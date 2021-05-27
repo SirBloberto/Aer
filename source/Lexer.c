@@ -24,13 +24,30 @@ void Lex() {
     }
 
     if(character == '+')
-        token = PLUS;
+        token = TOKEN_PLUS;
     if(character == '-')
-        token = MINUS;
+        token = TOKEN_MINUS;
     if(character == '*')
-        token = STAR;
+        token = TOKEN_STAR;
     if(character == '/')
-        token = SLASH;
+        token = TOKEN_SLASH;
+    if(character == '%')
+        token = TOKEN_PERCENT;
+    if(character == EOF)
+        token = TOKEN_END_OF_FILE;
+
+    if(character >= '1' && character <= '9') {
+        token = TOKEN_INTEGER;
+        value.type = TYPE_INTEGER;
+        value.integerData = character - '0';
+
+        character = NextCharacter();
+        while(character >= '0' && character <= '9') {
+            value.integerData = value.integerData * 10 + character - '0';
+            character = NextCharacter();
+        }
+        PutbackCharacter(character);
+    }
 }
 
 void OpenFile(const char* filename) {
@@ -41,7 +58,6 @@ void OpenFile(const char* filename) {
 
     line = 0;
     position = 0;
-    Lex();
 }
 
 void CloseFile() {
