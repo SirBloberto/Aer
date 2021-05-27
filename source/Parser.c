@@ -7,9 +7,7 @@ ASTNode* MultiplicativeExpression();
 ASTNode* PrimairyExpression();
 
 ASTNode* Parse() {
-    while(token != TOKEN_END_OF_FILE) {
-        Expression();
-    }
+    return Expression();
 }
 
 ASTNode* AdditiveExpression() {
@@ -41,6 +39,6 @@ ASTNode* MultiplicativeExpression() {
 }
 
 ASTNode* PrimairyExpression() {
-    if(CheckNext(TOKEN_INTEGER)) {
+    if(CheckNext(TOKEN_INTEGER))
         return ValueNode(value);
 }
