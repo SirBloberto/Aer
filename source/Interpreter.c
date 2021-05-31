@@ -1,29 +1,38 @@
 #include "../include/Interpreter.h"
 
-int Interpret(ASTNode* node) {
-    if(node->type == NODE_BINARY_EXPRESSION) {
-        int leftValue, rightValue;
-        if(node->binaryExpression.left)
-            leftValue = Interpret(node->binaryExpression.left);
-        if(node->binaryExpression.right)
-            rightValue = Interpret(node->binaryExpression.right);
+Value Interpret(ASTNode* node);
 
-        switch(node->binaryExpression.operation) {
-            case OPERATION_ADD: 
-                return (leftValue + rightValue);
-            case OPERATION_SUBTRACT:
-                return (leftValue - rightValue);
-            case OPERATION_MULTIPLY:
-                return (leftValue * rightValue);
-            case OPERATION_DIVIDE:
-                return (leftValue / rightValue);
-            case OPERATION_MODULO:
-                return (leftValue % rightValue);
-            default:
-                printf("Error");
-        }
-    } else if(node->type == NODE_VALUE)
-        return node->value.integerData;
-    else
-        printf("Error");
+Value InterpretBinaryExpression(BinaryExpression binaryExpression) {
+    Value leftValue = Interpret(binaryExpression.left);
+    Value rightValue = Interpret(binaryExpression.right);
+
+    if(leftValue.type == TYPE_INTEGER && rightValue.type == TYPE_INTEGER) {
+        Value resultValue;
+        long leftInteger = CoerceInteger(leftValue);
+        long rightInteger = CoerceInteger(rightValue);
+
+        if(binaryExpression.operation == OPERATION_ADD)
+            resultValue.integerValue = leftInteger + rightInteger;
+        if(binaryExpression.operation == OPERATION_SUBTRACT)
+            resultValue.integerValue = leftInteger - rightInteger;
+        if(binaryExpression.operation == OPERATION_MULTIPLY)
+            resultValue.integerValue = leftInteger * rightInteger;
+        if(binaryExpression.operation == OPERATION_DIVIDE)
+            resultValue.integerValue = leftInteger / rightInteger;
+        if(binaryExpression.operation == OPERATION_MODULO)
+            resultValue.integerValue = leftInteger % rightInteger;
+
+        return resultValue;
+    }
+}
+
+Value InterpretValue(Value value) {
+    return value;
+}
+
+Value Interpret(ASTNode* node) {
+    if(node->type == NODE_BINARY_EXPRESSION)
+        return InterpretBinaryExpression(node->binaryExpression);
+    if(node->type == NODE_VALUE)
+        return InterpretValue(node->value);
 }

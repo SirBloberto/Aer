@@ -1,10 +1,29 @@
+#include "../include/Compiler.h"
 #include "../include/Lexer.h"
 #include "../include/Parser.h"
+
+#include <stdlib.h>
 
 ASTNode* AdditiveExpression();
 ASTNode* Expression();
 ASTNode* MultiplicativeExpression();
 ASTNode* PrimairyExpression();
+
+ASTNode* BinaryExpressionNode(ASTNode* left, ASTNode* right, BinaryOperation operation) {
+    ASTNode* node = (ASTNode*)malloc(sizeof(ASTNode));
+    node->type = NODE_BINARY_EXPRESSION;
+    node->binaryExpression.left = left;
+    node->binaryExpression.right = right;
+    node->binaryExpression.operation = operation;
+    return node;
+}
+
+ASTNode* ValueNode(Value value) {
+    ASTNode* node = (ASTNode*)malloc(sizeof(ASTNode));
+    node->type = NODE_VALUE;
+    node->value = value;
+    return node;
+}
 
 ASTNode* Parse() {
     return Expression();

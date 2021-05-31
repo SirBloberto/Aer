@@ -1,8 +1,6 @@
 #ifndef LEXER_H
 #define LEXER_H
 
-#include <stdio.h>
-
 #include "../include/Value.h"
 
 typedef enum Token {
@@ -14,13 +12,6 @@ typedef enum Token {
     TOKEN_PERCENT,
     TOKEN_END_OF_FILE
 } Token;
-
-FILE* file;
-Token token;
-unsigned int line;
-unsigned int position;
-
-Value value;
 
 void OpenFile(const char* filename);
 

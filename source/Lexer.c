@@ -1,3 +1,5 @@
+#include <stdio.h>
+#include "../include/Compiler.h"
 #include "../include/Lexer.h"
 
 int NextCharacter(void) {
@@ -39,11 +41,11 @@ void Lex() {
     if(character >= '1' && character <= '9') {
         token = TOKEN_INTEGER;
         value.type = TYPE_INTEGER;
-        value.integerData = character - '0';
+        value.integerValue = character - '0';
 
         character = NextCharacter();
         while(character >= '0' && character <= '9') {
-            value.integerData = value.integerData * 10 + character - '0';
+            value.integerValue = value.integerValue * 10 + character - '0';
             character = NextCharacter();
         }
         PutbackCharacter(character);
