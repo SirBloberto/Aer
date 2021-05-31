@@ -1,9 +1,9 @@
 #ifndef INTERPRETER_H
 #define INTERPRETER_H
 
-#include "ASTNode.h"
+#include "Parser.h"
 #include "Value.h"
 
-int Interpret(ASTNode* node);
+Value Interpret(ASTNode* node);
 
 #endif
