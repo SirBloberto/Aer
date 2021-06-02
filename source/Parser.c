@@ -36,12 +36,9 @@ ASTNode* ValueNode(Value value) {
     return node;
 }
 
-void Parse() {
-    while(token != TOKEN_END_OF_FILE) {
-        Lex();
-        if(CheckNext(TOKEN_IDENTIFIER))
-            Interpret(ParseAssignmentExpression());
-    }
+ASTNode* Parse() {
+    if(CheckNext(TOKEN_IDENTIFIER))
+        return ParseAssignmentExpression();
 }
 
 ASTNode* ParseAssignmentExpression() {
@@ -83,5 +80,9 @@ ASTNode* ParseMultiplicativeExpression() {
 ASTNode* ParsePrimairyExpression() {
     if(CheckNext(TOKEN_INTEGER))
         return ValueNode(value);
+    if(CheckNext(TOKEN_IDENTIFIER)) {
+        int id = FindSymbol(value.identifierValue);
+        return ValueNode(globalVariables[id].value);
+    }
     return 0;
 }

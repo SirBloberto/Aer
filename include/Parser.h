@@ -48,6 +48,6 @@ ASTNode* AssignmentExpressionNode(ASTNode* left, ASTNode* right, AssignmentOpera
 ASTNode* BinaryExpressionNode(ASTNode* left, ASTNode* right, BinaryOperation operation);
 ASTNode* ValueNode(Value value);
 
-void Parse();
+ASTNode* Parse();
 
 #endif

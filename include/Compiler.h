@@ -16,4 +16,6 @@ unsigned int position;
 Value value;
 struct SymbolTable globalVariables[TABLE_SIZE];
 
+void Compile();
+
 #endif
