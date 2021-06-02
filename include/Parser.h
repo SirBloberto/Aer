@@ -5,6 +5,16 @@
 
 struct ASTNode;
 
+typedef enum AssignmentOperation {
+    OPERATION_ASSIGN
+} AssignmentOperation;
+
+typedef struct AssignmentExpression {
+    struct ASTNode* left;
+    struct ASTNode* right;
+    AssignmentOperation operation;
+} AssignmentExpression;
+
 typedef enum BinaryOperation {
     OPERATION_ADD,
     OPERATION_SUBTRACT,
@@ -20,6 +30,7 @@ typedef struct BinaryExpression {
 } BinaryExpression;
 
 typedef enum NodeType {
+    NODE_ASSIGNMENT_EXPRESSION,
     NODE_BINARY_EXPRESSION,
     NODE_VALUE
 } NodeType;
@@ -27,14 +38,16 @@ typedef enum NodeType {
 typedef struct ASTNode {
     enum NodeType type;
     union {
+        AssignmentExpression assignmentExpression;
         BinaryExpression binaryExpression;
         Value value;
     };
 } ASTNode;
 
+ASTNode* AssignmentExpressionNode(ASTNode* left, ASTNode* right, AssignmentOperation operation);
 ASTNode* BinaryExpressionNode(ASTNode* left, ASTNode* right, BinaryOperation operation);
 ASTNode* ValueNode(Value value);
 
-ASTNode* Parse();
+void Parse();
 
 #endif

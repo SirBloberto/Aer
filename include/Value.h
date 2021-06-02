@@ -2,6 +2,7 @@
 #define VALUE_H
 
 typedef enum ValueType {
+    TYPE_IDENTIFIER,
     TYPE_INTEGER,
     TYPE_FLOAT
 } Type;
@@ -9,6 +10,7 @@ typedef enum ValueType {
 typedef struct Value {
     enum ValueType type;
     union {
+        char* identifierValue;
         long integerValue;
         double floatValue;
     };

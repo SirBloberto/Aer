@@ -1,13 +1,24 @@
 #include "../include/Compiler.h"
+#include "../include/Interpreter.h"
 #include "../include/Lexer.h"
 #include "../include/Parser.h"
 
 #include <stdlib.h>
 
-ASTNode* AdditiveExpression();
-ASTNode* Expression();
-ASTNode* MultiplicativeExpression();
-ASTNode* PrimairyExpression();
+ASTNode* ParseAdditiveExpression();
+ASTNode* ParseAssignmentExpression();
+ASTNode* ParseExpression();
+ASTNode* ParseMultiplicativeExpression();
+ASTNode* ParsePrimairyExpression();
+
+ASTNode* AssignmentExpressionNode(ASTNode* left, ASTNode* right, AssignmentOperation operation) {
+    ASTNode* node = (ASTNode*)malloc(sizeof(ASTNode));
+    node->type = NODE_ASSIGNMENT_EXPRESSION;
+    node->assignmentExpression.left = left;
+    node->assignmentExpression.right = right;
+    node->assignmentExpression.operation = operation;
+    return node;
+}
 
 ASTNode* BinaryExpressionNode(ASTNode* left, ASTNode* right, BinaryOperation operation) {
     ASTNode* node = (ASTNode*)malloc(sizeof(ASTNode));
@@ -25,39 +36,56 @@ ASTNode* ValueNode(Value value) {
     return node;
 }
 
-ASTNode* Parse() {
-    return Expression();
+void Parse() {
+    while(token != TOKEN_END_OF_FILE) {
+        if(CheckNext(TOKEN_IDENTIFIER))
+            Interpret(ParseAssignmentExpression());
+    }
 }
 
-ASTNode* AdditiveExpression() {
-    ASTNode* left = MultiplicativeExpression();
+ASTNode* ParseAssignmentExpression() {
+    value.type = TYPE_IDENTIFIER;
+    value.identifierValue = identifier;
+    ASTNode* left = ValueNode(value);
+
+    ASTNode* node;
+    if(CheckNext(TOKEN_EQUALS)) {
+        node = AssignmentExpressionNode(left, ParseExpression(), OPERATION_ASSIGN);
+        CheckNext(TOKEN_NEW_LINE);
+        return node;
+    }
+}
+
+ASTNode* ParseAdditiveExpression() {
+    ASTNode* left = ParseMultiplicativeExpression();
 
     if(CheckNext(TOKEN_PLUS))
-        return BinaryExpressionNode(left, AdditiveExpression(), OPERATION_ADD);
+        return BinaryExpressionNode(left, ParseAdditiveExpression(), OPERATION_ADD);
     if(CheckNext(TOKEN_MINUS))
-        return BinaryExpressionNode(left, AdditiveExpression(), OPERATION_SUBTRACT);
+        return BinaryExpressionNode(left, ParseAdditiveExpression(), OPERATION_SUBTRACT);
 
     return left;
 }
 
-ASTNode* Expression() {
-    return AdditiveExpression();
+ASTNode* ParseExpression() {
+    return ParseAdditiveExpression();
 }
 
-ASTNode* MultiplicativeExpression() {
-    ASTNode* left = PrimairyExpression();
+ASTNode* ParseMultiplicativeExpression() {
+    ASTNode* left = ParsePrimairyExpression();
 
     if(CheckNext(TOKEN_STAR))
-        return BinaryExpressionNode(left, MultiplicativeExpression(), OPERATION_MULTIPLY);
+        return BinaryExpressionNode(left, ParseMultiplicativeExpression(), OPERATION_MULTIPLY);
     if(CheckNext(TOKEN_SLASH))
-        return BinaryExpressionNode(left, MultiplicativeExpression(), OPERATION_DIVIDE);
+        return BinaryExpressionNode(left, ParseMultiplicativeExpression(), OPERATION_DIVIDE);
     if(CheckNext(TOKEN_PERCENT))
-        return BinaryExpressionNode(left, MultiplicativeExpression(), OPERATION_MODULO);
+        return BinaryExpressionNode(left, ParseMultiplicativeExpression(), OPERATION_MODULO);
 
     return left;
 }
 
-ASTNode* PrimairyExpression() {
+ASTNode* ParsePrimairyExpression() {
     if(CheckNext(TOKEN_INTEGER))
         return ValueNode(value);
+    return 0;
 }

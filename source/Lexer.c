@@ -19,12 +19,6 @@ void Lex() {
     while(character == ' ')
         character = NextCharacter();
 
-    while(character == '\n') {
-        character = NextCharacter();
-        line++;
-        position = 0;
-    }
-
     if(character == '+')
         token = TOKEN_PLUS;
     if(character == '-')
@@ -35,6 +29,10 @@ void Lex() {
         token = TOKEN_SLASH;
     if(character == '%')
         token = TOKEN_PERCENT;
+    if(character == '=')
+        token = TOKEN_EQUALS;
+    if(character == '\n')
+        token = TOKEN_NEW_LINE;
     if(character == EOF)
         token = TOKEN_END_OF_FILE;
 
@@ -49,6 +47,22 @@ void Lex() {
             character = NextCharacter();
         }
         PutbackCharacter(character);
+    }
+
+    if(character >= 'A' && character <= 'z') {
+        token = TOKEN_IDENTIFIER;
+        //value.type = TYPE_IDENTIFIER;
+        identifier[0] = character;
+
+        int i = 1;
+        character = NextCharacter();
+        while(character >= 'A' && character <= 'z') {
+            identifier[i++] = character;
+            character = NextCharacter();
+        }
+        identifier[i] = 0;
+        PutbackCharacter(character);
+        //value.identifierValue = identifier;
     }
 }
 

@@ -1,5 +1,5 @@
 CC := gcc
-CFLAGS := -Wall
+CFLAGS := 
 
 SOURCE := $(foreach file, source, $(wildcard $(addprefix $(file)/*, .c*)))
 OBJECT := $(addprefix object/, $(addsuffix .o, $(notdir $(basename $(SOURCE)))))
