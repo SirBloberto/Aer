@@ -38,22 +38,18 @@ ASTNode* ValueNode(Value value) {
 
 void Parse() {
     while(token != TOKEN_END_OF_FILE) {
+        Lex();
         if(CheckNext(TOKEN_IDENTIFIER))
             Interpret(ParseAssignmentExpression());
     }
 }
 
 ASTNode* ParseAssignmentExpression() {
-    value.type = TYPE_IDENTIFIER;
-    value.identifierValue = identifier;
     ASTNode* left = ValueNode(value);
 
     ASTNode* node;
-    if(CheckNext(TOKEN_EQUALS)) {
-        node = AssignmentExpressionNode(left, ParseExpression(), OPERATION_ASSIGN);
-        CheckNext(TOKEN_NEW_LINE);
-        return node;
-    }
+    if(CheckNext(TOKEN_EQUALS))
+        return AssignmentExpressionNode(left, ParseExpression(), OPERATION_ASSIGN);
 }
 
 ASTNode* ParseAdditiveExpression() {

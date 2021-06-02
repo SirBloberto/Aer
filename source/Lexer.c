@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "../include/Compiler.h"
 #include "../include/Lexer.h"
 
@@ -51,7 +52,8 @@ void Lex() {
 
     if(character >= 'A' && character <= 'z') {
         token = TOKEN_IDENTIFIER;
-        //value.type = TYPE_IDENTIFIER;
+        value.type = TYPE_IDENTIFIER;
+        char identifier[512];
         identifier[0] = character;
 
         int i = 1;
@@ -62,7 +64,7 @@ void Lex() {
         }
         identifier[i] = 0;
         PutbackCharacter(character);
-        //value.identifierValue = identifier;
+        value.identifierValue = strdup(identifier);
     }
 }
 

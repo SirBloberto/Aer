@@ -2,16 +2,19 @@
 #include "../include/Interpreter.h"
 #include "../include/SymbolTable.h"
 
-Value Interpret(ASTNode* node);
-
 Value InterpretAssignmentExpression(ASTNode* node) {
     Value leftValue, rightValue;
     if(node->assignmentExpression.left)
         leftValue = Interpret(node->assignmentExpression.left);
     if(node->assignmentExpression.right)
         rightValue = Interpret(node->assignmentExpression.right);
-    //if(FindSymbol(leftValue.identifierValue));
+
+    if(FindSymbol(leftValue.identifierValue) == -1)
+        AddSymbol(leftValue.identifierValue);
+
+    globalVariables[FindSymbol(leftValue.identifierValue)].value = rightValue;
 }
+
 
 Value InterpretBinaryExpression(ASTNode* node) {
     Value leftValue, rightValue;

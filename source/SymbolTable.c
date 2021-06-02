@@ -1,22 +1,23 @@
+#include <string.h>
 #include "../include/Compiler.h"
 #include "../include/SymbolTable.h"
 
 static int globalVariablesCount = 0;
 
-int AddSymbol(char* identifier) {
+int AddSymbol(char* symbol) {
     int i;
 
-    if(FindSymbol(identifier) != -1)
-        return FindSymbol(identifier);
+    if(FindSymbol(symbol) != -1)
+        return FindSymbol(symbol);
 
     i = globalVariablesCount++;
-    globalVariables[i].identifier = identifier;
+    globalVariables[i].identifier = symbol;
     return i;
 }
 
-int FindSymbol(char* identifier) {
+int FindSymbol(char* symbol) {
     for(int i = 0; i < globalVariablesCount; i++) {
-        if(identifier == globalVariables[i].identifier)
+        if(!strcmp(symbol, globalVariables[i].identifier))
             return i;
     }
     return -1;
