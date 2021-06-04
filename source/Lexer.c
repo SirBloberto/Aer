@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../include/Compiler.h"
+#include "../include/Error.h"
 #include "../include/Lexer.h"
 
 int NextCharacter(void) {
@@ -14,7 +15,20 @@ void PutbackCharacter(int character) {
     position++;
 }
 
-void Identifier(int character, char* identifier) {
+void Number(int character) {
+    token = TOKEN_INTEGER;
+    value.type = TYPE_INTEGER;
+    value.integerValue = character - '0';
+
+    character = NextCharacter();
+    while(character >= '0' && character <= '9') {
+        value.integerValue = value.integerValue * 10 + character - '0';
+        character = NextCharacter();
+    }
+    PutbackCharacter(character);
+}
+
+void Identifier(char* identifier, int character) {
     identifier[0] = character;
     int i = 1;
     character = NextCharacter();
@@ -86,20 +100,11 @@ void Lex() {
         token = TOKEN_NEW_LINE;
     else if(character == EOF)
         token = TOKEN_END_OF_FILE;
-    else if(character >= '1' && character <= '9') {
-        token = TOKEN_INTEGER;
-        value.type = TYPE_INTEGER;
-        value.integerValue = character - '0';
-
-        character = NextCharacter();
-        while(character >= '0' && character <= '9') {
-            value.integerValue = value.integerValue * 10 + character - '0';
-            character = NextCharacter();
-        }
-        PutbackCharacter(character);
-    } else if(character >= 'A' && character <= 'z') {
+    else if(character >= '1' && character <= '9')
+        Number(character);
+    else if(character >= 'A' && character <= 'z') {
         char identifier[512];
-        Identifier(character, identifier);
+        Identifier(identifier, character);
 
         if(!Keyword(identifier)) {
             token = TOKEN_IDENTIFIER;
@@ -113,7 +118,7 @@ void OpenFile(const char* filename) {
     file = fopen(filename, "r");
 
     if(file == NULL)
-        fprintf(stderr, "Input file does not exist");
+        Error("Input file does not exist");
 
     line = 0;
     position = 0;

@@ -1,4 +1,5 @@
 #include "../include/Compiler.h"
+#include "../include/Error.h"
 #include "../include/Interpreter.h"
 #include "../include/Lexer.h"
 #include "../include/Parser.h"
@@ -41,14 +42,15 @@ ASTNode* ValueNode(Value value) {
 ASTNode* Parse() {
     if(CheckNext(TOKEN_IDENTIFIER))
         return ParseAssignmentExpression();
+    Error("Parse Error");
 }
 
 ASTNode* ParseAssignmentExpression() {
     ASTNode* left = ValueNode(value);
 
-    ASTNode* node;
     if(CheckNext(TOKEN_EQUALS))
-        return AssignmentExpressionNode(left, ParseExpression(), OPERATION_ASSIGN);
+        return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_ASSIGN);
+    Error("Parse AssignmentExpression Error");
 }
 
 ASTNode* ParseExpression() {
@@ -59,9 +61,9 @@ ASTNode* ParseEqualityExpression() {
     ASTNode* left = ParseRelationalExpression();
 
     if(CheckNext(TOKEN_EQUALS_EQUALS))
-        return BinaryExpressionNode(left, ParseEqualityExpression(), OPERATION_IS_EQUAL);
+        return BinaryExpressionNode(left, ParseEqualityExpression(), BINARY_OPERATION_EQUAL);
     if(CheckNext(TOKEN_EXCLAMATION_EQUALS))
-        return BinaryExpressionNode(left, ParseEqualityExpression(), OPERATION_IS_NOT_EQUAL);
+        return BinaryExpressionNode(left, ParseEqualityExpression(), BINARY_OPERATION_NOT_EQUAL);
     
     return left;
 }
@@ -70,13 +72,13 @@ ASTNode* ParseRelationalExpression() {
     ASTNode* left = ParseAdditiveExpression();
 
     if(CheckNext(TOKEN_GREATER))
-        return BinaryExpressionNode(left, ParseRelationalExpression(), OPERATION_IS_GREATER);
+        return BinaryExpressionNode(left, ParseRelationalExpression(), BINARY_OPERATION_GREATER);
     if(CheckNext(TOKEN_LESS))
-        return BinaryExpressionNode(left, ParseRelationalExpression(), OPERATION_IS_LESS);
+        return BinaryExpressionNode(left, ParseRelationalExpression(), BINARY_OPERATION_LESS);
     if(CheckNext(TOKEN_GREATER_EQUALS))
-        return BinaryExpressionNode(left, ParseRelationalExpression(), OPERATION_IS_GREATER_EQUAL);
+        return BinaryExpressionNode(left, ParseRelationalExpression(), BINARY_OPERATION_GREATER_EQUAL);
     if(CheckNext(TOKEN_LESS_EQUALS))
-        return BinaryExpressionNode(left, ParseRelationalExpression(), OPERATION_IS_LESS_EQUAL);
+        return BinaryExpressionNode(left, ParseRelationalExpression(), BINARY_OPERATION_LESS_EQUAL);
 
     return left;
 }
@@ -85,9 +87,9 @@ ASTNode* ParseAdditiveExpression() {
     ASTNode* left = ParseMultiplicativeExpression();
 
     if(CheckNext(TOKEN_PLUS))
-        return BinaryExpressionNode(left, ParseAdditiveExpression(), OPERATION_ADD);
+        return BinaryExpressionNode(left, ParseAdditiveExpression(), BINARY_OPERATION_ADD);
     if(CheckNext(TOKEN_MINUS))
-        return BinaryExpressionNode(left, ParseAdditiveExpression(), OPERATION_SUBTRACT);
+        return BinaryExpressionNode(left, ParseAdditiveExpression(), BINARY_OPERATION_SUBTRACT);
 
     return left;
 }
@@ -96,22 +98,23 @@ ASTNode* ParseMultiplicativeExpression() {
     ASTNode* left = ParsePrimairyExpression();
 
     if(CheckNext(TOKEN_STAR))
-        return BinaryExpressionNode(left, ParseMultiplicativeExpression(), OPERATION_MULTIPLY);
+        return BinaryExpressionNode(left, ParseMultiplicativeExpression(), BINARY_OPERATION_MULTIPLY);
     if(CheckNext(TOKEN_SLASH))
-        return BinaryExpressionNode(left, ParseMultiplicativeExpression(), OPERATION_DIVIDE);
+        return BinaryExpressionNode(left, ParseMultiplicativeExpression(), BINARY_OPERATION_DIVIDE);
     if(CheckNext(TOKEN_PERCENT))
-        return BinaryExpressionNode(left, ParseMultiplicativeExpression(), OPERATION_MODULO);
+        return BinaryExpressionNode(left, ParseMultiplicativeExpression(), BINARY_OPERATION_MODULO);
 
     return left;
 }
 
 ASTNode* ParsePrimairyExpression() {
+    if(CheckNext(TOKEN_TRUE) || CheckNext(TOKEN_FALSE))
+        return ValueNode(value);
     if(CheckNext(TOKEN_INTEGER))
         return ValueNode(value);
     if(CheckNext(TOKEN_IDENTIFIER)) {
         int id = FindSymbol(value.identifierValue);
         return ValueNode(globalVariables[id].value);
-    } if(CheckNext(TOKEN_TRUE) || CheckNext(TOKEN_FALSE))
-        return ValueNode(value);
-    return 0;
+    }
+    Error("Parse PrimairyExpression Error");
 }

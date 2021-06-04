@@ -20,10 +20,6 @@ void PrintMemory() {
     }
 }
 
-void ViewASTNode(ASTNode* node) {
-
-}
-
 void Compile() {
     while(token != TOKEN_END_OF_FILE) {
         Lex();

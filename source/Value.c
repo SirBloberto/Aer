@@ -1,27 +1,17 @@
+#include "../include/Error.h"
 #include "../include/Value.h"
+
+char CorrectBoolean(char booleanValue) {
+    if(booleanValue != 0)
+        return 1;
+    return 0;    
+}
 
 long CoerceInteger(Value value) {
     switch(value.type) {
-        case TYPE_BOOLEAN:
-            return (long)value.booleanValue;
         case TYPE_INTEGER:
             return (long)value.integerValue;
-        case TYPE_FLOAT:
-            return (long)value.floatValue;
         default:
-            return 0;
-    }
-}
-
-double CoerceFloat(Value value) {
-    switch(value.type) {
-        case TYPE_BOOLEAN:
-            return (double)value.booleanValue;
-        case TYPE_INTEGER:
-            return (double)value.integerValue;
-        case TYPE_FLOAT:
-            return (double)value.floatValue;
-        default:
-            return 0;
+            Error("Coerce Integer Error");
     }
 }

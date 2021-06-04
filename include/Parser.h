@@ -6,7 +6,7 @@
 struct ASTNode;
 
 typedef enum AssignmentOperation {
-    OPERATION_ASSIGN
+    ASSIGNMENT_OPERATION_ASSIGN
 } AssignmentOperation;
 
 typedef struct AssignmentExpression {
@@ -16,17 +16,20 @@ typedef struct AssignmentExpression {
 } AssignmentExpression;
 
 typedef enum BinaryOperation {
-    OPERATION_IS_EQUAL,
-    OPERATION_IS_NOT_EQUAL,
-    OPERATION_IS_LESS,
-    OPERATION_IS_GREATER,
-    OPERATION_IS_LESS_EQUAL,
-    OPERATION_IS_GREATER_EQUAL,
-    OPERATION_ADD,
-    OPERATION_SUBTRACT,
-    OPERATION_MULTIPLY,
-    OPERATION_DIVIDE,
-    OPERATION_MODULO
+    BINARY_OPERATION_EQUAL,
+    BINARY_OPERATION_NOT_EQUAL,
+
+    BINARY_OPERATION_GREATER,
+    BINARY_OPERATION_LESS,
+    BINARY_OPERATION_GREATER_EQUAL,
+    BINARY_OPERATION_LESS_EQUAL,
+
+    BINARY_OPERATION_ADD,
+    BINARY_OPERATION_SUBTRACT,
+    
+    BINARY_OPERATION_MULTIPLY,
+    BINARY_OPERATION_DIVIDE,
+    BINARY_OPERATION_MODULO
 } BinaryOperation;
 
 typedef struct BinaryExpression {

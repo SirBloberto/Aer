@@ -3,23 +3,23 @@
 
 typedef enum ValueType {
     TYPE_BOOLEAN,
-    TYPE_IDENTIFIER,
     TYPE_INTEGER,
-    TYPE_FLOAT
+
+    TYPE_IDENTIFIER
 } Type;
 
 typedef struct Value {
     enum ValueType type;
     union {
         char booleanValue;
-        char* identifierValue;
         long integerValue;
-        double floatValue;
+        
+        char* identifierValue;
     };
 } Value;
 
-long CoerceInteger(Value value);
+char CorrectBoolean(char booleanValue);
 
-double CoerceFloat(Value value);
+long CoerceInteger(Value value);
 
 #endif
