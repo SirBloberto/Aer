@@ -2,6 +2,8 @@
 
 long CoerceInteger(Value value) {
     switch(value.type) {
+        case TYPE_BOOLEAN:
+            return (long)value.booleanValue;
         case TYPE_INTEGER:
             return (long)value.integerValue;
         case TYPE_FLOAT:
@@ -13,10 +15,12 @@ long CoerceInteger(Value value) {
 
 double CoerceFloat(Value value) {
     switch(value.type) {
+        case TYPE_BOOLEAN:
+            return (double)value.booleanValue;
         case TYPE_INTEGER:
-            return (long)value.integerValue;
+            return (double)value.integerValue;
         case TYPE_FLOAT:
-            return (long)value.floatValue;
+            return (double)value.floatValue;
         default:
             return 0;
     }

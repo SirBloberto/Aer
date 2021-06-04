@@ -14,6 +14,32 @@ void PutbackCharacter(int character) {
     position++;
 }
 
+void Identifier(int character, char* identifier) {
+    identifier[0] = character;
+    int i = 1;
+    character = NextCharacter();
+    while(character >= 'A' && character <= 'z') {
+        identifier[i++] = character;
+        character = NextCharacter();
+    }
+    identifier[i] = 0;
+    PutbackCharacter(character);
+}
+
+int Keyword(char* identifier) {
+    if(!strcmp(identifier, "True")) {
+        token = TOKEN_TRUE;
+        value.type = TYPE_BOOLEAN;
+        value.booleanValue = 1;
+    } else if(!strcmp(identifier, "False")) {
+        token = TOKEN_FALSE;
+        value.type = TYPE_BOOLEAN;
+        value.booleanValue = 0;
+    } else 
+        return 0;
+    return 1;
+}
+
 void Lex() {
     int character = NextCharacter();
 
@@ -22,22 +48,45 @@ void Lex() {
 
     if(character == '+')
         token = TOKEN_PLUS;
-    if(character == '-')
+    else if(character == '-')
         token = TOKEN_MINUS;
-    if(character == '*')
+    else if(character == '*')
         token = TOKEN_STAR;
-    if(character == '/')
+    else if(character == '/')
         token = TOKEN_SLASH;
     if(character == '%')
         token = TOKEN_PERCENT;
-    if(character == '=')
-        token = TOKEN_EQUALS;
-    if(character == '\n')
+    else if(character == '=') {
+        if((character = NextCharacter()) == '=')
+            token = TOKEN_EQUALS_EQUALS;
+        else {
+            token = TOKEN_EQUALS;
+            PutbackCharacter(character);
+        }
+    } else if(character == '!') {
+        if((character = NextCharacter()) == '=')
+            token = TOKEN_EXCLAMATION_EQUALS;
+        else
+            PutbackCharacter(character);
+    } else if(character == '<') {
+        if((character = NextCharacter()) == '=')
+            token = TOKEN_LESS_EQUALS;
+        else {
+            token = TOKEN_LESS;
+            PutbackCharacter(character);
+        }
+    } else if(character == '>') {
+        if((character = NextCharacter()) == '=')
+            token = TOKEN_GREATER_EQUALS;
+        else {
+            token = TOKEN_GREATER;
+            PutbackCharacter(character);
+        }
+    } else if(character == '\n')
         token = TOKEN_NEW_LINE;
-    if(character == EOF)
+    else if(character == EOF)
         token = TOKEN_END_OF_FILE;
-
-    if(character >= '1' && character <= '9') {
+    else if(character >= '1' && character <= '9') {
         token = TOKEN_INTEGER;
         value.type = TYPE_INTEGER;
         value.integerValue = character - '0';
@@ -48,23 +97,15 @@ void Lex() {
             character = NextCharacter();
         }
         PutbackCharacter(character);
-    }
-
-    if(character >= 'A' && character <= 'z') {
-        token = TOKEN_IDENTIFIER;
-        value.type = TYPE_IDENTIFIER;
+    } else if(character >= 'A' && character <= 'z') {
         char identifier[512];
-        identifier[0] = character;
+        Identifier(character, identifier);
 
-        int i = 1;
-        character = NextCharacter();
-        while(character >= 'A' && character <= 'z') {
-            identifier[i++] = character;
-            character = NextCharacter();
+        if(!Keyword(identifier)) {
+            token = TOKEN_IDENTIFIER;
+            value.type = TYPE_IDENTIFIER;
+            value.identifierValue = strdup(identifier);
         }
-        identifier[i] = 0;
-        PutbackCharacter(character);
-        value.identifierValue = strdup(identifier);
     }
 }
 

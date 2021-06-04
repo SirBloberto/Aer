@@ -7,10 +7,21 @@ void PrintMemory() {
     for(int i = 0; i < TABLE_SIZE; i++) {
         if(globalVariables[i].identifier != 0) {
             printf("Identifier: %s,  ", globalVariables[i].identifier);
-            Value test = globalVariables[i].value;
-            printf("Value: %d\n", (int)test.integerValue);
+            Value value = globalVariables[i].value;
+            if(value.type == TYPE_INTEGER)
+                printf("Value: %d\n", (int)value.integerValue);
+            if(value.type == TYPE_BOOLEAN){
+                if(value.booleanValue == 0)
+                    printf("Value: False\n");
+                else
+                    printf("Value: True\n");
+            }
         }
     }
+}
+
+void ViewASTNode(ASTNode* node) {
+
 }
 
 void Compile() {

@@ -25,19 +25,38 @@ Value InterpretBinaryExpression(ASTNode* node) {
 
     if(leftValue.type == TYPE_INTEGER && rightValue.type == TYPE_INTEGER) {
         Value resultValue;
+        resultValue.type = TYPE_INTEGER;
         long leftInteger = CoerceInteger(leftValue);
         long rightInteger = CoerceInteger(rightValue);
 
         if(node->binaryExpression.operation == OPERATION_ADD)
             resultValue.integerValue = leftInteger + rightInteger;
-        if(node->binaryExpression.operation == OPERATION_SUBTRACT)
+        else if(node->binaryExpression.operation == OPERATION_SUBTRACT)
             resultValue.integerValue = leftInteger - rightInteger;
-        if(node->binaryExpression.operation == OPERATION_MULTIPLY)
+        else if(node->binaryExpression.operation == OPERATION_MULTIPLY)
             resultValue.integerValue = leftInteger * rightInteger;
-        if(node->binaryExpression.operation == OPERATION_DIVIDE)
+        else if(node->binaryExpression.operation == OPERATION_DIVIDE)
             resultValue.integerValue = leftInteger / rightInteger;
-        if(node->binaryExpression.operation == OPERATION_MODULO)
+        else if(node->binaryExpression.operation == OPERATION_MODULO)
             resultValue.integerValue = leftInteger % rightInteger;
+        else {
+            resultValue.type = TYPE_BOOLEAN;
+            if(node->binaryExpression.operation == OPERATION_IS_EQUAL)
+                resultValue.booleanValue = leftInteger == rightInteger;
+            else if(node->binaryExpression.operation == OPERATION_IS_NOT_EQUAL)
+                resultValue.booleanValue = leftInteger != rightInteger;
+            else if(node->binaryExpression.operation == OPERATION_IS_GREATER)
+                resultValue.booleanValue = leftInteger > rightInteger;
+            else if(node->binaryExpression.operation == OPERATION_IS_LESS)
+                resultValue.booleanValue = leftInteger < rightInteger;
+            else if(node->binaryExpression.operation == OPERATION_IS_GREATER_EQUAL)
+                resultValue.booleanValue = leftInteger >= rightInteger;
+            else if(node->binaryExpression.operation == OPERATION_IS_LESS_EQUAL)
+                resultValue.booleanValue = leftInteger <= rightInteger;
+
+            if(resultValue.booleanValue > 1)
+                resultValue.booleanValue = 1;
+        }
 
         return resultValue;
     }

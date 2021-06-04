@@ -16,6 +16,12 @@ typedef struct AssignmentExpression {
 } AssignmentExpression;
 
 typedef enum BinaryOperation {
+    OPERATION_IS_EQUAL,
+    OPERATION_IS_NOT_EQUAL,
+    OPERATION_IS_LESS,
+    OPERATION_IS_GREATER,
+    OPERATION_IS_LESS_EQUAL,
+    OPERATION_IS_GREATER_EQUAL,
     OPERATION_ADD,
     OPERATION_SUBTRACT,
     OPERATION_MULTIPLY,

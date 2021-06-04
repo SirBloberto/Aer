@@ -5,9 +5,11 @@
 
 #include <stdlib.h>
 
-ASTNode* ParseAdditiveExpression();
 ASTNode* ParseAssignmentExpression();
 ASTNode* ParseExpression();
+ASTNode* ParseEqualityExpression();
+ASTNode* ParseRelationalExpression();
+ASTNode* ParseAdditiveExpression();
 ASTNode* ParseMultiplicativeExpression();
 ASTNode* ParsePrimairyExpression();
 
@@ -49,6 +51,36 @@ ASTNode* ParseAssignmentExpression() {
         return AssignmentExpressionNode(left, ParseExpression(), OPERATION_ASSIGN);
 }
 
+ASTNode* ParseExpression() {
+    return ParseEqualityExpression();
+}
+
+ASTNode* ParseEqualityExpression() {
+    ASTNode* left = ParseRelationalExpression();
+
+    if(CheckNext(TOKEN_EQUALS_EQUALS))
+        return BinaryExpressionNode(left, ParseEqualityExpression(), OPERATION_IS_EQUAL);
+    if(CheckNext(TOKEN_EXCLAMATION_EQUALS))
+        return BinaryExpressionNode(left, ParseEqualityExpression(), OPERATION_IS_NOT_EQUAL);
+    
+    return left;
+}
+
+ASTNode* ParseRelationalExpression() {
+    ASTNode* left = ParseAdditiveExpression();
+
+    if(CheckNext(TOKEN_GREATER))
+        return BinaryExpressionNode(left, ParseRelationalExpression(), OPERATION_IS_GREATER);
+    if(CheckNext(TOKEN_LESS))
+        return BinaryExpressionNode(left, ParseRelationalExpression(), OPERATION_IS_LESS);
+    if(CheckNext(TOKEN_GREATER_EQUALS))
+        return BinaryExpressionNode(left, ParseRelationalExpression(), OPERATION_IS_GREATER_EQUAL);
+    if(CheckNext(TOKEN_LESS_EQUALS))
+        return BinaryExpressionNode(left, ParseRelationalExpression(), OPERATION_IS_LESS_EQUAL);
+
+    return left;
+}
+
 ASTNode* ParseAdditiveExpression() {
     ASTNode* left = ParseMultiplicativeExpression();
 
@@ -58,10 +90,6 @@ ASTNode* ParseAdditiveExpression() {
         return BinaryExpressionNode(left, ParseAdditiveExpression(), OPERATION_SUBTRACT);
 
     return left;
-}
-
-ASTNode* ParseExpression() {
-    return ParseAdditiveExpression();
 }
 
 ASTNode* ParseMultiplicativeExpression() {
@@ -83,6 +111,7 @@ ASTNode* ParsePrimairyExpression() {
     if(CheckNext(TOKEN_IDENTIFIER)) {
         int id = FindSymbol(value.identifierValue);
         return ValueNode(globalVariables[id].value);
-    }
+    } if(CheckNext(TOKEN_TRUE) || CheckNext(TOKEN_FALSE))
+        return ValueNode(value);
     return 0;
 }
