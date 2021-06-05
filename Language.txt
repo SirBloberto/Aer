@@ -17,17 +17,36 @@ Statement = AssignmentExpression
 
 AssignmentExpression = Identifier '=' Expression
 
-Expression = EqualityExpression
+Expression = LogicalAndExpression
+
+LogicalOrExpression = LogicalAndExpression
+                    | LogicalAndExpression '||' LogicalOrExpression
+
+LogicalAndExpression = BitwiseOrExpression
+                     | BitwiseOrExpression '&&' LogicalAndExpression
+
+BitwiseOrExpression = BitwiseXorExpression
+                    | BitwiseXorExpression '|' BitwiseOrExpression
+
+BitwiseXorExpression = BitwiseAndExpression
+                     | BitwiseAndExpression '^' BitwiseXorExpression
+
+BitwiseAndExpression = EqualityExpression
+                     | EqualityExpression '&' BitwiseAndExpression
 
 EqualityExpression = RelationalExpression
                    | RelationalExpression '==' EqualityExpression
                    | RelationalExpression '!=' EqualityExpression
 
-RelationalExpression = AdditiveExpression
-                     | AdditiveExpression '>' RelationalExpression
-                     | AdditiveExpression '<' RelationalExpression
-                     | AdditiveExpression '>=' RelationalExpression
-                     | AdditiveExpression '<=' RelationalExpression
+RelationalExpression = ShiftExpression
+                     | ShiftExpression '>' RelationalExpression
+                     | ShiftExpression '<' RelationalExpression
+                     | ShiftExpression '>=' RelationalExpression
+                     | ShiftExpression '<=' RelationalExpression
+
+ShiftExpression = AdditiveExpression
+                | AdditiveExpression '<<' ShiftExpression
+                | AdditiveExpression '>>' ShiftExpression
 
 AdditiveExpression = MultiplicativeExpression
                    | MultiplicativeExpression '+' AdditiveExpression
@@ -41,3 +60,4 @@ MultiplicativeExpression = PrimairyExpression
 PrimairyExpression = Identifier
                    | Boolean
                    | Integer
+                   | '(' Expression ')'

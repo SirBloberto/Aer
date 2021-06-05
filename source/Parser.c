@@ -8,8 +8,14 @@
 
 ASTNode* ParseAssignmentExpression();
 ASTNode* ParseExpression();
+ASTNode* ParseLogicalOrExpression();
+ASTNode* ParseLogicalAndExpression();
+ASTNode* ParseBitwiseOrExpression();
+ASTNode* ParseBitwiseXorExpression();
+ASTNode* ParseBitwiseAndExpression();
 ASTNode* ParseEqualityExpression();
 ASTNode* ParseRelationalExpression();
+ASTNode* ParseShiftExpression();
 ASTNode* ParseAdditiveExpression();
 ASTNode* ParseMultiplicativeExpression();
 ASTNode* ParsePrimairyExpression();
@@ -54,7 +60,52 @@ ASTNode* ParseAssignmentExpression() {
 }
 
 ASTNode* ParseExpression() {
-    return ParseEqualityExpression();
+    return ParseLogicalOrExpression();
+}
+
+ASTNode* ParseLogicalOrExpression() {
+    ASTNode* left = ParseLogicalAndExpression();
+
+    if(CheckNext(TOKEN_PIPE_PIPE))
+        return BinaryExpressionNode(left, ParseLogicalOrExpression(), BINARY_OPERATION_LOGICAL_OR);
+
+    return left;
+}
+
+ASTNode* ParseLogicalAndExpression() {
+    ASTNode* left = ParseBitwiseOrExpression();
+
+    if(CheckNext(TOKEN_AMPERSAND_AMPERSAND))
+        return BinaryExpressionNode(left, ParseLogicalAndExpression(), BINARY_OPERATION_LOGICAL_AND);
+
+    return left;
+}
+
+ASTNode* ParseBitwiseOrExpression() {
+    ASTNode* left = ParseBitwiseXorExpression();
+
+    if(CheckNext(TOKEN_PIPE))
+        return BinaryExpressionNode(left, ParseBitwiseOrExpression(), BINARY_OPERATION_BITWISE_OR);
+
+    return left;
+}
+
+ASTNode* ParseBitwiseXorExpression() {
+    ASTNode* left = ParseBitwiseAndExpression();
+
+    if(CheckNext(TOKEN_CARET))
+        return BinaryExpressionNode(left, ParseBitwiseXorExpression(), BINARY_OPERATION_BITWISE_XOR);
+
+    return left;
+}
+
+ASTNode* ParseBitwiseAndExpression() {
+    ASTNode* left = ParseEqualityExpression();
+
+    if(CheckNext(TOKEN_AMPERSAND))
+        return BinaryExpressionNode(left, ParseBitwiseAndExpression(), BINARY_OPERATION_BITWISE_AND);
+
+    return left;
 }
 
 ASTNode* ParseEqualityExpression() {
@@ -69,7 +120,7 @@ ASTNode* ParseEqualityExpression() {
 }
 
 ASTNode* ParseRelationalExpression() {
-    ASTNode* left = ParseAdditiveExpression();
+    ASTNode* left = ParseShiftExpression();
 
     if(CheckNext(TOKEN_GREATER))
         return BinaryExpressionNode(left, ParseRelationalExpression(), BINARY_OPERATION_GREATER);
@@ -79,6 +130,17 @@ ASTNode* ParseRelationalExpression() {
         return BinaryExpressionNode(left, ParseRelationalExpression(), BINARY_OPERATION_GREATER_EQUAL);
     if(CheckNext(TOKEN_LESS_EQUALS))
         return BinaryExpressionNode(left, ParseRelationalExpression(), BINARY_OPERATION_LESS_EQUAL);
+
+    return left;
+}
+
+ASTNode* ParseShiftExpression() {
+    ASTNode* left = ParseAdditiveExpression();
+
+    if(CheckNext(TOKEN_GREATER_GREATER))
+        return BinaryExpressionNode(left, ParseShiftExpression(), BINARY_OPERATION_RIGHT_SHIFT);
+    if(CheckNext(TOKEN_LESS_LESS))
+        return BinaryExpressionNode(left, ParseShiftExpression(), BINARY_OPERATION_LEFT_SHIFT);
 
     return left;
 }
@@ -110,11 +172,16 @@ ASTNode* ParseMultiplicativeExpression() {
 ASTNode* ParsePrimairyExpression() {
     if(CheckNext(TOKEN_TRUE) || CheckNext(TOKEN_FALSE))
         return ValueNode(value);
-    if(CheckNext(TOKEN_INTEGER))
+    else if(CheckNext(TOKEN_INTEGER))
         return ValueNode(value);
-    if(CheckNext(TOKEN_IDENTIFIER)) {
+    else if(CheckNext(TOKEN_IDENTIFIER)) {
         int id = FindSymbol(value.identifierValue);
         return ValueNode(globalVariables[id].value);
+    } else if(CheckNext(TOKEN_OPEN_PARENTHESE)) {
+        ASTNode* node = ParseExpression();
+        if(!CheckNext(TOKEN_CLOSE_PARENTHESE))
+            Error("No closing parenthese");
+        return node;
     }
     Error("Parse PrimairyExpression Error");
 }

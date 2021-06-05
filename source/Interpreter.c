@@ -15,48 +15,10 @@ Value InterpretAssignmentExpression(ASTNode* node) {
     return rightValue;
 }
 
-long InterpretBinaryExpressionInteger(long leftInteger, long rightInteger, BinaryOperation operation, Type* type) {
-    switch(operation) {
-        case BINARY_OPERATION_ADD:
-            *type = TYPE_INTEGER;
-            return leftInteger + rightInteger;
-        case BINARY_OPERATION_SUBTRACT:
-            *type = TYPE_INTEGER;
-            return leftInteger - rightInteger;
-        case BINARY_OPERATION_MULTIPLY:
-            *type = TYPE_INTEGER;
-            return leftInteger * rightInteger;
-        case BINARY_OPERATION_DIVIDE:
-            *type = TYPE_INTEGER;
-            return leftInteger / rightInteger;
-        case BINARY_OPERATION_MODULO:
-            *type = TYPE_INTEGER;
-            return leftInteger % rightInteger;
-        case BINARY_OPERATION_EQUAL:
-            *type = TYPE_BOOLEAN;
-            return leftInteger == rightInteger;
-        case BINARY_OPERATION_NOT_EQUAL:
-            *type = TYPE_BOOLEAN;
-            return leftInteger != rightInteger;
-        case BINARY_OPERATION_GREATER:
-            *type = TYPE_BOOLEAN;
-            return leftInteger > rightInteger;
-        case BINARY_OPERATION_LESS:
-            *type = TYPE_BOOLEAN;
-            return leftInteger < rightInteger;
-        case BINARY_OPERATION_GREATER_EQUAL:
-            *type = TYPE_BOOLEAN;
-            return leftInteger >= rightInteger;
-        case BINARY_OPERATION_LESS_EQUAL:
-            *type = TYPE_BOOLEAN;
-            return leftInteger <= rightInteger;
-        default:
-            Error("Interpret BinaryExpressionInteger Error");
-    }
-}
-
 int IsBooleanBinaryOperation(BinaryOperation operation) {
     switch(operation) {
+        //case BINARY_OPERATION_LOGICAL_AND: return 1;
+        //case BINARY_OPERATION_LOGICAL_OR: return 1;
         case BINARY_OPERATION_EQUAL: return 1;
         case BINARY_OPERATION_NOT_EQUAL: return 1;
         case BINARY_OPERATION_GREATER: return 1;
@@ -68,15 +30,15 @@ int IsBooleanBinaryOperation(BinaryOperation operation) {
 }
 
 Value InterpretBinaryExpression(ASTNode* node) {
-    Value leftValue = Interpret(node->assignmentExpression.left);
-    Value rightValue = Interpret(node->assignmentExpression.right);
+    Value leftValue = Interpret(node->binaryExpression.left);
+    Value rightValue = Interpret(node->binaryExpression.right);
 
     Value resultValue;
+    BinaryOperation operation = node->binaryExpression.operation;
     if(leftValue.type == TYPE_INTEGER && rightValue.type == TYPE_INTEGER) {
         long leftInteger = CoerceInteger(leftValue);
         long rightInteger = CoerceInteger(rightValue);
 
-        BinaryOperation operation = node->binaryExpression.operation;
         if(IsBooleanBinaryOperation(node->binaryExpression.operation)) {
             resultValue.type = TYPE_BOOLEAN;
 
@@ -96,7 +58,17 @@ Value InterpretBinaryExpression(ASTNode* node) {
             resultValue.booleanValue = CorrectBoolean(resultValue.booleanValue);
         } else {
             resultValue.type = TYPE_INTEGER;
-
+            
+            if(operation == BINARY_OPERATION_BITWISE_AND)
+                resultValue.integerValue = leftInteger & rightInteger;
+            if(operation == BINARY_OPERATION_BITWISE_OR)
+                resultValue.integerValue = leftInteger | rightInteger;
+            if(operation == BINARY_OPERATION_BITWISE_XOR)
+                resultValue.integerValue = leftInteger ^ rightInteger;
+            if(operation == BINARY_OPERATION_LEFT_SHIFT)
+                resultValue.integerValue = leftInteger << rightInteger;
+            if(operation == BINARY_OPERATION_RIGHT_SHIFT)
+                resultValue.integerValue = leftInteger >> rightInteger;
             if(operation == BINARY_OPERATION_ADD)
                 resultValue.integerValue = leftInteger + rightInteger;
             if(operation == BINARY_OPERATION_SUBTRACT)
@@ -108,6 +80,17 @@ Value InterpretBinaryExpression(ASTNode* node) {
             if(operation == BINARY_OPERATION_MODULO)
                 resultValue.integerValue = leftInteger % rightInteger;
         }
+    } else if(leftValue.type == TYPE_BOOLEAN && rightValue.type == TYPE_BOOLEAN) {
+        resultValue.type = TYPE_BOOLEAN;
+        char leftBoolean = CorrectBoolean(leftValue.booleanValue);
+        char rightBoolean = CorrectBoolean(rightValue.booleanValue);
+
+        if(operation == BINARY_OPERATION_LOGICAL_AND)
+            resultValue.booleanValue = leftBoolean && rightBoolean;
+        if(operation == BINARY_OPERATION_LOGICAL_OR)
+            resultValue.booleanValue = leftBoolean || rightBoolean;
+
+        CorrectBoolean(resultValue.booleanValue);
     }
     
     return resultValue;
