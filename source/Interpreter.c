@@ -91,6 +91,42 @@ Value InterpretBinaryExpression(ASTNode* node) {
             resultValue.booleanValue = leftBoolean || rightBoolean;
 
         CorrectBoolean(resultValue.booleanValue);
+    } else if((leftValue.type == TYPE_REAL && rightValue.type == TYPE_REAL) ||
+              (leftValue.type == TYPE_INTEGER && rightValue.type == TYPE_REAL) ||
+              (leftValue.type == TYPE_REAL && rightValue.type == TYPE_INTEGER)) {
+
+        double leftReal = CoerceReal(leftValue);
+        double rightReal = CoerceReal(rightValue);
+
+        if(IsBooleanBinaryOperation(node->binaryExpression.operation)) {
+            resultValue.type = TYPE_BOOLEAN;
+
+            if(operation == BINARY_OPERATION_EQUAL)
+                resultValue.booleanValue = leftReal == rightReal;
+            if(operation == BINARY_OPERATION_NOT_EQUAL)
+                resultValue.booleanValue = leftReal != rightReal;
+            if(operation == BINARY_OPERATION_GREATER)
+                resultValue.booleanValue = leftReal > rightReal;
+            if(operation == BINARY_OPERATION_LESS)
+                resultValue.booleanValue = leftReal < rightReal;
+            if(operation == BINARY_OPERATION_GREATER_EQUAL)
+                resultValue.booleanValue = leftReal >= rightReal;
+            if(operation == BINARY_OPERATION_LESS_EQUAL)
+                resultValue.booleanValue = leftReal <= rightReal;
+
+            resultValue.booleanValue = CorrectBoolean(resultValue.booleanValue);
+        } else {
+            resultValue.type = TYPE_REAL;
+            
+            if(operation == BINARY_OPERATION_ADD)
+                resultValue.realValue = leftReal + rightReal;
+            if(operation == BINARY_OPERATION_SUBTRACT)
+                resultValue.realValue = leftReal - rightReal;
+            if(operation == BINARY_OPERATION_MULTIPLY)
+                resultValue.realValue = leftReal * rightReal;
+            if(operation == BINARY_OPERATION_DIVIDE)
+                resultValue.realValue = leftReal / rightReal;
+        }
     }
     
     return resultValue;
@@ -112,6 +148,11 @@ Value InterpretUnaryExpression(ASTNode* node) {
 
         if(operation == UNARY_OPERATION_LOGICAL_NOT)
             value.booleanValue = !booleanValue;
+    } else if(value.type == TYPE_REAL) {
+        double realValue = value.realValue;
+
+        if(operation == UNARY_OPERATION_NEGATE)
+            value.realValue = -realValue;
     }
 
     return value;

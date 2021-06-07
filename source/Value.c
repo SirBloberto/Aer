@@ -11,7 +11,20 @@ long CoerceInteger(Value value) {
     switch(value.type) {
         case TYPE_INTEGER:
             return (long)value.integerValue;
+        case TYPE_REAL:
+            return (long)value.realValue;
         default:
             Error("Coerce Integer Error");
+    }
+}
+
+double CoerceReal(Value value) {
+    switch(value.type) {
+        case TYPE_INTEGER:
+            return (double)value.integerValue;
+        case TYPE_REAL:
+            return (double)value.realValue;
+        default:
+            Error("Coerce Real Error");
     }
 }

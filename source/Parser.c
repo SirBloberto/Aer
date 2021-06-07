@@ -185,12 +185,16 @@ ASTNode* ParseUnaryExpression() {
         return UnaryExpressionNode(ParsePrimairyExpression(), UNARY_OPERATION_NEGATE);
     if(CheckNext(TOKEN_TILDE))
         return UnaryExpressionNode(ParsePrimairyExpression(), UNARY_OPERATION_BITWISE_NOT);
+    else 
+        return ParsePrimairyExpression();
 }
 
 ASTNode* ParsePrimairyExpression() {
     if(CheckNext(TOKEN_TRUE) || CheckNext(TOKEN_FALSE))
         return ValueNode(value);
     else if(CheckNext(TOKEN_INTEGER))
+        return ValueNode(value);
+    else if(CheckNext(TOKEN_REAL))
         return ValueNode(value);
     else if(CheckNext(TOKEN_IDENTIFIER)) {
         int id = FindSymbol(value.identifierValue);

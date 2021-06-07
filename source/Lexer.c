@@ -16,14 +16,26 @@ void PutbackCharacter(int character) {
 }
 
 void Number(int character) {
-    token = TOKEN_INTEGER;
-    value.type = TYPE_INTEGER;
     value.integerValue = character - '0';
 
     character = NextCharacter();
     while(character >= '0' && character <= '9') {
         value.integerValue = value.integerValue * 10 + character - '0';
         character = NextCharacter();
+    }
+    if(character == '.') {
+        value.realValue = (double)value.integerValue;
+        character = NextCharacter();
+        for(int i = 10; character >= '0' && character <= '9'; i *= 10) {
+            value.realValue += (double)(character - '0') / i;
+            character = NextCharacter();
+        }
+        token = TOKEN_REAL;
+        value.type = TYPE_REAL;
+    }
+    else {
+        token = TOKEN_INTEGER;
+        value.type = TYPE_INTEGER;
     }
     PutbackCharacter(character);
 }

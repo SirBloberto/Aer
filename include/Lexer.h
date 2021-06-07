@@ -28,6 +28,7 @@ typedef enum Token {
     TOKEN_EXCLAMATION,
 
     TOKEN_INTEGER,
+    TOKEN_REAL,
 
     TOKEN_IDENTIFIER,
     TOKEN_TRUE,
