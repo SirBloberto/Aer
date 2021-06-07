@@ -96,6 +96,27 @@ Value InterpretBinaryExpression(ASTNode* node) {
     return resultValue;
 }
 
+Value InterpretUnaryExpression(ASTNode* node) {
+    Value value = Interpret(node->unaryExpression.node);
+
+    UnaryOperation operation = node->unaryExpression.operation;
+    if(value.type == TYPE_INTEGER) {
+        long integerValue = CoerceInteger(value);
+
+        if(operation == UNARY_OPERATION_NEGATE)
+            value.integerValue = -integerValue;
+        if(operation == UNARY_OPERATION_BITWISE_NOT)
+            value.integerValue = ~integerValue;
+    } else if(value.type == TYPE_BOOLEAN) {
+        char booleanValue = CorrectBoolean(value.booleanValue);
+
+        if(operation == UNARY_OPERATION_LOGICAL_NOT)
+            value.booleanValue = !booleanValue;
+    }
+
+    return value;
+}
+
 Value InterpretValue(ASTNode* node) {
     return node->value;
 }
@@ -106,6 +127,8 @@ Value Interpret(ASTNode* node) {
             return InterpretAssignmentExpression(node);
         case NODE_BINARY_EXPRESSION:
             return InterpretBinaryExpression(node);
+        case NODE_UNARY_EXPRESSION:
+            return InterpretUnaryExpression(node);
         case NODE_VALUE:
             return InterpretValue(node);
         default:

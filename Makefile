@@ -1,13 +1,11 @@
-CC := gcc
-
 SOURCE := $(foreach file, source, $(wildcard $(addprefix $(file)/*, .c*)))
 OBJECT := $(addprefix object/, $(addsuffix .o, $(notdir $(basename $(SOURCE)))))
 
 Compiler: $(OBJECT)
-	$(CC) -o binary/Compiler $^
+	gcc -o binary/Compiler $^
 
 object/%.o: source/%.c
-	$(CC) -c $< -o $@
+	gcc -c $< -o $@
 
 Clean:
-	@rm -rf binary/* object/*
+	rm -rf binary/* object/*

@@ -18,6 +18,7 @@ ASTNode* ParseRelationalExpression();
 ASTNode* ParseShiftExpression();
 ASTNode* ParseAdditiveExpression();
 ASTNode* ParseMultiplicativeExpression();
+ASTNode* ParseUnaryExpression();
 ASTNode* ParsePrimairyExpression();
 
 ASTNode* AssignmentExpressionNode(ASTNode* left, ASTNode* right, AssignmentOperation operation) {
@@ -35,6 +36,14 @@ ASTNode* BinaryExpressionNode(ASTNode* left, ASTNode* right, BinaryOperation ope
     node->binaryExpression.left = left;
     node->binaryExpression.right = right;
     node->binaryExpression.operation = operation;
+    return node;
+}
+
+ASTNode* UnaryExpressionNode(ASTNode* expression, UnaryOperation operation) {
+    ASTNode* node = (ASTNode*)malloc(sizeof(ASTNode));
+    node->type = NODE_UNARY_EXPRESSION;
+    node->unaryExpression.node = expression;
+    node->unaryExpression.operation = operation;
     return node;
 }
 
@@ -157,7 +166,7 @@ ASTNode* ParseAdditiveExpression() {
 }
 
 ASTNode* ParseMultiplicativeExpression() {
-    ASTNode* left = ParsePrimairyExpression();
+    ASTNode* left = ParseUnaryExpression();
 
     if(CheckNext(TOKEN_STAR))
         return BinaryExpressionNode(left, ParseMultiplicativeExpression(), BINARY_OPERATION_MULTIPLY);
@@ -167,6 +176,15 @@ ASTNode* ParseMultiplicativeExpression() {
         return BinaryExpressionNode(left, ParseMultiplicativeExpression(), BINARY_OPERATION_MODULO);
 
     return left;
+}
+
+ASTNode* ParseUnaryExpression() {
+    if(CheckNext(TOKEN_EXCLAMATION))
+        return UnaryExpressionNode(ParsePrimairyExpression(), UNARY_OPERATION_LOGICAL_NOT);
+    if(CheckNext(TOKEN_MINUS))
+        return UnaryExpressionNode(ParsePrimairyExpression(), UNARY_OPERATION_NEGATE);
+    if(CheckNext(TOKEN_TILDE))
+        return UnaryExpressionNode(ParsePrimairyExpression(), UNARY_OPERATION_BITWISE_NOT);
 }
 
 ASTNode* ParsePrimairyExpression() {

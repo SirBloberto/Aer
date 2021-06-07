@@ -74,6 +74,8 @@ void Lex() {
         token = TOKEN_SLASH;
     else if(character == '%')
         token = TOKEN_PERCENT;
+    else if(character == '~')
+        token = TOKEN_TILDE;
     else if(character == '^')
         token = TOKEN_CARET;
     else if(character == '&') {
@@ -100,8 +102,10 @@ void Lex() {
     } else if(character == '!') {
         if((character = NextCharacter()) == '=')
             token = TOKEN_EXCLAMATION_EQUALS;
-        else
+        else {
+            token = TOKEN_EXCLAMATION;
             PutbackCharacter(character);
+        }
     } else if(character == '<') {
         if((character = NextCharacter()) == '=')
             token = TOKEN_LESS_EQUALS;

@@ -52,10 +52,14 @@ AdditiveExpression = MultiplicativeExpression
                    | MultiplicativeExpression '+' AdditiveExpression
                    | MultiplicativeExpression '-' AdditiveExpression
 
-MultiplicativeExpression = PrimairyExpression
-                         | PrimairyExpression '*' MultiplicativeExpression
-                         | PrimairyExpression '/' MultiplicativeExpression
-                         | PrimairyExpression '%' MultiplicativeExpression
+MultiplicativeExpression = UnaryExpression
+                         | UnaryExpression '*' MultiplicativeExpression
+                         | UnaryExpression '/' MultiplicativeExpression
+                         | UnaryExpression '%' MultiplicativeExpression
+
+UnaryExpression = '!' PrimairyExpression
+                | '~' PrimairyExpression
+                | '-' PrimairyExpression
 
 PrimairyExpression = Identifier
                    | Boolean

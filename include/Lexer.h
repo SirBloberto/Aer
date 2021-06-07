@@ -1,6 +1,7 @@
 #ifndef LEXER_H
 #define LEXER_H
 
+//Assign the tokens proper names
 typedef enum Token {
     TOKEN_OPEN_PARENTHESE,
     TOKEN_CLOSE_PARENTHESE,
@@ -23,6 +24,8 @@ typedef enum Token {
     TOKEN_STAR,
     TOKEN_SLASH,
     TOKEN_PERCENT,
+    TOKEN_TILDE,
+    TOKEN_EXCLAMATION,
 
     TOKEN_INTEGER,
 

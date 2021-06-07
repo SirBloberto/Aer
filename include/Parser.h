@@ -15,6 +15,7 @@ typedef struct AssignmentExpression {
     AssignmentOperation operation;
 } AssignmentExpression;
 
+//Can use a mask to Determine what operations are valid on which types and which types they return
 typedef enum BinaryOperation {
     BINARY_OPERATION_LOGICAL_OR,
     BINARY_OPERATION_LOGICAL_AND,
@@ -48,9 +49,21 @@ typedef struct BinaryExpression {
     BinaryOperation operation;
 } BinaryExpression;
 
+typedef enum UnaryOperation {
+    UNARY_OPERATION_LOGICAL_NOT,
+    UNARY_OPERATION_BITWISE_NOT,
+    UNARY_OPERATION_NEGATE
+} UnaryOperation;
+
+typedef struct UnaryExpression {
+    struct ASTNode* node;
+    UnaryOperation operation;
+} UnaryExpression;
+
 typedef enum NodeType {
     NODE_ASSIGNMENT_EXPRESSION,
     NODE_BINARY_EXPRESSION,
+    NODE_UNARY_EXPRESSION,
     NODE_VALUE
 } NodeType;
 
@@ -59,12 +72,14 @@ typedef struct ASTNode {
     union {
         AssignmentExpression assignmentExpression;
         BinaryExpression binaryExpression;
+        UnaryExpression unaryExpression;
         Value value;
     };
 } ASTNode;
 
 ASTNode* AssignmentExpressionNode(ASTNode* left, ASTNode* right, AssignmentOperation operation);
 ASTNode* BinaryExpressionNode(ASTNode* left, ASTNode* right, BinaryOperation operation);
+ASTNode* UnaryExpressionNode(ASTNode* expression, UnaryOperation operation);
 ASTNode* ValueNode(Value value);
 
 ASTNode* Parse();
