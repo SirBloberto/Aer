@@ -76,23 +76,55 @@ void Lex() {
         token = TOKEN_OPEN_PARENTHESE;
     else if(character == ')')
         token = TOKEN_CLOSE_PARENTHESE;
-    else if(character == '+')
-        token = TOKEN_PLUS;
-    else if(character == '-')
-        token = TOKEN_MINUS;
-    else if(character == '*')
-        token = TOKEN_STAR;
-    else if(character == '/')
-        token = TOKEN_SLASH;
-    else if(character == '%')
-        token = TOKEN_PERCENT;
     else if(character == '~')
         token = TOKEN_TILDE;
-    else if(character == '^')
-        token = TOKEN_CARET;
-    else if(character == '&') {
+    else if(character == '+') {
+        if((character = NextCharacter()) == '=')
+            token = TOKEN_PLUS_EQUALS;
+        else {
+            token = TOKEN_PLUS;
+            PutbackCharacter(character);
+        }
+    } else if(character == '-') {
+        if((character = NextCharacter()) == '=')
+            token = TOKEN_MINUS_EQUALS;
+        else {
+            token = TOKEN_MINUS;
+            PutbackCharacter(character);
+        }
+    } else if(character == '*') {
+        if((character = NextCharacter()) == '=')
+            token = TOKEN_STAR_EQUALS;
+        else {
+            token = TOKEN_STAR;
+            PutbackCharacter(character);
+        }
+    } else if(character == '/') {
+        if((character = NextCharacter()) == '=')
+            token = TOKEN_SLASH_EQUALS;
+        else {
+            token = TOKEN_SLASH;
+            PutbackCharacter(character);
+        }
+    } else if(character == '%') {
+        if((character = NextCharacter()) == '=')
+            token = TOKEN_PERCENT_EQUALS;
+        else {
+            token = TOKEN_PERCENT;
+            PutbackCharacter(character);
+        }
+    } else if(character == '^') {
+        if((character = NextCharacter()) == '=')
+            token = TOKEN_CARET_EQUALS;
+        else {
+            token = TOKEN_CARET;
+            PutbackCharacter(character);
+        }
+    } else if(character == '&') {
         if((character = NextCharacter()) == '&')
             token = TOKEN_AMPERSAND_AMPERSAND;
+        else if(character == '=')
+            token = TOKEN_AMPERSAND_EQUALS;
         else {
             token = TOKEN_AMPERSAND;
             PutbackCharacter(character);
@@ -100,6 +132,8 @@ void Lex() {
     } else if(character == '|') {
         if((character = NextCharacter()) == '|')
             token = TOKEN_PIPE_PIPE;
+        else if(character == '=')
+            token = TOKEN_PIPE_EQUALS;
         else {
             token = TOKEN_PIPE;
             PutbackCharacter(character);
@@ -121,9 +155,16 @@ void Lex() {
     } else if(character == '<') {
         if((character = NextCharacter()) == '=')
             token = TOKEN_LESS_EQUALS;
-        else if(character == '<')
-            token = TOKEN_LESS_LESS;        
-        else {
+        else if(character == '<') {
+            token = TOKEN_LESS_LESS;
+            int thirdCharacter;
+            if((thirdCharacter == NextCharacter()) == '=')
+                token = TOKEN_LESS_LESS_EQUALS;
+            else {
+                PutbackCharacter(thirdCharacter);
+                PutbackCharacter(character);
+            }  
+        } else {
             token = TOKEN_LESS;
             PutbackCharacter(character);
         }

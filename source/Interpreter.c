@@ -7,18 +7,66 @@ Value InterpretAssignmentExpression(ASTNode* node) {
     Value leftValue = Interpret(node->assignmentExpression.left);
     Value rightValue = Interpret(node->assignmentExpression.right);
 
-    if(FindSymbol(leftValue.identifierValue) == -1)
-        AddSymbol(leftValue.identifierValue);
+    AssignmentOperation operation = node->assignmentExpression.operation;
+    int location = FindSymbol(leftValue.identifierValue);
 
-    globalVariables[FindSymbol(leftValue.identifierValue)].value = rightValue;
+    if(operation == ASSIGNMENT_OPERATION_ASSIGN) {
+        if(location == -1)
+            location = AddSymbol(leftValue.identifierValue);
+
+        globalVariables[location].value = rightValue;
+        return rightValue;
+    } else if(location == -1)
+        Error("Identifier does not exist cannot perform operation to nothing.");
+
+    if(globalVariables[location].value.type == TYPE_INTEGER && rightValue.type == TYPE_INTEGER) {
+        int rightInteger = CoerceInteger(rightValue);
+
+        if(operation == ASSIGNMENT_OPERATION_ADD_ASSIGN)
+            globalVariables[location].value.integerValue += rightInteger;
+        else if(operation == ASSIGNMENT_OPERATION_SUBTRACT_ASSIGN)
+            globalVariables[location].value.integerValue -= rightInteger;
+        else if(operation == ASSIGNMENT_OPERATION_MULTIPLY_ASSIGN)
+            globalVariables[location].value.integerValue *= rightInteger;
+        else if(operation == ASSIGNMENT_OPERATION_DIVIDE_ASSIGN)
+            globalVariables[location].value.integerValue /= rightInteger;
+        else if(operation == ASSIGNMENT_OPERATION_MODULO_ASSIGN)
+            globalVariables[location].value.integerValue %= rightInteger;
+        else if(operation == ASSIGNMENT_OPERATION_LEFT_SHIFT_ASSIGN)
+            globalVariables[location].value.integerValue <<= rightInteger;
+        else if(operation == ASSIGNMENT_OPERATION_RIGHT_SHIFT_ASSIGN)
+            globalVariables[location].value.integerValue >>= rightInteger;
+        else if(operation == ASSIGNMENT_OPERATION_AND_ASSIGN)
+            globalVariables[location].value.integerValue &= rightInteger;
+        else if(operation == ASSIGNMENT_OPERATION_OR_ASSIGN)
+            globalVariables[location].value.integerValue |= rightInteger;
+        else if(operation == ASSIGNMENT_OPERATION_XOR_ASSIGN)
+            globalVariables[location].value.integerValue ^= rightInteger;
+    } else if((globalVariables[location].value.type == TYPE_REAL && rightValue.type == TYPE_REAL) ||
+              (globalVariables[location].value.type == TYPE_INTEGER && rightValue.type == TYPE_REAL) ||
+              (globalVariables[location].value.type == TYPE_REAL && rightValue.type == TYPE_INTEGER)) {
+
+        globalVariables[location].value.realValue = CoerceReal(globalVariables[location].value);
+        globalVariables[location].value.type = TYPE_REAL;
+        double rightReal = CoerceReal(rightValue);
+
+        if(operation == ASSIGNMENT_OPERATION_ADD_ASSIGN)
+            globalVariables[location].value.realValue += rightReal;
+        else if(operation == ASSIGNMENT_OPERATION_SUBTRACT_ASSIGN)
+            globalVariables[location].value.realValue -= rightReal;
+        else if(operation == ASSIGNMENT_OPERATION_MULTIPLY_ASSIGN)
+            globalVariables[location].value.realValue *= rightReal;
+        else if(operation == ASSIGNMENT_OPERATION_DIVIDE_ASSIGN)
+            globalVariables[location].value.realValue /= rightReal;
+    }
 
     return rightValue;
 }
 
 int IsBooleanBinaryOperation(BinaryOperation operation) {
     switch(operation) {
-        //case BINARY_OPERATION_LOGICAL_AND: return 1;
-        //case BINARY_OPERATION_LOGICAL_OR: return 1;
+        case BINARY_OPERATION_LOGICAL_AND: return 1;
+        case BINARY_OPERATION_LOGICAL_OR: return 1;
         case BINARY_OPERATION_EQUAL: return 1;
         case BINARY_OPERATION_NOT_EQUAL: return 1;
         case BINARY_OPERATION_GREATER: return 1;

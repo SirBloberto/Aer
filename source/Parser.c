@@ -65,6 +65,26 @@ ASTNode* ParseAssignmentExpression() {
 
     if(CheckNext(TOKEN_EQUALS))
         return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_ASSIGN);
+    if(CheckNext(TOKEN_PLUS_EQUALS))
+        return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_ADD_ASSIGN);
+    if(CheckNext(TOKEN_MINUS_EQUALS))
+        return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_SUBTRACT_ASSIGN);
+    if(CheckNext(TOKEN_STAR_EQUALS))
+        return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_MULTIPLY_ASSIGN);
+    if(CheckNext(TOKEN_SLASH_EQUALS))
+        return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_DIVIDE_ASSIGN);
+    if(CheckNext(TOKEN_PERCENT_EQUALS))
+        return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_MODULO_ASSIGN);
+    if(CheckNext(TOKEN_LESS_LESS_EQUALS))
+        return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_LEFT_SHIFT_ASSIGN);
+    if(CheckNext(TOKEN_GREAT_GREAT_EQUALS))
+        return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_RIGHT_SHIFT_ASSIGN);
+    if(CheckNext(TOKEN_AMPERSAND_EQUALS))
+        return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_AND_ASSIGN);
+    if(CheckNext(TOKEN_PIPE_EQUALS))
+        return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_OR_ASSIGN);
+    if(CheckNext(TOKEN_CARET_EQUALS))
+        return AssignmentExpressionNode(left, ParseExpression(), ASSIGNMENT_OPERATION_XOR_ASSIGN);
     Error("Parse AssignmentExpression Error");
 }
 
