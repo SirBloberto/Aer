@@ -77,89 +77,89 @@ void Lex() {
     else if(character == ')')
         token = TOKEN_CLOSE_PARENTHESE;
     else if(character == '~')
-        token = TOKEN_TILDE;
+        token = TOKEN_BITWISE_NOT;
     else if(character == '+') {
         if((character = NextCharacter()) == '=')
-            token = TOKEN_PLUS_EQUALS;
+            token = TOKEN_ADD_ASSIGN;
         else {
-            token = TOKEN_PLUS;
+            token = TOKEN_ADD;
             PutbackCharacter(character);
         }
     } else if(character == '-') {
         if((character = NextCharacter()) == '=')
-            token = TOKEN_MINUS_EQUALS;
+            token = TOKEN_SUBTRACT_ASSIGN;
         else {
-            token = TOKEN_MINUS;
+            token = TOKEN_SUBTRACT;
             PutbackCharacter(character);
         }
     } else if(character == '*') {
         if((character = NextCharacter()) == '=')
-            token = TOKEN_STAR_EQUALS;
+            token = TOKEN_MULTIPLY_ASSIGN;
         else {
-            token = TOKEN_STAR;
+            token = TOKEN_MULTIPLY;
             PutbackCharacter(character);
         }
     } else if(character == '/') {
         if((character = NextCharacter()) == '=')
-            token = TOKEN_SLASH_EQUALS;
+            token = TOKEN_DIVIDE_ASSIGN;
         else {
-            token = TOKEN_SLASH;
+            token = TOKEN_DIVIDE;
             PutbackCharacter(character);
         }
     } else if(character == '%') {
         if((character = NextCharacter()) == '=')
-            token = TOKEN_PERCENT_EQUALS;
+            token = TOKEN_MODULO_ASSIGN;
         else {
-            token = TOKEN_PERCENT;
+            token = TOKEN_MODULO;
             PutbackCharacter(character);
         }
     } else if(character == '^') {
         if((character = NextCharacter()) == '=')
-            token = TOKEN_CARET_EQUALS;
+            token = TOKEN_BITWISE_XOR_ASSIGN;
         else {
-            token = TOKEN_CARET;
+            token = TOKEN_BITWISE_XOR;
             PutbackCharacter(character);
         }
     } else if(character == '&') {
         if((character = NextCharacter()) == '&')
-            token = TOKEN_AMPERSAND_AMPERSAND;
+            token = TOKEN_LOGICAL_AND;
         else if(character == '=')
-            token = TOKEN_AMPERSAND_EQUALS;
+            token = TOKEN_BITWISE_AND_ASSIGN;
         else {
-            token = TOKEN_AMPERSAND;
+            token = TOKEN_BITWISE_AND;
             PutbackCharacter(character);
         }
     } else if(character == '|') {
         if((character = NextCharacter()) == '|')
-            token = TOKEN_PIPE_PIPE;
+            token = TOKEN_LOGICAL_OR;
         else if(character == '=')
-            token = TOKEN_PIPE_EQUALS;
+            token = TOKEN_BITWISE_OR_ASSIGN;
         else {
-            token = TOKEN_PIPE;
+            token = TOKEN_BITWISE_OR;
             PutbackCharacter(character);
         }
     } else if(character == '=') {
         if((character = NextCharacter()) == '=')
-            token = TOKEN_EQUALS_EQUALS;
+            token = TOKEN_EQUAL;
         else {
-            token = TOKEN_EQUALS;
+            token = TOKEN_ASSIGN;
             PutbackCharacter(character);
         }
     } else if(character == '!') {
         if((character = NextCharacter()) == '=')
-            token = TOKEN_EXCLAMATION_EQUALS;
+            token = TOKEN_NOT_EQUAL;
         else {
-            token = TOKEN_EXCLAMATION;
+            token = TOKEN_LOGICAL_NOT;
             PutbackCharacter(character);
         }
     } else if(character == '<') {
         if((character = NextCharacter()) == '=')
-            token = TOKEN_LESS_EQUALS;
+            token = TOKEN_LESS_EQUAL;
         else if(character == '<') {
-            token = TOKEN_LESS_LESS;
+            token = TOKEN_LEFT_SHIFT;
             int thirdCharacter;
             if((thirdCharacter == NextCharacter()) == '=')
-                token = TOKEN_LESS_LESS_EQUALS;
+                token = TOKEN_LEFT_SHIFT_ASSIGN;
             else {
                 PutbackCharacter(thirdCharacter);
                 PutbackCharacter(character);
@@ -170,9 +170,9 @@ void Lex() {
         }
     } else if(character == '>') {
         if((character = NextCharacter()) == '=')
-            token = TOKEN_GREATER_EQUALS;
+            token = TOKEN_GREATER_EQUAL;
         else if(character == '>')
-            token = TOKEN_GREATER_GREATER;
+            token = TOKEN_RIGHT_SHIFT;
         else {
             token = TOKEN_GREATER;
             PutbackCharacter(character);
