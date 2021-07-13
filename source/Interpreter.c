@@ -210,6 +210,27 @@ Value InterpretValue(ASTNode* node) {
     return node->value;
 }
 
+Value InterpretCompoundStatement(ASTNode* node) {
+    CompoundStatement compoundStatement = node->compoundStatement;
+
+    for(int i = 0; i < compoundStatement.count; i++)
+        Interpret(compoundStatement.nodes[i]);
+}
+
+Value InterpretIfStatement(ASTNode* node) {
+    IfStatement ifStatement = node->ifStatement;
+
+    Value value = Interpret(ifStatement.condition);
+    if(value.type == TYPE_BOOLEAN) {
+        if(value.booleanValue)
+            Interpret(ifStatement.trueBlock);
+        else if(ifStatement.falseBlock != 0)
+            Interpret(ifStatement.falseBlock);
+    } else {
+        //Error
+    }
+}
+
 Value Interpret(ASTNode* node) {
     switch(node->type) {
         case NODE_ASSIGNMENT_EXPRESSION:
@@ -220,6 +241,10 @@ Value Interpret(ASTNode* node) {
             return InterpretUnaryExpression(node);
         case NODE_VALUE:
             return InterpretValue(node);
+        case NODE_COMPOUND_STATEMENT:
+            return InterpretCompoundStatement(node);
+        case NODE_IF_STATEMENT:
+            return InterpretIfStatement(node);
         default:
             Error("Interpret Error");
     }

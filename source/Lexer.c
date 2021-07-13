@@ -1,8 +1,12 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "../include/Compiler.h"
 #include "../include/Error.h"
+#include "../include/IndentStack.h"
 #include "../include/Lexer.h"
+
+int startOfLine = 1;
 
 int NextCharacter(void) {
     int character = fgetc(file);
@@ -12,7 +16,7 @@ int NextCharacter(void) {
 
 void PutbackCharacter(int character) {
     ungetc(character, file);
-    position++;
+    position--;
 }
 
 void Number(int character) {
@@ -61,7 +65,11 @@ int Keyword(char* identifier) {
         token = TOKEN_FALSE;
         value.type = TYPE_BOOLEAN;
         value.booleanValue = 0;
-    } else 
+    } else if(!strcmp(identifier, "If"))
+        token = TOKEN_IF;
+    else if(!strcmp(identifier, "Else"))
+        token = TOKEN_ELSE;
+    else
         return 0;
     return 1;
 }
@@ -78,6 +86,8 @@ void Lex() {
         token = TOKEN_CLOSE_PARENTHESE;
     else if(character == '~')
         token = TOKEN_BITWISE_NOT;
+    else if(character == ':')
+        token = TOKEN_COLON;
     else if(character == '+') {
         if((character = NextCharacter()) == '=')
             token = TOKEN_ADD_ASSIGN;
@@ -177,22 +187,54 @@ void Lex() {
             token = TOKEN_GREATER;
             PutbackCharacter(character);
         }
-    } else if(character == '\n')
-        token = TOKEN_NEW_LINE;
-    else if(character == EOF)
-        token = TOKEN_END_OF_FILE;
-    else if(character >= '1' && character <= '9')
+    } else if(character == EOF) {
+        if(CheckIndent() != 0) {
+            token = TOKEN_DEDENT;
+            PopDedent();
+            PutbackCharacter(character);
+        } else
+            token = TOKEN_END_OF_FILE;
+    } else if(character >= '1' && character <= '9')
         Number(character);
     else if(character >= 'A' && character <= 'z') {
-        char identifier[512];
-        Identifier(identifier, character);
+        if(startOfLine) {
+            if(CheckIndent() < position - 1) {
+                token = TOKEN_INDENT;
+                PushIndent(position - 1);
+                PutbackCharacter(character);
+            } else if(CheckIndent() > position - 1) {
+                token = TOKEN_DEDENT;
+                PopDedent();
+                PutbackCharacter(character);
+            } else {
+                char identifier[512];
+                Identifier(identifier, character);
 
-        if(!Keyword(identifier)) {
-            token = TOKEN_IDENTIFIER;
-            value.type = TYPE_IDENTIFIER;
-            value.identifierValue = strdup(identifier);
+                if(!Keyword(identifier)) {
+                    token = TOKEN_IDENTIFIER;
+                    value.type = TYPE_IDENTIFIER;
+                    value.identifierValue = strdup(identifier);
+                }
+            }
+        } else {
+            char identifier[512];
+            Identifier(identifier, character);
+
+            if(!Keyword(identifier)) {
+                token = TOKEN_IDENTIFIER;
+                value.type = TYPE_IDENTIFIER;
+                value.identifierValue = strdup(identifier);
+            }
         }
     }
+
+    if(character == '\n') {
+        token = TOKEN_NEW_LINE;
+        position = 0;
+        line++;
+        startOfLine = 1;
+    } else
+        startOfLine = 0;
 }
 
 void OpenFile(const char* filename) {
@@ -203,6 +245,9 @@ void OpenFile(const char* filename) {
 
     line = 0;
     position = 0;
+    indentStack.stack = (unsigned int*)malloc(sizeof(unsigned int) * INDENT_STACK_SIZE);
+    indentStack.count = 0;
+    PushIndent(0);
 }
 
 void CloseFile() {

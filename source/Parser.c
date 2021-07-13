@@ -6,6 +6,8 @@
 
 #include <stdlib.h>
 
+ASTNode* ParseIfStatement();
+ASTNode* ParseCompoundStatement();
 ASTNode* ParseAssignmentExpression();
 ASTNode* ParseExpression();
 ASTNode* ParseLogicalOrExpression();
@@ -47,6 +49,33 @@ ASTNode* UnaryExpressionNode(ASTNode* expression, UnaryOperation operation) {
     return node;
 }
 
+ASTNode** AddNodeToCompoundNode(ASTNode** nodes, unsigned int count, ASTNode* node) {
+    ASTNode** nodesCopy = (ASTNode**)malloc(sizeof(ASTNode*) * ++count);
+    if(nodes != 0) {
+        *nodesCopy = *nodes;
+        free(nodes);
+    }
+    nodesCopy[count - 1] = node;
+    return nodesCopy;
+}
+
+ASTNode* CompoundStatementNode(ASTNode** nodes, unsigned int count) {
+    ASTNode* node = (ASTNode*)malloc(sizeof(ASTNode));
+    node->type = NODE_COMPOUND_STATEMENT;
+    node->compoundStatement.nodes = nodes;
+    node->compoundStatement.count = count;
+    return node;
+}
+
+ASTNode* IfStatementNode(ASTNode* condition, ASTNode* trueBlock, ASTNode* falseBlock) {
+    ASTNode* node = (ASTNode*)malloc(sizeof(ASTNode));
+    node->type = NODE_IF_STATEMENT;
+    node->ifStatement.condition = condition;
+    node->ifStatement.trueBlock = trueBlock;
+    node->ifStatement.falseBlock = falseBlock;
+    return node;
+}
+
 ASTNode* ValueNode(Value value) {
     ASTNode* node = (ASTNode*)malloc(sizeof(ASTNode));
     node->type = NODE_VALUE;
@@ -57,7 +86,50 @@ ASTNode* ValueNode(Value value) {
 ASTNode* Parse() {
     if(CheckNext(TOKEN_IDENTIFIER))
         return ParseAssignmentExpression();
+    if(CheckNext(TOKEN_IF))
+        return ParseIfStatement();
+    else if(CheckNext(TOKEN_NEW_LINE))
+        return Parse();
     Error("Parse Error");
+}
+
+ASTNode* ParseIfStatement() {
+    ASTNode* condition = ParseExpression();
+
+    if(CheckNext(TOKEN_COLON)) {
+        ASTNode* trueBlock = ParseCompoundStatement();
+        ASTNode* falseBlock;
+
+        if(CheckNext(TOKEN_ELSE)) {
+            if(CheckNext(TOKEN_COLON))
+                falseBlock = ParseCompoundStatement();
+            else {
+                Error("Parse If Error: No Colon on else");
+            }
+        }
+
+        return IfStatementNode(condition, trueBlock, falseBlock);
+    } else {
+        Error("Parse If Error: No colon on if");
+    }
+}
+
+ASTNode* ParseCompoundStatement() {
+    ASTNode** nodes = 0;
+    unsigned int count = 0;
+    if(CheckNext(TOKEN_INDENT)) {
+        ASTNode* node;
+        while(token != TOKEN_DEDENT) {
+            node = Parse();
+            nodes = AddNodeToCompoundNode(nodes, count, node);
+            count++;
+        }
+        Lex();
+        return CompoundStatementNode(nodes, count);
+    } else if(CheckNext(TOKEN_NEW_LINE))
+        ParseCompoundStatement();
+    else
+        Error("Parse Compound Error: No indent token");
 }
 
 ASTNode* ParseAssignmentExpression() {

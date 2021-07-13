@@ -70,10 +70,23 @@ typedef struct UnaryExpression {
     UnaryOperation operation;
 } UnaryExpression;
 
+typedef struct CompoundStatement {
+    struct ASTNode** nodes;
+    unsigned int count;
+} CompoundStatement;
+
+typedef struct IfStatement {
+    struct ASTNode* condition;
+    struct ASTNode* trueBlock;
+    struct ASTNode* falseBlock;
+} IfStatement;
+
 typedef enum NodeType {
     NODE_ASSIGNMENT_EXPRESSION,
     NODE_BINARY_EXPRESSION,
     NODE_UNARY_EXPRESSION,
+    NODE_COMPOUND_STATEMENT,
+    NODE_IF_STATEMENT,
     NODE_VALUE
 } NodeType;
 
@@ -83,6 +96,10 @@ typedef struct ASTNode {
         AssignmentExpression assignmentExpression;
         BinaryExpression binaryExpression;
         UnaryExpression unaryExpression;
+
+        CompoundStatement compoundStatement;
+        IfStatement ifStatement;
+
         Value value;
     };
 } ASTNode;
@@ -90,6 +107,8 @@ typedef struct ASTNode {
 ASTNode* AssignmentExpressionNode(ASTNode* left, ASTNode* right, AssignmentOperation operation);
 ASTNode* BinaryExpressionNode(ASTNode* left, ASTNode* right, BinaryOperation operation);
 ASTNode* UnaryExpressionNode(ASTNode* expression, UnaryOperation operation);
+ASTNode* CompoundStatementNode(ASTNode** nodes, unsigned int count);
+ASTNode* IfStatementNode(ASTNode* condition, ASTNode* trueBlock, ASTNode* elseBlock);
 ASTNode* ValueNode(Value value);
 
 ASTNode* Parse();
