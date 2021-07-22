@@ -22,8 +22,8 @@ void PrintMemory() {
 }
 
 void Compile() {
+    Lex();
     while(token != TOKEN_END_OF_FILE) {
-        Lex();
         Interpret(Parse());
     }
 }

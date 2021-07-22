@@ -119,12 +119,18 @@ ASTNode* ParseCompoundStatement() {
     unsigned int count = 0;
     if(CheckNext(TOKEN_INDENT)) {
         ASTNode* node;
-        while(token != TOKEN_DEDENT) {
-            node = Parse();
+        while(1) {
+            if(CheckNext(TOKEN_IDENTIFIER))
+                node = ParseAssignmentExpression();
+            else if(CheckNext(TOKEN_IF))
+                node = ParseIfStatement();
+            else if(CheckNext(TOKEN_NEW_LINE))
+                continue;
+            else if(CheckNext(TOKEN_DEDENT))
+                break;
             nodes = AddNodeToCompoundNode(nodes, count, node);
             count++;
         }
-        Lex();
         return CompoundStatementNode(nodes, count);
     } else if(CheckNext(TOKEN_NEW_LINE))
         ParseCompoundStatement();

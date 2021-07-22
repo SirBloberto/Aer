@@ -233,7 +233,9 @@ void Lex() {
         position = 0;
         line++;
         startOfLine = 1;
-    } else
+    } else if (token == TOKEN_DEDENT)
+        startOfLine = 1;
+    else
         startOfLine = 0;
 }
 
