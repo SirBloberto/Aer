@@ -4,6 +4,6 @@
 #include "Parser.h"
 #include "Value.h"
 
-Value* Interpret(ASTNode* node);
+Value Interpret(ASTNode* node);
 
 #endif
