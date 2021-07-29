@@ -295,8 +295,7 @@ ASTNode* ParsePrimairyExpression() {
     else if(CheckNext(TOKEN_REAL))
         return ValueNode(value);
     else if(CheckNext(TOKEN_IDENTIFIER)) {
-        int id = FindSymbol(value.identifierValue);
-        return ValueNode(globalVariables[id].value);
+        return ValueNode(value);
     } else if(CheckNext(TOKEN_OPEN_PARENTHESE)) {
         ASTNode* node = ParseExpression();
         if(!CheckNext(TOKEN_CLOSE_PARENTHESE))

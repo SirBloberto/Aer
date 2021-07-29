@@ -4,7 +4,7 @@
 #include "../include/SymbolTable.h"
 
 Value InterpretAssignmentExpression(ASTNode* node) {
-    Value leftValue = Interpret(node->assignmentExpression.left);
+    Value leftValue = node->assignmentExpression.left->value;
     Value rightValue = Interpret(node->assignmentExpression.right);
 
     AssignmentOperation operation = node->assignmentExpression.operation;
@@ -207,6 +207,10 @@ Value InterpretUnaryExpression(ASTNode* node) {
 }
 
 Value InterpretValue(ASTNode* node) {
+    if(node->value.type == TYPE_IDENTIFIER) {
+        int location = FindSymbol(node->value.identifierValue);
+        return globalVariables[location].value;
+    }
     return node->value;
 }
 
@@ -226,9 +230,8 @@ Value InterpretIfStatement(ASTNode* node) {
             Interpret(ifStatement.trueBlock);
         else if(ifStatement.falseBlock != 0)
             Interpret(ifStatement.falseBlock);
-    } else {
-        //Error
-    }
+    } else
+        Error("Interpret If Statement Error: Type is not boolean");
 }
 
 Value Interpret(ASTNode* node) {
