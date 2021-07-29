@@ -69,6 +69,8 @@ int Keyword(char* identifier) {
         token = TOKEN_IF;
     else if(!strcmp(identifier, "Else"))
         token = TOKEN_ELSE;
+    else if(!strcmp(identifier, "Loop"))
+        token = TOKEN_LOOP;
     else
         return 0;
     return 1;

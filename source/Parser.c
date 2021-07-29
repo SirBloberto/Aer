@@ -6,8 +6,9 @@
 
 #include <stdlib.h>
 
-ASTNode* ParseIfStatement();
 ASTNode* ParseCompoundStatement();
+ASTNode* ParseIfStatement();
+ASTNode* ParseLoopStatement();
 ASTNode* ParseAssignmentExpression();
 ASTNode* ParseExpression();
 ASTNode* ParseLogicalOrExpression();
@@ -76,6 +77,14 @@ ASTNode* IfStatementNode(ASTNode* condition, ASTNode* trueBlock, ASTNode* falseB
     return node;
 }
 
+ASTNode* LoopStatementNode(ASTNode* condition, ASTNode* block) {
+    ASTNode* node = (ASTNode*)malloc(sizeof(ASTNode));
+    node->type = NODE_LOOP_STATEMENT;
+    node->loopStatement.condition = condition;
+    node->loopStatement.block = block;
+    return node;
+}
+
 ASTNode* ValueNode(Value value) {
     ASTNode* node = (ASTNode*)malloc(sizeof(ASTNode));
     node->type = NODE_VALUE;
@@ -88,30 +97,11 @@ ASTNode* Parse() {
         return ParseAssignmentExpression();
     if(CheckNext(TOKEN_IF))
         return ParseIfStatement();
+    if(CheckNext(TOKEN_LOOP))
+        return ParseLoopStatement();
     else if(CheckNext(TOKEN_NEW_LINE))
         return Parse();
     Error("Parse Error");
-}
-
-ASTNode* ParseIfStatement() {
-    ASTNode* condition = ParseExpression();
-
-    if(CheckNext(TOKEN_COLON)) {
-        ASTNode* trueBlock = ParseCompoundStatement();
-        ASTNode* falseBlock;
-
-        if(CheckNext(TOKEN_ELSE)) {
-            if(CheckNext(TOKEN_COLON))
-                falseBlock = ParseCompoundStatement();
-            else {
-                Error("Parse If Error: No Colon on else");
-            }
-        }
-
-        return IfStatementNode(condition, trueBlock, falseBlock);
-    } else {
-        Error("Parse If Error: No colon on if");
-    }
 }
 
 ASTNode* ParseCompoundStatement() {
@@ -136,6 +126,37 @@ ASTNode* ParseCompoundStatement() {
         ParseCompoundStatement();
     else
         Error("Parse Compound Error: No indent token");
+}
+
+ASTNode* ParseIfStatement() {
+    ASTNode* condition = ParseExpression();
+
+    if(CheckNext(TOKEN_COLON)) {
+        ASTNode* trueBlock = ParseCompoundStatement();
+        ASTNode* falseBlock;
+
+        if(CheckNext(TOKEN_ELSE)) {
+            if(CheckNext(TOKEN_COLON))
+                falseBlock = ParseCompoundStatement();
+            else {
+                Error("Parse If Error: No Colon on else");
+            }
+        }
+
+        return IfStatementNode(condition, trueBlock, falseBlock);
+    } else
+        Error("Parse If Error: No colon on if");
+}
+
+ASTNode* ParseLoopStatement() {
+    ASTNode* condition = ParseExpression();
+
+    if(CheckNext(TOKEN_COLON)) {
+        ASTNode* block = ParseCompoundStatement();
+
+        return LoopStatementNode(condition, block);
+    } else 
+        Error("Parse Loop Error: No conlon on loop");
 }
 
 ASTNode* ParseAssignmentExpression() {

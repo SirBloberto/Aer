@@ -44,6 +44,7 @@ typedef enum Token {
 
     TOKEN_IF,
     TOKEN_ELSE,
+    TOKEN_LOOP,
 
     TOKEN_IDENTIFIER,
     TOKEN_TRUE,

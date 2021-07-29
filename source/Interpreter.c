@@ -234,6 +234,19 @@ Value InterpretIfStatement(ASTNode* node) {
         Error("Interpret If Statement Error: Type is not boolean");
 }
 
+Value InterpretLoopStatement(ASTNode* node) {
+    LoopStatement loopStatement = node->loopStatement;
+
+    Value value = Interpret(loopStatement.condition);
+    if(value.type == TYPE_BOOLEAN) {
+        while(value.booleanValue) {
+            Interpret(loopStatement.block);
+            value = Interpret(loopStatement.condition);
+        }
+    } else
+        Error("Interpret Loop Statement Error: Type is not a boolean");
+}
+
 Value Interpret(ASTNode* node) {
     switch(node->type) {
         case NODE_ASSIGNMENT_EXPRESSION:
@@ -248,6 +261,8 @@ Value Interpret(ASTNode* node) {
             return InterpretCompoundStatement(node);
         case NODE_IF_STATEMENT:
             return InterpretIfStatement(node);
+        case NODE_LOOP_STATEMENT:
+            return InterpretLoopStatement(node);
         default:
             Error("Interpret Error");
     }

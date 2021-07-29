@@ -81,12 +81,18 @@ typedef struct IfStatement {
     struct ASTNode* falseBlock;
 } IfStatement;
 
+typedef struct LoopStatement {
+    struct ASTNode* condition;
+    struct ASTNode* block;
+} LoopStatement;
+
 typedef enum NodeType {
     NODE_ASSIGNMENT_EXPRESSION,
     NODE_BINARY_EXPRESSION,
     NODE_UNARY_EXPRESSION,
     NODE_COMPOUND_STATEMENT,
     NODE_IF_STATEMENT,
+    NODE_LOOP_STATEMENT,
     NODE_VALUE
 } NodeType;
 
@@ -99,6 +105,7 @@ typedef struct ASTNode {
 
         CompoundStatement compoundStatement;
         IfStatement ifStatement;
+        LoopStatement loopStatement;
 
         Value value;
     };
@@ -109,6 +116,7 @@ ASTNode* BinaryExpressionNode(ASTNode* left, ASTNode* right, BinaryOperation ope
 ASTNode* UnaryExpressionNode(ASTNode* expression, UnaryOperation operation);
 ASTNode* CompoundStatementNode(ASTNode** nodes, unsigned int count);
 ASTNode* IfStatementNode(ASTNode* condition, ASTNode* trueBlock, ASTNode* elseBlock);
+ASTNode* LoopStatementNode(ASTNode* condition, ASTNode* block);
 ASTNode* ValueNode(Value value);
 
 ASTNode* Parse();
