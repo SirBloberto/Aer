@@ -14,6 +14,14 @@ Keyword = 'False' | 'True'
 
 #Expressions
 Statement = AssignmentExpression
+          | IfStatement
+          | LoopStatement
+
+CompoundStatement = INDENT Statement* DEDENT
+
+IfStatement = 'If' Expression ':' CompoundStatement ?('Else:' CompoundStatement)
+
+LoopStatement = 'Loop' Expression ':' CompoundStatement
 
 AssignmentExpression = Identifier '=' Expression
 

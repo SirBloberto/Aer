@@ -196,7 +196,7 @@ void Lex() {
             PutbackCharacter(character);
         } else
             token = TOKEN_END_OF_FILE;
-    } else if(character >= '1' && character <= '9')
+    } else if(character >= '0' && character <= '9')
         Number(character);
     else if(character >= 'A' && character <= 'z') {
         if(startOfLine) {
