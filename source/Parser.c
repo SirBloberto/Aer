@@ -304,8 +304,8 @@ ASTNode* ParseUnaryExpression() {
         return UnaryExpressionNode(ParsePrimairyExpression(), UNARY_OPERATION_NEGATE);
     if(CheckNext(TOKEN_BITWISE_NOT))
         return UnaryExpressionNode(ParsePrimairyExpression(), UNARY_OPERATION_BITWISE_NOT);
-    else 
-        return ParsePrimairyExpression();
+        
+    return ParsePrimairyExpression();
 }
 
 ASTNode* ParsePrimairyExpression() {

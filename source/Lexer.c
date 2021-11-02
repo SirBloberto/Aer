@@ -169,13 +169,10 @@ void Lex() {
             token = TOKEN_LESS_EQUAL;
         else if(character == '<') {
             token = TOKEN_LEFT_SHIFT;
-            int thirdCharacter;
-            if((thirdCharacter == NextCharacter()) == '=')
+            if((character = NextCharacter()) == '=')
                 token = TOKEN_LEFT_SHIFT_ASSIGN;
-            else {
-                PutbackCharacter(thirdCharacter);
+            else
                 PutbackCharacter(character);
-            }  
         } else {
             token = TOKEN_LESS;
             PutbackCharacter(character);
@@ -183,9 +180,13 @@ void Lex() {
     } else if(character == '>') {
         if((character = NextCharacter()) == '=')
             token = TOKEN_GREATER_EQUAL;
-        else if(character == '>')
+        else if(character == '>') {
             token = TOKEN_RIGHT_SHIFT;
-        else {
+            if((character = NextCharacter()) == '=')
+                token = TOKEN_RIGHT_SHIFT_ASSIGN;
+            else
+                PutbackCharacter(character);
+        } else {
             token = TOKEN_GREATER;
             PutbackCharacter(character);
         }

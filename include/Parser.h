@@ -25,29 +25,22 @@ typedef struct AssignmentExpression {
     AssignmentOperation operation;
 } AssignmentExpression;
 
-//Can use a mask to Determine what operations are valid on which types and which types they return
 typedef enum BinaryOperation {
     BINARY_OPERATION_LOGICAL_OR,
     BINARY_OPERATION_LOGICAL_AND,
-    
     BINARY_OPERATION_BITWISE_OR,
     BINARY_OPERATION_BITWISE_XOR,
     BINARY_OPERATION_BITWISE_AND,
-
     BINARY_OPERATION_EQUAL,
     BINARY_OPERATION_NOT_EQUAL,
-
     BINARY_OPERATION_GREATER,
     BINARY_OPERATION_LESS,
     BINARY_OPERATION_GREATER_EQUAL,
     BINARY_OPERATION_LESS_EQUAL,
-
     BINARY_OPERATION_LEFT_SHIFT,
     BINARY_OPERATION_RIGHT_SHIFT,
-
     BINARY_OPERATION_ADD,
     BINARY_OPERATION_SUBTRACT,
-    
     BINARY_OPERATION_MULTIPLY,
     BINARY_OPERATION_DIVIDE,
     BINARY_OPERATION_MODULO
@@ -102,11 +95,9 @@ typedef struct ASTNode {
         AssignmentExpression assignmentExpression;
         BinaryExpression binaryExpression;
         UnaryExpression unaryExpression;
-
         CompoundStatement compoundStatement;
         IfStatement ifStatement;
         LoopStatement loopStatement;
-
         Value value;
     };
 } ASTNode;

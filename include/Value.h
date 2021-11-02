@@ -5,7 +5,6 @@ typedef enum ValueType {
     TYPE_BOOLEAN,
     TYPE_INTEGER,
     TYPE_REAL,
-
     TYPE_IDENTIFIER
 } Type;
 
@@ -15,7 +14,6 @@ typedef struct Value {
         char booleanValue;
         long integerValue;
         double realValue;
-        
         char* identifierValue;
     };
 } Value;
