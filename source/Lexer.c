@@ -19,6 +19,14 @@ void PutbackCharacter(int character) {
     position--;
 }
 
+void SkipWhitespace() {
+    int character = NextCharacter();
+
+    while(character == ' ')
+        character = NextCharacter();
+    PutbackCharacter(character);
+}
+
 void Number(int character) {
     value.integerValue = character - '0';
 
@@ -77,10 +85,9 @@ int Keyword(char* identifier) {
 }
 
 void Lex() {
-    int character = NextCharacter();
+    SkipWhitespace();
 
-    while(character == ' ')
-        character = NextCharacter();
+    int character = NextCharacter();
 
     if(character == '(')
         token = TOKEN_OPEN_PARENTHESE;
@@ -191,7 +198,7 @@ void Lex() {
             PutbackCharacter(character);
         }
     } else if(character == EOF) {
-        if(CheckIndent() != 0) {
+        if(GetIndent() != 0) {
             token = TOKEN_DEDENT;
             PopDedent();
             PutbackCharacter(character);
@@ -201,11 +208,11 @@ void Lex() {
         Number(character);
     else if(character >= 'A' && character <= 'z') {
         if(startOfLine) {
-            if(CheckIndent() < position - 1) {
+            if(GetIndent() < position - 1) {
                 token = TOKEN_INDENT;
                 PushIndent(position - 1);
                 PutbackCharacter(character);
-            } else if(CheckIndent() > position - 1) {
+            } else if(GetIndent() > position - 1) {
                 token = TOKEN_DEDENT;
                 PopDedent();
                 PutbackCharacter(character);

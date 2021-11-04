@@ -14,6 +14,7 @@ typedef struct Value {
         char booleanValue;
         long integerValue;
         double realValue;
+        char* stringValue;
         char* identifierValue;
     };
 } Value;

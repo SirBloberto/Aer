@@ -9,6 +9,6 @@ void PopDedent() {
     indentStack.stack[indentStack.count--] = 0;
 }
 
-unsigned int CheckIndent() {
+unsigned int GetIndent() {
     return indentStack.stack[indentStack.count - 1];
 }
