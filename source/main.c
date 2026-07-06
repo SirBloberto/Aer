@@ -5,6 +5,7 @@
 #include "aer.h"
 #include "aer_io.h"
 #include "aer_module.h"
+#include "disasm.h"
 #include "error.h"
 #include "lexer.h"
 #include "parser.h"
@@ -128,6 +129,19 @@ static bool run_file(char* path) {
     mode = MODE_RUN;
     read_file(path);
     run();
+#ifdef AER_DEBUG_TOOLS
+    /* AER_DISASSEMBLE unset: skip entirely, zero cost. Set to a path: write there. Set to "-" (or
+       anything else, e.g. empty): stderr. Checked after run() so both the static bytecode and the
+       full run's dispatch/hit counts are available together in one dump. */
+    const char* dump_path = getenv("AER_DISASSEMBLE");
+    if (dump_path) {
+        FILE* dump_out = strcmp(dump_path, "-") == 0 ? stderr : fopen(dump_path, "w");
+        if (!dump_out) { fprintf(stderr, "AER_DISASSEMBLE: could not open '%s' for writing\n", dump_path); dump_out = stderr; }
+        aer_disassemble(&chunk, dump_out);
+        aer_debug_memory_report(dump_out);
+        if (dump_out != stderr) fclose(dump_out);
+    }
+#endif
     /* A runtime error no longer terminates the process (see error.c) — the CLI decides to exit nonzero here; a failed assert() doesn't set aer_had_error() on purpose (see error.h), so it's checked separately. */
     return !aer_had_error() && aer_assert_failure_count() == 0;
 }

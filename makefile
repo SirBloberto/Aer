@@ -38,6 +38,14 @@ performance: $(SOURCE)
 	@mkdir -p binary
 	gcc $(PERFORMANCE_FLAGS) -o binary/aer-performance$(EXE) $(SOURCE) -lm $(WINLIBS)
 
+# Disassembler + opcode/memory profiling (source/core/disasm.c, AER_DEBUG_TOOLS-gated code in
+# vm.c/vm.h) — entirely absent from every other target, including `all`. Run with AER_DISASSEMBLE
+# set (a path, or "-" for stderr) to dump a disassembly + hit-count summary + memory report after
+# the script runs; unset behaves exactly like a normal build.
+debug-tools: $(SOURCE)
+	@mkdir -p binary
+	gcc $(FLAGS) -DAER_DEBUG_TOOLS -o binary/aer-debug$(EXE) $(SOURCE) -lm $(WINLIBS)
+
 # Split across focused files rather than one monolith — run all in sequence, stop at the first failure.
 TESTS := tests/test_core.aer \
          tests/test_collections.aer \

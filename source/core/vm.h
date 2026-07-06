@@ -56,6 +56,22 @@ typedef enum {
     OP_COMPOUND_LOCAL_NAME,  /* operands: lhs_slot, bin_op, rhs_name_idx, rhs_cache_idx */
     OP_COMPOUND_NAME_LOCAL,  /* operands: lhs_name_idx, lhs_cache_idx, bin_op, rhs_slot */
 
+    /* Compile-time fusion of a plain binary arithmetic expression (`a + b`, not an assignment) —
+       same discard-and-truncate-then-reemit scheme as OP_COMPOUND_* above, applied a third time
+       (see parse_binary_ops, parser.c). Profiling on nbody.aer showed OP_LOAD_LOCAL alone at ~29%
+       of all dispatches even though it's already minimal cost (one array read, no checks) — the
+       remaining cost is dispatch *count*, which only fusion (not caching) can reduce. Scoped to the
+       6 arithmetic ops only (+ - * / % //); AND/OR excluded (short-circuit doesn't fit "evaluate
+       both sides unconditionally"), and a struct-field operand (`b.mass`) doesn't fuse in this pass
+       — only LOCAL/NAME/CONST, the same shapes classify_operand already recognizes. `bin_op` is a
+       runtime operand (like OP_COMPOUND_* already does), not one opcode per operator. */
+    OP_BINARY_LOCAL_LOCAL,  /* operands: lhs_slot, bin_op, rhs_slot */
+    OP_BINARY_LOCAL_CONST,  /* operands: lhs_slot, bin_op, rhs_pool_idx */
+    OP_BINARY_LOCAL_NAME,   /* operands: lhs_slot, bin_op, rhs_name_idx, rhs_cache_idx */
+    OP_BINARY_NAME_LOCAL,   /* operands: lhs_name_idx, lhs_cache_idx, bin_op, rhs_slot */
+    OP_BINARY_NAME_CONST,   /* operands: lhs_name_idx, lhs_cache_idx, bin_op, rhs_pool_idx */
+    OP_BINARY_NAME_NAME,    /* operands: lhs_name_idx, lhs_cache_idx, bin_op, rhs_name_idx, rhs_cache_idx */
+
     /* Binary arithmetic */
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_FLOOR_DIV,
 
@@ -219,6 +235,15 @@ typedef struct {
        value, so reassignment is already reflected. */
     AerVal**     addr_cache;
     unsigned int addr_cache_count, addr_cache_cap;
+
+#ifdef AER_DEBUG_TOOLS
+    /* One dispatch counter per bytecode word, indexed by offset — only the word an opcode itself
+       starts at is ever incremented (see DISPATCH() in vm.c), operand words stay 0. Grown in
+       lockstep with `code` by chunk_ensure_debug_hits (vm.c), called once at the top of vm_run.
+       Entirely absent from a normal build — see source/core/disasm.h. */
+    unsigned long long* debug_hits;
+    unsigned int         debug_hits_cap;
+#endif
 } Chunk;
 
 /* ------------------------------------------------------------------ */
@@ -346,5 +371,12 @@ AerDict* vm_new_dict(void);
    lookup fail outright, not just leak. Zero the struct yourself after calling — unlike the xcalloc
    this replaced, pool_alloc returns uninitialized memory. */
 AerFunction* vm_new_function(void);
+
+#ifdef AER_DEBUG_TOOLS
+#include <stdio.h>
+/* Prints a byte-accurate memory breakdown (header vs. payload bytes per pool, plus GC run counts)
+   to `out` — see source/core/vm.c for what "payload" means per type. Debug-build only. */
+void aer_debug_memory_report(FILE* out);
+#endif
 
 #endif

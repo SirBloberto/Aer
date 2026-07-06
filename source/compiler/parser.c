@@ -238,7 +238,7 @@ static bool expr_depth_enter(void) {
 static void parse_statement(Chunk* c);
 static void parse_assignment(Chunk* c);
 static int  parse_binary(Chunk* c, unsigned int min_prec);
-static int  parse_binary_ops(Chunk* c, unsigned int min_prec);
+static int  parse_binary_ops(Chunk* c, unsigned int min_prec, unsigned int lhs_start);
 static void parse_unary(Chunk* c);
 static void parse_primary(Chunk* c);
 static void parse_primary_inner(Chunk* c);
@@ -501,7 +501,10 @@ static void parse_assignment(Chunk* c) {
                 break;
             }
         }
-        parse_binary_ops(c, 0);   /* optional trailing pipe/operator chain */
+        /* lhs_start = c->count: the chain just emitted is never a simple operand (it's at least
+           one OP_FIELD_GET/OP_INDEX_GET), so this deliberately passes an empty range — fusion
+           correctly never fires here, same as any other non-simple LHS. */
+        parse_binary_ops(c, 0, c->count);   /* optional trailing pipe/operator chain */
         chunk_emit(c, mode == MODE_SHELL ? OP_PRINT_REPL : OP_POP);
         return;
     }
@@ -603,8 +606,9 @@ static void parse_assignment(Chunk* c) {
 
     if (equal(TOKEN_PIPE)) {
         /* A pipe chain starting from a bare name, used as a statement, e.g. 'x |> length()' — same expression-statement treatment as the field/index-chain case above. */
+        unsigned int lhs_start = c->count;
         emit_load(c, name_idx);
-        parse_binary_ops(c, 0);
+        parse_binary_ops(c, 0, lhs_start);
         chunk_emit(c, mode == MODE_SHELL ? OP_PRINT_REPL : OP_POP);
         return;
     }
@@ -628,8 +632,16 @@ static void parse_assignment(Chunk* c) {
    coincidentally equal a comparison opcode's numeric value, since both are just small sequential
    integers). A recursive parse_binary/parse_binary_ops call (e.g. the "b+c" in "a < b+c") returns
    its OWN result to its OWN caller; that value is never read here, so it can't leak into or
-   overwrite this call's tracking — each stack frame's last_cmp is local and independent. */
-static int parse_binary_ops(Chunk* c, unsigned int min_prec) {
+   overwrite this call's tracking — each stack frame's last_cmp is local and independent.
+
+   `lhs_start` names where the CURRENT lhs-so-far's bytecode begins — passed in by the caller (see
+   parse_binary below), since by the time this function runs, that term has already been emitted.
+   It's a constant for the whole call, not updated per iteration: on the first loop iteration it's
+   exactly the one term the caller emitted (a candidate for arithmetic fusion below); from the
+   second iteration on, [lhs_start, rhs_start) has grown to include at least one prior operator, so
+   classify_operand naturally reports it as non-simple and fusion just doesn't fire — this is what
+   makes fusion apply to leaf pairs only, without extra bookkeeping. */
+static int parse_binary_ops(Chunk* c, unsigned int min_prec, unsigned int lhs_start) {
     int last_cmp = -1;
     while (1) {
         unsigned int idx = (unsigned int)token.type - BINARY_OP_START;
@@ -723,10 +735,38 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec) {
             else if (type_len == 7 && strncmp(type_name, "boolean", 7) == 0) { chunk_emit(c, OP_CAST); chunk_emit(c, CAST_BOOLEAN); }
             else { chunk_emit(c, OP_CHECK_SHAPE); chunk_emit(c, (int)type_idx); }
         } else {
+            unsigned int rhs_start = c->count;
             parse_binary(c, prec);
-            chunk_emit(c, (int)op);
-            if (op == OP_EQ || op == OP_NEQ || op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE)
-                last_cmp = (int)op;
+
+            /* Compile-time fusion of a plain arithmetic expression — see OP_BINARY_*'s comment in
+               vm.h. Comparisons are excluded: they already get their own fusion (OP_CMP_JUMP_FALSE)
+               when used as a condition, and a bare comparison VALUE is rare enough not to need a
+               second mechanism. AND/OR never reach here (handled in their own branches above). */
+            bool fused = false;
+            if (op == OP_ADD || op == OP_SUB || op == OP_MUL ||
+                op == OP_DIV || op == OP_MOD || op == OP_FLOOR_DIV) {
+                Operand lhs = classify_operand(c, lhs_start, rhs_start);
+                Operand rhs = classify_operand(c, rhs_start, c->count);
+                if ((lhs.kind == OPERAND_LOCAL || lhs.kind == OPERAND_NAME) &&
+                    (rhs.kind == OPERAND_LOCAL || rhs.kind == OPERAND_CONST || rhs.kind == OPERAND_NAME)) {
+                    c->count = lhs_start;   /* discard the LHS+RHS+nothing-yet just emitted */
+                    if (lhs.kind == OPERAND_LOCAL) {
+                        if      (rhs.kind == OPERAND_LOCAL) { chunk_emit(c, OP_BINARY_LOCAL_LOCAL); chunk_emit(c, lhs.a); chunk_emit(c, (int)op); chunk_emit(c, rhs.a); }
+                        else if (rhs.kind == OPERAND_CONST) { chunk_emit(c, OP_BINARY_LOCAL_CONST); chunk_emit(c, lhs.a); chunk_emit(c, (int)op); chunk_emit(c, rhs.a); }
+                        else                                 { chunk_emit(c, OP_BINARY_LOCAL_NAME);  chunk_emit(c, lhs.a); chunk_emit(c, (int)op); chunk_emit(c, rhs.a); chunk_emit(c, rhs.b); }
+                    } else {
+                        if      (rhs.kind == OPERAND_LOCAL) { chunk_emit(c, OP_BINARY_NAME_LOCAL); chunk_emit(c, lhs.a); chunk_emit(c, lhs.b); chunk_emit(c, (int)op); chunk_emit(c, rhs.a); }
+                        else if (rhs.kind == OPERAND_CONST) { chunk_emit(c, OP_BINARY_NAME_CONST); chunk_emit(c, lhs.a); chunk_emit(c, lhs.b); chunk_emit(c, (int)op); chunk_emit(c, rhs.a); }
+                        else                                 { chunk_emit(c, OP_BINARY_NAME_NAME);  chunk_emit(c, lhs.a); chunk_emit(c, lhs.b); chunk_emit(c, (int)op); chunk_emit(c, rhs.a); chunk_emit(c, rhs.b); }
+                    }
+                    fused = true;
+                }
+            }
+            if (!fused) {
+                chunk_emit(c, (int)op);
+                if (op == OP_EQ || op == OP_NEQ || op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE)
+                    last_cmp = (int)op;
+            }
         }
     }
     return last_cmp;
@@ -735,8 +775,9 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec) {
 /* Returns parse_binary_ops's result (see its comment) — a bare comparison Opcode if the WHOLE
    expression's outermost operator was one, else -1. */
 static int parse_binary(Chunk* c, unsigned int min_prec) {
+    unsigned int lhs_start = c->count;
     parse_unary(c);
-    return parse_binary_ops(c, min_prec);
+    return parse_binary_ops(c, min_prec, lhs_start);
 }
 
 static void parse_unary_inner(Chunk* c) {
@@ -1227,7 +1268,10 @@ static void parse_for(Chunk* c) {
                 break;
             }
         }
-        last_cmp = parse_binary_ops(c, 0);
+        /* ctx->top was captured right before emit_load(name1) above — exactly the LHS-so-far's
+           start, whether that ended up being a bare name (simple, fusable) or grew into a postfix
+           chain (not simple; classify_operand correctly reports that as non-fusable either way). */
+        last_cmp = parse_binary_ops(c, 0, ctx->top);
     } else {
         /* --- while loop, non-identifier condition --- */
         ctx->top = c->count;

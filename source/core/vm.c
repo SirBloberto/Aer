@@ -382,6 +382,86 @@ void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
     if (major_collections)  *major_collections  = major_collections_run;
 }
 
+#ifdef AER_DEBUG_TOOLS
+/* Byte-accurate memory report — aer_gc_stats() only gives a live *cell* count, which understates
+   real usage for string/array/dict: their pool cell is a fixed-size header only, the actual
+   payload (string bytes, array items[], dict hash buckets) is a separate xmalloc'd/xrealloc'd
+   allocation the pool system doesn't track at all. Walks each pool's cell_state the same way
+   gc_count_live_cells does, but reads each live cell's own size fields instead of just counting. */
+void aer_debug_memory_report(FILE* out) {
+    fprintf(out, "\n--- memory ---\n");
+
+    unsigned long long str_hdr = 0, str_payload = 0;
+    {
+        Pool* p = &string_pool;
+        for (unsigned int i = 0; i < p->slab_count; i++) {
+            unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
+            for (unsigned int j = 0; j < count; j++) {
+                if (p->cell_state[i][j] & POOL_FREE) continue;
+                AerString* s = (AerString*)(p->slabs[i] + (size_t)j * p->elem_size);
+                str_hdr += sizeof(AerString);
+                str_payload += s->length;
+            }
+        }
+    }
+    fprintf(out, "  string   header %10llu B  payload %10llu B\n", str_hdr, str_payload);
+
+    unsigned long long arr_hdr = 0, arr_payload = 0;
+    {
+        Pool* p = &array_pool;
+        for (unsigned int i = 0; i < p->slab_count; i++) {
+            unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
+            for (unsigned int j = 0; j < count; j++) {
+                if (p->cell_state[i][j] & POOL_FREE) continue;
+                AerArray* a = (AerArray*)(p->slabs[i] + (size_t)j * p->elem_size);
+                arr_hdr += sizeof(AerArray);
+                arr_payload += (unsigned long long)a->capacity * sizeof(AerVal);
+            }
+        }
+    }
+    fprintf(out, "  array    header %10llu B  payload %10llu B\n", arr_hdr, arr_payload);
+
+    unsigned long long dict_hdr = 0, dict_payload = 0;
+    {
+        Pool* p = &dict_pool;
+        for (unsigned int i = 0; i < p->slab_count; i++) {
+            unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
+            for (unsigned int j = 0; j < count; j++) {
+                if (p->cell_state[i][j] & POOL_FREE) continue;
+                AerDict* d = (AerDict*)(p->slabs[i] + (size_t)j * p->elem_size);
+                dict_hdr += sizeof(AerDict);
+                dict_payload += (unsigned long long)d->map.capacity * sizeof(HashTableEntry);
+                for (unsigned int b = 0; b < d->map.capacity; b++)
+                    if (d->map.buckets[b].key) dict_payload += d->map.buckets[b].length + 1;
+            }
+        }
+    }
+    fprintf(out, "  dict     header %10llu B  payload %10llu B\n", dict_hdr, dict_payload);
+
+    unsigned long long fn_hdr = 0, fn_payload = 0;
+    {
+        Pool* p = &function_pool;
+        for (unsigned int i = 0; i < p->slab_count; i++) {
+            unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
+            for (unsigned int j = 0; j < count; j++) {
+                if (p->cell_state[i][j] & POOL_FREE) continue;
+                AerFunction* f = (AerFunction*)(p->slabs[i] + (size_t)j * p->elem_size);
+                fn_hdr += sizeof(AerFunction);
+                if (f->defaults) fn_payload += (unsigned long long)(f->arity - f->min_arity) * sizeof(AerVal);
+            }
+        }
+    }
+    fprintf(out, "  function header %10llu B  payload %10llu B\n", fn_hdr, fn_payload);
+
+    unsigned long long long_hdr = (unsigned long long)long_pool.slab_count * long_pool.elems_per_slab * long_pool.elem_size;
+    fprintf(out, "  long     reserved %9llu B (no separate payload)\n", long_hdr);
+
+    unsigned int live, minor, major;
+    aer_gc_stats(&live, &minor, &major);
+    fprintf(out, "  %u live cells, %u minor collections, %u major collections\n", live, minor, major);
+}
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Chunk management                                                     */
 /* ------------------------------------------------------------------ */
@@ -402,6 +482,9 @@ void chunk_free(Chunk* c) {
     free(c->imported_modules);
     /* Not each entry — every populated slot is a pointer INTO vm->scopes, never separately owned. */
     free(c->addr_cache);
+#ifdef AER_DEBUG_TOOLS
+    free(c->debug_hits);
+#endif
     memset(c, 0, sizeof(*c));
 }
 
@@ -1309,15 +1392,35 @@ static inline void vm_index_set_compute(AerVal obj, AerVal idx, AerVal val) {
 /* Dispatch loop — computed goto (GCC direct-threaded dispatch); each instruction jumps straight to the next handler, letting the branch predictor learn per-instruction patterns. */
 /* ------------------------------------------------------------------ */
 
+#ifdef AER_DEBUG_TOOLS
+/* Grows Chunk.debug_hits to cover every word currently in c->code, zero-filling the new region —
+   called once at the top of vm_run so DISPATCH() can index it unconditionally. Safe to call every
+   run() (REPL appends code across calls): a no-op once debug_hits_cap already covers c->count. */
+static void chunk_ensure_debug_hits(Chunk* c) {
+    if (c->count <= c->debug_hits_cap) return;
+    unsigned int old_cap = c->debug_hits_cap;
+    c->debug_hits_cap = c->count;
+    c->debug_hits = xrealloc(c->debug_hits, sizeof(unsigned long long) * c->debug_hits_cap);
+    memset(c->debug_hits + old_cap, 0, sizeof(unsigned long long) * (c->debug_hits_cap - old_cap));
+}
+#endif
+
 bool vm_run(VM* vm) {
     Chunk* c = vm->chunk;
     Opcode cur_op;
+#ifdef AER_DEBUG_TOOLS
+    chunk_ensure_debug_hits(c);
+#endif
 
 #define READ()     (c->code[vm->ip++])
 #define PUSH(v)    do { if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return false; } vm->stack[vm->stack_top++] = (v); } while(0)
 #define POP()      (vm->stack_top > 0 ? vm->stack[--vm->stack_top] : (error("Stack underflow"), aer_null()))
 /* active_vm_for_errors = vm is just a pointer store; the line-lookup binary search only runs inside error() when a fault fires, not per-opcode as an earlier version did. */
+#ifdef AER_DEBUG_TOOLS
+#define DISPATCH() do { if (runtime_had_error) return false; gc_maybe_collect(vm); active_vm_for_errors = vm; unsigned int op_ip = vm->ip; cur_op = (Opcode)READ(); c->debug_hits[op_ip]++; goto *dt[cur_op]; } while(0)
+#else
 #define DISPATCH() do { if (runtime_had_error) return false; gc_maybe_collect(vm); active_vm_for_errors = vm; cur_op = (Opcode)READ(); goto *dt[cur_op]; } while(0)
+#endif
 
     static const void* const dt[] = {
         [OP_PUSH]           = &&lbl_push,
@@ -1334,6 +1437,12 @@ bool vm_run(VM* vm) {
         [OP_COMPOUND_LOCAL_LOCAL] = &&lbl_compound_local_local,
         [OP_COMPOUND_LOCAL_NAME]  = &&lbl_compound_local_name,
         [OP_COMPOUND_NAME_LOCAL]  = &&lbl_compound_name_local,
+        [OP_BINARY_LOCAL_LOCAL] = &&lbl_binary_local_local,
+        [OP_BINARY_LOCAL_CONST] = &&lbl_binary_local_const,
+        [OP_BINARY_LOCAL_NAME]  = &&lbl_binary_local_name,
+        [OP_BINARY_NAME_LOCAL]  = &&lbl_binary_name_local,
+        [OP_BINARY_NAME_CONST]  = &&lbl_binary_name_const,
+        [OP_BINARY_NAME_NAME]   = &&lbl_binary_name_name,
         [OP_ADD]            = &&lbl_binary,
         [OP_SUB]            = &&lbl_binary,
         [OP_MUL]            = &&lbl_binary,
@@ -1556,6 +1665,80 @@ lbl_compound_name_local: {
     AerVal result = vm_binary(*lhs_addr, rhs_val, bin_op);
     if (runtime_had_error) DISPATCH();
     *lhs_addr = result;
+    DISPATCH();
+}
+
+/* Fused plain binary expression (`a + b`, not an assignment) — see OP_BINARY_*'s comment in vm.h.
+   No write-back (unlike OP_COMPOUND_*), just pushes the result, so this follows lbl_binary's
+   discipline (below) rather than the compound handlers': no runtime_had_error check needed before
+   the push itself, since a transient stack value about to be discarded when the statement aborts
+   at the next DISPATCH() isn't corrupting any lasting state. A NAME operand's resolution can still
+   fail outright (undefined name), which *does* need checking before dereferencing it. */
+lbl_binary_local_local: {
+    int lhs_slot  = READ();
+    Opcode bin_op = (Opcode)READ();
+    int rhs_slot  = READ();
+    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
+    AerVal rhs_val = vm_read_local_slot(vm, rhs_slot);
+    PUSH(vm_binary(lhs_val, rhs_val, bin_op));
+    DISPATCH();
+}
+
+lbl_binary_local_const: {
+    int lhs_slot     = READ();
+    Opcode bin_op    = (Opcode)READ();
+    int rhs_pool_idx = READ();
+    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
+    PUSH(vm_binary(lhs_val, c->pool[rhs_pool_idx], bin_op));
+    DISPATCH();
+}
+
+lbl_binary_local_name: {
+    int lhs_slot      = READ();
+    Opcode bin_op     = (Opcode)READ();
+    int rhs_name_idx  = READ();
+    int rhs_cache_idx = READ();
+    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
+    AerVal* rhs_addr = vm_resolve_name_cached(vm, c, rhs_name_idx, rhs_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    PUSH(vm_binary(lhs_val, *rhs_addr, bin_op));
+    DISPATCH();
+}
+
+lbl_binary_name_local: {
+    int lhs_name_idx  = READ();
+    int lhs_cache_idx = READ();
+    Opcode bin_op     = (Opcode)READ();
+    int rhs_slot      = READ();
+    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    AerVal rhs_val = vm_read_local_slot(vm, rhs_slot);
+    PUSH(vm_binary(*lhs_addr, rhs_val, bin_op));
+    DISPATCH();
+}
+
+lbl_binary_name_const: {
+    int lhs_name_idx  = READ();
+    int lhs_cache_idx = READ();
+    Opcode bin_op     = (Opcode)READ();
+    int rhs_pool_idx  = READ();
+    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    PUSH(vm_binary(*lhs_addr, c->pool[rhs_pool_idx], bin_op));
+    DISPATCH();
+}
+
+lbl_binary_name_name: {
+    int lhs_name_idx  = READ();
+    int lhs_cache_idx = READ();
+    Opcode bin_op     = (Opcode)READ();
+    int rhs_name_idx  = READ();
+    int rhs_cache_idx = READ();
+    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    AerVal* rhs_addr = vm_resolve_name_cached(vm, c, rhs_name_idx, rhs_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    PUSH(vm_binary(*lhs_addr, *rhs_addr, bin_op));
     DISPATCH();
 }
 
