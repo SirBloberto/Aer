@@ -1443,6 +1443,7 @@ bool vm_run(VM* vm) {
         [OP_BINARY_NAME_LOCAL]  = &&lbl_binary_name_local,
         [OP_BINARY_NAME_CONST]  = &&lbl_binary_name_const,
         [OP_BINARY_NAME_NAME]   = &&lbl_binary_name_name,
+        [OP_COMPOUND_INDEXED_FIELD_LOCAL_LOCAL] = &&lbl_compound_indexed_field_local_local,
         [OP_ADD]            = &&lbl_binary,
         [OP_SUB]            = &&lbl_binary,
         [OP_MUL]            = &&lbl_binary,
@@ -1739,6 +1740,41 @@ lbl_binary_name_name: {
     AerVal* rhs_addr = vm_resolve_name_cached(vm, c, rhs_name_idx, rhs_cache_idx);
     if (runtime_had_error) DISPATCH();
     PUSH(vm_binary(*lhs_addr, *rhs_addr, bin_op));
+    DISPATCH();
+}
+
+/* Compound-assignment fusion for `arr[idx].field OP= rhs` — see OP_COMPOUND_INDEXED_FIELD_LOCAL_
+   LOCAL's comment in vm.h. rhs is already computed and on the stack (parse_assignment emits the
+   rhs expression before this opcode, same as every OP_COMPOUND_* handler); arr/idx are re-read
+   directly from their local slots rather than duplicated on the stack ahead of time — no DUP_N.
+   Shares vm_index_get_compute with lbl_index_get (to resolve arr[idx] into the struct instance)
+   and the same field linear-scan lbl_field_get/lbl_field_set use (pool-index equality, no strcmp). */
+lbl_compound_indexed_field_local_local: {
+    int arr_slot      = READ();
+    int idx_slot      = READ();
+    int field_idx     = READ();
+    Opcode bin_op     = (Opcode)READ();
+    AerVal rhs_val = POP();
+    AerVal arr_val = vm_read_local_slot(vm, arr_slot);
+    AerVal idx_val = vm_read_local_slot(vm, idx_slot);
+    AerVal obj = vm_index_get_compute(arr_val, idx_val);
+    if (runtime_had_error) DISPATCH();
+    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
+        error("'.' field access requires a struct instance"); DISPATCH();
+    }
+    AerArray* oa = aer_as_array(obj);
+    Shape* shape = oa->shape;
+    for (unsigned int i = 0; i < shape->field_count; i++) {
+        if (shape->field_names[i] == (unsigned int)field_idx) {
+            AerVal result = vm_binary(oa->items[i], rhs_val, bin_op);
+            if (runtime_had_error) DISPATCH();
+            gc_barrier_array(oa, result);
+            oa->items[i] = result;
+            DISPATCH();
+        }
+    }
+    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
+          aer_as_string(c->pool[field_idx])->data);
     DISPATCH();
 }
 

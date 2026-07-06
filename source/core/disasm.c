@@ -54,6 +54,8 @@ static const OpInfo op_info[OP_HALT + 1] = {
     [OP_BINARY_NAME_CONST]  = { "OP_BINARY_NAME_CONST",  "fused: global OP constant", {FLD_NAME, FLD_CACHE, FLD_BINOP, FLD_POOL} },
     [OP_BINARY_NAME_NAME]   = { "OP_BINARY_NAME_NAME",   "fused: global OP global", {FLD_NAME, FLD_CACHE, FLD_BINOP, FLD_NAME, FLD_CACHE} },
 
+    [OP_COMPOUND_INDEXED_FIELD_LOCAL_LOCAL] = { "OP_COMPOUND_INDEXED_FIELD_LOCAL_LOCAL", "fused: local[local].field OP= rhs (rhs already on stack)", {FLD_SLOT, FLD_SLOT, FLD_NAME, FLD_BINOP} },
+
     [OP_ADD] = { "OP_ADD", "pop b, a; push a + b", {0} },
     [OP_SUB] = { "OP_SUB", "pop b, a; push a - b", {0} },
     [OP_MUL] = { "OP_MUL", "pop b, a; push a * b", {0} },

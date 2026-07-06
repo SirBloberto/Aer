@@ -72,6 +72,18 @@ typedef enum {
     OP_BINARY_NAME_CONST,   /* operands: lhs_name_idx, lhs_cache_idx, bin_op, rhs_pool_idx */
     OP_BINARY_NAME_NAME,    /* operands: lhs_name_idx, lhs_cache_idx, bin_op, rhs_name_idx, rhs_cache_idx */
 
+    /* Compound-assignment fusion for the dominant `arr[idx].field OP= rhs` shape (e.g. nbody's
+       `bodies[i].vx -= dx * mj`) — eliminates OP_DUP_N entirely, not just the intermediate get.
+       Unfused: LOAD arr; LOAD idx; DUP_N 2; INDEX_GET; <rhs>; bin_op; FIELD_SET — 4 dispatches
+       around the rhs. Fused: <rhs>; this opcode — 1 dispatch around the rhs. The handler re-reads
+       arr/idx straight from their local slots at write-back time instead of duplicating them on
+       the stack; DUP_N exists to avoid *re-evaluating an expression* (real work, possibly with
+       side effects), but re-reading a LOCAL slot is just an array index and safe to do twice.
+       Scoped to LOCAL array + LOCAL index only, one index step then one field step, nothing
+       chained deeper — the single hottest shape, not a NAME/CONST combinatorial family (see
+       OP_INDEX_SET_LOCAL_CONST's own comment on staying narrow). */
+    OP_COMPOUND_INDEXED_FIELD_LOCAL_LOCAL, /* operands: arr_slot, idx_slot, field_name_pool_idx, bin_op */
+
     /* Binary arithmetic */
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_FLOOR_DIV,
 

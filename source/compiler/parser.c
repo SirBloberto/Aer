@@ -357,8 +357,9 @@ static void parse_assignment(Chunk* c) {
         bool pending_is_field = false;
         unsigned int pending_field_idx = 0;
         bool chained = false;   /* true once any step past the first has been consumed */
+        unsigned int chain_step_count = 0;  /* number of steps consumed by the while loop below */
 
-        unsigned int idx_start = 0, idx_end = 0;   /* only meaningful when !chained && !pending_is_field */
+        unsigned int idx_start = 0, idx_end = 0;   /* only meaningful when !chained && !pending_is_field, OR (see below) chain_step_count == 1 && first_step_is_index */
         if (consume(TOKEN_OPEN_BRACKET)) {
             idx_start = c->count;
             parse_binary(c, 0);
@@ -371,9 +372,15 @@ static void parse_assignment(Chunk* c) {
             pending_is_field  = true;
             lex();
         }
+        /* Captured before the while loop can overwrite pending_is_field — lets the compound-
+           assignment branch below recognize the exact "arr[idx].field" shape (one index step,
+           then one field step, nothing more) even though `chained` alone can't distinguish it
+           from a deeper chain. */
+        bool first_step_is_index = !pending_is_field;
 
         while (equal(TOKEN_OPEN_BRACKET) || equal(TOKEN_DOT)) {
             chained = true;
+            chain_step_count++;
             if (pending_is_field) { chunk_emit(c, OP_FIELD_GET); chunk_emit(c, (int)pending_field_idx); }
             else                    chunk_emit(c, OP_INDEX_GET);
 
@@ -461,6 +468,28 @@ static void parse_assignment(Chunk* c) {
            a second time. */
         for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
             if (consume(compound_assign_ops[i].tok)) {
+                /* Fusion for the single dominant chain shape `arr[idx].field OP= rhs` — see
+                   OP_COMPOUND_INDEXED_FIELD_LOCAL_LOCAL's comment in vm.h. Only fires when the
+                   chain is EXACTLY one index step then one field step (chain_step_count == 1,
+                   first_step_is_index, pending_is_field now true) and both array+index are
+                   LOCAL — a deeper chain (a[i][j].x, a.b[i].x) falls back to the general DUP_N
+                   path below unchanged. */
+                if (chain_step_count == 1 && first_step_is_index && pending_is_field) {
+                    Operand arr = classify_operand(c, arr_start, idx_start);
+                    Operand idx = classify_operand(c, idx_start, idx_end);
+                    if (arr.kind == OPERAND_LOCAL && idx.kind == OPERAND_LOCAL) {
+                        /* Discard the already-emitted LOAD arr; <index>; OP_INDEX_GET — the fused
+                           opcode re-reads arr/idx from their slots directly at its own dispatch
+                           time instead. */
+                        c->count = arr_start;
+                        parse_binary(c, 0);   /* rhs */
+                        chunk_emit(c, OP_COMPOUND_INDEXED_FIELD_LOCAL_LOCAL);
+                        chunk_emit(c, arr.a); chunk_emit(c, idx.a);
+                        chunk_emit(c, (int)pending_field_idx);
+                        chunk_emit(c, (int)compound_assign_ops[i].op);
+                        return;
+                    }
+                }
                 chunk_emit(c, OP_DUP_N);
                 chunk_emit(c, pending_is_field ? 1 : 2);
                 if (pending_is_field) { chunk_emit(c, OP_FIELD_GET); chunk_emit(c, (int)pending_field_idx); }
