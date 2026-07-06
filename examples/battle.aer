@@ -1,0 +1,95 @@
+# battle.aer — a small turn-based combat simulator, written to exercise a
+# broad slice of AER in one program: structs, closures, the pipe operator,
+# defer (with the "arguments evaluated early, but references still see
+# later mutations" nuance demonstrated deliberately), and the standard
+# library (random, string).
+#
+# Run it with:
+#   ./binary/aer examples/battle.aer
+
+import random
+import string
+
+struct Character:
+    name = "Unnamed"
+    hp = 100
+    attack = 10
+
+# A closure factory — each character gets an independently-tuned special
+# attack, capturing its own `character` and `bonus`. Closures in AER
+# capture their directly-enclosing function's variables, which is exactly
+# what's needed here.
+function make_special_attack(character, bonus):
+    return function():
+        return character.attack + bonus
+
+function deal_damage(target, amount):
+    target.hp = target.hp - amount
+    if target.hp < 0:
+        target.hp = 0
+    return target
+
+function is_alive(character):
+    return character.hp > 0
+
+function status_line(character):
+    n = character.name
+    h = character.hp
+    return "{n}: {h} HP"
+
+function battle_round(attacker, defender, round_num):
+    roll = random.randint(1, 6)
+    damage = attacker.attack + roll
+    defender = deal_damage(defender, damage)
+    a = attacker.name
+    d = defender.name
+    print("Round {round_num}: {a} hits {d} for {damage} (roll {roll})")
+    return defender
+
+function print_summary(result):
+    r = result["rounds"]
+    w = result["winner"]
+    print("--- battle over after {r} rounds — {w} wins ---")
+
+function run_battle(hero, villain):
+    # A dict, not two plain variables — defer evaluates its arguments
+    # immediately, so a plain integer/string captured here would freeze at
+    # its value right now. A dict is a reference: defer captures the
+    # reference immediately, but print_summary still sees every mutation
+    # made to it right up until the moment this function actually returns.
+    result = {"rounds": 0, "winner": "nobody"}
+    defer print_summary(result)
+
+    for round_num in 1..30:
+        villain = battle_round(hero, villain, round_num)
+        result["rounds"] = round_num
+        if !is_alive(villain):
+            result["winner"] = hero.name
+            break
+
+        hero = battle_round(villain, hero, round_num)
+        result["rounds"] = round_num
+        if !is_alive(hero):
+            result["winner"] = villain.name
+            break
+
+    return result["winner"]
+
+random.seed(42)   # drop this line for a different battle every run
+
+hero = Character("Aria", 120, 15)
+villain = Character("Grothak", 100, 12)
+
+print(status_line(hero) |> string.upper())
+print(status_line(villain) |> string.upper())
+
+hero_special = make_special_attack(hero, 5)
+special_damage = hero_special()
+hero_name = hero.name
+print("{hero_name}'s special attack would deal {special_damage} damage.")
+print("")
+
+winner_name = run_battle(hero, villain)
+
+print("")
+print("{winner_name} is victorious!")

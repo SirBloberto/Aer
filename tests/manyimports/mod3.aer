@@ -1,0 +1,2 @@
+function val3():
+    return 3

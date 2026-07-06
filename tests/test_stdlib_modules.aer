@@ -1,0 +1,221 @@
+#!/usr/bin/env aer
+# AER test suite — standard library (math, random, string, time),
+# file-based imports, and the io module.
+# Machine-checked via assert(): a clean run exits 0; any failure prints
+# "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
+
+# ------------------------------------------------------------------ #
+# 25. Standard library — math, sort, random                           #
+# ------------------------------------------------------------------ #
+
+import math
+import random
+
+assert(math.sqrt(16.0) == 4, "math.sqrt")
+assert(math.pow(2, 10) == 1024, "math.pow")
+assert(math.floor(3.7) == 3, "math.floor")
+assert(math.ceil(3.2) == 4, "math.ceil")
+assert(math.abs(-5) == 5, "math.abs on an integer")
+assert(math.abs(-5.5) == 5.5, "math.abs on a real")
+assert(math.min(3, 7) == 3, "math.min")
+assert(math.max(3, 7) == 7, "math.max")
+
+sorted_nums = math.sort([5, 3, 8, 1, 9, 2])
+assert(sorted_nums[0] == 1 && sorted_nums[1] == 2 && sorted_nums[5] == 9, "math.sort on numbers, ascending")
+
+sorted_words = math.sort(["banana", "apple", "cherry"])
+assert(sorted_words[0] == "apple" && sorted_words[1] == "banana" && sorted_words[2] == "cherry", "math.sort on strings, lexicographic")
+
+assert(math.sin(0) == 0, "math.sin(0)")
+assert(math.cos(0) == 1, "math.cos(0)")
+assert(math.log(1) == 0, "math.log(1) — natural log")
+assert(math.log2(8) == 3, "math.log2(8)")
+assert(math.log10(1000) == 3, "math.log10(1000)")
+assert(math.pi() > 3.14 && math.pi() < 3.15, "math.pi() is a function, not a bare module value")
+
+r = random.random()
+assert(r >= 0.0 && r < 1.0, "random.random() is in [0, 1)")
+
+ri = random.randint(1, 6)
+assert(ri >= 1 && ri <= 6, "random.randint(1, 6) is in [1, 6]")
+
+# random.seed() reseeds the RNG — the only way to prove it worked is that
+# two sequences started from the same seed agree.
+random.seed(42)
+seeded_first = random.random()
+random.seed(42)
+seeded_second = random.random()
+assert(seeded_first == seeded_second, "random.seed() makes subsequent random() calls reproducible")
+
+# sqrt(16.0) — error: stdlib functions require the module prefix once imported
+
+import string
+
+assert(string.upper("hello") == "HELLO", "string.upper")
+assert("hello" |> string.upper() == "HELLO", "pipe operator can target a module-qualified function, not just a bare name")
+assert(string.lower("HELLO") == "hello", "string.lower")
+assert(string.trim("  padded  ") == "padded", "string.trim")
+assert(string.contains("hello world", "wor"), "string.contains — match")
+assert(!string.contains("hello world", "xyz"), "string.contains — no match")
+
+split_result = string.split("a,b,c", ",")
+assert(length(split_result) == 3 && split_result[0] == "a" && split_result[2] == "c", "string.split")
+assert(string.join(["a", "b", "c"], "-") == "a-b-c", "string.join")
+
+assert(string.starts_with("hello world", "hello"), "string.starts_with — match")
+assert(!string.starts_with("hello world", "world"), "string.starts_with — no match")
+assert(string.ends_with("hello world", "world"), "string.ends_with — match")
+assert(!string.ends_with("hello world", "hello"), "string.ends_with — no match")
+assert(string.repeat("ab", 3) == "ababab", "string.repeat")
+assert(string.repeat("x", 0) == "", "string.repeat with count 0 is empty")
+assert(string.replace("foo bar foo", "foo", "baz") == "baz bar baz", "string.replace — multiple matches")
+assert(string.replace("aaa", "a", "bb") == "bbbbbb", "string.replace — replacement longer than the match")
+
+import time
+
+# Can't assert an exact value — sanity-check it's a plausible epoch second
+# count (well past 2023-11-14, the value below) rather than 0 or negative.
+assert(time.now() > 1700000000, "time.now() returns a plausible current epoch time")
+
+# Sub-second precision — two calls close together should differ by less than
+# a second (would always be exactly equal integers, or differ by whole
+# seconds only, under the old time()-based implementation).
+t_before = time.now()
+spin = 0
+for spin < 100000:
+    spin += 1
+t_after = time.now()
+assert(t_after > t_before, "time.now() has sub-second precision — a short interval still shows forward progress")
+assert(t_after - t_before < 5.0, "the same short interval measures as a small fraction of a second, not whole seconds")
+
+# strftime — a fixed, known timestamp so the formatted result is deterministic
+# regardless of when the test runs. 1700000000 is 2023-11-14 22:13:20 UTC;
+# formatted in whatever the test machine's local timezone is, so only the
+# parts that don't depend on timezone are asserted.
+formatted = time.strftime(1700000000, "%Y")
+assert(formatted == "2023", "time.strftime() formats a timestamp using a strftime-style format string")
+
+# ------------------------------------------------------------------ #
+# 26. File-based imports                                              #
+# ------------------------------------------------------------------ #
+
+# helpers.aer sits alongside this file and defines double(n), greet(name),
+# and add(a, b). import resolves it relative to this file's own directory,
+# runs it once (synchronously, at parse time), and its functions become
+# reachable as helpers.<name>(...) — call-only, same as the native modules.
+import helpers
+
+assert(helpers.double(21) == 42, "file-based import — function call")
+assert(helpers.greet("AER") == "Hello, AER!", "file-based import — string-returning function")
+assert(helpers.add(2, 3) == 5, "file-based import — a second function from the same module")
+
+# A defaulted trailing parameter works the same across a module-call boundary
+# (aer_module_call -> vm_setup_call) as it does for a same-VM call.
+assert(helpers.scale(5) == 10, "cross-module call — default parameter applies")
+assert(helpers.scale(5, 3) == 15, "cross-module call — explicit argument overrides the default, not padded with it too")
+
+# A second `import helpers` is a harmless no-op, not a re-run:
+import helpers
+assert(helpers.double(10) == 20, "re-importing the same file is a no-op, not a second execution")
+
+# A dotted import path is a directory hint only ("sub.greet" -> "sub/greet.aer")
+# — the module still binds under its own bare name, "greet".
+import sub.greet
+assert(greet.hello("AER") == "hello from sub/greet, AER", "dotted import — import sub.greet resolves sub/greet.aer and binds as 'greet'")
+
+# 9 distinct file imports — one past the module system's old hardcoded
+# 8-file cap (aer_module.c's MAX_FILE_MODULES, the lexer's own open-file
+# table, and Chunk's imported_modules array all used to cap at 8).
+import manyimports.mod1
+import manyimports.mod2
+import manyimports.mod3
+import manyimports.mod4
+import manyimports.mod5
+import manyimports.mod6
+import manyimports.mod7
+import manyimports.mod8
+import manyimports.mod9
+many_total = (mod1.val1() + mod2.val2() + mod3.val3() + mod4.val4() + mod5.val5() +
+              mod6.val6() + mod7.val7() + mod8.val8() + mod9.val9())
+assert(many_total == 45, "9 distinct file imports all work, past the old 8-file cap")
+
+# ------------------------------------------------------------------ #
+# 30. File I/O — io module (host-registered, not a native module)     #
+# ------------------------------------------------------------------ #
+
+# io is granted by the CLI host (source/main.c calls aer_io_register()),
+# not baked into the parser's native-module table like math/random/string —
+# see the README's "File I/O" section. tests/embed_smoke_test.c proves the
+# opposite case (a host that never registers it has no file access at all).
+import io
+
+scratch_path = "tests/io_scratch.txt"
+
+f, open_err = io.open(scratch_path, "w")
+assert(open_err == null, "io.open() in write mode succeeds and returns no error")
+write_result, write_err = io.write(f, "hello from AER\nsecond line")
+assert(write_err == null, "io.write() succeeds and returns no error")
+close_result, close_err = io.close(f)
+assert(close_err == null, "io.close() succeeds and returns no error")
+
+f2, open_err2 = io.open(scratch_path, "r")
+assert(open_err2 == null, "io.open() in read mode succeeds on a file just written")
+contents, read_err = io.read(f2)
+assert(read_err == null && contents == "hello from AER\nsecond line",
+       "io.read() returns exactly what was written")
+io.close(f2)
+
+missing_handle, missing_err = io.open("tests/definitely_does_not_exist.txt", "r")
+assert(missing_handle == null && missing_err != null,
+       "io.open() on a nonexistent file returns a null handle and a non-null error")
+
+# ------------------------------------------------------------------ #
+# json — encode/decode (a native module, same dispatch as math/string) #
+# ------------------------------------------------------------------ #
+
+import json
+
+assert(json.encode(null) == "null", "json.encode(null)")
+assert(json.encode(true) == "true", "json.encode(true)")
+assert(json.encode(42) == "42", "json.encode() on an integer")
+assert(json.encode("hi") == "\"hi\"", "json.encode() on a plain string")
+
+arr_json = json.encode([1, 2, "three", true, null])
+assert(arr_json == "[1,2,\"three\",true,null]", "json.encode() on a mixed array")
+
+decoded_arr, arr_err = json.decode(arr_json)
+assert(arr_err == null, "json.decode() on a well-formed array has no error")
+assert(decoded_arr[0] == 1 && decoded_arr[2] == "three" && decoded_arr[3] == true && decoded_arr[4] == null,
+       "json.decode() round-trips a mixed array exactly")
+
+dict_json = json.encode({"a": 1})
+decoded_dict, dict_err = json.decode(dict_json)
+assert(dict_err == null && decoded_dict["a"] == 1, "json.encode()/decode() round-trips a plain dict as a JSON object")
+
+# A struct instance encodes as a JSON object keyed by its field names, not
+# as a bare positional array — the distinction called out in the plan: a
+# struct is structurally a dict on the wire, so it decodes back as one
+# (AER has no way to know which struct type a plain JSON object came from).
+struct JsonPoint:
+    x
+    y
+
+point = JsonPoint(3, 4)
+point_json = json.encode(point)
+assert(point_json == "\{\"x\":3,\"y\":4}", "json.encode() encodes a struct instance as a JSON object using its field names")
+
+decoded_point, point_err = json.decode(point_json)
+assert(point_err == null && decoded_point["x"] == 3 && decoded_point["y"] == 4,
+       "json.decode() reads a struct-shaped JSON object back as a plain dict")
+
+# Escaping — quotes, backslashes, and control characters all round-trip.
+escaped = json.encode("line1\nline2\t\"quoted\"")
+decoded_str, str_err = json.decode(escaped)
+assert(str_err == null && decoded_str == "line1\nline2\t\"quoted\"", "json.encode()/decode() round-trips escaped characters exactly")
+
+# Malformed input reports an error instead of aborting the script, matching
+# every other fallible stdlib function's (value, err) convention.
+bad_value, bad_err = json.decode("[1, 2,")
+assert(bad_value == null && bad_err != null, "json.decode() on malformed input returns (null, error) rather than crashing")
+
+print("test_stdlib_modules.aer: all assertions passed.")

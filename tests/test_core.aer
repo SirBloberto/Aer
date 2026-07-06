@@ -1,0 +1,345 @@
+#!/usr/bin/env aer
+# AER test suite — core language mechanics: types, arithmetic, strings,
+# comparisons/logic, bitwise, casting, control flow, all `for` forms,
+# break/continue, and truthiness rules.
+# Machine-checked via assert(): a clean run exits 0; any failure prints
+# "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
+
+# ------------------------------------------------------------------ #
+# 1. Types and null                                                   #
+# ------------------------------------------------------------------ #
+
+n = null
+b = true
+i = 42
+r = 3.14
+s = "hello"
+
+assert(n == null, "null literal")
+assert(b == true, "boolean literal true")
+assert(false == false, "boolean literal false")
+assert(i == 42, "integer literal")
+assert(r == 3.14, "real literal")
+assert(s == "hello", "string literal")
+
+assert(n == null, "null equals null")
+assert(!(n != null), "null != null is false")
+assert(!(null == false), "null does not equal a different type")
+assert(null == null, "null == null is true")
+
+# ------------------------------------------------------------------ #
+# 2. Arithmetic                                                       #
+# ------------------------------------------------------------------ #
+
+assert(5 + 3 * 2 == 11, "precedence: * before +")
+assert(10 / 3 > 3.33 && 10 / 3 < 3.34, "true division always returns real")
+assert(10 // 3 == 3, "floor division")
+assert(-7 // 2 == -4, "floor division floors toward -inf, not toward zero")
+assert(10 % 3 == 1, "modulo")
+assert(2 + 2 == 4, "addition")
+assert(1 + 2.5 == 3.5, "integer promoted to real when mixed")
+
+# ------------------------------------------------------------------ #
+# 3. Strings — interpolation, escapes, indexing, slicing               #
+# ------------------------------------------------------------------ #
+
+name = "Robert"
+age  = 30
+assert("Hello {name}, you are {age} years old" == "Hello Robert, you are 30 years old", "string interpolation")
+
+path = "C:\\Users\\{name}"
+assert(path == "C:\\Users\\Robert", "backslash escape plus interpolation")
+
+assert("col1\tcol2" == "col1" + "\t" + "col2", "tab escape")
+assert("line1\nline2" == "line1" + "\n" + "line2", "newline escape")
+assert("say \"hi\"" == "say " + "\"" + "hi" + "\"", "escaped double quote")
+assert("use \{name} to interpolate" == "use " + "\{" + "name}" + " to interpolate", "escaped brace suppresses interpolation")
+
+# Interpolating an array/dict used to fall back to a terse
+# "<array[3]>"/"<dict[2]>" placeholder (vm_to_str's fixed-size buffer
+# couldn't hold recursive, unbounded content) even though print() already
+# rendered full contents recursively — now both go through the same
+# formatter (vm_format_value), so interpolation matches print() exactly.
+# (The struct case of this same fix is exercised in test_memory_gc.aer's
+# GC section, not here — see that file's comment for why.)
+interp_arr = [1, 2, "three"]
+assert("arr is {interp_arr}" == "arr is [1, 2, \"three\"]", "interpolating an array shows its contents, not a placeholder")
+
+interp_dict = {"a": 1}
+assert("dict is {interp_dict}" == "dict is \{\"a\": 1}", "interpolating a dict shows its contents, not a placeholder")
+
+# String comparison
+assert("abc" == "abc", "string equality")
+assert(!("abc" == "xyz"), "string inequality via ==")
+assert("abc" != "xyz", "string inequality via !=")
+
+# Strings are indexable — a single character is just a length-1 string
+word = "hello"
+assert(word[0] == "h", "string indexing")
+assert(word[-1] == "o", "negative string indexing")
+
+# Strings are sliceable — same [a:b], [a:], [:b], [:] forms as arrays
+assert(word[1:3] == "el", "string slice [a:b]")
+assert(word[2:] == "llo", "string slice [a:]")
+assert(word[:2] == "he", "string slice [:b]")
+assert(word[:] == "hello", "string slice [:] copies the whole string")
+
+# Strings are iterable
+chars = []
+for ch in "abc":
+    append(chars, ch)
+assert(length(chars) == 3 && chars[0] == "a" && chars[1] == "b" && chars[2] == "c", "string iteration yields one character at a time, in order")
+
+# Strings are immutable
+# word[0] = "H"   # would error: Strings are immutable
+
+# Multi-line strings — triple-quoted, raw newlines allowed, no escaping needed for "
+block = """line one
+line two with a "quote" in it
+line three"""
+expected_block = "line one\nline two with a \"quote\" in it\nline three"
+assert(block == expected_block, "triple-quoted strings preserve raw newlines and need no escaping for a bare quote")
+
+# ------------------------------------------------------------------ #
+# 4. Comparisons and logic                                            #
+# ------------------------------------------------------------------ #
+
+assert(1 < 2, "less than")
+assert(2 >= 2, "greater-or-equal")
+assert(1 == 1, "equal")
+assert(1 != 2, "not equal")
+assert((true && false) == false, "logical and")
+assert((true || false) == true, "logical or")
+assert(!false, "logical not")
+
+# && and || short-circuit — RHS is only evaluated if needed
+x = null
+short_circuit_result = "unset"
+if x != null && x == 42:    # safe: x==42 never runs when x is null
+    short_circuit_result = "found"
+else:
+    short_circuit_result = "safe"
+assert(short_circuit_result == "safe", "&& short-circuits before a null index/compare runs")
+
+# || short-circuit: second side skipped when first is true
+boom_called = false
+function boom():
+    boom_called = true
+    return false
+short_circuited = false
+if true || boom():
+    short_circuited = true
+assert(short_circuited && !boom_called, "|| short-circuits, boom() never called")
+
+# in — membership test for arrays and dicts
+nums = [1, 2, 3]
+assert(2 in nums, "value membership in an array")
+assert(!(9 in nums), "value not in an array")
+
+scores = {"alice": 95, "bob": 87}
+assert("alice" in scores, "key membership in a dict")
+assert(!("carol" in scores), "key not in a dict")
+
+# ------------------------------------------------------------------ #
+# 5. Bitwise                                                          #
+# ------------------------------------------------------------------ #
+
+assert((0xFF & 0x0F) == 15, "bitwise and")
+assert(0xFF == 255, "hex literal")
+assert(0x1A == 26, "hex literal")
+assert((1 | 2) == 3, "bitwise or")
+assert((3 ^ 1) == 2, "bitwise xor")
+assert(~0 == -1, "bitwise not")
+assert((1 << 4) == 16, "left shift")
+assert((16 >> 2) == 4, "right shift")
+
+# Bitwise compound assigns
+v = 0xFF
+v &= 0x0F
+assert(v == 15, "&= compound assign")
+
+v = 0
+v |= 3
+assert(v == 3, "|= compound assign")
+
+v = 7
+v ^= 2
+assert(v == 5, "^= compound assign")
+
+v = 1
+v <<= 3
+assert(v == 8, "<<= compound assign")
+
+v = 16
+v >>= 2
+assert(v == 4, ">>= compound assign")
+
+# ------------------------------------------------------------------ #
+# 6. `as` — type casting                                               #
+# ------------------------------------------------------------------ #
+
+assert(("42" as integer) == 42, "string to integer cast")
+assert((42 as float) == 42, "integer to real cast (compares equal via promotion)")
+assert((42 as string) == "42", "integer to string cast")
+assert((3.7 as integer) == 3, "real to integer cast truncates, does not round")
+assert((0 as boolean) == false, "0 casts to false")
+assert((1 as boolean) == true, "nonzero casts to true")
+assert(("" as boolean) == false, "empty string casts to false")
+
+# `as` binds tighter than arithmetic — reads as (x as integer) + 1
+assert("10" as integer + 1 == 11, "'as' binds tighter than +")
+
+# ------------------------------------------------------------------ #
+# 7. If / else — block form, plus the inline if-EXPRESSION              #
+# ------------------------------------------------------------------ #
+
+x = 7
+size_label = "unset"
+
+# Statements only ever use the block form — no same-line shortcut.
+if x > 5:
+    size_label = "big"
+else:
+    size_label = "small"
+assert(size_label == "big", "if/else block form")
+
+# The inline if-EXPRESSION is a different capability (it produces a value,
+# which the statement form can't) and is unaffected by that rule:
+abs_x = if x >= 0: x else: -x
+assert(abs_x == 7, "inline if-expression")
+
+label = if x % 2 == 0: "even" else: "odd"
+assert(label == "odd", "inline if-expression, else branch")
+
+# Inline with no else branch — evaluates to null
+maybe = if false: "yes"
+assert(maybe == null, "inline if-expression with no else evaluates to null")
+
+# ------------------------------------------------------------------ #
+# 8. For — while form                                                  #
+# ------------------------------------------------------------------ #
+
+i = 0
+for i < 5:
+    i += 1
+assert(i == 5, "while-form for loop")
+
+# A while-form condition starting with an identifier is a postfix chain
+# (field access, index, call), not just a bare name or a binary expression —
+# parse_for's fast path for this case only handled the bare-name/binary
+# case, so 'for current.next:' failed with a confusing "expected ':' after
+# while condition" pointing at the '.'. Common in linked-list-style
+# traversal: `for cur != null: ... cur = cur.next`.
+struct LoopLinkNode:
+    value
+    next
+lln3 = LoopLinkNode(3, null)
+lln2 = LoopLinkNode(2, lln3)
+lln1 = LoopLinkNode(1, lln2)
+llcur = lln1
+llwalked = []
+for llcur != null:
+    append(llwalked, llcur.value)
+    llcur = llcur.next
+assert(length(llwalked) == 3 && llwalked[0] == 1 && llwalked[1] == 2 && llwalked[2] == 3,
+       "while-form for loop whose condition is a field/postfix chain (linked-list traversal)")
+
+llcur2 = lln1
+llcount = 0
+for llcur2.next:
+    llcount += 1
+    llcur2 = llcur2.next
+assert(llcount == 2, "while-form for loop condition can be a bare field access with no comparison operator")
+
+# Compound assigns
+i = 10
+i -= 3
+assert(i == 7, "-= compound assign")
+i *= 2
+assert(i == 14, "*= compound assign")
+i //= 3
+assert(i == 4, "//= compound assign")
+i %= 3
+assert(i == 1, "%= compound assign")
+
+# ------------------------------------------------------------------ #
+# 9. For — range                                                       #
+# ------------------------------------------------------------------ #
+
+ascending = []
+for i in 0..5:
+    append(ascending, i)
+assert(length(ascending) == 5 && ascending[0] == 0 && ascending[4] == 4, "range 0..5 yields 0,1,2,3,4 in order")
+
+descending = []
+for i in 5..0:
+    append(descending, i)
+assert(length(descending) == 5 && descending[0] == 5 && descending[4] == 1, "range auto-reverses when start > end")
+
+# ------------------------------------------------------------------ #
+# 10. For — array iteration                                            #
+# ------------------------------------------------------------------ #
+
+fruits = ["apple", "banana", "cherry"]
+visited_fruits = []
+for fruit in fruits:
+    append(visited_fruits, fruit)
+assert(length(visited_fruits) == 3 && visited_fruits[0] == "apple" && visited_fruits[1] == "banana" && visited_fruits[2] == "cherry", "array iteration visits every element in order")
+
+# ------------------------------------------------------------------ #
+# 11. For — dict iteration                                             #
+# ------------------------------------------------------------------ #
+
+scores2 = {"alice": 95, "bob": 87, "carol": 92}
+
+key_count = 0
+for name2 in scores2:
+    assert(name2 in scores2, "each iterated key is really a key of the dict")
+    key_count += 1
+assert(key_count == 3, "dict key iteration visits every entry exactly once")
+
+pair_count = 0
+for name2, score in scores2:
+    assert(scores2[name2] == score, "iterated value matches a direct lookup by the iterated key")
+    pair_count += 1
+assert(pair_count == 3, "dict pair iteration visits every entry exactly once")
+
+# ------------------------------------------------------------------ #
+# 12. Break and continue                                               #
+# ------------------------------------------------------------------ #
+
+kept = []
+for i in 0..10:
+    if i % 2 == 0:
+        continue
+    if i > 7:
+        break
+    append(kept, i)
+assert(length(kept) == 4 && kept[0] == 1 && kept[1] == 3 && kept[2] == 5 && kept[3] == 7, "continue skips even numbers, break stops once i > 7")
+
+# ------------------------------------------------------------------ #
+# 24. Truthiness rules                                                 #
+# ------------------------------------------------------------------ #
+
+# Falsy: null, false, 0, 0.0, "", [], {}
+# Truthy: everything else
+
+function truthy(v):
+    return if v: "truthy" else: "falsy"
+
+assert(truthy(null) == "falsy", "null is falsy")
+assert(truthy(false) == "falsy", "false is falsy")
+assert(truthy(0) == "falsy", "integer 0 is falsy")
+assert(truthy(0.0) == "falsy", "real 0.0 is falsy")
+assert(truthy("") == "falsy", "empty string is falsy")
+assert(truthy([]) == "falsy", "empty array is falsy")
+assert(truthy({}) == "falsy", "empty dict is falsy")
+
+assert(truthy(true) == "truthy", "true is truthy")
+assert(truthy(1) == "truthy", "nonzero integer is truthy")
+assert(truthy(-1) == "truthy", "negative integer is truthy")
+assert(truthy("x") == "truthy", "non-empty string is truthy")
+assert(truthy([0]) == "truthy", "non-empty array is truthy, even [0]")
+assert(truthy({"a": 1}) == "truthy", "non-empty dict is truthy")
+
+print("test_core.aer: all assertions passed.")

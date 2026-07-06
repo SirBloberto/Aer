@@ -1,0 +1,45 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Run test suite (tests/test_*.aer — assert()-based, exits nonzero on any failure)
+        run: make test
+
+      - name: Run embedding smoke test
+        run: make test-embed
+
+      # Fixed seed for reproducibility — see tests/fuzz.py's docstring on why
+      # an unseeded run occasionally reports a non-actionable "hang" from a
+      # seed fixture's own recursive logic, not an AER defect.
+      - name: Fuzz (ASAN build, fixed seed)
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "## Fuzz results (ASAN, seed 100)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          make fuzz 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Code coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "## Code coverage" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          make coverage 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-gcov
+          path: object-cov/*.gcov

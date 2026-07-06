@@ -1,0 +1,15 @@
+#!/usr/bin/env aer
+# Exercises io.stdin() — must be invoked with piped input, not run bare
+# (see the makefile's `test` target, which pipes a known string into it).
+# Kept separate from the other test_*.aer files since piping stdin is a
+# shell-level concern the assert-based suite can't arrange for itself.
+
+import io
+
+h = io.stdin()
+contents, err = io.read(h)
+assert(err == null, "io.read(io.stdin()) succeeds on piped input")
+assert(contents == "expected stdin content\n",
+       "io.stdin() reads exactly what was piped in, through the same io.read() call site as a regular file")
+
+print("test_stdin.aer: all assertions passed.")

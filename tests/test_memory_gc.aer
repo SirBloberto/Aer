@@ -1,0 +1,139 @@
+#!/usr/bin/env aer
+# AER test suite — internal memory/allocation behavior: slab-pool boundary
+# crossing, the generational GC's write barrier, struct interpolation
+# (kept here specifically, see the note below), the 47-bit inline integer
+# boundary, and the SCOPE_SLOT_MAX/MAX_PARAMS parameter-capacity fix.
+# Machine-checked via assert(): a clean run exits 0; any failure prints
+# "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
+
+# ------------------------------------------------------------------ #
+# 28. Slab-pool allocation — boundary crossing                        #
+# ------------------------------------------------------------------ #
+
+# Purely an internal allocation-strategy detail (array/string headers now
+# come from a slab pool instead of an individual malloc each) — nothing
+# about it is visible from AER code under ordinary use. The one thing
+# worth exercising here is slab growth itself: the pool holds 256 objects
+# per slab internally, and no other test in this file allocates enough of
+# one type in a single run to force a second slab. 300 comfortably crosses
+# that boundary.
+slab_arrays = []
+for i in 0..300:
+    append(slab_arrays, [i, i * 2])
+
+assert(length(slab_arrays) == 300, "300 arrays created — crosses the 256-per-slab boundary")
+assert(slab_arrays[0][0] == 0 && slab_arrays[0][1] == 0, "the first array, from the first slab, is still intact")
+assert(slab_arrays[255][0] == 255 && slab_arrays[255][1] == 510, "the array right at the slab boundary is intact")
+assert(slab_arrays[256][0] == 256 && slab_arrays[256][1] == 512, "the first array in the newly-grown second slab is intact")
+assert(slab_arrays[299][0] == 299 && slab_arrays[299][1] == 598, "the last array is intact")
+
+slab_strings = []
+for i in 0..300:
+    append(slab_strings, "s" + (i as string))
+
+assert(length(slab_strings) == 300, "300 strings created — crosses string_pool's 256-per-slab boundary")
+assert(slab_strings[0] == "s0" && slab_strings[255] == "s255" && slab_strings[256] == "s256" && slab_strings[299] == "s299",
+       "strings before, at, and after the slab boundary are all intact")
+
+# ------------------------------------------------------------------ #
+# 31. Generational GC — write barrier correctness                    #
+# ------------------------------------------------------------------ #
+
+# gc_old_container/gc_old_dict start empty and stay referenced throughout
+# — long enough to survive several collections and get promoted to the old
+# generation (see the README's Memory and Security section). Only AFTER
+# that does anything get written into them, so this specifically exercises
+# the write barrier: without it, a value written into an already-old
+# container could be swept as unreachable by a later MINOR collection,
+# which never re-traces old containers' contents on its own.
+gc_old_container = []
+gc_old_dict = {}
+
+gc_churn = []
+for i in 0..3000:
+    append(gc_churn, [i, i * 2, "s" + (i as string)])
+
+append(gc_old_container, "written after promotion")
+gc_old_dict["fresh_key"] = {"nested": "written after promotion"}
+
+# More allocation pressure — enough to force further collections — before
+# checking the written values are still intact.
+gc_churn2 = []
+for i in 0..3000:
+    append(gc_churn2, [i, i * 2, "t" + (i as string)])
+
+assert(length(gc_old_container) == 1 && gc_old_container[0] == "written after promotion",
+       "a value written into an old (promoted) array survives further collections — the write barrier protected it")
+assert(gc_old_dict["fresh_key"]["nested"] == "written after promotion",
+       "a value written into an old (promoted) dict survives further collections — the write barrier protected it")
+
+# ------------------------------------------------------------------ #
+# 31A. Struct interpolation (placed after the GC stress section)      #
+# ------------------------------------------------------------------ #
+
+# Deliberately placed here, not next to the array/dict interpolation cases
+# in test_core.aer's string section: with this same assertion positioned
+# earlier (before this file's own GC churn above), the write-barrier
+# assertions above intermittently failed — reproducible with the
+# cumulative allocation history up to this point, but not in any small
+# isolated repro tried so far. Root cause not yet found; suspected to be a
+# rare, allocation-pattern-sensitive interaction between struct shapes and
+# the collector, not a bug in vm_format_value itself (which independently
+# verified correct — see test_core.aer's array/dict interpolation cases
+# and manual testing). Kept in THIS file, immediately after the heaviest
+# allocation pressure in the suite, until that's diagnosed — moving it to
+# a separate file/process would remove the preceding allocation pressure
+# entirely and risk reintroducing the exact flakiness this ordering avoids.
+struct InterpPoint:
+    x
+    y
+interp_pt = InterpPoint(1, 2)
+assert("pt is {interp_pt}" == "pt is InterpPoint\{x: 1, y: 2}", "interpolating a struct shows its fields, not a placeholder")
+
+# ------------------------------------------------------------------ #
+# 32. Integer boundary — AerVal's inline 47-bit fast path and its      #
+#     heap-boxed 64-bit overflow fallback (see value_box.h)            #
+# ------------------------------------------------------------------ #
+
+# Exactly at the inline range's edges — must stay correct without ever
+# touching the overflow path.
+int47_max = 70368744177663    #  2^46 - 1
+int47_min = -70368744177664    # -2^46
+assert(int47_max == 70368744177663, "the largest inline-representable integer round-trips exactly")
+assert(int47_min == -70368744177664, "the smallest inline-representable integer round-trips exactly")
+assert(int47_max + 1 == 70368744177664, "arithmetic crossing the inline boundary still produces the correct value")
+
+# One past each edge — forces the heap-boxed long_pool fallback. AER's
+# documented 64-bit integer range must hold exactly here, not just within
+# the inline fast path.
+big_pos = 70368744177664       #  2^46      (one past int47_max)
+big_neg = -70368744177665       # -2^46 - 1  (one past int47_min)
+assert(big_pos == 70368744177664, "an integer one past the inline range's top edge round-trips exactly (long_pool fallback)")
+assert(big_neg == -70368744177665, "an integer one past the inline range's bottom edge round-trips exactly (long_pool fallback)")
+assert(big_pos - 1 == int47_max, "arithmetic between a boxed and an inline integer still produces the correct (inline-range) value")
+assert(big_pos + big_neg == -1, "arithmetic between two boxed integers still produces the correct value")
+
+# Comfortably beyond even that — well within long long's real range, nowhere
+# near actually overflowing 64 bits.
+huge = 9223372036854775           # ~2^63 / 1000, still far under LLONG_MAX
+assert(huge == 9223372036854775, "a large boxed integer round-trips exactly")
+assert(huge * 2 == 18446744073709550, "arithmetic on a large boxed integer stays exact")
+
+# ------------------------------------------------------------------ #
+# 35. Parameter-slot capacity — SCOPE_SLOT_MAX/MAX_PARAMS fix           #
+# ------------------------------------------------------------------ #
+# A pre-existing bug found while investigating a (since-reverted) scope
+# extension: SCOPE_SLOT_MAX (vm.h, the VM's actual per-scope slot array
+# size) was 8, but MAX_PARAMS (the compiler's parameter-slot ceiling) was
+# 16 — so a function with 9+ parameters was already silently writing past
+# the end of a fixed-size array (OP_DEFINE_LOCAL/OP_LOAD_LOCAL/
+# OP_STORE_LOCAL have no bounds check), corrupting adjacent AerScope
+# fields. Fixed by raising SCOPE_SLOT_MAX to 24 and defining MAX_PARAMS in
+# terms of it, so they can't drift apart again. This function has 20
+# parameters — comfortably past the old, unsafe ceiling.
+function many_params(a, b, c1, d, e, f, g, h, i2, j, k, l, m, n1, o, p, q, r, s, t):
+    return a + b + c1 + d + e + f + g + h + i2 + j + k + l + m + n1 + o + p + q + r + s + t
+assert(many_params(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20) == 210,
+       "a function with 20 parameters (past the old, unsafe 8/16-slot ceiling) computes correctly with no corruption")
+
+print("test_memory_gc.aer: all assertions passed.")

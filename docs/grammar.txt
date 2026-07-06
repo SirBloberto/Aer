@@ -1,0 +1,259 @@
+# AER Grammar
+# Notation: * = zero or more, + = one or more, ? = optional, | = alternative
+# UPPER = terminal/token, lower = rule
+
+# ------------------------------------------------------------------ #
+# Tokens                                                               #
+# ------------------------------------------------------------------ #
+
+digit      = '0'..'9'
+alpha      = 'a'..'z' | 'A'..'Z' | '_'
+integer    = digit+ | '0x' hex_digit+
+hex_digit  = digit | 'a'..'f' | 'A'..'F'
+real       = digit+ '.' digit+
+boolean    = 'true' | 'false'
+null       = 'null'
+string     = '"' (escape | '{' identifier '}' | char)* '"'
+           | '"""' (any char, including raw newlines, until '"""')*  '"""'   # multi-line
+escape     = '\n' | '\t' | '\\' | '\"' | '\{'
+identifier = alpha (alpha | digit)*
+comment    = '#' (any char except newline)*
+
+# ------------------------------------------------------------------ #
+# Program structure                                                    #
+# ------------------------------------------------------------------ #
+
+program    = statement* EOF
+
+block      = NEWLINE INDENT statement+ DEDENT
+
+statement  = if_stmt
+           | for_stmt
+           | struct_stmt
+           | function_stmt
+           | return_stmt
+           | break_stmt
+           | continue_stmt
+           | import_stmt
+           | module_call_stmt
+           | assign_stmt
+
+# ------------------------------------------------------------------ #
+# Statements                                                           #
+# ------------------------------------------------------------------ #
+
+if_stmt       = 'if' expression ':' block ('else' ':' block)?
+              # block form only — no same-line single-statement shortcut.
+              # (Contrast with the inline if EXPRESSION under `primary`
+              # below, which is a distinct capability — it produces a
+              # value — not a layout variant of this statement.)
+
+for_stmt      = 'for' expression ':' block                                 # while
+              | 'for' identifier 'in' expression ':' block                 # for-each array/dict/string
+              | 'for' identifier 'in' expression '..' expression ':' block # range
+              | 'for' identifier ',' identifier 'in' expression ':' block  # dict key-value pair
+
+import_stmt   = 'import' identifier NEWLINE
+              # top-level only — a parse error inside a function/loop/if
+              # block, since a file-based import (see below) executes the
+              # imported file synchronously during parsing, reusing the
+              # same global lexer/parser state a nested block would also
+              # need. Binds `identifier` as a module name for the rest of
+              # this file or REPL session — not a scope variable, never a
+              # runtime value. "math", "random", "string" are hardcoded
+              # native modules (aer_stdlib.c); any other name is resolved
+              # as `identifier`.aer in the importing file's own directory,
+              # read/parsed/run via an isolated Chunk+VM (aer_module.c) —
+              # a parse-time error if the file doesn't exist, fails to
+              # parse, errors while running, or forms an import cycle.
+
+module_call_stmt = identifier '.' identifier '(' arg_list? ')' NEWLINE
+              # only valid when the first identifier names a previously
+              # imported module — resolved entirely at parse time, compiled
+              # directly to OP_CALL_MODULE. Also reachable as an expression,
+              # see module_call under `primary` below.
+
+struct_stmt   = 'struct' identifier ':' NEWLINE INDENT field_decl+ DEDENT
+
+field_decl    = identifier ('=' literal)? NEWLINE     # default is optional; omitted = null
+
+literal       = ('-')? (integer | real) | boolean | null | string
+              # struct field defaults must be a literal — no arbitrary expressions
+
+function_stmt = 'function' identifier '(' param_list? ')' ':' block
+              # block form only, same as if_stmt — no same-line shortcut.
+              # A function_stmt inside another function_stmt's block is
+              # still a parse error, regardless — named functions never
+              # nest. Use function_expr (below) for a nested, capturing
+              # function value instead.
+
+function_expr = 'function' '(' param_list? ')' ':' block
+              # an anonymous function VALUE, used as an expression (see
+              # primary below) rather than a top-level declaration — can be
+              # assigned, returned, or passed as an argument. May be nested
+              # inside another function's body (that's the only way to
+              # create a closure), and — only one level deep — may capture
+              # variables from its directly-enclosing function by reference.
+              # A function_expr nested inside an already-nested function_expr
+              # can still be created but won't capture; an outer-variable
+              # reference inside it fails at runtime with 'not defined'.
+
+param_list    = param (',' identifier)*
+param         = identifier ('as' identifier)?
+              # 'as Type' is only meaningful (and only parsed) on the FIRST
+              # parameter — a struct-typed receiver, enforced at every call
+              # site against the argument's actual shape
+
+return_stmt   = 'return' expr_list? NEWLINE
+
+break_stmt    = 'break' NEWLINE
+
+continue_stmt = 'continue' NEWLINE
+
+assign_stmt   = identifier '(' arg_list? ')' NEWLINE                             # call as statement
+              | identifier target_step+ '=' expression NEWLINE                  # index/field assignment (chainable, mixed)
+              | identifier compound_op expression NEWLINE                       # compound assign (not valid on a target_step chain)
+              | identifier '=' expr_list NEWLINE                                # assignment
+              | identifier ',' identifier+ '=' expr_list NEWLINE                # destructuring
+
+target_step   = '[' expression ']'          # index into an array or dict
+              | '.' identifier              # struct field
+
+compound_op   = '+=' | '-=' | '*=' | '/=' | '%=' | '//='
+              | '<<=' | '>>=' | '&=' | '|=' | '^='
+
+expr_list     = expression (',' expression)*
+
+# ------------------------------------------------------------------ #
+# Expressions                                                          #
+# ------------------------------------------------------------------ #
+
+# Precedence (lowest to highest):
+#   ||  |>   &&   |   ^   &   == !=   < > <= >= in   << >>   + -   * / % //   as
+
+expression    = binary
+
+binary        = unary (binary_tail)*
+
+binary_tail   = binary_op unary
+              | '|>' identifier '(' arg_list? ')'
+                # x |> f(args) desugars to f(x, args). Enforced: arg_list here
+                # may not contain a function call at ANY nesting depth
+                # (including a nested pipe's own call) — keeps a pipe chain a
+                # flat, readable sequence instead of hiding calls in calls.
+              | 'as' identifier
+                # x as T. If T is 'integer'/'float'/'string'/'boolean', this
+                # coerces the value. Otherwise T is treated as a struct type
+                # name and this becomes a runtime shape check: errors unless
+                # x is exactly a struct instance of type T, otherwise passes
+                # x through unchanged. It never converts one struct shape
+                # into another — there's no single well-defined way to do
+                # that. Binds tighter than every other operator, so
+                # `x as integer + 1` reads as `(x as integer) + 1`.
+
+binary_op     = '||' | '&&'
+              | '|'  | '^'  | '&'
+              | '==' | '!='
+              | '<'  | '>'  | '<=' | '>=' | 'in'
+              | '<<' | '>>'
+              | '+'  | '-'
+              | '*'  | '/'  | '%'  | '//'
+
+unary         = ('!' | '~' | '-') unary
+              | primary
+
+primary       = null
+              | boolean
+              | integer
+              | real
+              | string
+              | module_call                                      # only if identifier is an imported module
+              | identifier postfix*
+              | '(' expression ')'
+              | '[' arg_list? ']'                               # array literal
+              | '{' dict_pairs? '}'                              # dict literal
+              | 'if' expression ':' expression ('else' ':' expression)?   # inline if
+              | function_expr                                   # anonymous function value
+
+module_call   = identifier '.' identifier '(' arg_list? ')'
+              # the expression form of module_call_stmt above — same
+              # parse-time resolution, usable anywhere a value is expected
+
+postfix       = '(' arg_list? ')'
+              # call — resolved at runtime as, in order: a scope variable
+              # holding a function, a builtin, or (if the name matches
+              # neither) a struct instantiation, e.g. Point(1, 2)
+              | '[' index_or_slice ']'
+              | '.' identifier                                  # struct field get
+
+index_or_slice = expression                                     # arr[i] / dict["k"] — struct instances reject this, use '.'
+               | expression? ':' expression?                    # slice: [a:b] [a:] [:b] [:] — struct instances reject this too
+
+arg_list      = expression (',' expression)*
+
+dict_pairs    = expression ':' expression (',' expression ':' expression)*
+
+# ------------------------------------------------------------------ #
+# Types                                                                #
+# ------------------------------------------------------------------ #
+
+# null      — the absence of a value
+# boolean   — true | false
+# integer   — long long
+# real      — double-precision float
+# string    — UTF-8 byte sequence, immutable, indexable/sliceable/iterable, interpolation and escape support
+# function  — first-class callable with arity; optionally a struct-typed receiver on parameter 0;
+#             a function_expr nested one level inside another function may also be a closure,
+#             holding boxed references to variables it captured from its enclosing function
+# array     — mutable ordered sequence with reference semantics; bracket-indexed, sliceable
+# dict      — mutable string-keyed hash table with reference semantics; bracket-indexed (string keys only)
+# struct instance — a fixed-shape array with a declared name and field list (see struct_stmt);
+#                    dot-accessed only — bracket indexing, slicing, append(), and delete() are all
+#                    rejected on a struct instance, keeping structs and collections isolated
+
+# ------------------------------------------------------------------ #
+# Built-in functions                                                   #
+# ------------------------------------------------------------------ #
+
+# length(x)          — length of array, dict, or string
+# append(arr, val)   — append val to array, returns array (rejects struct instances)
+# delete(dict, key)  — remove string key from dict, returns dict
+# delete(arr, index) — remove element at index (negative indices allowed), shifting
+#                       subsequent elements down to preserve order; returns array
+#                       (rejects struct instances — see above)
+# print(x)           — print a value followed by a newline, returns null
+# type(x)            — type name as a string; struct instances report their declared name (e.g. "Point")
+
+# Membership ('in'), casting/shape-checking ('as'), and pipelining ('|>')
+# are language operators, not builtin functions — see the precedence
+# table above.
+
+# ------------------------------------------------------------------ #
+# Standard library                                                     #
+# ------------------------------------------------------------------ #
+
+# Not core builtins — require `import` (see import_stmt above) and are
+# dispatched separately (source/core/aer_stdlib.c, not vm.c's lbl_call
+# core-builtin chain). Only two hardcoded native modules exist:
+
+# import math
+#   math.sqrt(x)        — square root, always returns a real
+#   math.pow(x, y)      — x to the power of y, always returns a real
+#   math.floor(x)       — round toward negative infinity, returns an integer
+#   math.ceil(x)        — round toward positive infinity, returns an integer
+#   math.abs(x)         — absolute value, preserves integer/real
+#   math.min(a, b)      — the smaller of two numbers, preserves whichever argument's type
+#   math.max(a, b)      — the larger of two numbers, preserves whichever argument's type
+#   math.sort(arr)      — sorts in place (ascending) and returns the array; every element
+#                         must be a number (compared numerically) or every element must be
+#                         a string (compared lexicographically) — mixing is rejected
+# import random
+#   random.random()      — a real in [0, 1)
+#   random.randint(a, b) — an integer in [a, b], inclusive of both ends
+# import string
+#   string.upper(s)          — ASCII-only uppercase
+#   string.lower(s)          — ASCII-only lowercase
+#   string.trim(s)           — strips leading/trailing whitespace
+#   string.contains(s, sub)  — true if sub occurs anywhere in s
+#   string.split(s, sep)     — splits on a non-empty separator, returns an array
+#   string.join(arr, sep)    — joins an array of strings with sep

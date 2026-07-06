@@ -6,3 +6,20 @@
 
 #Ignore object files
 /object/*
+
+/.vscode
+
+#Scratch file written/overwritten by tests/test.aer's io round-trip test
+/tests/io_scratch.txt
+
+#REPL history, written to the cwd by start_terminal()
+/.aer_history
+
+#Failing inputs saved by tests/fuzz.py — reproductions, not fixtures to keep
+/tests/fuzz_crashes/
+
+#gcov/coverage build artifacts
+/object-cov/*
+*.gcov
+*.gcda
+*.gcno

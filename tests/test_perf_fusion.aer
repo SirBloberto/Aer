@@ -1,0 +1,270 @@
+#!/usr/bin/env aer
+# AER test suite — tail-call optimization, call-site/LOAD-STORE inline
+# caching, and compile-time opcode fusion (compound assignment and
+# array-index-get). Ground-truth coverage these optimizations must
+# reproduce exactly against the unoptimized/unfused behavior.
+# Machine-checked via assert(): a clean run exits 0; any failure prints
+# "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
+
+# ------------------------------------------------------------------ #
+# 29. Tail-call optimization                                          #
+# ------------------------------------------------------------------ #
+
+# `return name(args)` as the WHOLE statement reuses the current call frame
+# instead of pushing a new one — completing at a depth far past the
+# 64-frame call-stack limit is the direct, observable proof it fired; the
+# unoptimized path would hit "Call stack overflow" long before this.
+function count_down(n, acc):
+    if n <= 0:
+        return acc
+    return count_down(n - 1, acc + n)
+
+tco_result = count_down(100000, 0)
+assert(tco_result == 5000050000,
+       "deep self tail recursion (100,000 levels) completes — proof the frame was reused, not grown")
+
+# Mutual tail recursion — not just simple self-recursion. Guards against
+# negative n (parity of |n|) so the pair terminates for any integer input
+# instead of counting down through zero forever — found by tests/fuzz.py
+# mutating the literal below into a negative number.
+function is_even(n):
+    if n < 0:
+        return is_even(-n)
+    if n == 0:
+        return true
+    return is_odd(n - 1)
+
+function is_odd(n):
+    if n < 0:
+        return is_odd(-n)
+    if n == 0:
+        return false
+    return is_even(n - 1)
+
+assert(is_even(100000) == true, "mutual tail recursion between two functions, 100,000 levels deep")
+assert(is_odd(100001) == true, "mutual tail recursion — the other parity")
+
+# A tail-recursive function that also defers on every call: defer_count > 0
+# at each tail position disables the optimization for that call (falls back
+# to a normal, stack-growing call instead), but every deferred call must
+# still run, in the correct order, at a depth well under the 64-frame limit.
+tail_defer_log = []
+function tail_defer_test(n):
+    defer append(tail_defer_log, n)
+    if n <= 0:
+        return 0
+    return tail_defer_test(n - 1)
+
+tail_defer_test(10)
+assert(length(tail_defer_log) == 11 && tail_defer_log[0] == 0 && tail_defer_log[10] == 10,
+       "defer still fires correctly, in order, for a tail-recursive function whose own pending defers disable the optimization each call")
+
+# A call wrapped in anything else (here, `+ 0`) is NOT a tail call — proof
+# the detection doesn't over-apply. Kept shallow (well under 64) since this
+# path is deliberately not optimized.
+function not_tail(n):
+    if n <= 0:
+        return 0
+    return not_tail(n - 1) + 0
+
+assert(not_tail(20) == 0, "a call wrapped by another operator is correctly excluded from tail-call optimization")
+
+# ------------------------------------------------------------------ #
+# 29A. Call-site inline caching (a call target resolved to a global's    #
+#      address, not a snapshot of its value — see Chunk.call_cache)     #
+# ------------------------------------------------------------------ #
+
+# call_greet's call to `greet` gets cached (as an address) the first time
+# it runs. Reassigning `greet` afterward must still be visible on the next
+# call through that same cached site — proving the cache reads live state
+# every time, not a stale snapshot from whenever it was first populated.
+function greet_v1(n):
+    return "hello " + n
+function call_greet(n):
+    return greet(n)
+greet = greet_v1
+assert(call_greet("a") == "hello a", "a cached call site resolves normally before any reassignment")
+assert(call_greet("b") == "hello b", "...and again, now via the populated cache")
+
+function greet_v2(n):
+    return "goodbye " + n
+greet = greet_v2
+assert(call_greet("c") == "goodbye c", "reassigning the global after the call site is cached is still reflected immediately")
+
+# ------------------------------------------------------------------ #
+# 29B. Call-cache shadowing bug — a parameter sharing a name with an   #
+#      existing global function must keep winning on every call       #
+#      through the same call site, not just the first one before the  #
+#      cache populated (a real bug found and fixed this round: the     #
+#      cache used to populate on "a global with this name exists       #
+#      somewhere," not "the global is the winning resolution").        #
+# ------------------------------------------------------------------ #
+
+function cache_helper():
+    return "global helper"
+function cache_wrapper(cache_helper):
+    return cache_helper()
+function local_helper_1():
+    return "local helper 1"
+function local_helper_2():
+    return "local helper 2"
+
+assert(cache_wrapper(local_helper_1) == "local helper 1", "first call through the site resolves the passed-in local")
+assert(cache_wrapper(local_helper_2) == "local helper 2", "second call must still resolve the local, not a wrongly-cached global address")
+assert(cache_wrapper(cache_helper) == "global helper", "passing the global itself still works, unrelated to the cache")
+
+# ------------------------------------------------------------------ #
+# 29C. Global LOAD/STORE inline caching (Chunk.addr_cache, extended    #
+#      from call targets to plain variable access)                    #
+# ------------------------------------------------------------------ #
+
+lc_total = 0
+function lc_bump():
+    lc_total = lc_total + 1     # same LOAD/STORE site hit on every call
+    return lc_total
+for lc_i in 0..5:
+    lc_bump()
+assert(lc_total == 5, "a global read-then-written through the same cached LOAD/STORE site stays correct across repeated calls")
+
+function lc_recurse(n):
+    if n <= 0:
+        return 0
+    lc_total = lc_total + n     # same site, hit many times via recursion
+    return lc_recurse(n - 1) + 0
+lc_recurse(4)
+assert(lc_total == 15, "the same global LOAD/STORE site stays correct across recursive calls too")
+
+lc_greeting = "hello"
+function lc_say():
+    return lc_greeting           # OP_LOAD on a global, cached after the first call
+assert(lc_say() == "hello", "a cached global load resolves normally before any reassignment")
+lc_greeting = "goodbye"
+assert(lc_say() == "goodbye", "reassigning the global after the load site is cached is still reflected immediately")
+
+function lc_shadow_test(lc_total):
+    return lc_total + 100        # parameter named the same as the global — OP_LOAD_LOCAL, not addr_cache
+assert(lc_shadow_test(1) == 101, "a parameter shadowing a same-named global still resolves to the parameter")
+assert(lc_shadow_test(2) == 102, "...and again — must not read the global's cached address")
+assert(lc_total == 15, "the global itself is untouched by the shadowing parameter's own writes")
+
+# ------------------------------------------------------------------ #
+# 33. Compound assignment — ground-truth coverage before opcode        #
+#     fusion (see the opcode-fusion plan) — every shape a fused        #
+#     OP_COMPOUND_* handler must reproduce exactly, recorded against    #
+#     today's unfused 4-opcode codegen first.                          #
+# ------------------------------------------------------------------ #
+
+# NAME op= NAME — two top-level globals, neither a literal RHS (existing
+# coverage was 100% "global += literal"; this shape had zero coverage).
+ca_gt_a = 3
+ca_gt_b = 4
+ca_gt_a += ca_gt_b
+assert(ca_gt_a == 7, "NAME += NAME on two globals")
+
+# Self-referential: LHS and RHS are the same storage. A fused handler that
+# reads the RHS AFTER writing the LHS back would silently double the wrong
+# thing here — this pins down "read both operands before any write".
+ca_gt_c = 5
+ca_gt_c += ca_gt_c
+assert(ca_gt_c == 10, "NAME += itself reads before writing")
+
+# Non-simple RHS (a call) — must keep working via the ordinary, unfused
+# fallback path regardless of what fusion does elsewhere.
+function ca_one():
+    return 1
+ca_gt_d = 1
+ca_gt_d += ca_one()
+assert(ca_gt_d == 2, "compound assignment with a non-simple (call) RHS still works")
+
+# Parameter LHS (the fast OP_LOAD_LOCAL/OP_STORE_LOCAL path) with each RHS
+# kind: CONST, another parameter (LOCAL), and a global (NAME).
+ca_global_rhs = 10
+function ca_param_compound(p, q):
+    p += 1          # LOCAL += CONST
+    q += p          # LOCAL += LOCAL
+    p += ca_global_rhs   # LOCAL += NAME
+    return p, q
+ca_r1, ca_r2 = ca_param_compound(5, 100)
+assert(ca_r1 == 16, "parameter += CONST, then += NAME, accumulates correctly")
+assert(ca_r2 == 106, "parameter += another parameter (LOCAL += LOCAL)")
+
+# Ordinary NON-parameter local inside a function body — this is the "NAME,
+# not GLOBAL" case: only parameters get OP_LOAD_LOCAL; a plain local
+# declared inside the function body still goes through the same opcode a
+# true global does.
+function ca_local_compound():
+    x = 1
+    x += 1
+    return x
+assert(ca_local_compound() == 2, "a non-parameter function-local += CONST")
+
+# Closure/box aliasing: capture a parameter in a closure, THEN compound-
+# assign it in the enclosing function's own body afterward — the closure
+# must see the update. No prior test exercised compound assignment on a
+# captured variable at all.
+function ca_make_pair_compound(x):
+    getter = function():
+        return x
+    x += 10                # compound-assign AFTER the closure captured x
+    return getter, x
+ca_get_after, ca_x_after = ca_make_pair_compound(1)
+assert(ca_get_after() == 11, "a closure sees a compound assignment made to its captured parameter after capture")
+assert(ca_x_after == 11, "the enclosing function's own return value reflects the same compound assignment")
+
+# ------------------------------------------------------------------ #
+# 34. Array-index-get fusion — one test per OP_INDEX_GET_*_* shape,     #
+#     plus the explicit non-fusing cases (arithmetic index, chained     #
+#     bracket, slice) that must keep working via the unfused fallback,  #
+#     plus bounds/type-error cases through the fused paths.             #
+# ------------------------------------------------------------------ #
+
+ig_arr = [10, 20, 30, 40, 50]
+ig_dict = {"a": 1, "b": 2}
+ig_str = "hello"
+
+# NAME arr, CONST index — ig_arr is a non-parameter top-level global
+# (NAME-kind), the index is a bare literal.
+assert(ig_arr[2] == 30, "NAME[CONST] fuses to OP_INDEX_GET_NAME_CONST")
+
+# NAME arr, NAME index — both bare globals.
+ig_idx = 3
+assert(ig_arr[ig_idx] == 40, "NAME[NAME] fuses to OP_INDEX_GET_NAME_NAME")
+
+# NAME arr, LOCAL index — index is a parameter inside a function body.
+function ig_name_local(i):
+    return ig_arr[i]
+assert(ig_name_local(1) == 20, "NAME[LOCAL] fuses to OP_INDEX_GET_NAME_LOCAL")
+
+# LOCAL arr, CONST/LOCAL/NAME index — arr is itself a parameter.
+function ig_local_const(a):
+    return a[0]
+function ig_local_local(a, i):
+    return a[i]
+function ig_local_name(a):
+    return a[ig_idx]
+assert(ig_local_const(ig_arr) == 10, "LOCAL[CONST] fuses to OP_INDEX_GET_LOCAL_CONST")
+assert(ig_local_local(ig_arr, 4) == 50, "LOCAL[LOCAL] fuses to OP_INDEX_GET_LOCAL_LOCAL")
+assert(ig_local_name(ig_arr) == 40, "LOCAL[NAME] fuses to OP_INDEX_GET_LOCAL_NAME")
+
+# Dict and string indexing through the same fused NAME[CONST]/NAME[NAME]
+# paths — the handler stays fully polymorphic, matching lbl_index_get.
+assert(ig_dict["a"] == 1, "dict indexing still works through a fused NAME[CONST] path")
+ig_key = "b"
+assert(ig_dict[ig_key] == 2, "dict indexing still works through a fused NAME[NAME] path")
+assert(ig_str[1] == "e", "string indexing still works through a fused NAME[CONST] path")
+
+# Explicit non-fusing cases — must still produce correct results via the
+# unfused fallback, unchanged.
+assert(ig_arr[ig_idx + 1] == 50, "arr[i + 1] (arithmetic index) does not fuse but still works")
+ig_nested = [[1, 2], [3, 4]]
+assert(ig_nested[0][1] == 2, "arr[0][1] — the first bracket fuses (NAME[CONST]), the chained second bracket doesn't, and the result is still correct")
+assert(length(ig_arr[1:3]) == 2 && ig_arr[1:3][0] == 20 && ig_arr[1:3][1] == 30, "arr[a:b] (slice) does not fuse but still works")
+
+# Bounds/type-error cases for the fused paths (out-of-bounds index, wrong
+# key type) can't be asserted against here — this file runs in MODE_RUN,
+# which aborts the whole script on the first runtime error, so there's no
+# way to observe "this one expression errored, then execution continued."
+# That's exercised in tests/embed_smoke_test.c instead, the same reason
+# Part 1's error-flag short-circuit test lives there and not here.
+
+print("test_perf_fusion.aer: all assertions passed.")

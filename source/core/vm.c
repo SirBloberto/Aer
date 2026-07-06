@@ -1,0 +1,2467 @@
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "aer_host.h"
+#include "aer_json.h"
+#include "aer_module.h"
+#include "aer_stdlib.h"
+#include "error.h"
+#include "pool.h"
+#include "vm.h"
+#include "value_box.h"
+
+/* Slab pools for heap types confirmed (via every free() site) to never be freed individually — alloc-speed only. Only vm_box_slot uses closure_box_pool; scope-overflow and dict-entry boxes are xmalloc'd and freed elsewhere, so they must keep using xmalloc. Guarded since vm_init() reruns per VM/module import and would otherwise leak slabs. */
+/* long_pool: heap fallback for a TYPE_INTEGER outside AerVal's 47-bit inline range (value_box.h's AER_BIGFLAG_BIT); one boxed value is immutable, so no write barrier needed. */
+static Pool string_pool, array_pool, dict_pool, function_pool, closure_box_pool, long_pool;
+static bool pools_initialized = false;
+
+static void vm_pools_init_once(void) {
+    if (pools_initialized) return;
+    pool_init(&string_pool,      sizeof(AerString),   256);
+    pool_init(&array_pool,       sizeof(AerArray),    256);
+    pool_init(&dict_pool,        sizeof(AerDict),      64);
+    pool_init(&function_pool,    sizeof(AerFunction),  64);
+    pool_init(&closure_box_pool, sizeof(AerVal),        64);
+    pool_init(&long_pool,        sizeof(long long),     64);
+    pools_initialized = true;
+}
+
+/* AerVal's factory for TYPE_INTEGER (defined here, not value_box.h, since it needs long_pool): in-range values encode inline, out-of-range values get one long_pool cell. */
+AerVal aer_int(long long n) {
+    if (n >= AER_INT47_MIN && n <= AER_INT47_MAX) {
+        AerVal v;
+        v.bits = AER_BOXED_TEST | ((uint64_t)TYPE_INTEGER << AER_TAG_SHIFT) |
+                 ((uint64_t)n & AER_INT47_MASK);
+        return v;
+    }
+    long long* box = pool_alloc(&long_pool);
+    *box = n;
+    AerVal v;
+    v.bits = AER_BOXED_TEST | ((uint64_t)TYPE_INTEGER << AER_TAG_SHIFT) |
+             AER_BIGFLAG_BIT | ((uint64_t)(uintptr_t)box & AER_INT47_MASK);
+    return v;
+}
+
+/* ------------------------------------------------------------------ */
+/* Generational GC — write barrier and remembered set                   */
+/* ------------------------------------------------------------------ */
+
+/* True if v's own pooled cell is young; null/boolean/real (and inline integers) have no cell, so they're trivially "not young". */
+static bool value_is_young(AerVal v) {
+    switch (aer_type(v)) {
+        case TYPE_STRING:   return pool_is_young(&string_pool,   aer_as_string(v));
+        case TYPE_ARRAY:    return pool_is_young(&array_pool,    aer_as_array(v));
+        case TYPE_DICT:     return pool_is_young(&dict_pool,     aer_as_dict(v));
+        case TYPE_FUNCTION: return pool_is_young(&function_pool, aer_as_function(v));
+        case TYPE_INTEGER:  return aer_int_is_boxed(v) && pool_is_young(&long_pool, aer_int_box_ptr(v));
+        default:            return false;
+    }
+}
+
+typedef enum { REMEMBERED_ARRAY, REMEMBERED_DICT, REMEMBERED_BOX } RememberedKind;
+typedef struct { void* ptr; RememberedKind kind; } RememberedEntry;
+
+/* Old objects a write barrier caught holding a young reference; entries are only ever added/deduped, never removed, and re-traced as extra roots on every minor collection thereafter. */
+static RememberedEntry* remembered_set   = NULL;
+static unsigned int     remembered_count = 0;
+static unsigned int     remembered_cap   = 0;
+
+/* Pool for a remembered pointer's kind, so gc_remember can dedup via its cell's REMEMBERED bit (O(1)) instead of scanning remembered_set; returns NULL only for an overflow-spilled closure box, which falls back to the linear scan below. */
+static Pool* remembered_pool_for(void* ptr, RememberedKind kind) {
+    switch (kind) {
+        case REMEMBERED_ARRAY: return &array_pool;
+        case REMEMBERED_DICT:  return &dict_pool;
+        case REMEMBERED_BOX:   return pool_owns(&closure_box_pool, ptr) ? &closure_box_pool : NULL;
+    }
+    return NULL;
+}
+
+static void gc_remember(void* ptr, RememberedKind kind) {
+    Pool* p = remembered_pool_for(ptr, kind);
+    if (p) {
+        if (pool_is_remembered(p, ptr)) return;   /* already remembered */
+        pool_mark_remembered(p, ptr);
+    } else {
+        for (unsigned int i = 0; i < remembered_count; i++)
+            if (remembered_set[i].ptr == ptr) return;   /* already remembered */
+    }
+    if (remembered_count >= remembered_cap) {
+        remembered_cap = remembered_cap ? remembered_cap * 2 : 64;
+        remembered_set = xrealloc(remembered_set, sizeof(RememberedEntry) * remembered_cap);
+    }
+    remembered_set[remembered_count].ptr  = ptr;
+    remembered_set[remembered_count].kind = kind;
+    remembered_count++;
+}
+
+/* Write barrier for array item writes (index-assign, append, struct field-set via lbl_field_set — a struct is an array with a shape); `a` is always array_pool-tracked so the young check is exact. */
+static void gc_barrier_array(AerArray* a, AerVal new_value) {
+    if (pool_is_young(&array_pool, a)) return;   /* young containers are already
+                                                      re-traced normally next cycle */
+    if (!value_is_young(new_value)) return;
+    gc_remember(a, REMEMBERED_ARRAY);
+}
+
+/* Write barrier for dict entry writes (both the update-in-place and
+   new-entry paths in lbl_index_set). `d` is always dict_pool-tracked. */
+static void gc_barrier_dict(AerDict* d, AerVal new_value) {
+    if (pool_is_young(&dict_pool, d)) return;
+    if (!value_is_young(new_value)) return;
+    gc_remember(d, REMEMBERED_DICT);
+}
+
+/* Write barrier for closure-box writes (OP_STORE_UPVALUE — reassigning a
+   captured variable). Deliberately skips the box's-own-age gate the array/dict
+   barriers use: an overflow-captured box (vm_box_slot's un-tracked xmalloc
+   branch) isn't pool-tracked and would fault pool_is_young's slab lookup, so
+   this remembers unconditionally whenever new_value is young — correct, just
+   a few extra remembered entries in the common pool-tracked case. */
+static void gc_barrier_box(AerVal* box, AerVal new_value) {
+    if (!value_is_young(new_value)) return;
+    gc_remember(box, REMEMBERED_BOX);
+}
+
+/* ------------------------------------------------------------------ */
+/* Generational GC — mark phase                                        */
+/* ------------------------------------------------------------------ */
+
+/* Explicit growable worklist, not C recursion, since user data structures have no depth limit; pool_mark's "already marked" return terminates cycles correctly. */
+typedef struct {
+    AerVal*      items;
+    unsigned int count, cap;
+} MarkWorklist;
+
+static MarkWorklist gc_worklist = {0};
+
+static void worklist_push(AerVal v) {
+    if (gc_worklist.count >= gc_worklist.cap) {
+        gc_worklist.cap   = gc_worklist.cap ? gc_worklist.cap * 2 : 256;
+        gc_worklist.items = xrealloc(gc_worklist.items, sizeof(AerVal) * gc_worklist.cap);
+    }
+    gc_worklist.items[gc_worklist.count++] = v;
+}
+
+/* Shared by TYPE_FUNCTION marking and CallFrame root marking (a frame's executing function is a raw AerFunction*, not a wrapped Value). */
+static void mark_function(AerFunction* f) {
+    if (pool_mark(&function_pool, f)) return;   /* already visited this cycle */
+    for (unsigned int i = 0; i < f->upvalue_count; i++)
+        worklist_push(*f->upvalues[i]);
+}
+
+static void mark_value(AerVal v) {
+    switch (aer_type(v)) {
+        case TYPE_STRING:
+            pool_mark(&string_pool, aer_as_string(v));   /* a leaf — data owns no other Values */
+            break;
+        case TYPE_ARRAY:
+            if (!pool_mark(&array_pool, aer_as_array(v))) {
+                AerArray* a = aer_as_array(v);
+                for (unsigned int i = 0; i < a->count; i++)
+                    worklist_push(a->items[i]);
+            }
+            break;
+        case TYPE_DICT:
+            if (!pool_mark(&dict_pool, aer_as_dict(v))) {
+                DictMap* map = &aer_as_dict(v)->map;
+                for (unsigned int i = 0; i < map->capacity; i++)
+                    if (map->buckets[i].key)
+                        worklist_push(map->buckets[i].payload.inline_val);
+                /* Bucket keys are plain dictmap-owned char*, not Values — nothing to push. */
+            }
+            break;
+        case TYPE_FUNCTION:
+            mark_function(aer_as_function(v));
+            break;
+        case TYPE_INTEGER:
+            /* Only an out-of-range integer has a heap cell (AER_BIGFLAG_BIT); a leaf like TYPE_STRING. */
+            if (aer_int_is_boxed(v)) pool_mark(&long_pool, aer_int_box_ptr(v));
+            break;
+        default:
+            break;   /* null/boolean/real (and an inline integer) reference no heap cell */
+    }
+}
+
+static void mark_drain(void) {
+    while (gc_worklist.count > 0)
+        mark_value(gc_worklist.items[--gc_worklist.count]);
+}
+
+/* Pushes every live root in one VM; called once for the calling VM and once per file-module VM (aer_module_get) — the five pools are one shared heap fed by N independent root sets, not N separate collectors. */
+static void mark_vm_roots(VM* vm) {
+    for (int i = 0; i < vm->stack_top; i++)
+        worklist_push(vm->stack[i]);
+    for (unsigned int i = 0; i < vm->pending_upvalue_count; i++)
+        worklist_push(*vm->pending_upvalues[i]);
+
+    for (int s = 0; s < vm->scope_depth; s++) {
+        AerScope* scope = &vm->scopes[s];
+        for (int i = 0; i < scope->count; i++)
+            worklist_push(scope->slots[i].box ? *scope->slots[i].box : scope->slots[i].val);
+        if (scope->overflow) {
+            HashMap* map = &scope->map;
+            for (unsigned int i = 0; i < map->capacity; i++)
+                if (map->buckets[i].key)
+                    worklist_push(*(AerVal*)map->buckets[i].payload.boxed);
+        }
+    }
+
+    for (int f = 0; f < vm->call_depth; f++) {
+        CallFrame* frame = &vm->call_stack[f];
+        if (frame->function) mark_function(frame->function);
+        for (int d = 0; d < frame->defer_count; d++)
+            for (int a = 0; a < frame->defers[d].arg_count; a++)
+                worklist_push(frame->defers[d].args[a]);
+        if (frame->defers_draining) worklist_push(frame->pending_return_value);
+    }
+}
+
+/* Chunk.pool and every Shape's field_defaults are permanent roots, walked fresh every cycle since mark bits are cleared each sweep. */
+static void mark_chunk_roots(Chunk* chunk) {
+    for (unsigned int i = 0; i < chunk->pool_count; i++)
+        worklist_push(chunk->pool[i]);
+    for (unsigned int s = 0; s < chunk->shape_count; s++) {
+        Shape* shape = chunk->shapes[s];
+        for (unsigned int i = 0; i < shape->field_count; i++)
+            worklist_push(shape->field_defaults[i]);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Generational GC — sweep finalizers                                  */
+/* ------------------------------------------------------------------ */
+
+static void free_string(void* cell)   { free(((AerString*)cell)->data); }
+static void free_array(void* cell)    { free(((AerArray*)cell)->items); }
+static void free_dict(void* cell)     { dictmap_free(&((AerDict*)cell)->map); }   /* already frees every entry's key */
+static void free_function(void* cell) { free(((AerFunction*)cell)->upvalues); }   /* just the pointer array — boxes are tracked independently since one can be shared by multiple closures */
+static void free_box(void* cell)      { (void)cell; }   /* a bare Value; whatever it references is tracked by its own pool */
+static void free_long(void* cell)     { (void)cell; }   /* a bare long long — no heap references, immutable once created */
+
+/* ------------------------------------------------------------------ */
+/* Generational GC — collection                                        */
+/* ------------------------------------------------------------------ */
+
+static void gc_collect(VM* vm, bool minor) {
+    /* Must run before marking every cycle: a minor sweep never visits old cells, so without this an old cell's mark bit would stay set forever and never be re-traced. */
+    pool_clear_marks(&string_pool);
+    pool_clear_marks(&array_pool);
+    pool_clear_marks(&dict_pool);
+    pool_clear_marks(&function_pool);
+    pool_clear_marks(&closure_box_pool);
+    pool_clear_marks(&long_pool);
+
+    mark_vm_roots(vm);
+    mark_chunk_roots(vm->chunk);
+    for (unsigned int i = 0; ; i++) {
+        VM* mvm; Chunk* mchunk;
+        if (!aer_module_get(i, &mvm, &mchunk)) break;
+        mark_vm_roots(mvm);
+        mark_chunk_roots(mchunk);
+    }
+
+    if (minor) {
+        /* Old objects the write barrier caught holding a young reference, traced as extra
+           roots since a minor pass never looks at old cells otherwise. A MAJOR pass can
+           legitimately free a remembered object between when it was added and now (entries
+           are never proactively removed), so check liveness before dereferencing each one
+           and compact the array in place rather than leaving a dangling pointer. */
+        unsigned int kept = 0;
+        for (unsigned int i = 0; i < remembered_count; i++) {
+            RememberedEntry* e = &remembered_set[i];
+            bool alive;
+            switch (e->kind) {
+                case REMEMBERED_ARRAY: alive = !pool_is_freed(&array_pool, e->ptr); break;
+                case REMEMBERED_DICT:  alive = !pool_is_freed(&dict_pool,  e->ptr); break;
+                case REMEMBERED_BOX:
+                    /* An overflow-capture box isn't closure_box_pool-tracked and is never swept, so it's always alive; a tracked one needs the real check. */
+                    alive = !pool_owns(&closure_box_pool, e->ptr) ||
+                            !pool_is_freed(&closure_box_pool, e->ptr);
+                    break;
+                default: alive = false; break;
+            }
+            if (!alive) continue;
+
+            switch (e->kind) {
+                case REMEMBERED_ARRAY: {
+                    AerArray* a = (AerArray*)e->ptr;
+                    for (unsigned int j = 0; j < a->count; j++) worklist_push(a->items[j]);
+                    break;
+                }
+                case REMEMBERED_DICT: {
+                    DictMap* map = &((AerDict*)e->ptr)->map;
+                    for (unsigned int j = 0; j < map->capacity; j++)
+                        if (map->buckets[j].key) worklist_push(map->buckets[j].payload.inline_val);
+                    break;
+                }
+                case REMEMBERED_BOX:
+                    worklist_push(*(AerVal*)e->ptr);
+                    break;
+            }
+            remembered_set[kept++] = *e;
+        }
+        remembered_count = kept;
+    }
+
+    mark_drain();
+
+    pool_sweep(&string_pool,      minor, free_string);
+    pool_sweep(&array_pool,       minor, free_array);
+    pool_sweep(&dict_pool,        minor, free_dict);
+    pool_sweep(&function_pool,    minor, free_function);
+    pool_sweep(&closure_box_pool, minor, free_box);
+    pool_sweep(&long_pool,        minor, free_long);
+}
+
+/* ------------------------------------------------------------------ */
+/* Generational GC — trigger                                           */
+/* ------------------------------------------------------------------ */
+
+/* Tuning defaults (overridable via aer_gc_configure()): minor_gc_threshold is total cells allocated across all pools since the last minor GC; major_gc_every_n_minor runs a major pass after that many minor ones. */
+static unsigned int minor_gc_threshold     = 2048;
+static unsigned int major_gc_every_n_minor = 10;
+
+/* 0 (the default) means unlimited — see aer_gc_set_ceiling. */
+static unsigned int gc_live_cell_ceiling = 0;
+
+static unsigned int minor_collections_run = 0;
+static unsigned int major_collections_run = 0;
+static unsigned int minor_since_major     = 0;
+
+static void gc_reset_alloc_counts(void) {
+    pool_total_alloc_count = 0;
+}
+
+/* Shared by aer_gc_stats and gc_maybe_collect's ceiling check — one place walking all pools' cell_state, not two. */
+static unsigned int gc_count_live_cells(void) {
+    unsigned int total = 0;
+    Pool* pools[] = { &string_pool, &array_pool, &dict_pool, &function_pool, &closure_box_pool, &long_pool };
+    for (unsigned int p = 0; p < 6; p++) {
+        Pool* pool = pools[p];
+        for (unsigned int i = 0; i < pool->slab_count; i++) {
+            unsigned int count = (i == pool->slab_count - 1) ? pool->next_index : pool->elems_per_slab;
+            for (unsigned int j = 0; j < count; j++)
+                if (!(pool->cell_state[i][j] & POOL_FREE)) total++;
+        }
+    }
+    return total;
+}
+
+static int gc_suppress_depth = 0;
+
+void vm_gc_suppress(void)   { gc_suppress_depth++; }
+void vm_gc_unsuppress(void) { if (gc_suppress_depth > 0) gc_suppress_depth--; }
+
+void aer_gc_configure(unsigned int minor_threshold, unsigned int major_every_n_minor) {
+    if (minor_threshold)    minor_gc_threshold     = minor_threshold;
+    if (major_every_n_minor) major_gc_every_n_minor = major_every_n_minor;
+}
+
+void aer_gc_set_ceiling(unsigned int max_live_cells) {
+    gc_live_cell_ceiling = max_live_cells;
+}
+
+/* Split out from gc_maybe_collect so that stays small enough to inline into DISPATCH(). Only
+   ever runs between two complete opcodes, where stack/scope/call-frame invariants are
+   self-consistent (no handler leaves those half-updated across its own DISPATCH() call). */
+static void gc_run_collection_cycle(VM* vm) {
+    gc_collect(vm, true);
+    minor_collections_run++;
+    gc_reset_alloc_counts();
+
+    bool major_ran = false;
+    if (++minor_since_major >= major_gc_every_n_minor) {
+        gc_collect(vm, false);
+        major_collections_run++;
+        minor_since_major = 0;
+        major_ran = true;
+    }
+
+    /* Ceiling check runs AFTER the normal trigger logic so a ceiling'd host still gets the
+       usual cheap minor/major rhythm; checked once per opcode (not per-allocation), so one
+       opcode's worth of allocation can slip past the ceiling before the abort fires — a
+       deliberate, minor looseness. */
+    if (gc_live_cell_ceiling == 0) return;
+    unsigned int live = gc_count_live_cells();
+    if (live <= gc_live_cell_ceiling) return;
+    if (!major_ran) {
+        gc_collect(vm, false);
+        major_collections_run++;
+        minor_since_major = 0;
+        live = gc_count_live_cells();
+        if (live <= gc_live_cell_ceiling) return;
+    }
+    error("Memory ceiling exceeded: %u live cells (limit %u)", live, gc_live_cell_ceiling);
+}
+
+/* Checked once per opcode from DISPATCH(); kept tiny and always_inline so the common case (nowhere near threshold) costs nothing beyond what's already inlined into the dispatch loop. */
+static inline __attribute__((always_inline)) void gc_maybe_collect(VM* vm) {
+    if (gc_suppress_depth > 0) return;
+    if (pool_total_alloc_count < minor_gc_threshold) return;
+    gc_run_collection_cycle(vm);
+}
+
+/* Embedding-facing introspection (include/aer.h); live_cells is a bookkeeping snapshot, not a fresh trace, so it undercounts unswept-but-garbage cells since the last cycle. */
+void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
+                  unsigned int* major_collections) {
+    if (live_cells)         *live_cells         = gc_count_live_cells();
+    if (minor_collections)  *minor_collections  = minor_collections_run;
+    if (major_collections)  *major_collections  = major_collections_run;
+}
+
+/* ------------------------------------------------------------------ */
+/* Chunk management                                                     */
+/* ------------------------------------------------------------------ */
+
+void chunk_init(Chunk* c) {
+    memset(c, 0, sizeof(*c));
+}
+
+void chunk_free(Chunk* c) {
+    free(c->code);
+    for (unsigned int i = 0; i < c->pool_count; i++)
+        if (aer_type(c->pool[i]) == TYPE_STRING) free(aer_as_string(c->pool[i])->data);
+    free(c->pool);
+    hashmap_free(&c->name_index);
+    free(c->line_mark_offsets);
+    free(c->line_mark_lines);
+    for (unsigned int i = 0; i < c->import_count; i++) free(c->imported_modules[i]);
+    free(c->imported_modules);
+    /* Not each entry — every populated slot is a pointer INTO vm->scopes, never separately owned. */
+    free(c->addr_cache);
+    memset(c, 0, sizeof(*c));
+}
+
+unsigned int chunk_add_addr_cache(Chunk* c) {
+    if (c->addr_cache_count >= c->addr_cache_cap) {
+        c->addr_cache_cap = c->addr_cache_cap ? c->addr_cache_cap * 2 : 32;
+        c->addr_cache = xrealloc(c->addr_cache, sizeof(AerVal*) * c->addr_cache_cap);
+    }
+    c->addr_cache[c->addr_cache_count] = NULL;
+    return c->addr_cache_count++;
+}
+
+void chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line) {
+    if (c->line_mark_count > 0 && c->line_mark_offsets[c->line_mark_count - 1] >= offset) return;
+    if (c->line_mark_count >= c->line_mark_cap) {
+        c->line_mark_cap = c->line_mark_cap ? c->line_mark_cap * 2 : 64;
+        c->line_mark_offsets = xrealloc(c->line_mark_offsets, sizeof(unsigned int) * c->line_mark_cap);
+        c->line_mark_lines   = xrealloc(c->line_mark_lines,   sizeof(unsigned int) * c->line_mark_cap);
+    }
+    c->line_mark_offsets[c->line_mark_count] = offset;
+    c->line_mark_lines[c->line_mark_count]   = line;
+    c->line_mark_count++;
+}
+
+unsigned int chunk_line_for_offset(Chunk* c, unsigned int offset) {
+    if (c->line_mark_count == 0) return 0;
+    unsigned int lo = 0, hi = c->line_mark_count;   /* find first mark with offset > target */
+    while (lo < hi) {
+        unsigned int mid = lo + (hi - lo) / 2;
+        if (c->line_mark_offsets[mid] <= offset) lo = mid + 1;
+        else                                     hi = mid;
+    }
+    return lo == 0 ? 0 : c->line_mark_lines[lo - 1];
+}
+
+/* Whichever VM is currently dispatching, kept fresh by DISPATCH() each opcode; self-corrects after a nested module call's vm_run() returns since the outer VM reasserts itself next dispatch. */
+static VM* active_vm_for_errors = NULL;
+
+static unsigned int lookup_runtime_line(void) {
+    if (!active_vm_for_errors) return 0;
+    return chunk_line_for_offset(active_vm_for_errors->chunk, active_vm_for_errors->ip);
+}
+
+/* Wraps (data, length) — caller must already exclusively own data — in a fresh heap box; never allocates or copies the character data itself. */
+AerVal aer_make_string(char* data, unsigned int length) {
+    AerString* s = pool_alloc(&string_pool);
+    s->data = data;
+    s->length = length;
+    return aer_string_val(s);
+}
+
+void chunk_emit(Chunk* c, int word) {
+    if (c->count >= c->capacity) {
+        c->capacity = c->capacity ? c->capacity * 2 : 64;
+        c->code = xrealloc(c->code, sizeof(int) * c->capacity);
+    }
+    c->code[c->count++] = word;
+}
+
+/* Appends v to the pool and returns its index; shared tail for both paths of chunk_add_pool. */
+static unsigned int chunk_pool_append(Chunk* c, AerVal v) {
+    if (c->pool_count >= c->pool_cap) {
+        c->pool_cap = c->pool_cap ? c->pool_cap * 2 : 16;
+        c->pool = xrealloc(c->pool, sizeof(AerVal) * c->pool_cap);
+    }
+    c->pool[c->pool_count] = v;
+    return c->pool_count++;
+}
+
+unsigned int chunk_add_pool(Chunk* c, AerVal v) {
+    /* Strings dominate call volume and the REPL never resets the pool between lines, so dedup them via name_index (O(1)) instead of the O(n) linear scan below, kept for rarer non-string literals. */
+    if (aer_type(v) == TYPE_STRING) {
+        /* Tokens are substrings of the source buffer, not NUL-terminated — build an owned copy first. */
+        AerString* vs = aer_as_string(v);
+        char* key = xmalloc(vs->length + 1);
+        memcpy(key, vs->data, vs->length);
+        key[vs->length] = '\0';
+
+        unsigned int* existing = (unsigned int*)hashmap_get(&c->name_index, key);
+        if (existing) { free(key); return *existing; }
+
+        vs->data = key;   /* pool entry takes ownership of `key` */
+        unsigned int idx = chunk_pool_append(c, v);
+
+        /* Independent copy, not an alias of c->pool[idx]'s, so both can be freed independently without a double-free. */
+        char* index_key = xstrdup(key);
+        unsigned int* idx_box = xmalloc(sizeof(unsigned int));
+        *idx_box = idx;
+        hashmap_put(&c->name_index, index_key, idx_box);
+        return idx;
+    }
+
+    for (unsigned int i = 0; i < c->pool_count; i++) {
+        AerVal* e = &c->pool[i];
+        if (aer_type(*e) != aer_type(v)) continue;
+        if (aer_type(v) == TYPE_NULL)                                                  return i;
+        if (aer_type(v) == TYPE_INTEGER && aer_as_int(*e)  == aer_as_int(v))  return i;
+        if (aer_type(v) == TYPE_REAL    && aer_as_real(*e) == aer_as_real(v)) return i;
+        if (aer_type(v) == TYPE_BOOLEAN && aer_as_bool(*e) == aer_as_bool(v)) return i;
+        if (aer_type(v) == TYPE_FUNCTION &&
+            aer_as_function(*e)->code_offset == aer_as_function(v)->code_offset &&
+            aer_as_function(*e)->arity       == aer_as_function(v)->arity) return i;
+    }
+    return chunk_pool_append(c, v);
+}
+
+/* Newest-first so a redeclared struct (e.g. re-running a REPL block) shadows the old one for new lookups, without invalidating instances still pointing at the old Shape. */
+Shape* chunk_find_shape(Chunk* c, const char* name) {
+    for (unsigned int i = c->shape_count; i > 0; i--) {
+        Shape* s = c->shapes[i - 1];
+        if (strcmp(aer_as_string(c->pool[s->name])->data, name) == 0) return s;
+    }
+    return NULL;
+}
+
+bool chunk_is_imported(Chunk* c, const char* name, unsigned int len) {
+    for (unsigned int i = 0; i < c->import_count; i++)
+        if (strlen(c->imported_modules[i]) == len && strncmp(c->imported_modules[i], name, len) == 0)
+            return true;
+    return false;
+}
+
+bool chunk_add_import(Chunk* c, const char* name, unsigned int len,
+                       const char* path_name, unsigned int path_len) {
+    /* Anything not a native/host module is attempted as a file-based import; aer_module_load() reports its own errors for that path. */
+    if (!aer_stdlib_is_native_module(name, len) && !aer_host_is_module(name, len) &&
+        !aer_module_load(name, len, path_name, path_len)) {
+        return false;
+    }
+    if (chunk_is_imported(c, name, len)) return true;   /* re-importing is harmless, not an error */
+    if (c->import_count >= c->import_cap) {
+        c->import_cap = c->import_cap ? c->import_cap * 2 : 8;
+        c->imported_modules = xrealloc(c->imported_modules, sizeof(char*) * c->import_cap);
+    }
+    char* copy = xmalloc(len + 1);
+    memcpy(copy, name, len);
+    copy[len] = '\0';
+    c->imported_modules[c->import_count++] = copy;
+    return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* VM lifecycle                                                         */
+/* ------------------------------------------------------------------ */
+
+void vm_init(VM* vm, Chunk* chunk) {
+    memset(vm, 0, sizeof(*vm));
+    vm->chunk       = chunk;
+    vm->scope_depth = 1;
+    aer_stdlib_init();
+    vm_pools_init_once();
+    runtime_line_lookup = lookup_runtime_line;
+}
+
+void vm_free(VM* vm) {
+    for (int i = 0; i < vm->scope_depth; i++)
+        if (vm->scopes[i].overflow && !vm->scopes[i].overflow_has_captures)
+            hashmap_free(&vm->scopes[i].map);
+    /* Every call_stack slot, not just up to call_depth — a slot's lazily allocated defers array stays allocated across reuse, so any slot ever used may still hold one. */
+    for (int i = 0; i < VM_CALL_MAX; i++)
+        free(vm->call_stack[i].defers);
+}
+
+/* ------------------------------------------------------------------ */
+/* Scope helpers                                                        */
+/* ------------------------------------------------------------------ */
+
+/* Scope depth the current call began at, so a failed lookup jumps straight to global instead of walking caller frames — safe since closures reach captures via boxes, not the scope chain. */
+static inline int vm_scope_floor(VM* vm) {
+    return vm->call_depth == 0 ? 0 : vm->call_stack[vm->call_depth - 1].return_scope_depth;
+}
+
+/* A closure-captured slot (box != NULL) transparently resolves to its box instead of the stale inline val, so OP_LOAD still sees whatever the closure last wrote. */
+static inline __attribute__((always_inline)) AerVal* vm_scope_get(VM* vm, unsigned int name) {
+    int floor = vm_scope_floor(vm);
+    for (int i = vm->scope_depth - 1; i >= floor; i--) {
+        AerScope* s = &vm->scopes[i];
+        for (int j = 0; j < s->count; j++)
+            if (s->slots[j].name == name) {
+                AerVal* box = s->slots[j].box;
+                return box ? box : &s->slots[j].val;
+            }
+        if (s->overflow) {
+            AerVal* v = (AerVal*)hashmap_get(&s->map, aer_as_string(vm->chunk->pool[name])->data);
+            if (v) return v;
+        }
+    }
+    if (floor == 0) return NULL;   /* global was already included above */
+    AerScope* g = &vm->scopes[0];
+    for (int j = 0; j < g->count; j++)
+        if (g->slots[j].name == name) {
+            AerVal* box = g->slots[j].box;
+            return box ? box : &g->slots[j].val;
+        }
+    if (g->overflow) {
+        AerVal* v = (AerVal*)hashmap_get(&g->map, aer_as_string(vm->chunk->pool[name])->data);
+        if (v) return v;
+    }
+    return NULL;
+}
+
+/* For the inline address cache: is `name` a global whose address is stable for the VM's whole
+   lifetime? Only global INLINE slots qualify (vm->scopes[0] never reallocates); an overflowed
+   global (its map's bucket array can move on rehash) or a boxed one (closure-captured) are
+   excluded and just fall back to vm_scope_get, uncached, same as today. */
+static AerVal* vm_global_slot_address(VM* vm, unsigned int name) {
+    AerScope* g = &vm->scopes[0];
+    for (int j = 0; j < g->count; j++)
+        if (g->slots[j].name == name && !g->slots[j].box) return &g->slots[j].val;
+    return NULL;
+}
+
+/* Shared by lbl_load and the OP_COMPOUND_NAME_* fused handlers — resolves name_idx to its live
+   address, caching only the confirmed WINNING resolution (the same exact-match discipline that
+   fixed a real shadowing bug). Returns NULL after calling error() if undefined; caller must
+   check and bail via DISPATCH(), same as any fallible sub-step in a fused handler. */
+static inline AerVal* vm_resolve_name_cached(VM* vm, Chunk* c, int name_idx, int cache_idx) {
+    AerVal* found = c->addr_cache[cache_idx];
+    if (!found) {
+        found = vm_scope_get(vm, (unsigned int)name_idx);
+        if (found) {
+            AerVal* cacheable = vm_global_slot_address(vm, (unsigned int)name_idx);
+            if (cacheable && cacheable == found) c->addr_cache[cache_idx] = cacheable;
+        }
+    }
+    if (!found) error("'%s' is not defined", aer_as_string(c->pool[name_idx])->data);
+    return found;
+}
+
+/* Shared by lbl_load_local and any fused handler reading a LOCAL-kind operand; always the
+   current call's base scope (vm_scope_floor), never scope_depth-1 directly, since this can
+   run from inside a nested if/for block. A parameter slot always resolves, so no error check. */
+static inline AerVal vm_read_local_slot(VM* vm, int slot) {
+    AerScope* s = &vm->scopes[vm_scope_floor(vm)];
+    AerVal* box = s->slots[slot].box;
+    return box ? *box : s->slots[slot].val;
+}
+
+/* Write counterpart of vm_read_local_slot; shared by lbl_store_local and the fused handlers' write-back. */
+static inline void vm_write_local_slot(VM* vm, int slot, AerVal val) {
+    AerScope* s = &vm->scopes[vm_scope_floor(vm)];
+    AerVal* box = s->slots[slot].box;
+    if (box) *box = val; else s->slots[slot].val = val;
+}
+
+/* Always create/update in the innermost scope — used for params and loop vars. */
+static inline __attribute__((always_inline)) void vm_scope_define(VM* vm, unsigned int name, AerVal val) {
+    AerScope* s = &vm->scopes[vm->scope_depth - 1];
+    for (int j = 0; j < s->count; j++) {
+        if (s->slots[j].name == name) {
+            AerVal* box = s->slots[j].box;
+            if (box) *box = val; else s->slots[j].val = val;
+            return;
+        }
+    }
+    if (s->count < SCOPE_SLOT_MAX) {
+        s->slots[s->count].name = name;
+        s->slots[s->count].val  = val;
+        /* Reset explicitly: slots are reused across scope pushes without
+           zeroing (only `count` resets), so a stale box from an earlier
+           scope could otherwise leak through. */
+        s->slots[s->count].box  = NULL;
+        s->count++;
+        return;
+    }
+    /* Spill to hashmap for scopes with more than SCOPE_SLOT_MAX variables. */
+    s->overflow = true;
+    const char* key = aer_as_string(vm->chunk->pool[name])->data;
+    AerVal* existing = (AerVal*)hashmap_get(&s->map, key);
+    if (existing) { *existing = val; return; }
+    char* k = xmalloc(strlen(key) + 1);
+    AerVal* vp = xmalloc(sizeof(AerVal));
+    strcpy(k, key);
+    *vp = val;
+    hashmap_put(&s->map, k, vp);
+}
+
+/* Walk chain to update nearest binding (current call's own scopes, then
+   global — see vm_scope_floor); create in innermost if not found anywhere. */
+static inline __attribute__((always_inline)) void vm_scope_set(VM* vm, unsigned int name, AerVal val) {
+    int floor = vm_scope_floor(vm);
+    for (int i = vm->scope_depth - 1; i >= floor; i--) {
+        AerScope* s = &vm->scopes[i];
+        for (int j = 0; j < s->count; j++) {
+            if (s->slots[j].name == name) {
+                AerVal* box = s->slots[j].box;
+                if (box) *box = val; else s->slots[j].val = val;
+                return;
+            }
+        }
+        if (s->overflow) {
+            AerVal* v = (AerVal*)hashmap_get(&s->map, aer_as_string(vm->chunk->pool[name])->data);
+            if (v) { *v = val; return; }
+        }
+    }
+    if (floor != 0) {
+        AerScope* g = &vm->scopes[0];
+        for (int j = 0; j < g->count; j++) {
+            if (g->slots[j].name == name) {
+                AerVal* box = g->slots[j].box;
+                if (box) *box = val; else g->slots[j].val = val;
+                return;
+            }
+        }
+        if (g->overflow) {
+            AerVal* v = (AerVal*)hashmap_get(&g->map, aer_as_string(vm->chunk->pool[name])->data);
+            if (v) { *v = val; return; }
+        }
+    }
+    vm_scope_define(vm, name, val);
+}
+
+/* Boxes the current binding of `name`, or returns the existing box if already captured, so
+   multiple closures sharing a variable share one box. An overflow-path variable is boxed via
+   its existing hashmap pointer, marking overflow_has_captures so scope-pop leaks the hashmap
+   instead of freeing it out from under the closure. Returns NULL (after calling error()) if not found. */
+static AerVal* vm_box_slot(VM* vm, unsigned int name) {
+    int floor = vm_scope_floor(vm);
+    for (int i = vm->scope_depth - 1; i >= floor; i--) {
+        AerScope* s = &vm->scopes[i];
+        for (int j = 0; j < s->count; j++) {
+            if (s->slots[j].name != name) continue;
+            if (!s->slots[j].box) {
+                AerVal* box = pool_alloc(&closure_box_pool);
+                *box = s->slots[j].val;
+                s->slots[j].box = box;
+            }
+            return s->slots[j].box;
+        }
+        if (s->overflow) {
+            AerVal* box = (AerVal*)hashmap_get(&s->map, aer_as_string(vm->chunk->pool[name])->data);
+            if (box) { s->overflow_has_captures = true; return box; }
+        }
+    }
+    if (floor != 0) {
+        AerScope* g = &vm->scopes[0];
+        for (int j = 0; j < g->count; j++) {
+            if (g->slots[j].name != name) continue;
+            if (!g->slots[j].box) {
+                AerVal* box = pool_alloc(&closure_box_pool);
+                *box = g->slots[j].val;
+                g->slots[j].box = box;
+            }
+            return g->slots[j].box;
+        }
+        if (g->overflow) {
+            AerVal* box = (AerVal*)hashmap_get(&g->map, aer_as_string(vm->chunk->pool[name])->data);
+            if (box) { g->overflow_has_captures = true; return box; }
+        }
+    }
+    error("'%s' is not defined", aer_as_string(vm->chunk->pool[name])->data);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Type helpers                                                         */
+/* ------------------------------------------------------------------ */
+
+/* Struct instances report their declared name (e.g. "Player") instead of "array" — used by type() and OP_CHECK_SHAPE's error message. */
+static const char* vm_type_name(Chunk* c, AerVal v) {
+    static const char* type_names[] = {
+        "null", "boolean", "integer", "real", "string", "function", "array", "dict"
+    };
+    if (aer_type(v) == TYPE_ARRAY && aer_as_array(v)->shape)
+        return aer_as_string(c->pool[aer_as_array(v)->shape->name])->data;
+    return type_names[aer_type(v)];
+}
+
+/* ------------------------------------------------------------------ */
+/* Value formatting — shared by print() and vm_to_str() (interpolation, +, etc.) for one consistent recursive rendering, not a terse "<array[3]>" fallback. */
+/* ------------------------------------------------------------------ */
+
+typedef struct { char* buf; size_t len; size_t cap; } StrBuilder;
+
+static void sb_init(StrBuilder* sb) {
+    sb->cap = 64;
+    sb->buf = xmalloc(sb->cap);
+    sb->len = 0;
+    sb->buf[0] = '\0';
+}
+
+static void sb_append_n(StrBuilder* sb, const char* s, size_t n) {
+    if (sb->len + n + 1 > sb->cap) {
+        while (sb->len + n + 1 > sb->cap) sb->cap *= 2;
+        sb->buf = xrealloc(sb->buf, sb->cap);
+    }
+    memcpy(sb->buf + sb->len, s, n);
+    sb->len += n;
+    sb->buf[sb->len] = '\0';
+}
+
+static void sb_append(StrBuilder* sb, const char* s) { sb_append_n(sb, s, strlen(s)); }
+
+static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuilder* sb);
+
+static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuilder* sb) {
+    char tmp[64];
+    switch (aer_type(v)) {
+        case TYPE_NULL:     sb_append(sb, "null"); break;
+        case TYPE_INTEGER:  snprintf(tmp, sizeof(tmp), "%lld", aer_as_int(v));  sb_append(sb, tmp); break;
+        case TYPE_REAL:     snprintf(tmp, sizeof(tmp), "%g",   aer_as_real(v)); sb_append(sb, tmp); break;
+        case TYPE_BOOLEAN:  sb_append(sb, aer_as_bool(v) ? "true" : "false"); break;
+        case TYPE_FUNCTION: sb_append(sb, "<function>"); break;
+        case TYPE_STRING: {
+            AerString* s = aer_as_string(v);
+            if (in_collection) sb_append(sb, "\"");
+            sb_append_n(sb, s->data, s->length);
+            if (in_collection) sb_append(sb, "\"");
+            break;
+        }
+        case TYPE_ARRAY: {
+            AerArray* a = aer_as_array(v);
+            if (a->shape) {
+                Shape* shape = a->shape;
+                sb_append(sb, aer_as_string(c->pool[shape->name])->data);
+                sb_append(sb, "{");
+                for (unsigned int i = 0; i < shape->field_count; i++) {
+                    if (i > 0) sb_append(sb, ", ");
+                    sb_append(sb, aer_as_string(c->pool[shape->field_names[i]])->data);
+                    sb_append(sb, ": ");
+                    vm_format_value(c, a->items[i], true, sb);
+                }
+                sb_append(sb, "}");
+                break;
+            }
+            sb_append(sb, "[");
+            for (unsigned int i = 0; i < a->count; i++) {
+                if (i > 0) sb_append(sb, ", ");
+                vm_format_value(c, a->items[i], true, sb);
+            }
+            sb_append(sb, "]");
+            break;
+        }
+        case TYPE_DICT: {
+            AerDict* d = aer_as_dict(v);
+            sb_append(sb, "{");
+            bool first = true;
+            for (unsigned int i = 0; i < d->map.capacity; i++) {
+                HashTableEntry* e = &d->map.buckets[i];
+                if (!e->key) continue;
+                if (!first) sb_append(sb, ", ");
+                first = false;
+                sb_append(sb, "\"");
+                sb_append(sb, e->key);
+                sb_append(sb, "\": ");
+                vm_format_value(c, e->payload.inline_val, true, sb);
+            }
+            sb_append(sb, "}");
+            break;
+        }
+    }
+}
+
+static void vm_print_value(Chunk* c, AerVal v, bool in_collection) {
+    StrBuilder sb;
+    sb_init(&sb);
+    vm_format_value(c, v, in_collection, &sb);
+    printf("%s", sb.buf);
+    free(sb.buf);
+}
+
+/* ------------------------------------------------------------------ */
+
+static inline __attribute__((always_inline)) bool vm_truthy(AerVal v) {
+    switch (aer_type(v)) {
+        case TYPE_NULL:     return false;
+        case TYPE_BOOLEAN:  return aer_as_bool(v);
+        case TYPE_INTEGER:  return aer_as_int(v) != 0;
+        case TYPE_REAL:     return aer_as_real(v) != 0.0;
+        case TYPE_STRING:   return aer_as_string(v)->length > 0;
+        case TYPE_FUNCTION: return true;
+        case TYPE_ARRAY:    return aer_as_array(v)->count > 0;
+        case TYPE_DICT:     return aer_as_dict(v)->map.count > 0;
+    }
+    return false;
+}
+
+static inline __attribute__((always_inline)) AerVal vm_promote_real(AerVal v) {
+    if (aer_type(v) == TYPE_INTEGER) v = aer_real((double)aer_as_int(v));
+    return v;
+}
+
+/* ------------------------------------------------------------------ */
+/* Binary operation dispatch                                            */
+/* ------------------------------------------------------------------ */
+
+/* Structural/reference equality with no error path — unlike OP_EQ, a type mismatch here just means "not this one, keep looking." Used by OP_IN's array scan. */
+static bool values_equal(AerVal a, AerVal b) {
+    if (aer_type(a) != aer_type(b)) return false;
+    switch (aer_type(a)) {
+        case TYPE_NULL:     return true;
+        case TYPE_BOOLEAN:  return aer_as_bool(a) == aer_as_bool(b);
+        case TYPE_INTEGER:  return aer_as_int(a) == aer_as_int(b);
+        case TYPE_REAL:     return aer_as_real(a) == aer_as_real(b);
+        case TYPE_STRING:   return aer_as_string(a)->length == aer_as_string(b)->length &&
+                                    strncmp(aer_as_string(a)->data, aer_as_string(b)->data, aer_as_string(a)->length) == 0;
+        case TYPE_FUNCTION: return aer_as_function(a)->code_offset == aer_as_function(b)->code_offset;
+        case TYPE_ARRAY:    return aer_as_array(a) == aer_as_array(b);
+        case TYPE_DICT:     return aer_as_dict(a) == aer_as_dict(b);
+    }
+    return false;
+}
+
+static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b, Opcode op) {
+    /* Logical ops work on any type via truthiness */
+    if (op == OP_AND || op == OP_OR) {
+        return aer_bool((op == OP_AND) ? (vm_truthy(a) && vm_truthy(b))
+                                        : (vm_truthy(a) || vm_truthy(b)));
+    }
+
+    /* Checked before null-handling below so `null in arr` isn't intercepted by the "null op anything-else errors" rule, which is about direct comparison, not container search. */
+    if (op == OP_IN) {
+        if (aer_type(b) == TYPE_DICT) {
+            if (aer_type(a) != TYPE_STRING) { error("Left side of 'in' must be a string when testing dict membership"); return aer_bool(false); }
+            AerString* as = aer_as_string(a);
+            unsigned int klen = as->length;
+            if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return aer_bool(false); }
+            char kbuf[VM_KEY_MAX + 1];
+            memcpy(kbuf, as->data, klen);
+            kbuf[klen] = '\0';
+            return aer_bool(dictmap_get(&aer_as_dict(b)->map, kbuf) != NULL);
+        }
+        if (aer_type(b) == TYPE_ARRAY) {
+            AerArray* arr = aer_as_array(b);
+            for (unsigned int i = 0; i < arr->count; i++) {
+                if (values_equal(a, arr->items[i])) return aer_bool(true);
+            }
+            return aer_bool(false);
+        }
+        error("Right side of 'in' must be a dict or array");
+        return aer_bool(false);
+    }
+
+    /* Integer-vs-integer fast path, checked before null/real-promotion below — the common case for arithmetic-heavy code, and neither branch applies once both are integers. */
+    if (aer_type(a) == TYPE_INTEGER && aer_type(b) == TYPE_INTEGER) {
+        long long l = aer_as_int(a), rv = aer_as_int(b);
+        switch (op) {
+            case OP_ADD:         return aer_int(l + rv);
+            case OP_SUB:         return aer_int(l - rv);
+            case OP_MUL:         return aer_int(l * rv);
+            case OP_DIV:
+                if (rv == 0) { error("Division by zero"); return aer_int(0); }
+                return aer_real((double)l / (double)rv);
+            case OP_FLOOR_DIV:
+                if (rv == 0) { error("Division by zero"); return aer_int(0); }
+                return aer_int((long long)floor((double)l / (double)rv));
+            case OP_MOD:
+                if (rv == 0) { error("Modulo by zero"); return aer_int(0); }
+                return aer_int(l % rv);
+            case OP_LSHIFT:      return aer_int(l << rv);
+            case OP_RSHIFT:      return aer_int(l >> rv);
+            case OP_BITWISE_AND: return aer_int(l &  rv);
+            case OP_BITWISE_OR:  return aer_int(l |  rv);
+            case OP_BITWISE_XOR: return aer_int(l ^  rv);
+            case OP_EQ:  return aer_bool(l == rv);
+            case OP_NEQ: return aer_bool(l != rv);
+            case OP_LT:  return aer_bool(l <  rv);
+            case OP_GT:  return aer_bool(l >  rv);
+            case OP_LTE: return aer_bool(l <= rv);
+            case OP_GTE: return aer_bool(l >= rv);
+            default: error("Operator not valid for integers"); return aer_int(0);
+        }
+    }
+
+    /* null equality: null == null is true; null op anything-else errors */
+    if (aer_type(a) == TYPE_NULL || aer_type(b) == TYPE_NULL) {
+        if (op == OP_EQ)  return aer_bool(aer_type(a) == TYPE_NULL && aer_type(b) == TYPE_NULL);
+        if (op == OP_NEQ) return aer_bool(!(aer_type(a) == TYPE_NULL && aer_type(b) == TYPE_NULL));
+        error("Operator not valid for null"); return aer_bool(false);
+    }
+
+    if (aer_type(a) == TYPE_REAL || aer_type(b) == TYPE_REAL) {
+        a = vm_promote_real(a);
+        b = vm_promote_real(b);
+    }
+
+    if (aer_type(a) == TYPE_REAL && aer_type(b) == TYPE_REAL) {
+        double l = aer_as_real(a), rv = aer_as_real(b);
+        switch (op) {
+            case OP_ADD: return aer_real(l + rv);
+            case OP_SUB: return aer_real(l - rv);
+            case OP_MUL: return aer_real(l * rv);
+            case OP_DIV:
+                if (rv == 0.0) { error("Division by zero"); return aer_real(0.0); }
+                return aer_real(l / rv);
+            case OP_FLOOR_DIV:
+                if (rv == 0.0) { error("Division by zero"); return aer_real(0.0); }
+                return aer_real(floor(l / rv));
+            case OP_MOD: return aer_real(fmod(l, rv));
+            case OP_EQ:  return aer_bool(l == rv);
+            case OP_NEQ: return aer_bool(l != rv);
+            case OP_LT:  return aer_bool(l <  rv);
+            case OP_GT:  return aer_bool(l >  rv);
+            case OP_LTE: return aer_bool(l <= rv);
+            case OP_GTE: return aer_bool(l >= rv);
+            default: error("Operator not valid for reals"); return aer_real(0.0);
+        }
+    }
+
+    if (aer_type(a) == TYPE_BOOLEAN && aer_type(b) == TYPE_BOOLEAN) {
+        if (op == OP_EQ)  return aer_bool(aer_as_bool(a) == aer_as_bool(b));
+        if (op == OP_NEQ) return aer_bool(aer_as_bool(a) != aer_as_bool(b));
+        error("Operator not valid for booleans"); return aer_bool(false);
+    }
+
+    if (aer_type(a) == TYPE_STRING && aer_type(b) == TYPE_STRING) {
+        AerString* as = aer_as_string(a);
+        AerString* bs = aer_as_string(b);
+        bool eq = as->length == bs->length &&
+                  strncmp(as->data, bs->data, as->length) == 0;
+        if (op == OP_EQ)  return aer_bool(eq);
+        if (op == OP_NEQ) return aer_bool(!eq);
+        if (op == OP_ADD) {
+            unsigned int len = as->length + bs->length;
+            char* buf = xmalloc(len + 1);
+            memcpy(buf, as->data, as->length);
+            memcpy(buf + as->length, bs->data, bs->length);
+            buf[len] = '\0';
+            /* aer_make_string takes ownership of buf directly; no pool interning needed since this string is used once, right here (see vm_to_str's comment). */
+            return aer_make_string(buf, len);
+        }
+        error("Operator not valid for strings"); return aer_bool(false);
+    }
+
+    if (aer_type(a) == TYPE_ARRAY && aer_type(b) == TYPE_ARRAY) {
+        if (op == OP_EQ)  return aer_bool(aer_as_array(a) == aer_as_array(b));
+        if (op == OP_NEQ) return aer_bool(aer_as_array(a) != aer_as_array(b));
+        error("Operator not valid for arrays"); return aer_bool(false);
+    }
+
+    if (aer_type(a) == TYPE_DICT && aer_type(b) == TYPE_DICT) {
+        if (op == OP_EQ)  return aer_bool(aer_as_dict(a) == aer_as_dict(b));
+        if (op == OP_NEQ) return aer_bool(aer_as_dict(a) != aer_as_dict(b));
+        error("Operator not valid for dicts"); return aer_bool(false);
+    }
+
+    error("Type mismatch in binary expression");
+    return aer_bool(false);
+}
+
+static AerVal vm_to_str(VM* vm, AerVal v) {
+    if (aer_type(v) == TYPE_STRING) return v;
+
+    char*        owned;
+    unsigned int len;
+
+    if (aer_type(v) == TYPE_ARRAY || aer_type(v) == TYPE_DICT) {
+        /* Unbounded recursive content doesn't fit the fixed buffer below, so reuse print()'s formatter; sb.buf is already a fresh allocation, handed to aer_make_string as-is. */
+        StrBuilder sb;
+        sb_init(&sb);
+        vm_format_value(vm->chunk, v, false, &sb);
+        owned = sb.buf;
+        len   = (unsigned int)sb.len;
+    } else {
+        /* Copies into a fresh owned buffer since AerString always owns its data, and buf is a stack array that can't be handed to aer_make_string directly. */
+        char buf[64];
+        switch (aer_type(v)) {
+            case TYPE_NULL:     snprintf(buf, sizeof(buf), "null");                              break;
+            case TYPE_INTEGER:  snprintf(buf, sizeof(buf), "%lld", aer_as_int(v));               break;
+            case TYPE_REAL:     snprintf(buf, sizeof(buf), "%g",   aer_as_real(v));               break;
+            case TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s",   aer_as_bool(v) ? "true" : "false"); break;
+            case TYPE_FUNCTION: snprintf(buf, sizeof(buf), "<function>");                        break;
+            case TYPE_ARRAY: case TYPE_DICT: case TYPE_STRING: break;   /* handled above */
+        }
+        len   = (unsigned int)strlen(buf);
+        owned = xmalloc(len + 1);
+        memcpy(owned, buf, len + 1);
+    }
+    /* No chunk_add_pool interning: this string is used once and never looked up by pool index again. Interning would grow the pool/name_index forever per unique value — measured 7x slower for 100k unique casts vs. 10 distinct ones. */
+    return aer_make_string(owned, len);
+}
+
+/* Resolves a[start:end] bounds against length `len`; either bound may be TYPE_NULL (defaults to 0/len). Clamps out-of-range bounds instead of erroring, Python-slice style. */
+static bool vm_slice_bounds(AerVal start_v, AerVal end_v, long long len,
+                             long long* out_start, long long* out_end) {
+    if (aer_type(start_v) != TYPE_NULL && aer_type(start_v) != TYPE_INTEGER) { error("Slice bounds must be integers"); return false; }
+    if (aer_type(end_v)   != TYPE_NULL && aer_type(end_v)   != TYPE_INTEGER) { error("Slice bounds must be integers"); return false; }
+    long long start = (aer_type(start_v) == TYPE_NULL) ? 0   : aer_as_int(start_v);
+    long long end   = (aer_type(end_v)   == TYPE_NULL) ? len : aer_as_int(end_v);
+    if (start < 0) start += len;
+    if (end   < 0) end   += len;
+    if (start < 0)   start = 0;
+    if (end   > len) end   = len;
+    if (end   < start) end = start;
+    *out_start = start;
+    *out_end   = end;
+    return true;
+}
+
+/* Shared by lbl_call_value and aer_module_call — arity/receiver-type check and call-frame
+   construction, identical whether the call stays in one VM or crosses into a module's own.
+   Doesn't touch the argument stack; `fn_chunk` is the function's own chunk (for error
+   messages), not necessarily target's. Not static: aer_module.c calls this too. */
+bool vm_setup_call(VM* target, Chunk* fn_chunk, AerVal fv, int arg_count,
+                    AerVal* args, unsigned int return_ip) {
+    if (aer_type(fv) != TYPE_FUNCTION) { error("Value is not callable"); return false; }
+    AerFunction* f = aer_as_function(fv);
+    if (arg_count < (int)f->min_arity || arg_count > (int)f->arity) {
+        if (f->min_arity == f->arity)
+            error("Function expects %u arguments, got %d", f->arity, arg_count);
+        else
+            error("Function expects between %u and %u arguments, got %d", f->min_arity, f->arity, arg_count);
+        return false;
+    }
+    if (f->has_receiver) {
+        AerVal arg0 = args[0];
+        if (aer_type(arg0) != TYPE_ARRAY || !aer_as_array(arg0)->shape ||
+            aer_as_array(arg0)->shape->name != f->receiver_type) {
+            error("Function expects its first argument to be a %s",
+                  aer_as_string(fn_chunk->pool[f->receiver_type])->data);
+            return false;
+        }
+    }
+    if (target->call_depth >= VM_CALL_MAX) { error("Call stack overflow"); return false; }
+    /* Only pushed after every failure check above — a partial push here would leave stray values a caller's own cleanup wouldn't know to pop. */
+    int missing = (int)f->arity - arg_count;
+    if (missing > 0) {
+        if (target->stack_top + missing > VM_STACK_MAX) { error("Stack overflow"); return false; }
+        for (int i = arg_count; i < (int)f->arity; i++)
+            target->stack[target->stack_top++] = f->defaults[i - f->min_arity];
+    }
+    CallFrame* frame = &target->call_stack[target->call_depth];
+    frame->return_ip          = return_ip;
+    frame->return_scope_depth = target->scope_depth;
+    frame->upvalues           = f->upvalues;
+    frame->function           = f;
+    /* call_stack is a fixed, reused array — a slot's previous occupant may have left pending defers, which a fresh call must never inherit. */
+    frame->defer_count        = 0;
+    frame->defers_draining    = false;
+    target->call_depth++;
+    target->ip = f->code_offset;
+    return true;
+}
+
+AerArray* vm_new_array(void) {
+    return pool_alloc(&array_pool);
+}
+
+AerDict* vm_new_dict(void) {
+    return pool_alloc(&dict_pool);
+}
+
+AerFunction* vm_new_function(void) {
+    return pool_alloc(&function_pool);
+}
+
+/* Resolves name as a builtin or struct call against a plain args[] array (not POP()ing from
+   the operand stack) — used only by deferred-call replay in lbl_return, whose args are already
+   staged in a bounded DeferredCall; lbl_call keeps its own POP()-based version since its
+   arg_count is parser-unbounded. Returns true if `name` was recognized, result in *out. */
+static bool vm_call_builtin(Chunk* c, const char* name, AerVal* args, int arg_count, AerVal* out) {
+    *out = aer_null();
+
+    if (strcmp(name, "length") == 0 && arg_count == 1) {
+        AerVal a = args[0];
+        if      (aer_type(a) == TYPE_ARRAY)  *out = aer_int((long long)aer_as_array(a)->count);
+        else if (aer_type(a) == TYPE_STRING) *out = aer_int((long long)aer_as_string(a)->length);
+        else if (aer_type(a) == TYPE_DICT)   *out = aer_int((long long)aer_as_dict(a)->map.count);
+        else error("length() requires an array, dict, or string");
+        return true;
+    }
+    if (strcmp(name, "delete") == 0 && arg_count == 2) {
+        AerVal obj = args[0], key = args[1];
+        if (aer_type(obj) == TYPE_DICT) {
+            if (aer_type(key) != TYPE_STRING) { error("delete() key must be a string"); return true; }
+            AerString* ks = aer_as_string(key);
+            unsigned int klen = ks->length;
+            if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return true; }
+            char kbuf[VM_KEY_MAX + 1];
+            memcpy(kbuf, ks->data, klen);
+            kbuf[klen] = '\0';
+            dictmap_remove(&aer_as_dict(obj)->map, kbuf);
+            *out = obj;
+            return true;
+        }
+        if (aer_type(obj) == TYPE_ARRAY) {
+            AerArray* a = aer_as_array(obj);
+            if (a->shape) { error("delete() cannot remove fields from a struct instance — structs have a fixed shape"); return true; }
+            if (aer_type(key) != TYPE_INTEGER) { error("Array delete() index must be an integer"); return true; }
+            long long i = aer_as_int(key);
+            if (i < 0) i += (long long)a->count;
+            if (i < 0 || (unsigned long long)i >= a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(key), a->count); return true; }
+            memmove(&a->items[i], &a->items[i + 1], (size_t)(a->count - (unsigned long long)i - 1) * sizeof(AerVal));
+            a->count--;
+            *out = obj;
+            return true;
+        }
+        error("delete() requires a dict or array");
+        return true;
+    }
+    if (strcmp(name, "append") == 0 && arg_count == 2) {
+        AerVal arr = args[0], val = args[1];
+        if (aer_type(arr) != TYPE_ARRAY) { error("append() requires an array"); return true; }
+        AerArray* a = aer_as_array(arr);
+        if (a->shape) { error("append() cannot add fields to a struct instance — structs have a fixed shape"); return true; }
+        if (a->count >= a->capacity) {
+            a->capacity = a->capacity ? a->capacity * 2 : 4;
+            a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
+        }
+        gc_barrier_array(a, val);
+        a->items[a->count++] = val;
+        *out = arr;
+        return true;
+    }
+    if (strcmp(name, "print") == 0 && arg_count == 1) {
+        vm_print_value(c, args[0], false);
+        printf("\n");
+        return true;
+    }
+    if (strcmp(name, "type") == 0 && arg_count == 1) {
+        const char* tn = vm_type_name(c, args[0]);
+        /* Copies rather than pointing at a static literal or the chunk's pool data — AerString always owns its data, no exceptions. */
+        unsigned int tn_len = (unsigned int)strlen(tn);
+        char* tn_buf = xmalloc(tn_len + 1);
+        memcpy(tn_buf, tn, tn_len + 1);
+        *out = aer_make_string(tn_buf, tn_len);   /* no chunk_add_pool interning — see vm_to_str's comment */
+        return true;
+    }
+    if (strcmp(name, "assert") == 0 && arg_count == 2) {
+        AerVal cond = args[0], msg = args[1];
+        if (aer_type(msg) != TYPE_STRING) { error("assert() requires a string message as its second argument"); return true; }
+        if (!vm_truthy(cond)) {
+            assert_failure_count++;
+            AerString* ms = aer_as_string(msg);
+            printf("ASSERT FAILED: %.*s\n", (int)ms->length, ms->data);
+        }
+        return true;
+    }
+    if (strcmp(name, "panic") == 0 && arg_count == 1) {
+        AerVal msg = args[0];
+        if (aer_type(msg) != TYPE_STRING) { error("panic() requires a string message"); return true; }
+        AerString* ms = aer_as_string(msg);
+        error("panic: %.*s", (int)ms->length, ms->data);
+        return true;
+    }
+
+    Shape* shape = chunk_find_shape(c, name);
+    if (shape) {
+        if ((unsigned int)arg_count > shape->field_count) {
+            error("'%s' takes at most %u argument%s, got %d",
+                  name, shape->field_count, shape->field_count == 1 ? "" : "s", arg_count);
+            return true;
+        }
+        AerArray* a = pool_alloc(&array_pool);
+        a->count = a->capacity = shape->field_count;
+        a->items = xmalloc(sizeof(AerVal) * a->capacity);
+        a->shape = shape;
+        for (int i = 0; i < arg_count; i++) a->items[i] = args[i];
+        for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
+            a->items[i] = shape->field_defaults[i];
+        *out = aer_array_val(a);
+        return true;
+    }
+
+    return false;
+}
+
+/* Shared by lbl_index_get and the OP_INDEX_GET_*_* fused handlers (see
+   Part 2 of the array-index-get fusion comment in vm.h) — identical
+   type dispatch, bounds/negative-index handling, and error messages as
+   the original inline body, just returning the value instead of
+   PUSH()ing it so callers can fuse it into a stack-neutral read. On any
+   error path this calls error() (setting runtime_had_error) and returns
+   aer_null(); every caller must PUSH/DISPATCH exactly as before — the
+   returned null is never actually used once DISPATCH() bails. */
+static inline AerVal vm_index_get_compute(AerVal obj, AerVal idx) {
+    if (aer_type(obj) == TYPE_ARRAY) {
+        AerArray* a = aer_as_array(obj);
+        if (a->shape) { error("Struct fields are accessed with '.', not '[]'"); return aer_null(); }
+        if (aer_type(idx) != TYPE_INTEGER) { error("Array index must be an integer"); return aer_null(); }
+        long long i = aer_as_int(idx);
+        if (i < 0) i += (long long)a->count;
+        if (i < 0 || (unsigned long long)i >= a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(idx), a->count); return aer_null(); }
+        return a->items[i];
+    } else if (aer_type(obj) == TYPE_DICT) {
+        if (aer_type(idx) != TYPE_STRING) { error("Dict key must be a string"); return aer_null(); }
+        AerString* is = aer_as_string(idx);
+        unsigned int klen = is->length;
+        if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return aer_null(); }
+        char kbuf[VM_KEY_MAX + 1];
+        memcpy(kbuf, is->data, klen);
+        kbuf[klen] = '\0';
+        AerVal* found = dictmap_get(&aer_as_dict(obj)->map, kbuf);
+        if (!found) return aer_null();
+        return *found;
+    } else if (aer_type(obj) == TYPE_STRING) {
+        AerString* os = aer_as_string(obj);
+        if (aer_type(idx) != TYPE_INTEGER) { error("String index must be an integer"); return aer_null(); }
+        long long i = aer_as_int(idx);
+        long long len = (long long)os->length;
+        if (i < 0) i += len;
+        if (i < 0 || i >= len) { error("String index %lld out of bounds (len %lld)", aer_as_int(idx), len); return aer_null(); }
+        /* A single character is a length-1 string (AER has no char type); copies the byte since AerString must always own its data, even after obj is later collected. */
+        char* ch_buf = xmalloc(2);
+        ch_buf[0] = os->data[i];
+        ch_buf[1] = '\0';
+        return aer_make_string(ch_buf, 1);   /* no chunk_add_pool interning — see vm_to_str's comment */
+    } else {
+        error("Cannot index type");
+        return aer_null();
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Dispatch loop — computed goto (GCC direct-threaded dispatch); each instruction jumps straight to the next handler, letting the branch predictor learn per-instruction patterns. */
+/* ------------------------------------------------------------------ */
+
+bool vm_run(VM* vm) {
+    Chunk* c = vm->chunk;
+    Opcode cur_op;
+
+#define READ()     (c->code[vm->ip++])
+#define PUSH(v)    do { if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return false; } vm->stack[vm->stack_top++] = (v); } while(0)
+#define POP()      (vm->stack_top > 0 ? vm->stack[--vm->stack_top] : (error("Stack underflow"), aer_null()))
+/* active_vm_for_errors = vm is just a pointer store; the line-lookup binary search only runs inside error() when a fault fires, not per-opcode as an earlier version did. */
+#define DISPATCH() do { if (runtime_had_error) return false; gc_maybe_collect(vm); active_vm_for_errors = vm; cur_op = (Opcode)READ(); goto *dt[cur_op]; } while(0)
+
+    static const void* const dt[] = {
+        [OP_PUSH]           = &&lbl_push,
+        [OP_LOAD]           = &&lbl_load,
+        [OP_STORE]          = &&lbl_store,
+        [OP_DEFINE]         = &&lbl_define,
+        [OP_LOAD_LOCAL]     = &&lbl_load_local,
+        [OP_STORE_LOCAL]    = &&lbl_store_local,
+        [OP_DEFINE_LOCAL]   = &&lbl_define_local,
+        [OP_COMPOUND_NAME_CONST] = &&lbl_compound_name_const,
+        [OP_COMPOUND_NAME_NAME]  = &&lbl_compound_name_name,
+        [OP_COMPOUND_LOCAL_CONST] = &&lbl_compound_local_const,
+        [OP_COMPOUND_LOCAL_LOCAL] = &&lbl_compound_local_local,
+        [OP_COMPOUND_LOCAL_NAME]  = &&lbl_compound_local_name,
+        [OP_COMPOUND_NAME_LOCAL]  = &&lbl_compound_name_local,
+        [OP_ADD]            = &&lbl_binary,
+        [OP_SUB]            = &&lbl_binary,
+        [OP_MUL]            = &&lbl_binary,
+        [OP_DIV]            = &&lbl_binary,
+        [OP_MOD]            = &&lbl_binary,
+        [OP_FLOOR_DIV]      = &&lbl_binary,
+        [OP_EQ]             = &&lbl_binary,
+        [OP_NEQ]            = &&lbl_binary,
+        [OP_LT]             = &&lbl_binary,
+        [OP_GT]             = &&lbl_binary,
+        [OP_LTE]            = &&lbl_binary,
+        [OP_GTE]            = &&lbl_binary,
+        [OP_IN]             = &&lbl_binary,
+        [OP_AND]            = &&lbl_binary,
+        [OP_OR]             = &&lbl_binary,
+        [OP_PIPE]           = &&lbl_binary,
+        [OP_BITWISE_AND]    = &&lbl_binary,
+        [OP_BITWISE_OR]     = &&lbl_binary,
+        [OP_BITWISE_XOR]    = &&lbl_binary,
+        [OP_LSHIFT]         = &&lbl_binary,
+        [OP_RSHIFT]         = &&lbl_binary,
+        [OP_NEGATE]         = &&lbl_negate,
+        [OP_NOT]            = &&lbl_not,
+        [OP_BITWISE_NOT]    = &&lbl_bitwise_not,
+        [OP_JUMP]           = &&lbl_jump,
+        [OP_JUMP_IF_FALSE]  = &&lbl_jump_if_false,
+        [OP_JUMP_IF_TRUE]   = &&lbl_jump_if_true,
+        [OP_PUSH_SCOPE]     = &&lbl_push_scope,
+        [OP_POP_SCOPE]      = &&lbl_pop_scope,
+        [OP_CALL]           = &&lbl_call,
+        [OP_TAIL_CALL]      = &&lbl_call,
+        [OP_CALL_VALUE]     = &&lbl_call_value,
+        [OP_CALL_MODULE]    = &&lbl_call_module,
+        [OP_CAPTURE]        = &&lbl_capture,
+        [OP_MAKE_CLOSURE]   = &&lbl_make_closure,
+        [OP_LOAD_UPVALUE]   = &&lbl_load_upvalue,
+        [OP_STORE_UPVALUE]  = &&lbl_store_upvalue,
+        [OP_RETURN]         = &&lbl_return,
+        [OP_DEFER_PUSH]     = &&lbl_defer_push,
+        [OP_ARRAY_NEW]      = &&lbl_array_new,
+        [OP_DICT_NEW]       = &&lbl_dict_new,
+        [OP_INDEX_GET]      = &&lbl_index_get,
+        [OP_INDEX_GET_LOCAL_CONST] = &&lbl_index_get_local_const,
+        [OP_INDEX_GET_LOCAL_LOCAL] = &&lbl_index_get_local_local,
+        [OP_INDEX_GET_LOCAL_NAME]  = &&lbl_index_get_local_name,
+        [OP_INDEX_GET_NAME_CONST]  = &&lbl_index_get_name_const,
+        [OP_INDEX_GET_NAME_LOCAL]  = &&lbl_index_get_name_local,
+        [OP_INDEX_GET_NAME_NAME]   = &&lbl_index_get_name_name,
+        [OP_INDEX_SET]      = &&lbl_index_set,
+        [OP_SLICE_GET]      = &&lbl_slice_get,
+        [OP_DEFINE_STRUCT]  = &&lbl_define_struct,
+        [OP_FIELD_GET]      = &&lbl_field_get,
+        [OP_FIELD_SET]      = &&lbl_field_set,
+        [OP_CHECK_SHAPE]    = &&lbl_check_shape,
+        [OP_UNPACK]         = &&lbl_unpack,
+        [OP_ITER_NEXT]      = &&lbl_iter_next,
+        [OP_ITER_NEXT_PAIR] = &&lbl_iter_next_pair,
+        [OP_ITER_RANGE]     = &&lbl_iter_range,
+        [OP_PRINT_REPL]     = &&lbl_print_repl,
+        [OP_POP]            = &&lbl_pop,
+        [OP_TO_STR]         = &&lbl_to_str,
+        [OP_CAST]           = &&lbl_cast,
+        [OP_HALT]           = &&lbl_halt,
+    };
+
+    DISPATCH();
+
+lbl_push:
+    PUSH(c->pool[READ()]);
+    DISPATCH();
+
+lbl_load: {
+    int idx       = READ();
+    int cache_idx = READ();
+    AerVal* found = c->addr_cache[cache_idx];
+    if (!found) {
+        found = vm_scope_get(vm, (unsigned int)idx);
+        /* Same exact-match discipline as lbl_call's cache — only cache when the global IS the winning resolution, per the shadowing bug that fix addressed. */
+        if (found) {
+            AerVal* cacheable = vm_global_slot_address(vm, (unsigned int)idx);
+            if (cacheable && cacheable == found) c->addr_cache[cache_idx] = cacheable;
+        }
+    }
+    if (!found) { error("'%s' is not defined", aer_as_string(c->pool[idx])->data); PUSH(aer_null()); }
+    else         PUSH(*found);
+    DISPATCH();
+}
+
+lbl_store: {
+    int idx       = READ();
+    int cache_idx = READ();
+    AerVal val = POP();
+    AerVal* cached = c->addr_cache[cache_idx];
+    if (cached) {
+        *cached = val;
+    } else {
+        AerVal* found = vm_scope_get(vm, (unsigned int)idx);
+        if (found) {
+            *found = val;
+            AerVal* cacheable = vm_global_slot_address(vm, (unsigned int)idx);
+            if (cacheable && cacheable == found) c->addr_cache[cache_idx] = cacheable;
+        } else {
+            vm_scope_define(vm, (unsigned int)idx, val);
+        }
+    }
+    DISPATCH();
+}
+
+lbl_define: {
+    int idx = READ();
+    AerVal val = POP();
+    vm_scope_define(vm, (unsigned int)idx, val);
+    DISPATCH();
+}
+
+/* A parameter's slot in the CURRENT call's base scope — vm_scope_floor(vm), not scope_depth-1,
+   since this can run from inside a nested if/for block. Must check .box: a parameter captured
+   by a nested closure is boxed by vm_box_slot, and reading/writing the raw slot after that
+   would silently miss what the closure sees or changes. */
+lbl_load_local: {
+    int slot = READ();
+    AerScope* s = &vm->scopes[vm_scope_floor(vm)];
+    AerVal* box = s->slots[slot].box;
+    PUSH(box ? *box : s->slots[slot].val);
+    DISPATCH();
+}
+
+lbl_store_local: {
+    int slot = READ();
+    AerScope* s = &vm->scopes[vm_scope_floor(vm)];
+    AerVal val = POP();
+    AerVal* box = s->slots[slot].box;
+    if (box) *box = val; else s->slots[slot].val = val;
+    DISPATCH();
+}
+
+/* Runs once per call at function entry, so — unlike lbl_load_local/store_local — always the
+   innermost scope. Still sets .name, not just .val: vm_box_slot scans slots[j].name to find a
+   nested closure's captured parameter, so skipping it would silently break capture. */
+lbl_define_local: {
+    int slot = READ();
+    int name_idx = READ();
+    AerScope* s = &vm->scopes[vm->scope_depth - 1];
+    s->slots[slot].val  = POP();
+    s->slots[slot].box  = NULL;
+    s->slots[slot].name = (unsigned int)name_idx;
+    if (slot >= (int)s->count) s->count = (unsigned int)slot + 1;
+    DISPATCH();
+}
+
+/* Fused `name OP= const` (e.g. `i += 1`) — see OP_COMPOUND_*'s comment in vm.h. Stack-neutral,
+   matching the unfused 4-opcode form's net-zero effect. The runtime_had_error check after each
+   fallible step replaces the intervening DISPATCH() the unfused form used to abort cleanly. */
+lbl_compound_name_const: {
+    int lhs_name_idx  = READ();
+    int lhs_cache_idx = READ();
+    Opcode bin_op     = (Opcode)READ();
+    int rhs_pool_idx  = READ();
+    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    AerVal result = vm_binary(*lhs_addr, c->pool[rhs_pool_idx], bin_op);
+    if (runtime_had_error) DISPATCH();
+    *lhs_addr = result;
+    DISPATCH();
+}
+
+/* Fused `name OP= name` (e.g. `total += i`) — same discipline as lbl_compound_name_const, RHS resolved by name; reads both operands before writing, correct for self-referential `x += x`. */
+lbl_compound_name_name: {
+    int lhs_name_idx  = READ();
+    int lhs_cache_idx = READ();
+    Opcode bin_op     = (Opcode)READ();
+    int rhs_name_idx  = READ();
+    int rhs_cache_idx = READ();
+    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    AerVal* rhs_addr = vm_resolve_name_cached(vm, c, rhs_name_idx, rhs_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    AerVal result = vm_binary(*lhs_addr, *rhs_addr, bin_op);
+    if (runtime_had_error) DISPATCH();
+    *lhs_addr = result;
+    DISPATCH();
+}
+
+/* Phase 2 — the 4 remaining compound-assignment shapes. A LOCAL operand can't fail to resolve,
+   but reads/writes MUST go through vm_read_local_slot/vm_write_local_slot's box check, or a
+   closure-captured parameter would silently diverge (see lbl_load_local's comment). */
+lbl_compound_local_const: {
+    int lhs_slot     = READ();
+    Opcode bin_op    = (Opcode)READ();
+    int rhs_pool_idx = READ();
+    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
+    AerVal result = vm_binary(lhs_val, c->pool[rhs_pool_idx], bin_op);
+    if (runtime_had_error) DISPATCH();
+    vm_write_local_slot(vm, lhs_slot, result);
+    DISPATCH();
+}
+
+lbl_compound_local_local: {
+    int lhs_slot  = READ();
+    Opcode bin_op = (Opcode)READ();
+    int rhs_slot  = READ();
+    /* Both read before either is written — matches the self-referential `p += p` case. */
+    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
+    AerVal rhs_val = vm_read_local_slot(vm, rhs_slot);
+    AerVal result = vm_binary(lhs_val, rhs_val, bin_op);
+    if (runtime_had_error) DISPATCH();
+    vm_write_local_slot(vm, lhs_slot, result);
+    DISPATCH();
+}
+
+lbl_compound_local_name: {
+    int lhs_slot      = READ();
+    Opcode bin_op     = (Opcode)READ();
+    int rhs_name_idx  = READ();
+    int rhs_cache_idx = READ();
+    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
+    AerVal* rhs_addr = vm_resolve_name_cached(vm, c, rhs_name_idx, rhs_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    AerVal result = vm_binary(lhs_val, *rhs_addr, bin_op);
+    if (runtime_had_error) DISPATCH();
+    vm_write_local_slot(vm, lhs_slot, result);
+    DISPATCH();
+}
+
+lbl_compound_name_local: {
+    int lhs_name_idx  = READ();
+    int lhs_cache_idx = READ();
+    Opcode bin_op     = (Opcode)READ();
+    int rhs_slot      = READ();
+    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    AerVal rhs_val = vm_read_local_slot(vm, rhs_slot);
+    AerVal result = vm_binary(*lhs_addr, rhs_val, bin_op);
+    if (runtime_had_error) DISPATCH();
+    *lhs_addr = result;
+    DISPATCH();
+}
+
+/* All 18 binary/comparison/logical/bitwise ops share one handler.
+   cur_op holds whichever opcode was dispatched here. */
+lbl_binary: {
+    AerVal b = POP(), a = POP();
+    PUSH(vm_binary(a, b, cur_op));
+    DISPATCH();
+}
+
+lbl_negate: {
+    AerVal v = POP();
+    if      (aer_type(v) == TYPE_INTEGER) PUSH(aer_int(-aer_as_int(v)));
+    else if (aer_type(v) == TYPE_REAL)    PUSH(aer_real(-aer_as_real(v)));
+    else { error("Negation requires a numeric type"); PUSH(aer_null()); }
+    DISPATCH();
+}
+
+lbl_not: {
+    AerVal v = POP();
+    PUSH(aer_bool(!vm_truthy(v)));
+    DISPATCH();
+}
+
+lbl_bitwise_not: {
+    AerVal v = POP();
+    if (aer_type(v) != TYPE_INTEGER) { error("Bitwise NOT requires an integer"); PUSH(aer_null()); }
+    else PUSH(aer_int(~aer_as_int(v)));
+    DISPATCH();
+}
+
+lbl_jump: {
+    int target = READ();
+    vm->ip = (unsigned int)target;
+    DISPATCH();
+}
+
+lbl_jump_if_false: {
+    int target = READ();
+    if (!vm_truthy(POP())) vm->ip = (unsigned int)target;
+    DISPATCH();
+}
+
+lbl_jump_if_true: {
+    int target = READ();
+    if (vm_truthy(POP())) vm->ip = (unsigned int)target;
+    DISPATCH();
+}
+
+lbl_push_scope: {
+    if (vm->scope_depth >= VM_SCOPE_MAX) { error("Scope stack overflow"); return false; }
+    AerScope* ns = &vm->scopes[vm->scope_depth++];
+    ns->count    = 0;
+    ns->overflow = false;
+    /* Always reset: a leaked previous occupant's hashmap (overflow_has_captures) isn't zeroed by hashmap_free, so this scope must not inherit a stale map struct. */
+    ns->map                    = (HashMap){0};
+    ns->overflow_has_captures  = false;
+    DISPATCH();
+}
+
+lbl_pop_scope:
+    if (vm->scope_depth <= 1) { error("Scope stack underflow"); return false; }
+    --vm->scope_depth;
+    if (vm->scopes[vm->scope_depth].overflow && !vm->scopes[vm->scope_depth].overflow_has_captures)
+        hashmap_free(&vm->scopes[vm->scope_depth].map);
+    DISPATCH();
+
+lbl_print_repl: {
+    AerVal v = POP();
+    if (aer_type(v) != TYPE_NULL) {
+        vm_print_value(c, v, false);
+        printf("\n");
+    }
+    DISPATCH();
+}
+
+lbl_call: {
+    int name_idx   = READ();
+    int arg_count  = READ();
+    int cache_idx  = READ();
+    AerVal* fv = c->addr_cache[cache_idx];
+    if (!fv) {
+        fv = vm_scope_get(vm, (unsigned int)name_idx);
+        /* Only cache when the global IS the winning resolution — a local binding shadowing a same-named global must keep winning every call, not just before the cache populated. */
+        AerVal* cacheable = vm_global_slot_address(vm, (unsigned int)name_idx);
+        if (cacheable && cacheable == fv) c->addr_cache[cache_idx] = cacheable;
+    }
+    const char* name = aer_as_string(c->pool[name_idx])->data;
+
+    /* Built-in functions */
+    if (!fv) {
+        if (strcmp(name, "length") == 0 && arg_count == 1) {
+            AerVal a = POP();
+            AerVal r;
+            if      (aer_type(a) == TYPE_ARRAY)  r = aer_int((long long)aer_as_array(a)->count);
+            else if (aer_type(a) == TYPE_STRING) r = aer_int((long long)aer_as_string(a)->length);
+            else if (aer_type(a) == TYPE_DICT)   r = aer_int((long long)aer_as_dict(a)->map.count);
+            else { error("length() requires an array, dict, or string"); r = aer_int(0); }
+            PUSH(r); DISPATCH();
+        }
+        if (strcmp(name, "delete") == 0 && arg_count == 2) {
+            AerVal key = POP();
+            AerVal obj = POP();
+            if (aer_type(obj) == TYPE_DICT) {
+                if (aer_type(key) != TYPE_STRING) { error("delete() key must be a string"); PUSH(aer_null()); DISPATCH(); }
+                AerString* ks = aer_as_string(key);
+                unsigned int klen = ks->length;
+                if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); PUSH(aer_null()); DISPATCH(); }
+                char kbuf[VM_KEY_MAX + 1];
+                memcpy(kbuf, ks->data, klen);
+                kbuf[klen] = '\0';
+                dictmap_remove(&aer_as_dict(obj)->map, kbuf);
+                PUSH(obj); DISPATCH();
+            }
+            if (aer_type(obj) == TYPE_ARRAY) {
+                AerArray* a = aer_as_array(obj);
+                if (a->shape) { error("delete() cannot remove fields from a struct instance — structs have a fixed shape"); PUSH(aer_null()); DISPATCH(); }
+                if (aer_type(key) != TYPE_INTEGER) { error("Array delete() index must be an integer"); PUSH(aer_null()); DISPATCH(); }
+                long long i = aer_as_int(key);
+                if (i < 0) i += (long long)a->count;
+                if (i < 0 || (unsigned long long)i >= a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(key), a->count); PUSH(aer_null()); DISPATCH(); }
+                /* Shift-based, preserves order; overlapping ranges need memmove not memcpy (deleting the last element is a harmless zero-length copy). */
+                memmove(&a->items[i], &a->items[i + 1], (size_t)(a->count - (unsigned long long)i - 1) * sizeof(AerVal));
+                a->count--;
+                PUSH(obj); DISPATCH();
+            }
+            error("delete() requires a dict or array");
+            PUSH(aer_null()); DISPATCH();
+        }
+        if (strcmp(name, "append") == 0 && arg_count == 2) {
+            AerVal val = POP();
+            AerVal arr = POP();
+            if (aer_type(arr) != TYPE_ARRAY) { error("append() requires an array"); PUSH(aer_null()); DISPATCH(); }
+            AerArray* a = aer_as_array(arr);
+            if (a->shape) { error("append() cannot add fields to a struct instance — structs have a fixed shape"); PUSH(aer_null()); DISPATCH(); }
+            if (a->count >= a->capacity) {
+                a->capacity = a->capacity ? a->capacity * 2 : 4;
+                a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
+            }
+            gc_barrier_array(a, val);
+            a->items[a->count++] = val;
+            PUSH(arr); DISPATCH();
+        }
+        if (strcmp(name, "print") == 0 && arg_count == 1) {
+            vm_print_value(c, POP(), false);
+            printf("\n");
+            PUSH(aer_null()); DISPATCH();
+        }
+        if (strcmp(name, "type") == 0 && arg_count == 1) {
+            AerVal v = POP();
+            const char* tn = vm_type_name(c, v);
+            /* Copies — see vm_call_builtin's identical type() case. */
+            unsigned int tn_len = (unsigned int)strlen(tn);
+            char* tn_buf = xmalloc(tn_len + 1);
+            memcpy(tn_buf, tn, tn_len + 1);
+            PUSH(aer_make_string(tn_buf, tn_len)); DISPATCH();   /* no chunk_add_pool interning — see vm_to_str's comment */
+        }
+        if (strcmp(name, "assert") == 0 && arg_count == 2) {
+            AerVal msg  = POP();
+            AerVal cond = POP();
+            if (aer_type(msg) != TYPE_STRING) {
+                error("assert() requires a string message as its second argument");
+                PUSH(aer_null()); DISPATCH();
+            }
+            /* Deliberately skips error()/runtime_had_error — a failed assertion reports and execution keeps running, unlike every other runtime fault. */
+            if (!vm_truthy(cond)) {
+                assert_failure_count++;
+                AerString* ms = aer_as_string(msg);
+                printf("ASSERT FAILED: %.*s\n", (int)ms->length, ms->data);
+            }
+            PUSH(aer_null()); DISPATCH();
+        }
+        if (strcmp(name, "panic") == 0 && arg_count == 1) {
+            AerVal msg = POP();
+            if (aer_type(msg) != TYPE_STRING) {
+                error("panic() requires a string message");
+                PUSH(aer_null()); DISPATCH();
+            }
+            /* error() sets runtime_had_error — DISPATCH()'s check aborts on the next dispatch, same path as any other runtime fault. */
+            {
+                AerString* ms = aer_as_string(msg);
+                error("panic: %.*s", (int)ms->length, ms->data);
+            }
+            PUSH(aer_null()); DISPATCH();
+        }
+
+        /* Not a variable, not a builtin — instantiation: Point(1, 2). Fewer args than fields is allowed (trailing fields take defaults); more is not. */
+        Shape* shape = chunk_find_shape(c, name);
+        if (shape) {
+            if ((unsigned int)arg_count > shape->field_count) {
+                error("'%s' takes at most %u argument%s, got %d",
+                      name, shape->field_count, shape->field_count == 1 ? "" : "s", arg_count);
+                for (int i = 0; i < arg_count; i++) POP();
+                PUSH(aer_null()); DISPATCH();
+            }
+            AerArray* a = pool_alloc(&array_pool);
+            a->count = a->capacity = shape->field_count;
+            a->items = xmalloc(sizeof(AerVal) * a->capacity);
+            a->shape = shape;
+            for (int i = arg_count - 1; i >= 0; i--) a->items[i] = POP();
+            for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
+                a->items[i] = shape->field_defaults[i];
+            PUSH(aer_array_val(a)); DISPATCH();
+        }
+
+        error("'%s' is not defined", name);
+        for (int i = 0; i < arg_count; i++) POP();
+        PUSH(aer_null()); DISPATCH();
+    }
+
+    if (aer_type(*fv) != TYPE_FUNCTION) {
+        error("'%s' is not a function", name);
+        for (int i = 0; i < arg_count; i++) POP();
+        PUSH(aer_null()); DISPATCH();
+    }
+    {
+    AerFunction* fvf = aer_as_function(*fv);
+    if (arg_count < (int)fvf->min_arity || arg_count > (int)fvf->arity) {
+        if (fvf->min_arity == fvf->arity)
+            error("'%s' expects %u arguments, got %d", name, fvf->arity, arg_count);
+        else
+            error("'%s' expects between %u and %u arguments, got %d", name, fvf->min_arity, fvf->arity, arg_count);
+        for (int i = 0; i < arg_count; i++) POP();
+        PUSH(aer_null()); DISPATCH();
+    }
+    /* Omitted trailing args get pushed here, so the callee's OP_DEFINE_LOCAL sequence still sees exactly `arity` values. */
+    for (int i = arg_count; i < (int)fvf->arity; i++) PUSH(fvf->defaults[i - fvf->min_arity]);
+    arg_count = (int)fvf->arity;
+    if (fvf->has_receiver) {
+        AerVal arg0 = vm->stack[vm->stack_top - arg_count];
+        if (aer_type(arg0) != TYPE_ARRAY || !aer_as_array(arg0)->shape ||
+            aer_as_array(arg0)->shape->name != fvf->receiver_type) {
+            error("'%s' expects its first argument to be a %s",
+                  name, aer_as_string(c->pool[fvf->receiver_type])->data);
+            for (int i = 0; i < arg_count; i++) POP();
+            PUSH(aer_null()); DISPATCH();
+        }
+    }
+    /* OP_TAIL_CALL shares this whole handler with OP_CALL and diverges only past this point,
+       once fv is confirmed callable with matching arity/receiver. Reusing the current frame is
+       only safe with no pending defers (they'd need to run before this frame is discarded, and
+       there's no return value yet to hand back mid-call), so a tail call with pending defers
+       just falls through to the normal stack-growing path below. */
+    if (cur_op == OP_TAIL_CALL) {
+        CallFrame* caller = &vm->call_stack[vm->call_depth - 1];
+        if (caller->defer_count == 0) {
+            int base = caller->return_scope_depth;
+            while (vm->scope_depth > base) {
+                --vm->scope_depth;
+                if (vm->scopes[vm->scope_depth].overflow && !vm->scopes[vm->scope_depth].overflow_has_captures)
+                    hashmap_free(&vm->scopes[vm->scope_depth].map);
+            }
+            caller->upvalues = fvf->upvalues;
+            caller->function = fvf;
+            vm->ip = fvf->code_offset;
+            DISPATCH();
+        }
+    }
+    if (vm->call_depth >= VM_CALL_MAX) { error("Call stack overflow"); return false; }
+    {
+        CallFrame* frame = &vm->call_stack[vm->call_depth];
+        frame->return_ip          = vm->ip;
+        frame->return_scope_depth = vm->scope_depth;
+        frame->upvalues           = fvf->upvalues;
+        frame->function           = fvf;
+        /* See vm_setup_call's identical reset — reused call_stack slots must never inherit a previous occupant's pending defers. */
+        frame->defer_count        = 0;
+        frame->defers_draining    = false;
+    }
+    vm->call_depth++;
+    vm->ip = fvf->code_offset;
+    DISPATCH();
+    }
+}
+
+lbl_return: {
+    /* Address of this OP_RETURN itself (vm->ip already advanced past it); used as a deferred call's return_ip so its own OP_RETURN lands back here to check for further pending defers. */
+    unsigned int return_addr = vm->ip - 1;
+    CallFrame* frame = &vm->call_stack[vm->call_depth - 1];
+    AerVal popped = POP();
+    if (!frame->defers_draining) {
+        /* First visit for this call: `popped` is the real return value. */
+        frame->pending_return_value = popped;
+        frame->defers_draining      = true;
+    }
+    /* Otherwise `popped` is a just-finished deferred call's own result, discarded here. */
+
+    while (frame->defer_count > 0) {
+        DeferredCall dc = frame->defers[--frame->defer_count];
+        const char* dname = aer_as_string(c->pool[dc.name_idx])->data;
+        AerVal* dfv = vm_scope_get(vm, dc.name_idx);
+
+        if (dfv) {
+            if (aer_type(*dfv) != TYPE_FUNCTION) {
+                error("'%s' is not a function", dname);
+            } else {
+                for (int i = 0; i < dc.arg_count; i++) PUSH(dc.args[i]);
+                AerVal* dargs = &vm->stack[vm->stack_top - dc.arg_count];
+                if (vm_setup_call(vm, c, *dfv, dc.arg_count, dargs, return_addr)) {
+                    /* Resumes inside the deferred call's bytecode; when it returns, execution re-enters lbl_return for THIS frame, rechecking defer_count. */
+                    DISPATCH();
+                }
+                for (int i = 0; i < dc.arg_count; i++) POP();   /* vm_setup_call failed; error() already called */
+            }
+        } else {
+            AerVal result;
+            bool handled = vm_call_builtin(c, dname, dc.args, dc.arg_count, &result);
+            if (!handled) error("'%s' is not defined", dname);
+        }
+        if (runtime_had_error) DISPATCH();   /* uniform abort, same as every other error path */
+    }
+
+    int base = frame->return_scope_depth;
+    while (vm->scope_depth > base) {
+        --vm->scope_depth;
+        if (vm->scopes[vm->scope_depth].overflow && !vm->scopes[vm->scope_depth].overflow_has_captures)
+            hashmap_free(&vm->scopes[vm->scope_depth].map);
+    }
+    AerVal ret = frame->pending_return_value;
+    frame->defers_draining = false;
+    vm->ip = vm->call_stack[--vm->call_depth].return_ip;
+    PUSH(ret);
+    DISPATCH();
+}
+
+lbl_defer_push: {
+    int name_idx  = READ();
+    int arg_count = READ();
+    CallFrame* frame = &vm->call_stack[vm->call_depth - 1];
+    /* arg_count > MAX_DEFER_ARGS is already rejected at parse time; this is just a defensive backstop against dc->args[] overflow. */
+    if (arg_count > MAX_DEFER_ARGS) {
+        error("Too many arguments to a deferred call (max %d)", MAX_DEFER_ARGS);
+        for (int i = 0; i < arg_count; i++) POP();
+        DISPATCH();
+    }
+    if (frame->defer_count >= MAX_DEFERS_PER_CALL) {
+        error("Too many deferred calls in one function (max %d)", MAX_DEFERS_PER_CALL);
+        for (int i = 0; i < arg_count; i++) POP();
+        DISPATCH();
+    }
+    /* Lazily allocated, kept (not freed) once allocated, so a later call reusing this call_stack slot finds it already there. */
+    if (!frame->defers) frame->defers = xmalloc(sizeof(DeferredCall) * MAX_DEFERS_PER_CALL);
+    DeferredCall* dc = &frame->defers[frame->defer_count++];
+    dc->name_idx  = (unsigned int)name_idx;
+    dc->arg_count = arg_count;
+    for (int i = arg_count - 1; i >= 0; i--) dc->args[i] = POP();
+    DISPATCH();
+}
+
+lbl_call_value: {
+    int arg_count = READ();
+    AerVal fv = vm->stack[vm->stack_top - arg_count - 1];
+    AerVal* args = &vm->stack[vm->stack_top - arg_count];
+    if (!vm_setup_call(vm, c, fv, arg_count, args, vm->ip)) {
+        for (int i = 0; i <= arg_count; i++) POP();
+        PUSH(aer_null()); DISPATCH();
+    }
+    /* vm_setup_call may have pushed default values for omitted trailing params, so the
+       true count now on the stack is the function's own arity, not the original arg_count. */
+    int final_count = (int)aer_as_function(fv)->arity;
+    /* Shift args down one slot to overwrite the function value — done after vm_setup_call since it reads args[0] (the receiver) from its original position. */
+    memmove(&vm->stack[vm->stack_top - final_count - 1], args, (size_t)final_count * sizeof(AerVal));
+    vm->stack_top--;
+    DISPATCH();
+}
+
+lbl_call_module: {
+    int module_idx = READ();
+    int fn_idx     = READ();
+    int arg_count  = READ();
+    const char* module = aer_as_string(c->pool[module_idx])->data;
+    const char* fn     = aer_as_string(c->pool[fn_idx])->data;
+    bool handled = false;
+    if      (strcmp(module, "math")   == 0) handled = aer_math_call(vm, c, fn, arg_count);
+    else if (strcmp(module, "random") == 0) handled = aer_random_call(vm, c, fn, arg_count);
+    else if (strcmp(module, "string") == 0) handled = aer_string_call(vm, c, fn, arg_count);
+    else if (strcmp(module, "time")   == 0) handled = aer_time_call(vm, c, fn, arg_count);
+    else if (strcmp(module, "json")   == 0) handled = aer_json_call(vm, c, fn, arg_count);
+    else if (aer_host_is_module(module, (unsigned int)strlen(module)))
+                                             handled = aer_host_call(vm, module, fn, arg_count);
+    else                                     handled = aer_module_call(vm, module, fn, arg_count);
+    if (handled) DISPATCH();
+    /* The module matched but `fn` wasn't one of its functions — e.g. wrong module, or undefined at the file-module's top level. */
+    error("'%s' has no function '%s'", module, fn);
+    for (int i = 0; i < arg_count; i++) POP();
+    PUSH(aer_null()); DISPATCH();
+}
+
+lbl_capture: {
+    int name_idx = READ();
+    AerVal* box = vm_box_slot(vm, (unsigned int)name_idx);
+    if (!box) { DISPATCH(); }   /* vm_box_slot already called error() */
+    if (vm->pending_upvalue_count >= MAX_CAPTURES) {
+        error("Too many captured variables in one closure (max %d)", MAX_CAPTURES);
+        DISPATCH();
+    }
+    vm->pending_upvalues[vm->pending_upvalue_count++] = box;
+    DISPATCH();
+}
+
+lbl_make_closure: {
+    int code_offset   = READ();
+    int arity          = READ();
+    int min_arity       = READ();
+    int has_receiver    = READ();
+    int receiver_type   = READ();
+    int upvalue_count   = READ();
+    AerVal** upvalues = NULL;
+    if (upvalue_count > 0) {
+        upvalues = xmalloc(sizeof(AerVal*) * (size_t)upvalue_count);
+        /* The preceding OP_CAPTUREs appended boxes in exactly the order this closure's upvalue slots need. */
+        memcpy(upvalues, vm->pending_upvalues, sizeof(AerVal*) * (size_t)upvalue_count);
+    }
+    vm->pending_upvalue_count = 0;
+    /* Rebuilt fresh per closure like upvalues above — simpler than sharing, and rare on a hot path. */
+    int default_count = arity - min_arity;
+    AerVal* defaults = NULL;
+    if (default_count > 0) {
+        defaults = xmalloc(sizeof(AerVal) * (size_t)default_count);
+        for (int i = 0; i < default_count; i++) defaults[i] = c->pool[READ()];
+    }
+    AerFunction* fn = pool_alloc(&function_pool);
+    fn->code_offset   = (unsigned int)code_offset;
+    fn->arity         = (unsigned int)arity;
+    fn->min_arity     = (unsigned int)min_arity;
+    fn->defaults      = defaults;
+    fn->has_receiver  = has_receiver != 0;
+    fn->receiver_type = (unsigned int)receiver_type;
+    fn->upvalues      = upvalues;
+    fn->upvalue_count = (unsigned int)upvalue_count;
+    PUSH(aer_function_val(fn));
+    DISPATCH();
+}
+
+lbl_load_upvalue: {
+    int slot = READ();
+    AerVal** upvalues = vm->call_stack[vm->call_depth - 1].upvalues;
+    PUSH(*upvalues[slot]);
+    DISPATCH();
+}
+
+lbl_store_upvalue: {
+    int slot = READ();
+    AerVal val = POP();
+    AerVal** upvalues = vm->call_stack[vm->call_depth - 1].upvalues;
+    gc_barrier_box(upvalues[slot], val);
+    *upvalues[slot] = val;
+    DISPATCH();
+}
+
+lbl_array_new: {
+    int count = READ();
+    AerArray* a = pool_alloc(&array_pool);
+    a->capacity = count > 0 ? (unsigned int)count : 4;
+    a->count    = (unsigned int)count;
+    a->items    = xmalloc(sizeof(AerVal) * a->capacity);
+    a->shape    = NULL;
+    for (int i = count - 1; i >= 0; i--)
+        a->items[i] = POP();
+    PUSH(aer_array_val(a));
+    DISPATCH();
+}
+
+lbl_unpack: {
+    int idx = READ();
+    AerVal arr = vm->stack[vm->stack_top - 1];   /* peek — do not pop */
+    if (aer_type(arr) != TYPE_ARRAY) { error("Cannot unpack a non-array"); PUSH(aer_null()); DISPATCH(); }
+    AerArray* a = aer_as_array(arr);
+    if ((unsigned int)idx >= a->count) {
+        error("Cannot unpack index %d: array has %u element%s",
+              idx, a->count, a->count == 1 ? "" : "s");
+        PUSH(aer_null()); DISPATCH();
+    }
+    PUSH(a->items[idx]);
+    DISPATCH();
+}
+
+lbl_dict_new: {
+    int count = READ();
+    AerDict* d = pool_alloc(&dict_pool);
+    memset(&d->map, 0, sizeof(d->map));
+    d->map.is_inline = true;   /* AerDict stores AerVal inline, not boxed — see hashtable.h */
+    /* Stack: key0, val0, key1, val1, ..., keyN-1, valN-1 (valN-1 on top) */
+    for (int i = count - 1; i >= 0; i--) {
+        AerVal val = POP();
+        AerVal key = POP();
+        if (aer_type(key) != TYPE_STRING) { error("Dict keys must be strings"); continue; }
+        AerString* ks = aer_as_string(key);
+        unsigned int klen = ks->length;
+        char* k = xmalloc(klen + 1);
+        memcpy(k, ks->data, klen);
+        k[klen] = '\0';
+        dictmap_put(&d->map, k, val);
+    }
+    PUSH(aer_dict_val(d));
+    DISPATCH();
+}
+
+lbl_index_get: {
+    AerVal idx = POP();
+    AerVal obj = POP();
+    PUSH(vm_index_get_compute(obj, idx));
+    DISPATCH();
+}
+
+/* Fused `name[index]` reads. Reads both operands directly, computes via the shared
+   vm_index_get_compute, then pushes the result — unlike Part 1's compound-assignment family
+   this isn't stack-neutral. A NAME-kind operand can fail to resolve; check runtime_had_error
+   and DISPATCH() immediately rather than indexing with garbage, same as OP_COMPOUND_NAME_*. */
+lbl_index_get_local_const: {
+    int arr_slot = READ();
+    int idx_pool = READ();
+    AerVal obj = vm_read_local_slot(vm, arr_slot);
+    AerVal idx = c->pool[idx_pool];
+    PUSH(vm_index_get_compute(obj, idx));
+    DISPATCH();
+}
+
+lbl_index_get_local_local: {
+    int arr_slot = READ();
+    int idx_slot = READ();
+    AerVal obj = vm_read_local_slot(vm, arr_slot);
+    AerVal idx = vm_read_local_slot(vm, idx_slot);
+    PUSH(vm_index_get_compute(obj, idx));
+    DISPATCH();
+}
+
+lbl_index_get_local_name: {
+    int arr_slot      = READ();
+    int idx_name_idx  = READ();
+    int idx_cache_idx = READ();
+    AerVal obj = vm_read_local_slot(vm, arr_slot);
+    AerVal* idx_addr = vm_resolve_name_cached(vm, c, idx_name_idx, idx_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    PUSH(vm_index_get_compute(obj, *idx_addr));
+    DISPATCH();
+}
+
+lbl_index_get_name_const: {
+    int arr_name_idx  = READ();
+    int arr_cache_idx = READ();
+    int idx_pool      = READ();
+    AerVal* obj_addr = vm_resolve_name_cached(vm, c, arr_name_idx, arr_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    AerVal idx = c->pool[idx_pool];
+    PUSH(vm_index_get_compute(*obj_addr, idx));
+    DISPATCH();
+}
+
+lbl_index_get_name_local: {
+    int arr_name_idx  = READ();
+    int arr_cache_idx = READ();
+    int idx_slot      = READ();
+    AerVal* obj_addr = vm_resolve_name_cached(vm, c, arr_name_idx, arr_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    AerVal idx = vm_read_local_slot(vm, idx_slot);
+    PUSH(vm_index_get_compute(*obj_addr, idx));
+    DISPATCH();
+}
+
+lbl_index_get_name_name: {
+    int arr_name_idx  = READ();
+    int arr_cache_idx = READ();
+    int idx_name_idx  = READ();
+    int idx_cache_idx = READ();
+    AerVal* obj_addr = vm_resolve_name_cached(vm, c, arr_name_idx, arr_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    AerVal* idx_addr = vm_resolve_name_cached(vm, c, idx_name_idx, idx_cache_idx);
+    if (runtime_had_error) DISPATCH();
+    PUSH(vm_index_get_compute(*obj_addr, *idx_addr));
+    DISPATCH();
+}
+
+lbl_index_set: {
+    AerVal val = POP();
+    AerVal idx = POP();
+    AerVal obj = POP();
+    if (aer_type(obj) == TYPE_ARRAY) {
+        AerArray* a = aer_as_array(obj);
+        if (a->shape) { error("Struct fields are assigned with '.', not '[]'"); DISPATCH(); }
+        if (aer_type(idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
+        long long i = aer_as_int(idx);
+        if (i < 0) i += (long long)a->count;
+        if (i < 0 || (unsigned long long)i >= a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(idx), a->count); DISPATCH(); }
+        gc_barrier_array(a, val);
+        a->items[i] = val;
+    } else if (aer_type(obj) == TYPE_DICT) {
+        if (aer_type(idx) != TYPE_STRING) { error("Dict key must be a string"); DISPATCH(); }
+        AerString* is = aer_as_string(idx);
+        unsigned int klen = is->length;
+        if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); DISPATCH(); }
+        char kbuf[VM_KEY_MAX + 1];
+        memcpy(kbuf, is->data, klen);
+        kbuf[klen] = '\0';
+        gc_barrier_dict(aer_as_dict(obj), val);
+        AerVal* existing = dictmap_get(&aer_as_dict(obj)->map, kbuf);
+        if (existing) {
+            *existing = val;   /* update in place — no allocation */
+        } else {
+            char* k = xmalloc(klen + 1);
+            memcpy(k, is->data, klen);
+            k[klen] = '\0';
+            dictmap_put(&aer_as_dict(obj)->map, k, val);
+        }
+    } else if (aer_type(obj) == TYPE_STRING) {
+        error("Strings are immutable — cannot assign to an index");
+    } else {
+        error("Cannot index type");
+    }
+    DISPATCH();
+}
+
+lbl_slice_get: {
+    AerVal end_v   = POP();
+    AerVal start_v = POP();
+    AerVal obj     = POP();
+    if (aer_type(obj) == TYPE_ARRAY) {
+        AerArray* a = aer_as_array(obj);
+        if (a->shape) { error("Structs cannot be sliced"); PUSH(aer_null()); DISPATCH(); }
+        long long start, end;
+        if (!vm_slice_bounds(start_v, end_v, (long long)a->count, &start, &end)) { PUSH(aer_null()); DISPATCH(); }
+        unsigned int n = (unsigned int)(end - start);
+        AerArray* r = pool_alloc(&array_pool);
+        r->count    = n;
+        r->capacity = n > 0 ? n : 4;
+        r->items    = xmalloc(sizeof(AerVal) * r->capacity);
+        r->shape    = NULL;   /* a slice is always a plain array, even of a struct */
+        for (unsigned int i = 0; i < n; i++) r->items[i] = a->items[start + i];
+        PUSH(aer_array_val(r));
+    } else if (aer_type(obj) == TYPE_STRING) {
+        AerString* os = aer_as_string(obj);
+        long long start, end;
+        if (!vm_slice_bounds(start_v, end_v, (long long)os->length, &start, &end)) { PUSH(aer_null()); DISPATCH(); }
+        /* Copies rather than pointing into obj's own buffer, since obj could be collected later while this slice is still alive. */
+        unsigned int sub_len = (unsigned int)(end - start);
+        char* sub_buf = xmalloc(sub_len + 1);
+        memcpy(sub_buf, os->data + start, sub_len);
+        sub_buf[sub_len] = '\0';
+        PUSH(aer_make_string(sub_buf, sub_len));   /* no chunk_add_pool interning — see vm_to_str's comment */
+    } else {
+        error("Cannot slice this type");
+        PUSH(aer_null());
+    }
+    DISPATCH();
+}
+
+lbl_define_struct: {
+    int name_idx    = READ();
+    int field_count = READ();
+    Shape* shape = xmalloc(sizeof(Shape));
+    shape->name        = (unsigned int)name_idx;
+    shape->field_count = (unsigned int)field_count;
+    for (int i = 0; i < field_count; i++) {
+        shape->field_names[i]    = (unsigned int)READ();
+        shape->field_defaults[i] = c->pool[READ()];
+    }
+    if (c->shape_count >= c->shape_cap) {
+        c->shape_cap = c->shape_cap ? c->shape_cap * 2 : 4;
+        c->shapes = xrealloc(c->shapes, sizeof(Shape*) * c->shape_cap);
+    }
+    c->shapes[c->shape_count++] = shape;
+    DISPATCH();
+}
+
+lbl_field_get: {
+    int field_idx = READ();
+    AerVal obj = POP();
+    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
+        error("'.' field access requires a struct instance");
+        PUSH(aer_null()); DISPATCH();
+    }
+    AerArray* oa = aer_as_array(obj);
+    Shape* shape = oa->shape;
+    /* field_idx and shape->field_names[i] are chunk_add_pool-deduped indices, so an identical field name always yields the identical index — comparing indices is equivalent to strcmp, without one. */
+    for (unsigned int i = 0; i < shape->field_count; i++) {
+        if (shape->field_names[i] == (unsigned int)field_idx) {
+            PUSH(oa->items[i]); DISPATCH();
+        }
+    }
+    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
+          aer_as_string(c->pool[field_idx])->data);
+    PUSH(aer_null()); DISPATCH();
+}
+
+lbl_field_set: {
+    int field_idx = READ();
+    AerVal val = POP();
+    AerVal obj = POP();
+    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
+        error("'.' field access requires a struct instance"); DISPATCH();
+    }
+    AerArray* oa = aer_as_array(obj);
+    Shape* shape = oa->shape;
+    /* See lbl_field_get's comment — same pool-index equivalence. */
+    for (unsigned int i = 0; i < shape->field_count; i++) {
+        if (shape->field_names[i] == (unsigned int)field_idx) {
+            gc_barrier_array(oa, val);
+            oa->items[i] = val; DISPATCH();
+        }
+    }
+    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
+          aer_as_string(c->pool[field_idx])->data);
+    DISPATCH();
+}
+
+lbl_check_shape: {
+    int name_idx = READ();
+    AerVal v = POP();
+    if (aer_type(v) != TYPE_ARRAY || !aer_as_array(v)->shape || aer_as_array(v)->shape->name != (unsigned int)name_idx) {
+        error("Expected a '%s', got a '%s'", aer_as_string(c->pool[name_idx])->data, vm_type_name(c, v));
+        PUSH(aer_null()); DISPATCH();
+    }
+    PUSH(v);
+    DISPATCH();
+}
+
+lbl_iter_next: {
+    int end_addr = READ();
+    AerVal* idx_v = &vm->stack[vm->stack_top - 1];
+    AerVal* col   = &vm->stack[vm->stack_top - 2];
+    long long idx = aer_as_int(*idx_v);
+    if (aer_type(*col) == TYPE_ARRAY) {
+        AerArray* a = aer_as_array(*col);
+        if ((unsigned long long)idx >= a->count) {
+            vm->stack_top -= 2; vm->ip = (unsigned int)end_addr;
+        } else {
+            *idx_v = aer_int(idx + 1);
+            PUSH(a->items[idx]);
+        }
+    } else if (aer_type(*col) == TYPE_DICT) {
+        AerDict* d = aer_as_dict(*col);
+        while ((unsigned long long)idx < d->map.capacity && !d->map.buckets[idx].key)
+            idx++;
+        if ((unsigned long long)idx >= d->map.capacity) {
+            vm->stack_top -= 2; vm->ip = (unsigned int)end_addr;
+        } else {
+            *idx_v = aer_int(idx + 1);
+            /* Copies the key rather than pointing into the hashmap's buffer, since the entry could be removed/overwritten while this string is still alive. */
+            unsigned int key_len = d->map.buckets[idx].length;
+            char* key_buf = xmalloc(key_len + 1);
+            memcpy(key_buf, d->map.buckets[idx].key, key_len);
+            key_buf[key_len] = '\0';
+            PUSH(aer_make_string(key_buf, key_len));   /* no chunk_add_pool interning — see vm_to_str's comment */
+        }
+    } else if (aer_type(*col) == TYPE_STRING) {
+        AerString* cs = aer_as_string(*col);
+        if ((unsigned long long)idx >= cs->length) {
+            vm->stack_top -= 2; vm->ip = (unsigned int)end_addr;
+        } else {
+            *idx_v = aer_int(idx + 1);
+            char* ch_buf = xmalloc(2);
+            ch_buf[0] = cs->data[idx];
+            ch_buf[1] = '\0';
+            PUSH(aer_make_string(ch_buf, 1));   /* no chunk_add_pool interning — see vm_to_str's comment */
+        }
+    } else { error("Cannot iterate over this type"); vm->stack_top -= 2; vm->ip = (unsigned int)end_addr; }
+    DISPATCH();
+}
+
+lbl_iter_next_pair: {
+    int end_addr = READ();
+    AerVal* idx_v = &vm->stack[vm->stack_top - 1];
+    AerVal* col   = &vm->stack[vm->stack_top - 2];
+    long long idx = aer_as_int(*idx_v);
+    if (aer_type(*col) != TYPE_DICT) { error("for k, v requires a dict"); vm->stack_top -= 2; vm->ip = (unsigned int)end_addr; DISPATCH(); }
+    AerDict* d = aer_as_dict(*col);
+    while ((unsigned long long)idx < d->map.capacity && !d->map.buckets[idx].key)
+        idx++;
+    if ((unsigned long long)idx >= d->map.capacity) {
+        vm->stack_top -= 2; vm->ip = (unsigned int)end_addr;
+    } else {
+        *idx_v = aer_int(idx + 1);
+        /* Copies the key — see lbl_iter_next's identical comment on this pattern. */
+        unsigned int key_len = d->map.buckets[idx].length;
+        char* key_buf = xmalloc(key_len + 1);
+        memcpy(key_buf, d->map.buckets[idx].key, key_len);
+        key_buf[key_len] = '\0';
+        PUSH(aer_make_string(key_buf, key_len));   /* key — no chunk_add_pool interning, see vm_to_str's comment */
+        PUSH(d->map.buckets[idx].payload.inline_val);           /* value */
+    }
+    DISPATCH();
+}
+
+lbl_iter_range: {
+    int end_addr = READ();
+    /* Stack: [cur, end, step] — step is always present (parser defaults to 1), so no branch is needed. Direction is inferred from cur vs end, not the step's sign, so `10..0..2` still descends. */
+    AerVal* cur_v  = &vm->stack[vm->stack_top - 3];
+    AerVal* end_v  = &vm->stack[vm->stack_top - 2];
+    AerVal* step_v = &vm->stack[vm->stack_top - 1];
+    if (aer_type(*cur_v) != TYPE_INTEGER || aer_type(*end_v) != TYPE_INTEGER || aer_type(*step_v) != TYPE_INTEGER) {
+        error("Range bounds and step must be integers"); vm->stack_top -= 3; vm->ip = (unsigned int)end_addr; DISPATCH();
+    }
+    long long cur = aer_as_int(*cur_v), rng_end = aer_as_int(*end_v), step = aer_as_int(*step_v);
+    if (step <= 0) {
+        error("Range step must be a positive integer (direction is inferred from the bounds, not the step's sign)");
+        vm->stack_top -= 3; vm->ip = (unsigned int)end_addr; DISPATCH();
+    }
+    bool ascending = cur < rng_end;
+    /* >= / <= rather than == : a step that doesn't evenly divide the range must still stop cleanly instead of stepping past rng_end and never hitting it exactly. */
+    if (ascending ? (cur >= rng_end) : (cur <= rng_end)) {
+        vm->stack_top -= 3; vm->ip = (unsigned int)end_addr;
+    } else {
+        PUSH(*cur_v);
+        *cur_v = aer_int(cur + (ascending ? step : -step));
+    }
+    DISPATCH();
+}
+
+lbl_to_str: {
+    /* Not PUSH(vm_to_str(vm, POP())) directly — PUSH's macro body and POP() would both modify vm->stack_top within one unsequenced expression (a real -Wsequence-point issue). */
+    AerVal v = POP();
+    PUSH(vm_to_str(vm, v));
+    DISPATCH();
+}
+
+lbl_cast: {
+    int cast_type = READ();
+    AerVal v = POP();
+    AerVal r = aer_null();
+    /* atoll()/atof() only consume a leading sign/digits(/./exponent), so truncating to a fixed buffer (instead of a length-sized VLA) can't change the parsed value for a real number. */
+    char buf[64];
+    switch (cast_type) {
+        case CAST_INTEGER:
+            switch (aer_type(v)) {
+                case TYPE_INTEGER: r = v; break;
+                case TYPE_REAL:    r = aer_int((long long)aer_as_real(v)); break;
+                case TYPE_BOOLEAN: r = aer_int(aer_as_bool(v) ? 1 : 0); break;
+                case TYPE_STRING: {
+                    AerString* vs = aer_as_string(v);
+                    unsigned int n = vs->length < sizeof(buf) - 1
+                                          ? vs->length : sizeof(buf) - 1;
+                    memcpy(buf, vs->data, n);
+                    buf[n] = '\0';
+                    r = aer_int(atoll(buf)); break;
+                }
+                default: error("Cannot convert this type to integer"); r = aer_int(0);
+            }
+            break;
+        case CAST_FLOAT:
+            switch (aer_type(v)) {
+                case TYPE_REAL:    r = v; break;
+                case TYPE_INTEGER: r = aer_real((double)aer_as_int(v)); break;
+                case TYPE_BOOLEAN: r = aer_real(aer_as_bool(v) ? 1.0 : 0.0); break;
+                case TYPE_STRING: {
+                    AerString* vs = aer_as_string(v);
+                    unsigned int n = vs->length < sizeof(buf) - 1
+                                          ? vs->length : sizeof(buf) - 1;
+                    memcpy(buf, vs->data, n);
+                    buf[n] = '\0';
+                    r = aer_real(atof(buf)); break;
+                }
+                default: error("Cannot convert this type to float"); r = aer_real(0.0);
+            }
+            break;
+        case CAST_BOOLEAN:
+            r = aer_bool(vm_truthy(v));
+            break;
+    }
+    PUSH(r);
+    DISPATCH();
+}
+
+lbl_pop:
+    POP();
+    DISPATCH();
+
+lbl_halt:
+    return true;
+}

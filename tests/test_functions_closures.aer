@@ -1,0 +1,279 @@
+#!/usr/bin/env aer
+# AER test suite — functions, closures, the pipe operator, multiple return
+# values, and destructuring.
+# Machine-checked via assert(): a clean run exits 0; any failure prints
+# "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
+
+# ------------------------------------------------------------------ #
+# 16. Functions                                                        #
+# ------------------------------------------------------------------ #
+
+function add(a, b):
+    return a + b
+
+function factorial(n):
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+
+assert(add(3, 4) == 7, "basic function call")
+assert(factorial(5) == 120, "recursion")
+
+# Nested calls
+assert(add(factorial(3), factorial(4)) == 30, "nested function calls (6 + 24 = 30)")
+
+# Functions as values
+function apply(f, x):
+    return f(x)
+
+function double(n):
+    return n * 2
+
+assert(apply(double, 10) == 20, "function passed as a value")
+assert(apply(factorial, 5) == 120, "a different function passed as a value")
+
+# Function stored in variable
+fn = double
+assert(fn(7) == 14, "function stored in a variable")
+
+# Function stored in array — call directly via index
+ops = [add, double]
+assert(ops[0](3, 4) == 7, "OP_CALL_VALUE — function stored in an array, called via index")
+assert(ops[1](5) == 10, "OP_CALL_VALUE — a different array-stored function")
+
+# Function stored in dict
+dispatch = {"add": add, "double": double}
+assert(dispatch["add"](10, 20) == 30, "function stored in a dict, called via key")
+
+# Bare return / falling off end returns null
+function no_return():
+    x = 1
+
+result = no_return()
+assert(result == null, "falling off the end of a function returns null")
+
+# ------------------------------------------------------------------ #
+# 17. Anonymous functions and closures                                #
+# ------------------------------------------------------------------ #
+
+# function(params): body — a function VALUE, not a declaration. Can be
+# assigned, returned, or passed just like any other value.
+square = function(n):
+    return n * n
+assert(square(5) == 25, "anonymous function expression")
+
+# Anonymous functions can be defined inside another function's body and
+# capture that function's variables by reference — the captured variable's
+# storage is shared between the closure and the enclosing function from
+# the moment the closure is created.
+function make_counter():
+    count = 0
+    bump = function():
+        count = count + 1      # reads AND writes the enclosing 'count'
+        return count
+    return bump
+
+counter = make_counter()
+assert(counter() == 1, "closure captures and mutates the enclosing variable")
+assert(counter() == 2, "closure state persists across calls")
+
+counter2 = make_counter()             # a fresh, independent counter
+assert(counter2() == 1, "a second closure instance is independent")
+assert(counter() == 3, "the first closure instance is unaffected by the second")
+
+# A pure write to a captured variable also works correctly — AER checks
+# whether the enclosing function already has a binding for that name
+# before deciding a write declares a fresh local, so this "setter" closure
+# updates the enclosing 'x' rather than shadowing it with a throwaway one.
+function make_pair():
+    x = 0
+    getter = function():
+        return x
+    setter = function(y):
+        x = y
+    return getter, setter
+
+get_x, set_x = make_pair()
+assert(get_x() == 0, "getter closure reads the initial captured value")
+set_x(42)
+assert(get_x() == 42, "setter closure (first-occurrence write) updates the shared variable")
+
+# Capture is one level deep only: a function expression can capture from
+# its DIRECTLY enclosing function. A function expression nested inside an
+# already-nested function expression can still be created, but won't
+# capture — any outer-variable reference inside it fails with a plain
+# 'not defined' error rather than doing anything silently wrong.
+
+# Named function statements (`function foo(): ...`) still cannot be
+# nested at all, capturing or not — only function EXPRESSIONS can:
+# function outer():
+#     function inner():   # error: nested named function definitions
+#         return 1          # are not supported
+#     return inner()
+
+# Capturing still works even when the enclosing function has spilled past
+# SCOPE_SLOT_MAX (8) locals into the hashmap-overflow representation —
+# 'count' below is the 9th local in make_overflow_counter.
+function make_overflow_counter():
+    a = 1
+    b = 2
+    c = 3
+    d = 4
+    e = 5
+    f = 6
+    g = 7
+    h = 8
+    count = 100
+    bump = function():
+        count = count + 1
+        return count
+    return bump
+
+oc = make_overflow_counter()
+assert(oc() == 101, "closure capture works past the 8-local scope-overflow boundary")
+assert(oc() == 102, "overflow-scope closure state persists across calls")
+
+# Capturing a PARAMETER specifically (not a plain local declared inside the
+# function body) — parameters are bound through a separate fast, slot-based
+# path (OP_DEFINE_LOCAL/OP_LOAD_LOCAL/OP_STORE_LOCAL, see vm.c) rather than
+# the name-based scope lookup plain locals still use, so this exercises a
+# real, separate correctness path: a captured parameter must still be
+# found by name (vm_box_slot) and, once boxed, every read/write of it —
+# including from the OUTER function's own body, not just the closure —
+# must go through the box, not the raw slot.
+function make_pair_from_param(x):
+    getter = function():
+        return x
+    setter = function(v):
+        x = v
+    getter2 = function():
+        return x
+    return getter, setter, getter2
+
+get_p, set_p, get_p_direct = make_pair_from_param(1)
+assert(get_p() == 1, "closure over a captured parameter reads the initial value")
+set_p(99)
+assert(get_p() == 99, "mutating a captured parameter through one closure is visible to another")
+assert(get_p_direct() == 99, "...and to a third closure created after the mutation")
+
+# ------------------------------------------------------------------ #
+# 18. Pipe operator — |>                                               #
+# ------------------------------------------------------------------ #
+
+# x |> f(args) desugars to f(x, args) — x becomes argument zero
+function increment(n, amount):
+    return n + amount
+
+piped = 5 |> increment(3)
+assert(piped == 8, "pipe operator desugars to a normal call")
+
+# Chains read left to right
+function square2(n):
+    return n * n
+
+result2 = 3 |> increment(1) |> square2()
+assert(result2 == 16, "pipe chains read left to right ((3+1)^2 = 16)")
+
+# Enforced: no function calls anywhere inside a pipe target's arguments,
+# at any depth — keeps pipe chains flat and readable.
+# 5 |> increment(square(2))            # would error: nested call not allowed
+# 5 |> increment(2 |> square())        # would also error (nested pipe's own call)
+
+# A pipe chain used as a statement (its result discarded), not just as the
+# right-hand side of an assignment — from a bare name and from a field
+# chain. Both land in parse_assignment's non-assignment fallbacks, which
+# used to hard-error ("Expected assignment operator..." / "Compound
+# assignment ... is not supported") since only calls and assignments were
+# recognized as valid statement shapes.
+function pipe_stmt_append(entry, tag):
+    append(entry, tag)
+
+numbers_list = [1, 2, 3]
+numbers_list |> pipe_stmt_append("touched")
+assert(length(numbers_list) == 4 && numbers_list[3] == "touched",
+       "a bare-name pipe chain works as a statement, not just an expression")
+
+struct Basket:
+    items
+
+basket = Basket([1, 2])
+basket.items |> pipe_stmt_append("added")
+assert(length(basket.items) == 3 && basket.items[2] == "added",
+       "a field-chain pipe (a.b |> f(...)) works as a statement too")
+
+# Calling a function value reached through indexing/field access, as a bare
+# statement (not assigned to anything) — functions stored in an array/dict
+# and dispatched dynamically is a common pattern once functions are
+# first-class values. This landed in the same fallback as the pipe-as-
+# statement cases above: previously only a bare `name(args)` call was
+# recognized as a statement; `queue[i](args)` hit the same "compound
+# assignment" error pipe chains used to.
+call_log = []
+function log_a():
+    append(call_log, "a")
+function log_b():
+    append(call_log, "b")
+
+queue = [log_a, log_b]
+for i in 0..length(queue):
+    queue[i]()
+assert(length(call_log) == 2 && call_log[0] == "a" && call_log[1] == "b",
+       "calling a function value via queue[i]() works as a bare statement")
+
+# ------------------------------------------------------------------ #
+# 19. Multiple return values                                           #
+# ------------------------------------------------------------------ #
+
+function min_max(arr):
+    lo = arr[0]
+    hi = arr[0]
+    for v in arr:
+        if v < lo:
+            lo = v
+        if v > hi:
+            hi = v
+    return lo, hi
+
+lo, hi = min_max([3, 1, 4, 1, 5, 9, 2, 6])
+assert(lo == 1 && hi == 9, "multiple return values, destructured directly")
+
+# ------------------------------------------------------------------ #
+# 20. Destructuring                                                    #
+# ------------------------------------------------------------------ #
+
+a2, b2 = 10, 20
+assert(a2 == 10 && b2 == 20, "destructuring from a comma-separated expression list")
+
+a2, b2 = b2, a2                          # swap — RHS fully evaluated before assignment
+assert(a2 == 20 && b2 == 10, "destructuring swap — RHS fully evaluated before any assignment")
+
+# ------------------------------------------------------------------ #
+# 21. Default parameters                                               #
+# ------------------------------------------------------------------ #
+
+function greet(name, greeting = "Hello"):
+    return "{greeting}, {name}!"
+
+assert(greet("World") == "Hello, World!", "a trailing default is used when the argument is omitted")
+assert(greet("World", "Hi") == "Hi, World!", "a trailing default is overridden when the argument is supplied")
+
+function add3(a, b = 10, c = 100):
+    return a + b + c
+
+assert(add3(1) == 111, "two trailing defaults, zero supplied")
+assert(add3(1, 2) == 103, "two trailing defaults, one supplied")
+assert(add3(1, 2, 3) == 6, "two trailing defaults, both supplied — no default should apply")
+
+function make_adder(base = 5):
+    return function(x):
+        return x + base
+
+add5 = make_adder()
+add9 = make_adder(9)
+assert(add5(1) == 6, "a closure captures a defaulted parameter's default value")
+assert(add9(1) == 10, "a closure captures a defaulted parameter's supplied value")
+
+f = greet
+assert(f("Value") == "Hello, Value!", "a default still applies through a function-value call (OP_CALL_VALUE), not just a named call")
+
+print("test_functions_closures.aer: all assertions passed.")

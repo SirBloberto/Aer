@@ -1,0 +1,104 @@
+#!/usr/bin/env aer
+# AER test suite — arrays, dicts, and nested collections.
+# Machine-checked via assert(): a clean run exits 0; any failure prints
+# "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
+
+# ------------------------------------------------------------------ #
+# 13. Arrays                                                           #
+# ------------------------------------------------------------------ #
+
+arr = [10, 20, 30]
+assert(arr[0] == 10, "array indexing")
+assert(arr[-1] == 30, "negative array indexing")
+
+arr[1] = 99
+assert(arr[0] == 10 && arr[1] == 99 && arr[2] == 30, "array index assignment")
+
+append(arr, 40)
+assert(length(arr) == 4 && arr[3] == 40, "append adds to the end and updates length")
+
+# delete(arr, index) removes by index, shifting subsequent elements down to
+# preserve order — negative indices work the same as bracket indexing.
+delete(arr, 1)                        # removes 99
+assert(length(arr) == 3 && arr[0] == 10 && arr[1] == 30 && arr[2] == 40, "delete by index shifts subsequent elements down")
+
+delete(arr, -1)                       # removes the last element (40)
+assert(length(arr) == 2 && arr[0] == 10 && arr[1] == 30, "delete(-1) removes the last element — no separate pop() needed")
+
+# append()/delete() both mutate in place and also return the array; the
+# return value is only useful if you don't already have a reference to it.
+# delete(arr, 99)   # would error: Array index 99 out of bounds (len 2)
+
+# Slicing — [a:b], [a:], [:b], [:] — always returns a new array
+nums2 = [0, 1, 2, 3, 4, 5]
+assert(nums2[1:4][0] == 1 && nums2[1:4][1] == 2 && nums2[1:4][2] == 3 && length(nums2[1:4]) == 3, "array slice [a:b]")
+assert(length(nums2[3:]) == 3 && nums2[3:][0] == 3, "array slice [a:]")
+assert(length(nums2[:3]) == 3 && nums2[:3][0] == 0, "array slice [:b]")
+assert(length(nums2[:]) == 6, "array slice [:] copies the whole array")
+
+# Arrays have reference semantics — assignment copies the reference
+a = [1, 2, 3]
+b = a
+b[0] = 99
+assert(a[0] == 99, "arrays are references — mutating b also mutates a")
+
+# Truthiness: empty array is falsy, non-empty is truthy
+assert((if []: "empty" else: "not empty") == "not empty", "non-empty array is truthy")
+
+empty_arr = []
+empty_arr_label = "unset"
+if empty_arr:
+    empty_arr_label = "truthy"
+else:
+    empty_arr_label = "falsy"
+assert(empty_arr_label == "falsy", "empty array is falsy")
+
+# ------------------------------------------------------------------ #
+# 14. Dicts                                                            #
+# ------------------------------------------------------------------ #
+
+d = {"x": 1, "y": 2}
+assert(d["x"] == 1, "dict indexing")
+assert(d["missing"] == null, "missing key returns null, not an error")
+
+d["z"] = 3
+assert("z" in d, "dict key assignment")
+assert(length(d) == 3, "dict length after assignment")
+
+delete(d, "y")
+assert(!("y" in d), "delete removes a dict key")
+
+# Dicts have reference semantics
+d1 = {"a": 1}
+d2 = d1
+d2["a"] = 99
+assert(d1["a"] == 99, "dicts are references — mutating d2 also mutates d1")
+
+# Truthiness: empty dict is falsy
+empty_dict = {}
+empty_dict_label = "unset"
+if empty_dict:
+    empty_dict_label = "truthy"
+else:
+    empty_dict_label = "falsy"
+assert(empty_dict_label == "falsy", "empty dict is falsy")
+
+# ------------------------------------------------------------------ #
+# 15. Nested collections                                               #
+# ------------------------------------------------------------------ #
+
+matrix = [[1, 2], [3, 4]]
+assert(matrix[0][1] == 2, "nested array indexing")
+assert(matrix[1][0] == 3, "nested array indexing")
+
+matrix[0][1] = 99                    # chained index assignment
+assert(matrix[0][0] == 1 && matrix[0][1] == 99, "chained nested index assignment")
+
+record = {"name": "Alice", "scores": [100, 95, 88]}
+assert(record["scores"][0] == 100, "dict containing an array")
+assert(record["scores"][-1] == 88, "dict containing an array, negative index")
+
+nested = {"a": {"b": {"c": 42}}}
+assert(nested["a"]["b"]["c"] == 42, "deeply nested dicts")
+
+print("test_collections.aer: all assertions passed.")

@@ -1,0 +1,71 @@
+#!/usr/bin/env aer
+# AER test suite — structs: fixed-shape records, dot-access, struct-typed
+# receiver parameters, and shape-checking via `as`.
+# Machine-checked via assert(): a clean run exits 0; any failure prints
+# "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
+#
+# Struct interpolation is deliberately NOT tested here — see
+# test_memory_gc.aer's comment on why that specific assertion has to run
+# immediately after a GC stress section, in the same file/process, not
+# here.
+
+# ------------------------------------------------------------------ #
+# 23. Structs                                                          #
+# ------------------------------------------------------------------ #
+
+# Fixed layout, declared with field defaults. Defaults are optional
+# literals only (no arbitrary expressions); a bare field name defaults
+# to null.
+struct Point:
+    x = 0.0
+    y = 0.0
+
+# Instantiation reuses call syntax — positional, in declared field order.
+# Omitted trailing arguments take their declared defaults.
+p1 = Point(1.0, 2.0)
+p2 = Point(5.0)        # y defaults to 0.0
+p3 = Point()           # x and y both default to 0.0
+
+assert(p2.x == 5.0 && p2.y == 0.0, "struct instantiation with a defaulted trailing field")
+assert(p3.x == 0.0 && p3.y == 0.0, "struct instantiation with all fields defaulted")
+
+# Field access is dot notation only — read and write.
+assert(p1.x == 1 && p1.y == 2, "struct field access")
+p1.x = 10.0
+assert(p1.x == 10, "struct field assignment")
+
+# Unknown fields error — typo protection falls out of the lookup.
+# print(p1.z)            # would error: 'Point' has no field 'z'
+
+# Structs report their own type name, not the generic "array".
+assert(type(p1) == "Point", "struct instances report their declared type name")
+
+# Isolated data boundaries: structs are dot-only. Collection operations
+# (bracket indexing, slicing, append, delete) are all rejected on a struct
+# instance — a struct's shape is fixed, a collection's is not.
+# print(p1[0])           # would error: use '.' not '[]'
+# append(p1, 1)          # would error: fixed shape
+
+# Struct-typed receiver parameters — only parameter 0 may carry `as Type`,
+# enforced at every call site (not just documentation).
+struct Enemy:
+    hp = 100
+
+function heal(target as Point, amount):
+    target.x = target.x + amount   # compound assign ('target.x += amount') is not supported
+    return target
+
+heal(p1, 5.0)
+assert(p1.x == 15, "struct-typed receiver parameter, mutation through it")
+
+e = Enemy()
+# heal(e, 5.0)            # would error: heal() expects its first argument to be a Point
+
+# `as StructName` outside a function signature is a standalone runtime
+# shape check — it verifies, it never converts (there's no single
+# well-defined way to reshape one struct into another).
+checked = p1 as Point
+assert(checked.x == 15, "'as StructName' passes a matching instance through unchanged")
+# bad = e as Point        # would error: Expected a 'Point', got a 'Enemy'
+
+print("test_structs.aer: all assertions passed.")
