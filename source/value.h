@@ -71,16 +71,17 @@ struct AerArray {
     Shape*       shape;   /* NULL for ordinary arrays; set for struct instances */
 };
 
-/* Pointers grouped first, then ints, then the single bool last — cuts padding-driven
-   struct size from 48 to 40 bytes on a 64-bit build versus declaration order. */
+/* Pointer first, then the two pool-index-sized ints (code_offset/receiver_type can each exceed
+   65535 in a large program's constant pool, so they stay full width), then the two fields bounded
+   by a language-level cap (arity/min_arity <= MAX_PARAMS == SCOPE_SLOT_MAX == 32, comfortably
+   inside uint16_t), then the single bool — 24 bytes on a 64-bit build now that closures (and their
+   upvalues array) are gone; every AerFunction is a plain function value. */
 struct AerFunction {
     AerVal*      defaults;        /* NULL if min_arity == arity; else (arity - min_arity) compile-time-literal values */
-    AerVal**     upvalues;        /* NULL unless this is a closure; else a heap array of box pointers, one per captured variable, in capture order */
     unsigned int code_offset;
-    unsigned int arity;
-    unsigned int min_arity;       /* params [0, min_arity) are required; [min_arity, arity) use defaults[] below, in order */
     unsigned int receiver_type;   /* pool index of Type's name, if has_receiver */
-    unsigned int upvalue_count;
+    uint16_t     arity;
+    uint16_t     min_arity;       /* params [0, min_arity) are required; [min_arity, arity) use defaults[] below, in order */
     bool         has_receiver;    /* true if param 0 was declared `p as Type` */
 };
 

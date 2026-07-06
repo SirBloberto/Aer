@@ -2,7 +2,11 @@
 # -static (otherwise the exe depends on MSYS2's libwinpthread-1.dll and silently fails
 # to launch outside the exact shell it was built in). Detected via `uname -s`, not
 # $(OS) — that env var doesn't reliably survive into an MSYS2 login shell.
-ifneq (,$(findstring MINGW,$(shell uname -s 2>/dev/null)))
+# Match "_NT" rather than "MINGW": a bash launched without MSYSTEM=MINGW64 set (e.g.
+# a plain Git Bash / VS Code terminal session) reports "MSYS_NT-..." instead of
+# "MINGW64_NT-...", which "MINGW" alone misses — silently skipping this whole branch
+# and producing an unstatic, un-kernel32-linked .exe that looks like a normal build.
+ifneq (,$(findstring _NT,$(shell uname -s 2>/dev/null)))
     EXE     := .exe
     WINLIBS := -lkernel32 -static
 else
@@ -37,7 +41,7 @@ performance: $(SOURCE)
 # Split across focused files rather than one monolith — run all in sequence, stop at the first failure.
 TESTS := tests/test_core.aer \
          tests/test_collections.aer \
-         tests/test_functions_closures.aer \
+         tests/test_functions.aer \
          tests/test_structs.aer \
          tests/test_errors_scope.aer \
          tests/test_stdlib_modules.aer \

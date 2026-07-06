@@ -14,8 +14,9 @@
 # ------------------------------------------------------------------ #
 
 # Fixed layout, declared with field defaults. Defaults are optional
-# literals only (no arbitrary expressions); a bare field name defaults
-# to null.
+# literals only (no arbitrary expressions), plus the two special-cased
+# empty-collection forms '[]'/'{}' (see section 38); a bare field name
+# defaults to null.
 struct Point:
     x = 0.0
     y = 0.0
@@ -52,11 +53,11 @@ struct Enemy:
     hp = 100
 
 function heal(target as Point, amount):
-    target.x = target.x + amount   # compound assign ('target.x += amount') is not supported
+    target.x += amount
     return target
 
 heal(p1, 5.0)
-assert(p1.x == 15, "struct-typed receiver parameter, mutation through it")
+assert(p1.x == 15, "struct-typed receiver parameter, mutation through it via compound assignment")
 
 e = Enemy()
 # heal(e, 5.0)            # would error: heal() expects its first argument to be a Point
@@ -67,5 +68,87 @@ e = Enemy()
 checked = p1 as Point
 assert(checked.x == 15, "'as StructName' passes a matching instance through unchanged")
 # bad = e as Point        # would error: Expected a 'Point', got a 'Enemy'
+
+# ------------------------------------------------------------------ #
+# 37. Compound assignment through a field/index chain (p.x += 1)      #
+#     — the chain's earlier steps are evaluated exactly once (via     #
+#     OP_DUP_N), not re-run for the read and the write separately.    #
+# ------------------------------------------------------------------ #
+
+ca_p = Point(1.0, 2.0)
+ca_p.x += 4
+assert(ca_p.x == 5, "struct field += a constant")
+ca_p.y -= 1
+assert(ca_p.y == 1, "struct field -= a constant")
+
+# Chained field access (a.b.c) — only the LAST step is the compound
+# target; the earlier ones (ca_outer -> .inner) are plain FIELD_GETs.
+struct Inner:
+    v = 0
+struct Outer:
+    inner = null
+ca_outer = Outer(Inner(10))
+ca_outer.inner.v += 5
+assert(ca_outer.inner.v == 15, "compound assignment through a chained struct field (a.b.c += n)")
+
+# Index compound assignment on an array/dict — same mechanism, the other
+# pending-step shape (OP_DUP_N 2, since [obj, idx] is on the stack).
+ca_arr = [1, 2, 3]
+ca_arr[1] += 100
+assert(ca_arr[1] == 102, "array element += a constant")
+ca_dict = {"count": 1}
+ca_dict["count"] += 1
+assert(ca_dict["count"] == 2, "dict value += a constant")
+
+# The index expression itself must be evaluated exactly ONCE — proof the
+# chain isn't re-run for the write half (a real risk this feature could
+# have introduced: `a[f()] += 1` silently calling f() twice).
+ca_call_count = 0
+function ca_side_effecting_index():
+    ca_call_count += 1
+    return 0
+ca_side_arr = [10]
+ca_side_arr[ca_side_effecting_index()] += 1
+assert(ca_side_arr[0] == 11, "a[f()] += 1 applies the update correctly")
+assert(ca_call_count == 1, "...and f() was called exactly once, not once per read/write half")
+
+# ------------------------------------------------------------------ #
+# 38. Non-primitive struct field defaults — '[]' and '{}' (empty       #
+#     collection literals) are the two allowed non-scalar defaults.   #
+#     The whole point is per-instance freshness: ground-truth proof   #
+#     that mutating one instance's default-initialized field never    #
+#     touches another instance's (the Python mutable-default bug      #
+#     this feature has to not reproduce).                             #
+# ------------------------------------------------------------------ #
+
+struct Bucket:
+    items = []
+    tags = {}
+
+nd_a = Bucket()
+nd_b = Bucket()
+append(nd_a.items, 1)
+append(nd_a.items, 2)
+nd_a.tags["x"] = 1
+
+assert(length(nd_a.items) == 2, "appending to one instance's default-array field grows it normally")
+assert(length(nd_b.items) == 0, "...and a DIFFERENT instance's default-array field is untouched — not the same shared array")
+assert(length(nd_a.tags) == 1, "the same guarantee for a default-dict field")
+assert(length(nd_b.tags) == 0, "...untouched on a different instance")
+
+# A field explicitly passed at construction is unaffected by any of this
+# (only OMITTED trailing fields fall back to the default machinery).
+nd_c = Bucket([9, 9, 9])
+assert(length(nd_c.items) == 3, "an explicitly passed array argument is used as-is, not replaced by a fresh empty one")
+
+# Function parameter defaults get the identical per-CALL freshness — the
+# same underlying vm_default_value fix in vm.c applies to both call sites.
+function collect(x, seen = []):
+    append(seen, x)
+    return seen
+fd_r1 = collect(1)
+fd_r2 = collect(2)
+assert(length(fd_r1) == 1 && fd_r1[0] == 1, "first call's omitted-argument default starts fresh")
+assert(length(fd_r2) == 1 && fd_r2[0] == 2, "a second call's own omitted-argument default is independent, not the first call's mutated array")
 
 print("test_structs.aer: all assertions passed.")

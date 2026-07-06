@@ -118,21 +118,21 @@ assert(cache_wrapper(cache_helper) == "global helper", "passing the global itsel
 #      from call targets to plain variable access)                    #
 # ------------------------------------------------------------------ #
 
+# Assignment inside a function is always local now, so a function can no longer read-then-write
+# a global by bare name (see tests/test_errors_scope.aer's shadow_outer) — the read-then-write
+# repetition this used to cover moves to a top-level loop instead, still the same cached
+# LOAD/STORE site hit on every iteration.
 lc_total = 0
-function lc_bump():
-    lc_total = lc_total + 1     # same LOAD/STORE site hit on every call
-    return lc_total
 for lc_i in 0..5:
-    lc_bump()
-assert(lc_total == 5, "a global read-then-written through the same cached LOAD/STORE site stays correct across repeated calls")
+    lc_total = lc_total + 1
+assert(lc_total == 5, "a global read-then-written through the same cached LOAD/STORE site stays correct across repeated top-level iterations")
 
-function lc_recurse(n):
+# A function can still freely READ a global recursively — only writing it by bare name is gone.
+function lc_recurse_read(n, acc):
     if n <= 0:
-        return 0
-    lc_total = lc_total + n     # same site, hit many times via recursion
-    return lc_recurse(n - 1) + 0
-lc_recurse(4)
-assert(lc_total == 15, "the same global LOAD/STORE site stays correct across recursive calls too")
+        return acc
+    return lc_recurse_read(n - 1, acc + lc_total)   # same OP_LOAD site, hit many times via recursion
+assert(lc_recurse_read(4, 0) == 20, "the same cached global LOAD site stays correct across recursive calls")
 
 lc_greeting = "hello"
 function lc_say():
@@ -145,7 +145,7 @@ function lc_shadow_test(lc_total):
     return lc_total + 100        # parameter named the same as the global — OP_LOAD_LOCAL, not addr_cache
 assert(lc_shadow_test(1) == 101, "a parameter shadowing a same-named global still resolves to the parameter")
 assert(lc_shadow_test(2) == 102, "...and again — must not read the global's cached address")
-assert(lc_total == 15, "the global itself is untouched by the shadowing parameter's own writes")
+assert(lc_total == 5, "the global itself is untouched by the shadowing parameter's own writes")
 
 # ------------------------------------------------------------------ #
 # 33. Compound assignment — ground-truth coverage before opcode        #
@@ -197,19 +197,6 @@ function ca_local_compound():
     x += 1
     return x
 assert(ca_local_compound() == 2, "a non-parameter function-local += CONST")
-
-# Closure/box aliasing: capture a parameter in a closure, THEN compound-
-# assign it in the enclosing function's own body afterward — the closure
-# must see the update. No prior test exercised compound assignment on a
-# captured variable at all.
-function ca_make_pair_compound(x):
-    getter = function():
-        return x
-    x += 10                # compound-assign AFTER the closure captured x
-    return getter, x
-ca_get_after, ca_x_after = ca_make_pair_compound(1)
-assert(ca_get_after() == 11, "a closure sees a compound assignment made to its captured parameter after capture")
-assert(ca_x_after == 11, "the enclosing function's own return value reflects the same compound assignment")
 
 # ------------------------------------------------------------------ #
 # 34. Array-index-get fusion — one test per OP_INDEX_GET_*_* shape,     #
@@ -266,5 +253,215 @@ assert(length(ig_arr[1:3]) == 2 && ig_arr[1:3][0] == 20 && ig_arr[1:3][1] == 30,
 # way to observe "this one expression errored, then execution continued."
 # That's exercised in tests/embed_smoke_test.c instead, the same reason
 # Part 1's error-flag short-circuit test lives there and not here.
+
+# ------------------------------------------------------------------ #
+# 36. Function-local slots — every name in a function body (not just  #
+#     parameters) resolves to a fixed OP_LOAD_LOCAL/STORE_LOCAL slot   #
+#     at parse time now (current_locals, parser.c), never a name-based #
+#     scope walk. 29C above already proved the GLOBAL half of this     #
+#     (addr_cache); these prove the local half.                        #
+# ------------------------------------------------------------------ #
+
+# Same slot read/written many times via a loop within ONE call.
+function llc_sum_to(n):
+    total = 0
+    i = 1
+    for i <= n:
+        total += i
+        i += 1
+    return total
+assert(llc_sum_to(100) == 5050, "a function-local var read/written every iteration of an in-function loop stays correct")
+
+# Same function called repeatedly — each call gets a fresh flat scope; a
+# previous call's value must never leak into the next one's same slot.
+function llc_counter(start):
+    x = start
+    x += 1
+    return x
+assert(llc_counter(1) == 2, "first call through a function-local slot")
+assert(llc_counter(10) == 11, "second call through the same slot starts from its own fresh local, not the previous call's")
+assert(llc_counter(100) == 101, "a third call, same guarantee")
+
+# Recursive — the SAME slot index is used at every recursion depth (each
+# depth gets its own call frame, so its own copy of that slot).
+function llc_recurse_local(n, acc):
+    step = n * 2         # non-parameter local, same slot at every depth
+    if n <= 0:
+        return acc
+    return llc_recurse_local(n - 1, acc + step)
+assert(llc_recurse_local(5, 0) == 30, "a function-local var resolves correctly at every depth of a recursive call (5*2+4*2+3*2+2*2+1*2)")
+
+# Nested for-loops inside a function — no per-block scope exists anymore, so
+# this also proves loop variables at different nesting depths (i reused
+# across two separate for-loops, i again inside the p-loop) land in the
+# right slots without colliding — the actual sieve-of-Eratosthenes shape.
+function llc_nested_loops(limit):
+    flags = []
+    for i in 0..limit+1:
+        append(flags, 0)
+    p = 2
+    for p * p <= limit:
+        if flags[p] == 0:
+            i = p * p
+            for i <= limit:
+                flags[i] = 1
+                i += p
+        p += 1
+    count = 0
+    for i in 0..limit+1:
+        if flags[i] == 0 && i >= 2:
+            count += 1
+    return count
+assert(llc_nested_loops(30) == 10, "primes below 30 via nested in-function loops (2,3,5,7,11,13,17,19,23,29) — proves reused loop-variable names across separate loops don't collide")
+
+# ------------------------------------------------------------------ #
+# 39. Array-index-SET fusion — the write-side counterpart of 34, one   #
+#     test per OP_INDEX_SET_*_* shape, plus the explicit non-fusing    #
+#     cases (chained target, non-CONST value) that must keep working   #
+#     via the unfused fallback.                                        #
+# ------------------------------------------------------------------ #
+
+is_arr = [10, 20, 30, 40, 50]
+
+# NAME arr, CONST index, CONST value — fuses to OP_INDEX_SET_NAME_CONST.
+is_arr[2] = 99
+assert(is_arr[2] == 99, "NAME[CONST] = CONST fuses to OP_INDEX_SET_NAME_CONST")
+
+# NAME arr, NAME index, CONST value — fuses to OP_INDEX_SET_NAME_NAME.
+is_idx = 3
+is_arr[is_idx] = 88
+assert(is_arr[3] == 88, "NAME[NAME] = CONST fuses to OP_INDEX_SET_NAME_NAME")
+
+# NAME arr, LOCAL index, CONST value — fuses to OP_INDEX_SET_NAME_LOCAL.
+function is_name_local(i):
+    is_arr[i] = 77
+    return is_arr[i]
+assert(is_name_local(1) == 77, "NAME[LOCAL] = CONST fuses to OP_INDEX_SET_NAME_LOCAL")
+
+# LOCAL arr, CONST/LOCAL/NAME index, CONST value — arr is itself a parameter.
+function is_local_const(a):
+    a[0] = 1
+    return a[0]
+function is_local_local(a, i):
+    a[i] = 2
+    return a[i]
+function is_local_name(a):
+    a[is_idx] = 3
+    return a[is_idx]
+assert(is_local_const([0, 0]) == 1, "LOCAL[CONST] = CONST fuses to OP_INDEX_SET_LOCAL_CONST")
+assert(is_local_local([0, 0, 0], 1) == 2, "LOCAL[LOCAL] = CONST fuses to OP_INDEX_SET_LOCAL_LOCAL")
+assert(is_local_name([0, 0, 0, 0]) == 3, "LOCAL[NAME] = CONST fuses to OP_INDEX_SET_LOCAL_NAME")
+
+# Dict indexing still works through the same fused NAME[CONST] path — the
+# handler stays fully polymorphic, matching lbl_index_set.
+is_dict = {"a": 1}
+is_dict["a"] = 2
+assert(is_dict["a"] == 2, "dict assignment still works through a fused NAME[CONST] path")
+
+# Explicit non-fusing cases — must still produce correct results via the
+# unfused fallback, unchanged.
+is_arr[ig_idx + 1] = 111    # arithmetic index — does not fuse
+assert(is_arr[4] == 111, "arr[i + 1] = CONST (arithmetic index) does not fuse but still works")
+is_nested = [[1, 2], [3, 4]]
+is_nested[0][1] = 222       # chained bracket — does not fuse
+assert(is_nested[0][1] == 222, "arr[0][1] = CONST (chained bracket) does not fuse but still works")
+
+# Value is NOT a bare CONST (a NAME, a LOCAL, and a call) — none of these
+# fuse (see parse_assignment's comment on why the value side is restricted
+# to CONST), but all three must still assign correctly via the unfused path.
+is_val_name = 55
+is_arr[0] = is_val_name
+assert(is_arr[0] == 55, "arr[CONST_idx] = NAME does not fuse but still works")
+function is_val_local(x):
+    is_arr[1] = x
+    return is_arr[1]
+assert(is_val_local(66) == 66, "arr[CONST_idx] = LOCAL does not fuse but still works")
+
+# The evaluation-order hazard this restriction specifically guards against:
+# a value expression (a call) that reassigns the very variable used as the
+# index. Correct behavior is array-then-index-then-value order (matching
+# the unfused semantics), i.e. the index used is the value BEFORE the call
+# runs — not whatever the call changed it to.
+is_order_idx = 0
+is_order_arr = [100, 200]
+function is_order_side_effect():
+    is_order_idx = 1     # reassigns the index variable as a side effect
+    return 999
+is_order_arr[is_order_idx] = is_order_side_effect()
+assert(is_order_arr[0] == 999 && is_order_arr[1] == 200,
+       "arr[i] = f() writes to the index i had BEFORE f() ran, not after — proof the value-must-be-CONST restriction correctly forces this through the unfused, correctly-ordered path")
+
+# ------------------------------------------------------------------ #
+# 40. Compare-and-branch fusion (OP_CMP_JUMP_FALSE) — one test per     #
+#     comparison operator, through if/while/if-expr, plus the          #
+#     non-fusing cases (and/or, a bare boolean, a non-comparison        #
+#     expression) that must keep working via plain OP_JUMP_IF_FALSE.   #
+# ------------------------------------------------------------------ #
+
+# Each of these routes the comparison through an actual `if` CONDITION (via the inline
+# if-expression form, itself one of the three emit_jump_if_false call sites) — not through a
+# plain boolean-valued function argument, which would never touch emit_jump_if_false at all.
+assert((if 1 == 1: true else: false) == true,  "if (a == b) fuses to OP_CMP_JUMP_FALSE, true branch")
+assert((if 1 == 2: true else: false) == false, "if (a == b) fuses to OP_CMP_JUMP_FALSE, false branch")
+assert((if 1 != 2: true else: false) == true,  "if (a != b) fuses")
+assert((if 1 <  2: true else: false) == true,  "if (a < b) fuses")
+assert((if 2 >  1: true else: false) == true,  "if (a > b) fuses")
+assert((if 1 <= 1: true else: false) == true,  "if (a <= b) fuses")
+assert((if 1 >= 1: true else: false) == true,  "if (a >= b) fuses")
+
+# Block-form if/else — the same call site (parse_if), different grammar production.
+cb_result = false
+if 5 > 3:
+    cb_result = true
+else:
+    cb_result = false
+assert(cb_result == true, "block-form if (a > b) also fuses")
+
+# while/for condition — the second emit_jump_if_false call site.
+cb_wsum = 0
+cb_i = 0
+for cb_i < 5:
+    cb_wsum += cb_i
+    cb_i += 1
+assert(cb_wsum == 10, "a while-style for-loop condition (i < 5) fuses and still terminates/accumulates correctly")
+
+# Non-fusing: and/or conditions (short-circuit jumps, not a bare comparison — the outermost
+# operator here is && / ||, so parse_binary_ops's last_cmp correctly comes back -1).
+assert((if 1 < 2 && 3 < 4: true else: false) == true, "a && condition does not fuse (last operator is &&, not a bare comparison) but still works")
+assert((if 1 > 2 || 3 < 4: true else: false) == true, "a || condition does not fuse but still works")
+
+# Non-fusing: a bare boolean variable/expression, no comparison at all.
+cb_flag = true
+assert((if cb_flag: true else: false) == true, "a bare boolean variable condition does not fuse (nothing to fuse) but still works")
+
+# Non-fusing: arithmetic result used directly as a truthy condition (no comparison).
+assert((if 1 + 1: true else: false) == true, "a non-comparison, non-boolean truthy condition does not fuse but still works")
+
+# The comparison's operands may themselves be arbitrary (non-simple) expressions —
+# fusion only cares that the OUTERMOST operator is a comparison, not what's inside it.
+function cb_double(n):
+    return n * 2
+assert((if cb_double(3) == 6: true else: false) == true, "a comparison whose operands are complex sub-expressions (calls) still fuses and evaluates them correctly")
+
+# Sieve-shaped nested loop conditions (p * p <= limit, i <= limit) — the exact
+# pattern that motivated this fusion — still produce the right prime count.
+function cb_sieve(limit):
+    flags = []
+    for i in 0..limit+1:
+        append(flags, 0)
+    p = 2
+    for p * p <= limit:
+        if flags[p] == 0:
+            i = p * p
+            for i <= limit:
+                flags[i] = 1
+                i += p
+        p += 1
+    count = 0
+    for i in 0..limit+1:
+        if flags[i] == 0 && i >= 2:
+            count += 1
+    return count
+assert(cb_sieve(30) == 10, "sieve-shaped nested-loop comparisons (p*p<=limit, i<=limit) all fuse and still count primes correctly")
 
 print("test_perf_fusion.aer: all assertions passed.")

@@ -65,9 +65,6 @@ bool  pool_is_remembered(Pool* p, void* cell);
 /* Sets cell's remembered-set bit. Never cleared — see the comment above. */
 void  pool_mark_remembered(Pool* p, void* cell);
 
-/* Non-fatal membership test — true if cell belongs to this pool at all; unlike other pool_* functions, safe to call with a pointer that isn't this pool's (a closure box may not be pool-tracked, see gc_barrier_box in vm.c). */
-bool  pool_owns(Pool* p, void* cell);
-
 /* Walks every carved-out cell; free-listed cells are always skipped, and if young_only, old cells too (a minor collection assumes old cells are live). Unmarked cells go to on_free then the free-list; marked cells are promoted with their mark bit cleared for next cycle. */
 void  pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell));
 

@@ -84,19 +84,18 @@ function_stmt = 'function' identifier '(' param_list? ')' ':' block
               # block form only, same as if_stmt — no same-line shortcut.
               # A function_stmt inside another function_stmt's block is
               # still a parse error, regardless — named functions never
-              # nest. Use function_expr (below) for a nested, capturing
-              # function value instead.
+              # nest. Use function_expr (below) for a nested function
+              # value instead.
 
 function_expr = 'function' '(' param_list? ')' ':' block
               # an anonymous function VALUE, used as an expression (see
               # primary below) rather than a top-level declaration — can be
               # assigned, returned, or passed as an argument. May be nested
-              # inside another function's body (that's the only way to
-              # create a closure), and — only one level deep — may capture
-              # variables from its directly-enclosing function by reference.
-              # A function_expr nested inside an already-nested function_expr
-              # can still be created but won't capture; an outer-variable
-              # reference inside it fails at runtime with 'not defined'.
+              # inside another function's body, but compiles exactly like a
+              # top-level function otherwise: it can only see its own
+              # parameters/locals and true globals — AER has no closures, so
+              # referencing the enclosing function's variable fails at
+              # runtime with 'not defined', not anything silently wrong.
 
 param_list    = param (',' identifier)*
 param         = identifier ('as' identifier)?
@@ -203,8 +202,8 @@ dict_pairs    = expression ':' expression (',' expression ':' expression)*
 # real      — double-precision float
 # string    — UTF-8 byte sequence, immutable, indexable/sliceable/iterable, interpolation and escape support
 # function  — first-class callable with arity; optionally a struct-typed receiver on parameter 0;
-#             a function_expr nested one level inside another function may also be a closure,
-#             holding boxed references to variables it captured from its enclosing function
+#             no closures — a function_expr nested inside another function can only see its own
+#             parameters/locals and true globals, never the enclosing function's variables
 # array     — mutable ordered sequence with reference semantics; bracket-indexed, sliceable
 # dict      — mutable string-keyed hash table with reference semantics; bracket-indexed (string keys only)
 # struct instance — a fixed-shape array with a declared name and field list (see struct_stmt);

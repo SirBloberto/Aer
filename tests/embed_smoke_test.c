@@ -99,13 +99,13 @@ int main(void) {
 
     /* The embedding contract documented on vm_run() in vm.h: a host
        reusing the same VM* after an error must reset stack/call/scope
-       state itself, honoring overflow_has_captures — applied here by
-       hand, exactly like main.c's run() does between REPL statements. */
+       state itself, applied here by hand, exactly like main.c's run()
+       does between REPL statements. */
     vm.stack_top  = 0;
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
 
@@ -128,7 +128,7 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
     shell("x = 1\n\n\nbad = x.y\n");
@@ -177,7 +177,7 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
     shell("function not_tail(n):\n    if n <= 0:\n        return 0\n    return not_tail(n - 1) + 0\n\nnot_tail(1000)\n");
@@ -204,7 +204,7 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
     set_aer_path("tests");
@@ -228,7 +228,7 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
     shell("import io\n");
@@ -248,7 +248,7 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
     shell("for i in 0..5000:\n    temp = [i, i * 2, i * 3]\n");
@@ -270,7 +270,7 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
     aer_gc_configure(20, 0);   /* tiny minor threshold; 0 leaves the major cadence alone */
@@ -294,7 +294,7 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
     aer_gc_set_ceiling(50);
@@ -313,7 +313,7 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
     aer_gc_set_ceiling(0);
@@ -337,14 +337,18 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
-    shell("function f(x):\n    x.y += 1\n\n"
+    /* x.y += 1 used to be this test's broken statement, back when compound
+       field/index assignment (parser.c's parse_assignment) wasn't supported
+       at all — now that it is, `x.` with no field name after the dot is the
+       still-genuinely-invalid construct, unrelated to that feature. */
+    shell("function f(x):\n    x. += 1\n\n"
           "n1 = 42\nassert(n1 == 42, \"a statement after a broken function body still compiles and runs\")\n");
     ok = run_appended(&chunk, &vm);
 
-    check(aer_had_error(), "the unsupported compound field-assignment inside f() still reports its own error");
+    check(aer_had_error(), "the malformed field access inside f() still reports its own error");
     check(aer_assert_failure_count() == 0,
           "n1 is defined and correct — the earlier error did not corrupt the next top-level statement");
 
@@ -362,7 +366,7 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
     shell("compound_x = 5\n");
@@ -388,7 +392,7 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
     shell("ig_smoke_arr = [1, 2, 3]\n");
@@ -412,7 +416,7 @@ int main(void) {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     aer_clear_error();
     shell("malformed_for_x = 1\nfor malformed_for_x !  print(\"body\")\n    malformed_for_x = 2\nmalformed_for_after = \"reached\"\n");

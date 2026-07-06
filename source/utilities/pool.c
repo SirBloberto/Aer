@@ -47,11 +47,6 @@ static unsigned char* pool_cell_state(Pool* p, void* cell) {
     return state;
 }
 
-/* Non-fatal membership test — used where a pointer might legitimately not belong to this pool (an un-pool-tracked closure box, see gc_barrier_box in vm.c), unlike every other pool_* function here. */
-bool pool_owns(Pool* p, void* cell) {
-    return pool_cell_state_or_null(p, cell) != NULL;
-}
-
 void* pool_alloc(Pool* p) {
     pool_total_alloc_count++;
     if (p->free_list) {

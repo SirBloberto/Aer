@@ -39,12 +39,25 @@ function read_outer():
 
 assert(read_outer() == 10, "function reads the outer/global scope")
 
-function mutate_outer():
-    outer = 99                       # no implicit shadowing — this WALKS UP
-    return outer                     # and mutates the existing global 'outer'
+function shadow_outer():
+    outer = 99                       # assignment inside a function is always local —
+    return outer                     # this creates a fresh local, it never reaches the global
 
-assert(mutate_outer() == 99, "assignment inside a function walks up, no implicit shadowing")
-assert(outer == 99, "the outer/global binding was really mutated, not shadowed")
+assert(shadow_outer() == 99, "assignment inside a function creates a local...")
+assert(outer == 10, "...and the outer/global binding is left untouched")
+
+# To update shared state from inside a function, mutate something you were explicitly
+# given a reference to (a struct/array/dict), not a bare name — see the Scope section
+# of the README.
+struct Counter:
+    value
+
+function bump(c):
+    c.value += 1
+
+shared = Counter(10)
+bump(shared)
+assert(shared.value == 11, "explicit mutation through a passed-in reference still works")
 
 # Variables inside blocks are local to that block
 for i in 0..3:

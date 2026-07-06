@@ -1,5 +1,5 @@
 #!/usr/bin/env aer
-# AER test suite — functions, closures, the pipe operator, multiple return
+# AER test suite — functions, the pipe operator, multiple return
 # values, and destructuring.
 # Machine-checked via assert(): a clean run exits 0; any failure prints
 # "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
@@ -53,108 +53,36 @@ result = no_return()
 assert(result == null, "falling off the end of a function returns null")
 
 # ------------------------------------------------------------------ #
-# 17. Anonymous functions and closures                                #
+# 17. Anonymous function expressions                                   #
 # ------------------------------------------------------------------ #
 
 # function(params): body — a function VALUE, not a declaration. Can be
-# assigned, returned, or passed just like any other value.
+# assigned, returned, or passed just like any other value. Compiles exactly
+# like a named function otherwise — it can only see its own parameters and
+# locals, plus true globals; there is no capture of an enclosing function's
+# variables (AER has no closures — a function's data access is always
+# either its own parameters/locals, or an explicit reference passed in).
 square = function(n):
     return n * n
 assert(square(5) == 25, "anonymous function expression")
 
-# Anonymous functions can be defined inside another function's body and
-# capture that function's variables by reference — the captured variable's
-# storage is shared between the closure and the enclosing function from
-# the moment the closure is created.
-function make_counter():
-    count = 0
-    bump = function():
-        count = count + 1      # reads AND writes the enclosing 'count'
-        return count
-    return bump
-
-counter = make_counter()
-assert(counter() == 1, "closure captures and mutates the enclosing variable")
-assert(counter() == 2, "closure state persists across calls")
-
-counter2 = make_counter()             # a fresh, independent counter
-assert(counter2() == 1, "a second closure instance is independent")
-assert(counter() == 3, "the first closure instance is unaffected by the second")
-
-# A pure write to a captured variable also works correctly — AER checks
-# whether the enclosing function already has a binding for that name
-# before deciding a write declares a fresh local, so this "setter" closure
-# updates the enclosing 'x' rather than shadowing it with a throwaway one.
-function make_pair():
-    x = 0
-    getter = function():
-        return x
-    setter = function(y):
-        x = y
-    return getter, setter
-
-get_x, set_x = make_pair()
-assert(get_x() == 0, "getter closure reads the initial captured value")
-set_x(42)
-assert(get_x() == 42, "setter closure (first-occurrence write) updates the shared variable")
-
-# Capture is one level deep only: a function expression can capture from
-# its DIRECTLY enclosing function. A function expression nested inside an
-# already-nested function expression can still be created, but won't
-# capture — any outer-variable reference inside it fails with a plain
-# 'not defined' error rather than doing anything silently wrong.
-
 # Named function statements (`function foo(): ...`) still cannot be
-# nested at all, capturing or not — only function EXPRESSIONS can:
+# nested at all — only function EXPRESSIONS can appear inside a function
+# body:
 # function outer():
 #     function inner():   # error: nested named function definitions
 #         return 1          # are not supported
 #     return inner()
 
-# Capturing still works even when the enclosing function has spilled past
-# SCOPE_SLOT_MAX (8) locals into the hashmap-overflow representation —
-# 'count' below is the 9th local in make_overflow_counter.
-function make_overflow_counter():
-    a = 1
-    b = 2
-    c = 3
-    d = 4
-    e = 5
-    f = 6
-    g = 7
-    h = 8
-    count = 100
-    bump = function():
-        count = count + 1
-        return count
-    return bump
-
-oc = make_overflow_counter()
-assert(oc() == 101, "closure capture works past the 8-local scope-overflow boundary")
-assert(oc() == 102, "overflow-scope closure state persists across calls")
-
-# Capturing a PARAMETER specifically (not a plain local declared inside the
-# function body) — parameters are bound through a separate fast, slot-based
-# path (OP_DEFINE_LOCAL/OP_LOAD_LOCAL/OP_STORE_LOCAL, see vm.c) rather than
-# the name-based scope lookup plain locals still use, so this exercises a
-# real, separate correctness path: a captured parameter must still be
-# found by name (vm_box_slot) and, once boxed, every read/write of it —
-# including from the OUTER function's own body, not just the closure —
-# must go through the box, not the raw slot.
-function make_pair_from_param(x):
-    getter = function():
-        return x
-    setter = function(v):
-        x = v
-    getter2 = function():
-        return x
-    return getter, setter, getter2
-
-get_p, set_p, get_p_direct = make_pair_from_param(1)
-assert(get_p() == 1, "closure over a captured parameter reads the initial value")
-set_p(99)
-assert(get_p() == 99, "mutating a captured parameter through one closure is visible to another")
-assert(get_p_direct() == 99, "...and to a third closure created after the mutation")
+# A function expression nested inside another function body can still
+# reference its OWN parameters/locals and true globals, same as any
+# function — but not the enclosing function's locals, since there's no
+# capture mechanism. That would be a plain 'not defined' error:
+# function make_thing():
+#     x = 1
+#     inner = function():
+#         return x           # error: 'x' is not defined — no capture
+#     return inner()
 
 # ------------------------------------------------------------------ #
 # 18. Pipe operator — |>                                               #
@@ -264,16 +192,7 @@ assert(add3(1) == 111, "two trailing defaults, zero supplied")
 assert(add3(1, 2) == 103, "two trailing defaults, one supplied")
 assert(add3(1, 2, 3) == 6, "two trailing defaults, both supplied — no default should apply")
 
-function make_adder(base = 5):
-    return function(x):
-        return x + base
-
-add5 = make_adder()
-add9 = make_adder(9)
-assert(add5(1) == 6, "a closure captures a defaulted parameter's default value")
-assert(add9(1) == 10, "a closure captures a defaulted parameter's supplied value")
-
 f = greet
 assert(f("Value") == "Hello, Value!", "a default still applies through a function-value call (OP_CALL_VALUE), not just a named call")
 
-print("test_functions_closures.aer: all assertions passed.")
+print("test_functions.aer: all assertions passed.")

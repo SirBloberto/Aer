@@ -54,8 +54,7 @@ static void run() {
     vm.call_depth = 0;
     while (vm.scope_depth > 1) {
         AerScope* s = &vm.scopes[--vm.scope_depth];
-        /* overflow_has_captures guard — same as vm.c's lbl_pop_scope/lbl_return/vm_free: a scope a runtime error aborted mid-call may still have a live closure holding a box into its hashmap, so freeing it here would use-after-free that closure. */
-        if (s->overflow && !s->overflow_has_captures) hashmap_free(&s->map);
+        if (s->overflow) hashmap_free(&s->map);
     }
     lex();
     parse(&chunk);

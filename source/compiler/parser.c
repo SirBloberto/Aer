@@ -41,15 +41,17 @@ typedef struct {
     unsigned int top;                 /* loop condition address (continue target) */
     unsigned int patches[BREAK_MAX];  /* break OP_JUMP operand positions          */
     unsigned int patch_count;
-    int scope_depth;                  /* compile_scope_depth before loop's scope  */
     int iter_slots;                   /* extra value-stack slots held by iterator (0=while, 2=for-each) */
 } LoopContext;
 
 static LoopContext loop_stack[LOOP_MAX];
-static int loop_depth          = 0;   /* total loops on stack                   */
-static int loop_floor          = 0;   /* function-relative floor for break/cont */
-static int compile_scope_depth = 0;   /* mirrors PUSH_SCOPE / POP_SCOPE emits   */
-static int function_depth      = 0;   /* nesting depth of function definitions  */
+static int loop_depth     = 0;   /* total loops on stack                   */
+static int loop_floor     = 0;   /* function-relative floor for break/cont */
+static int function_depth = 0;   /* nesting depth of function definitions  */
+/* if/for block nesting, independent of function_depth — every local is now flat-slotted in the
+   enclosing function's own frame (see current_locals), so blocks no longer push a runtime scope;
+   this exists purely to keep parse_import's top-level-only check correct. */
+static int block_depth    = 0;
 
 /* Set just before parse_compound() returns (it always exits at a fresh statement
    boundary: EOF/ELSE/DEDENT). Callers' skip-loops check this first so they can tell
@@ -85,108 +87,45 @@ static bool pipe_forbid_calls = false;
    so last_bare_call_end == c->count is a robust proof the whole return expr is one bare call. */
 static unsigned int last_bare_call_end = (unsigned int)-1;
 
-/* Closure capture analysis: no compile-time symbol table, so this uses a single-pass
-   rule (first occurrence of a name decides captured vs. local) instead of Python-style
-   whole-function hoisting. A first-occurrence write is ambiguous alone (looks like a
-   fresh local); outer_locals below resolves it by checking if the enclosing function
-   already assigned the name. Deliberately narrow: only one nesting level can capture
-   (see parse_function_expr's capture_supported), so this never needs to be a stack. */
-#define MAX_TRACKED_LOCALS 32
-
-typedef struct {
-    unsigned int local_names[MAX_TRACKED_LOCALS];
-    unsigned int local_count;
-    unsigned int captured_names[MAX_CAPTURES];   /* in first-capture order == upvalue slot order */
-    unsigned int capture_count;
-} CaptureCtx;
-
-static CaptureCtx capture_ctx;
-static bool        capturing = false;   /* true only while compiling a capturing function's body */
-
-/* Names assigned so far in the current top-level function's body (function_depth==1) —
-   resolves the setter ambiguity above; populated by emit_store/emit_define, reset per
-   function in parse_function_body. */
-static unsigned int outer_locals[MAX_TRACKED_LOCALS];
-static unsigned int outer_local_count = 0;
-
-static bool outer_locals_has(unsigned int name_idx) {
-    for (unsigned int i = 0; i < outer_local_count; i++)
-        if (outer_locals[i] == name_idx) return true;
-    return false;
-}
-
-static void outer_locals_add(unsigned int name_idx) {
-    if (!outer_locals_has(name_idx) && outer_local_count < MAX_TRACKED_LOCALS)
-        outer_locals[outer_local_count++] = name_idx;
-}
-
-static bool capture_is_local(unsigned int name_idx) {
-    for (unsigned int i = 0; i < capture_ctx.local_count; i++)
-        if (capture_ctx.local_names[i] == name_idx) return true;
-    return false;
-}
-
-static bool capture_is_captured(unsigned int name_idx) {
-    for (unsigned int i = 0; i < capture_ctx.capture_count; i++)
-        if (capture_ctx.captured_names[i] == name_idx) return true;
-    return false;
-}
-
-/* Returns the upvalue slot index for an already-captured name; only valid once capture_is_captured(name_idx) is true. */
-static unsigned int capture_slot(unsigned int name_idx) {
-    unsigned int i = 0;
-    for (; i < capture_ctx.capture_count; i++)
-        if (capture_ctx.captured_names[i] == name_idx) break;
-    return i;
-}
-
-/* Classifies name_idx on first encounter (see capture rule above); already-classified names report their existing classification. */
-static bool capture_classify(unsigned int name_idx, bool as_write) {
-    if (capture_is_local(name_idx))    return false;
-    if (capture_is_captured(name_idx)) return true;
-    if (as_write && !outer_locals_has(name_idx)) {
-        if (capture_ctx.local_count < MAX_TRACKED_LOCALS)
-            capture_ctx.local_names[capture_ctx.local_count++] = name_idx;
-        return false;
-    }
-    if (capture_ctx.capture_count < MAX_CAPTURES) {
-        capture_ctx.captured_names[capture_ctx.capture_count++] = name_idx;
-    } else {
-        error_at("Too many captured variables in one closure (max %d)", MAX_CAPTURES);
-    }
-    return true;
-}
-
 /* Shares vm.h's SCOPE_SLOT_MAX (not independent) — slots this table hands out are written into ScopeSlot[] with no runtime bounds check. */
-#define MAX_PARAMS   SCOPE_SLOT_MAX
+#define MAX_LOCALS   SCOPE_SLOT_MAX
 
-/* Parameters of the function CURRENTLY being compiled — lets emit_load/emit_store use
-   the fast OP_LOAD_LOCAL/OP_STORE_LOCAL/OP_DEFINE_LOCAL slot opcodes (CPython's LOAD_FAST)
-   instead of name-based ones. Deliberately not extended to ordinary body locals: a
-   "hybrid scopes" idea was tried and reverted (see git history) because a plain
-   `x = value` in a function body must walk up and mutate an existing outer/global `x`
-   per AER's no-implicit-shadowing rule — treating it as an unconditional fresh local
-   broke that, caught by tests/test.aer's `mutate_outer` case. A parameter has no such
-   ambiguity: it's always a fresh binding, never a walk-up candidate. Saved/restored
-   around a nested function body exactly like capturing/capture_ctx in parse_function. */
-static unsigned int current_params[MAX_PARAMS];
-static unsigned int current_param_count = 0;
+/* Every local of the function CURRENTLY being compiled — parameters and ordinary body locals
+   alike, one slot per distinct name for the whole function (loop variables and re-assignments
+   reuse the same slot on every later occurrence, exactly like CPython's co_varnames). Lets
+   emit_load/emit_store/emit_define use the fast OP_LOAD_LOCAL/OP_STORE_LOCAL/OP_DEFINE_LOCAL
+   opcodes instead of name-based ones. Safe to do unconditionally now that assignment inside a
+   function is always local (no walk-up-and-mutate-outer to preserve — see README's Scope
+   section); an earlier "hybrid scopes" attempt scoped to parameters only was reverted because it
+   couldn't coexist with that older walk-up rule. Saved/restored around a nested function body. */
+static unsigned int current_locals[MAX_LOCALS];
+static unsigned int current_local_count = 0;
 
-/* Returns name_idx's slot if it's a parameter of the current function, else -1 (emit_load/emit_store fall back to name-based opcodes). */
-static int current_param_slot(unsigned int name_idx) {
-    for (unsigned int i = 0; i < current_param_count; i++)
-        if (current_params[i] == name_idx) return (int)i;
+/* Read-only lookup — does not allocate. -1 means name_idx isn't a local of the function currently
+   being compiled, so it must be a global (emit_load's only remaining fallback). */
+static int current_local_slot(unsigned int name_idx) {
+    for (unsigned int i = 0; i < current_local_count; i++)
+        if (current_locals[i] == name_idx) return (int)i;
     return -1;
 }
 
-/* Replaces direct `chunk_emit(c, OP_LOAD); chunk_emit(c, name_idx);` at every read site; identical behavior outside a capturing function. */
-static void emit_load(Chunk* c, unsigned int name_idx) {
-    if (capturing && capture_classify(name_idx, false)) {
-        chunk_emit(c, OP_LOAD_UPVALUE);
-        chunk_emit(c, (int)capture_slot(name_idx));
-        return;
+/* Returns name_idx's slot, registering a fresh one on first appearance in this function.
+   -1 (with error_at already called) once a function's distinct local names exceed MAX_LOCALS. */
+static int current_local_slot_or_alloc(unsigned int name_idx) {
+    int slot = current_local_slot(name_idx);
+    if (slot >= 0) return slot;
+    if (current_local_count >= MAX_LOCALS) {
+        error_at("Too many local variables in one function (max %d)", MAX_LOCALS);
+        return -1;
     }
-    int slot = current_param_slot(name_idx);
+    slot = (int)current_local_count;
+    current_locals[current_local_count++] = name_idx;
+    return slot;
+}
+
+/* Replaces direct `chunk_emit(c, OP_LOAD); chunk_emit(c, name_idx);` at every read site. */
+static void emit_load(Chunk* c, unsigned int name_idx) {
+    int slot = current_local_slot(name_idx);
     if (slot >= 0) {
         chunk_emit(c, OP_LOAD_LOCAL);
         chunk_emit(c, slot);
@@ -197,29 +136,22 @@ static void emit_load(Chunk* c, unsigned int name_idx) {
     chunk_emit(c, (int)chunk_add_addr_cache(c));
 }
 
-/* Replaces direct OP_STORE emission at plain-assignment write sites (not params/loop
-   vars — see emit_define); same behavior outside capturing functions. */
+/* Replaces direct OP_STORE emission at plain-assignment write sites. Inside a function, every
+   name is local — first appearance defines a fresh slot, any later one just updates it; at the
+   top level (function_depth == 0) this is unchanged, a genuine global write. */
 static void emit_store(Chunk* c, unsigned int name_idx) {
-    if (function_depth == 1) outer_locals_add(name_idx);
-    if (capturing) {
-        bool already_classified = capture_is_local(name_idx) || capture_is_captured(name_idx);
-        bool captured = capture_classify(name_idx, true);
-        if (captured) {
-            chunk_emit(c, OP_STORE_UPVALUE);
-            chunk_emit(c, (int)capture_slot(name_idx));
-            return;
-        }
-        if (!already_classified) {
-            /* First occurrence, now classified local: OP_DEFINE guarantees a fresh local instead of risking OP_STORE walking up to an unrelated outer binding. */
-            chunk_emit(c, OP_DEFINE);
+    if (function_depth > 0) {
+        int existing = current_local_slot(name_idx);
+        int slot = current_local_slot_or_alloc(name_idx);
+        if (slot < 0) return;   /* error_at already called */
+        if (existing >= 0) {
+            chunk_emit(c, OP_STORE_LOCAL);
+            chunk_emit(c, slot);
+        } else {
+            chunk_emit(c, OP_DEFINE_LOCAL);
+            chunk_emit(c, slot);
             chunk_emit(c, (int)name_idx);
-            return;
         }
-    }
-    int slot = current_param_slot(name_idx);
-    if (slot >= 0) {
-        chunk_emit(c, OP_STORE_LOCAL);
-        chunk_emit(c, slot);
         return;
     }
     chunk_emit(c, OP_STORE);
@@ -260,33 +192,29 @@ static Operand classify_operand(Chunk* c, unsigned int start, unsigned int end) 
     return none;
 }
 
-/* For loop variables — always unambiguously local, so this just registers the name and
-   emits plain OP_DEFINE. Parameters use emit_define_param's fast slot path instead; loop
-   vars can't, since a fresh scope is pushed every iteration with no call-lifetime slot. */
+/* For loop variables — inside a function this is just another local (registers the name,
+   reusing its slot if an earlier loop in the same function already used it); at the top level
+   (function_depth == 0) it's unchanged, a genuine global. */
 static void emit_define(Chunk* c, unsigned int name_idx) {
-    if (function_depth == 1) outer_locals_add(name_idx);
-    if (capturing && !capture_is_local(name_idx) && !capture_is_captured(name_idx)
-        && capture_ctx.local_count < MAX_TRACKED_LOCALS) {
-        capture_ctx.local_names[capture_ctx.local_count++] = name_idx;
+    if (function_depth > 0) {
+        int slot = current_local_slot_or_alloc(name_idx);
+        if (slot < 0) return;   /* error_at already called */
+        chunk_emit(c, OP_DEFINE_LOCAL);
+        chunk_emit(c, slot);
+        chunk_emit(c, (int)name_idx);
+        return;
     }
     chunk_emit(c, OP_DEFINE);
     chunk_emit(c, (int)name_idx);
 }
 
-/* One parameter of the function being compiled — mirrors emit_define's bookkeeping
-   (so later reassignment or closure capture still classifies correctly), but also
-   records (name_idx -> slot) in current_params so emit_load/emit_store later resolve
-   it to OP_LOAD_LOCAL/OP_STORE_LOCAL instead of a name-based lookup. */
+/* One parameter of the function being compiled — registers (name_idx -> slot) in
+   current_locals so emit_load/emit_store later resolve it to OP_LOAD_LOCAL/OP_STORE_LOCAL. */
 static void emit_define_param(Chunk* c, unsigned int name_idx) {
-    if (function_depth == 1) outer_locals_add(name_idx);
-    if (capturing && !capture_is_local(name_idx) && !capture_is_captured(name_idx)
-        && capture_ctx.local_count < MAX_TRACKED_LOCALS) {
-        capture_ctx.local_names[capture_ctx.local_count++] = name_idx;
-    }
-    unsigned int slot = current_param_count;
-    if (current_param_count < MAX_PARAMS) current_params[current_param_count++] = name_idx;
+    int slot = current_local_slot_or_alloc(name_idx);
+    if (slot < 0) return;   /* error_at already called */
     chunk_emit(c, OP_DEFINE_LOCAL);
-    chunk_emit(c, (int)slot);
+    chunk_emit(c, slot);
     chunk_emit(c, (int)name_idx);
 }
 
@@ -309,8 +237,8 @@ static bool expr_depth_enter(void) {
 
 static void parse_statement(Chunk* c);
 static void parse_assignment(Chunk* c);
-static void parse_binary(Chunk* c, unsigned int min_prec);
-static void parse_binary_ops(Chunk* c, unsigned int min_prec);
+static int  parse_binary(Chunk* c, unsigned int min_prec);
+static int  parse_binary_ops(Chunk* c, unsigned int min_prec);
 static void parse_unary(Chunk* c);
 static void parse_primary(Chunk* c);
 static void parse_primary_inner(Chunk* c);
@@ -394,6 +322,23 @@ static void parse_statement(Chunk* c) {
     error_at("Expected a statement");
 }
 
+/* Shared by parse_assignment's plain-name compound path and its field/index-chain compound
+   path (`p.x += 1`, `a[i] += 1`) — token -> the binary opcode that implements its `OP=` form. */
+static const struct { TokenType tok; Opcode op; } compound_assign_ops[] = {
+    { TOKEN_ADD_ASSIGN,          OP_ADD         },
+    { TOKEN_SUBTRACT_ASSIGN,     OP_SUB         },
+    { TOKEN_MULTIPLY_ASSIGN,     OP_MUL         },
+    { TOKEN_DIVIDE_ASSIGN,       OP_DIV         },
+    { TOKEN_MODULO_ASSIGN,       OP_MOD         },
+    { TOKEN_LEFT_SHIFT_ASSIGN,   OP_LSHIFT      },
+    { TOKEN_RIGHT_SHIFT_ASSIGN,  OP_RSHIFT      },
+    { TOKEN_AND_ASSIGN,          OP_BITWISE_AND },
+    { TOKEN_OR_ASSIGN,           OP_BITWISE_OR  },
+    { TOKEN_XOR_ASSIGN,          OP_BITWISE_XOR },
+    { TOKEN_FLOOR_DIVIDE_ASSIGN, OP_FLOOR_DIV   },
+};
+#define COMPOUND_ASSIGN_OP_COUNT (int)(sizeof(compound_assign_ops) / sizeof(*compound_assign_ops))
+
 static void parse_assignment(Chunk* c) {
     unsigned int name_idx = chunk_add_pool(c, token.value);
     lex();
@@ -406,13 +351,18 @@ static void parse_assignment(Chunk* c) {
 
     if (equal(TOKEN_OPEN_BRACKET) || equal(TOKEN_DOT)) {
         /* a[i], a.x, and mixed chains (a.b[0].c = ...) all land here — the pending step resolves as a GET until another step follows, and as the final SET once '=' is reached. */
+        unsigned int arr_start = c->count;
         emit_load(c, name_idx);
 
         bool pending_is_field = false;
         unsigned int pending_field_idx = 0;
+        bool chained = false;   /* true once any step past the first has been consumed */
 
+        unsigned int idx_start = 0, idx_end = 0;   /* only meaningful when !chained && !pending_is_field */
         if (consume(TOKEN_OPEN_BRACKET)) {
+            idx_start = c->count;
             parse_binary(c, 0);
+            idx_end = c->count;
             require(TOKEN_CLOSE_BRACKET, "expected ']' after index");
         } else {
             consume(TOKEN_DOT);
@@ -423,6 +373,7 @@ static void parse_assignment(Chunk* c) {
         }
 
         while (equal(TOKEN_OPEN_BRACKET) || equal(TOKEN_DOT)) {
+            chained = true;
             if (pending_is_field) { chunk_emit(c, OP_FIELD_GET); chunk_emit(c, (int)pending_field_idx); }
             else                    chunk_emit(c, OP_INDEX_GET);
 
@@ -441,19 +392,93 @@ static void parse_assignment(Chunk* c) {
 
         if (equal(TOKEN_ASSIGN)) {
             consume(TOKEN_ASSIGN);
-            parse_binary(c, 0);          /* value */
+            unsigned int val_start = c->count;
+            parse_binary(c, 0);          /* value — always parsed first, unconditionally */
+            unsigned int val_end = c->count;
+
+            /* Array-index-set fusion, mirroring OP_INDEX_GET_*'s scheme (vm.h): only for the
+               single, unchained `name[index] = value` shape — a chained write (a.b[i] = v) or a
+               struct field write keeps using the generic OP_INDEX_SET/OP_FIELD_SET, exactly as
+               before.
+                 The value must be a bare CONST, not just any expression — this is a correctness
+               requirement, not a simplification. The fused opcode resolves the array and index at
+               ITS OWN dispatch time, which is necessarily after the value's bytecode (already
+               emitted first, above) has already run. If the value were an arbitrary expression —
+               a call, say — that reassigned the very variable used as the index, the unfused
+               evaluation order (array, then index, then value) and the fused one (value, then
+               array, then index) could disagree on which index actually gets written to. A CONST
+               can't reassign anything, so evaluating it "first" is unobservably identical to
+               evaluating it last — closing that gap. (LOCAL/NAME would be equally side-effect-free
+               and safe to allow here too, in principle; left out only to keep this at 6 opcodes
+               instead of 18 — CONST covers the dominant real case, `arr[i] = <literal>`.) */
+            if (!chained && !pending_is_field) {
+                Operand arr = classify_operand(c, arr_start, idx_start);
+                Operand idx = classify_operand(c, idx_start, idx_end);
+                Operand val = classify_operand(c, val_start, val_end);
+                if ((arr.kind == OPERAND_LOCAL || arr.kind == OPERAND_NAME) &&
+                    (idx.kind == OPERAND_CONST || idx.kind == OPERAND_LOCAL || idx.kind == OPERAND_NAME) &&
+                    val.kind == OPERAND_CONST) {
+                    /* Discard the LOAD+index+value-push just emitted — the fused opcode below
+                       re-resolves all three directly from their pool/slot/name+cache operands. */
+                    c->count = arr_start;
+                    if (arr.kind == OPERAND_LOCAL) {
+                        if (idx.kind == OPERAND_CONST) {
+                            chunk_emit(c, OP_INDEX_SET_LOCAL_CONST);
+                            chunk_emit(c, arr.a); chunk_emit(c, idx.a); chunk_emit(c, val.a);
+                        } else if (idx.kind == OPERAND_LOCAL) {
+                            chunk_emit(c, OP_INDEX_SET_LOCAL_LOCAL);
+                            chunk_emit(c, arr.a); chunk_emit(c, idx.a); chunk_emit(c, val.a);
+                        } else {
+                            chunk_emit(c, OP_INDEX_SET_LOCAL_NAME);
+                            chunk_emit(c, arr.a); chunk_emit(c, idx.a); chunk_emit(c, idx.b); chunk_emit(c, val.a);
+                        }
+                    } else {
+                        if (idx.kind == OPERAND_CONST) {
+                            chunk_emit(c, OP_INDEX_SET_NAME_CONST);
+                            chunk_emit(c, arr.a); chunk_emit(c, arr.b); chunk_emit(c, idx.a); chunk_emit(c, val.a);
+                        } else if (idx.kind == OPERAND_LOCAL) {
+                            chunk_emit(c, OP_INDEX_SET_NAME_LOCAL);
+                            chunk_emit(c, arr.a); chunk_emit(c, arr.b); chunk_emit(c, idx.a); chunk_emit(c, val.a);
+                        } else {
+                            chunk_emit(c, OP_INDEX_SET_NAME_NAME);
+                            chunk_emit(c, arr.a); chunk_emit(c, arr.b); chunk_emit(c, idx.a); chunk_emit(c, idx.b); chunk_emit(c, val.a);
+                        }
+                    }
+                    return;
+                }
+            }
             if (pending_is_field) { chunk_emit(c, OP_FIELD_SET); chunk_emit(c, (int)pending_field_idx); }
             else                    chunk_emit(c, OP_INDEX_SET);
             return;
         }
 
-        /* Not a plain assignment — finish the pending step as a GET and fall through to a
-           general expression statement: a call on the retrieved value (queue[i](), obj.method()),
+        /* Compound assignment to the chain's final step (`p.x += 1`, `a[i] += 1`): the stack
+           right now holds exactly what the pending GET/SET needs — [obj] for a field, [obj, idx]
+           for an index — with every earlier step in the chain (a.b.c, a[f()], etc.) already
+           evaluated exactly once. OP_DUP_N duplicates that so the GET can consume one copy while
+           the original stays underneath for the eventual SET, instead of re-emitting (and
+           re-running, possibly re-calling a side-effecting index expression) the whole chain
+           a second time. */
+        for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
+            if (consume(compound_assign_ops[i].tok)) {
+                chunk_emit(c, OP_DUP_N);
+                chunk_emit(c, pending_is_field ? 1 : 2);
+                if (pending_is_field) { chunk_emit(c, OP_FIELD_GET); chunk_emit(c, (int)pending_field_idx); }
+                else                    chunk_emit(c, OP_INDEX_GET);
+                parse_binary(c, 0);      /* rhs */
+                chunk_emit(c, (int)compound_assign_ops[i].op);
+                if (pending_is_field) { chunk_emit(c, OP_FIELD_SET); chunk_emit(c, (int)pending_field_idx); }
+                else                    chunk_emit(c, OP_INDEX_SET);
+                return;
+            }
+        }
+
+        /* Not a plain or compound assignment — finish the pending step as a GET and fall through
+           to a general expression statement: a call on the retrieved value (queue[i](), obj.method()),
            further chaining, and/or a trailing pipe (b.neighbors |> append(a)), discarded like
-           any other expression statement. Anything else is the genuine "compound assignment
-           to an indexed/field value" error this used to always report unconditionally. */
+           any other expression statement. Anything else is a genuine parse error. */
         if (!equal(TOKEN_OPEN_PARENTHESE) && !equal(TOKEN_PIPE)) {
-            error_at("Compound assignment to an indexed or field value is not supported; use 'a.x = a.x + 1'");
+            error_at("Expected an assignment ('='), a compound assignment ('+=' etc.), or a call/pipe continuation after this chain");
             return;
         }
         if (pending_is_field) { chunk_emit(c, OP_FIELD_GET); chunk_emit(c, (int)pending_field_idx); }
@@ -516,21 +541,8 @@ static void parse_assignment(Chunk* c) {
         return;
     }
 
-    static const struct { TokenType tok; Opcode op; } ops[] = {
-        { TOKEN_ADD_ASSIGN,          OP_ADD         },
-        { TOKEN_SUBTRACT_ASSIGN,     OP_SUB         },
-        { TOKEN_MULTIPLY_ASSIGN,     OP_MUL         },
-        { TOKEN_DIVIDE_ASSIGN,       OP_DIV         },
-        { TOKEN_MODULO_ASSIGN,       OP_MOD         },
-        { TOKEN_LEFT_SHIFT_ASSIGN,   OP_LSHIFT      },
-        { TOKEN_RIGHT_SHIFT_ASSIGN,  OP_RSHIFT      },
-        { TOKEN_AND_ASSIGN,          OP_BITWISE_AND },
-        { TOKEN_OR_ASSIGN,           OP_BITWISE_OR  },
-        { TOKEN_XOR_ASSIGN,          OP_BITWISE_XOR },
-        { TOKEN_FLOOR_DIVIDE_ASSIGN, OP_FLOOR_DIV   },
-    };
-    for (int i = 0; i < (int)(sizeof(ops) / sizeof(*ops)); i++) {
-        if (consume(ops[i].tok)) {
+    for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
+        if (consume(compound_assign_ops[i].tok)) {
             unsigned int lhs_start = c->count;
             emit_load(c, name_idx);
             unsigned int rhs_start = c->count;
@@ -538,10 +550,10 @@ static void parse_assignment(Chunk* c) {
             Operand lhs = classify_operand(c, lhs_start, rhs_start);
             Operand rhs = classify_operand(c, rhs_start, c->count);
             /* All 6 LHS x RHS shapes fuse now (Phase 1: NAME_CONST/NAME_NAME; Phase 2: the
-               LOCAL-involving ones — see OP_COMPOUND_*'s comment in vm.h). A LOCAL (parameter)
-               LHS/RHS goes through vm_read_local_slot/vm_write_local_slot's closure-box check,
-               matching lbl_load_local/lbl_store_local exactly. Reuses lhs/rhs's already-allocated
-               cache slots (from the emit_load calls just made) for any NAME operand. */
+               LOCAL-involving ones — see OP_COMPOUND_*'s comment in vm.h). A LOCAL LHS/RHS goes
+               through vm_read_local_slot/vm_write_local_slot, matching lbl_load_local/
+               lbl_store_local exactly. Reuses lhs/rhs's already-allocated cache slots (from the
+               emit_load calls just made) for any NAME operand. */
             if ((lhs.kind == OPERAND_LOCAL || lhs.kind == OPERAND_NAME) &&
                 (rhs.kind == OPERAND_CONST || rhs.kind == OPERAND_LOCAL || rhs.kind == OPERAND_NAME)) {
                 c->count = lhs_start;   /* discard the LOAD+RHS just emitted */
@@ -549,41 +561,41 @@ static void parse_assignment(Chunk* c) {
                     if (rhs.kind == OPERAND_CONST) {
                         chunk_emit(c, OP_COMPOUND_LOCAL_CONST);
                         chunk_emit(c, lhs.a);
-                        chunk_emit(c, (int)ops[i].op);
+                        chunk_emit(c, (int)compound_assign_ops[i].op);
                         chunk_emit(c, rhs.a);
                     } else if (rhs.kind == OPERAND_LOCAL) {
                         chunk_emit(c, OP_COMPOUND_LOCAL_LOCAL);
                         chunk_emit(c, lhs.a);
-                        chunk_emit(c, (int)ops[i].op);
+                        chunk_emit(c, (int)compound_assign_ops[i].op);
                         chunk_emit(c, rhs.a);
                     } else {
                         chunk_emit(c, OP_COMPOUND_LOCAL_NAME);
                         chunk_emit(c, lhs.a);
-                        chunk_emit(c, (int)ops[i].op);
+                        chunk_emit(c, (int)compound_assign_ops[i].op);
                         chunk_emit(c, rhs.a); chunk_emit(c, rhs.b);
                     }
                 } else {
                     if (rhs.kind == OPERAND_CONST) {
                         chunk_emit(c, OP_COMPOUND_NAME_CONST);
                         chunk_emit(c, lhs.a); chunk_emit(c, lhs.b);
-                        chunk_emit(c, (int)ops[i].op);
+                        chunk_emit(c, (int)compound_assign_ops[i].op);
                         chunk_emit(c, rhs.a);
                     } else if (rhs.kind == OPERAND_LOCAL) {
                         chunk_emit(c, OP_COMPOUND_NAME_LOCAL);
                         chunk_emit(c, lhs.a); chunk_emit(c, lhs.b);
-                        chunk_emit(c, (int)ops[i].op);
+                        chunk_emit(c, (int)compound_assign_ops[i].op);
                         chunk_emit(c, rhs.a);
                     } else {
                         chunk_emit(c, OP_COMPOUND_NAME_NAME);
                         chunk_emit(c, lhs.a); chunk_emit(c, lhs.b);
-                        chunk_emit(c, (int)ops[i].op);
+                        chunk_emit(c, (int)compound_assign_ops[i].op);
                         chunk_emit(c, rhs.a); chunk_emit(c, rhs.b);
                     }
                 }
                 return;
             }
             /* Not fusable — a non-simple RHS (upvalue or compound expression); byte-for-byte what this code already did. */
-            chunk_emit(c, (int)ops[i].op);
+            chunk_emit(c, (int)compound_assign_ops[i].op);
             emit_store(c, name_idx);
             return;
         }
@@ -604,8 +616,21 @@ static void parse_assignment(Chunk* c) {
 /* Expressions                                                          */
 /* ------------------------------------------------------------------ */
 
-/* Operator-climb from current token; LHS must already be on the stack. */
-static void parse_binary_ops(Chunk* c, unsigned int min_prec) {
+/* Operator-climb from current token; LHS must already be on the stack. Returns the Opcode (cast
+   to int) of a bare comparison (EQ/NEQ/LT/GT/LTE/GTE) if THIS call's own outermost/last-applied
+   operator was one, via the plain generic branch below; -1 otherwise (no operator applied here,
+   or the last one applied was AND/OR/PIPE/CAST/an arithmetic-or-bitwise op). Used by
+   parse_if/parse_for/parse_if_expr's emit_jump_if_false to fuse a condition's trailing comparison
+   directly into its branch (see OP_CMP_JUMP_FALSE's comment in vm.h) — safe because this is a
+   real signal from the parser about what IT structurally just emitted, not a guess reconstructed
+   from inspecting raw bytecode after the fact (which an earlier draft of this feature tried and
+   found unsound: an unrelated instruction's operand word — a pool index, a cache slot — can
+   coincidentally equal a comparison opcode's numeric value, since both are just small sequential
+   integers). A recursive parse_binary/parse_binary_ops call (e.g. the "b+c" in "a < b+c") returns
+   its OWN result to its OWN caller; that value is never read here, so it can't leak into or
+   overwrite this call's tracking — each stack frame's last_cmp is local and independent. */
+static int parse_binary_ops(Chunk* c, unsigned int min_prec) {
+    int last_cmp = -1;
     while (1) {
         unsigned int idx = (unsigned int)token.type - BINARY_OP_START;
         if (idx >= BINARY_OP_COUNT || binary_precedence[idx] <= min_prec)
@@ -613,6 +638,7 @@ static void parse_binary_ops(Chunk* c, unsigned int min_prec) {
         Opcode       op   = binary_ops[idx];
         unsigned int prec = binary_precedence[idx];
         lex();
+        last_cmp = -1;   /* reset every iteration — only the plain generic branch below sets it */
 
         if (op == OP_AND) {
             /* Short-circuit: LHS false → false, RHS never evaluated */
@@ -647,15 +673,15 @@ static void parse_binary_ops(Chunk* c, unsigned int min_prec) {
                chains stay flat. A module-qualified target (x |> string.upper()) works the
                same way, emitting OP_CALL_MODULE instead — same "arg count already includes
                the piped value" trick, since OP_CALL_MODULE pops arg_count values like OP_CALL. */
-            if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a function name after '|>'"); return; }
+            if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a function name after '|>'"); return -1; }
             if (at_module_name(c)) {
                 unsigned int module_idx = chunk_add_pool(c, token.value);
                 lex();
                 if (!consume(TOKEN_DOT)) {
                     error_at("A module can't be used as a value on its own — call a function on it, e.g. 'module.function(...)'");
-                    return;
+                    return -1;
                 }
-                if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a function name after '.'"); return; }
+                if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a function name after '.'"); return -1; }
                 unsigned int fn_idx = chunk_add_pool(c, token.value);
                 lex();
                 require(TOKEN_OPEN_PARENTHESE, "expected '(' after module function name");
@@ -663,7 +689,7 @@ static void parse_binary_ops(Chunk* c, unsigned int min_prec) {
                 pipe_forbid_calls = true;
                 unsigned int n = parse_arg_list(c);
                 pipe_forbid_calls = outer_forbid;
-                if (outer_forbid) { error_at("Function calls are not allowed inside a pipe's arguments"); return; }
+                if (outer_forbid) { error_at("Function calls are not allowed inside a pipe's arguments"); return -1; }
                 chunk_emit(c, OP_CALL_MODULE);
                 chunk_emit(c, (int)module_idx);
                 chunk_emit(c, (int)fn_idx);
@@ -676,7 +702,7 @@ static void parse_binary_ops(Chunk* c, unsigned int min_prec) {
                 pipe_forbid_calls = true;
                 unsigned int n = parse_arg_list(c);
                 pipe_forbid_calls = outer_forbid;
-                if (outer_forbid) { error_at("Function calls are not allowed inside a pipe's arguments"); return; }
+                if (outer_forbid) { error_at("Function calls are not allowed inside a pipe's arguments"); return -1; }
                 chunk_emit(c, OP_CALL);
                 chunk_emit(c, (int)name_idx);
                 chunk_emit(c, (int)(n + 1));
@@ -686,7 +712,7 @@ static void parse_binary_ops(Chunk* c, unsigned int min_prec) {
             /* x as T — T is a bare type name, read directly rather than through parse_binary.
                Anything not a known primitive is a struct type, resolved at runtime via
                OP_CHECK_SHAPE, which only ever verifies (never converts — no well-defined way to reshape one struct into another). */
-            if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a type name after 'as'"); return; }
+            if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a type name after 'as'"); return -1; }
             unsigned int type_idx = chunk_add_pool(c, token.value);
             const char* type_name = aer_as_string(token.value)->data;
             unsigned int type_len = aer_as_string(token.value)->length;
@@ -699,13 +725,18 @@ static void parse_binary_ops(Chunk* c, unsigned int min_prec) {
         } else {
             parse_binary(c, prec);
             chunk_emit(c, (int)op);
+            if (op == OP_EQ || op == OP_NEQ || op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE)
+                last_cmp = (int)op;
         }
     }
+    return last_cmp;
 }
 
-static void parse_binary(Chunk* c, unsigned int min_prec) {
+/* Returns parse_binary_ops's result (see its comment) — a bare comparison Opcode if the WHOLE
+   expression's outermost operator was one, else -1. */
+static int parse_binary(Chunk* c, unsigned int min_prec) {
     parse_unary(c);
-    parse_binary_ops(c, min_prec);
+    return parse_binary_ops(c, min_prec);
 }
 
 static void parse_unary_inner(Chunk* c) {
@@ -1012,19 +1043,36 @@ static void parse_compound(Chunk* c) {
 /* Control flow                                                         */
 /* ------------------------------------------------------------------ */
 
+/* Emits the branch-on-false step for a condition the caller already parsed (whose parse_binary()/
+   parse_binary_ops() return value is passed as last_cmp) — fuses it with the condition's own
+   trailing comparison into one OP_CMP_JUMP_FALSE when last_cmp says the condition's outermost
+   operator was a bare comparison, replacing the lone comparison opcode that same parse already
+   emitted; otherwise falls back to a plain OP_JUMP_IF_FALSE, byte-for-byte what every caller did
+   before this existed. Returns the not-yet-patched jump-target operand's position, same contract
+   as the raw "OP_JUMP_IF_FALSE; patch = c->count; chunk_emit(0)" sequence this replaces. */
+static unsigned int emit_jump_if_false(Chunk* c, int last_cmp) {
+    if (last_cmp == OP_EQ || last_cmp == OP_NEQ || last_cmp == OP_LT ||
+        last_cmp == OP_GT || last_cmp == OP_LTE || last_cmp == OP_GTE) {
+        c->count--;   /* discard the bare comparison opcode word the condition's parse just emitted */
+        chunk_emit(c, OP_CMP_JUMP_FALSE);
+        chunk_emit(c, last_cmp);
+    } else {
+        chunk_emit(c, OP_JUMP_IF_FALSE);
+    }
+    unsigned int patch = c->count;
+    chunk_emit(c, 0);
+    return patch;
+}
+
 static void parse_if(Chunk* c) {
-    parse_binary(c, 0);
+    int last_cmp = parse_binary(c, 0);
     require(TOKEN_COLON, "expected ':' after if condition");
 
-    chunk_emit(c, OP_JUMP_IF_FALSE);
-    unsigned int patch_jif = c->count;
-    chunk_emit(c, 0);
+    unsigned int patch_jif = emit_jump_if_false(c, last_cmp);
 
-    compile_scope_depth++;
-    chunk_emit(c, OP_PUSH_SCOPE);
+    block_depth++;
     parse_compound(c);
-    chunk_emit(c, OP_POP_SCOPE);
-    compile_scope_depth--;
+    block_depth--;
 
     if (consume(TOKEN_ELSE)) {
         /* The if-branch's parse_compound() just set recovered_at_boundary; that's stale
@@ -1035,11 +1083,9 @@ static void parse_if(Chunk* c) {
         unsigned int patch_jmp = c->count;
         chunk_emit(c, 0);
         c->code[patch_jif] = (int)c->count;
-        compile_scope_depth++;
-        chunk_emit(c, OP_PUSH_SCOPE);
+        block_depth++;
         parse_compound(c);
-        chunk_emit(c, OP_POP_SCOPE);
-        compile_scope_depth--;
+        block_depth--;
         c->code[patch_jmp] = (int)c->count;
     } else {
         c->code[patch_jif] = (int)c->count;
@@ -1048,12 +1094,10 @@ static void parse_if(Chunk* c) {
 
 /* Inline if-expression: if cond: value else: value  (no newline after ':') */
 static void parse_if_expr(Chunk* c) {
-    parse_binary(c, 0);          /* condition */
+    int last_cmp = parse_binary(c, 0);          /* condition */
     require(TOKEN_COLON, "expected ':' after if condition");
 
-    chunk_emit(c, OP_JUMP_IF_FALSE);
-    unsigned int patch_jif = c->count;
-    chunk_emit(c, 0);
+    unsigned int patch_jif = emit_jump_if_false(c, last_cmp);
 
     parse_binary(c, 0);          /* then-value */
 
@@ -1088,8 +1132,8 @@ static void parse_for(Chunk* c) {
     if (loop_depth >= LOOP_MAX) { error_at("Too many nested loops"); return; }
     LoopContext* ctx = &loop_stack[loop_depth++];
     ctx->patch_count = 0;
-    ctx->scope_depth = compile_scope_depth;
     ctx->iter_slots  = 0;
+    int last_cmp = -1;   /* set by the while-condition paths below; unused by the for-in paths, which return before it's read */
 
     if (equal(TOKEN_IN)) {
         error_at("Expected loop variable name before 'in'; use 'for x in collection:'");
@@ -1150,11 +1194,9 @@ static void parse_for(Chunk* c) {
                 emit_define(c, name1);
             }
 
-            compile_scope_depth++;
-            chunk_emit(c, OP_PUSH_SCOPE);
+            block_depth++;
             parse_compound(c);
-            chunk_emit(c, OP_POP_SCOPE);
-            compile_scope_depth--;
+            block_depth--;
 
             finish_loop(c, ctx, ctx->top, patch_exit);
             return;
@@ -1185,21 +1227,21 @@ static void parse_for(Chunk* c) {
                 break;
             }
         }
-        parse_binary_ops(c, 0);
+        last_cmp = parse_binary_ops(c, 0);
     } else {
         /* --- while loop, non-identifier condition --- */
         ctx->top = c->count;
-        parse_binary(c, 0);
+        last_cmp = parse_binary(c, 0);
     }
 
     require(TOKEN_COLON, "expected ':' after while condition");
     /* Same check as the for-in clause above, same reason. */
     if (parse_had_error) { loop_depth--; return; }
-    chunk_emit(c, OP_JUMP_IF_FALSE);
-    unsigned int patch_jif = c->count;
-    chunk_emit(c, 0);
+    unsigned int patch_jif = emit_jump_if_false(c, last_cmp);
 
+    block_depth++;
     parse_compound(c);
+    block_depth--;
 
     finish_loop(c, ctx, ctx->top, patch_jif);
 }
@@ -1211,8 +1253,6 @@ static void parse_for(Chunk* c) {
 static void parse_break(Chunk* c) {
     if (loop_depth == loop_floor) { error_at("'break' outside loop"); return; }
     LoopContext* ctx = &loop_stack[loop_depth - 1];
-    int n = compile_scope_depth - ctx->scope_depth;
-    for (int i = 0; i < n; i++) chunk_emit(c, OP_POP_SCOPE);
     /* Pop iterator state ([col, idx] or [cur, end, step]) that for-each leaves on the stack */
     for (int i = 0; i < ctx->iter_slots; i++) chunk_emit(c, OP_POP);
     chunk_emit(c, OP_JUMP);
@@ -1224,8 +1264,6 @@ static void parse_break(Chunk* c) {
 static void parse_continue(Chunk* c) {
     if (loop_depth == loop_floor) { error_at("'continue' outside loop"); return; }
     LoopContext* ctx = &loop_stack[loop_depth - 1];
-    int n = compile_scope_depth - ctx->scope_depth;
-    for (int i = 0; i < n; i++) chunk_emit(c, OP_POP_SCOPE);
     chunk_emit(c, OP_JUMP);
     chunk_emit(c, (int)ctx->top);  /* known at compile time — no patching needed */
 }
@@ -1261,6 +1299,32 @@ static bool parse_literal_default(AerVal* out) {
         memcpy(buf, aer_as_string(token.value)->data, len);
         buf[len] = '\0';
         *out = aer_make_string(buf, len);
+    } else if (token.type == TOKEN_OPEN_BRACKET) {
+        /* '[]' only — a non-empty literal would need per-element defaults to make sense (and
+           still couldn't hold anything non-literal), so it's not accepted here. This bakes one
+           EMPTY array as a template value; vm_default_value (vm.c) allocates a fresh empty array
+           from it at each use (a struct instantiation, or a call that omits this argument) rather
+           than ever sharing this one — an array is mutable, so aliasing it the way a primitive
+           default safely can would reproduce Python's mutable-default-argument bug (append() on
+           one use silently showing up on every other one). vm_new_array() pulls from the same
+           slab pool the VM's own OP_ARRAY_NEW does; safe to call here only because every entry
+           point (main.c, aer_module.c, the embed API) calls vm_init() — which initializes that
+           pool — before parsing ever begins. */
+        lex();
+        if (token.type != TOKEN_CLOSE_BRACKET) return false;
+        AerArray* a = vm_new_array();
+        a->count = a->capacity = 0;
+        a->items = NULL;
+        a->shape = NULL;
+        *out = aer_array_val(a);
+    } else if (token.type == TOKEN_OPEN_BRACE) {
+        /* '{}' only — same reasoning as '[]' above, see vm_struct_default_value. */
+        lex();
+        if (token.type != TOKEN_CLOSE_BRACE) return false;
+        AerDict* d = vm_new_dict();
+        memset(&d->map, 0, sizeof(d->map));
+        d->map.is_inline = true;
+        *out = aer_dict_val(d);
     } else {
         return false;
     }
@@ -1323,8 +1387,8 @@ static void parse_struct(Chunk* c) {
 
 static void parse_import(Chunk* c) {
     /* Top-level only — a nested import would need saving/restoring the whole parser
-       context (loop_depth, function_depth, capture_ctx...), not just the lexer's, for no real benefit. */
-    if (compile_scope_depth != 0) {
+       context (loop_depth, function_depth...), not just the lexer's, for no real benefit. */
+    if (function_depth != 0 || block_depth != 0) {
         error_at("'import' is only allowed at the top level of a file, not inside a function, loop, or if block");
         return;
     }
@@ -1405,7 +1469,7 @@ typedef struct {
     unsigned int func_start;
     unsigned int arity;
     unsigned int min_arity;                        /* params [0, min_arity) are required */
-    unsigned int default_pool_idx[MAX_PARAMS];      /* valid for indices [min_arity, arity) */
+    unsigned int default_pool_idx[MAX_LOCALS];      /* valid for indices [min_arity, arity) */
     bool         has_receiver;
     unsigned int receiver_type;
 } FunctionSig;
@@ -1413,8 +1477,8 @@ typedef struct {
 static FunctionSig parse_function_body(Chunk* c) {
     require(TOKEN_OPEN_PARENTHESE, "expected '(' after function name");
 
-    unsigned int params[MAX_PARAMS], arity = 0;
-    unsigned int default_pool_idx[MAX_PARAMS];
+    unsigned int params[MAX_LOCALS], arity = 0;
+    unsigned int default_pool_idx[MAX_LOCALS];
     unsigned int min_arity = 0;
     bool seen_default = false;
     bool has_receiver = false;
@@ -1422,7 +1486,7 @@ static FunctionSig parse_function_body(Chunk* c) {
     if (!equal(TOKEN_CLOSE_PARENTHESE)) {
         do {
             if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected parameter name"); return (FunctionSig){0}; }
-            if (arity >= MAX_PARAMS)      { error_at("Too many parameters");      return (FunctionSig){0}; }
+            if (arity >= MAX_LOCALS)      { error_at("Too many parameters");      return (FunctionSig){0}; }
             params[arity] = chunk_add_pool(c, token.value);
             lex();
             /* `p as Type` — only meaningful on parameter 0 (the receiver), enforced at
@@ -1431,7 +1495,7 @@ static FunctionSig parse_function_body(Chunk* c) {
                desyncing the parser into cascading, unrelated-looking errors. */
             if (consume(TOKEN_AS)) {
                 if (arity != 0) {
-                    error_at("A struct-type parameter ('as Type') is only allowed on the first parameter");
+                    error_at("A struct-type parameter ('as Type') is only allowed on the first parameter — it names that parameter as the method receiver, checked once against the call's first argument; there's no mechanism to check later parameters, so give them a plain name instead");
                     return (FunctionSig){0};
                 }
                 if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a struct type name after 'as'"); return (FunctionSig){0}; }
@@ -1463,31 +1527,26 @@ static FunctionSig parse_function_body(Chunk* c) {
 
     unsigned int func_start = c->count;
 
-    /* Only a genuine 0 -> 1 transition starts a fresh outer_locals window — a nested closure's body (1 -> 2) must see the enclosing function's accumulated set, not a cleared one. */
-    if (function_depth == 0) outer_local_count = 0;
-
     /* Isolate break/continue and return from outer context */
     int saved_loop_depth = loop_depth;
     int saved_loop_floor = loop_floor;
     loop_floor = loop_depth;
     function_depth++;
 
-    /* current_params tracks the currently-compiling function's own parameters (see its
-       declaration) — a nested closure gets a fresh table here, with the enclosing
-       function's restored after, the same save/restore pattern as capturing/capture_ctx. */
-    unsigned int saved_params[MAX_PARAMS];
-    unsigned int saved_param_count = current_param_count;
-    memcpy(saved_params, current_params, sizeof(unsigned int) * current_param_count);
-    current_param_count = 0;
+    /* current_locals tracks the currently-compiling function's own locals (see its
+       declaration) — a nested function gets a fresh table here, with the enclosing
+       function's restored after. */
+    unsigned int saved_locals[MAX_LOCALS];
+    unsigned int saved_local_count = current_local_count;
+    memcpy(saved_locals, current_locals, sizeof(unsigned int) * current_local_count);
+    current_local_count = 0;
 
-    compile_scope_depth++;
     chunk_emit(c, OP_PUSH_SCOPE);
     for (int i = (int)arity - 1; i >= 0; i--) {
         emit_define_param(c, params[i]);
     }
 
     parse_compound(c);
-    compile_scope_depth--;
 
     /* Implicit void return if control falls off the end */
     AerVal zero = aer_null();
@@ -1495,8 +1554,8 @@ static FunctionSig parse_function_body(Chunk* c) {
     chunk_emit(c, (int)chunk_add_pool(c, zero));
     chunk_emit(c, OP_RETURN);
 
-    current_param_count = saved_param_count;
-    memcpy(current_params, saved_params, sizeof(unsigned int) * saved_param_count);
+    current_local_count = saved_local_count;
+    memcpy(current_locals, saved_locals, sizeof(unsigned int) * saved_local_count);
 
     function_depth--;
     loop_depth = saved_loop_depth;
@@ -1508,20 +1567,18 @@ static FunctionSig parse_function_body(Chunk* c) {
     sig.func_start     = func_start;
     sig.arity          = arity;
     sig.min_arity      = min_arity;
-    memcpy(sig.default_pool_idx, default_pool_idx, sizeof(unsigned int) * MAX_PARAMS);
+    memcpy(sig.default_pool_idx, default_pool_idx, sizeof(unsigned int) * MAX_LOCALS);
     sig.has_receiver   = has_receiver;
     sig.receiver_type  = receiver_type;
     return sig;
 }
 
-/* Emits the "plain" (non-capturing) function value: a precomputed pool constant, identical across calls to this function_stmt/function_expr — the pre-closures bytecode shape. */
-static void emit_plain_function_value(Chunk* c, FunctionSig sig) {
+/* Emits the function's value: a precomputed pool constant, identical across every call. */
+static void emit_function_value(Chunk* c, FunctionSig sig) {
     /* vm_new_function(), not raw xcalloc — every AerFunction must come from function_pool
        (see vm.h) so the GC's mark phase can walk it once in Chunk.pool. Zeroed by hand
        since pool_alloc returns uninitialized memory, unlike the xcalloc this replaced. */
     AerFunction* fn = vm_new_function();
-    fn->upvalues      = NULL;
-    fn->upvalue_count = 0;
     fn->code_offset   = sig.func_start;
     fn->arity         = sig.arity;
     fn->min_arity     = sig.min_arity;
@@ -1540,9 +1597,11 @@ static void emit_plain_function_value(Chunk* c, FunctionSig sig) {
 }
 
 static void parse_function(Chunk* c) {
-    /* Named functions can't nest — no capture mechanism backs them (that's what anonymous
-       functions are for). Parsing still runs normally so a malformed body doesn't cascade
-       into confusing errors; parse_had_error is re-forced true below to roll back the definition. */
+    /* Named functions can't nest — a nested function body can only ever see its own locals and
+       true globals (see current_locals), never "reach into" the function it's nested inside, so
+       there's no reason to allow it. Parsing still runs normally so a malformed body doesn't
+       cascade into confusing errors; parse_had_error is re-forced true below to roll back the
+       definition. */
     bool is_nested = function_depth > 0;
     if (is_nested) {
         error_at("Nested named function definitions are not supported — define an anonymous "
@@ -1552,62 +1611,23 @@ static void parse_function(Chunk* c) {
     unsigned int name_idx = chunk_add_pool(c, token.value);
     lex();
 
-    /* A rejected nested function might still sit inside a capturing closure's body, so
-       capturing is suspended regardless of is_nested — otherwise its reads/writes would pollute the enclosing capture_ctx with entries that outlive the rollback. */
-    bool       saved_capturing = capturing;
-    CaptureCtx saved_ctx       = capture_ctx;
-    capturing = false;
-
     FunctionSig sig = parse_function_body(c);
-
-    capturing   = saved_capturing;
-    capture_ctx = saved_ctx;
 
     /* Re-assert after body parsing: parse_compound() resets parse_had_error per statement, which would otherwise erase the flag before the caller rolls bytecode back. */
     if (is_nested) { parse_had_error = true; return; }
 
-    emit_plain_function_value(c, sig);
+    emit_function_value(c, sig);
     chunk_emit(c, OP_STORE);
     chunk_emit(c, (int)name_idx);
     chunk_emit(c, (int)chunk_add_addr_cache(c));
 }
 
-/* Anonymous function expression: function(params): body, used as a value. Unlike
-   parse_function, this is allowed to nest; capture_supported is false past one nesting level (see the capture-analysis comment above). */
+/* Anonymous function expression: function(params): body, used as a value. Unlike parse_function,
+   this is allowed to nest — it compiles exactly like a named function otherwise (own locals only,
+   no access to an enclosing function's locals; see current_locals). */
 static void parse_function_expr(Chunk* c) {
-    bool capture_supported = (function_depth == 1);
-
-    /* Unconditional save/restore: a function expression nested in an already-capturing one must have capturing suspended for its own body, not inherit the outer context's true. */
-    bool        saved_capturing = capturing;
-    CaptureCtx  saved_ctx       = capture_ctx;
-    capturing = capture_supported;
-    if (capture_supported) {
-        capture_ctx.local_count   = 0;
-        capture_ctx.capture_count = 0;
-    }
-
     FunctionSig sig = parse_function_body(c);
-
-    if (capture_supported && capture_ctx.capture_count > 0) {
-        for (unsigned int i = 0; i < capture_ctx.capture_count; i++) {
-            chunk_emit(c, OP_CAPTURE);
-            chunk_emit(c, (int)capture_ctx.captured_names[i]);
-        }
-        chunk_emit(c, OP_MAKE_CLOSURE);
-        chunk_emit(c, (int)sig.func_start);
-        chunk_emit(c, (int)sig.arity);
-        chunk_emit(c, (int)sig.min_arity);
-        chunk_emit(c, sig.has_receiver ? 1 : 0);
-        chunk_emit(c, (int)sig.receiver_type);
-        chunk_emit(c, (int)capture_ctx.capture_count);
-        for (unsigned int i = sig.min_arity; i < sig.arity; i++)
-            chunk_emit(c, (int)sig.default_pool_idx[i]);
-    } else {
-        emit_plain_function_value(c, sig);
-    }
-
-    capturing   = saved_capturing;
-    capture_ctx = saved_ctx;
+    emit_function_value(c, sig);
 }
 
 /* defer name(args) — args are evaluated now at the defer statement (via parse_arg_list,

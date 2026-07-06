@@ -57,10 +57,10 @@ operator is one line — plus, for the handful whose right-hand side isn't a gen
 no heap allocation in the hot loop. Direct-threaded dispatch lets the CPU's branch predictor learn
 per-instruction patterns instead of funnelling every opcode through one `switch`.
 
-**Closures without a symbol table.** AER's parser has no compile-time symbol table anywhere else —
-closures still work, resolved by a simple first-occurrence read/write rule instead of full lexical
-scoping analysis, and captured variables cost nothing for every function that never has anything
-captured from it.
+**Every local is a flat, compile-time-resolved slot — no closures.** Assignment inside a function
+is always local, which means every name in a function body resolves to a fixed slot at parse time,
+not a runtime scope-chain walk. A function's data access is always either its own parameters/locals
+or an explicit reference passed in — never an implicit reach into an enclosing function's variables.
 
 **A real module system without a module value type.** `import math` and `import helpers` both work,
 resolved entirely at parse time — file-based imports even run the imported file synchronously,
@@ -296,7 +296,7 @@ AER is dynamically typed. There are eight underlying value types:
 | Integer | `0`, `42`, `-7` | `long long`; true division always returns Real |
 | Real | `3.14`, `-0.5` | `double` |
 | String | `"hello"` | Immutable; supports indexing, slicing, iteration, interpolation and escapes |
-| Function | `function foo(): ...` | First-class; stores code offset, arity, an optional struct-typed receiver, and — for a closure — its captured variables |
+| Function | `function foo(): ...` | First-class; stores code offset, arity, and an optional struct-typed receiver |
 | Array | `[1, 2, 3]` | Mutable; reference semantics — see [Lists](#lists) |
 | Dict | `{"a": 1}` | Mutable string-keyed; reference semantics — see [Maps](#maps) |
 
@@ -595,7 +595,49 @@ the function has a `defer` call still pending, the frame can't be discarded yet 
 falls back to a normal, stack-growing call instead, so `defer` still always fires correctly, just
 without the stack-depth benefit for that call.
 
-### Anonymous Functions and Closures
+### Scope inside a function
+
+Assignment inside a function body is **always local**, unconditionally — the same name at module
+level (or in a different function) is never reached or shadowed silently, because it's never
+reached at all:
+
+```
+outer = 10
+
+function shadow_outer():
+    outer = 99      # creates a fresh local — does not touch the global above
+    return outer
+
+print(shadow_outer())    # 99
+print(outer)              # 10 — unchanged
+```
+
+A function can still freely *read* any global by name — only *assigning* to a name is always
+local. To share state across calls, mutate something you were explicitly given a reference to (a
+struct, array, or dict — all reference types), instead of relying on a function reaching outward by
+bare name:
+
+```
+struct Counter:
+    value
+
+function bump(c):
+    c.value += 1     # mutates the struct's own field, not a name lookup
+
+shared = Counter(0)
+bump(shared)
+bump(shared)
+print(shared.value)    # 2
+```
+
+AER has no closures: a function's data access is always either its own parameters/locals, or a
+reference explicitly passed to it — never an implicit reach into an enclosing function's variables.
+An anonymous function nested inside another function's body can only see its own parameters and
+locals, plus true globals, exactly like a named function; referencing a name that belongs only to
+the *enclosing* function fails at runtime with a plain `'x' is not defined`, not anything silently
+wrong.
+
+### Anonymous Function Expressions
 
 `function(params): body` is a function **value**, not a declaration — it can be assigned, returned,
 or passed as an argument, and follows the same block-body-only rule as a named function:
@@ -606,56 +648,8 @@ square = function(n):
 print(square(5))    # 25
 ```
 
-An anonymous function defined inside another function's body can **capture** that function's
-variables by reference. The moment the closure is created, the captured variable's storage is
-shared between the closure and the enclosing function — a write through either side is visible to
-both, and the shared state persists for as long as the closure itself does, independent of whether
-the enclosing function call has returned:
-
-```
-function make_counter():
-    count = 0
-    bump = function():
-        count = count + 1     # reads AND writes the enclosing 'count'
-        return count
-    return bump
-
-counter = make_counter()
-print(counter())    # 1
-print(counter())    # 2 — state persists across calls
-
-counter2 = make_counter()   # a fresh, independent counter
-print(counter2())   # 1 — unaffected by 'counter' above
-```
-
-A closure that only ever *writes* a captured variable (never reads it first) still works correctly
-— a "setter" closure updates the enclosing variable rather than silently shadowing it with a
-throwaway one of its own:
-
-```
-function make_pair():
-    x = 0
-    getter = function():
-        return x
-    setter = function(y):
-        x = y
-    return getter, setter
-
-get_x, set_x = make_pair()
-print(get_x())    # 0
-set_x(42)
-print(get_x())    # 42 — the setter really did update the shared x
-```
-
-**By design, not a temporary limitation:**
-
-- Capture is one level deep, permanently. A function expression can capture from its *directly*
-  enclosing function. One nested inside an already-nested function expression can still be created
-  — anonymous functions may nest to any depth — it just won't capture; an outer-variable reference
-  inside it fails at runtime with a plain `'x' is not defined` error rather than doing anything
-  silently wrong.
-- Named function statements (`function foo(): ...`) still cannot be nested at all, capturing or
-  not. Only function *expressions* can nest — that's the only way to create a closure.
+Named function statements (`function foo(): ...`) still cannot be nested at all — only function
+*expressions* can appear inside a function body.
 
 ### Multiple Return Values
 
@@ -1293,7 +1287,7 @@ game, a config parser) simply doesn't call it, and its scripts have none.
 | Call stack depth | 64 frames — doesn't apply to true tail calls (see [Functions](#functions)), which reuse the current frame instead of consuming one |
 | Value stack | 256 slots |
 | Loop nesting | 16 levels |
-| Function parameters | 24 |
+| Distinct local names per function (parameters + body locals combined) | 32 |
 | Destructuring targets | 16 |
 | Struct fields | 16 |
 | Interpolation buffer | 4 096 chars |
@@ -1301,8 +1295,8 @@ game, a config parser) simply doesn't call it, and its scripts have none.
 
 ### Missing features
 
-- A generational garbage collector reclaims `AerString`/`AerArray`/`AerDict`/`AerFunction`/closure
-  boxes (see [Memory and Security](#memory-and-security)), but struct-type registrations still grow
+- A generational garbage collector reclaims `AerString`/`AerArray`/`AerDict`/`AerFunction`
+  (see [Memory and Security](#memory-and-security)), but struct-type registrations still grow
   monotonically for the life of the process — deliberately, since that's what makes REPL
   function/struct persistence work. The file-module registry grows the same way during normal
   execution, but an embedding host can explicitly reclaim it via `aer_module_free_all()` (see
@@ -1411,45 +1405,45 @@ pointer chasing at runtime — just sequential integer array reads.
 inside the `Chunk`, referenced by index from the bytecode. String pool entries are deduplicated in
 O(1) via a name-to-index hashmap (`Chunk.name_index`); non-string literals use a linear scan.
 
-**Scope chain:** a static array of small inline-slot scopes (spilling to a `HashMap` past 8
-variables) in the VM struct. Each `if`/`for`/`function` body is wrapped with `OP_PUSH_SCOPE` /
-`OP_POP_SCOPE`. A lookup walks from the innermost scope down to the current function call's own
-floor (its top-level scope, and anything nested inside it) — since nested function definitions are
-rejected at parse time, nothing below that floor can ever be a legitimate target — and if not found
-there, jumps straight to the global scope. This skips every caller frame recursion or deep call
-chains would otherwise force a walk through.
+**Scope:** a static array of small inline-slot scopes (spilling to a `HashMap` past 32 variables) in
+the VM struct. `scopes[0]` is the global scope; every function call pushes exactly one more
+(`OP_PUSH_SCOPE`/`OP_POP_SCOPE`, once per call, not once per `if`/`for` block — blocks don't scope
+at all anymore, see below) holding every local the function's *whole* body uses. Because assignment
+inside a function is always local (see [Scope inside a function](#scope-inside-a-function)), the
+parser resolves every name in a function body to a fixed slot at parse time — there is no runtime
+scope-chain walk for locals at all.
 
-**Parameters get a faster path than the name-based scope chain** — `OP_LOAD_LOCAL`/
-`OP_STORE_LOCAL`/`OP_DEFINE_LOCAL`, a direct index into the current call's own base scope
-(`vm_scope_floor`) instead of the walk-and-compare above, the same role CPython's `LOAD_FAST`
-plays relative to `LOAD_GLOBAL`. The parser recognizes a name as eligible the moment it sees it
-declared as a parameter of the function currently being compiled (`current_params`,
-`parser.c`) — a plain local (not a parameter) still uses the name-based path above regardless of
-where it's declared. Still correctly goes through a parameter's box if a nested closure has
-captured it (see Closures below) — `OP_DEFINE_LOCAL` still records the slot's name for exactly
-that reason, even though normal reads/writes never need it.
+**Every local gets a compile-time slot** — `OP_LOAD_LOCAL`/`OP_STORE_LOCAL`/`OP_DEFINE_LOCAL`, a
+direct index into the current call's own scope (`vm_scope_floor`), the same role CPython's
+`LOAD_FAST` plays relative to `LOAD_GLOBAL`. The parser assigns each distinct name in the function
+currently being compiled a slot the moment it first sees that name assigned or declared as a
+parameter (`current_locals`, `parser.c`) — a loop variable or plain body-local gets exactly the same
+fast path a parameter does; a name the parser doesn't recognize as a local of the current function
+is a true global instead, resolved by the name-based path below. `if`/`for` blocks don't introduce
+their own scope — a loop variable's slot is simply reused across iterations, matching Python's
+`LOAD_FAST`/`STORE_FAST` behavior (the value from the last iteration is still readable after the
+loop ends).
 
 **Call stack:** a static array of `CallFrame`s (return address, scope depth — doubling as the
-scope-lookup floor described above — and the called function's upvalues array, `NULL` unless it's
-a closure). `OP_CALL` saves a frame and jumps to the function's bytecode offset; if the callee
-declared a struct-typed receiver on parameter 0, the argument's shape is checked against it before
-the jump. `OP_RETURN` unwinds all scopes back to the saved depth, restores the instruction pointer,
-and pushes the return value. This call-setup logic (arity check, receiver check, frame construction)
-is factored into a single shared helper, `vm_setup_call`, used both for an ordinary in-VM call and
-for invoking a file-module's function across the VM boundary (see below).
+scope-lookup floor described above). `OP_CALL` saves a frame and jumps to the function's bytecode
+offset; if the callee declared a struct-typed receiver on parameter 0, the argument's shape is
+checked against it before the jump. `OP_RETURN` unwinds all scopes back to the saved depth, restores
+the instruction pointer, and pushes the return value. This call-setup logic (arity check, receiver
+check, frame construction) is factored into a single shared helper, `vm_setup_call`, used both for an
+ordinary in-VM call and for invoking a file-module's function across the VM boundary (see below).
 
 **Inline caching for call targets and globals:** each `OP_CALL`/`OP_TAIL_CALL`/`OP_LOAD`/`OP_STORE`
 site carries a cache-slot operand indexing into `Chunk.addr_cache` — populated the first time that
 site's name resolves to an address inside the *global* scope's own inline slots (a fixed,
 never-reallocated location for the VM's whole lifetime), and dereferenced directly on every later
-visit, skipping the scope walk entirely. This caches the *address* a name resolved to, not a
-snapshot of the value there, so reassigning the global is reflected immediately on the next access
-through that same site — no invalidation logic needed. Caching only happens when the global is
-confirmed to be the *winning* resolution (not merely "a global with this name exists somewhere") —
-a closer binding of the same name (a parameter or local shadowing a same-named global) must keep
-winning on every visit through that site, not just the first one before the cache populated. A name
-resolved through a local is never cached this way, since a different call's scope occupies that
-depth every time; those accesses keep resolving by name, same as before caching existed.
+visit, skipping the lookup entirely. This caches the *address* a name resolved to, not a snapshot of
+the value there, so reassigning the global is reflected immediately on the next access through that
+same site — no invalidation logic needed. `OP_LOAD`/`OP_STORE` always resolve a true global (the
+parser guarantees this, per the local-slot paragraph above), so their sites cache unconditionally.
+`OP_CALL`/`OP_TAIL_CALL` can still name a function value held in a local (`f = greet; f("World")`) —
+those only cache when the global is confirmed to be the *winning* resolution (not merely "a global
+with this name exists somewhere") — a local of the same name must keep winning on every visit
+through that site, not just the first one before the cache populated.
 
 `OP_TAIL_CALL` — emitted by `parse_return` instead of `OP_CALL` only when a `return name(args)`
 statement compiles to nothing but that one call (see [Functions](#functions)) — shares `OP_CALL`'s
@@ -1457,17 +1451,6 @@ entire dispatch-table target and handler; the two diverge only once a callee is 
 the point a frame would normally be pushed. With no pending `defer` calls on the current frame, it
 unwinds that frame's own scopes and jumps straight into the callee, reusing the frame in place
 instead of growing the call stack.
-
-**Closures:** capturing a variable promotes its scope slot from a plain value to a heap-allocated
-box (`ScopeSlot.box`); every scope access transparently reads or writes through the box once one
-exists, so the enclosing function and the closure stay synchronized without either side needing to
-know which representation the other is using. A closure's own body accesses captured variables
-through `OP_LOAD_UPVALUE`/`OP_STORE_UPVALUE` against the current `CallFrame`'s upvalues array, not
-through the normal scope chain — captures and ordinary scope lookups are two entirely separate
-paths that never interfere with each other. A variable captured from the hashmap-overflow scope
-representation reuses its existing hashmap value pointer as the box directly, and that scope's
-`overflow_has_captures` flag tells every scope-pop path to leak its hashmap instead of freeing it
-out from under the closure.
 
 **Collections:** `AerArray` and `AerDict` are heap-allocated structs held by pointer inside a
 `Value`. Assignment copies the pointer — all aliases share the same data. Arrays grow with
@@ -1555,37 +1538,43 @@ Rather than returning the operand value (as JavaScript does), AER's `&&`/`||` al
 `true` or `false`. `x = x || "default"` does not work the way it does in JavaScript.
 `x = if x: x else: "default"` is the idiomatic replacement.
 
-### Named functions can't nest; anonymous ones can, and may capture one level deep
+### Named functions can't nest; no closures at all
 
-**Named** function statements (`function foo(): ...`) are still rejected at parse time if nested —
-that restriction never had anything to do with the *existence* of closures, only with which syntax
-creates one. Building a real capture mechanism didn't remove the restriction, it just gave
-**anonymous** function expressions (`function(...): ...`) a safe way to be the thing you nest: they
-may be defined inside another function's body — the only way to create a closure — and, one level
-deep, may capture that function's variables by reference. A function value's fields grew to
-`(code_offset, arity, has_receiver, receiver_type, upvalues, upvalue_count)`; the last two are only
-non-empty for a closure — an ordinary function still compiles to a plain precomputed constant, no
-heap allocation, no cost.
+**Named** function statements (`function foo(): ...`) are rejected at parse time if nested — a
+nested function's variable lookups would only work by accident, only while the enclosing call is
+still on the stack. Anonymous function expressions (`function(...): ...`) *can* be defined inside
+another function's body, but AER doesn't give them a capture mechanism: a nested function
+expression can only see its own parameters/locals and true globals, exactly like a top-level
+function — referencing the enclosing function's variable is a plain `'x' is not defined` error, not
+anything silently wrong.
 
-Captured variables aren't free, but the cost is scoped narrowly: the moment a closure captures a
-variable, that variable's storage is promoted from a plain stack slot to a heap-allocated box — the
-enclosing function's own later reads/writes to it, and the closure's, both transparently go through
-that same box from then on, which is what keeps them synchronized. Every *other* variable access,
-in every function that never has anything captured from it, pays nothing beyond one cheap
-already-false pointer check.
+This was a deliberate choice, not a missing feature: a closure is a function value carrying
+*implicit* bound state from wherever it happened to be created, invisible at every later call site —
+the same category of hidden indirection AER avoids elsewhere in the language. Sharing state across
+calls still works — just explicitly, by mutating a struct/array/dict you were actually passed as a
+parameter (see [Scope inside a function](#scope-inside-a-function)) — the same idiom C uses for a
+callback that needs extra context (`void* userdata`), rather than a compiler-managed heap promotion
+behind the scenes.
 
-### Function calls only ever see their own scopes, globals, or captured boxes
+### Every local is a fixed slot; function calls only ever see their own scope or globals
 
-Every scope lookup from inside a function call is bounded to that call's own scopes (its top-level
-locals plus anything pushed by `if`/`for` blocks nested inside it); if a name isn't found there,
-the lookup jumps straight to global, skipping every caller frame in between. This still holds
-exactly as before closures existed — a function body still never legitimately needs to reach into
-a caller's frame through the *normal* scope-chain walk. Captured variables don't use that path at
-all: they're accessed through a dedicated pair of opcodes tied to the closure's own upvalues array,
-resolved once at the closure's creation point rather than by name on every access, which is what
-makes them compatible with the scope-floor optimization instead of undermining it. The payoff for
-recursion is unchanged: resolving a recursive function's own name from deep in a call chain still
-costs one hop, not one per stack frame.
+Assignment inside a function body is always local (see
+[Scope inside a function](#scope-inside-a-function)) — there is no walk-up-and-mutate-outer
+ambiguity to resolve, so every name a function body assigns or reads (other than a true global) is
+resolvable to a fixed slot at *parse* time, not a runtime lookup. This is what let `OP_LOAD_LOCAL`/
+`OP_STORE_LOCAL`/`OP_DEFINE_LOCAL` extend from parameters-only to every local a function has: an
+earlier "hybrid scopes" design (locals fast-pathed like parameters, everything else name-based) was
+tried and reverted before closures existed, specifically because the *old* semantics — a plain
+assignment walking up to mutate an existing outer/global binding — couldn't be resolved at parse
+time in the general case. Removing that walk-up rule in favor of always-local is what made the full
+flat-slot model possible.
+
+A lookup that isn't resolved to a local at parse time (a true global reference, or a call target
+that might be one) is bounded to the current call's own scope plus the global scope — since nested
+function definitions are rejected and there's no capture path, nothing else can ever be a
+legitimate target, so it never needs to walk caller frames. The payoff for recursion is unchanged:
+resolving a recursive function's own name from deep in a call chain still costs one hop, not one
+per stack frame.
 
 ### Structs are arrays with a shape, not a new value type
 
@@ -1650,45 +1639,37 @@ imported file avoids this entirely, at the cost of needing a small cross-VM call
 
 ### Memory management
 
-AER runs a **generational mark-and-sweep collector** over the five pooled heap types
-(`AerString`/`AerArray`/`AerDict`/`AerFunction` headers and closure-capture boxes,
-`source/utilities/pool.c`). Every pool cell carries one byte of state: a mark bit (this collection
-cycle only), a generation bit (young/old — promoted the first time a cell survives any collection),
-and a free-list bit. Allocation is unchanged from the pooled/slab design (a free-list pop, or a bump
-into the current slab) — collection is what's new.
+AER runs a **generational mark-and-sweep collector** over four pooled heap types
+(`AerString`/`AerArray`/`AerDict`/`AerFunction` headers, `source/utilities/pool.c`). Every pool cell
+carries one byte of state: a mark bit (this collection cycle only), a generation bit (young/old —
+promoted the first time a cell survives any collection), and a free-list bit. Allocation is
+unchanged from the pooled/slab design (a free-list pop, or a bump into the current slab) —
+collection is what's new.
 
 **Two collection modes, one shared heap.** A *minor* collection traces the normal roots (the VM
-stack, every scope, every call frame's function/upvalues/pending defers) plus a *remembered set* —
-old objects a write barrier caught being mutated to hold a young reference — and only sweeps young
+stack, every scope, every call frame's function and pending defers) plus a *remembered set* — old
+objects a write barrier caught being mutated to hold a young reference — and only sweeps young
 cells; old cells are presumed live and left untouched, which is what keeps minor collections cheap.
 A *major* collection (run periodically, after a fixed number of minor ones) traces the same roots
-with no remembered set needed and sweeps both generations. The five pools are process-global and
+with no remembered set needed and sweeps both generations. The four pools are process-global and
 shared by the main VM *and* every file-module's own VM (`import` still runs each file in a fully
 separate `Chunk`+`VM` — see [Modularity](#modularity)), so a collection triggered anywhere marks
 every loaded module's roots too, not just the VM that triggered it.
 
-**The write barrier** — the mechanism that makes minor collections safe — only has three real call
-sites: array item writes (index-assignment, `append`, struct field assignment), dict entry writes,
-and closure-box writes (reassigning a captured variable). Stack and scope writes need no barrier at
-all: both are small and fully re-walked as roots on *every* collection regardless of generation, so
-anything reachable from them is never missed by a minor pass. Remembered-set entries are added but
-never proactively removed — simpler, and impossible to get a removal check wrong — except that a
-later *major* collection can legitimately free an object that's still listed; each entry's liveness
-is checked before it's re-traced, and dead entries are quietly dropped when found, rather than ever
-dereferencing a stale one.
+**The write barrier** — the mechanism that makes minor collections safe — only has two real call
+sites: array item writes (index-assignment, `append`, struct field assignment) and dict entry
+writes. Stack and scope writes need no barrier at all: both are small and fully re-walked as roots
+on *every* collection regardless of generation, so anything reachable from them is never missed by a
+minor pass. Remembered-set entries are added but never proactively removed — simpler, and impossible
+to get a removal check wrong — except that a later *major* collection can legitimately free an
+object that's still listed; each entry's liveness is checked before it's re-traced, and dead entries
+are quietly dropped when found, rather than ever dereferencing a stale one.
 
 **What's still permanent, deliberately**: `Chunk`s, `Shape` (struct-type) registrations, and the
 file-module registry are never collected — this is what makes REPL function/struct persistence work
 ("the bytecode array and struct registry grow monotonically and are never reset") and isn't a gap,
 it's the same policy this project always had for those three, now with everything *else* actually
 reclaimed around them.
-
-**One known, accepted limitation**: a scope that spills past 8 locals into its hashmap-overflow
-representation, if a closure then captures one of the spilled variables, boxes that capture by
-reusing the hashmap's own entry pointer directly rather than allocating from the pooled box type
-(`vm_box_slot`'s overflow branch) — this narrow case is outside pool tracking entirely and keeps
-leaking, exactly as it did before the collector existed. Closing it means routing that one capture
-path through the pooled allocator too; a real, separable follow-up, not bundled into this change.
 
 Introspect a running VM via `aer_gc_stats()` (`include/aer.h`) — live cell count, minor collections
 run, major collections run.
@@ -1730,7 +1711,7 @@ raises a normal AER runtime error instead of risking a stack overflow.
 | `source/core/aer_module.h/c` | File-based `import` — resolution, isolated per-file `Chunk`/`VM`, cross-VM call trampoline |
 | `source/core/aer_host.h/c` | Host-registered native function registry (`aer_register_function`) — reached from AER the same way as `math`/`random`/`string` |
 | `source/utilities/hashmap.h/c` | FNV-1a open-addressing hashmap (one per scope/dict) |
-| `source/utilities/pool.h/c` | Slab (bump/arena) allocator for heap types that are never individually freed — `AerString`/`AerArray`/`AerDict`/`AerFunction` headers, closure-capture boxes |
+| `source/utilities/pool.h/c` | Slab (bump/arena) allocator for heap types that are never individually freed — `AerString`/`AerArray`/`AerDict`/`AerFunction` headers |
 | `source/utilities/error.h/c` | Error reporting with source location and column pointer; recoverable-error sink (callback or stderr), `aer_report_fatal` for genuinely unrecoverable conditions, `assert_failure_count` |
 | `include/aer.h` | Public embedding API: version constant, error callback/query functions, custom native-function registration (see [Embedding](#embedding)) |
 | `tests/test.aer` | Runnable documentation and regression suite — `assert()`-based, exits nonzero on any failure |

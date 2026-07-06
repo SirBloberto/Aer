@@ -203,7 +203,7 @@ static AerVal* find_module_function(FileModule* m, const char* fn) {
     for (int j = 0; j < g->count; j++) {
         unsigned int name_idx = g->slots[j].name;
         if (strcmp(aer_as_string(m->chunk->pool[name_idx])->data, fn) != 0) continue;
-        AerVal* v = g->slots[j].box ? g->slots[j].box : &g->slots[j].val;
+        AerVal* v = &g->slots[j].val;
         return aer_type(*v) == TYPE_FUNCTION ? v : NULL;
     }
     if (g->overflow) {
