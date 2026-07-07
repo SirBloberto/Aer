@@ -136,4 +136,68 @@ function many_params(a, b, c1, d, e, f, g, h, i2, j, k, l, m, n1, o, p, q, r, s,
 assert(many_params(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20) == 210,
        "a function with 20 parameters (past the old, unsafe 8/16-slot ceiling) computes correctly with no corruption")
 
+# ------------------------------------------------------------------ #
+# 36. struct_pool — inline field storage: slab boundary + write barrier #
+# ------------------------------------------------------------------ #
+
+# Struct instances now come from their own pool (struct_pool, 64 elems per
+# slab) with field storage allocated INLINE with the header instead of a
+# separate xmalloc'd buffer, collapsing two dependent pointer dereferences
+# into one on every field access. 100 comfortably crosses the 64-per-slab
+# boundary.
+struct SlabPoint:
+    x
+    y
+
+slab_structs = []
+for i in 0..100:
+    append(slab_structs, SlabPoint(i, i * 2))
+
+assert(length(slab_structs) == 100, "100 struct instances created — crosses struct_pool's 64-per-slab boundary")
+assert(slab_structs[0].x == 0 && slab_structs[0].y == 0, "the first struct, from the first slab, is intact")
+assert(slab_structs[63].x == 63 && slab_structs[63].y == 126, "the struct right at the slab boundary is intact")
+assert(slab_structs[64].x == 64 && slab_structs[64].y == 128, "the first struct in the newly-grown second slab is intact")
+assert(slab_structs[99].x == 99 && slab_structs[99].y == 198, "the last struct is intact")
+
+# Write barrier for struct field-set specifically (the new REMEMBERED_STRUCT
+# path in gc_barrier_array) — same pattern as gc_old_container/gc_old_dict
+# above, but for a struct instance. Without the barrier, a value written
+# into an already-old struct instance could be swept as unreachable by a
+# later minor collection, which never re-traces old cells on its own.
+struct OldStruct:
+    payload
+
+gc_old_struct = OldStruct(null)
+
+gc_churn3 = []
+for i in 0..3000:
+    append(gc_churn3, [i, i * 2, "u" + (i as string)])
+
+gc_old_struct.payload = "written after promotion"
+
+gc_churn4 = []
+for i in 0..3000:
+    append(gc_churn4, [i, i * 2, "v" + (i as string)])
+
+assert(gc_old_struct.payload == "written after promotion",
+       "a value written into an old (promoted) struct's field survives further collections — the write barrier protected it")
+
+# Struct field mutation through all three write paths, confirming the new
+# inline-items layout is correct for each.
+struct MutPoint:
+    x
+    y
+
+mp = MutPoint(1, 2)
+mp.x = 10                    # plain assignment
+mp.y += 5                    # compound assignment
+mut_pts = [MutPoint(1, 1), MutPoint(2, 2), MutPoint(3, 3)]
+for i in 0..3:
+    mut_pts[i].x += 100      # arr[idx].field compound-assignment fusion path
+
+assert(mp.x == 10, "plain field assignment correct with inline struct storage")
+assert(mp.y == 7, "compound field assignment correct with inline struct storage")
+assert(mut_pts[0].x == 101 && mut_pts[1].x == 102 && mut_pts[2].x == 103,
+       "arr[idx].field compound-assignment fusion correct with inline struct storage")
+
 print("test_memory_gc.aer: all assertions passed.")

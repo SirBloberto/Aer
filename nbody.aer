@@ -28,43 +28,64 @@ function offset_momentum(bodies):
 
 
 function energy(bodies):
-    e = 0.0  
-    num_bodies = length(bodies)  
+    e = 0.0
+    num_bodies = length(bodies)
     for i in 0..num_bodies:
         b = bodies[i]
-        sq = b.vx * b.vx + b.vy * b.vy + b.vz * b.vz  
-        e += 0.5 * bodies[i].mass * sq
+        vx = b.vx
+        vy = b.vy
+        vz = b.vz
+        bim = b.mass
+        e += 0.5 * bim * (vx * vx + vy * vy + vz * vz)
         for j in (i+1)..num_bodies:
-            dx = b.x - bodies[j].x 
-            dy = b.y - bodies[j].y 
-            dz = b.z - bodies[j].z   
-            sq = dx * dx + dy * dy + dz * dz 
-            e -= (b.mass * bodies[j].mass) / math.sqrt(sq)   
+            bj = bodies[j]
+            dx = b.x - bj.x
+            dy = b.y - bj.y
+            dz = b.z - bj.z
+            sq = dx * dx + dy * dy + dz * dz
+            e -= (bim * bj.mass) / math.sqrt(sq)
     return e
 
+# Body fields are hoisted into locals for the outer body `i` (bix/biy/biz/bimass/bivx/bivy/bivz),
+# matching the idiom the reference benchmarks-game nbody.lua uses: the O(n^2) inner loop over j
+# reads/writes only locals plus the inner body bj, and bi's velocity is written back to the struct
+# once per outer i instead of once per (i, j) pair. Same algorithm, same result, just avoiding
+# O(n^2) struct field traffic where a single O(n) read/write-back suffices.
 function advance(bodies, dt):
     num_bodies = length(bodies)
-    for i in 0..num_bodies: 
-        for j in (i+1)..num_bodies:   
-            dx = bodies[i].x - bodies[j].x 
-            dy = bodies[i].y - bodies[j].y 
-            dz = bodies[i].z - bodies[j].z       
-            dpos_norm_sq = dx * dx + dy * dy + dz * dz
-            mag = dt / (dpos_norm_sq * math.sqrt(dpos_norm_sq)) 
-            
-            mj = bodies[j].mass * mag
-            bodies[i].vx -= dx * mj  
-            bodies[i].vy -= dy * mj   
-            bodies[i].vz -= dz * mj 
-            
-            mi = bodies[i].mass * mag      
-            bodies[j].vx += dx * mi  
-            bodies[j].vy += dy * mi   
-            bodies[j].vz += dz * mi            
-        
     for i in 0..num_bodies:
-        bodies[i].x += bodies[i].vx * dt  
-        bodies[i].y += bodies[i].vy * dt   
+        bi = bodies[i]
+        bix = bi.x
+        biy = bi.y
+        biz = bi.z
+        bimass = bi.mass
+        bivx = bi.vx
+        bivy = bi.vy
+        bivz = bi.vz
+        for j in (i+1)..num_bodies:
+            bj = bodies[j]
+            dx = bix - bj.x
+            dy = biy - bj.y
+            dz = biz - bj.z
+            dpos_norm_sq = dx * dx + dy * dy + dz * dz
+            mag = dt / (dpos_norm_sq * math.sqrt(dpos_norm_sq))
+
+            mj = bj.mass * mag
+            bivx -= dx * mj
+            bivy -= dy * mj
+            bivz -= dz * mj
+
+            mi = bimass * mag
+            bj.vx += dx * mi
+            bj.vy += dy * mi
+            bj.vz += dz * mi
+        bi.vx = bivx
+        bi.vy = bivy
+        bi.vz = bivz
+
+    for i in 0..num_bodies:
+        bodies[i].x += bodies[i].vx * dt
+        bodies[i].y += bodies[i].vy * dt
         bodies[i].z += bodies[i].vz * dt
 
 bodies = [

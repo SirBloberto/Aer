@@ -13,8 +13,39 @@
 
 /* Slab pools for heap types confirmed (via every free() site) to never be freed individually — alloc-speed only. Guarded since vm_init() reruns per VM/module import and would otherwise leak slabs. */
 /* long_pool: heap fallback for a TYPE_INTEGER outside AerVal's 47-bit inline range (value_box.h's AER_BIGFLAG_BIT); one boxed value is immutable, so no write barrier needed. */
-static Pool string_pool, array_pool, dict_pool, function_pool, long_pool;
+static Pool string_pool, array_pool, dict_pool, function_pool, long_pool, struct_pool;
 static bool pools_initialized = false;
+
+/* struct_pool holds struct instances (AerArray with shape != NULL) as ONE allocation instead of
+   the usual header-plus-separate-items-buffer two-allocation layout ordinary arrays use — see the
+   struct-construction sites below for why this is sound (a struct's field count never changes
+   after construction, so there's no reallocation to support, unlike a plain array's items[]).
+   Sized for MAX_STRUCT_FIELDS (the worst case) since Pool requires uniform cell size — wastes some
+   space for shapes with fewer fields, a bounded, deliberate trade for collapsing two dependent
+   pointer dereferences (header, then its separately-allocated items[]) into one on every struct
+   field access. */
+#ifdef AER_V3
+/* v3 register-VM prototype, M1 — see OP_V3_*'s comment in vm.h. A dedicated, isolated register
+   file, entirely separate from vm->stack/vm->scopes so the prototype cannot interact with or
+   destabilize the existing stack-based interpreter no matter what it's given to run. 64 registers
+   is a generous ceiling for M1's hand-written expression-tree tests; revisited once M2+ needs a
+   real per-call sizing story. */
+#define V3_REGISTER_MAX 64
+static AerVal v3_registers[V3_REGISTER_MAX];
+
+/* Test-only accessor (source/compiler/parser_v3.c's hand-driven compiler and tests/v3_smoke_test.c
+   are the only intended callers) — reads back a v3 register's final value after a v3-only chunk
+   has run to OP_HALT. */
+AerVal v3_register_get(int slot) {
+    return v3_registers[slot];
+}
+
+/* Decodes an OP_V3_BINARY RK operand — see V3_RK_CONST_FLAG's comment in vm.h. */
+static inline AerVal vm_v3_rk_value(Chunk* c, int rk) {
+    if (rk & V3_RK_CONST_FLAG) return c->pool[rk & ~V3_RK_CONST_FLAG];
+    return v3_registers[rk];
+}
+#endif
 
 static void vm_pools_init_once(void) {
     if (pools_initialized) return;
@@ -23,6 +54,7 @@ static void vm_pools_init_once(void) {
     pool_init(&dict_pool,     sizeof(AerDict),      64);
     pool_init(&function_pool, sizeof(AerFunction),  64);
     pool_init(&long_pool,     sizeof(long long),    64);
+    pool_init(&struct_pool,   sizeof(AerArray) + MAX_STRUCT_FIELDS * sizeof(AerVal), 64);
     pools_initialized = true;
 }
 
@@ -58,7 +90,7 @@ static bool value_is_young(AerVal v) {
     }
 }
 
-typedef enum { REMEMBERED_ARRAY, REMEMBERED_DICT } RememberedKind;
+typedef enum { REMEMBERED_ARRAY, REMEMBERED_DICT, REMEMBERED_STRUCT } RememberedKind;
 typedef struct { void* ptr; RememberedKind kind; } RememberedEntry;
 
 /* Old objects a write barrier caught holding a young reference; entries are only ever added/deduped, never removed, and re-traced as extra roots on every minor collection thereafter. */
@@ -70,8 +102,9 @@ static unsigned int     remembered_cap   = 0;
 static Pool* remembered_pool_for(void* ptr, RememberedKind kind) {
     (void)ptr;
     switch (kind) {
-        case REMEMBERED_ARRAY: return &array_pool;
-        case REMEMBERED_DICT:  return &dict_pool;
+        case REMEMBERED_ARRAY:  return &array_pool;
+        case REMEMBERED_DICT:   return &dict_pool;
+        case REMEMBERED_STRUCT: return &struct_pool;
     }
     return NULL;
 }
@@ -94,12 +127,16 @@ static void gc_remember(void* ptr, RememberedKind kind) {
     remembered_count++;
 }
 
-/* Write barrier for array item writes (index-assign, append, struct field-set via lbl_field_set — a struct is an array with a shape); `a` is always array_pool-tracked so the young check is exact. */
+/* Write barrier for array item writes (index-assign, append, struct field-set via lbl_field_set —
+   a struct is an array with a shape, now backed by struct_pool instead of array_pool — see
+   vm_pools_init_once). Branches on a->shape to pick the right pool/remembered-kind pair, mirroring
+   gc_barrier_dict's single-pool pattern but for whichever of the two pools actually owns `a`. */
 static void gc_barrier_array(AerArray* a, AerVal new_value) {
-    if (pool_is_young(&array_pool, a)) return;   /* young containers are already
-                                                      re-traced normally next cycle */
+    Pool* p = a->shape ? &struct_pool : &array_pool;
+    if (pool_is_young(p, a)) return;   /* young containers are already
+                                          re-traced normally next cycle */
     if (!value_is_young(new_value)) return;
-    gc_remember(a, REMEMBERED_ARRAY);
+    gc_remember(a, a->shape ? REMEMBERED_STRUCT : REMEMBERED_ARRAY);
 }
 
 /* Write barrier for dict entry writes (both the update-in-place and
@@ -140,13 +177,15 @@ static void mark_value(AerVal v) {
         case TYPE_STRING:
             pool_mark(&string_pool, aer_as_string(v));   /* a leaf — data owns no other Values */
             break;
-        case TYPE_ARRAY:
-            if (!pool_mark(&array_pool, aer_as_array(v))) {
-                AerArray* a = aer_as_array(v);
+        case TYPE_ARRAY: {
+            AerArray* a = aer_as_array(v);
+            Pool* p = a->shape ? &struct_pool : &array_pool;   /* see vm_pools_init_once */
+            if (!pool_mark(p, a)) {
                 for (unsigned int i = 0; i < a->count; i++)
                     worklist_push(a->items[i]);
             }
             break;
+        }
         case TYPE_DICT:
             if (!pool_mark(&dict_pool, aer_as_dict(v))) {
                 DictMap* map = &aer_as_dict(v)->map;
@@ -220,6 +259,7 @@ static void free_array(void* cell)    { free(((AerArray*)cell)->items); }
 static void free_dict(void* cell)     { dictmap_free(&((AerDict*)cell)->map); }   /* already frees every entry's key */
 static void free_function(void* cell) { (void)cell; }   /* nothing to free — no closure upvalues array anymore */
 static void free_long(void* cell)     { (void)cell; }   /* a bare long long — no heap references, immutable once created */
+static void free_struct(void* cell)   { (void)cell; }   /* items lives inline in this same cell — nothing separate to free */
 
 /* ------------------------------------------------------------------ */
 /* Generational GC — collection                                        */
@@ -232,6 +272,7 @@ static void gc_collect(VM* vm, bool minor) {
     pool_clear_marks(&dict_pool);
     pool_clear_marks(&function_pool);
     pool_clear_marks(&long_pool);
+    pool_clear_marks(&struct_pool);
 
     mark_vm_roots(vm);
     mark_chunk_roots(vm->chunk);
@@ -253,14 +294,16 @@ static void gc_collect(VM* vm, bool minor) {
             RememberedEntry* e = &remembered_set[i];
             bool alive;
             switch (e->kind) {
-                case REMEMBERED_ARRAY: alive = !pool_is_freed(&array_pool, e->ptr); break;
-                case REMEMBERED_DICT:  alive = !pool_is_freed(&dict_pool,  e->ptr); break;
+                case REMEMBERED_ARRAY:  alive = !pool_is_freed(&array_pool,  e->ptr); break;
+                case REMEMBERED_STRUCT: alive = !pool_is_freed(&struct_pool, e->ptr); break;
+                case REMEMBERED_DICT:   alive = !pool_is_freed(&dict_pool,   e->ptr); break;
                 default: alive = false; break;
             }
             if (!alive) continue;
 
             switch (e->kind) {
-                case REMEMBERED_ARRAY: {
+                case REMEMBERED_ARRAY:
+                case REMEMBERED_STRUCT: {
                     AerArray* a = (AerArray*)e->ptr;
                     for (unsigned int j = 0; j < a->count; j++) worklist_push(a->items[j]);
                     break;
@@ -284,6 +327,7 @@ static void gc_collect(VM* vm, bool minor) {
     pool_sweep(&dict_pool,     minor, free_dict);
     pool_sweep(&function_pool, minor, free_function);
     pool_sweep(&long_pool,     minor, free_long);
+    pool_sweep(&struct_pool,   minor, free_struct);
 }
 
 /* ------------------------------------------------------------------ */
@@ -308,8 +352,8 @@ static void gc_reset_alloc_counts(void) {
 /* Shared by aer_gc_stats and gc_maybe_collect's ceiling check — one place walking all pools' cell_state, not two. */
 static unsigned int gc_count_live_cells(void) {
     unsigned int total = 0;
-    Pool* pools[] = { &string_pool, &array_pool, &dict_pool, &function_pool, &long_pool };
-    for (unsigned int p = 0; p < 5; p++) {
+    Pool* pools[] = { &string_pool, &array_pool, &dict_pool, &function_pool, &long_pool, &struct_pool };
+    for (unsigned int p = 0; p < 6; p++) {
         Pool* pool = pools[p];
         for (unsigned int i = 0; i < pool->slab_count; i++) {
             unsigned int count = (i == pool->slab_count - 1) ? pool->next_index : pool->elems_per_slab;
@@ -455,6 +499,26 @@ void aer_debug_memory_report(FILE* out) {
 
     unsigned long long long_hdr = (unsigned long long)long_pool.slab_count * long_pool.elems_per_slab * long_pool.elem_size;
     fprintf(out, "  long     reserved %9llu B (no separate payload)\n", long_hdr);
+
+    /* struct_pool cells are fixed-size (sizeof(AerArray) + MAX_STRUCT_FIELDS*sizeof(AerVal)) —
+       "header" here is the fixed per-cell reservation, "payload" is the sum of each live
+       instance's ACTUAL field_count*sizeof(AerVal), so the gap between the two is exactly the
+       over-provisioning cost the MAX_STRUCT_FIELDS-sized single pool trades for one allocation
+       instead of two — see vm_pools_init_once. */
+    unsigned long long struct_hdr = 0, struct_payload = 0;
+    {
+        Pool* p = &struct_pool;
+        for (unsigned int i = 0; i < p->slab_count; i++) {
+            unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
+            for (unsigned int j = 0; j < count; j++) {
+                if (p->cell_state[i][j] & POOL_FREE) continue;
+                struct_hdr += p->elem_size;
+                AerArray* a = (AerArray*)(p->slabs[i] + (size_t)j * p->elem_size);
+                struct_payload += (unsigned long long)a->count * sizeof(AerVal);
+            }
+        }
+    }
+    fprintf(out, "  struct   reserved %9llu B  used %10llu B\n", struct_hdr, struct_payload);
 
     unsigned int live, minor, major;
     aer_gc_stats(&live, &minor, &major);
@@ -982,6 +1046,39 @@ static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b
         }
     }
 
+    /* Real-vs-real fast path, mirrored right after the int/int one above for the same reason —
+       nbody-style arithmetic-heavy code is dominated by this case, but until now it fell through
+       the AND/OR check, the IN check, the (failing) int/int check, a null check, and real-
+       promotion logic that's a no-op when both operands are already real, before ever reaching
+       the real/real switch below (which still has to stay — this is not a replacement for it, just
+       a fast exit before the checks a promoted-from-int operand still needs). Same case bodies as
+       that switch, duplicated rather than shared, since jumping into the middle of the block below
+       isn't simpler than just checking here first. Measured neutral in isolation on nbody.aer
+       (~2.41s vs ~2.42s baseline, within noise) — kept anyway since it's a correct simplification
+       with no added opcodes/call sites and no downside found, not because it proved a win. */
+    if (aer_type(a) == TYPE_REAL && aer_type(b) == TYPE_REAL) {
+        double l = aer_as_real(a), rv = aer_as_real(b);
+        switch (op) {
+            case OP_ADD: return aer_real(l + rv);
+            case OP_SUB: return aer_real(l - rv);
+            case OP_MUL: return aer_real(l * rv);
+            case OP_DIV:
+                if (rv == 0.0) { error("Division by zero"); return aer_real(0.0); }
+                return aer_real(l / rv);
+            case OP_FLOOR_DIV:
+                if (rv == 0.0) { error("Division by zero"); return aer_real(0.0); }
+                return aer_real(floor(l / rv));
+            case OP_MOD: return aer_real(fmod(l, rv));
+            case OP_EQ:  return aer_bool(l == rv);
+            case OP_NEQ: return aer_bool(l != rv);
+            case OP_LT:  return aer_bool(l <  rv);
+            case OP_GT:  return aer_bool(l >  rv);
+            case OP_LTE: return aer_bool(l <= rv);
+            case OP_GTE: return aer_bool(l >= rv);
+            default: error("Operator not valid for reals"); return aer_real(0.0);
+        }
+    }
+
     /* null equality: null == null is true; null op anything-else errors */
     if (aer_type(a) == TYPE_NULL || aer_type(b) == TYPE_NULL) {
         if (op == OP_EQ)  return aer_bool(aer_type(a) == TYPE_NULL && aer_type(b) == TYPE_NULL);
@@ -1288,9 +1385,11 @@ static bool vm_call_builtin(Chunk* c, const char* name, AerVal* args, int arg_co
                   name, shape->field_count, shape->field_count == 1 ? "" : "s", arg_count);
             return true;
         }
-        AerArray* a = pool_alloc(&array_pool);
+        /* struct_pool cell holds the AerArray header AND its field storage in one allocation —
+           items points right after the header instead of a separate xmalloc (see vm_pools_init_once). */
+        AerArray* a = pool_alloc(&struct_pool);
         a->count = a->capacity = shape->field_count;
-        a->items = xmalloc(sizeof(AerVal) * a->capacity);
+        a->items = (AerVal*)((char*)a + sizeof(AerArray));
         a->shape = shape;
         for (int i = 0; i < arg_count; i++) a->items[i] = args[i];
         for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
@@ -1510,6 +1609,11 @@ bool vm_run(VM* vm) {
         [OP_TO_STR]         = &&lbl_to_str,
         [OP_CAST]           = &&lbl_cast,
         [OP_HALT]           = &&lbl_halt,
+#ifdef AER_V3
+        [OP_V3_LOADK]       = &&lbl_v3_loadk,
+        [OP_V3_MOVE]        = &&lbl_v3_move,
+        [OP_V3_BINARY]      = &&lbl_v3_binary,
+#endif
     };
 
     DISPATCH();
@@ -1984,9 +2088,11 @@ lbl_call: {
                 for (int i = 0; i < arg_count; i++) POP();
                 PUSH(aer_null()); DISPATCH();
             }
-            AerArray* a = pool_alloc(&array_pool);
+            /* struct_pool cell holds the AerArray header AND its field storage in one allocation —
+               items points right after the header instead of a separate xmalloc (see vm_pools_init_once). */
+            AerArray* a = pool_alloc(&struct_pool);
             a->count = a->capacity = shape->field_count;
-            a->items = xmalloc(sizeof(AerVal) * a->capacity);
+            a->items = (AerVal*)((char*)a + sizeof(AerArray));
             a->shape = shape;
             for (int i = arg_count - 1; i >= 0; i--) a->items[i] = POP();
             for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
@@ -2637,6 +2743,36 @@ lbl_cast: {
 lbl_pop:
     POP();
     DISPATCH();
+
+#ifdef AER_V3
+/* v3 register-VM prototype, M1 — see OP_V3_*'s comment in vm.h. Stack-neutral: none of these three
+   touch vm->stack/vm->scopes/PUSH/POP at all, only v3_registers[] and (for LOADK) the chunk pool —
+   the whole point of keeping this genuinely isolated from the live interpreter. */
+lbl_v3_loadk: {
+    int dest = READ();
+    int pool_idx = READ();
+    v3_registers[dest] = c->pool[pool_idx];
+    DISPATCH();
+}
+
+lbl_v3_move: {
+    int dest = READ();
+    int src  = READ();
+    v3_registers[dest] = v3_registers[src];
+    DISPATCH();
+}
+
+lbl_v3_binary: {
+    int dest       = READ();
+    int rk_b       = READ();
+    Opcode bin_op  = (Opcode)READ();
+    int rk_c       = READ();
+    AerVal b = vm_v3_rk_value(c, rk_b);
+    AerVal cc = vm_v3_rk_value(c, rk_c);
+    v3_registers[dest] = vm_binary(b, cc, bin_op);
+    DISPATCH();
+}
+#endif
 
 lbl_halt:
     return true;

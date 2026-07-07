@@ -16,7 +16,9 @@ endif
 
 FLAGS := -O2 -g -Wall -Wextra -I include -I source -I source/compiler -I source/core -I source/utilities
 
-SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/utilities/*.c)
+# parser_v3.c is excluded here — it references AER_V3-gated opcodes (vm.h) that don't exist in a
+# normal build; it's compiled only by test-v3 below, which defines AER_V3 for its whole build.
+SOURCE := $(filter-out source/compiler/parser_v3.c,$(wildcard source/*.c source/compiler/*.c source/core/*.c source/utilities/*.c))
 OBJECT := $(patsubst source/%.c,object/%.o,$(SOURCE))
 
 # Everything except main.c — conflicts with test-embed's own main() below.
@@ -71,6 +73,21 @@ test-embed: $(LIBOBJECT)
 	gcc $(FLAGS) -o binary/embed_smoke_test$(EXE) $(LIBOBJECT) object/embed_smoke_test.o -lm $(WINLIBS)
 	./binary/embed_smoke_test$(EXE)
 
+# v3 register-VM prototype, M1 (source/compiler/parser_v3.c/.h, AER_V3-gated code in vm.c/vm.h) —
+# entirely absent from every other target, including `all`, same isolation precedent as
+# AER_DEBUG_TOOLS/debug-tools above: this session found repeatedly that even unused new code can
+# measurably shift hot-path performance via layout effects, so this needs to be genuinely absent
+# from a normal build, not just unreachable. tests/v3_smoke_test.c has its own main(), so main.c is
+# excluded here too, matching test-embed's pattern; parser_v3.c is added back in since it's
+# excluded from the main SOURCE list above.
+V3SOURCE := $(filter-out source/main.c,$(SOURCE)) source/compiler/parser_v3.c
+
+test-v3:
+	@mkdir -p binary object
+	gcc $(FLAGS) -DAER_V3 -c tests/v3_smoke_test.c -o object/v3_smoke_test.o
+	gcc $(FLAGS) -DAER_V3 -o binary/v3_smoke_test$(EXE) $(V3SOURCE) object/v3_smoke_test.o -lm $(WINLIBS)
+	./binary/v3_smoke_test$(EXE)
+
 # ASAN build for tests/fuzz.py — catches non-crashing memory bugs a plain build misses.
 # Needs libasan (standard on Linux/macOS); may not link on a bare MinGW/MSYS2 install.
 asan: $(SOURCE)
@@ -84,6 +101,24 @@ FUZZ_SEED       := --seed 100
 
 fuzz: asan
 	python3 tests/fuzz.py --binary binary/aer-asan$(EXE) --iterations $(FUZZ_ITERATIONS) $(FUZZ_SEED)
+
+# Profile-guided optimization: a two-pass build, not a source change. Pass 1 instruments a build
+# with -fprofile-generate and runs it against nbody.aer (the actual workload this targets) plus the
+# full test suite (broader code-path coverage), producing real execution-frequency data in
+# object-pgo/*.gcda; pass 2 recompiles with -fprofile-use so gcc lays out hot/cold code from that
+# real profile instead of static heuristics. Directly targets the code-layout/icache sensitivity
+# this session's benchmarking turned up (three opcode-level micro-optimizations measured worse than
+# predicted, apparently from shifted code layout, not the logic itself — see the register-VM
+# scoping plan's "Result" section) rather than guessing at layout by hand.
+PGO_DIR := object-pgo
+
+pgo: $(SOURCE)
+	@rm -rf $(PGO_DIR)
+	@mkdir -p binary $(PGO_DIR)
+	gcc $(FLAGS) -fprofile-generate=$(PGO_DIR) -o binary/aer-pgo-gen$(EXE) $(SOURCE) -lm $(WINLIBS)
+	./binary/aer-pgo-gen$(EXE) nbody.aer
+	@for t in $(TESTS); do ./binary/aer-pgo-gen$(EXE) $$t >/dev/null 2>&1 || true; done
+	gcc $(FLAGS) -fprofile-use=$(PGO_DIR) -fprofile-correction -Wno-coverage-mismatch -Wno-missing-profile -o binary/aer-pgo$(EXE) $(SOURCE) -lm $(WINLIBS)
 
 COVOBJECT := $(patsubst source/%.c,object-cov/%.o,$(SOURCE))
 
@@ -108,4 +143,4 @@ coverage: $(COVOBJECT)
 	python3 tests/coverage_summary.py object-cov
 
 clean:
-	rm -rf binary/* object/* object-cov/* tests/fuzz_crashes
+	rm -rf binary/* object/* object-cov/* object-pgo/* tests/fuzz_crashes

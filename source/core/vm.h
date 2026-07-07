@@ -185,7 +185,34 @@ typedef enum {
     OP_TO_STR,  /* pops any value, pushes its string representation */
     OP_CAST,    /* operand: CAST_INTEGER/CAST_FLOAT/CAST_BOOLEAN — pops value, pushes it converted */
     OP_HALT,
+
+#ifdef AER_V3
+    /* ---- v3 register-VM prototype, M1 (arithmetic + register allocator only — see the
+       register-based bytecode plan). Entirely separate from every opcode above: reads/writes
+       v3_registers[] (vm.c), never vm->stack or vm->scopes, so these cannot interact with or
+       destabilize the existing stack-based interpreter no matter how they're exercised. Not
+       reachable from real .aer source yet — only source/compiler/parser_v3.c's hand-driven
+       expression-tree compiler emits these, for M1's standalone test. Gated behind AER_V3 (own
+       `make test-v3` target) so this is completely absent — not just unreachable, actually not
+       compiled in at all — from every normal build, matching AER_DEBUG_TOOLS's precedent: this
+       session found repeatedly that even unused new code can measurably shift hot-path
+       performance via layout effects, so "never dispatched to" alone isn't good enough here. */
+    OP_V3_LOADK,  /* operands: dest_reg, pool_idx — v3_registers[dest_reg] = chunk pool constant */
+    OP_V3_MOVE,   /* operands: dest_reg, src_reg — v3_registers[dest_reg] = v3_registers[src_reg] */
+    /* RK-encoded operand: a register index, or (with bit 30 set) a constant-pool index — see
+       vm_v3_rk_value (vm.c). One opcode per operator's runtime `bin_op`, same as OP_BINARY_*
+       already does, not a family of opcodes per operand-kind combination — that's the entire
+       point of RK encoding. */
+    OP_V3_BINARY, /* operands: dest_reg, rk_b, bin_op, rk_c — v3_registers[dest_reg] = rk_b OP rk_c */
+#endif
 } Opcode;
+
+#ifdef AER_V3
+/* RK encoding for OP_V3_BINARY's operands — see vm_v3_rk_value (vm.c). Pool indices are always
+   small non-negative ints in practice, nowhere near this bit, so reusing it as a "this is a
+   constant, not a register" flag is safe and simple (matches Lua's own BITRK convention). */
+#define V3_RK_CONST_FLAG (1 << 30)
+#endif
 
 /* OP_CAST operand values — target type for `x as T` (T=string compiles to OP_TO_STR instead, since that conversion already existed). */
 #define CAST_INTEGER 0
@@ -383,6 +410,14 @@ AerDict* vm_new_dict(void);
    lookup fail outright, not just leak. Zero the struct yourself after calling — unlike the xcalloc
    this replaced, pool_alloc returns uninitialized memory. */
 AerFunction* vm_new_function(void);
+
+#ifdef AER_V3
+/* v3 register-VM prototype, M1 (see the OP_V3_ opcodes and V3_RK_CONST_FLAG above) — reads back a
+   v3 register's value after a v3-only chunk has run to OP_HALT. Test-only: source/compiler/
+   parser_v3.c's hand-driven expression-tree compiler and tests/v3_smoke_test.c are the only
+   intended callers. */
+AerVal v3_register_get(int slot);
+#endif
 
 #ifdef AER_DEBUG_TOOLS
 #include <stdio.h>
