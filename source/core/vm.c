@@ -677,7 +677,14 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
         unsigned int* existing = (unsigned int*)hashmap_get(&c->name_index, key);
         if (existing) { free(key); return *existing; }
 
+        /* vs->data was already an owned, single-reference buffer at every call site (e.g. the
+           lexer's emit_string_token freshly xmalloc's one per token) — free it before replacing
+           it with `key`, or it's orphaned with nothing left pointing to it. Confirmed as a real
+           leak via LeakSanitizer (Raspberry Pi ASAN build) once the unrelated pool-initialization
+           crash that had been masking it was fixed. */
+        char* old_data = vs->data;
         vs->data = key;   /* pool entry takes ownership of `key` */
+        free(old_data);
         unsigned int idx = chunk_pool_append(c, v);
 
         /* Independent copy, not an alias of c->pool[idx]'s, so both can be freed independently without a double-free. */
