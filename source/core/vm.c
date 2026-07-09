@@ -630,8 +630,17 @@ static unsigned int lookup_runtime_line(void) {
     return chunk_line_for_offset(active_vm_for_errors->chunk, active_vm_for_errors->ip);
 }
 
-/* Wraps (data, length) — caller must already exclusively own data — in a fresh heap box; never allocates or copies the character data itself. */
+/* Wraps (data, length) — caller must already exclusively own data — in a fresh heap box; never allocates or copies the character data itself.
+   vm_pools_init_once() is normally reached via vm_init() before anything compiles, but the lexer
+   can call this (via emit_string_token, for every identifier/string token) during compilation
+   itself — e.g. v3_parse() legitimately runs lex()/v3_parse() before any VM exists yet. Without
+   this guard, string_pool is still the zero-initialized static (elem_size=0, elems_per_slab=0),
+   so pool_alloc's slab xmalloc(0*0) hands back a ~1-byte allocation that this function then
+   writes a pointer into — a real heap-buffer-overflow, confirmed via ASAN (only reachable when
+   nothing else already initialized the pools first, which every existing caller in main.c/
+   tests/v3_smoke_test.c's early tests happened to already guarantee by accident of ordering). */
 AerVal aer_make_string(char* data, unsigned int length) {
+    vm_pools_init_once();
     AerString* s = pool_alloc(&string_pool);
     s->data = data;
     s->length = length;
