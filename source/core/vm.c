@@ -25,17 +25,39 @@ static bool pools_initialized = false;
    pointer dereferences (header, then its separately-allocated items[]) into one on every struct
    field access. */
 #ifdef AER_V3
-/* v3 register-VM prototype, M1 — see OP_V3_*'s comment in vm.h. A dedicated, isolated register
-   file, entirely separate from vm->stack/vm->scopes so the prototype cannot interact with or
-   destabilize the existing stack-based interpreter no matter what it's given to run. 64 registers
-   is a generous ceiling for M1's hand-written expression-tree tests; revisited once M2+ needs a
-   real per-call sizing story. */
-#define V3_REGISTER_MAX 64
-static AerVal v3_registers[V3_REGISTER_MAX];
+/* v3 register-VM prototype — see OP_V3_*'s comment in vm.h. Entirely separate from
+   vm->stack/vm->scopes so the prototype cannot interact with or destabilize the existing
+   stack-based interpreter no matter what it's given to run.
+
+   M5 — real per-call register windowing, superseding M3's single fixed callee bank
+   (`V3_CALLEE_FRAME_BASE`, deleted) and its two bare globals (`v3_return_ip`/`v3_call_dest_reg`,
+   also deleted): those supported exactly one call level, since a second OP_V3_CALL before the
+   first returned would clobber them and corrupt the outer call's return. Now every active call
+   gets its own isolated V3_FRAME_REGISTERS-sized bank, mirroring vm->call_stack[VM_CALL_MAX]'s
+   existing role for the stack VM — nested/recursive calls can no longer clobber each other.
+   (V3_FRAME_REGISTERS itself now lives in vm.h, not here — parser_v3.c's real-source variable
+   table needs to see it too.) */
+
+typedef struct {
+    AerVal       registers[V3_FRAME_REGISTERS];
+    unsigned int return_ip;   /* where to resume in the CALLER */
+    int          dest_reg;    /* which of the CALLER's registers gets the return value */
+} V3CallFrame;
+
+static V3CallFrame v3_call_stack[VM_CALL_MAX];   /* reuses the stack VM's own recursion ceiling */
+static int         v3_call_depth = 0;            /* 0 = the top-level/main frame */
+
+/* Every M1-M4 opcode handler indexes this exactly as before (`v3_registers[dest]`, etc.) — only
+   its type changed, from a fixed array to a pointer repointed at the active frame's bank on every
+   call/return (lbl_v3_call/lbl_v3_return, below). This is what lets every opcode handler EXCEPT
+   those two stay completely unchanged: they transparently operate on whichever frame is currently
+   executing without needing to know call depth exists. */
+static AerVal* v3_registers = v3_call_stack[0].registers;
 
 /* Test-only accessor (source/compiler/parser_v3.c's hand-driven compiler and tests/v3_smoke_test.c
    are the only intended callers) — reads back a v3 register's final value after a v3-only chunk
-   has run to OP_HALT. */
+   has run to OP_HALT. Reads whichever frame is currently active, which is frame 0 (the top level)
+   once a chunk has run to completion with every call balanced by a return. */
 AerVal v3_register_get(int slot) {
     return v3_registers[slot];
 }
@@ -216,6 +238,22 @@ static void mark_drain(void) {
 static void mark_vm_roots(VM* vm) {
     for (int i = 0; i < vm->stack_top; i++)
         worklist_push(vm->stack[i]);
+
+#ifdef AER_V3
+    /* M4 — v3 registers can hold heap references (arrays/dicts), unlike M1-M3's scalars-only
+       registers. Scanned unconditionally, same as vm->stack above, not tracked for liveness: an
+       idle register is 0-bits, which decodes as TYPE_REAL 0.0 under NaN-boxing (value_box.h) and
+       is a harmless no-op leaf in mark_value's default case, so there's no cost to scanning past
+       whatever's actually live.
+       M5 — reshaped from a single flat array to every frame's bank (v3_call_stack[VM_CALL_MAX],
+       V3_FRAME_REGISTERS each), still blanket-scanned regardless of v3_call_depth for the same
+       reason: a frame beyond the active depth is either all-zero or holds a previous, already-
+       returned call's stale values, and scanning either is a harmless no-op/over-retention, never
+       a dangling read. */
+    for (int f = 0; f < VM_CALL_MAX; f++)
+        for (int i = 0; i < V3_FRAME_REGISTERS; i++)
+            worklist_push(v3_call_stack[f].registers[i]);
+#endif
 
     for (int s = 0; s < vm->scope_depth; s++) {
         AerScope* scope = &vm->scopes[s];
@@ -701,6 +739,14 @@ void vm_init(VM* vm, Chunk* chunk) {
     aer_stdlib_init();
     vm_pools_init_once();
     runtime_line_lookup = lookup_runtime_line;
+#ifdef AER_V3
+    /* Resets the v3 call stack for a fresh run — needed since v3_call_depth/v3_registers are
+       file-scope statics outside VM, shared across every vm_init() call in a process (e.g. a test
+       harness running several independent chunks back to back); a chunk that ended mid-call
+       (a bug, or a deliberately unbalanced test) must not leak into the next chunk's run. */
+    v3_call_depth = 0;
+    v3_registers  = v3_call_stack[0].registers;
+#endif
 }
 
 void vm_free(VM* vm) {
@@ -1613,6 +1659,18 @@ bool vm_run(VM* vm) {
         [OP_V3_LOADK]       = &&lbl_v3_loadk,
         [OP_V3_MOVE]        = &&lbl_v3_move,
         [OP_V3_BINARY]      = &&lbl_v3_binary,
+        [OP_V3_JUMP_IF_FALSE_REG] = &&lbl_v3_jump_if_false_reg,
+        [OP_V3_CMP_JUMP_FALSE]    = &&lbl_v3_cmp_jump_false,
+        [OP_V3_CALL]              = &&lbl_v3_call,
+        [OP_V3_RETURN]            = &&lbl_v3_return,
+        [OP_V3_ARRAY_NEW]         = &&lbl_v3_array_new,
+        [OP_V3_INDEX_GET]         = &&lbl_v3_index_get,
+        [OP_V3_INDEX_SET]         = &&lbl_v3_index_set,
+        [OP_V3_DICT_NEW]          = &&lbl_v3_dict_new,
+        [OP_V3_ITER_NEXT_ARRAY]   = &&lbl_v3_iter_next_array,
+        [OP_V3_STRUCT_NEW]        = &&lbl_v3_struct_new,
+        [OP_V3_FIELD_GET]         = &&lbl_v3_field_get,
+        [OP_V3_FIELD_SET]         = &&lbl_v3_field_set,
 #endif
     };
 
@@ -2770,6 +2828,241 @@ lbl_v3_binary: {
     AerVal b = vm_v3_rk_value(c, rk_b);
     AerVal cc = vm_v3_rk_value(c, rk_c);
     v3_registers[dest] = vm_binary(b, cc, bin_op);
+    DISPATCH();
+}
+
+/* M2 — control flow. Stack-neutral, same as the M1 opcodes above — reads v3_registers[]/the chunk
+   pool only, never pops/pushes anything, and OP_JUMP (reused as-is for unconditional jumps) is
+   already stack-neutral too. */
+lbl_v3_jump_if_false_reg: {
+    int reg    = READ();
+    int target = READ();
+    if (!vm_truthy(v3_registers[reg])) vm->ip = (unsigned int)target;
+    DISPATCH();
+}
+
+lbl_v3_cmp_jump_false: {
+    int rk_a      = READ();
+    Opcode cmp_op = (Opcode)READ();
+    int rk_b      = READ();
+    int target    = READ();
+    AerVal a = vm_v3_rk_value(c, rk_a);
+    AerVal b = vm_v3_rk_value(c, rk_b);
+    if (!vm_truthy(vm_binary(a, b, cmp_op))) vm->ip = (unsigned int)target;
+    DISPATCH();
+}
+
+/* M5 — real per-call register windowing. Bulk-copies arg_reg_base..+arg_count from the CALLER's
+   bank into the NEW callee frame's bank (always starting at its own register 0 — no more fixed
+   shared offset to agree on) in one dispatch, same bulk-copy mechanism M3 proved, now landing in
+   an isolated frame instead of a shared fixed range. Mirrors the stack VM's own overflow check
+   (vm.c's vm_setup_call: `if (target->call_depth >= VM_CALL_MAX) { error("Call stack overflow");
+   ... }`) almost verbatim — same ceiling, same error-then-DISPATCH() discipline. */
+lbl_v3_call: {
+    int dest_reg      = READ();
+    int callee_offset = READ();
+    int arg_reg_base  = READ();
+    int arg_count     = READ();
+    if (v3_call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); DISPATCH(); }
+    V3CallFrame* caller = &v3_call_stack[v3_call_depth];
+    V3CallFrame* callee = &v3_call_stack[v3_call_depth + 1];
+    for (int i = 0; i < arg_count; i++)
+        callee->registers[i] = caller->registers[arg_reg_base + i];
+    callee->return_ip = vm->ip;   /* already past this instruction's operands — the correct resume point */
+    callee->dest_reg  = dest_reg;
+    v3_call_depth++;
+    v3_registers = v3_call_stack[v3_call_depth].registers;
+    vm->ip = (unsigned int)callee_offset;
+    DISPATCH();
+}
+
+/* src_reg is a plain 0-based index into the CALLEE's own frame — no more "absolute index into a
+   shared fixed bank" caveat, since every call now owns an isolated bank. return_ip/dest_reg live
+   in the callee's own frame (not a single shared global), which is exactly what makes nested/
+   recursive calls safe: an outer call's return info can't be clobbered by an inner one. */
+lbl_v3_return: {
+    int src_reg = READ();
+    V3CallFrame* callee = &v3_call_stack[v3_call_depth];
+    AerVal result = callee->registers[src_reg];
+    unsigned int return_ip = callee->return_ip;
+    int dest_reg = callee->dest_reg;
+    v3_call_depth--;
+    v3_registers = v3_call_stack[v3_call_depth].registers;
+    v3_registers[dest_reg] = result;
+    vm->ip = return_ip;
+    DISPATCH();
+}
+
+/* M4 — the register-VM analog of lbl_array_new (above): same pool_alloc/capacity/items/shape
+   setup, but the source is an already-in-order register range instead of N stack pops, so the
+   copy runs forward (lbl_array_new copies backward specifically to undo the stack's LIFO pop
+   order — registers have no such inversion to undo). This is the first v3 opcode that puts a
+   heap pointer in v3_registers[] — see mark_vm_roots's new AER_V3 block, required before this
+   opcode could be safe to use across a GC cycle. */
+lbl_v3_array_new: {
+    int dest_reg     = READ();
+    int item_reg_base= READ();
+    int item_count   = READ();
+    AerArray* a = pool_alloc(&array_pool);
+    a->capacity = item_count > 0 ? (unsigned int)item_count : 4;
+    a->count    = (unsigned int)item_count;
+    a->items    = xmalloc(sizeof(AerVal) * a->capacity);
+    a->shape    = NULL;
+    for (int i = 0; i < item_count; i++)
+        a->items[i] = v3_registers[item_reg_base + i];
+    v3_registers[dest_reg] = aer_array_val(a);
+    DISPATCH();
+}
+
+/* Reuses vm_index_get_compute (above) as-is — already type-generic (array/dict/string) and
+   already has all bounds/negative-index logic, so nothing about indexing itself needed
+   reimplementing for the register path. */
+lbl_v3_index_get: {
+    int dest_reg = READ();
+    int arr_reg  = READ();
+    int rk_idx   = READ();
+    AerVal idx = vm_v3_rk_value(c, rk_idx);
+    v3_registers[dest_reg] = vm_index_get_compute(v3_registers[arr_reg], idx);
+    DISPATCH();
+}
+
+/* Reuses vm_index_set_compute (above) as-is — including its internal gc_barrier_array/
+   gc_barrier_dict call, which this is the first v3 opcode to exercise against a register-held
+   reference rather than a stack-held one. */
+lbl_v3_index_set: {
+    int arr_reg = READ();
+    int rk_idx  = READ();
+    int rk_val  = READ();
+    AerVal idx = vm_v3_rk_value(c, rk_idx);
+    AerVal val = vm_v3_rk_value(c, rk_val);
+    vm_index_set_compute(v3_registers[arr_reg], idx, val);
+    DISPATCH();
+}
+
+/* Mirrors lbl_dict_new (above) exactly — same pool_alloc/memset/is_inline setup, same
+   key-must-be-string validation and owned-copy-of-the-key discipline — reading pairs from an
+   already-in-order register range instead of popping them off the stack in reverse. */
+lbl_v3_dict_new: {
+    int dest_reg      = READ();
+    int pair_reg_base = READ();
+    int pair_count    = READ();
+    AerDict* d = pool_alloc(&dict_pool);
+    memset(&d->map, 0, sizeof(d->map));
+    d->map.is_inline = true;   /* AerDict stores AerVal inline, not boxed — see hashtable.h */
+    for (int i = 0; i < pair_count; i++) {
+        AerVal key = v3_registers[pair_reg_base + 2 * i];
+        AerVal val = v3_registers[pair_reg_base + 2 * i + 1];
+        if (aer_type(key) != TYPE_STRING) { error("Dict keys must be strings"); continue; }
+        AerString* ks = aer_as_string(key);
+        unsigned int klen = ks->length;
+        char* k = xmalloc(klen + 1);
+        memcpy(k, ks->data, klen);
+        k[klen] = '\0';
+        dictmap_put(&d->map, k, val);
+    }
+    v3_registers[dest_reg] = aer_dict_val(d);
+    DISPATCH();
+}
+
+/* Mirrors lbl_iter_next's TYPE_ARRAY branch (above) exactly — same bounds check/advance/fetch —
+   reading col/idx from registers instead of peeking the stack, and with no stack slots to pop on
+   exit (see this opcode's own comment in vm.h for why). */
+lbl_v3_iter_next_array: {
+    int col_reg       = READ();
+    int idx_reg       = READ();
+    int item_dest_reg = READ();
+    int end_target    = READ();
+    AerVal col = v3_registers[col_reg];
+    if (aer_type(col) != TYPE_ARRAY) {
+        error("v3 M4 slice only supports iterating arrays");
+        DISPATCH();
+    }
+    AerArray* a = aer_as_array(col);
+    long long idx = aer_as_int(v3_registers[idx_reg]);
+    if ((unsigned long long)idx >= a->count) {
+        vm->ip = (unsigned int)end_target;
+        DISPATCH();
+    }
+    v3_registers[item_dest_reg] = a->items[idx];
+    v3_registers[idx_reg]       = aer_int(idx + 1);
+    DISPATCH();
+}
+
+/* Mirrors lbl_call's struct-instantiation fallback (above, around line 2137) almost verbatim —
+   same chunk_find_shape() lookup, same arity check, same single-allocation struct_pool layout —
+   reading args from a register range instead of popping them off the stack in reverse. */
+lbl_v3_struct_new: {
+    int dest_reg          = READ();
+    int type_name_pool_idx = READ();
+    int arg_reg_base      = READ();
+    int arg_count         = READ();
+    const char* name = aer_as_string(c->pool[type_name_pool_idx])->data;
+    Shape* shape = chunk_find_shape(c, name);
+    if (!shape) { error("'%s' is not defined", name); DISPATCH(); }
+    if ((unsigned int)arg_count > shape->field_count) {
+        error("'%s' takes at most %u argument%s, got %d",
+              name, shape->field_count, shape->field_count == 1 ? "" : "s", arg_count);
+        DISPATCH();
+    }
+    AerArray* a = pool_alloc(&struct_pool);
+    a->count = a->capacity = shape->field_count;
+    a->items = (AerVal*)((char*)a + sizeof(AerArray));
+    a->shape = shape;
+    for (int i = 0; i < arg_count; i++)
+        a->items[i] = v3_registers[arg_reg_base + i];
+    for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
+        a->items[i] = vm_default_value(shape->field_defaults[i]);
+    v3_registers[dest_reg] = aer_array_val(a);
+    DISPATCH();
+}
+
+/* Mirrors lbl_field_get (above) exactly — same pool-index field-name scan — reading struct_reg
+   from a register instead of popping the stack. */
+lbl_v3_field_get: {
+    int dest_reg   = READ();
+    int struct_reg = READ();
+    int field_idx  = READ();
+    AerVal obj = v3_registers[struct_reg];
+    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
+        error("'.' field access requires a struct instance");
+        DISPATCH();
+    }
+    AerArray* oa = aer_as_array(obj);
+    Shape* shape = oa->shape;
+    for (unsigned int i = 0; i < shape->field_count; i++) {
+        if (shape->field_names[i] == (unsigned int)field_idx) {
+            v3_registers[dest_reg] = oa->items[i];
+            DISPATCH();
+        }
+    }
+    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
+          aer_as_string(c->pool[field_idx])->data);
+    DISPATCH();
+}
+
+/* Mirrors lbl_field_set (above) exactly, including its gc_barrier_array call — the first v3
+   opcode to exercise that barrier for a struct instance rather than an array/dict. */
+lbl_v3_field_set: {
+    int struct_reg = READ();
+    int field_idx  = READ();
+    int rk_val     = READ();
+    AerVal obj = v3_registers[struct_reg];
+    AerVal val = vm_v3_rk_value(c, rk_val);
+    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
+        error("'.' field access requires a struct instance");
+        DISPATCH();
+    }
+    AerArray* oa = aer_as_array(obj);
+    Shape* shape = oa->shape;
+    for (unsigned int i = 0; i < shape->field_count; i++) {
+        if (shape->field_names[i] == (unsigned int)field_idx) {
+            gc_barrier_array(oa, val);
+            oa->items[i] = val;
+            DISPATCH();
+        }
+    }
+    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
+          aer_as_string(c->pool[field_idx])->data);
     DISPATCH();
 }
 #endif

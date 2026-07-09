@@ -204,6 +204,101 @@ typedef enum {
        already does, not a family of opcodes per operand-kind combination — that's the entire
        point of RK encoding. */
     OP_V3_BINARY, /* operands: dest_reg, rk_b, bin_op, rk_c — v3_registers[dest_reg] = rk_b OP rk_c */
+
+    /* M2 — control flow. Plain OP_JUMP above is reused as-is for unconditional jumps: its handler
+       (lbl_jump) only ever touches vm->ip, never vm->stack/vm->scopes, so it's already exactly as
+       stack-neutral as everything else in this family — no V3-specific version needed. These two
+       ARE new because their stack-based equivalents (OP_JUMP_IF_FALSE, OP_CMP_JUMP_FALSE) POP their
+       condition off vm->stack, which the v3 path must never touch. */
+    OP_V3_JUMP_IF_FALSE_REG, /* operands: reg, target — jump to target if v3_registers[reg] is falsy, no pop */
+    /* RK-encoded fused comparison + branch — the register-operand counterpart of
+       OP_CMP_JUMP_FALSE (see its own comment below): jump to target if !(rk_a <cmp_op> rk_b),
+       reading both operands directly (register or inline constant) instead of popping two stack
+       values. Same fusion motivation as the stack version — a loop/if condition is virtually
+       always a bare comparison, so fusing it with the branch avoids a separate "compute bool,
+       then branch on it" step, here also avoiding any stack traffic for the condition at all. */
+    OP_V3_CMP_JUMP_FALSE,    /* operands: rk_a, cmp_op, rk_b, target */
+
+    /* Function calls. M3 proved the core mechanism narrowly (bulk-binding N argument registers in
+       a single dispatch, replacing the stack VM's OP_PUSH_SCOPE + N-times OP_DEFINE_LOCAL/POP
+       prologue) with a single fixed callee bank and no CallFrame/vm->call_stack/GC-root
+       integration — a genuine, stated limitation: single-level only, no recursion/nesting.
+         M5 closes that gap with real per-call register windowing (vm.c's V3CallFrame/
+       v3_call_stack[VM_CALL_MAX], mirroring vm->call_stack's own role) — every call now gets its
+       own isolated register bank, so nested/recursive calls can no longer clobber each other. The
+       operand shapes below are unchanged from M3; only the underlying storage is now real windows
+       instead of one shared fixed bank. */
+    OP_V3_CALL,   /* operands: dest_reg, callee_offset, arg_reg_base, arg_count — bulk-copies
+                     v3_registers[arg_reg_base..+arg_count) (caller's frame) into the new callee
+                     frame's own registers starting at 0, in one dispatch, saves the return
+                     address + dest_reg in the callee's frame, jumps to callee_offset */
+    OP_V3_RETURN, /* operand: src_reg (0-based, in the callee's own frame) — writes
+                     v3_registers[src_reg] to the caller's saved dest_reg, pops the callee's frame,
+                     jumps back */
+
+    /* M4 (this slice: arrays only, see the plan's "deferred" list for dicts/structs/iteration) —
+       the first v3 opcodes to put a HEAP-ALLOCATED value in a register, which is why
+       mark_vm_roots (vm.c) gained an AER_V3 block scanning all of v3_registers[] alongside this —
+       registers holding only scalars (M1-M3) never needed that, a register holding the only
+       reference to an array does. */
+    OP_V3_ARRAY_NEW,  /* operands: dest_reg, item_reg_base, item_count — bulk-copies
+                          v3_registers[item_reg_base..+item_count) into a freshly allocated
+                          AerArray's items buffer in one dispatch (the construction analog of
+                          OP_V3_CALL's bulk arg-copy), v3_registers[dest_reg] = the new array */
+    OP_V3_INDEX_GET,  /* operands: dest_reg, arr_reg, rk_idx — v3_registers[dest_reg] =
+                          v3_registers[arr_reg][rk_idx], via the existing, type-generic
+                          vm_index_get_compute() (vm.c) — arr_reg is always a register (a
+                          collection can't be a pool constant); rk_idx is RK-encoded like
+                          OP_V3_BINARY's operands */
+    OP_V3_INDEX_SET,  /* operands: arr_reg, rk_idx, rk_val — v3_registers[arr_reg][rk_idx] =
+                          rk_val, via the existing vm_index_set_compute() (vm.c), which also
+                          runs the GC write barrier — the first v3 opcode to exercise it against
+                          a register-held reference */
+
+    /* M4 follow-up — same bulk-copy-from-registers mechanism as OP_V3_ARRAY_NEW, applied to
+       key/value pairs instead of a flat item list; no new risk, since get/set already work on
+       dicts for free through OP_V3_INDEX_GET/SET's shared vm_index_get_compute()/
+       vm_index_set_compute() calls. Mirrors lbl_dict_new's key-must-be-string validation and
+       owned-copy-of-the-key discipline exactly, just reading pairs from registers instead of
+       popping them off the stack in reverse. */
+    OP_V3_DICT_NEW,   /* operands: dest_reg, pair_reg_base, pair_count — reads pair_count
+                          (key,val) register pairs starting at pair_reg_base (key at
+                          pair_reg_base + 2*i, val at + 2*i + 1), builds a fresh AerDict,
+                          v3_registers[dest_reg] = the new dict */
+
+    /* M4's iteration slice — arrays only, the narrowest proof of the mechanism (dict-key/pair
+       iteration and OP_ITER_RANGE's integer-range form are further follow-ups, same discipline as
+       every other M4 opcode). The stack VM (lbl_iter_next, vm.c) hides its 2 words of iterator
+       state ([col, idx]) as extra slots on vm->stack, popped on exit and by `break` (parse_for's
+       ctx->iter_slots POPs, parser.c) to keep the stack balanced. Registers have no such balance
+       to maintain — col_reg/idx_reg are just two more registers the caller already owns, so this
+       opcode needs no exit-time cleanup and `break` out of a v3 for-loop (once one exists) would
+       just be a plain jump, no POP bookkeeping required. item_dest_reg IS the loop variable's
+       register directly; unlike OP_ITER_NEXT + a separate OP_DEFINE_LOCAL, there's no separate
+       "bind the loop variable" step since the register already **is** the binding. */
+    OP_V3_ITER_NEXT_ARRAY, /* operands: col_reg, idx_reg, item_dest_reg, end_target — if
+                              v3_registers[idx_reg] >= array(col_reg).count: jump to end_target
+                              (loop exit, item_dest_reg untouched); else v3_registers[item_dest_reg]
+                              = array.items[idx], v3_registers[idx_reg] += 1, fall through */
+
+    /* M5 slice 6 — structs. OP_DEFINE_STRUCT itself (above) is reused unmodified for struct
+       *definitions*: its handler (lbl_define_struct, vm.c) only ever reads operands and writes to
+       chunk->shapes[], never vm->stack/scopes/v3_registers, so it's already exactly as
+       stack-neutral as OP_JUMP is (see OP_V3_CALL's own precedent for reusing a stack-VM opcode
+       as-is when it's genuinely neutral). These three ARE new because instantiation, field get,
+       and field set all touch either vm->stack (the stack VM's OP_CALL fallback/OP_FIELD_GET/SET)
+       or need register operands instead. */
+    OP_V3_STRUCT_NEW, /* operands: dest_reg, type_name_pool_idx, arg_reg_base, arg_count — mirrors
+                          lbl_call's struct-instantiation fallback (vm.c): chunk_find_shape() by
+                          name, arity check (arg_count <= field_count), one struct_pool allocation
+                          (items inline right after the header), bulk-copies
+                          v3_registers[arg_reg_base..+arg_count) into the leading fields,
+                          vm_default_value()-fills any trailing omitted fields */
+    OP_V3_FIELD_GET,  /* operands: dest_reg, struct_reg, field_name_pool_idx — mirrors
+                          lbl_field_get's pool-index field-name scan (vm.c), v3_registers[dest_reg]
+                          = the matching field */
+    OP_V3_FIELD_SET,  /* operands: struct_reg, field_name_pool_idx, rk_val — mirrors
+                          lbl_field_set (vm.c), including its gc_barrier_array call */
 #endif
 } Opcode;
 
@@ -212,6 +307,13 @@ typedef enum {
    small non-negative ints in practice, nowhere near this bit, so reusing it as a "this is a
    constant, not a register" flag is safe and simple (matches Lua's own BITRK convention). */
 #define V3_RK_CONST_FLAG (1 << 30)
+
+/* Per-call register bank size (vm.c's V3CallFrame) — also visible here since parser_v3.c's
+   real-source variable table (M5 slice 2) needs to know the ceiling on distinct variable names
+   in one frame. 32 matches SCOPE_SLOT_MAX's precedent (the stack VM's own per-call local-slot
+   ceiling), generous for hand-fed test scripts; a real program needing more would need a spill
+   mechanism this prototype doesn't have. */
+#define V3_FRAME_REGISTERS 32
 #endif
 
 /* OP_CAST operand values — target type for `x as T` (T=string compiles to OP_TO_STR instead, since that conversion already existed). */
