@@ -11,6 +11,12 @@ void pool_init(Pool* p, size_t elem_size, unsigned int elems_per_slab) {
     p->slab_count     = 0;
     p->slab_cap       = 0;
     p->elem_size      = elem_size;
+    /* Round elem_size up to the next power of two — see stride's own comment in pool.h. */
+    size_t stride = 1;
+    unsigned int shift = 0;
+    while (stride < elem_size) { stride <<= 1; shift++; }
+    p->stride         = stride;
+    p->stride_shift   = shift;
     p->elems_per_slab = elems_per_slab;
     p->next_index     = elems_per_slab;   /* forces the first pool_alloc to grab a slab */
     p->free_list      = NULL;
@@ -22,7 +28,7 @@ static void pool_grow(Pool* p) {
         p->slabs      = xrealloc(p->slabs,      sizeof(char*) * p->slab_cap);
         p->cell_state = xrealloc(p->cell_state, sizeof(unsigned char*) * p->slab_cap);
     }
-    p->slabs[p->slab_count]      = xmalloc(p->elem_size * p->elems_per_slab);
+    p->slabs[p->slab_count]      = xmalloc(p->stride * p->elems_per_slab);
     p->cell_state[p->slab_count] = xcalloc(p->elems_per_slab, 1);   /* all zero: unmarked, young */
     p->slab_count++;
     p->next_index = 0;
@@ -32,10 +38,10 @@ static void pool_grow(Pool* p) {
 static unsigned char* pool_cell_state_or_null(Pool* p, void* cell) {
     for (unsigned int i = 0; i < p->slab_count; i++) {
         char*  slab       = p->slabs[i];
-        size_t slab_bytes = p->elem_size * p->elems_per_slab;
+        size_t slab_bytes = p->stride * p->elems_per_slab;
         if ((char*)cell >= slab && (char*)cell < slab + slab_bytes) {
             size_t offset = (size_t)((char*)cell - slab);
-            return &p->cell_state[i][offset / p->elem_size];
+            return &p->cell_state[i][offset >> p->stride_shift];
         }
     }
     return NULL;
@@ -56,7 +62,7 @@ void* pool_alloc(Pool* p) {
         return cell;
     }
     if (p->next_index >= p->elems_per_slab) pool_grow(p);
-    char* cell = p->slabs[p->slab_count - 1] + (size_t)p->next_index * p->elem_size;
+    char* cell = p->slabs[p->slab_count - 1] + (size_t)p->next_index * p->stride;
     p->cell_state[p->slab_count - 1][p->next_index] = 0;
     p->next_index++;
     return cell;
@@ -103,7 +109,7 @@ void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell)) {
             unsigned char* state = &p->cell_state[i][j];
             if (*state & POOL_FREE) continue;                  /* already free-listed; nothing marks a free cell, so don't re-free it */
             if (young_only && (*state & POOL_OLD)) continue;    /* old cells are presumed live during a minor pass */
-            char* cell = p->slabs[i] + (size_t)j * p->elem_size;
+            char* cell = p->slabs[i] + (size_t)j * p->stride;
             if (*state & POOL_MARKED) {
                 *state = (unsigned char)((*state & ~POOL_MARKED) | POOL_OLD);   /* survived -> promote */
             } else {

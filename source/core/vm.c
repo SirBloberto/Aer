@@ -518,7 +518,7 @@ void aer_debug_memory_report(FILE* out) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
                 if (p->cell_state[i][j] & POOL_FREE) continue;
-                AerString* s = (AerString*)(p->slabs[i] + (size_t)j * p->elem_size);
+                AerString* s = (AerString*)(p->slabs[i] + (size_t)j * p->stride);
                 str_hdr += sizeof(AerString);
                 str_payload += s->length;
             }
@@ -533,7 +533,7 @@ void aer_debug_memory_report(FILE* out) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
                 if (p->cell_state[i][j] & POOL_FREE) continue;
-                AerArray* a = (AerArray*)(p->slabs[i] + (size_t)j * p->elem_size);
+                AerArray* a = (AerArray*)(p->slabs[i] + (size_t)j * p->stride);
                 arr_hdr += sizeof(AerArray);
                 arr_payload += (unsigned long long)a->capacity * sizeof(AerVal);
             }
@@ -548,7 +548,7 @@ void aer_debug_memory_report(FILE* out) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
                 if (p->cell_state[i][j] & POOL_FREE) continue;
-                AerDict* d = (AerDict*)(p->slabs[i] + (size_t)j * p->elem_size);
+                AerDict* d = (AerDict*)(p->slabs[i] + (size_t)j * p->stride);
                 dict_hdr += sizeof(AerDict);
                 dict_payload += (unsigned long long)d->map.capacity * sizeof(HashTableEntry);
                 for (unsigned int b = 0; b < d->map.capacity; b++)
@@ -565,7 +565,7 @@ void aer_debug_memory_report(FILE* out) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
                 if (p->cell_state[i][j] & POOL_FREE) continue;
-                AerFunction* f = (AerFunction*)(p->slabs[i] + (size_t)j * p->elem_size);
+                AerFunction* f = (AerFunction*)(p->slabs[i] + (size_t)j * p->stride);
                 fn_hdr += sizeof(AerFunction);
                 if (f->defaults) fn_payload += (unsigned long long)(f->arity - f->min_arity) * sizeof(AerVal);
             }
@@ -573,7 +573,7 @@ void aer_debug_memory_report(FILE* out) {
     }
     fprintf(out, "  function header %10llu B  payload %10llu B\n", fn_hdr, fn_payload);
 
-    unsigned long long long_hdr = (unsigned long long)long_pool.slab_count * long_pool.elems_per_slab * long_pool.elem_size;
+    unsigned long long long_hdr = (unsigned long long)long_pool.slab_count * long_pool.elems_per_slab * long_pool.stride;
     fprintf(out, "  long     reserved %9llu B (no separate payload)\n", long_hdr);
 
     /* struct_pool cells are fixed-size (sizeof(AerArray) + MAX_STRUCT_FIELDS*sizeof(AerVal)) —
@@ -588,8 +588,8 @@ void aer_debug_memory_report(FILE* out) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
                 if (p->cell_state[i][j] & POOL_FREE) continue;
-                struct_hdr += p->elem_size;
-                AerArray* a = (AerArray*)(p->slabs[i] + (size_t)j * p->elem_size);
+                struct_hdr += p->stride;
+                AerArray* a = (AerArray*)(p->slabs[i] + (size_t)j * p->stride);
                 struct_payload += (unsigned long long)a->count * sizeof(AerVal);
             }
         }
@@ -1803,6 +1803,7 @@ bool vm_run(VM* vm) {
         [OP_V3_FIELD_SET]         = &&lbl_v3_field_set,
         [OP_V3_UNARY]             = &&lbl_v3_unary,
         [OP_V3_CAST]              = &&lbl_v3_cast,
+        [OP_V3_BINARY_FIELD]      = &&lbl_v3_binary_field,
 #endif
     };
 
@@ -3292,6 +3293,41 @@ lbl_v3_field_get: {
             c->field_cache_shape[site] = shape;
             c->field_cache_slot[site]  = (int)i;
             v3_registers[dest_reg] = oa->items[i];
+            DISPATCH();
+        }
+    }
+    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
+          aer_as_string(c->pool[field_idx])->data);
+    DISPATCH();
+}
+
+/* Fusion opcode — see its own comment in vm.h. Same inline-cache mechanism as lbl_v3_field_get
+   (a distinct site, since this instruction lives at its own, different bytecode offset), just
+   feeding the field value straight into vm_binary instead of writing it to a register first. */
+lbl_v3_binary_field: {
+    unsigned int site = vm->ip - 1;
+    int dest_reg   = READ();
+    int rk_lhs     = READ();
+    int bin_op     = READ();
+    int struct_reg = READ();
+    int field_idx  = READ();
+    AerVal lhs = vm_v3_rk_value(c, rk_lhs);
+    AerVal obj = v3_registers[struct_reg];
+    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
+        error("'.' field access requires a struct instance");
+        DISPATCH();
+    }
+    AerArray* oa = aer_as_array(obj);
+    Shape* shape = oa->shape;
+    if (c->field_cache_shape[site] == shape) {
+        v3_registers[dest_reg] = vm_binary(lhs, oa->items[c->field_cache_slot[site]], (Opcode)bin_op);
+        DISPATCH();
+    }
+    for (unsigned int i = 0; i < shape->field_count; i++) {
+        if (shape->field_names[i] == (unsigned int)field_idx) {
+            c->field_cache_shape[site] = shape;
+            c->field_cache_slot[site]  = (int)i;
+            v3_registers[dest_reg] = vm_binary(lhs, oa->items[i], (Opcode)bin_op);
             DISPATCH();
         }
     }

@@ -947,7 +947,36 @@ static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs) {
             continue;
         }
 
+        unsigned int rhs_start = c->count;
         int rhs = v3_parse_binary(c, prec);   /* same precedence as floor -> left-associative */
+
+        /* Fusion — see OP_V3_BINARY_FIELD's own comment in vm.h. Found via a real per-opcode
+           dispatch audit on nbody.aer: `x OP y.field` (e.g. `dx = bix - bj.x`) compiled as a bare
+           OP_V3_FIELD_GET immediately followed by this function's own OP_V3_BINARY reading its
+           result back out of a register — two dispatches for one operation. Recognized here by
+           checking whether the RHS we just compiled was EXACTLY one bare `struct.field` read
+           (a single OP_V3_FIELD_GET, 4 words, nothing chained after it) — if so, discard that
+           instruction (never executed) and re-encode its two operands as this fused opcode's
+           trailing operands instead. One-directional (RHS-is-field only) — see the opcode's own
+           comment on why the reverse shape isn't handled here. */
+        if (c->count - rhs_start == 4 && c->code[rhs_start] == OP_V3_FIELD_GET) {
+            int struct_reg = c->code[rhs_start + 2];
+            int field_idx  = c->code[rhs_start + 3];
+            c->count = rhs_start;   /* discard the OP_V3_FIELD_GET just emitted, never executed */
+
+            if (v3_is_temp(rhs)) v3_reg_free(1);
+            if (v3_is_temp(lhs)) v3_reg_free(1);
+
+            int dest = v3_reg_alloc();
+            chunk_emit(c, OP_V3_BINARY_FIELD);
+            chunk_emit(c, dest);
+            chunk_emit(c, lhs);
+            chunk_emit(c, (int)op);
+            chunk_emit(c, struct_reg);
+            chunk_emit(c, field_idx);
+            lhs = dest;
+            continue;
+        }
 
         /* Free-then-allocate, RHS then LHS, matching v3_compile_node's own discipline exactly. */
         if (v3_is_temp(rhs)) v3_reg_free(1);
@@ -1061,7 +1090,7 @@ static void v3_parse_assignment(Chunk* c, unsigned int name_idx) {
             chunk_emit(c, OP_V3_LOADK);
             chunk_emit(c, reg);
             chunk_emit(c, rk_val & ~V3_RK_CONST_FLAG);
-        } else {
+        } else if (reg != rk_val) {
             chunk_emit(c, OP_V3_MOVE);
             chunk_emit(c, reg);
             chunk_emit(c, rk_val);
@@ -1071,6 +1100,15 @@ static void v3_parse_assignment(Chunk* c, unsigned int name_idx) {
                computed into. */
             if (v3_is_temp(rk_val)) v3_reg_free(1);
         }
+        /* reg == rk_val: the RHS's result temp already landed exactly where v3_var_slot just
+           reserved this new variable's own register (the common case for any single-result
+           expression — v3_var_slot allocates at v3_reserved_floor, which is exactly where the
+           RHS's last live temp sits once every intermediate temp along the way has already been
+           freed by the usual free-then-allocate discipline). Copying a register onto itself is a
+           no-op, so skip the MOVE entirely instead of emitting one unconditionally — this was
+           previously always emitted even when it did nothing (see the histogram investigation:
+           OP_V3_MOVE was 18.5% of all v3 dispatches). v3_var_slot has already advanced
+           reserved_floor/next_temp_register past `reg`, so no separate free is needed here either. */
         return;
     }
 

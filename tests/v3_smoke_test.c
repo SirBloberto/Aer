@@ -1400,6 +1400,28 @@ int main(void) {
         chunk_free(&c);
     }
 
+    /* Test 65 (fusion, found via a real per-opcode dispatch audit on nbody.aer): `x OP y.field`
+       (field on the RIGHT) should compile to one OP_V3_BINARY_FIELD instead of an
+       OP_V3_FIELD_GET followed by OP_V3_BINARY — covers a register LHS, a constant LHS, and
+       confirms the deliberately-unfused reverse shape (field on the LEFT) still produces the
+       correct value via the ordinary fallback path. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c,
+            "struct Point:\n    x\n    y\n\n"
+            "p = Point(10, 20)\n"
+            "a = 3\n"
+            "b = a - p.x\n"
+            "d = 100 - p.y\n"
+            "e = p.x - a\n");
+        check(ok, "real source fused/unfused struct-field binary ops ran without error");
+        check(aer_as_int(v3_register_get(2)) == -7, "b == -7 — a - p.x, fused (reg OP field)");
+        check(aer_as_int(v3_register_get(3)) == 80, "d == 80 — 100 - p.y, fused (const OP field)");
+        check(aer_as_int(v3_register_get(4)) == 7,  "e == 7 — p.x - a, NOT fused (field on the left), still correct via the ordinary path");
+        chunk_free(&c);
+    }
+
     if (failures == 0) printf("\nAll v3 smoke tests passed.\n");
     else                printf("\n%d v3 smoke test(s) FAILED.\n", failures);
     return failures == 0 ? 0 : 1;

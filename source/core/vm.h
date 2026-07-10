@@ -376,6 +376,19 @@ typedef enum {
        conversion) is out of scope for this slice — no v3 struct-shape-check opcode exists yet. */
     OP_V3_CAST, /* operands: dest_reg, cast_type, rk_operand — v3_registers[dest_reg] =
                    vm_cast(rk_operand, cast_type) */
+
+    /* Fusion, found via a real per-opcode dispatch audit on nbody.aer: `x OP y.field` (e.g. this
+       exact benchmark's `dx = bix - bj.x`) always compiled as OP_V3_FIELD_GET (into a fresh temp)
+       immediately followed by OP_V3_BINARY reading that temp — two dispatches for something that's
+       structurally one operation. Recognized at emit time in v3_parse_binary_ops (parser_v3.c) by
+       truncating the just-emitted OP_V3_FIELD_GET and re-encoding it as this opcode's last two
+       operands, the same "discard-and-truncate-then-reemit" technique parser.c's own binary/
+       compound-assign fusion family already uses. Deliberately one-directional — `y.field OP x`
+       (field on the LEFT, e.g. `bj.mass * mag`) is NOT fused by this opcode; that shape needs
+       either a mirrored opcode or a commutative-swap, neither implemented yet (real, identified,
+       smaller remaining opportunity — see the fusion audit). */
+    OP_V3_BINARY_FIELD, /* operands: dest_reg, rk_lhs, bin_op, struct_reg, field_name_pool_idx —
+                            v3_registers[dest_reg] = rk_lhs OP struct_reg.field */
 #endif
 } Opcode;
 
