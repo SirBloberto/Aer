@@ -411,6 +411,32 @@ typedef enum {
    ceiling), generous for hand-fed test scripts; a real program needing more would need a spill
    mechanism this prototype doesn't have. */
 #define V3_FRAME_REGISTERS 32
+
+/* Packed-instruction descriptor word — found via a real per-opcode dispatch audit on nbody.aer:
+   every v3 operand used to get its own full 32-bit word regardless of how small its value
+   actually was (a register index only ever needs 5 bits for V3_FRAME_REGISTERS = 32), each one
+   costing its own separate array-index-and-increment fetch. Every OP_V3_* opcode's NARROW fields
+   — register indices and small enums (bin_op/unary_op/cast_type) — now pack into one shared
+   32-bit descriptor word alongside the opcode itself: [C:8][B:8][A:8][opcode:8], opcode in the
+   low byte so extracting it is a single mask, no shift. WIDE fields — RK-encoded operands
+   (register-or-constant, V3_RK_CONST_FLAG unchanged), bare pool indices, and jump targets — keep
+   their own dedicated word exactly as before this change; nothing about how those are read
+   (READ(), vm_v3_rk_value()) is any different. Jump targets specifically are NEVER packed
+   alongside anything else, on purpose — v3_patch_jump (parser_v3.c) does a blind word overwrite
+   at dozens of call sites, and keeping every patchable field in its own dedicated word is what
+   lets that stay a blind overwrite instead of needing read-modify-write.
+   Unused fields are passed as 0 by convention (V3_PACK1/2 wrap V3_PACK3 for opcodes with fewer
+   than 3 narrow fields, purely for readability at the call site — the encoding is identical).
+   No separate v3-only dispatch fetch is needed for this — vm.c's shared DISPATCH() macro masks
+   the fetched word with & 0xFF before casting to Opcode, which is a complete no-op for every
+   existing (unpacked) opcode word — see DISPATCH()'s own comment in vm.c for why. */
+#define V3_PACK3(op, a, b, cc) \
+    (((int)(op) & 0xFF) | (((a) & 0xFF) << 8) | (((b) & 0xFF) << 16) | (((cc) & 0xFF) << 24))
+#define V3_PACK2(op, a, b)   V3_PACK3(op, a, b, 0)
+#define V3_PACK1(op, a)      V3_PACK3(op, a, 0, 0)
+#define V3_UNPACK_A(word) (((word) >> 8)  & 0xFF)
+#define V3_UNPACK_B(word) (((word) >> 16) & 0xFF)
+#define V3_UNPACK_C(word) (((word) >> 24) & 0xFF)
 #endif
 
 /* OP_CAST operand values — target type for `x as T` (T=string compiles to OP_TO_STR instead, since that conversion already existed). */

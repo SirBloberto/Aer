@@ -106,8 +106,8 @@ int main(void) {
 
         unsigned int pool_a = chunk_add_pool(&c, aer_int(3));
         unsigned int pool_b = chunk_add_pool(&c, aer_int(4));
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 0); chunk_emit(&c, (int)pool_a);  /* reg 0 = 3 */
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 1); chunk_emit(&c, (int)pool_b);  /* reg 1 = 4 */
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 0)); chunk_emit(&c, (int)pool_a);  /* reg 0 = 3 */
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 1)); chunk_emit(&c, (int)pool_b);  /* reg 1 = 4 */
         v3_reg_reserve(2);   /* registers 0,1 are now "locals" — never freed/reallocated below */
 
         V3Node a1 = { .kind = V3_NODE_REG, .reg = 0 };
@@ -168,20 +168,20 @@ int main(void) {
         unsigned int pool_one  = chunk_add_pool(&c, aer_int(1));
         unsigned int pool_five = chunk_add_pool(&c, aer_int(5));
 
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 0); chunk_emit(&c, (int)pool_zero);  /* sum = 0 */
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 1); chunk_emit(&c, (int)pool_zero);  /* i = 0 */
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 0)); chunk_emit(&c, (int)pool_zero);  /* sum = 0 */
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 1)); chunk_emit(&c, (int)pool_zero);  /* i = 0 */
         v3_reg_reserve(2);   /* registers 0 (sum), 1 (i) are now "locals" */
 
         unsigned int loop_start = c.count;
         unsigned int exit_patch = v3_emit_cmp_jump_false(&c, /*rk_i=*/1, OP_LT, /*rk_5=*/(int)pool_five | V3_RK_CONST_FLAG);
 
         /* sum = sum + i — writes directly into register 0, no new allocation. */
-        chunk_emit(&c, OP_V3_BINARY);
-        chunk_emit(&c, 0); chunk_emit(&c, 0); chunk_emit(&c, (int)OP_ADD); chunk_emit(&c, 1);
+        chunk_emit(&c, V3_PACK2(OP_V3_BINARY, 0, (int)OP_ADD));
+        chunk_emit(&c, 0); chunk_emit(&c, 1);
 
         /* i = i + 1 — writes directly into register 1, no new allocation. */
-        chunk_emit(&c, OP_V3_BINARY);
-        chunk_emit(&c, 1); chunk_emit(&c, 1); chunk_emit(&c, (int)OP_ADD);
+        chunk_emit(&c, V3_PACK2(OP_V3_BINARY, 1, (int)OP_ADD));
+        chunk_emit(&c, 1);
         chunk_emit(&c, (int)pool_one | V3_RK_CONST_FLAG);
 
         chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
@@ -237,7 +237,7 @@ int main(void) {
         v3_reg_reserve(1);   /* register 0 holds the argument being passed */
 
         unsigned int pool_six = chunk_add_pool(&c, aer_int(6));
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 0); chunk_emit(&c, (int)pool_six);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 0)); chunk_emit(&c, (int)pool_six);
         v3_emit_call(&c, /*dest_reg=*/1, callee_offset, /*arg_reg_base=*/0, /*arg_count=*/1);
         chunk_emit(&c, OP_HALT);
 
@@ -275,20 +275,20 @@ int main(void) {
                                                                 /*rk_1=*/(int)pool_1 | V3_RK_CONST_FLAG);
 
         /* Recursive case (n > 1): reg1 = n - 1; reg2 = factorial(reg1); reg3 = n * reg2; return reg3 */
-        chunk_emit(&c, OP_V3_BINARY);
-        chunk_emit(&c, 1); chunk_emit(&c, 0); chunk_emit(&c, (int)OP_SUB);
+        chunk_emit(&c, V3_PACK2(OP_V3_BINARY, 1, (int)OP_SUB));
+        chunk_emit(&c, 0);
         chunk_emit(&c, (int)pool_1 | V3_RK_CONST_FLAG);
 
         v3_emit_call(&c, /*dest_reg=*/2, callee_offset, /*arg_reg_base=*/1, /*arg_count=*/1);
 
-        chunk_emit(&c, OP_V3_BINARY);
-        chunk_emit(&c, 3); chunk_emit(&c, 0); chunk_emit(&c, (int)OP_MUL); chunk_emit(&c, 2);
+        chunk_emit(&c, V3_PACK2(OP_V3_BINARY, 3, (int)OP_MUL));
+        chunk_emit(&c, 0); chunk_emit(&c, 2);
         v3_emit_return(&c, 3);
 
         /* Base case (n <= 1): return 1. OP_V3_RETURN above jumps away, so this is only ever
            reached via the patched branch, never by fall-through. */
         v3_patch_jump(&c, base_case_patch, c.count);
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 4); chunk_emit(&c, (int)pool_1);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 4)); chunk_emit(&c, (int)pool_1);
         v3_emit_return(&c, 4);
 
         v3_patch_jump(&c, skip_callee_patch, c.count);   /* caller code starts right here */
@@ -298,7 +298,7 @@ int main(void) {
         v3_reg_reserve(1);
 
         unsigned int pool_5 = chunk_add_pool(&c, aer_int(5));
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 0); chunk_emit(&c, (int)pool_5);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 0)); chunk_emit(&c, (int)pool_5);
         v3_emit_call(&c, /*dest_reg=*/1, callee_offset, /*arg_reg_base=*/0, /*arg_count=*/1);
         chunk_emit(&c, OP_HALT);
 
@@ -332,7 +332,7 @@ int main(void) {
         v3_reg_reset();
         v3_reg_reserve(1);
         unsigned int pool_zero = chunk_add_pool(&c, aer_int(0));
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 0); chunk_emit(&c, (int)pool_zero);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 0)); chunk_emit(&c, (int)pool_zero);
         v3_emit_call(&c, /*dest_reg=*/1, callee_offset, /*arg_reg_base=*/0, /*arg_count=*/1);
         chunk_emit(&c, OP_HALT);
 
@@ -364,15 +364,15 @@ int main(void) {
         unsigned int pool_200  = chunk_add_pool(&c, aer_int(200));
         unsigned int pool_99   = chunk_add_pool(&c, aer_int(99));
 
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 0); chunk_emit(&c, (int)pool_10);
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 1); chunk_emit(&c, (int)pool_20);
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 2); chunk_emit(&c, (int)pool_30);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 0)); chunk_emit(&c, (int)pool_10);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 1)); chunk_emit(&c, (int)pool_20);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 2)); chunk_emit(&c, (int)pool_30);
         v3_reg_reserve(3);   /* regs 0-2: source items, read by both arrays below */
 
         v3_emit_array_new(&c, /*dest=*/3, /*item_reg_base=*/0, /*item_count=*/3);
         v3_reg_reserve(1);   /* reg 3: the array whose survival across GC pressure this test proves */
 
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 4); chunk_emit(&c, (int)pool_zero);  /* i = 0 */
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 4)); chunk_emit(&c, (int)pool_zero);  /* i = 0 */
         v3_reg_reserve(1);   /* reg 4: loop counter */
 
         unsigned int loop_start = c.count;
@@ -386,8 +386,8 @@ int main(void) {
         v3_emit_array_new(&c, /*dest=*/5, /*item_reg_base=*/0, /*item_count=*/3);
 
         /* i = i + 1 */
-        chunk_emit(&c, OP_V3_BINARY);
-        chunk_emit(&c, 4); chunk_emit(&c, 4); chunk_emit(&c, (int)OP_ADD);
+        chunk_emit(&c, V3_PACK2(OP_V3_BINARY, 4, (int)OP_ADD));
+        chunk_emit(&c, 4);
         chunk_emit(&c, (int)pool_one | V3_RK_CONST_FLAG);
 
         chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
@@ -449,10 +449,10 @@ int main(void) {
         unsigned int pool_99    = chunk_add_pool(&c, aer_int(99));
 
         /* reg0/reg1 = key "a", val 10; reg2/reg3 = key "b", val 20 */
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 0); chunk_emit(&c, (int)pool_key_a);
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 1); chunk_emit(&c, (int)pool_10);
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 2); chunk_emit(&c, (int)pool_key_b);
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 3); chunk_emit(&c, (int)pool_20);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 0)); chunk_emit(&c, (int)pool_key_a);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 1)); chunk_emit(&c, (int)pool_10);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 2)); chunk_emit(&c, (int)pool_key_b);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 3)); chunk_emit(&c, (int)pool_20);
         v3_reg_reserve(4);
 
         v3_emit_dict_new(&c, /*dest=*/4, /*pair_reg_base=*/0, /*pair_count=*/2);
@@ -489,16 +489,16 @@ int main(void) {
         unsigned int pool_30   = chunk_add_pool(&c, aer_int(30));
         unsigned int pool_zero = chunk_add_pool(&c, aer_int(0));
 
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 0); chunk_emit(&c, (int)pool_10);
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 1); chunk_emit(&c, (int)pool_20);
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 2); chunk_emit(&c, (int)pool_30);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 0)); chunk_emit(&c, (int)pool_10);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 1)); chunk_emit(&c, (int)pool_20);
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 2)); chunk_emit(&c, (int)pool_30);
         v3_reg_reserve(3);   /* regs 0-2: the array's source items */
 
         v3_emit_array_new(&c, /*dest=*/3, /*item_reg_base=*/0, /*item_count=*/3);
         v3_reg_reserve(1);   /* reg 3: the collection being iterated */
 
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 4); chunk_emit(&c, (int)pool_zero);  /* idx = 0 */
-        chunk_emit(&c, OP_V3_LOADK); chunk_emit(&c, 5); chunk_emit(&c, (int)pool_zero);  /* sum = 0 */
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 4)); chunk_emit(&c, (int)pool_zero);  /* idx = 0 */
+        chunk_emit(&c, V3_PACK1(OP_V3_LOADK, 5)); chunk_emit(&c, (int)pool_zero);  /* sum = 0 */
         v3_reg_reserve(2);   /* regs 4-5: iterator index, running sum */
 
         unsigned int loop_start = c.count;   /* the iterate opcode is its own back-edge target */
@@ -506,8 +506,8 @@ int main(void) {
                                                             /*item_dest_reg=*/6);
 
         /* sum = sum + item */
-        chunk_emit(&c, OP_V3_BINARY);
-        chunk_emit(&c, 5); chunk_emit(&c, 5); chunk_emit(&c, (int)OP_ADD); chunk_emit(&c, 6);
+        chunk_emit(&c, V3_PACK2(OP_V3_BINARY, 5, (int)OP_ADD));
+        chunk_emit(&c, 5); chunk_emit(&c, 6);
 
         chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
         v3_patch_jump(&c, exit_patch, c.count);

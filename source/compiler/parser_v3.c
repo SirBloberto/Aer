@@ -53,18 +53,15 @@ int v3_compile_node(Chunk* c, V3Node* node) {
     if (!(rk_lhs & V3_RK_CONST_FLAG) && node->lhs->kind == V3_NODE_BINARY) v3_reg_free(1);
 
     int dest = v3_reg_alloc();
-    chunk_emit(c, OP_V3_BINARY);
-    chunk_emit(c, dest);
+    chunk_emit(c, V3_PACK2(OP_V3_BINARY, dest, (int)node->bin_op));
     chunk_emit(c, rk_lhs);
-    chunk_emit(c, (int)node->bin_op);
     chunk_emit(c, rk_rhs);
     return dest;
 }
 
 unsigned int v3_emit_cmp_jump_false(Chunk* c, int rk_a, Opcode cmp_op, int rk_b) {
-    chunk_emit(c, OP_V3_CMP_JUMP_FALSE);
+    chunk_emit(c, V3_PACK1(OP_V3_CMP_JUMP_FALSE, (int)cmp_op));
     chunk_emit(c, rk_a);
-    chunk_emit(c, (int)cmp_op);
     chunk_emit(c, rk_b);
     unsigned int patch_offset = c->count;
     chunk_emit(c, 0);   /* placeholder — patched by v3_patch_jump once the target is known */
@@ -72,8 +69,7 @@ unsigned int v3_emit_cmp_jump_false(Chunk* c, int rk_a, Opcode cmp_op, int rk_b)
 }
 
 unsigned int v3_emit_jump_if_false_reg(Chunk* c, int reg) {
-    chunk_emit(c, OP_V3_JUMP_IF_FALSE_REG);
-    chunk_emit(c, reg);
+    chunk_emit(c, V3_PACK1(OP_V3_JUMP_IF_FALSE_REG, reg));
     unsigned int patch_offset = c->count;
     chunk_emit(c, 0);
     return patch_offset;
@@ -84,61 +80,46 @@ void v3_patch_jump(Chunk* c, unsigned int patch_offset, unsigned int target) {
 }
 
 void v3_emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count) {
-    chunk_emit(c, OP_V3_CALL);
-    chunk_emit(c, dest_reg);
+    chunk_emit(c, V3_PACK3(OP_V3_CALL, dest_reg, arg_reg_base, arg_count));
     chunk_emit(c, (int)callee_offset);
-    chunk_emit(c, arg_reg_base);
-    chunk_emit(c, arg_count);
 }
 
 void v3_emit_return(Chunk* c, int src_reg) {
-    chunk_emit(c, OP_V3_RETURN);
-    chunk_emit(c, src_reg);
+    chunk_emit(c, V3_PACK1(OP_V3_RETURN, src_reg));
 }
 
 void v3_emit_array_new(Chunk* c, int dest_reg, int item_reg_base, int item_count) {
-    chunk_emit(c, OP_V3_ARRAY_NEW);
-    chunk_emit(c, dest_reg);
-    chunk_emit(c, item_reg_base);
-    chunk_emit(c, item_count);
+    chunk_emit(c, V3_PACK3(OP_V3_ARRAY_NEW, dest_reg, item_reg_base, item_count));
 }
 
 void v3_emit_index_get(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
-    chunk_emit(c, OP_V3_INDEX_GET);
-    chunk_emit(c, dest_reg);
-    chunk_emit(c, arr_reg);
+    chunk_emit(c, V3_PACK2(OP_V3_INDEX_GET, dest_reg, arr_reg));
     chunk_emit(c, rk_idx);
 }
 
 void v3_emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val) {
-    chunk_emit(c, OP_V3_INDEX_SET);
-    chunk_emit(c, arr_reg);
+    chunk_emit(c, V3_PACK1(OP_V3_INDEX_SET, arr_reg));
     chunk_emit(c, rk_idx);
     chunk_emit(c, rk_val);
 }
 
 void v3_emit_dict_new(Chunk* c, int dest_reg, int pair_reg_base, int pair_count) {
-    chunk_emit(c, OP_V3_DICT_NEW);
-    chunk_emit(c, dest_reg);
-    chunk_emit(c, pair_reg_base);
-    chunk_emit(c, pair_count);
+    chunk_emit(c, V3_PACK3(OP_V3_DICT_NEW, dest_reg, pair_reg_base, pair_count));
 }
 
 unsigned int v3_emit_iter_next_array(Chunk* c, int col_reg, int idx_reg, int item_dest_reg) {
-    chunk_emit(c, OP_V3_ITER_NEXT_ARRAY);
-    chunk_emit(c, col_reg);
-    chunk_emit(c, idx_reg);
-    chunk_emit(c, item_dest_reg);
+    chunk_emit(c, V3_PACK3(OP_V3_ITER_NEXT_ARRAY, col_reg, idx_reg, item_dest_reg));
     unsigned int patch_offset = c->count;
     chunk_emit(c, 0);   /* placeholder — patched by v3_patch_jump once the loop-exit target is known */
     return patch_offset;
 }
 
 unsigned int v3_emit_iter_range(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg) {
-    chunk_emit(c, OP_V3_ITER_RANGE);
-    chunk_emit(c, cur_reg);
-    chunk_emit(c, end_reg);
-    chunk_emit(c, step_reg);
+    /* 4 narrow fields, but only 3 fit alongside the opcode in one packed word — item_dest_reg
+       gets its own word rather than displacing end_target from ITS dedicated word (hard rule:
+       a patchable jump target is never packed alongside anything else, so v3_patch_jump's blind
+       overwrite stays correct). Still 3 words total, down from 6. */
+    chunk_emit(c, V3_PACK3(OP_V3_ITER_RANGE, cur_reg, end_reg, step_reg));
     chunk_emit(c, item_dest_reg);
     unsigned int patch_offset = c->count;
     chunk_emit(c, 0);   /* placeholder — patched by v3_patch_jump once the loop-exit target is known */
@@ -146,23 +127,17 @@ unsigned int v3_emit_iter_range(Chunk* c, int cur_reg, int end_reg, int step_reg
 }
 
 void v3_emit_struct_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int arg_reg_base, int arg_count) {
-    chunk_emit(c, OP_V3_STRUCT_NEW);
-    chunk_emit(c, dest_reg);
+    chunk_emit(c, V3_PACK3(OP_V3_STRUCT_NEW, dest_reg, arg_reg_base, arg_count));
     chunk_emit(c, (int)type_name_pool_idx);
-    chunk_emit(c, arg_reg_base);
-    chunk_emit(c, arg_count);
 }
 
 void v3_emit_field_get(Chunk* c, int dest_reg, int struct_reg, unsigned int field_name_pool_idx) {
-    chunk_emit(c, OP_V3_FIELD_GET);
-    chunk_emit(c, dest_reg);
-    chunk_emit(c, struct_reg);
+    chunk_emit(c, V3_PACK2(OP_V3_FIELD_GET, dest_reg, struct_reg));
     chunk_emit(c, (int)field_name_pool_idx);
 }
 
 void v3_emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, int rk_val) {
-    chunk_emit(c, OP_V3_FIELD_SET);
-    chunk_emit(c, struct_reg);
+    chunk_emit(c, V3_PACK1(OP_V3_FIELD_SET, struct_reg));
     chunk_emit(c, (int)field_name_pool_idx);
     chunk_emit(c, rk_val);
 }
@@ -312,9 +287,7 @@ static bool v3_is_temp(int rk) {
 static int v3_materialize(Chunk* c, int rk) {
     if (!(rk & V3_RK_CONST_FLAG)) return rk;
     int reg = v3_reg_alloc();
-    chunk_emit(c, OP_V3_LOADK);
-    chunk_emit(c, reg);
-    chunk_emit(c, rk & ~V3_RK_CONST_FLAG);
+    chunk_emit(c, V3_PACK1(OP_V3_LOADK, reg)); chunk_emit(c, rk & ~V3_RK_CONST_FLAG);
     return reg;
 }
 
@@ -417,13 +390,9 @@ static int v3_arg_materialize(Chunk* c, int rk) {
     }
     int target = v3_reg_alloc();
     if (rk & V3_RK_CONST_FLAG) {
-        chunk_emit(c, OP_V3_LOADK);
-        chunk_emit(c, target);
-        chunk_emit(c, rk & ~V3_RK_CONST_FLAG);
+        chunk_emit(c, V3_PACK1(OP_V3_LOADK, target)); chunk_emit(c, rk & ~V3_RK_CONST_FLAG);
     } else {
-        chunk_emit(c, OP_V3_MOVE);
-        chunk_emit(c, target);
-        chunk_emit(c, rk);
+        chunk_emit(c, V3_PACK2(OP_V3_MOVE, target, rk));
     }
     return target;
 }
@@ -563,8 +532,8 @@ static int v3_parse_string_literal(Chunk* c) {
             } else {
                 if (v3_is_temp(result)) v3_reg_free(1);
                 int dest = v3_reg_alloc();
-                chunk_emit(c, OP_V3_BINARY); chunk_emit(c, dest); chunk_emit(c, result);
-                chunk_emit(c, (int)OP_ADD); chunk_emit(c, rk_seg);
+                chunk_emit(c, V3_PACK2(OP_V3_BINARY, dest, (int)OP_ADD));
+                chunk_emit(c, result); chunk_emit(c, rk_seg);
                 result = dest;
             }
         }
@@ -592,7 +561,7 @@ static int v3_parse_string_literal(Chunk* c) {
         }
 
         int str_dest = v3_reg_alloc();
-        chunk_emit(c, OP_V3_UNARY); chunk_emit(c, str_dest); chunk_emit(c, (int)OP_TO_STR); chunk_emit(c, var_reg);
+        chunk_emit(c, V3_PACK2(OP_V3_UNARY, str_dest, (int)OP_TO_STR)); chunk_emit(c, var_reg);
 
         if (result < 0) {
             result = str_dest;
@@ -600,8 +569,8 @@ static int v3_parse_string_literal(Chunk* c) {
             if (v3_is_temp(str_dest)) v3_reg_free(1);
             if (v3_is_temp(result))   v3_reg_free(1);
             int dest = v3_reg_alloc();
-            chunk_emit(c, OP_V3_BINARY); chunk_emit(c, dest); chunk_emit(c, result);
-            chunk_emit(c, (int)OP_ADD); chunk_emit(c, str_dest);
+            chunk_emit(c, V3_PACK2(OP_V3_BINARY, dest, (int)OP_ADD));
+            chunk_emit(c, result); chunk_emit(c, str_dest);
             result = dest;
         }
         i++;   /* skip '}' */
@@ -695,9 +664,7 @@ static int v3_parse_primary_inner(Chunk* c) {
             int global_reg;
             if (v3_global_lookup(name_idx, &global_reg)) {
                 int dest = v3_reg_alloc();
-                chunk_emit(c, OP_V3_LOAD_GLOBAL);
-                chunk_emit(c, dest);
-                chunk_emit(c, global_reg);
+                chunk_emit(c, V3_PACK2(OP_V3_LOAD_GLOBAL, dest, global_reg));
                 return dest;
             }
         }
@@ -769,9 +736,7 @@ static int v3_parse_unary_inner(Chunk* c) {
     int rk = v3_parse_unary(c);
     if (v3_is_temp(rk)) v3_reg_free(1);   /* free-then-allocate, matching every other site */
     int dest = v3_reg_alloc();
-    chunk_emit(c, OP_V3_UNARY);
-    chunk_emit(c, dest);
-    chunk_emit(c, (int)unary_op);
+    chunk_emit(c, V3_PACK2(OP_V3_UNARY, dest, (int)unary_op));
     chunk_emit(c, rk);
     return dest;
 }
@@ -798,14 +763,14 @@ static int v3_compile_and(Chunk* c, int lhs, unsigned int prec) {
 
     int dest = v3_reg_alloc();
     unsigned int pool_true = chunk_add_pool(c, aer_bool(true));
-    chunk_emit(c, OP_V3_LOADK); chunk_emit(c, dest); chunk_emit(c, (int)pool_true);
+    chunk_emit(c, V3_PACK1(OP_V3_LOADK, dest)); chunk_emit(c, (int)pool_true);
     chunk_emit(c, OP_JUMP);
     unsigned int patch_end = c->count; chunk_emit(c, 0);
 
     v3_patch_jump(c, patch_false_a, c->count);
     v3_patch_jump(c, patch_false_b, c->count);
     unsigned int pool_false = chunk_add_pool(c, aer_bool(false));
-    chunk_emit(c, OP_V3_LOADK); chunk_emit(c, dest); chunk_emit(c, (int)pool_false);
+    chunk_emit(c, V3_PACK1(OP_V3_LOADK, dest)); chunk_emit(c, (int)pool_false);
 
     v3_patch_jump(c, patch_end, c->count);
     return dest;
@@ -823,7 +788,7 @@ static int v3_compile_or(Chunk* c, int lhs, unsigned int prec) {
 
     int dest = v3_reg_alloc();
     unsigned int pool_true = chunk_add_pool(c, aer_bool(true));
-    chunk_emit(c, OP_V3_LOADK); chunk_emit(c, dest); chunk_emit(c, (int)pool_true);
+    chunk_emit(c, V3_PACK1(OP_V3_LOADK, dest)); chunk_emit(c, (int)pool_true);
     chunk_emit(c, OP_JUMP);
     unsigned int patch_end_a = c->count; chunk_emit(c, 0);
 
@@ -833,13 +798,13 @@ static int v3_compile_or(Chunk* c, int lhs, unsigned int prec) {
     unsigned int patch_result_false = v3_emit_jump_if_false_reg(c, reg_rhs);
     if (v3_is_temp(reg_rhs)) v3_reg_free(1);
 
-    chunk_emit(c, OP_V3_LOADK); chunk_emit(c, dest); chunk_emit(c, (int)pool_true);
+    chunk_emit(c, V3_PACK1(OP_V3_LOADK, dest)); chunk_emit(c, (int)pool_true);
     chunk_emit(c, OP_JUMP);
     unsigned int patch_end_b = c->count; chunk_emit(c, 0);
 
     v3_patch_jump(c, patch_result_false, c->count);
     unsigned int pool_false = chunk_add_pool(c, aer_bool(false));
-    chunk_emit(c, OP_V3_LOADK); chunk_emit(c, dest); chunk_emit(c, (int)pool_false);
+    chunk_emit(c, V3_PACK1(OP_V3_LOADK, dest)); chunk_emit(c, (int)pool_false);
 
     v3_patch_jump(c, patch_end_a, c->count);
     v3_patch_jump(c, patch_end_b, c->count);
@@ -925,9 +890,7 @@ static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigne
             int dest = v3_reg_alloc();
 
             if (type_len == 6 && strncmp(type_name, "string", 6) == 0) {
-                chunk_emit(c, OP_V3_UNARY);
-                chunk_emit(c, dest);
-                chunk_emit(c, (int)OP_TO_STR);
+                chunk_emit(c, V3_PACK2(OP_V3_UNARY, dest, (int)OP_TO_STR));
                 chunk_emit(c, lhs);
             } else {
                 int cast_type;
@@ -938,9 +901,7 @@ static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigne
                     error_at("v3 prototype only supports casting to string/integer/float/boolean (struct-shape casting via 'as' is not yet supported)");
                     return dest;
                 }
-                chunk_emit(c, OP_V3_CAST);
-                chunk_emit(c, dest);
-                chunk_emit(c, cast_type);
+                chunk_emit(c, V3_PACK2(OP_V3_CAST, dest, cast_type));
                 chunk_emit(c, lhs);
             }
             lhs = dest;
@@ -955,12 +916,12 @@ static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigne
            itself emitted (short-circuit and/or, nested calls, ...). Truncating here, before RHS
            exists at all, avoids that entirely — same "only ever discard from the tail" invariant
            the RHS-is-field fusion below relies on. */
-        bool lhs_is_field = (c->count - lhs_start == 4 && c->code[lhs_start] == OP_V3_FIELD_GET);
+        bool lhs_is_field = (c->count - lhs_start == 2 && (c->code[lhs_start] & 0xFF) == OP_V3_FIELD_GET);
         int lhs_struct_reg = 0;
         unsigned int lhs_field_idx = 0;
         if (lhs_is_field) {
-            lhs_struct_reg = c->code[lhs_start + 2];
-            lhs_field_idx  = (unsigned int)c->code[lhs_start + 3];
+            lhs_struct_reg = V3_UNPACK_B(c->code[lhs_start]);
+            lhs_field_idx  = (unsigned int)c->code[lhs_start + 1];
             c->count = lhs_start;   /* discard lhs's OP_V3_FIELD_GET, never executed */
         }
 
@@ -972,11 +933,8 @@ static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigne
             if (v3_is_temp(lhs)) v3_reg_free(1);
 
             int dest = v3_reg_alloc();
-            chunk_emit(c, OP_V3_FIELD_BINARY);
-            chunk_emit(c, dest);
-            chunk_emit(c, lhs_struct_reg);
+            chunk_emit(c, V3_PACK3(OP_V3_FIELD_BINARY, dest, lhs_struct_reg, (int)op));
             chunk_emit(c, (int)lhs_field_idx);
-            chunk_emit(c, (int)op);
             chunk_emit(c, rhs);
             lhs = dest;
             lhs_start = c->count;
@@ -991,20 +949,17 @@ static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigne
            (a single OP_V3_FIELD_GET, 4 words, nothing chained after it) — if so, discard that
            instruction (never executed) and re-encode its two operands as this fused opcode's
            trailing operands instead. */
-        if (c->count - rhs_start == 4 && c->code[rhs_start] == OP_V3_FIELD_GET) {
-            int struct_reg = c->code[rhs_start + 2];
-            int field_idx  = c->code[rhs_start + 3];
+        if (c->count - rhs_start == 2 && (c->code[rhs_start] & 0xFF) == OP_V3_FIELD_GET) {
+            int struct_reg = V3_UNPACK_B(c->code[rhs_start]);
+            int field_idx  = c->code[rhs_start + 1];
             c->count = rhs_start;   /* discard the OP_V3_FIELD_GET just emitted, never executed */
 
             if (v3_is_temp(rhs)) v3_reg_free(1);
             if (v3_is_temp(lhs)) v3_reg_free(1);
 
             int dest = v3_reg_alloc();
-            chunk_emit(c, OP_V3_BINARY_FIELD);
-            chunk_emit(c, dest);
+            chunk_emit(c, V3_PACK3(OP_V3_BINARY_FIELD, dest, struct_reg, (int)op));
             chunk_emit(c, lhs);
-            chunk_emit(c, (int)op);
-            chunk_emit(c, struct_reg);
             chunk_emit(c, field_idx);
             lhs = dest;
             lhs_start = c->count;
@@ -1016,10 +971,8 @@ static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigne
         if (v3_is_temp(lhs)) v3_reg_free(1);
 
         int dest = v3_reg_alloc();
-        chunk_emit(c, OP_V3_BINARY);
-        chunk_emit(c, dest);
+        chunk_emit(c, V3_PACK2(OP_V3_BINARY, dest, (int)op));
         chunk_emit(c, lhs);
-        chunk_emit(c, (int)op);
         chunk_emit(c, rhs);
         lhs = dest;
         lhs_start = c->count;
@@ -1122,13 +1075,9 @@ static void v3_parse_assignment(Chunk* c, unsigned int name_idx) {
         int reg = v3_var_slot(name_idx);
         if (reg < 0) return;   /* error_at already called */
         if (rk_val & V3_RK_CONST_FLAG) {
-            chunk_emit(c, OP_V3_LOADK);
-            chunk_emit(c, reg);
-            chunk_emit(c, rk_val & ~V3_RK_CONST_FLAG);
+            chunk_emit(c, V3_PACK1(OP_V3_LOADK, reg)); chunk_emit(c, rk_val & ~V3_RK_CONST_FLAG);
         } else if (reg != rk_val) {
-            chunk_emit(c, OP_V3_MOVE);
-            chunk_emit(c, reg);
-            chunk_emit(c, rk_val);
+            chunk_emit(c, V3_PACK2(OP_V3_MOVE, reg, rk_val));
             /* Checked AFTER v3_var_slot (which may have just reserved `reg`, raising the floor) so
                this correctly recognizes rk_val as no-longer-a-temp in the (common) case where a
                brand-new variable's assigned register happens to already be the exact temp its RHS
@@ -1161,10 +1110,8 @@ static void v3_parse_assignment(Chunk* c, unsigned int name_idx) {
 
         int rk_rhs = v3_parse_binary(c, 0);
         if (parse_had_error) return;
-        chunk_emit(c, OP_V3_BINARY);
+        chunk_emit(c, V3_PACK2(OP_V3_BINARY, reg, (int)v3_compound_assign_ops[i].op));
         chunk_emit(c, reg);
-        chunk_emit(c, reg);
-        chunk_emit(c, (int)v3_compound_assign_ops[i].op);
         chunk_emit(c, rk_rhs);
         if (v3_is_temp(rk_rhs)) v3_reg_free(1);
         return;
@@ -1224,11 +1171,8 @@ static void v3_parse_index_assignment(Chunk* c, unsigned int name_idx) {
             int rk_rhs = v3_parse_binary(c, 0);
             if (parse_had_error) return;
 
-            chunk_emit(c, OP_V3_FIELD_BINARY);
-            chunk_emit(c, field_reg);
-            chunk_emit(c, struct_reg);
+            chunk_emit(c, V3_PACK3(OP_V3_FIELD_BINARY, field_reg, struct_reg, (int)v3_compound_assign_ops[i].op));
             chunk_emit(c, (int)field_idx);
-            chunk_emit(c, (int)v3_compound_assign_ops[i].op);
             chunk_emit(c, rk_rhs);
             if (v3_is_temp(rk_rhs)) v3_reg_free(1);
 
@@ -1270,10 +1214,8 @@ static void v3_parse_index_assignment(Chunk* c, unsigned int name_idx) {
         int rk_rhs = v3_parse_binary(c, 0);
         if (parse_had_error) return;
 
-        chunk_emit(c, OP_V3_BINARY);
+        chunk_emit(c, V3_PACK2(OP_V3_BINARY, item_reg, (int)v3_compound_assign_ops[i].op));
         chunk_emit(c, item_reg);
-        chunk_emit(c, item_reg);
-        chunk_emit(c, (int)v3_compound_assign_ops[i].op);
         chunk_emit(c, rk_rhs);
         if (v3_is_temp(rk_rhs)) v3_reg_free(1);
 
@@ -1429,9 +1371,7 @@ static void v3_parse_for_in(Chunk* c, unsigned int loop_var_name) {
 
     int idx_reg = v3_reg_alloc();
     unsigned int pool_zero = chunk_add_pool(c, aer_int(0));
-    chunk_emit(c, OP_V3_LOADK);
-    chunk_emit(c, idx_reg);
-    chunk_emit(c, (int)pool_zero);
+    chunk_emit(c, V3_PACK1(OP_V3_LOADK, idx_reg)); chunk_emit(c, (int)pool_zero);
 
     /* Feature-completeness fix — same reasoning as the range branch's own comment above: idx_reg
        (always a genuine temp) and col_reg (a temp unless it aliases an existing variable) must
@@ -1521,12 +1461,9 @@ static int v3_parse_module_call(Chunk* c) {
     int dest = (arg_count > 0) ? arg_reg_base : v3_reg_alloc();
     if (arg_count > 1) v3_reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
-    chunk_emit(c, OP_V3_CALL_MODULE);
-    chunk_emit(c, dest);
+    chunk_emit(c, V3_PACK3(OP_V3_CALL_MODULE, dest, base, arg_count));
     chunk_emit(c, (int)module_idx);
     chunk_emit(c, (int)fn_idx);
-    chunk_emit(c, base);
-    chunk_emit(c, arg_count);
     return dest;
 }
 
@@ -1589,11 +1526,8 @@ static int v3_parse_builtin_call(Chunk* c, unsigned int name_idx) {
     int dest = (arg_count > 0) ? arg_reg_base : v3_reg_alloc();
     if (arg_count > 1) v3_reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
-    chunk_emit(c, OP_V3_CALL_BUILTIN);
-    chunk_emit(c, dest);
+    chunk_emit(c, V3_PACK3(OP_V3_CALL_BUILTIN, dest, base, arg_count));
     chunk_emit(c, (int)name_idx);
-    chunk_emit(c, base);
-    chunk_emit(c, arg_count);
     return dest;
 }
 
@@ -1672,10 +1606,8 @@ static void v3_parse_defer(Chunk* c) {
         return;
     }
 
-    chunk_emit(c, OP_V3_DEFER_PUSH);
+    chunk_emit(c, V3_PACK2(OP_V3_DEFER_PUSH, arg_count > 0 ? arg_reg_base : 0, arg_count));
     chunk_emit(c, (int)func_offset);
-    chunk_emit(c, arg_count > 0 ? arg_reg_base : 0);
-    chunk_emit(c, arg_count);
 
     /* Args are copied out of these registers immediately by the opcode above — unlike a plain
        call, there's no result register to reuse one of them for, so all of them free. */
@@ -1893,11 +1825,8 @@ static void v3_parse_field_assignment(Chunk* c, unsigned int name_idx) {
         int rk_rhs = v3_parse_binary(c, 0);
         if (parse_had_error) return;
 
-        chunk_emit(c, OP_V3_FIELD_BINARY);
-        chunk_emit(c, field_reg);
-        chunk_emit(c, struct_reg);
+        chunk_emit(c, V3_PACK3(OP_V3_FIELD_BINARY, field_reg, struct_reg, (int)v3_compound_assign_ops[i].op));
         chunk_emit(c, (int)field_idx);
-        chunk_emit(c, (int)v3_compound_assign_ops[i].op);
         chunk_emit(c, rk_rhs);
         if (v3_is_temp(rk_rhs)) v3_reg_free(1);
 
