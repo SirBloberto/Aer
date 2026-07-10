@@ -38,10 +38,33 @@ static bool pools_initialized = false;
    (V3_FRAME_REGISTERS itself now lives in vm.h, not here — parser_v3.c's real-source variable
    table needs to see it too.) */
 
+/* M5 slice 12 — a `defer name(args)` statement. Unlike the stack VM's DeferredCall (whose
+   name_idx re-resolves via scope lookup at replay time, since functions there are first-class
+   values), v3 resolves the target at COMPILE time via v3_func_lookup — consistent with v3 already
+   resolving every other call site's target at compile time (functions aren't first-class values
+   in this prototype at all). `args` are snapshotted at the defer statement, same as the stack
+   VM's version — a deferred call's arguments are evaluated once, now, not re-evaluated at replay
+   time. */
+typedef struct {
+    unsigned int callee_offset;
+    AerVal       args[MAX_DEFER_ARGS];
+    int          arg_count;
+} V3DeferredCall;
+
 typedef struct {
     AerVal       registers[V3_FRAME_REGISTERS];
     unsigned int return_ip;   /* where to resume in the CALLER */
     int          dest_reg;    /* which of the CALLER's registers gets the return value */
+
+    /* Pending `defer` calls, drained LIFO by lbl_v3_return before the frame unwinds — mirrors
+       CallFrame's own defers/defer_count exactly, including the lazy-xmalloc-once-and-keep
+       rationale (defer is rare, V3_FRAME_REGISTERS-sized frames are not). Unlike CallFrame, no
+       pending_return_value/defers_draining bookkeeping is needed: each v3 call gets its own
+       isolated register bank (V3CallFrame.registers), so a frame's real return value just sits in
+       its own src_reg untouched while nested deferred calls run in deeper, separate frames — there
+       is no shared mutable stack slot for a deferred call's own result to collide with. */
+    V3DeferredCall* defers;
+    int             defer_count;
 } V3CallFrame;
 
 static V3CallFrame v3_call_stack[VM_CALL_MAX];   /* reuses the stack VM's own recursion ceiling */
@@ -253,6 +276,17 @@ static void mark_vm_roots(VM* vm) {
     for (int f = 0; f < VM_CALL_MAX; f++)
         for (int i = 0; i < V3_FRAME_REGISTERS; i++)
             worklist_push(v3_call_stack[f].registers[i]);
+
+    /* M5 slice 12 — a deferred call's snapshotted args live outside v3_registers[], in each frame's
+       own defers[] side array (mirroring CallFrame's identical defer-args root below), so they need
+       their own scan; blanket over every frame for the same "harmless to over-scan" reason as the
+       registers loop just above. */
+    for (int f = 0; f < VM_CALL_MAX; f++) {
+        V3CallFrame* frame = &v3_call_stack[f];
+        for (int d = 0; d < frame->defer_count; d++)
+            for (int a = 0; a < frame->defers[d].arg_count; a++)
+                worklist_push(frame->defers[d].args[a]);
+    }
 #endif
 
     for (int s = 0; s < vm->scope_depth; s++) {
@@ -762,6 +796,7 @@ void vm_init(VM* vm, Chunk* chunk) {
        (a bug, or a deliberately unbalanced test) must not leak into the next chunk's run. */
     v3_call_depth = 0;
     v3_registers  = v3_call_stack[0].registers;
+    v3_call_stack[0].defer_count = 0;
 #endif
 }
 
@@ -772,6 +807,12 @@ void vm_free(VM* vm) {
     /* Every call_stack slot, not just up to call_depth — a slot's lazily allocated defers array stays allocated across reuse, so any slot ever used may still hold one. */
     for (int i = 0; i < VM_CALL_MAX; i++)
         free(vm->call_stack[i].defers);
+#ifdef AER_V3
+    /* Same reasoning as the stack VM's loop just above — a v3 call_stack slot's lazily allocated
+       defers array persists across reuse, so any slot ever used may still hold one. */
+    for (int i = 0; i < VM_CALL_MAX; i++)
+        free(v3_call_stack[i].defers);
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -1549,6 +1590,52 @@ static inline void vm_index_set_compute(AerVal obj, AerVal idx, AerVal val) {
     }
 }
 
+/* Shared by lbl_cast and (M5 slice 9) lbl_v3_cast — extracted so the v3 register path can reuse
+   the exact same conversion rules without duplicating this switch. */
+static AerVal vm_cast(AerVal v, int cast_type) {
+    AerVal r = aer_null();
+    /* atoll()/atof() only consume a leading sign/digits(/./exponent), so truncating to a fixed buffer (instead of a length-sized VLA) can't change the parsed value for a real number. */
+    char buf[64];
+    switch (cast_type) {
+        case CAST_INTEGER:
+            switch (aer_type(v)) {
+                case TYPE_INTEGER: r = v; break;
+                case TYPE_REAL:    r = aer_int((long long)aer_as_real(v)); break;
+                case TYPE_BOOLEAN: r = aer_int(aer_as_bool(v) ? 1 : 0); break;
+                case TYPE_STRING: {
+                    AerString* vs = aer_as_string(v);
+                    unsigned int n = vs->length < sizeof(buf) - 1
+                                          ? vs->length : sizeof(buf) - 1;
+                    memcpy(buf, vs->data, n);
+                    buf[n] = '\0';
+                    r = aer_int(atoll(buf)); break;
+                }
+                default: error("Cannot convert this type to integer"); r = aer_int(0);
+            }
+            break;
+        case CAST_FLOAT:
+            switch (aer_type(v)) {
+                case TYPE_REAL:    r = v; break;
+                case TYPE_INTEGER: r = aer_real((double)aer_as_int(v)); break;
+                case TYPE_BOOLEAN: r = aer_real(aer_as_bool(v) ? 1.0 : 0.0); break;
+                case TYPE_STRING: {
+                    AerString* vs = aer_as_string(v);
+                    unsigned int n = vs->length < sizeof(buf) - 1
+                                          ? vs->length : sizeof(buf) - 1;
+                    memcpy(buf, vs->data, n);
+                    buf[n] = '\0';
+                    r = aer_real(atof(buf)); break;
+                }
+                default: error("Cannot convert this type to float"); r = aer_real(0.0);
+            }
+            break;
+        case CAST_BOOLEAN:
+            r = aer_bool(vm_truthy(v));
+            break;
+    }
+    return r;
+}
+
 /* ------------------------------------------------------------------ */
 /* Dispatch loop — computed goto (GCC direct-threaded dispatch); each instruction jumps straight to the next handler, letting the branch predictor learn per-instruction patterns. */
 /* ------------------------------------------------------------------ */
@@ -1678,15 +1765,22 @@ bool vm_run(VM* vm) {
         [OP_V3_JUMP_IF_FALSE_REG] = &&lbl_v3_jump_if_false_reg,
         [OP_V3_CMP_JUMP_FALSE]    = &&lbl_v3_cmp_jump_false,
         [OP_V3_CALL]              = &&lbl_v3_call,
+        [OP_V3_CALL_MODULE]       = &&lbl_v3_call_module,
+        [OP_V3_CALL_BUILTIN]      = &&lbl_v3_call_builtin,
+        [OP_V3_LOAD_GLOBAL]       = &&lbl_v3_load_global,
+        [OP_V3_DEFER_PUSH]        = &&lbl_v3_defer_push,
         [OP_V3_RETURN]            = &&lbl_v3_return,
         [OP_V3_ARRAY_NEW]         = &&lbl_v3_array_new,
         [OP_V3_INDEX_GET]         = &&lbl_v3_index_get,
         [OP_V3_INDEX_SET]         = &&lbl_v3_index_set,
         [OP_V3_DICT_NEW]          = &&lbl_v3_dict_new,
         [OP_V3_ITER_NEXT_ARRAY]   = &&lbl_v3_iter_next_array,
+        [OP_V3_ITER_RANGE]        = &&lbl_v3_iter_range,
         [OP_V3_STRUCT_NEW]        = &&lbl_v3_struct_new,
         [OP_V3_FIELD_GET]         = &&lbl_v3_field_get,
         [OP_V3_FIELD_SET]         = &&lbl_v3_field_set,
+        [OP_V3_UNARY]             = &&lbl_v3_unary,
+        [OP_V3_CAST]              = &&lbl_v3_cast,
 #endif
     };
 
@@ -2770,47 +2864,7 @@ lbl_to_str: {
 lbl_cast: {
     int cast_type = READ();
     AerVal v = POP();
-    AerVal r = aer_null();
-    /* atoll()/atof() only consume a leading sign/digits(/./exponent), so truncating to a fixed buffer (instead of a length-sized VLA) can't change the parsed value for a real number. */
-    char buf[64];
-    switch (cast_type) {
-        case CAST_INTEGER:
-            switch (aer_type(v)) {
-                case TYPE_INTEGER: r = v; break;
-                case TYPE_REAL:    r = aer_int((long long)aer_as_real(v)); break;
-                case TYPE_BOOLEAN: r = aer_int(aer_as_bool(v) ? 1 : 0); break;
-                case TYPE_STRING: {
-                    AerString* vs = aer_as_string(v);
-                    unsigned int n = vs->length < sizeof(buf) - 1
-                                          ? vs->length : sizeof(buf) - 1;
-                    memcpy(buf, vs->data, n);
-                    buf[n] = '\0';
-                    r = aer_int(atoll(buf)); break;
-                }
-                default: error("Cannot convert this type to integer"); r = aer_int(0);
-            }
-            break;
-        case CAST_FLOAT:
-            switch (aer_type(v)) {
-                case TYPE_REAL:    r = v; break;
-                case TYPE_INTEGER: r = aer_real((double)aer_as_int(v)); break;
-                case TYPE_BOOLEAN: r = aer_real(aer_as_bool(v) ? 1.0 : 0.0); break;
-                case TYPE_STRING: {
-                    AerString* vs = aer_as_string(v);
-                    unsigned int n = vs->length < sizeof(buf) - 1
-                                          ? vs->length : sizeof(buf) - 1;
-                    memcpy(buf, vs->data, n);
-                    buf[n] = '\0';
-                    r = aer_real(atof(buf)); break;
-                }
-                default: error("Cannot convert this type to float"); r = aer_real(0.0);
-            }
-            break;
-        case CAST_BOOLEAN:
-            r = aer_bool(vm_truthy(v));
-            break;
-    }
-    PUSH(r);
+    PUSH(vm_cast(v, cast_type));
     DISPATCH();
 }
 
@@ -2884,8 +2938,9 @@ lbl_v3_call: {
     V3CallFrame* callee = &v3_call_stack[v3_call_depth + 1];
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = caller->registers[arg_reg_base + i];
-    callee->return_ip = vm->ip;   /* already past this instruction's operands — the correct resume point */
-    callee->dest_reg  = dest_reg;
+    callee->return_ip   = vm->ip;   /* already past this instruction's operands — the correct resume point */
+    callee->dest_reg    = dest_reg;
+    callee->defer_count = 0;   /* reused call_stack slots must never inherit a previous occupant's pending defers */
     v3_call_depth++;
     v3_registers = v3_call_stack[v3_call_depth].registers;
     vm->ip = (unsigned int)callee_offset;
@@ -2895,17 +2950,130 @@ lbl_v3_call: {
 /* src_reg is a plain 0-based index into the CALLEE's own frame — no more "absolute index into a
    shared fixed bank" caveat, since every call now owns an isolated bank. return_ip/dest_reg live
    in the callee's own frame (not a single shared global), which is exactly what makes nested/
-   recursive calls safe: an outer call's return info can't be clobbered by an inner one. */
+   recursive calls safe: an outer call's return info can't be clobbered by an inner one.
+     M5 slice 12 — before actually returning, drains this frame's pending defers LIFO, one per
+   visit: each is set up as an inline call into a fresh, deeper v3_call_stack slot whose return_ip
+   points back at THIS SAME OP_V3_RETURN instruction (reenter_addr, computed the same way the
+   stack VM's lbl_return computes its own self-re-entry address), so the deferred call's own
+   eventual OP_V3_RETURN re-dispatches here and rechecks defer_count, same LIFO-drain-before-
+   real-return shape as lbl_return's while loop. Simpler than the stack VM's version: since every
+   v3 call already owns an isolated register bank, this frame's `result` (once finally read, after
+   defer_count reaches 0) can't be clobbered by a deferred call's own return value the way a
+   shared value-stack slot could — no pending_return_value/defers_draining flag needed. */
 lbl_v3_return: {
     int src_reg = READ();
+    unsigned int reenter_addr = vm->ip - 2;   /* this OP_V3_RETURN's own address: opcode + src_reg */
     V3CallFrame* callee = &v3_call_stack[v3_call_depth];
+
+    if (callee->defer_count > 0) {
+        if (v3_call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); DISPATCH(); }
+        V3DeferredCall dc = callee->defers[--callee->defer_count];
+        V3CallFrame* next = &v3_call_stack[v3_call_depth + 1];
+        for (int i = 0; i < dc.arg_count; i++) next->registers[i] = dc.args[i];
+        next->return_ip   = reenter_addr;
+        next->dest_reg    = -1;   /* sentinel: a deferred call's own return value is always discarded, never written anywhere (register 0 may be a live variable in the frame it would otherwise land in) */
+        next->defer_count = 0;
+        v3_call_depth++;
+        v3_registers = v3_call_stack[v3_call_depth].registers;
+        vm->ip = dc.callee_offset;
+        DISPATCH();
+    }
+
     AerVal result = callee->registers[src_reg];
     unsigned int return_ip = callee->return_ip;
     int dest_reg = callee->dest_reg;
     v3_call_depth--;
     v3_registers = v3_call_stack[v3_call_depth].registers;
-    v3_registers[dest_reg] = result;
+    if (dest_reg >= 0) v3_registers[dest_reg] = result;   /* dest_reg == -1: a deferred call's discarded result */
     vm->ip = return_ip;
+    DISPATCH();
+}
+
+/* See OP_V3_CALL_MODULE's comment in vm.h — bridges to the exact same stack-based stdlib dispatch
+   lbl_call_module uses, since reimplementing every stdlib function for registers would be pure
+   duplication. */
+lbl_v3_call_module: {
+    int dest_reg     = READ();
+    int module_idx   = READ();
+    int fn_idx       = READ();
+    int arg_reg_base = READ();
+    int arg_count    = READ();
+    const char* module = aer_as_string(c->pool[module_idx])->data;
+    const char* fn     = aer_as_string(c->pool[fn_idx])->data;
+    for (int i = 0; i < arg_count; i++) PUSH(v3_registers[arg_reg_base + i]);
+    bool handled = false;
+    if      (strcmp(module, "math")   == 0) handled = aer_math_call(vm, c, fn, arg_count);
+    else if (strcmp(module, "random") == 0) handled = aer_random_call(vm, c, fn, arg_count);
+    else if (strcmp(module, "string") == 0) handled = aer_string_call(vm, c, fn, arg_count);
+    else if (strcmp(module, "time")   == 0) handled = aer_time_call(vm, c, fn, arg_count);
+    else if (strcmp(module, "json")   == 0) handled = aer_json_call(vm, c, fn, arg_count);
+    else if (aer_host_is_module(module, (unsigned int)strlen(module)))
+                                             handled = aer_host_call(vm, module, fn, arg_count);
+    else                                     handled = aer_module_call(vm, module, fn, arg_count);
+    if (handled) { v3_registers[dest_reg] = POP(); DISPATCH(); }
+    error("'%s' has no function '%s'", module, fn);
+    for (int i = 0; i < arg_count; i++) POP();
+    v3_registers[dest_reg] = aer_null();
+    DISPATCH();
+}
+
+/* See OP_V3_CALL_BUILTIN's comment in vm.h — vm_call_builtin() already takes a plain AerVal*
+   array (built for deferred-call replay, vm.c above), so unlike OP_V3_CALL_MODULE this needs no
+   push/pop bridge to vm->stack at all. 4 local slots is headroom over every builtin's real max
+   arity (2 — delete/append/assert). */
+lbl_v3_call_builtin: {
+    int dest_reg     = READ();
+    int name_idx     = READ();
+    int arg_reg_base = READ();
+    int arg_count    = READ();
+    const char* name = aer_as_string(c->pool[name_idx])->data;
+    if (arg_count > 4) {
+        error("Too many arguments to '%s'", name);
+        v3_registers[dest_reg] = aer_null();
+        DISPATCH();
+    }
+    AerVal args[4];
+    for (int i = 0; i < arg_count; i++) args[i] = v3_registers[arg_reg_base + i];
+    AerVal out;
+    bool handled = vm_call_builtin(c, name, args, arg_count, &out);
+    if (!handled) error("'%s' is not defined, or was called with the wrong number of arguments", name);
+    v3_registers[dest_reg] = out;
+    DISPATCH();
+}
+
+/* See OP_V3_LOAD_GLOBAL's comment in vm.h — always reads frame 0 directly, never the currently
+   active frame, since a function's own registers are a completely separate bank from the
+   top-level's. */
+lbl_v3_load_global: {
+    int dest_reg   = READ();
+    int global_reg = READ();
+    v3_registers[dest_reg] = v3_call_stack[0].registers[global_reg];
+    DISPATCH();
+}
+
+/* See V3DeferredCall's comment (above) and OP_V3_DEFER_PUSH's (vm.h) — snapshots arg_count
+   register values into the CURRENT frame's own deferred-call list now; lbl_v3_return drains this
+   list LIFO before the frame actually returns. Overflow checks mirror the stack VM's
+   lbl_defer_push exactly (arg_count is already rejected at parse time by v3_parse_defer, this is
+   just a defensive backstop). */
+lbl_v3_defer_push: {
+    int callee_offset = READ();
+    int arg_reg_base  = READ();
+    int arg_count     = READ();
+    V3CallFrame* frame = &v3_call_stack[v3_call_depth];
+    if (arg_count > MAX_DEFER_ARGS) {
+        error("Too many arguments to a deferred call (max %d)", MAX_DEFER_ARGS);
+        DISPATCH();
+    }
+    if (frame->defer_count >= MAX_DEFERS_PER_CALL) {
+        error("Too many deferred calls in one function (max %d)", MAX_DEFERS_PER_CALL);
+        DISPATCH();
+    }
+    if (!frame->defers) frame->defers = xmalloc(sizeof(V3DeferredCall) * MAX_DEFERS_PER_CALL);
+    V3DeferredCall* dc = &frame->defers[frame->defer_count++];
+    dc->callee_offset = (unsigned int)callee_offset;
+    dc->arg_count      = arg_count;
+    for (int i = 0; i < arg_count; i++) dc->args[i] = v3_registers[arg_reg_base + i];
     DISPATCH();
 }
 
@@ -3004,6 +3172,40 @@ lbl_v3_iter_next_array: {
     DISPATCH();
 }
 
+/* Feature-completeness follow-up — mirrors lbl_iter_range's TYPE_INTEGER checks/direction-inference/
+   exit-condition exactly (vm.c, above), reading/writing three plain registers instead of three
+   un-popped stack slots; no stack cleanup needed on exit since registers aren't a shared LIFO
+   structure the way vm->stack is. */
+lbl_v3_iter_range: {
+    int cur_reg       = READ();
+    int end_reg       = READ();
+    int step_reg      = READ();
+    int item_dest_reg = READ();
+    int end_target     = READ();
+    AerVal cur_v  = v3_registers[cur_reg];
+    AerVal end_v  = v3_registers[end_reg];
+    AerVal step_v = v3_registers[step_reg];
+    if (aer_type(cur_v) != TYPE_INTEGER || aer_type(end_v) != TYPE_INTEGER || aer_type(step_v) != TYPE_INTEGER) {
+        error("Range bounds and step must be integers");
+        vm->ip = (unsigned int)end_target;
+        DISPATCH();
+    }
+    long long cur = aer_as_int(cur_v), rng_end = aer_as_int(end_v), step = aer_as_int(step_v);
+    if (step <= 0) {
+        error("Range step must be a positive integer (direction is inferred from the bounds, not the step's sign)");
+        vm->ip = (unsigned int)end_target;
+        DISPATCH();
+    }
+    bool ascending = cur < rng_end;
+    if (ascending ? (cur >= rng_end) : (cur <= rng_end)) {
+        vm->ip = (unsigned int)end_target;
+        DISPATCH();
+    }
+    v3_registers[item_dest_reg] = cur_v;
+    v3_registers[cur_reg]       = aer_int(cur + (ascending ? step : -step));
+    DISPATCH();
+}
+
 /* Mirrors lbl_call's struct-instantiation fallback (above, around line 2137) almost verbatim —
    same chunk_find_shape() lookup, same arity check, same single-allocation struct_pool layout —
    reading args from a register range instead of popping them off the stack in reverse. */
@@ -3079,6 +3281,53 @@ lbl_v3_field_set: {
     }
     error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
           aer_as_string(c->pool[field_idx])->data);
+    DISPATCH();
+}
+
+/* Merges lbl_negate/lbl_not/lbl_bitwise_not (above, ~line 1967) into one handler keyed by
+   unary_op, same "reuse the stack VM's Opcode value as an operand tag" convention lbl_v3_binary
+   already uses — reading an RK operand (register or constant) instead of popping the stack.
+   M5 slice 9 folded OP_TO_STR in too (string interpolation's "{name}" -> string conversion) —
+   same one-opcode-per-mechanism-family shape, calling the existing vm_to_str() helper (shared
+   with print()/lbl_to_str above) rather than reimplementing value formatting. */
+lbl_v3_unary: {
+    int dest        = READ();
+    Opcode unary_op = (Opcode)READ();
+    int rk          = READ();
+    AerVal v = vm_v3_rk_value(c, rk);
+    AerVal result;
+    switch (unary_op) {
+        case OP_NEGATE:
+            if      (aer_type(v) == TYPE_INTEGER) result = aer_int(-aer_as_int(v));
+            else if (aer_type(v) == TYPE_REAL)     result = aer_real(-aer_as_real(v));
+            else { error("Negation requires a numeric type"); result = aer_null(); }
+            break;
+        case OP_NOT:
+            result = aer_bool(!vm_truthy(v));
+            break;
+        case OP_BITWISE_NOT:
+            if (aer_type(v) != TYPE_INTEGER) { error("Bitwise NOT requires an integer"); result = aer_null(); }
+            else result = aer_int(~aer_as_int(v));
+            break;
+        case OP_TO_STR:
+            result = vm_to_str(vm, v);
+            break;
+        default:
+            result = aer_null();
+            break;
+    }
+    v3_registers[dest] = result;
+    DISPATCH();
+}
+
+/* `x as integer/float/boolean` — reuses the extracted vm_cast() helper (above, shared with
+   lbl_cast) directly, no logic duplicated. */
+lbl_v3_cast: {
+    int dest      = READ();
+    int cast_type = READ();
+    int rk        = READ();
+    AerVal v = vm_v3_rk_value(c, rk);
+    v3_registers[dest] = vm_cast(v, cast_type);
     DISPATCH();
 }
 #endif

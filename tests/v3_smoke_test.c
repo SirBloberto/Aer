@@ -27,6 +27,14 @@ static void check(bool cond, const char* what) {
     else      { printf("FAIL: %s\n", what); failures++; }
 }
 
+/* M5 slice 9 — compares a v3 register's string value against a C string, for interpolation tests. */
+static bool v3_string_eq(AerVal v, const char* expected) {
+    if (aer_type(v) != TYPE_STRING) return false;
+    AerString* s = aer_as_string(v);
+    size_t elen = strlen(expected);
+    return s->length == elen && memcmp(s->data, expected, elen) == 0;
+}
+
 /* Runs `c` (already ending in OP_HALT) on a fresh VM, returning true on a clean finish.
    runtime_had_error is a global DISPATCH() checks on every single instruction (see error.h) — the
    normal interpreter resets it once per REPL statement (main.c's run()); a test harness invoking
@@ -757,6 +765,638 @@ int main(void) {
 
         check(!ok, "instantiating a struct with more arguments than fields reports a clean runtime error, not a crash");
 
+        chunk_free(&c);
+    }
+
+    /* Test 26 (M5 slice 7): unary operators — negate, not, bitwise-not, and a chained double
+       negation. `y` is always register 1 (second variable, after `x`). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = 5\ny = -x\n");
+        check(ok, "real source unary negate ('y = -x') ran without error");
+        check(aer_as_int(v3_register_get(1)) == -5, "y == -5");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = true\ny = !x\n");
+        check(ok, "real source unary not ('y = !x') ran without error");
+        check(aer_as_bool(v3_register_get(1)) == false, "y == false");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = 5\ny = ~x\n");
+        check(ok, "real source unary bitwise-not ('y = ~x') ran without error");
+        check(aer_as_int(v3_register_get(1)) == -6, "y == -6 (~5 in two's complement)");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = 5\ny = --x\n");
+        check(ok, "real source chained unary ('y = --x', double negation) ran without error");
+        check(aer_as_int(v3_register_get(1)) == 5, "y == 5 — double negation cancels, proving v3_parse_unary's self-recursion");
+        chunk_free(&c);
+    }
+
+    /* Test 27 (M5 slice 7): and/or short-circuit — all four truth-table corners. AER spells these
+       `&&`/`||` (lexer.h's TOKEN_AND/TOKEN_OR comments), not the words "and"/"or" — `y` is
+       register 0 (the only variable in each script). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "y = true && true\n");
+        check(ok, "'y = true && true' ran without error");
+        check(aer_as_bool(v3_register_get(0)) == true, "y == true");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "y = true && false\n");
+        check(ok, "'y = true && false' ran without error");
+        check(aer_as_bool(v3_register_get(0)) == false, "y == false");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "y = false || true\n");
+        check(ok, "'y = false || true' ran without error");
+        check(aer_as_bool(v3_register_get(0)) == true, "y == true");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "y = false || false\n");
+        check(ok, "'y = false || false' ran without error");
+        check(aer_as_bool(v3_register_get(0)) == false, "y == false");
+        chunk_free(&c);
+    }
+
+    /* Test 28 (M5 slice 7): compound assignment — arithmetic chain, one bitwise case, and a
+       compile-time error for compound-assigning an undefined name. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = 5\nx += 3\nx *= 2\n");
+        check(ok, "real source compound assignment ('x = 5; x += 3; x *= 2') ran without error");
+        check(aer_as_int(v3_register_get(0)) == 16, "x == 16 — (5 + 3) * 2");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = 6\nx &= 3\n");
+        check(ok, "real source bitwise compound assignment ('x = 6; x &= 3') ran without error");
+        check(aer_as_int(v3_register_get(0)) == 2, "x == 2 (6 & 3)");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x += 3\n");
+        check(!ok, "compound-assigning an undefined name reports a clean parse error, not a crash");
+        chunk_free(&c);
+    }
+
+    /* Test 29 (M5 slice 7): bitwise/shift as plain (non-assignment) expressions. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "y = 6 & 3\n");
+        check(ok, "real source bitwise AND expression ('y = 6 & 3') ran without error");
+        check(aer_as_int(v3_register_get(0)) == 2, "y == 2");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "y = 1 << 4\n");
+        check(ok, "real source left-shift expression ('y = 1 << 4') ran without error");
+        check(aer_as_int(v3_register_get(0)) == 16, "y == 16");
+        chunk_free(&c);
+    }
+
+    /* Test 30 (M5 slice 8): `break` inside a real-source for-while loop. `sum`/`i` are registers
+       0/1 (encounter order). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c,
+            "sum = 0\n"
+            "i = 0\n"
+            "for i < 10:\n"
+            "    if i == 5:\n"
+            "        break\n"
+            "    sum = sum + i\n"
+            "    i = i + 1\n");
+        check(ok, "real source 'break' inside a for-while loop ran without error");
+        check(aer_as_int(v3_register_get(0)) == 10, "sum == 10 — 0+1+2+3+4, break fired exactly at i==5");
+        check(aer_as_int(v3_register_get(1)) == 5, "i == 5 — the loop exited via break, not the condition");
+        chunk_free(&c);
+    }
+
+    /* Test 31 (M5 slice 8): `continue` inside a real-source for-while loop. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c,
+            "sum = 0\n"
+            "i = 0\n"
+            "for i < 5:\n"
+            "    i = i + 1\n"
+            "    if i == 3:\n"
+            "        continue\n"
+            "    sum = sum + i\n");
+        check(ok, "real source 'continue' inside a for-while loop ran without error");
+        check(aer_as_int(v3_register_get(0)) == 12, "sum == 12 — 1+2+4+5, i==3's iteration skipped sum += i via continue");
+        chunk_free(&c);
+    }
+
+    /* Test 32 (M5 slice 8): `break` inside a real-source for-in loop over an array. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c,
+            "sum = 0\n"
+            "for x in [1, 2, 3, 4, 5]:\n"
+            "    if x == 4:\n"
+            "        break\n"
+            "    sum = sum + x\n");
+        check(ok, "real source 'break' inside a for-in loop ran without error");
+        check(aer_as_int(v3_register_get(0)) == 6, "sum == 6 — 1+2+3, break fired at x==4 before it was added");
+        chunk_free(&c);
+    }
+
+    /* Test 33 (M5 slice 8): `break`/`continue` outside any loop are clean compile-time errors. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "break\n");
+        check(!ok, "'break' outside a loop reports a clean parse error, not a crash");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "continue\n");
+        check(!ok, "'continue' outside a loop reports a clean parse error, not a crash");
+        chunk_free(&c);
+    }
+
+    /* Test 34 (M5 slice 9): plain string literal through the new v3_parse_string_literal path
+       (no `{...}` — must still behave exactly like the old simple path did). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "y = \"hello\"\n");
+        check(ok, "real source plain string literal ('y = \"hello\"') ran without error");
+        check(v3_string_eq(v3_register_get(0), "hello"), "y == \"hello\"");
+        chunk_free(&c);
+    }
+
+    /* Test 35 (M5 slice 9): single interpolation. `x` is register 0, `y` register 1. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = 5\ny = \"value is {x}\"\n");
+        check(ok, "real source string interpolation ('y = \"value is {x}\"') ran without error");
+        check(v3_string_eq(v3_register_get(1), "value is 5"), "y == \"value is 5\"");
+        chunk_free(&c);
+    }
+
+    /* Test 36 (M5 slice 9): multiple interpolations in one literal. `a`/`b`/`y` are registers 0/1/2. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "a = 1\nb = 2\ny = \"{a} and {b}\"\n");
+        check(ok, "real source multi-interpolation ('y = \"{a} and {b}\"') ran without error");
+        check(v3_string_eq(v3_register_get(2), "1 and 2"), "y == \"1 and 2\"");
+        chunk_free(&c);
+    }
+
+    /* Test 37 (M5 slice 9): interpolating an undefined name is a clean compile-time error. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "y = \"{undefined_name}\"\n");
+        check(!ok, "interpolating an undefined name reports a clean parse error, not a crash");
+        chunk_free(&c);
+    }
+
+    /* Test 38 (M5 slice 8): 'in' — falls straight through to the generic OP_V3_BINARY/vm_binary
+       path already used by every other binary operator, so this is really a table-entry test. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "arr = [1, 2, 3]\ny = 2 in arr\nz = 9 in arr\n");
+        check(ok, "real source 'in' ('2 in arr') ran without error");
+        check(aer_as_bool(v3_register_get(1)) == true,  "y == true — 2 is in arr");
+        check(aer_as_bool(v3_register_get(2)) == false, "z == false — 9 is not in arr");
+        chunk_free(&c);
+    }
+
+    /* Test 39 (M5 slice 8): 'as' casting — string (via OP_V3_UNARY's OP_TO_STR case) and the
+       three OP_V3_CAST primitives. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = 5\ny = x as string\n");
+        check(ok, "real source 'x as string' ran without error");
+        check(v3_string_eq(v3_register_get(1), "5"), "y == \"5\"");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = \"42\"\ny = x as integer\n");
+        check(ok, "real source 'x as integer' ran without error");
+        check(aer_as_int(v3_register_get(1)) == 42, "y == 42");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = 3\ny = x as float\n");
+        check(ok, "real source 'x as float' ran without error");
+        check(aer_as_real(v3_register_get(1)) == 3.0, "y == 3.0");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = 1\ny = x as boolean\n");
+        check(ok, "real source 'x as boolean' ran without error");
+        check(aer_as_bool(v3_register_get(1)) == true, "y == true");
+        chunk_free(&c);
+    }
+
+    /* Test 40 (M5 slice 8): casting to an unknown/struct type name is a clean compile-time error
+       in v3 (no OP_CHECK_SHAPE equivalent exists yet — see OP_V3_CAST's comment in vm.h). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = 5\ny = x as SomeStruct\n");
+        check(!ok, "'as' to an unknown type name reports a clean parse error, not a crash");
+        chunk_free(&c);
+    }
+
+    /* Test 41 (M5 slice 10): pipe operator, no extra args — 'x |> f()' desugars to 'f(x)'. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "function square(x):\n    return x * x\ny = 6 |> square()\n");
+        check(ok, "real source 'y = 6 |> square()' ran without error");
+        check(aer_as_int(v3_register_get(0)) == 36, "y == 36 — piped value became square()'s only argument");
+        chunk_free(&c);
+    }
+
+    /* Test 42 (M5 slice 10): pipe operator with extra args — 'x |> f(a)' desugars to 'f(x, a)'. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "function add(a, b):\n    return a + b\ny = 3 |> add(4)\n");
+        check(ok, "real source 'y = 3 |> add(4)' ran without error");
+        check(aer_as_int(v3_register_get(0)) == 7, "y == 7 — piped value became add()'s first argument, 4 the second");
+        chunk_free(&c);
+    }
+
+    /* Test 43 (M5 slice 10): a module-qualified pipe target is a clean compile-time error in v3
+       (no module system yet), not a crash or silent misparse. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "x = 5\ny = x |> string.upper()\n");
+        check(!ok, "module-qualified pipe target reports a clean parse error, not a crash");
+        chunk_free(&c);
+    }
+
+    /* Test 44 (M5 slice 11): 'import' + module-qualified call, statement position. `y` is
+       register 0 — math.sqrt(16.0) returns 4.0 through OP_V3_CALL_MODULE's stack bridge. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "import math\ny = math.sqrt(16.0)\n");
+        check(ok, "real source 'import math' + 'y = math.sqrt(16.0)' ran without error");
+        check(aer_as_real(v3_register_get(0)) == 4.0, "y == 4.0");
+        chunk_free(&c);
+    }
+
+    /* Test 45 (M5 slice 11): module call with two arguments, and as a bare statement (no
+       assignment — result discarded, same as a plain function call statement). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "import math\ny = math.pow(2, 10)\nmath.floor(3.7)\n");
+        check(ok, "real source 'math.pow(2, 10)' + a bare 'math.floor(3.7)' statement ran without error");
+        check(aer_as_real(v3_register_get(0)) == 1024.0, "y == 1024.0");
+        chunk_free(&c);
+    }
+
+    /* Test 46 (M5 slice 11): calling a module function without importing it first is a clean
+       parse error (the module name is never registered via chunk_add_import, so it falls through
+       to plain-identifier resolution and fails as an unknown function). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "y = math.sqrt(16.0)\n");
+        check(!ok, "calling a module function without importing it first reports a clean parse error, not a crash");
+        chunk_free(&c);
+    }
+
+    /* Test 47 (M5 slice 12): 'defer' runs LIFO. `log` is a shared array passed into run() by
+       reference — each deferred record() overwrites log[0], so the FINAL value (read back via
+       `result = log[0]` after run() returns) reveals which one ran LAST. If defers ran in the
+       order they were written (FIFO), result would be 3; LIFO gives 1. Top-level registers:
+       log=0, result=1 (run(log)'s own discarded result lands in a temp, not a named variable). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c,
+            "function record(log, val):\n    log[0] = val\n"
+            "function run(log):\n    defer record(log, 1)\n    defer record(log, 2)\n    defer record(log, 3)\n    return 0\n"
+            "log = [0]\nrun(log)\nresult = log[0]\n");
+        check(ok, "real source 'defer' x3 inside run(log) ran without error");
+        check(aer_as_int(v3_register_get(1)) == 1, "result == 1 — defers drained LIFO (3, then 2, then 1 ran last)");
+        chunk_free(&c);
+    }
+
+    /* Test 48 (M5 slice 12): a deferred call's arguments are snapshotted at the defer statement,
+       not re-evaluated at replay time — x is reassigned to 99 AFTER the defer statement, but the
+       deferred record() call still sees x's value at the moment it was deferred (5). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c,
+            "function record(log, val):\n    log[0] = val\n"
+            "function run(log, x):\n    defer record(log, x)\n    x = 99\n    return 0\n"
+            "log = [0]\nrun(log, 5)\nresult = log[0]\n");
+        check(ok, "real source 'defer record(log, x)' then reassigning x ran without error");
+        check(aer_as_int(v3_register_get(1)) == 5, "result == 5 — the deferred call saw x's value at the defer statement, not its later reassignment");
+        chunk_free(&c);
+    }
+
+    /* Test 49 (M5 slice 12): defer runs before an explicit return, and the real return value is
+       preserved — y must be 42 (run()'s actual return value), independent of what the deferred
+       call does to the shared log array. Top-level registers: log=0, y=1, result=2. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c,
+            "function record(log, val):\n    log[0] = val\n"
+            "function run(log):\n    defer record(log, 1)\n    return 42\n"
+            "log = [0]\ny = run(log)\nresult = log[0]\n");
+        check(ok, "real source 'defer' then 'return 42' ran without error");
+        check(aer_as_int(v3_register_get(1)) == 42, "y == 42 — the real return value survives defer draining");
+        check(aer_as_int(v3_register_get(2)) == 1, "result == 1 — the deferred call still ran before run() actually returned");
+        chunk_free(&c);
+    }
+
+    /* Test 50 (M5 slice 12): 'defer' outside a function, and deferring an unknown function, are
+       both clean compile-time errors, not crashes. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "defer foo()\n");
+        check(!ok, "'defer' outside a function reports a clean parse error, not a crash");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "function run():\n    defer undefined_fn()\n");
+        check(!ok, "deferring an undefined function reports a clean parse error, not a crash");
+        chunk_free(&c);
+    }
+
+    /* Test 51 (feature completeness): 'for i in 0..5:' — range for-loop over a dynamic bound (n),
+       proving OP_V3_ITER_RANGE's cur_reg is a genuinely fresh register: if it aliased `n`'s own
+       register, `n` would be silently mutated to 5 by the loop. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "n = 5\nsum = 0\nfor i in 0..n:\n    sum = sum + i\n");
+        check(ok, "real source 'for i in 0..n: sum += i' ran without error");
+        check(aer_as_int(v3_register_get(1)) == 10, "sum == 10 — 0+1+2+3+4");
+        check(aer_as_int(v3_register_get(0)) == 5, "n == 5 — unchanged by the loop (cur_reg didn't alias n's register)");
+        chunk_free(&c);
+    }
+
+    /* Test 52 (feature completeness): 'a..b..step' explicit step, and a descending range (start >
+       end infers descending direction, not the step's sign). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "sum = 0\nfor i in 0..10..2:\n    sum = sum + i\n");
+        check(ok, "real source 'for i in 0..10..2:' ran without error");
+        check(aer_as_int(v3_register_get(0)) == 20, "sum == 20 — 0+2+4+6+8");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "sum = 0\nfor i in 5..0:\n    sum = sum + i\n");
+        check(ok, "real source 'for i in 5..0:' (descending) ran without error");
+        check(aer_as_int(v3_register_get(0)) == 15, "sum == 15 — 5+4+3+2+1, direction inferred from bounds");
+        chunk_free(&c);
+    }
+
+    /* Test 53 (feature completeness): break/continue still work inside a range for-loop, same as
+       they already do for array for-in (Tests 30-32). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "sum = 0\nfor i in 0..10:\n    if i == 5:\n        break\n    sum = sum + i\n");
+        check(ok, "real source 'break' inside a range for-loop ran without error");
+        check(aer_as_int(v3_register_get(0)) == 10, "sum == 10 — 0+1+2+3+4, break fired at i==5");
+        chunk_free(&c);
+    }
+
+    /* Test 54 (feature completeness): destructuring assignment, comma-separated RHS values packed
+       into an implicit array then unpacked — 'px, py, pz = 0.0, 0.0, 0.0', the exact shape nbody.aer
+       uses. Registers: px=0, py=1, pz=2. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "px, py, pz = 1, 2, 3\n");
+        check(ok, "real source 'px, py, pz = 1, 2, 3' ran without error");
+        check(aer_as_int(v3_register_get(0)) == 1, "px == 1");
+        check(aer_as_int(v3_register_get(1)) == 2, "py == 2");
+        check(aer_as_int(v3_register_get(2)) == 3, "pz == 3");
+        chunk_free(&c);
+    }
+
+    /* Test 55 (feature completeness): destructuring from a single array-valued RHS expression
+       (not a literal comma list) — 'a, b = arr' unpacks arr[0]/arr[1]. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "arr = [10, 20]\na, b = arr\n");
+        check(ok, "real source 'a, b = arr' (single array-valued RHS) ran without error");
+        check(aer_as_int(v3_register_get(1)) == 10, "a == 10 — arr[0]");
+        check(aer_as_int(v3_register_get(2)) == 20, "b == 20 — arr[1]");
+        chunk_free(&c);
+    }
+
+    /* Test 56 (feature completeness): destructuring still works when a temp register is live
+       across the assignment (the RHS uses an existing variable in an expression) — proves target
+       registers are reserved before the RHS is parsed, so a brand-new target variable's register
+       can't collide with a temp the RHS is still using. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "n = 5\na, b = n + 1, n + 2\n");
+        check(ok, "real source destructuring with a live RHS temp ran without error");
+        check(aer_as_int(v3_register_get(0)) == 5, "n == 5 — unchanged");
+        check(aer_as_int(v3_register_get(1)) == 6, "a == 6 — n + 1");
+        check(aer_as_int(v3_register_get(2)) == 7, "b == 7 — n + 2");
+        chunk_free(&c);
+    }
+
+    /* Test 57 (feature completeness): global builtins — length(), append(), type(). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "arr = [1, 2, 3]\ny = length(arr)\n");
+        check(ok, "real source 'y = length(arr)' ran without error");
+        check(aer_as_int(v3_register_get(1)) == 3, "y == 3");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "arr = [1, 2]\nappend(arr, 3)\ny = length(arr)\n");
+        check(ok, "real source 'append(arr, 3)' as a bare statement ran without error");
+        check(aer_as_int(v3_register_get(1)) == 3, "y == 3 — append() grew the same array in place");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "y = type(5)\n");
+        check(ok, "real source 'y = type(5)' ran without error");
+        check(v3_string_eq(v3_register_get(0), "integer"), "y == \"integer\"");
+        chunk_free(&c);
+    }
+
+    /* Test 58 (feature completeness): calling an unrecognized name (not a variable, function,
+       struct, module, or builtin) is still a clean compile-time error. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "y = totally_unknown_name(1)\n");
+        check(!ok, "calling a genuinely unknown name reports a clean parse error, not a crash");
+        chunk_free(&c);
+    }
+
+    /* Test 59 (feature completeness): compound assignment on a struct field ('p.x += 5'), the
+       exact shape nbody.aer's advance() function uses ('bj.vx += dx * mi'). Reads the fields back
+       via plain 'rx = p.x' since v3_register_get only sees registers, not struct fields directly.
+       Registers: p=0, rx=1, ry=2. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c,
+            "struct Point:\n    x\n    y\n"
+            "p = Point(1, 2)\np.x += 5\np.y *= 3\nrx = p.x\nry = p.y\n");
+        check(ok, "real source 'p.x += 5' / 'p.y *= 3' ran without error");
+        check(aer_as_int(v3_register_get(1)) == 6, "rx == 6 — 1 + 5");
+        check(aer_as_int(v3_register_get(2)) == 6, "ry == 6 — 2 * 3");
+        chunk_free(&c);
+    }
+
+    /* Test 60 (feature completeness): compound assignment on an array index ('arr[0] += 5'),
+       symmetric to the struct-field case just above. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "arr = [1, 2, 3]\narr[1] += 10\ny = arr[1]\n");
+        check(ok, "real source 'arr[1] += 10' ran without error");
+        check(aer_as_int(v3_register_get(1)) == 12, "y == 12 — 2 + 10");
+        chunk_free(&c);
+    }
+
+    /* Test 61 (feature completeness): a top-level ("global") variable is readable from inside a
+       function body via OP_V3_LOAD_GLOBAL, mirroring parser.c's own local-miss-falls-back-to-
+       global read. `SCALE` (register 0) is defined before `scaled` is called; `scaled`'s own
+       parameter `x` shadows nothing since there's no name collision here. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c,
+            "SCALE = 10\n"
+            "function scaled(x):\n    return x * SCALE\n"
+            "y = scaled(4)\n");
+        check(ok, "real source function reading a top-level global (SCALE) ran without error");
+        check(aer_as_int(v3_register_get(1)) == 40, "y == 40 — 4 * SCALE (SCALE read correctly from inside scaled())");
+        check(aer_as_int(v3_register_get(0)) == 10, "SCALE == 10 — unchanged by the call");
+        chunk_free(&c);
+    }
+
+    /* Test 62 (feature completeness): assignment inside a function is always local — it must NOT
+       silently write through to a same-named global. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c,
+            "x = 1\n"
+            "function set_local():\n    x = 99\n    return x\n"
+            "y = set_local()\n");
+        check(ok, "real source function-local assignment shadowing a global ran without error");
+        check(aer_as_int(v3_register_get(1)) == 99, "y == 99 — set_local()'s own return value");
+        check(aer_as_int(v3_register_get(0)) == 1, "x == 1 at top level — unchanged; the function's 'x = 99' was local, not a write-through to the global");
+        chunk_free(&c);
+    }
+
+    /* Test 63 (feature completeness, regression): a NEW variable declared inside a nested for-in
+       loop's body must not alias the OUTER loop's own long-lived iteration registers (cur_reg/
+       step_reg for a range loop, idx_reg/col_reg for an array loop). Found via nbody.aer's real
+       `for i in 0..num_bodies: for j in (i+1)..num_bodies: ...` shape, which silently corrupted
+       the outer loop's own `i` before this was fixed (v3_parse_for_in temporarily promotes its
+       long-lived registers via v3_reserved_floor for the loop's duration — see its own comment).
+       n=4: total pairs (i,j) with i<j is 4*3/2=6, not reachable at all if the inner loop's own `j`
+       corrupts the outer `i` (produces 3, or hangs, depending on exactly how it corrupts). */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "n = 4\ntotal = 0\nfor i in 0..n:\n    for j in (i+1)..n:\n        total = total + 1\n");
+        check(ok, "real source nested range for-loops (inner bound depends on outer var) ran without error");
+        check(aer_as_int(v3_register_get(1)) == 6, "total == 6 — 4 choose 2 pairs; a wrong/hung result would mean the inner loop's own j corrupted the outer loop's i");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "n = 3\ntotal = 0\nfor i in 0..n:\n    for j in 0..n:\n        total = total + 1\n");
+        check(ok, "real source nested range for-loops (independent bounds) ran without error");
+        check(aer_as_int(v3_register_get(1)) == 9, "total == 9 — 3*3, same aliasing hazard even when the inner loop doesn't depend on the outer var");
+        chunk_free(&c);
+    }
+
+    /* Test 64 (feature completeness, regression): a multi-argument call/array-literal/struct
+       construction where a NON-LAST argument is a computed expression (not a bare constant or
+       bare variable) must still land every argument in truly contiguous registers. Found via
+       nbody.aer's Body() constructor calls, several of whose args are `const * DAYS_PER_YEAR`
+       expressions — v3_arg_materialize used to always allocate a NEW register via v3_reg_alloc()
+       even when its input was already the topmost live temp, silently leaving a one-register gap
+       that shifted every following argument by one slot. With only 2 items the gap happened to go
+       unnoticed (nothing after the last one to misalign); a 3rd item exposed values shifted by
+       exactly one register. `y` here mixes a computed non-last arg (a+b) with plain trailing args,
+       matching the shape that broke. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        bool ok = v3_run_source(&c, "a = 2\nb = 3\narr = [a + b, 10, 20]\nx = arr[0]\ny = arr[1]\nz = arr[2]\n");
+        check(ok, "real source array literal with a computed non-last item, read back fully, ran without error");
+        check(aer_as_int(v3_register_get(3)) == 5,  "x == 5 — arr[0], the computed (a + b) item");
+        check(aer_as_int(v3_register_get(4)) == 10, "y == 10 — arr[1], correctly NOT shifted into arr[0]'s old register gap");
+        check(aer_as_int(v3_register_get(5)) == 20, "z == 20 — arr[2], correctly still the last item");
         chunk_free(&c);
     }
 

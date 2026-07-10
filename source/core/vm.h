@@ -236,6 +236,49 @@ typedef enum {
                      v3_registers[src_reg] to the caller's saved dest_reg, pops the callee's frame,
                      jumps back */
 
+    /* M5 slice 11 — module/stdlib calls (module.function(args)). Unlike OP_V3_CALL, this doesn't
+       get its own register-native calling convention: math/string/json/etc.'s implementations
+       (aer_math_call() and friends, vm.c) are shared stack-based infrastructure also used by the
+       stack VM's OP_CALL_MODULE, and reimplementing every stdlib function for a register calling
+       convention would be pure duplication for no behavioral gain. Instead the handler bridges the
+       two models directly: push arg_count values from the registers onto vm->stack, call the same
+       aer_*_call() the stack VM uses (pops arg_count args, pushes exactly one result on success),
+       then pop that single result back into dest_reg. Stack-neutral from the caller's perspective —
+       vm->stack_top ends exactly where it started, just like it does inside any other opcode that
+       makes a nested vm_run() call. */
+    OP_V3_CALL_MODULE, /* operands: dest_reg, module_pool_idx, fn_pool_idx, arg_reg_base, arg_count */
+
+    /* Feature-completeness follow-up — global builtins (length/delete/append/print/type/assert/
+       panic) called bare, e.g. `length(arr)`. Bridges to the exact same `vm_call_builtin()`
+       (vm.c) the stack VM's deferred-call replay already uses — that helper already takes a plain
+       AerVal* array (not a stack peek), so unlike OP_V3_CALL_MODULE this needs no push/pop bridge
+       at all: registers are copied into a small local array, passed straight through. Struct
+       construction (vm_call_builtin's other fallback branch, via chunk_find_shape) is deliberately
+       never reached here — v3 already resolves struct construction at compile time
+       (v3_is_struct_name/OP_V3_STRUCT_NEW), so only the seven builtin names above are ever checked
+       at parse time (v3_is_builtin_name, parser_v3.c) before this opcode is emitted. */
+    OP_V3_CALL_BUILTIN, /* operands: dest_reg, name_pool_idx, arg_reg_base, arg_count */
+
+    /* Feature-completeness follow-up — reading a top-level ("global") variable from inside a
+       function body, mirroring the stack VM's local-miss-falls-back-to-global read (OP_LOAD).
+       v3's per-call register windowing means a function's own registers are never the top-level
+       frame's registers, so this can't just be "the register" the way a local read is — it always
+       reads v3_call_stack[0] specifically (vm.c), regardless of which frame is currently
+       executing, since the top-level frame is never popped mid-run. Read-only: assignment inside
+       a function is always local in this language (parser.c's emit_store), so there's no
+       OP_V3_STORE_GLOBAL counterpart. */
+    OP_V3_LOAD_GLOBAL, /* operands: dest_reg, global_reg — v3_registers[dest_reg] =
+                          v3_call_stack[0].registers[global_reg] */
+
+    /* M5 slice 12 — `defer name(args)`. callee_offset is resolved at COMPILE time (unlike the
+       stack VM's OP_DEFER_PUSH, whose name_idx re-resolves via scope lookup at replay time) —
+       consistent with v3 already resolving every call target at compile time. Snapshots
+       arg_count values out of the CURRENT frame's registers into that frame's own deferred-call
+       list (V3CallFrame.defers, vm.c) immediately; lbl_v3_return drains this list LIFO before the
+       frame actually unwinds. See V3DeferredCall's comment (vm.c) for why v3 needs neither
+       CallFrame's pending_return_value nor its defers_draining flag. */
+    OP_V3_DEFER_PUSH, /* operands: callee_offset, arg_reg_base, arg_count */
+
     /* M4 (this slice: arrays only, see the plan's "deferred" list for dicts/structs/iteration) —
        the first v3 opcodes to put a HEAP-ALLOCATED value in a register, which is why
        mark_vm_roots (vm.c) gained an AER_V3 block scanning all of v3_registers[] alongside this —
@@ -281,6 +324,19 @@ typedef enum {
                               (loop exit, item_dest_reg untouched); else v3_registers[item_dest_reg]
                               = array.items[idx], v3_registers[idx_reg] += 1, fall through */
 
+    /* The integer-range follow-up flagged above — mirrors the stack VM's OP_ITER_RANGE (lbl_iter_range,
+       vm.c) exactly in semantics (direction inferred from cur vs end, not step's sign; step must be
+       positive; >=/<= exit check so a step that doesn't evenly divide the range still stops cleanly),
+       reading/writing three plain registers instead of three un-popped stack slots. cur_reg MUST be a
+       register the loop owns exclusively (never an aliased existing variable's register — see
+       v3_parse_for_in's use of v3_arg_materialize, not v3_materialize, to guarantee this), since this
+       opcode mutates it every iteration; end_reg/step_reg are read-only and may safely alias an
+       existing variable's register. */
+    OP_V3_ITER_RANGE, /* operands: cur_reg, end_reg, step_reg, item_dest_reg, end_target — if the
+                          range is exhausted: jump to end_target (item_dest_reg untouched); else
+                          v3_registers[item_dest_reg] = v3_registers[cur_reg], v3_registers[cur_reg]
+                          advances by +-step, fall through */
+
     /* M5 slice 6 — structs. OP_DEFINE_STRUCT itself (above) is reused unmodified for struct
        *definitions*: its handler (lbl_define_struct, vm.c) only ever reads operands and writes to
        chunk->shapes[], never vm->stack/scopes/v3_registers, so it's already exactly as
@@ -299,6 +355,27 @@ typedef enum {
                           = the matching field */
     OP_V3_FIELD_SET,  /* operands: struct_reg, field_name_pool_idx, rk_val — mirrors
                           lbl_field_set (vm.c), including its gc_barrier_array call */
+
+    /* M5 slice 7 — expression-grammar completions. unary_op reuses OP_NEGATE/OP_NOT/
+       OP_BITWISE_NOT as its operand tag, same convention OP_V3_BINARY already uses for bin_op —
+       one opcode per operator FAMILY, not one opcode per operator. and/or need no opcode at all:
+       they compile to existing OP_V3_JUMP_IF_FALSE_REG/OP_JUMP/OP_V3_LOADK, same as the stack
+       VM's own OP_AND/OP_OR are pure control-flow sugar with no dedicated opcode. */
+    OP_V3_UNARY, /* operands: dest_reg, unary_op, rk_operand — v3_registers[dest_reg] =
+                    unary_op(rk_operand); merges lbl_negate/lbl_not/lbl_bitwise_not (vm.c) into
+                    one handler, same as OP_V3_BINARY merges OP_ADD..OP_FLOOR_DIV etc. M5 slice 9
+                    folded OP_TO_STR in too (string interpolation's value-to-string step), calling
+                    the existing vm_to_str() helper — same one-opcode-per-family shape. */
+
+    /* M5 slice 9 — `x as integer/float/boolean`. Separate from OP_V3_UNARY since OP_CAST's own
+       operand (CAST_INTEGER/FLOAT/BOOLEAN, vm.h's #defines below) isn't an Opcode value the way
+       unary_op/bin_op are, so it doesn't fit that family's tag convention — but the actual
+       conversion logic is shared via the extracted vm_cast() helper (vm.c), not duplicated.
+       `x as string` still goes through OP_V3_UNARY's OP_TO_STR case (matches parser.c's own
+       parse_binary_ops, which does the same); `x as SomeStructType` (shape verification, never a
+       conversion) is out of scope for this slice — no v3 struct-shape-check opcode exists yet. */
+    OP_V3_CAST, /* operands: dest_reg, cast_type, rk_operand — v3_registers[dest_reg] =
+                   vm_cast(rk_operand, cast_type) */
 #endif
 } Opcode;
 

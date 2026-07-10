@@ -80,6 +80,14 @@ void v3_emit_dict_new(Chunk* c, int dest_reg, int pair_reg_base, int pair_count)
    VM's own "the iterate opcode is the loop's back-edge target" convention (parse_for, parser.c). */
 unsigned int v3_emit_iter_next_array(Chunk* c, int col_reg, int idx_reg, int item_dest_reg);
 
+/* Feature-completeness follow-up — the integer-range form flagged (but deferred) in
+   OP_V3_ITER_NEXT_ARRAY's own comment. Same emit-then-patch idiom: cur_reg MUST already be a
+   register the loop owns exclusively (mutated every iteration — never an aliased existing
+   variable's register), end_reg/step_reg may safely alias an existing variable's register
+   (read-only). Caller emits this instruction's own offset as the loop's back-edge target, same
+   convention as v3_emit_iter_next_array. */
+unsigned int v3_emit_iter_range(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg);
+
 /* M5 slice 6 — structs. type_name_pool_idx/field_name_pool_idx are plain pool indices (not
    RK-encoded — a type/field name is always a compile-time-known constant, never a register).
    rk_val (v3_emit_field_set) is RK-encoded like every other value operand. */
