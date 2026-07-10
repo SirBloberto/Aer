@@ -622,6 +622,9 @@ void chunk_free(Chunk* c) {
     free(c->imported_modules);
     /* Not each entry — every populated slot is a pointer INTO vm->scopes, never separately owned. */
     free(c->addr_cache);
+    /* Not each entry — every populated slot is a Shape* owned by c->shapes, never separately owned. */
+    free(c->field_cache_shape);
+    free(c->field_cache_slot);
 #ifdef AER_DEBUG_TOOLS
     free(c->debug_hits);
 #endif
@@ -1657,12 +1660,27 @@ static void chunk_ensure_debug_hits(Chunk* c) {
 }
 #endif
 
+/* Grows Chunk.field_cache_shape/slot to cover every word currently in c->code, zero-filling the
+   new region (NULL shape = not cached) — same growth idiom as chunk_ensure_debug_hits above, but
+   unconditional: this is a real always-on perf feature, not a debug tool. Called once at the top
+   of vm_run; a no-op once field_cache_cap already covers c->count (REPL appends code across
+   vm_run calls, same as debug_hits). */
+static void chunk_ensure_field_cache(Chunk* c) {
+    if (c->count <= c->field_cache_cap) return;
+    unsigned int old_cap = c->field_cache_cap;
+    c->field_cache_cap = c->count;
+    c->field_cache_shape = xrealloc(c->field_cache_shape, sizeof(Shape*) * c->field_cache_cap);
+    c->field_cache_slot  = xrealloc(c->field_cache_slot,  sizeof(int)    * c->field_cache_cap);
+    memset(c->field_cache_shape + old_cap, 0, sizeof(Shape*) * (c->field_cache_cap - old_cap));
+}
+
 bool vm_run(VM* vm) {
     Chunk* c = vm->chunk;
     Opcode cur_op;
 #ifdef AER_DEBUG_TOOLS
     chunk_ensure_debug_hits(c);
 #endif
+    chunk_ensure_field_cache(c);
 
 #define READ()     (c->code[vm->ip++])
 #define PUSH(v)    do { if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return false; } vm->stack[vm->stack_top++] = (v); } while(0)
@@ -2715,6 +2733,7 @@ lbl_define_struct: {
 }
 
 lbl_field_get: {
+    unsigned int site = vm->ip - 1;   /* the opcode's own word — see field_cache_shape's comment */
     int field_idx = READ();
     AerVal obj = POP();
     if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
@@ -2723,9 +2742,14 @@ lbl_field_get: {
     }
     AerArray* oa = aer_as_array(obj);
     Shape* shape = oa->shape;
+    if (c->field_cache_shape[site] == shape) {
+        PUSH(oa->items[c->field_cache_slot[site]]); DISPATCH();
+    }
     /* field_idx and shape->field_names[i] are chunk_add_pool-deduped indices, so an identical field name always yields the identical index — comparing indices is equivalent to strcmp, without one. */
     for (unsigned int i = 0; i < shape->field_count; i++) {
         if (shape->field_names[i] == (unsigned int)field_idx) {
+            c->field_cache_shape[site] = shape;
+            c->field_cache_slot[site]  = (int)i;
             PUSH(oa->items[i]); DISPATCH();
         }
     }
@@ -2735,6 +2759,7 @@ lbl_field_get: {
 }
 
 lbl_field_set: {
+    unsigned int site = vm->ip - 1;
     int field_idx = READ();
     AerVal val = POP();
     AerVal obj = POP();
@@ -2743,9 +2768,15 @@ lbl_field_set: {
     }
     AerArray* oa = aer_as_array(obj);
     Shape* shape = oa->shape;
+    if (c->field_cache_shape[site] == shape) {
+        gc_barrier_array(oa, val);
+        oa->items[c->field_cache_slot[site]] = val; DISPATCH();
+    }
     /* See lbl_field_get's comment — same pool-index equivalence. */
     for (unsigned int i = 0; i < shape->field_count; i++) {
         if (shape->field_names[i] == (unsigned int)field_idx) {
+            c->field_cache_shape[site] = shape;
+            c->field_cache_slot[site]  = (int)i;
             gc_barrier_array(oa, val);
             oa->items[i] = val; DISPATCH();
         }
@@ -3241,6 +3272,7 @@ lbl_v3_struct_new: {
 /* Mirrors lbl_field_get (above) exactly — same pool-index field-name scan — reading struct_reg
    from a register instead of popping the stack. */
 lbl_v3_field_get: {
+    unsigned int site = vm->ip - 1;
     int dest_reg   = READ();
     int struct_reg = READ();
     int field_idx  = READ();
@@ -3251,8 +3283,14 @@ lbl_v3_field_get: {
     }
     AerArray* oa = aer_as_array(obj);
     Shape* shape = oa->shape;
+    if (c->field_cache_shape[site] == shape) {
+        v3_registers[dest_reg] = oa->items[c->field_cache_slot[site]];
+        DISPATCH();
+    }
     for (unsigned int i = 0; i < shape->field_count; i++) {
         if (shape->field_names[i] == (unsigned int)field_idx) {
+            c->field_cache_shape[site] = shape;
+            c->field_cache_slot[site]  = (int)i;
             v3_registers[dest_reg] = oa->items[i];
             DISPATCH();
         }
@@ -3265,6 +3303,7 @@ lbl_v3_field_get: {
 /* Mirrors lbl_field_set (above) exactly, including its gc_barrier_array call — the first v3
    opcode to exercise that barrier for a struct instance rather than an array/dict. */
 lbl_v3_field_set: {
+    unsigned int site = vm->ip - 1;
     int struct_reg = READ();
     int field_idx  = READ();
     int rk_val     = READ();
@@ -3276,8 +3315,15 @@ lbl_v3_field_set: {
     }
     AerArray* oa = aer_as_array(obj);
     Shape* shape = oa->shape;
+    if (c->field_cache_shape[site] == shape) {
+        gc_barrier_array(oa, val);
+        oa->items[c->field_cache_slot[site]] = val;
+        DISPATCH();
+    }
     for (unsigned int i = 0; i < shape->field_count; i++) {
         if (shape->field_names[i] == (unsigned int)field_idx) {
+            c->field_cache_shape[site] = shape;
+            c->field_cache_slot[site]  = (int)i;
             gc_barrier_array(oa, val);
             oa->items[i] = val;
             DISPATCH();

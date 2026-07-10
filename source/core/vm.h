@@ -454,6 +454,21 @@ typedef struct {
     AerVal**     addr_cache;
     unsigned int addr_cache_count, addr_cache_cap;
 
+    /* One inline cache slot per OP_FIELD_GET/OP_FIELD_SET/OP_V3_FIELD_GET/OP_V3_FIELD_SET site,
+       indexed by the offset the opcode itself starts at (same indexing scheme as debug_hits
+       below) — remembers the last Shape* seen at that site plus the field's resolved index
+       within that shape, so a monomorphic site (the overwhelming common case: the same struct
+       type hitting the same `.field` expression on every iteration of a hot loop) skips straight
+       to the slot instead of re-scanning shape->field_names[] every single access. A polymorphic
+       site just keeps missing the cache (one wasted pointer compare) and falls back to the
+       existing linear scan — never incorrect, only sometimes not-sped-up. Shape* is never
+       reallocated once created (see struct Shape's own comment), so a cached pointer never goes
+       stale; grown in lockstep with `code` by chunk_ensure_field_cache (vm.c), called once at the
+       top of vm_run. NULL shape means "not cached yet". */
+    Shape**      field_cache_shape;
+    int*         field_cache_slot;
+    unsigned int field_cache_cap;
+
 #ifdef AER_DEBUG_TOOLS
     /* One dispatch counter per bytecode word, indexed by offset — only the word an opcode itself
        starts at is ever incremented (see DISPATCH() in vm.c), operand words stay 0. Grown in
