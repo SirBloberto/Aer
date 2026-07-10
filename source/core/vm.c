@@ -269,19 +269,23 @@ static void mark_vm_roots(VM* vm) {
        is a harmless no-op leaf in mark_value's default case, so there's no cost to scanning past
        whatever's actually live.
        M5 — reshaped from a single flat array to every frame's bank (v3_call_stack[VM_CALL_MAX],
-       V3_FRAME_REGISTERS each), still blanket-scanned regardless of v3_call_depth for the same
-       reason: a frame beyond the active depth is either all-zero or holds a previous, already-
-       returned call's stale values, and scanning either is a harmless no-op/over-retention, never
-       a dangling read. */
-    for (int f = 0; f < VM_CALL_MAX; f++)
+       V3_FRAME_REGISTERS each). Originally blanket-scanned over all VM_CALL_MAX frames regardless
+       of v3_call_depth on the theory that over-scanning dead frames is a harmless no-op; measured
+       on real hardware (Pi, nbody.aer) this was NOT free — it was the dominant source of cache
+       misses in the whole VM (10x the stack VM's), because a GC pass that runs at recursion depth
+       ~2-3 was still walking all 64 frames' worth of cold, mostly-zeroed memory every time. Frames
+       beyond v3_call_depth are dead (already returned, defers already drained by lbl_v3_return
+       before unwind), so bounding the scan to the live call chain can't under-collect — it only
+       stops retaining garbage from frames nothing can reach anymore. */
+    for (int f = 0; f <= v3_call_depth; f++)
         for (int i = 0; i < V3_FRAME_REGISTERS; i++)
             worklist_push(v3_call_stack[f].registers[i]);
 
     /* M5 slice 12 — a deferred call's snapshotted args live outside v3_registers[], in each frame's
        own defers[] side array (mirroring CallFrame's identical defer-args root below), so they need
-       their own scan; blanket over every frame for the same "harmless to over-scan" reason as the
-       registers loop just above. */
-    for (int f = 0; f < VM_CALL_MAX; f++) {
+       their own scan; bounded to the live call chain for the same reason as the registers loop
+       just above. */
+    for (int f = 0; f <= v3_call_depth; f++) {
         V3CallFrame* frame = &v3_call_stack[f];
         for (int d = 0; d < frame->defer_count; d++)
             for (int a = 0; a < frame->defers[d].arg_count; a++)
