@@ -1,0 +1,8 @@
+a = 1
+b = 2
+for i in 0..20000000:
+    a = a + b
+    a = a - b
+    a = a * 2
+    a = a - b
+print("done: {a}")

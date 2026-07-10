@@ -1,0 +1,9 @@
+struct P:
+    x
+
+p = P(5)
+a = 3
+for i in 0..20000000:
+    y = a - p.x
+    z = p.x * a
+print("done: {y} {z}")
