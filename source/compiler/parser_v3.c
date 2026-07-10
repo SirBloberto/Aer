@@ -184,7 +184,7 @@ static int  v3_parse_primary(Chunk* c);
 static int  v3_parse_string_literal(Chunk* c);
 static int  v3_parse_unary_inner(Chunk* c);
 static int  v3_parse_unary(Chunk* c);
-static int  v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs);
+static int  v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned int lhs_start);
 static int  v3_parse_binary(Chunk* c, unsigned int min_prec);
 static int  v3_compile_and(Chunk* c, int lhs, unsigned int prec);
 static int  v3_compile_or(Chunk* c, int lhs, unsigned int prec);
@@ -899,16 +899,16 @@ static int v3_compile_pipe(Chunk* c, int lhs) {
    split (parser.c:673-810) exactly, so a for-while condition that starts with an identifier can
    resolve that identifier once (see v3_parse_for_while) and climb from there, same as parser.c's
    own for-loop does for its while-fallback form. */
-static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs) {
+static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned int lhs_start) {
     for (;;) {
         unsigned int prec;
         Opcode op;
         if (!v3_binary_op_info(token.type, &prec, &op) || prec <= min_prec) break;
         lex();
 
-        if (op == OP_AND)  { lhs = v3_compile_and(c, lhs, prec); continue; }
-        if (op == OP_OR)   { lhs = v3_compile_or(c, lhs, prec);  continue; }
-        if (op == OP_PIPE) { lhs = v3_compile_pipe(c, lhs);      continue; }
+        if (op == OP_AND)  { lhs = v3_compile_and(c, lhs, prec); lhs_start = c->count; continue; }
+        if (op == OP_OR)   { lhs = v3_compile_or(c, lhs, prec);  lhs_start = c->count; continue; }
+        if (op == OP_PIPE) { lhs = v3_compile_pipe(c, lhs);      lhs_start = c->count; continue; }
 
         /* `x as T` — T is a bare type name, read directly rather than through v3_parse_binary,
            mirroring parser.c's own OP_CAST handling (parser.c:752-765). Struct-shape casting
@@ -944,11 +944,44 @@ static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs) {
                 chunk_emit(c, lhs);
             }
             lhs = dest;
+            lhs_start = c->count;
             continue;
+        }
+
+        /* Fusion — see OP_V3_FIELD_BINARY's own comment in vm.h. Checked BEFORE parsing the RHS,
+           while lhs's own bytecode (if it was a bare `struct.field` read) is still the last thing
+           in the chunk — once RHS is parsed, its bytecode would sit after lhs's, and excising a
+           chunk from the MIDDLE of the bytecode stream would risk invalidating any jump target RHS
+           itself emitted (short-circuit and/or, nested calls, ...). Truncating here, before RHS
+           exists at all, avoids that entirely — same "only ever discard from the tail" invariant
+           the RHS-is-field fusion below relies on. */
+        bool lhs_is_field = (c->count - lhs_start == 4 && c->code[lhs_start] == OP_V3_FIELD_GET);
+        int lhs_struct_reg = 0;
+        unsigned int lhs_field_idx = 0;
+        if (lhs_is_field) {
+            lhs_struct_reg = c->code[lhs_start + 2];
+            lhs_field_idx  = (unsigned int)c->code[lhs_start + 3];
+            c->count = lhs_start;   /* discard lhs's OP_V3_FIELD_GET, never executed */
         }
 
         unsigned int rhs_start = c->count;
         int rhs = v3_parse_binary(c, prec);   /* same precedence as floor -> left-associative */
+
+        if (lhs_is_field) {
+            if (v3_is_temp(rhs)) v3_reg_free(1);
+            if (v3_is_temp(lhs)) v3_reg_free(1);
+
+            int dest = v3_reg_alloc();
+            chunk_emit(c, OP_V3_FIELD_BINARY);
+            chunk_emit(c, dest);
+            chunk_emit(c, lhs_struct_reg);
+            chunk_emit(c, (int)lhs_field_idx);
+            chunk_emit(c, (int)op);
+            chunk_emit(c, rhs);
+            lhs = dest;
+            lhs_start = c->count;
+            continue;
+        }
 
         /* Fusion — see OP_V3_BINARY_FIELD's own comment in vm.h. Found via a real per-opcode
            dispatch audit on nbody.aer: `x OP y.field` (e.g. `dx = bix - bj.x`) compiled as a bare
@@ -957,8 +990,7 @@ static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs) {
            checking whether the RHS we just compiled was EXACTLY one bare `struct.field` read
            (a single OP_V3_FIELD_GET, 4 words, nothing chained after it) — if so, discard that
            instruction (never executed) and re-encode its two operands as this fused opcode's
-           trailing operands instead. One-directional (RHS-is-field only) — see the opcode's own
-           comment on why the reverse shape isn't handled here. */
+           trailing operands instead. */
         if (c->count - rhs_start == 4 && c->code[rhs_start] == OP_V3_FIELD_GET) {
             int struct_reg = c->code[rhs_start + 2];
             int field_idx  = c->code[rhs_start + 3];
@@ -975,6 +1007,7 @@ static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs) {
             chunk_emit(c, struct_reg);
             chunk_emit(c, field_idx);
             lhs = dest;
+            lhs_start = c->count;
             continue;
         }
 
@@ -989,13 +1022,15 @@ static int v3_parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs) {
         chunk_emit(c, (int)op);
         chunk_emit(c, rhs);
         lhs = dest;
+        lhs_start = c->count;
     }
     return lhs;
 }
 
 static int v3_parse_binary(Chunk* c, unsigned int min_prec) {
+    unsigned int lhs_start = c->count;
     int lhs = v3_parse_unary(c);
-    return v3_parse_binary_ops(c, min_prec, lhs);
+    return v3_parse_binary_ops(c, min_prec, lhs, lhs_start);
 }
 
 /* M5 slice 7 — mirrors parser.c's compound_assign_ops[] (parser.c:327-339) exactly, all 11
@@ -1179,15 +1214,20 @@ static void v3_parse_index_assignment(Chunk* c, unsigned int name_idx) {
         for (int i = 0; i < V3_COMPOUND_ASSIGN_OP_COUNT; i++) {
             if (!consume(v3_compound_assign_ops[i].tok)) continue;
 
+            /* Fusion — `arr[idx].field OP= rhs` (e.g. nbody's `bodies[i].x += bodies[i].vx * dt`):
+               OP_V3_FIELD_BINARY already computes exactly `dest = struct.field OP rhs` (built for
+               the general expression case above), so the read-then-combine step here is one
+               dispatch instead of OP_V3_FIELD_GET followed by OP_V3_BINARY — no new opcode
+               needed, just using the existing one directly instead of going through a temp. */
             int field_reg = v3_reg_alloc();
-            v3_emit_field_get(c, field_reg, struct_reg, field_idx);
 
             int rk_rhs = v3_parse_binary(c, 0);
             if (parse_had_error) return;
 
-            chunk_emit(c, OP_V3_BINARY);
+            chunk_emit(c, OP_V3_FIELD_BINARY);
             chunk_emit(c, field_reg);
-            chunk_emit(c, field_reg);
+            chunk_emit(c, struct_reg);
+            chunk_emit(c, (int)field_idx);
             chunk_emit(c, (int)v3_compound_assign_ops[i].op);
             chunk_emit(c, rk_rhs);
             if (v3_is_temp(rk_rhs)) v3_reg_free(1);
@@ -1429,7 +1469,11 @@ static void v3_parse_for_while(Chunk* c) {
         int reg = v3_var_slot(name_idx);
         if (reg < 0) return;
         unsigned int loop_top = c->count;
-        int rk_cond = v3_parse_binary_ops(c, 0, reg);
+        /* lhs_start == c->count: `reg` came straight from v3_var_slot, no bytecode was emitted for
+           it, so it can never look like a bare OP_V3_FIELD_GET — correctly disables the
+           lhs-is-field fusion for this caller without needing a special case in the shared
+           function. */
+        int rk_cond = v3_parse_binary_ops(c, 0, reg, c->count);
         v3_parse_for_body(c, loop_top, rk_cond);
         return;
     }
@@ -1835,22 +1879,24 @@ static void v3_parse_field_assignment(Chunk* c, unsigned int name_idx) {
        v3_parse_assignment's plain-variable compound assignment, just via field get/set instead of
        reading/writing a permanent register directly. Order matches parser.c's OP_DUP_N-based
        version exactly (parser.c:462-501): the field's CURRENT value is read before the RHS is
-       parsed, not after — matters if the RHS itself has a side effect on this same field. No
-       fusion mechanism needed (unlike the stack VM's OP_COMPOUND_INDEXED_FIELD_* family, which
-       exists purely to save a stack DUP — registers have nothing to duplicate). Still single-level
-       only, same limitation the plain '=' case above already has. */
+       parsed, not after — matters if the RHS itself has a side effect on this same field.
+       Fusion, added after v3_parse_binary_ops grew OP_V3_FIELD_BINARY for the general expression
+       case (`y.field OP x`, e.g. nbody's `mj = bj.mass * mag`) — that opcode already computes
+       exactly `dest = struct.field OP rhs`, which is precisely this read-modify step, so it's used
+       directly here instead of a separate OP_V3_FIELD_GET feeding an OP_V3_BINARY. Still single-
+       level only, same limitation the plain '=' case above already has. */
     for (int i = 0; i < V3_COMPOUND_ASSIGN_OP_COUNT; i++) {
         if (!consume(v3_compound_assign_ops[i].tok)) continue;
 
         int field_reg = v3_reg_alloc();
-        v3_emit_field_get(c, field_reg, struct_reg, field_idx);
 
         int rk_rhs = v3_parse_binary(c, 0);
         if (parse_had_error) return;
 
-        chunk_emit(c, OP_V3_BINARY);
+        chunk_emit(c, OP_V3_FIELD_BINARY);
         chunk_emit(c, field_reg);
-        chunk_emit(c, field_reg);
+        chunk_emit(c, struct_reg);
+        chunk_emit(c, (int)field_idx);
         chunk_emit(c, (int)v3_compound_assign_ops[i].op);
         chunk_emit(c, rk_rhs);
         if (v3_is_temp(rk_rhs)) v3_reg_free(1);

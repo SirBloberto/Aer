@@ -1401,10 +1401,12 @@ int main(void) {
     }
 
     /* Test 65 (fusion, found via a real per-opcode dispatch audit on nbody.aer): `x OP y.field`
-       (field on the RIGHT) should compile to one OP_V3_BINARY_FIELD instead of an
-       OP_V3_FIELD_GET followed by OP_V3_BINARY — covers a register LHS, a constant LHS, and
-       confirms the deliberately-unfused reverse shape (field on the LEFT) still produces the
-       correct value via the ordinary fallback path. */
+       fuses to OP_V3_BINARY_FIELD (field on the right) and `y.field OP x` fuses to
+       OP_V3_FIELD_BINARY (field on the left, no operand-swap needed since that opcode encodes
+       the field as its own left operand directly) — covers a register LHS/RHS and a constant
+       LHS/RHS for each direction, plus a 3-term chain (`p.x + p.y + a`) proving the SECOND
+       operator in a chain correctly falls back to the ordinary unfused path once `lhs` is no
+       longer a bare field-get (it's the first fusion's own result register instead). */
     {
         Chunk c;
         chunk_init(&c);
@@ -1414,11 +1416,15 @@ int main(void) {
             "a = 3\n"
             "b = a - p.x\n"
             "d = 100 - p.y\n"
-            "e = p.x - a\n");
-        check(ok, "real source fused/unfused struct-field binary ops ran without error");
-        check(aer_as_int(v3_register_get(2)) == -7, "b == -7 — a - p.x, fused (reg OP field)");
-        check(aer_as_int(v3_register_get(3)) == 80, "d == 80 — 100 - p.y, fused (const OP field)");
-        check(aer_as_int(v3_register_get(4)) == 7,  "e == 7 — p.x - a, NOT fused (field on the left), still correct via the ordinary path");
+            "e = p.x - a\n"
+            "f = p.y - 5\n"
+            "g = p.x + p.y + a\n");
+        check(ok, "real source fused struct-field binary ops (both operand orders) ran without error");
+        check(aer_as_int(v3_register_get(2)) == -7, "b == -7 — a - p.x, fused via OP_V3_BINARY_FIELD (reg OP field)");
+        check(aer_as_int(v3_register_get(3)) == 80, "d == 80 — 100 - p.y, fused via OP_V3_BINARY_FIELD (const OP field)");
+        check(aer_as_int(v3_register_get(4)) == 7,  "e == 7 — p.x - a, fused via OP_V3_FIELD_BINARY (field OP reg)");
+        check(aer_as_int(v3_register_get(5)) == 15, "f == 15 — p.y - 5, fused via OP_V3_FIELD_BINARY (field OP const)");
+        check(aer_as_int(v3_register_get(6)) == 33, "g == 33 — p.x + p.y + a: first '+' fuses (field OP field's own p.y read is untouched, p.x fuses as lhs), second '+' is the ordinary unfused path since its own lhs is now a fusion result, not a bare field-get");
         chunk_free(&c);
     }
 

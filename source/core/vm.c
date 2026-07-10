@@ -1804,6 +1804,7 @@ bool vm_run(VM* vm) {
         [OP_V3_UNARY]             = &&lbl_v3_unary,
         [OP_V3_CAST]              = &&lbl_v3_cast,
         [OP_V3_BINARY_FIELD]      = &&lbl_v3_binary_field,
+        [OP_V3_FIELD_BINARY]      = &&lbl_v3_field_binary,
 #endif
     };
 
@@ -3328,6 +3329,40 @@ lbl_v3_binary_field: {
             c->field_cache_shape[site] = shape;
             c->field_cache_slot[site]  = (int)i;
             v3_registers[dest_reg] = vm_binary(lhs, oa->items[i], (Opcode)bin_op);
+            DISPATCH();
+        }
+    }
+    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
+          aer_as_string(c->pool[field_idx])->data);
+    DISPATCH();
+}
+
+/* Mirror of lbl_v3_binary_field for the other operand order — see OP_V3_FIELD_BINARY's own
+   comment in vm.h. Own field_cache site, same as every other field-access opcode. */
+lbl_v3_field_binary: {
+    unsigned int site = vm->ip - 1;
+    int dest_reg   = READ();
+    int struct_reg = READ();
+    int field_idx  = READ();
+    int bin_op     = READ();
+    int rk_rhs     = READ();
+    AerVal rhs = vm_v3_rk_value(c, rk_rhs);
+    AerVal obj = v3_registers[struct_reg];
+    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
+        error("'.' field access requires a struct instance");
+        DISPATCH();
+    }
+    AerArray* oa = aer_as_array(obj);
+    Shape* shape = oa->shape;
+    if (c->field_cache_shape[site] == shape) {
+        v3_registers[dest_reg] = vm_binary(oa->items[c->field_cache_slot[site]], rhs, (Opcode)bin_op);
+        DISPATCH();
+    }
+    for (unsigned int i = 0; i < shape->field_count; i++) {
+        if (shape->field_names[i] == (unsigned int)field_idx) {
+            c->field_cache_shape[site] = shape;
+            c->field_cache_slot[site]  = (int)i;
+            v3_registers[dest_reg] = vm_binary(oa->items[i], rhs, (Opcode)bin_op);
             DISPATCH();
         }
     }

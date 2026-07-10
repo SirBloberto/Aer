@@ -383,12 +383,19 @@ typedef enum {
        structurally one operation. Recognized at emit time in v3_parse_binary_ops (parser_v3.c) by
        truncating the just-emitted OP_V3_FIELD_GET and re-encoding it as this opcode's last two
        operands, the same "discard-and-truncate-then-reemit" technique parser.c's own binary/
-       compound-assign fusion family already uses. Deliberately one-directional — `y.field OP x`
-       (field on the LEFT, e.g. `bj.mass * mag`) is NOT fused by this opcode; that shape needs
-       either a mirrored opcode or a commutative-swap, neither implemented yet (real, identified,
-       smaller remaining opportunity — see the fusion audit). */
+       compound-assign fusion family already uses. */
     OP_V3_BINARY_FIELD, /* operands: dest_reg, rk_lhs, bin_op, struct_reg, field_name_pool_idx —
                             v3_registers[dest_reg] = rk_lhs OP struct_reg.field */
+
+    /* Mirror of OP_V3_BINARY_FIELD for the other operand order — `y.field OP x` (e.g. this exact
+       benchmark's `mj = bj.mass * mag`), field on the LEFT. No operand swap/commutativity
+       reasoning needed: this opcode encodes the field as the LEFT operand directly, so it's
+       correct for every operator, commutative or not (`-`, `/`, comparisons included), the same
+       way OP_V3_BINARY_FIELD needed none for the field-on-the-right case. Recognized the same way,
+       by checking whether the LHS the caller already parsed (before entering the operator loop)
+       was itself a bare OP_V3_FIELD_GET. */
+    OP_V3_FIELD_BINARY, /* operands: dest_reg, struct_reg, field_name_pool_idx, bin_op, rk_rhs —
+                            v3_registers[dest_reg] = struct_reg.field OP rk_rhs */
 #endif
 } Opcode;
 
