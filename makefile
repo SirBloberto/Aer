@@ -89,12 +89,17 @@ test-v3:
 	./binary/v3_smoke_test$(EXE)
 
 # Standalone CLI runner (tests/v3_run_file.c) so a real .aer file can actually be run through v3 —
-# same isolation precedent as test-v3 above (never part of `all`/aer.exe). Usage:
-#   make run-v3 FILE=nbody.aer
-run-v3:
+# same isolation precedent as test-v3 above (never part of `all`/aer.exe).
+#   make build-v3          — build binary/v3_run_file only, no run (use this before perf/timing —
+#                             run-v3 below always recompiles unconditionally, so timing THAT target
+#                             would fold gcc's build time into the measurement)
+#   make run-v3 FILE=x.aer — build (if needed — see above) and run in one step, for quick manual checks
+build-v3:
 	@mkdir -p binary object
 	gcc $(FLAGS) -DAER_V3 -c tests/v3_run_file.c -o object/v3_run_file.o
 	gcc $(FLAGS) -DAER_V3 -o binary/v3_run_file$(EXE) $(V3SOURCE) object/v3_run_file.o -lm $(WINLIBS)
+
+run-v3: build-v3
 	./binary/v3_run_file$(EXE) $(FILE)
 
 # ASAN build for tests/fuzz.py — catches non-crashing memory bugs a plain build misses.
