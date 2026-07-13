@@ -19,8 +19,8 @@ extern unsigned int assert_failure_count;
 /* Set once (vm.c) to look up the executing instruction's source line for error()'s runtime faults; called lazily only inside error() (not every dispatch), so error-free runs pay nothing; NULL or a 0 return both mean "unknown," and error() omits the "Line N: " prefix rather than print a misleading "Line 0". */
 extern unsigned int (*runtime_line_lookup)(void);
 
-void error(char* format, ...);
-void error_at(char* format, ...);
+void error(char* format, ...) __attribute__((cold));
+void error_at(char* format, ...) __attribute__((cold));
 
 /* Terminates the process for a condition error recovery doesn't apply to (OOM) — routes through the same sink as error()/error_at() first; the only thing here still allowed to call exit(). */
 void aer_report_fatal(const char* msg);
