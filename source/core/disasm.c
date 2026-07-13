@@ -32,24 +32,54 @@ typedef struct {
     int packed;
 } OpInfo;
 
+/* True for the 18 specialized binary opcodes (OP_ADD/OP_LT/etc.) that now dispatch directly
+   instead of through a generic OP_BINARY wrapper — see PACK_BINARY's comment in vm.h. Not a
+   contiguous enum range (OP_AND/OP_OR/OP_PIPE sit between OP_IN and OP_BITWISE_AND but are never
+   actually dispatched), so spelled out explicitly rather than a range check. */
+static bool op_is_specialized_binary(Opcode op) {
+    switch (op) {
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_FLOOR_DIV:
+        case OP_EQ: case OP_NEQ: case OP_LT: case OP_GT: case OP_LTE: case OP_GTE: case OP_IN:
+        case OP_BITWISE_AND: case OP_BITWISE_OR: case OP_BITWISE_XOR: case OP_LSHIFT: case OP_RSHIFT:
+            return true;
+        default: return false;
+    }
+}
+
 /* OP_PRINT_REPL is the last member of the Opcode enum (vm.h). */
 #define OP_INFO_MAX OP_PRINT_REPL
 
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
-    /* OP_ADD..OP_RSHIFT/OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR are never dispatched as a
-       standalone instruction — only ever embedded as a bin_op/unary_op TAG inside OP_BINARY/
-       OP_CMP_JUMP_FALSE/OP_UNARY/OP_BINARY_FIELD/OP_FIELD_BINARY's packed word. They
-       still need a `.name`-only entry here: print_field's FLD_BINOP case calls opcode_name(word) to
-       render that embedded tag, which reads straight out of this table. Their `desc`/`fields` are
-       never used (disassemble_one only reaches those for an instruction actually fetched via
-       DISPATCH(), which these opcode values never are), so left blank. */
-    [OP_ADD] = { "OP_ADD" }, [OP_SUB] = { "OP_SUB" }, [OP_MUL] = { "OP_MUL" },
-    [OP_DIV] = { "OP_DIV" }, [OP_MOD] = { "OP_MOD" }, [OP_FLOOR_DIV] = { "OP_FLOOR_DIV" },
-    [OP_EQ] = { "OP_EQ" }, [OP_NEQ] = { "OP_NEQ" }, [OP_LT] = { "OP_LT" }, [OP_GT] = { "OP_GT" },
-    [OP_LTE] = { "OP_LTE" }, [OP_GTE] = { "OP_GTE" }, [OP_IN] = { "OP_IN" },
+    /* OP_ADD..OP_RSHIFT/OP_IN are genuinely dispatched now, each its own top-level opcode with a
+       dedicated vm_run label (see PACK_BINARY's comment in vm.h) — same single-word encoding
+       OP_BINARY used to use alone, decoded the same special-cased way below. Their `.name` also
+       still gets read by print_field's FLD_BINOP case when one of these values shows up as an
+       embedded tag elsewhere (OP_CMP_JUMP_FALSE/OP_BINARY_FIELD/OP_FIELD_BINARY's packed word). */
+    [OP_ADD] = { "OP_ADD", "reg = rk + rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_SUB] = { "OP_SUB", "reg = rk - rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_MUL] = { "OP_MUL", "reg = rk * rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_DIV] = { "OP_DIV", "reg = rk / rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_MOD] = { "OP_MOD", "reg = rk % rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_FLOOR_DIV] = { "OP_FLOOR_DIV", "reg = rk // rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_EQ]  = { "OP_EQ",  "reg = rk == rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_NEQ] = { "OP_NEQ", "reg = rk != rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_LT]  = { "OP_LT",  "reg = rk < rk",  {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_GT]  = { "OP_GT",  "reg = rk > rk",  {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_LTE] = { "OP_LTE", "reg = rk <= rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_GTE] = { "OP_GTE", "reg = rk >= rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_IN]  = { "OP_IN",  "reg = rk in rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_BITWISE_AND] = { "OP_BITWISE_AND", "reg = rk & rk",  {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_BITWISE_OR]  = { "OP_BITWISE_OR",  "reg = rk | rk",  {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_BITWISE_XOR] = { "OP_BITWISE_XOR", "reg = rk ^ rk",  {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_LSHIFT] = { "OP_LSHIFT", "reg = rk << rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    [OP_RSHIFT] = { "OP_RSHIFT", "reg = rk >> rk", {FLD_REG, FLD_BINOP}, false, 2 },
+
+    /* OP_AND/OP_OR/OP_PIPE/OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR are still never dispatched as
+       a standalone instruction — OP_AND/OP_OR/OP_PIPE are intercepted at parse time (short-circuit
+       jumps / call desugaring, vm.h's own comment), and the unary ones are OP_UNARY's embedded tag
+       only. `.name`-only entries, same reasoning as before: FLD_BINOP/unary printing reads .name
+       straight out of this table without ever reaching `desc`/`fields`. */
     [OP_AND] = { "OP_AND" }, [OP_OR] = { "OP_OR" }, [OP_PIPE] = { "OP_PIPE" },
-    [OP_BITWISE_AND] = { "OP_BITWISE_AND" }, [OP_BITWISE_OR] = { "OP_BITWISE_OR" },
-    [OP_BITWISE_XOR] = { "OP_BITWISE_XOR" }, [OP_LSHIFT] = { "OP_LSHIFT" }, [OP_RSHIFT] = { "OP_RSHIFT" },
     [OP_NEGATE] = { "OP_NEGATE" }, [OP_NOT] = { "OP_NOT" }, [OP_BITWISE_NOT] = { "OP_BITWISE_NOT" },
     [OP_TO_STR] = { "OP_TO_STR" },
 
@@ -65,11 +95,11 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
        disassembly purposes. */
     [OP_LOADK] = { "OP_LOADK", "reg = pool constant", {FLD_REG, FLD_POOL}, false, 1 },
     [OP_MOVE]  = { "OP_MOVE",  "reg = reg", {FLD_REG, FLD_REG}, false, 2 },
-    /* OP_BINARY is the sole exception to the "packed fields come from A/B/C, everything else is a
-       separate wide word" rule described above: its whole instruction (dest, bin_op, AND both RK
-       operands) is packed into ONE word (PACK_BINARY, vm.h), so it has no trailing wide fields at
-       all — disassemble_one special-cases it rather than going through the generic field loop. */
-    [OP_BINARY] = { "OP_BINARY", "reg = rk OP rk", {FLD_REG, FLD_BINOP}, false, 2 },
+    /* OP_BINARY itself is never dispatched anymore — PACK_BINARY's opcode byte now holds the real
+       operator (OP_ADD/OP_LT/etc., above) directly. Name-only entry, same reasoning as OP_AND/
+       OP_OR/etc. above; this exact word layout (dest, bin_op, both RK operands packed into ONE
+       word) is what disassemble_one's special-case branch decodes for all of them. */
+    [OP_BINARY] = { "OP_BINARY" },
     [OP_JUMP_IF_FALSE_REG] = { "OP_JUMP_IF_FALSE_REG", "jump if !reg, no pop", {FLD_REG, FLD_JUMP}, false, 1 },
     /* cmp_op/rk_a/rk_b all packed into one word (PACK_CMP_JUMP_FALSE, vm.h); the loop/if condition
        target stays its own dedicated word regardless — same patchable-target rule as everywhere
@@ -200,11 +230,13 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
             print_pool_value(out, c->pool[fdefault_idx]);
         }
         fprintf(out, "]");
-    } else if (op == OP_BINARY) {
+    } else if (op == OP_BINARY || op_is_specialized_binary(op)) {
         /* Packed single-word encoding (PACK_BINARY, vm.h) — dest/bin_op still come from A/B like
            any other packed opcode, but both RK operands live in THIS SAME word (bits 24-43/44-63)
            instead of trailing words, so they're decoded here rather than through the generic
-           fields[]-driven loop below (which OP_BINARY's own op_info entry has no entries left for). */
+           fields[]-driven loop below. bin_op (bits 16-23) is redundant with `op` itself now for the
+           18 specialized opcodes (both hold the same operator), but still printed via FLD_BINOP for
+           a uniform decode across the OP_BINARY case (dead in practice) and the real ones. */
         print_field(out, c, FLD_REG,   (int)UNPACK_A(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
         print_rk20(out, c, UNPACK_RK_B20(op_word));

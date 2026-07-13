@@ -13,12 +13,14 @@ struct AerDict {
 };
 
 typedef enum {
-    /* Binary arithmetic */
+    /* Binary arithmetic — each is its own top-level dispatched opcode (vm_run has a dedicated
+       label per operator via PACK_BINARY, vm.h), not merely a runtime tag anymore; see
+       PACK_BINARY's own comment for why (folds away the old inner bin_op switch). */
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_FLOOR_DIV,
 
-    /* Binary comparison */
+    /* Binary comparison — same deal, own dispatched opcode each. */
     OP_EQ, OP_NEQ, OP_LT, OP_GT, OP_LTE, OP_GTE,
-    OP_IN,              /* key in dict → key existence; value in array → element scan */
+    OP_IN,              /* key in dict → key existence; value in array → element scan; also its own dispatched opcode */
 
     /* Binary logical — never actually dispatched (parse_binary_ops intercepts `and`/`or`
        before emitting a real OP_BINARY, routing them to short-circuiting jumps instead, since
@@ -28,7 +30,7 @@ typedef enum {
     OP_AND, OP_OR,
     OP_PIPE,            /* never dispatched either — `x |> f(args)` desugars to a call at parse time; kept as a lookup-table tag only, same reason as OP_AND/OP_OR */
 
-    /* Binary bitwise */
+    /* Binary bitwise — same deal, own dispatched opcode each. */
     OP_BITWISE_AND, OP_BITWISE_OR, OP_BITWISE_XOR, OP_LSHIFT, OP_RSHIFT,
 
     /* Unary */
@@ -54,9 +56,12 @@ typedef enum {
     OP_LOADK,  /* operands: dest_reg, pool_idx — registers[dest_reg] = chunk pool constant */
     OP_MOVE,   /* operands: dest_reg, src_reg — registers[dest_reg] = registers[src_reg] */
     /* RK-encoded operand: a register index, or (with bit 30 set) a constant-pool index — see
-       vm_rk_value (vm.c). One opcode per operator's runtime `bin_op`, not a family of opcodes
-       per operand-kind combination — that's the entire point of RK encoding. */
-    OP_BINARY, /* operands: dest_reg, rk_b, bin_op, rk_c — registers[dest_reg] = rk_b OP rk_c */
+       vm_rk_value (vm.c). One RK-encoded operand slot per side, not a family of opcodes per
+       operand-kind combination — that's the entire point of RK encoding. */
+    OP_BINARY, /* legacy/unused as a dispatch target — PACK_BINARY's opcode byte now holds the
+                  real operator (OP_ADD/OP_LT/etc., each with its own vm_run label) directly, not
+                  this generic wrapper; kept as an enum value only because emit_binary/PACK_BINARY
+                  still use "OP_BINARY" as the family's name in comments elsewhere. */
 
     /* Control flow. These two ARE their own opcodes (rather than reusing something else) because
        their condition is read directly out of a register (or an RK-encoded constant), never
@@ -346,13 +351,13 @@ typedef enum {
 #define UNPACK_B(word) (((word) >> 16) & 0xFF)
 #define UNPACK_C(word) (((word) >> 24) & 0xFF)
 
-/* OP_BINARY alone gets a dedicated single-64-bit-word encoding: it's the single hottest opcode in
-   arithmetic-heavy code (over a third of all dispatches on nbody.aer), and the ordinary PACK3/RK
-   scheme above still costs it 3 separate code-array fetches per dispatch (op_word, rk_b, rk_c) —
+/* Binary operators alone get a dedicated single-64-bit-word encoding: they're the hottest opcodes
+   in arithmetic-heavy code (over a third of all dispatches on nbody.aer), and the ordinary PACK3/RK
+   scheme above still costs 3 separate code-array fetches per dispatch (op_word, rk_b, rk_c) —
    one DISPATCH() fetch of op_word, then two more READ()s just to find out what to compute. Once
    code[] is a 64-bit-word array (see Chunk's own comment above), opcode(8) + dest(8) + bin_op(8) +
-   two 20-bit RK operands (52 bits) fits in one word with room to spare, cutting OP_BINARY to the
-   ONE fetch DISPATCH() already does for every opcode, unconditionally.
+   two 20-bit RK operands (52 bits) fits in one word with room to spare, cutting every binary op to
+   the ONE fetch DISPATCH() already does for every opcode, unconditionally.
      This compact RK operand needs its own (narrower) flag/index split — RK20_CONST_FLAG at bit 19
    rather than RK_CONST_FLAG's bit 30 — since 20 bits total has to hold both the flag and the
    index. 19 index bits (524288 slots) is still enormous headroom over both FRAME_REGISTERS (128)
@@ -367,8 +372,17 @@ typedef enum {
     (((rk) & RK_CONST_FLAG) \
         ? (RK20_CONST_FLAG | ((unsigned long long)((rk) & ~RK_CONST_FLAG) & RK20_INDEX_MASK)) \
         : ((unsigned long long)(rk) & RK20_INDEX_MASK))
+/* The opcode byte holds bin_op itself (OP_ADD, OP_LT, ...), not a generic OP_BINARY — every real
+   binary operator dispatches straight to its own vm_run label instead of funneling through one
+   shared handler that then re-switches on bin_op at runtime. That inner re-switch used to cost a
+   second indirect branch on top of the outer computed-goto for every single arithmetic op; since
+   bin_op is a compile-time constant at each of vm_run's 18 specialized call sites into
+   always_inline vm_binary(), the compiler folds it away to straight-line code instead. bin_op is
+   still duplicated into bits 16-23 (its old, pre-specialization home) purely so disasm.c's
+   existing FLD_BINOP decode path keeps working unchanged — genuinely redundant with the opcode
+   byte now, kept only for that reuse. */
 #define PACK_BINARY(dest, bin_op, rk_b, rk_c) \
-    ( ((unsigned long long)(OP_BINARY) & 0xFF) \
+    ( ((unsigned long long)(bin_op) & 0xFF) \
     | (((unsigned long long)(dest)   & 0xFF) << 8) \
     | (((unsigned long long)(bin_op) & 0xFF) << 16) \
     | ((PACK_RK20(rk_b) & 0xFFFFFULL) << 24) \

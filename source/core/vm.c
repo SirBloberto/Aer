@@ -931,8 +931,15 @@ static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b
         return aer_bool(false);
     }
 
+    /* Computed once and reused through both fast paths below — aer_type() is cheap, but the
+       int/int and real/real checks used to each call it fresh on the same, unchanged a/b,
+       paying for the is-boxed test twice on every binary op that reaches the real/real path
+       (the common case for arithmetic-heavy code like nbody). Not reused past the real-promotion
+       below, since that reassigns a/b — types genuinely change there. */
+    ValueType ta = aer_type(a), tb = aer_type(b);
+
     /* Integer-vs-integer fast path, checked before null/real-promotion below — the common case for arithmetic-heavy code, and neither branch applies once both are integers. */
-    if (aer_type(a) == TYPE_INTEGER && aer_type(b) == TYPE_INTEGER) {
+    if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) {
         long long l = aer_as_int(a), rv = aer_as_int(b);
         switch (op) {
             case OP_ADD:         return aer_int(l + rv);
@@ -970,7 +977,7 @@ static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b
        promoted-from-int operand still needs, not a replacement). Same case bodies as that switch,
        duplicated rather than shared, since jumping into the middle of the block below isn't
        simpler than just checking here first. */
-    if (aer_type(a) == TYPE_REAL && aer_type(b) == TYPE_REAL) {
+    if (ta == TYPE_REAL && tb == TYPE_REAL) {
         double l = aer_as_real(a), rv = aer_as_real(b);
         switch (op) {
             case OP_ADD: return aer_real(l + rv);
@@ -994,13 +1001,13 @@ static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b
     }
 
     /* null equality: null == null is true; null op anything-else errors */
-    if (aer_type(a) == TYPE_NULL || aer_type(b) == TYPE_NULL) {
-        if (op == OP_EQ)  return aer_bool(aer_type(a) == TYPE_NULL && aer_type(b) == TYPE_NULL);
-        if (op == OP_NEQ) return aer_bool(!(aer_type(a) == TYPE_NULL && aer_type(b) == TYPE_NULL));
+    if (ta == TYPE_NULL || tb == TYPE_NULL) {
+        if (op == OP_EQ)  return aer_bool(ta == TYPE_NULL && tb == TYPE_NULL);
+        if (op == OP_NEQ) return aer_bool(!(ta == TYPE_NULL && tb == TYPE_NULL));
         error("Operator not valid for null"); return aer_bool(false);
     }
 
-    if (aer_type(a) == TYPE_REAL || aer_type(b) == TYPE_REAL) {
+    if (ta == TYPE_REAL || tb == TYPE_REAL) {
         a = vm_promote_real(a);
         b = vm_promote_real(b);
     }
@@ -1616,17 +1623,38 @@ bool vm_run(VM* vm) {
 #endif
 
     static const void* const dt[] = {
-        /* OP_ADD..OP_RSHIFT/OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR have no entries here at all —
-           they're never dispatched as a standalone instruction, only ever embedded as a
-           bin_op/unary_op TAG inside an OP_BINARY/OP_UNARY/etc. instruction's packed word (see
-           PACK3's comment above); indexing dt[] with cur_op only happens right after DISPATCH()
-           reads a genuine top-level instruction word, which is never one of these. */
+        /* OP_ADD..OP_RSHIFT/OP_IN each get their own entry below (see BINARY_OP_LABEL, further
+           down this function) — genuinely dispatched now, not just an embedded tag. OP_AND/OP_OR/
+           OP_PIPE/OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR still have no entries here at all:
+           the first three are intercepted at parse time (short-circuit jumps / call desugaring),
+           and the rest are only ever embedded as OP_UNARY's tag — indexing dt[] with cur_op only
+           happens right after DISPATCH() reads a genuine top-level instruction word, which is
+           never one of these. */
         [OP_JUMP]           = &&lbl_jump,
         [OP_DEFINE_STRUCT]  = &&lbl_define_struct,
         [OP_HALT]           = &&lbl_halt,
         [OP_LOADK]       = &&lbl_loadk,
         [OP_MOVE]        = &&lbl_move,
-        [OP_BINARY]      = &&lbl_binary,
+        /* Each binary operator dispatches straight to its own label now — see PACK_BINARY's
+           comment in vm.h for why OP_BINARY itself no longer appears here. */
+        [OP_ADD]         = &&lbl_add,
+        [OP_SUB]         = &&lbl_sub,
+        [OP_MUL]         = &&lbl_mul,
+        [OP_DIV]         = &&lbl_div,
+        [OP_MOD]         = &&lbl_mod,
+        [OP_FLOOR_DIV]   = &&lbl_floor_div,
+        [OP_EQ]          = &&lbl_eq,
+        [OP_NEQ]         = &&lbl_neq,
+        [OP_LT]          = &&lbl_lt,
+        [OP_GT]          = &&lbl_gt,
+        [OP_LTE]         = &&lbl_lte,
+        [OP_GTE]         = &&lbl_gte,
+        [OP_IN]          = &&lbl_in,
+        [OP_BITWISE_AND] = &&lbl_bitwise_and,
+        [OP_BITWISE_OR]  = &&lbl_bitwise_or,
+        [OP_BITWISE_XOR] = &&lbl_bitwise_xor,
+        [OP_LSHIFT]      = &&lbl_lshift,
+        [OP_RSHIFT]      = &&lbl_rshift,
         [OP_JUMP_IF_FALSE_REG] = &&lbl_jump_if_false_reg,
         [OP_CMP_JUMP_FALSE]    = &&lbl_cmp_jump_false,
         [OP_CALL]              = &&lbl_call,
@@ -1701,18 +1729,43 @@ lbl_move: {
     DISPATCH();
 }
 
-/* Whole instruction — dest, bin_op, AND both RK operands — packed into the single op_word DISPATCH()
+/* Whole instruction — dest AND both RK operands — packed into the single op_word DISPATCH()
    already fetched (see PACK_BINARY's comment in vm.h). No further READ() at all: this is the
-   entire reason OP_BINARY gets its own encoding instead of the ordinary PACK3+wide-word scheme
-   every other opcode uses. */
-lbl_binary: {
-    int dest      = (int)UNPACK_A(op_word);
-    Opcode bin_op = (Opcode)UNPACK_B(op_word);
-    AerVal b  = vm_rk_value20(vm, c, UNPACK_RK_B20(op_word));
-    AerVal cc = vm_rk_value20(vm, c, UNPACK_RK_C20(op_word));
-    vm->registers[dest] = vm_binary(b, cc, bin_op);
-    DISPATCH();
+   entire reason binary operators get their own encoding instead of the ordinary PACK3+wide-word
+   scheme every other opcode uses. The operator itself is passed to vm_binary as a literal enum
+   constant (not a variable decoded from op_word) — since vm_binary is always_inline, the compiler
+   constant-folds away every branch in it that doesn't apply to that specific operator (the AND/OR/
+   IN checks, the other type-switch cases, ...), leaving straight-line code. That's the entire
+   point of having 18 labels instead of decoding one shared bin_op tag and switching on it at
+   runtime — this used to cost a second indirect branch on top of DISPATCH()'s own, for every
+   single arithmetic/comparison/bitwise op. */
+#define BINARY_OP_LABEL(label, opc) \
+label: { \
+    int dest  = (int)UNPACK_A(op_word); \
+    AerVal b  = vm_rk_value20(vm, c, UNPACK_RK_B20(op_word)); \
+    AerVal cc = vm_rk_value20(vm, c, UNPACK_RK_C20(op_word)); \
+    vm->registers[dest] = vm_binary(b, cc, opc); \
+    DISPATCH(); \
 }
+BINARY_OP_LABEL(lbl_add, OP_ADD)
+BINARY_OP_LABEL(lbl_sub, OP_SUB)
+BINARY_OP_LABEL(lbl_mul, OP_MUL)
+BINARY_OP_LABEL(lbl_div, OP_DIV)
+BINARY_OP_LABEL(lbl_mod, OP_MOD)
+BINARY_OP_LABEL(lbl_floor_div, OP_FLOOR_DIV)
+BINARY_OP_LABEL(lbl_eq,  OP_EQ)
+BINARY_OP_LABEL(lbl_neq, OP_NEQ)
+BINARY_OP_LABEL(lbl_lt,  OP_LT)
+BINARY_OP_LABEL(lbl_gt,  OP_GT)
+BINARY_OP_LABEL(lbl_lte, OP_LTE)
+BINARY_OP_LABEL(lbl_gte, OP_GTE)
+BINARY_OP_LABEL(lbl_in,  OP_IN)
+BINARY_OP_LABEL(lbl_bitwise_and, OP_BITWISE_AND)
+BINARY_OP_LABEL(lbl_bitwise_or,  OP_BITWISE_OR)
+BINARY_OP_LABEL(lbl_bitwise_xor, OP_BITWISE_XOR)
+BINARY_OP_LABEL(lbl_lshift, OP_LSHIFT)
+BINARY_OP_LABEL(lbl_rshift, OP_RSHIFT)
+#undef BINARY_OP_LABEL
 
 /* M2 — control flow. Stack-neutral, same as the M1 opcodes above — reads vm->registers[]/the chunk
    pool only, never pops/pushes anything, and OP_JUMP (reused as-is for unconditional jumps) is

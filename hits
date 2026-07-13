@@ -1,0 +1,343 @@
+--- disassembly (303 words) ---
+     0  OP_LOADK                      reg = pool constant  reg=0  val=3.14159   [hits=1, line=1]
+     2  OP_MUL                        reg = rk * rk  reg=1  op=OP_MUL  rk=const:4  rk=reg0   [hits=1, line=2]
+     3  OP_MUL                        reg = rk * rk  reg=1  op=OP_MUL  rk=reg1  rk=reg0   [hits=1, line=2]
+     4  OP_LOADK                      reg = pool constant  reg=2  val=365.24   [hits=1, line=3]
+     6  OP_DEFINE_STRUCT              register a struct type (variable-length: name, field count, then that many field/default pairs)  name=Body fields=7 [x=null, y=null, z=null, vx=null, vy=null, vz=null, mass=null]   [hits=1, line=5]
+    23  OP_JUMP                       unconditional jump  -> 67   [hits=1, line=17]
+    25  OP_LOADK                      reg = pool constant  reg=4  val=0   [hits=1, line=18]
+    27  OP_LOADK                      reg = pool constant  reg=5  val=0   [hits=1, line=18]
+    29  OP_LOADK                      reg = pool constant  reg=6  val=0   [hits=1, line=18]
+    31  OP_ARRAY_NEW                  reg = new array from a contiguous reg range  reg=4  reg=4  n=3   [hits=1, line=18]
+    32  OP_INDEX_GET                  reg = reg[rk]  reg=1  reg=4  rk=const:0   [hits=1, line=18]
+    33  OP_INDEX_GET                  reg = reg[rk]  reg=2  reg=4  rk=const:1   [hits=1, line=18]
+    34  OP_INDEX_GET                  reg = reg[rk]  reg=3  reg=4  rk=const:2   [hits=1, line=18]
+    35  OP_LOADK                      reg = pool constant  reg=5  val=0   [hits=1, line=19]
+    37  OP_ITER_NEXT_ARRAY            for-each step, array or dict-keys  reg=0  reg=5  reg=4  -> 50   [hits=6, line=19]
+    39  OP_FIELD_GET                  reg = struct.field  reg=7  reg=4  name=mass   [hits=5, line=20]
+    40  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=6  reg=4  op=OP_MUL  name=vx  rk=reg7   [hits=5, line=20]
+    41  OP_ADD                        reg = rk + rk  reg=1  op=OP_ADD  rk=reg1  rk=reg6   [hits=5, line=20]
+    42  OP_FIELD_GET                  reg = struct.field  reg=7  reg=4  name=mass   [hits=5, line=21]
+    43  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=6  reg=4  op=OP_MUL  name=vy  rk=reg7   [hits=5, line=21]
+    44  OP_ADD                        reg = rk + rk  reg=2  op=OP_ADD  rk=reg2  rk=reg6   [hits=5, line=21]
+    45  OP_FIELD_GET                  reg = struct.field  reg=7  reg=4  name=mass   [hits=5, line=22]
+    46  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=6  reg=4  op=OP_MUL  name=vz  rk=reg7   [hits=5, line=22]
+    47  OP_ADD                        reg = rk + rk  reg=3  op=OP_ADD  rk=reg3  rk=reg6   [hits=5, line=22]
+    48  OP_JUMP                       unconditional jump  -> 37   [hits=5, line=22]
+    50  OP_INDEX_GET                  reg = reg[rk]  reg=5  reg=0  rk=const:0   [hits=1, line=24]
+    51  OP_MOVE                       reg = reg  reg=4  reg=5   [hits=1, line=24]
+    52  OP_UNARY                      reg = unary_op(rk)  reg=5  op=OP_NEGATE  rk=reg1   [hits=1, line=25]
+    53  OP_LOAD_GLOBAL                reg = top-level frame's reg (read-only)  reg=6  reg=1   [hits=1, line=25]
+    54  OP_DIV                        reg = rk / rk  reg=5  op=OP_DIV  rk=reg5  rk=reg6   [hits=1, line=25]
+    55  OP_FIELD_SET                  struct.field = rk  reg=4  name=vx  rk=reg5   [hits=1, line=25]
+    56  OP_UNARY                      reg = unary_op(rk)  reg=5  op=OP_NEGATE  rk=reg2   [hits=1, line=26]
+    57  OP_LOAD_GLOBAL                reg = top-level frame's reg (read-only)  reg=6  reg=1   [hits=1, line=26]
+    58  OP_DIV                        reg = rk / rk  reg=5  op=OP_DIV  rk=reg5  rk=reg6   [hits=1, line=26]
+    59  OP_FIELD_SET                  struct.field = rk  reg=4  name=vy  rk=reg5   [hits=1, line=26]
+    60  OP_UNARY                      reg = unary_op(rk)  reg=5  op=OP_NEGATE  rk=reg3   [hits=1, line=27]
+    61  OP_LOAD_GLOBAL                reg = top-level frame's reg (read-only)  reg=6  reg=1   [hits=1, line=27]
+    62  OP_DIV                        reg = rk / rk  reg=5  op=OP_DIV  rk=reg5  rk=reg6   [hits=1, line=27]
+    63  OP_FIELD_SET                  struct.field = rk  reg=4  name=vz  rk=reg5   [hits=1, line=27]
+    64  OP_LOADK                      reg = pool constant  reg=5  val=null   [hits=1, line=27]
+    66  OP_RETURN                     return reg to caller, drain pending defers first  reg=5   [hits=1, line=27]
+    67  OP_JUMP                       unconditional jump  -> 122   [hits=1, line=30]
+    69  OP_LOADK                      reg = pool constant  reg=1  val=0   [hits=2, line=31]
+    71  OP_MOVE                       reg = reg  reg=2  reg=0   [hits=2, line=32]
+    72  OP_CALL_BUILTIN               global builtin (length/append/etc.) by name  reg=2  reg=2  n=1  name=length   [hits=2, line=32]
+    73  OP_LOADK                      reg = pool constant  reg=4  val=0   [hits=2, line=33]
+    75  OP_LOADK                      reg = pool constant  reg=5  val=1   [hits=2, line=33]
+    77  OP_ITER_RANGE                 for-each step, numeric a..b[..step] range  reg=4  reg=2  reg=5  reg=3  -> 118   [hits=12, line=33]
+    79  OP_INDEX_GET                  reg = reg[rk]  reg=6  reg=0  rk=reg3   [hits=10, line=34]
+    80  OP_FIELD_GET                  reg = struct.field  reg=7  reg=6  name=vx   [hits=10, line=35]
+    81  OP_FIELD_GET                  reg = struct.field  reg=8  reg=6  name=vy   [hits=10, line=36]
+    82  OP_FIELD_GET                  reg = struct.field  reg=9  reg=6  name=vz   [hits=10, line=37]
+    83  OP_FIELD_GET                  reg = struct.field  reg=10  reg=6  name=mass   [hits=10, line=38]
+    84  OP_MUL                        reg = rk * rk  reg=11  op=OP_MUL  rk=const:0.5  rk=reg10   [hits=10, line=39]
+    85  OP_MUL                        reg = rk * rk  reg=12  op=OP_MUL  rk=reg7  rk=reg7   [hits=10, line=39]
+    86  OP_MUL                        reg = rk * rk  reg=13  op=OP_MUL  rk=reg8  rk=reg8   [hits=10, line=39]
+    87  OP_ADD                        reg = rk + rk  reg=12  op=OP_ADD  rk=reg12  rk=reg13   [hits=10, line=39]
+    88  OP_MUL                        reg = rk * rk  reg=13  op=OP_MUL  rk=reg9  rk=reg9   [hits=10, line=39]
+    89  OP_ADD                        reg = rk + rk  reg=12  op=OP_ADD  rk=reg12  rk=reg13   [hits=10, line=39]
+    90  OP_MUL                        reg = rk * rk  reg=11  op=OP_MUL  rk=reg11  rk=reg12   [hits=10, line=39]
+    91  OP_ADD                        reg = rk + rk  reg=1  op=OP_ADD  rk=reg1  rk=reg11   [hits=10, line=39]
+    92  OP_ADD                        reg = rk + rk  reg=12  op=OP_ADD  rk=reg3  rk=const:1   [hits=10, line=40]
+    93  OP_LOADK                      reg = pool constant  reg=13  val=1   [hits=10, line=40]
+    95  OP_ITER_RANGE                 for-each step, numeric a..b[..step] range  reg=12  reg=2  reg=13  reg=11  -> 116   [hits=30, line=40]
+    97  OP_INDEX_GET                  reg = reg[rk]  reg=14  reg=0  rk=reg11   [hits=20, line=41]
+    98  OP_FIELD_GET                  reg = struct.field  reg=16  reg=14  name=x   [hits=20, line=42]
+    99  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=15  reg=6  op=OP_SUB  name=x  rk=reg16   [hits=20, line=42]
+   100  OP_FIELD_GET                  reg = struct.field  reg=17  reg=14  name=y   [hits=20, line=43]
+   101  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=16  reg=6  op=OP_SUB  name=y  rk=reg17   [hits=20, line=43]
+   102  OP_FIELD_GET                  reg = struct.field  reg=18  reg=14  name=z   [hits=20, line=44]
+   103  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=17  reg=6  op=OP_SUB  name=z  rk=reg18   [hits=20, line=44]
+   104  OP_MUL                        reg = rk * rk  reg=18  op=OP_MUL  rk=reg15  rk=reg15   [hits=20, line=45]
+   105  OP_MUL                        reg = rk * rk  reg=19  op=OP_MUL  rk=reg16  rk=reg16   [hits=20, line=45]
+   106  OP_ADD                        reg = rk + rk  reg=18  op=OP_ADD  rk=reg18  rk=reg19   [hits=20, line=45]
+   107  OP_MUL                        reg = rk * rk  reg=19  op=OP_MUL  rk=reg17  rk=reg17   [hits=20, line=45]
+   108  OP_ADD                        reg = rk + rk  reg=18  op=OP_ADD  rk=reg18  rk=reg19   [hits=20, line=45]
+   109  OP_BINARY_FIELD               fused: reg = rk OP struct.field (field on the right)  reg=19  reg=14  op=OP_MUL  rk=reg10  name=mass   [hits=20, line=46]
+   110  OP_MOVE                       reg = reg  reg=20  reg=18   [hits=20, line=46]
+   111  OP_CALL_MODULE                call a native or file-module function by (module, function) name  reg=20  reg=20  n=1  name=math  name=sqrt   [hits=20, line=46]
+   112  OP_DIV                        reg = rk / rk  reg=19  op=OP_DIV  rk=reg19  rk=reg20   [hits=20, line=46]
+   113  OP_SUB                        reg = rk - rk  reg=1  op=OP_SUB  rk=reg1  rk=reg19   [hits=20, line=46]
+   114  OP_JUMP                       unconditional jump  -> 95   [hits=20, line=46]
+   116  OP_JUMP                       unconditional jump  -> 77   [hits=10, line=46]
+   118  OP_RETURN                     return reg to caller, drain pending defers first  reg=1   [hits=2, line=47]
+   119  OP_LOADK                      reg = pool constant  reg=4  val=null
+   121  OP_RETURN                     return reg to caller, drain pending defers first  reg=4
+   122  OP_JUMP                       unconditional jump  -> 211   [hits=1, line=54]
+   124  OP_MOVE                       reg = reg  reg=2  reg=0   [hits=500000, line=55]
+   125  OP_CALL_BUILTIN               global builtin (length/append/etc.) by name  reg=2  reg=2  n=1  name=length   [hits=500000, line=55]
+   126  OP_LOADK                      reg = pool constant  reg=4  val=0   [hits=500000, line=56]
+   128  OP_LOADK                      reg = pool constant  reg=5  val=1   [hits=500000, line=56]
+   130  OP_ITER_RANGE                 for-each step, numeric a..b[..step] range  reg=4  reg=2  reg=5  reg=3  -> 182   [hits=3000000, line=56]
+   132  OP_INDEX_GET                  reg = reg[rk]  reg=6  reg=0  rk=reg3   [hits=2500000, line=57]
+   133  OP_FIELD_GET                  reg = struct.field  reg=7  reg=6  name=x   [hits=2500000, line=58]
+   134  OP_FIELD_GET                  reg = struct.field  reg=8  reg=6  name=y   [hits=2500000, line=59]
+   135  OP_FIELD_GET                  reg = struct.field  reg=9  reg=6  name=z   [hits=2500000, line=60]
+   136  OP_FIELD_GET                  reg = struct.field  reg=10  reg=6  name=mass   [hits=2500000, line=61]
+   137  OP_FIELD_GET                  reg = struct.field  reg=11  reg=6  name=vx   [hits=2500000, line=62]
+   138  OP_FIELD_GET                  reg = struct.field  reg=12  reg=6  name=vy   [hits=2500000, line=63]
+   139  OP_FIELD_GET                  reg = struct.field  reg=13  reg=6  name=vz   [hits=2500000, line=64]
+   140  OP_ADD                        reg = rk + rk  reg=15  op=OP_ADD  rk=reg3  rk=const:1   [hits=2500000, line=65]
+   141  OP_LOADK                      reg = pool constant  reg=16  val=1   [hits=2500000, line=65]
+   143  OP_ITER_RANGE                 for-each step, numeric a..b[..step] range  reg=15  reg=2  reg=16  reg=14  -> 177   [hits=7500000, line=65]
+   145  OP_INDEX_GET                  reg = reg[rk]  reg=17  reg=0  rk=reg14   [hits=5000000, line=66]
+   146  OP_BINARY_FIELD               fused: reg = rk OP struct.field (field on the right)  reg=18  reg=17  op=OP_SUB  rk=reg7  name=x   [hits=5000000, line=67]
+   147  OP_BINARY_FIELD               fused: reg = rk OP struct.field (field on the right)  reg=19  reg=17  op=OP_SUB  rk=reg8  name=y   [hits=5000000, line=68]
+   148  OP_BINARY_FIELD               fused: reg = rk OP struct.field (field on the right)  reg=20  reg=17  op=OP_SUB  rk=reg9  name=z   [hits=5000000, line=69]
+   149  OP_MUL                        reg = rk * rk  reg=21  op=OP_MUL  rk=reg18  rk=reg18   [hits=5000000, line=70]
+   150  OP_MUL                        reg = rk * rk  reg=22  op=OP_MUL  rk=reg19  rk=reg19   [hits=5000000, line=70]
+   151  OP_ADD                        reg = rk + rk  reg=21  op=OP_ADD  rk=reg21  rk=reg22   [hits=5000000, line=70]
+   152  OP_MUL                        reg = rk * rk  reg=22  op=OP_MUL  rk=reg20  rk=reg20   [hits=5000000, line=70]
+   153  OP_ADD                        reg = rk + rk  reg=21  op=OP_ADD  rk=reg21  rk=reg22   [hits=5000000, line=70]
+   154  OP_MOVE                       reg = reg  reg=22  reg=21   [hits=5000000, line=71]
+   155  OP_CALL_MODULE                call a native or file-module function by (module, function) name  reg=22  reg=22  n=1  name=math  name=sqrt   [hits=5000000, line=71]
+   156  OP_MUL                        reg = rk * rk  reg=22  op=OP_MUL  rk=reg21  rk=reg22   [hits=5000000, line=71]
+   157  OP_DIV                        reg = rk / rk  reg=22  op=OP_DIV  rk=reg1  rk=reg22   [hits=5000000, line=71]
+   158  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=23  reg=17  op=OP_MUL  name=mass  rk=reg22   [hits=5000000, line=73]
+   159  OP_MUL                        reg = rk * rk  reg=24  op=OP_MUL  rk=reg18  rk=reg23   [hits=5000000, line=74]
+   160  OP_SUB                        reg = rk - rk  reg=11  op=OP_SUB  rk=reg11  rk=reg24   [hits=5000000, line=74]
+   161  OP_MUL                        reg = rk * rk  reg=24  op=OP_MUL  rk=reg19  rk=reg23   [hits=5000000, line=75]
+   162  OP_SUB                        reg = rk - rk  reg=12  op=OP_SUB  rk=reg12  rk=reg24   [hits=5000000, line=75]
+   163  OP_MUL                        reg = rk * rk  reg=24  op=OP_MUL  rk=reg20  rk=reg23   [hits=5000000, line=76]
+   164  OP_SUB                        reg = rk - rk  reg=13  op=OP_SUB  rk=reg13  rk=reg24   [hits=5000000, line=76]
+   165  OP_MUL                        reg = rk * rk  reg=24  op=OP_MUL  rk=reg10  rk=reg22   [hits=5000000, line=78]
+   166  OP_MUL                        reg = rk * rk  reg=26  op=OP_MUL  rk=reg18  rk=reg24   [hits=5000000, line=79]
+   167  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=25  reg=17  op=OP_ADD  name=vx  rk=reg26   [hits=5000000, line=79]
+   168  OP_FIELD_SET                  struct.field = rk  reg=17  name=vx  rk=reg25   [hits=5000000, line=79]
+   169  OP_MUL                        reg = rk * rk  reg=26  op=OP_MUL  rk=reg19  rk=reg24   [hits=5000000, line=80]
+   170  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=25  reg=17  op=OP_ADD  name=vy  rk=reg26   [hits=5000000, line=80]
+   171  OP_FIELD_SET                  struct.field = rk  reg=17  name=vy  rk=reg25   [hits=5000000, line=80]
+   172  OP_MUL                        reg = rk * rk  reg=26  op=OP_MUL  rk=reg20  rk=reg24   [hits=5000000, line=81]
+   173  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=25  reg=17  op=OP_ADD  name=vz  rk=reg26   [hits=5000000, line=81]
+   174  OP_FIELD_SET                  struct.field = rk  reg=17  name=vz  rk=reg25   [hits=5000000, line=81]
+   175  OP_JUMP                       unconditional jump  -> 143   [hits=5000000, line=81]
+   177  OP_FIELD_SET                  struct.field = rk  reg=6  name=vx  rk=reg11   [hits=2500000, line=82]
+   178  OP_FIELD_SET                  struct.field = rk  reg=6  name=vy  rk=reg12   [hits=2500000, line=83]
+   179  OP_FIELD_SET                  struct.field = rk  reg=6  name=vz  rk=reg13   [hits=2500000, line=84]
+   180  OP_JUMP                       unconditional jump  -> 130   [hits=2500000, line=84]
+   182  OP_LOADK                      reg = pool constant  reg=4  val=0   [hits=500000, line=86]
+   184  OP_LOADK                      reg = pool constant  reg=5  val=1   [hits=500000, line=86]
+   186  OP_ITER_RANGE                 for-each step, numeric a..b[..step] range  reg=4  reg=2  reg=5  reg=3  -> 208   [hits=3000000, line=86]
+   188  OP_INDEX_GET                  reg = reg[rk]  reg=6  reg=0  rk=reg3   [hits=2500000, line=87]
+   189  OP_INDEX_GET                  reg = reg[rk]  reg=8  reg=0  rk=reg3   [hits=2500000, line=87]
+   190  OP_FIELD_GET                  reg = struct.field  reg=8  reg=8  name=vx   [hits=2500000, line=87]
+   191  OP_MUL                        reg = rk * rk  reg=8  op=OP_MUL  rk=reg8  rk=reg1   [hits=2500000, line=87]
+   192  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=7  reg=6  op=OP_ADD  name=x  rk=reg8   [hits=2500000, line=87]
+   193  OP_FIELD_SET                  struct.field = rk  reg=6  name=x  rk=reg7   [hits=2500000, line=87]
+   194  OP_INDEX_GET                  reg = reg[rk]  reg=6  reg=0  rk=reg3   [hits=2500000, line=88]
+   195  OP_INDEX_GET                  reg = reg[rk]  reg=8  reg=0  rk=reg3   [hits=2500000, line=88]
+   196  OP_FIELD_GET                  reg = struct.field  reg=8  reg=8  name=vy   [hits=2500000, line=88]
+   197  OP_MUL                        reg = rk * rk  reg=8  op=OP_MUL  rk=reg8  rk=reg1   [hits=2500000, line=88]
+   198  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=7  reg=6  op=OP_ADD  name=y  rk=reg8   [hits=2500000, line=88]
+   199  OP_FIELD_SET                  struct.field = rk  reg=6  name=y  rk=reg7   [hits=2500000, line=88]
+   200  OP_INDEX_GET                  reg = reg[rk]  reg=6  reg=0  rk=reg3   [hits=2500000, line=89]
+   201  OP_INDEX_GET                  reg = reg[rk]  reg=8  reg=0  rk=reg3   [hits=2500000, line=89]
+   202  OP_FIELD_GET                  reg = struct.field  reg=8  reg=8  name=vz   [hits=2500000, line=89]
+   203  OP_MUL                        reg = rk * rk  reg=8  op=OP_MUL  rk=reg8  rk=reg1   [hits=2500000, line=89]
+   204  OP_FIELD_BINARY               fused: reg = struct.field OP rk (field on the left)  reg=7  reg=6  op=OP_ADD  name=z  rk=reg8   [hits=2500000, line=89]
+   205  OP_FIELD_SET                  struct.field = rk  reg=6  name=z  rk=reg7   [hits=2500000, line=89]
+   206  OP_JUMP                       unconditional jump  -> 186   [hits=2500000, line=89]
+   208  OP_LOADK                      reg = pool constant  reg=4  val=null   [hits=500000, line=89]
+   210  OP_RETURN                     return reg to caller, drain pending defers first  reg=4   [hits=500000, line=89]
+   211  OP_LOADK                      reg = pool constant  reg=3  val=0   [hits=1, line=91]
+   213  OP_LOADK                      reg = pool constant  reg=4  val=0   [hits=1, line=91]
+   215  OP_LOADK                      reg = pool constant  reg=5  val=0   [hits=1, line=91]
+   217  OP_LOADK                      reg = pool constant  reg=6  val=0   [hits=1, line=91]
+   219  OP_LOADK                      reg = pool constant  reg=7  val=0   [hits=1, line=91]
+   221  OP_LOADK                      reg = pool constant  reg=8  val=0   [hits=1, line=91]
+   223  OP_MOVE                       reg = reg  reg=9  reg=1   [hits=1, line=91]
+   224  OP_STRUCT_NEW                 reg = new struct instance from a contiguous reg range  reg=3  reg=3  n=7  name=Body   [hits=1, line=91]
+   225  OP_LOADK                      reg = pool constant  reg=4  val=4.84143   [hits=1, line=91]
+   227  OP_UNARY                      reg = unary_op(rk)  reg=5  op=OP_NEGATE  rk=const:1.16032   [hits=1, line=91]
+   228  OP_UNARY                      reg = unary_op(rk)  reg=6  op=OP_NEGATE  rk=const:0.103622   [hits=1, line=91]
+   229  OP_MUL                        reg = rk * rk  reg=7  op=OP_MUL  rk=const:0.00166008  rk=reg2   [hits=1, line=91]
+   230  OP_MUL                        reg = rk * rk  reg=8  op=OP_MUL  rk=const:0.00769901  rk=reg2   [hits=1, line=91]
+   231  OP_UNARY                      reg = unary_op(rk)  reg=9  op=OP_NEGATE  rk=const:6.9046e-05   [hits=1, line=91]
+   232  OP_MUL                        reg = rk * rk  reg=9  op=OP_MUL  rk=reg9  rk=reg2   [hits=1, line=91]
+   233  OP_MUL                        reg = rk * rk  reg=10  op=OP_MUL  rk=const:0.000954792  rk=reg1   [hits=1, line=91]
+   234  OP_STRUCT_NEW                 reg = new struct instance from a contiguous reg range  reg=4  reg=4  n=7  name=Body   [hits=1, line=91]
+   235  OP_LOADK                      reg = pool constant  reg=5  val=8.34337   [hits=1, line=91]
+   237  OP_LOADK                      reg = pool constant  reg=6  val=4.1248   [hits=1, line=91]
+   239  OP_UNARY                      reg = unary_op(rk)  reg=7  op=OP_NEGATE  rk=const:0.403523   [hits=1, line=91]
+   240  OP_UNARY                      reg = unary_op(rk)  reg=8  op=OP_NEGATE  rk=const:0.00276743   [hits=1, line=91]
+   241  OP_MUL                        reg = rk * rk  reg=8  op=OP_MUL  rk=reg8  rk=reg2   [hits=1, line=91]
+   242  OP_MUL                        reg = rk * rk  reg=9  op=OP_MUL  rk=const:0.00499853  rk=reg2   [hits=1, line=91]
+   243  OP_MUL                        reg = rk * rk  reg=10  op=OP_MUL  rk=const:2.30417e-05  rk=reg2   [hits=1, line=91]
+   244  OP_MUL                        reg = rk * rk  reg=11  op=OP_MUL  rk=const:0.000285886  rk=reg1   [hits=1, line=91]
+   245  OP_STRUCT_NEW                 reg = new struct instance from a contiguous reg range  reg=5  reg=5  n=7  name=Body   [hits=1, line=91]
+   246  OP_LOADK                      reg = pool constant  reg=6  val=12.8944   [hits=1, line=91]
+   248  OP_UNARY                      reg = unary_op(rk)  reg=7  op=OP_NEGATE  rk=const:15.1112   [hits=1, line=91]
+   249  OP_UNARY                      reg = unary_op(rk)  reg=8  op=OP_NEGATE  rk=const:0.223308   [hits=1, line=91]
+   250  OP_MUL                        reg = rk * rk  reg=9  op=OP_MUL  rk=const:0.0029646  rk=reg2   [hits=1, line=91]
+   251  OP_MUL                        reg = rk * rk  reg=10  op=OP_MUL  rk=const:0.00237847  rk=reg2   [hits=1, line=91]
+   252  OP_UNARY                      reg = unary_op(rk)  reg=11  op=OP_NEGATE  rk=const:2.9659e-05   [hits=1, line=91]
+   253  OP_MUL                        reg = rk * rk  reg=11  op=OP_MUL  rk=reg11  rk=reg2   [hits=1, line=91]
+   254  OP_MUL                        reg = rk * rk  reg=12  op=OP_MUL  rk=const:4.36624e-05  rk=reg1   [hits=1, line=91]
+   255  OP_STRUCT_NEW                 reg = new struct instance from a contiguous reg range  reg=6  reg=6  n=7  name=Body   [hits=1, line=91]
+   256  OP_LOADK                      reg = pool constant  reg=7  val=15.3797   [hits=1, line=91]
+   258  OP_UNARY                      reg = unary_op(rk)  reg=8  op=OP_NEGATE  rk=const:25.9193   [hits=1, line=91]
+   259  OP_LOADK                      reg = pool constant  reg=9  val=0.179259   [hits=1, line=91]
+   261  OP_MUL                        reg = rk * rk  reg=10  op=OP_MUL  rk=const:0.00268068  rk=reg2   [hits=1, line=91]
+   262  OP_MUL                        reg = rk * rk  reg=11  op=OP_MUL  rk=const:0.00162824  rk=reg2   [hits=1, line=91]
+   263  OP_UNARY                      reg = unary_op(rk)  reg=12  op=OP_NEGATE  rk=const:9.51592e-05   [hits=1, line=91]
+   264  OP_MUL                        reg = rk * rk  reg=12  op=OP_MUL  rk=reg12  rk=reg2   [hits=1, line=91]
+   265  OP_MUL                        reg = rk * rk  reg=13  op=OP_MUL  rk=const:5.15139e-05  rk=reg1   [hits=1, line=91]
+   266  OP_STRUCT_NEW                 reg = new struct instance from a contiguous reg range  reg=7  reg=7  n=7  name=Body   [hits=1, line=91]
+   267  OP_ARRAY_NEW                  reg = new array from a contiguous reg range  reg=3  reg=3  n=5   [hits=1, line=91]
+   268  OP_CALL_MODULE                call a native or file-module function by (module, function) name  reg=4  reg=4  n=0  name=time  name=now   [hits=1, line=131]
+   269  OP_MOVE                       reg = reg  reg=5  reg=3   [hits=1, line=132]
+   270  OP_CALL                       call by compile-time-resolved offset  reg=5  reg=5  n=1  -> 25   [hits=1, line=132]
+   272  OP_MOVE                       reg = reg  reg=5  reg=3   [hits=1, line=133]
+   273  OP_CALL                       call by compile-time-resolved offset  reg=5  reg=5  n=1  -> 69   [hits=1, line=133]
+   275  OP_LOADK                      reg = pool constant  reg=7  val=0   [hits=1, line=134]
+   277  OP_LOADK                      reg = pool constant  reg=8  val=500000   [hits=1, line=134]
+   279  OP_LOADK                      reg = pool constant  reg=9  val=1   [hits=1, line=134]
+   281  OP_ITER_RANGE                 for-each step, numeric a..b[..step] range  reg=7  reg=8  reg=9  reg=6  -> 290   [hits=500001, line=134]
+   283  OP_MOVE                       reg = reg  reg=10  reg=3   [hits=500000, line=135]
+   284  OP_LOADK                      reg = pool constant  reg=11  val=0.01   [hits=500000, line=135]
+   286  OP_CALL                       call by compile-time-resolved offset  reg=10  reg=10  n=2  -> 124   [hits=500000, line=135]
+   288  OP_JUMP                       unconditional jump  -> 281   [hits=500000, line=135]
+   290  OP_MOVE                       reg = reg  reg=7  reg=3   [hits=1, line=136]
+   291  OP_CALL                       call by compile-time-resolved offset  reg=7  reg=7  n=1  -> 69   [hits=1, line=136]
+   293  OP_MOVE                       reg = reg  reg=5  reg=7   [hits=1, line=136]
+   294  OP_CALL_MODULE                call a native or file-module function by (module, function) name  reg=7  reg=7  n=0  name=time  name=now   [hits=1, line=137]
+   295  OP_SUB                        reg = rk - rk  reg=7  op=OP_SUB  rk=reg7  rk=reg4   [hits=1, line=137]
+   296  OP_LOADK                      reg = pool constant  reg=8  val="Took: "   [hits=1, line=138]
+   298  OP_UNARY                      reg = unary_op(rk)  reg=9  op=OP_TO_STR  rk=reg7   [hits=1, line=138]
+   299  OP_ADD                        reg = rk + rk  reg=8  op=OP_ADD  rk=reg8  rk=reg9   [hits=1, line=138]
+   300  OP_ADD                        reg = rk + rk  reg=8  op=OP_ADD  rk=reg8  rk=const:"s"   [hits=1, line=138]
+   301  OP_CALL_BUILTIN               global builtin (length/append/etc.) by name  reg=8  reg=8  n=1  name=print   [hits=1, line=138]
+   302  OP_HALT                       stop execution   [hits=1, line=138]
+
+--- per-opcode summary ---
+  OP_MUL                       62500128
+  OP_FIELD_SET                 30000003
+  OP_FIELD_BINARY              27500075
+  OP_FIELD_GET                 25000115
+  OP_INDEX_GET                 22500034
+  OP_SUB                       15000021
+  OP_BINARY_FIELD              15000020
+  OP_ITER_RANGE                14000043
+  OP_ADD                       12500097
+  OP_JUMP                      10500038
+  OP_MOVE                      6000028
+  OP_LOADK                     5500039
+  OP_DIV                       5000023
+  OP_CALL_MODULE               5000022
+  OP_RETURN                    500003
+  OP_CALL                      500003
+  OP_CALL_BUILTIN              500003
+  OP_UNARY                     14
+  OP_ITER_NEXT_ARRAY           6
+  OP_STRUCT_NEW                5
+  OP_LOAD_GLOBAL               3
+  OP_ARRAY_NEW                 2
+  OP_DEFINE_STRUCT             1
+  OP_HALT                      1
+
+--- hot source lines ---
+  line 70     25000000
+  line 71     20000000
+  line 81     20000000
+  line 89     18500000
+  line 88     15000000
+  line 87     15000000
+  line 79     15000000
+  line 80     15000000
+  line 65     12500000
+  line 74     10000000
+  line 75     10000000
+  line 76     10000000
+  line 68     5000000
+  line 84     5000000
+  line 78     5000000
+  line 69     5000000
+  line 73     5000000
+  line 67     5000000
+  line 66     5000000
+  line 86     4000000
+  line 56     4000000
+  line 62     2500000
+  line 64     2500000
+  line 60     2500000
+  line 58     2500000
+  line 57     2500000
+  line 61     2500000
+  line 63     2500000
+  line 59     2500000
+  line 82     2500000
+  line 83     2500000
+  line 135    2000000
+  line 55     1000000
+  line 134    500004
+  line 46     130
+  line 45     100
+  line 39     80
+  line 40     50
+  line 91     45
+  line 43     40
+  line 42     40
+  line 44     40
+  line 22     20
+  line 41     20
+  line 33     16
+  line 21     15
+  line 20     15
+  line 34     10
+  line 37     10
+  line 36     10
+  line 38     10
+  line 35     10
+  line 19     7
+  line 18     7
+  line 27     6
+  line 138    6
+  line 25     4
+  line 32     4
+  line 26     4
+  line 136    3
+  line 2      2
+  line 31     2
+  line 47     2
+  line 24     2
+  line 137    2
+  line 133    2
+  line 132    2
+  line 5      1
+  line 3      1
+  line 30     1
+  line 17     1
+  line 131    1
+  line 54     1
+  line 1      1
+
+--- memory ---
+  string   header       4640 B  payload       1100 B
+  array    header         48 B  payload         64 B
+  dict     header          0 B  payload          0 B
+  function header          0 B  payload          0 B
+  long     reserved         0 B (no separate payload)
+  struct   reserved      1280 B  used        280 B
+  297 live cells, 0 minor collections, 0 major collections
