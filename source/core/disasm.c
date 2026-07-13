@@ -71,35 +71,51 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
        all — disassemble_one special-cases it rather than going through the generic field loop. */
     [OP_BINARY] = { "OP_BINARY", "reg = rk OP rk", {FLD_REG, FLD_BINOP}, false, 2 },
     [OP_JUMP_IF_FALSE_REG] = { "OP_JUMP_IF_FALSE_REG", "jump if !reg, no pop", {FLD_REG, FLD_JUMP}, false, 1 },
-    [OP_CMP_JUMP_FALSE]    = { "OP_CMP_JUMP_FALSE",    "fused: jump if !(rk <op> rk)", {FLD_BINOP, FLD_RK, FLD_RK, FLD_JUMP}, false, 1 },
+    /* cmp_op/rk_a/rk_b all packed into one word (PACK_CMP_JUMP_FALSE, vm.h); the loop/if condition
+       target stays its own dedicated word regardless — same patchable-target rule as everywhere
+       else. Special-cased in disassemble_one. */
+    [OP_CMP_JUMP_FALSE]    = { "OP_CMP_JUMP_FALSE",    "fused: jump if !(rk <op> rk)", {FLD_BINOP, FLD_RK, FLD_RK, FLD_JUMP}, false, 3 },
     [OP_CALL]  = { "OP_CALL",  "call by compile-time-resolved offset", {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP}, false, 3 },
-    [OP_CALL_VALUE] = { "OP_CALL_VALUE", "call a runtime function value held in a register", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
+    /* OP_CALL_VALUE/OP_TAIL_CALL_VALUE pack all 4 fields into one word (PACK_REG4, vm.h) —
+       callee_reg is always a plain register, never a patched target, unlike OP_CALL's
+       callee_offset (see emit_call_value's own comment) — special-cased in disassemble_one. */
+    [OP_CALL_VALUE] = { "OP_CALL_VALUE", "call a runtime function value held in a register", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 4 },
     [OP_TAIL_CALL]       = { "OP_TAIL_CALL",       "tail call by compile-time-resolved offset, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP}, false, 3 },
-    [OP_TAIL_CALL_VALUE] = { "OP_TAIL_CALL_VALUE", "tail call through a register value, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
+    [OP_TAIL_CALL_VALUE] = { "OP_TAIL_CALL_VALUE", "tail call through a register value, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 4 },
     [OP_CALL_GLOBAL_VALUE]      = { "OP_CALL_GLOBAL_VALUE",      "call a runtime function value held in the top-level frame's reg", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
     [OP_TAIL_CALL_GLOBAL_VALUE] = { "OP_TAIL_CALL_GLOBAL_VALUE", "tail call through the top-level frame's reg, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
     [OP_RETURN] = { "OP_RETURN", "return reg to caller, drain pending defers first", {FLD_REG}, false, 1 },
-    [OP_CALL_MODULE]  = { "OP_CALL_MODULE",  "call a native or file-module function by (module, function) name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_NAME}, false, 3 },
-    [OP_CALL_BUILTIN] = { "OP_CALL_BUILTIN", "global builtin (length/append/etc.) by name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME}, false, 3 },
+    /* No patchable target at all — module/function/builtin names are always literal identifiers
+       resolved at parse time — so everything packs into one word (PACK_CALL_MODULE/
+       PACK_CALL_BUILTIN, vm.h). Special-cased in disassemble_one. */
+    [OP_CALL_MODULE]  = { "OP_CALL_MODULE",  "call a native or file-module function by (module, function) name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_NAME}, false, 5 },
+    [OP_CALL_BUILTIN] = { "OP_CALL_BUILTIN", "global builtin (length/append/etc.) by name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME}, false, 4 },
     [OP_LOAD_GLOBAL]  = { "OP_LOAD_GLOBAL",  "reg = top-level frame's reg (read-only)", {FLD_REG, FLD_REG}, false, 2 },
-    [OP_STORE_GLOBAL] = { "OP_STORE_GLOBAL", "top-level frame's reg = rk", {FLD_REG, FLD_RK}, false, 1 },
+    [OP_STORE_GLOBAL] = { "OP_STORE_GLOBAL", "top-level frame's reg = rk", {FLD_REG, FLD_RK}, false, 2 },
     [OP_DEFER_PUSH]   = { "OP_DEFER_PUSH",   "snapshot args; run at this frame's OP_RETURN", {FLD_REG, FLD_COUNT, FLD_JUMP}, false, 2 },
     [OP_ARRAY_NEW] = { "OP_ARRAY_NEW", "reg = new array from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT}, false, 3 },
-    [OP_INDEX_GET] = { "OP_INDEX_GET", "reg = reg[rk]", {FLD_REG, FLD_REG, FLD_RK}, false, 2 },
-    [OP_INDEX_SET] = { "OP_INDEX_SET", "reg[rk] = rk", {FLD_REG, FLD_RK, FLD_RK}, false, 1 },
-    [OP_SLICE_GET] = { "OP_SLICE_GET", "reg = reg[rk:rk]", {FLD_REG, FLD_REG, FLD_RK, FLD_RK}, false, 2 },
-    [OP_CHECK_SHAPE] = { "OP_CHECK_SHAPE", "reg = check_shape(reg, type)", {FLD_REG, FLD_REG, FLD_NAME}, false, 2 },
+    /* OP_INDEX_GET/OP_ITER_NEXT_PAIR/OP_ITER_RANGE/OP_FIELD_GET/OP_FIELD_SET are the Slice A
+       extension of OP_BINARY's single-word treatment (PACK_INDEX_GET/PACK_REG4/PACK_FIELD_GET/
+       PACK_FIELD_SET, vm.h) — disassemble_one special-cases all of them below the same way it
+       does OP_BINARY, since their RK/name fields no longer live in separate trailing words. Their
+       `packed` count here still needs to equal fields[]'s full length (nothing genuinely trailing)
+       so aer_disassemble's word-count accounting stays correct even though the generic per-field
+       loop never actually runs for them. */
+    [OP_INDEX_GET] = { "OP_INDEX_GET", "reg = reg[rk]", {FLD_REG, FLD_REG, FLD_RK}, false, 3 },
+    [OP_INDEX_SET] = { "OP_INDEX_SET", "reg[rk] = rk", {FLD_REG, FLD_RK, FLD_RK}, false, 3 },
+    [OP_SLICE_GET] = { "OP_SLICE_GET", "reg = reg[rk:rk]", {FLD_REG, FLD_REG, FLD_RK, FLD_RK}, false, 4 },
+    [OP_CHECK_SHAPE] = { "OP_CHECK_SHAPE", "reg = check_shape(reg, type)", {FLD_REG, FLD_REG, FLD_NAME}, false, 3 },
     [OP_DICT_NEW]  = { "OP_DICT_NEW",  "reg = new dict from contiguous key/value reg pairs", {FLD_REG, FLD_REG, FLD_COUNT}, false, 3 },
     [OP_ITER_NEXT_ARRAY] = { "OP_ITER_NEXT_ARRAY", "for-each step, array or dict-keys", {FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 3 },
-    [OP_ITER_NEXT_PAIR]  = { "OP_ITER_NEXT_PAIR",  "for-each step, dict key+value pairs", {FLD_REG, FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 3 },
-    [OP_ITER_RANGE]      = { "OP_ITER_RANGE",      "for-each step, numeric a..b[..step] range", {FLD_REG, FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 3 },
-    [OP_STRUCT_NEW] = { "OP_STRUCT_NEW", "reg = new struct instance from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME}, false, 3 },
-    [OP_FIELD_GET]  = { "OP_FIELD_GET",  "reg = struct.field", {FLD_REG, FLD_REG, FLD_NAME}, false, 2 },
-    [OP_FIELD_SET]  = { "OP_FIELD_SET",  "struct.field = rk", {FLD_REG, FLD_NAME, FLD_RK}, false, 1 },
-    [OP_UNARY] = { "OP_UNARY", "reg = unary_op(rk)", {FLD_REG, FLD_BINOP, FLD_RK}, false, 2 },
-    [OP_CAST]  = { "OP_CAST",  "reg = cast(rk)", {FLD_REG, FLD_CAST, FLD_RK}, false, 2 },
-    [OP_BINARY_FIELD] = { "OP_BINARY_FIELD", "fused: reg = rk OP struct.field (field on the right)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_RK, FLD_NAME}, false, 3 },
-    [OP_FIELD_BINARY] = { "OP_FIELD_BINARY", "fused: reg = struct.field OP rk (field on the left)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_NAME, FLD_RK}, false, 3 },
+    [OP_ITER_NEXT_PAIR]  = { "OP_ITER_NEXT_PAIR",  "for-each step, dict key+value pairs", {FLD_REG, FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 4 },
+    [OP_ITER_RANGE]      = { "OP_ITER_RANGE",      "for-each step, numeric a..b[..step] range", {FLD_REG, FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 4 },
+    [OP_STRUCT_NEW] = { "OP_STRUCT_NEW", "reg = new struct instance from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME}, false, 4 },
+    [OP_FIELD_GET]  = { "OP_FIELD_GET",  "reg = struct.field", {FLD_REG, FLD_REG, FLD_NAME}, false, 3 },
+    [OP_FIELD_SET]  = { "OP_FIELD_SET",  "struct.field = rk", {FLD_REG, FLD_NAME, FLD_RK}, false, 3 },
+    [OP_UNARY] = { "OP_UNARY", "reg = unary_op(rk)", {FLD_REG, FLD_BINOP, FLD_RK}, false, 3 },
+    [OP_CAST]  = { "OP_CAST",  "reg = cast(rk)", {FLD_REG, FLD_CAST, FLD_RK}, false, 3 },
+    [OP_BINARY_FIELD] = { "OP_BINARY_FIELD", "fused: reg = rk OP struct.field (field on the right)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_RK, FLD_NAME}, false, 5 },
+    [OP_FIELD_BINARY] = { "OP_FIELD_BINARY", "fused: reg = struct.field OP rk (field on the left)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_NAME, FLD_RK}, false, 5 },
     [OP_PRINT_REPL] = { "OP_PRINT_REPL", "shell mode: print reg unless null", {FLD_REG}, false, 1 },
 };
 
@@ -193,6 +209,97 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
         print_rk20(out, c, UNPACK_RK_B20(op_word));
         print_rk20(out, c, UNPACK_RK_C20(op_word));
+    } else if (op == OP_INDEX_GET) {
+        /* Slice A of the same treatment — see PACK_INDEX_GET's comment in vm.h. */
+        print_field(out, c, FLD_REG, (int)UNPACK_INDEX_GET_DEST(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_INDEX_GET_ARR(op_word));
+        print_rk20(out, c, UNPACK_INDEX_GET_RK(op_word));
+    } else if (op == OP_FIELD_GET) {
+        print_field(out, c, FLD_REG,  (int)UNPACK_FIELD_GET_DEST(op_word));
+        print_field(out, c, FLD_REG,  (int)UNPACK_FIELD_GET_STRUCT(op_word));
+        print_field(out, c, FLD_NAME, (int)UNPACK_FIELD_GET_FIELD(op_word));
+    } else if (op == OP_FIELD_SET) {
+        print_field(out, c, FLD_REG,  (int)UNPACK_FIELD_SET_STRUCT(op_word));
+        print_field(out, c, FLD_NAME, (int)UNPACK_FIELD_SET_FIELD(op_word));
+        print_rk20(out, c, UNPACK_FIELD_SET_RK(op_word));
+    } else if (op == OP_ITER_RANGE || op == OP_ITER_NEXT_PAIR) {
+        /* 4 registers packed via PACK_REG4 (vm.h); the loop-exit target still gets its own
+           trailing word regardless — a patchable jump target is never packed alongside anything
+           else (see PACK_REG4's own comment), so pos must still advance past it here. */
+        print_field(out, c, FLD_REG, (int)UNPACK_REG4_A(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_REG4_B(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_REG4_C(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_REG4_D(op_word));
+        int target = (int)c->code[pos++];
+        print_field(out, c, FLD_JUMP, target);
+    } else if (op == OP_CALL_VALUE || op == OP_TAIL_CALL_VALUE) {
+        /* See PACK_REG4's comment in vm.h / emit_call_value's own comment (parser.c) — callee_reg
+           is never a patched target, so it packs alongside the other 3 fields with nothing left
+           trailing. */
+        print_field(out, c, FLD_REG,   (int)UNPACK_REG4_A(op_word));
+        print_field(out, c, FLD_REG,   (int)UNPACK_REG4_B(op_word));
+        print_field(out, c, FLD_COUNT, (int)UNPACK_REG4_C(op_word));
+        print_field(out, c, FLD_REG,   (int)UNPACK_REG4_D(op_word));
+    } else if (op == OP_STORE_GLOBAL) {
+        print_field(out, c, FLD_REG, (int)UNPACK_STORE_GLOBAL_REG(op_word));
+        print_rk20(out, c, UNPACK_STORE_GLOBAL_RK(op_word));
+    } else if (op == OP_UNARY) {
+        print_field(out, c, FLD_REG,   (int)UNPACK_UNARY_DEST(op_word));
+        print_field(out, c, FLD_BINOP, (int)UNPACK_UNARY_OP(op_word));
+        print_rk20(out, c, UNPACK_UNARY_RK(op_word));
+    } else if (op == OP_CAST) {
+        print_field(out, c, FLD_REG,  (int)UNPACK_CAST_DEST(op_word));
+        print_field(out, c, FLD_CAST, (int)UNPACK_CAST_TYPE(op_word));
+        print_rk20(out, c, UNPACK_CAST_RK(op_word));
+    } else if (op == OP_CHECK_SHAPE) {
+        print_field(out, c, FLD_REG,  (int)UNPACK_CHECK_SHAPE_DEST(op_word));
+        print_field(out, c, FLD_REG,  (int)UNPACK_CHECK_SHAPE_LHS(op_word));
+        print_field(out, c, FLD_NAME, (int)UNPACK_CHECK_SHAPE_NAME(op_word));
+    } else if (op == OP_STRUCT_NEW) {
+        print_field(out, c, FLD_REG,   (int)UNPACK_STRUCT_NEW_DEST(op_word));
+        print_field(out, c, FLD_REG,   (int)UNPACK_STRUCT_NEW_ARG_BASE(op_word));
+        print_field(out, c, FLD_COUNT, (int)UNPACK_STRUCT_NEW_ARG_COUNT(op_word));
+        print_field(out, c, FLD_NAME,  (int)UNPACK_STRUCT_NEW_NAME(op_word));
+    } else if (op == OP_CMP_JUMP_FALSE) {
+        /* cmp_op/rk_a/rk_b packed (PACK_CMP_JUMP_FALSE, vm.h); the branch target still trails as
+           its own word (patchable, never packed alongside anything else). */
+        print_field(out, c, FLD_BINOP, (int)UNPACK_CMP_JUMP_OP(op_word));
+        print_rk20(out, c, UNPACK_CMP_JUMP_RK_A(op_word));
+        print_rk20(out, c, UNPACK_CMP_JUMP_RK_B(op_word));
+        int target = (int)c->code[pos++];
+        print_field(out, c, FLD_JUMP, target);
+    } else if (op == OP_INDEX_SET) {
+        print_field(out, c, FLD_REG, (int)UNPACK_INDEX_SET_ARR(op_word));
+        print_rk20(out, c, UNPACK_INDEX_SET_IDX(op_word));
+        print_rk20(out, c, UNPACK_INDEX_SET_VAL(op_word));
+    } else if (op == OP_SLICE_GET) {
+        print_field(out, c, FLD_REG, (int)UNPACK_SLICE_GET_DEST(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_SLICE_GET_ARR(op_word));
+        print_rk20(out, c, UNPACK_SLICE_GET_START(op_word));
+        print_rk20(out, c, UNPACK_SLICE_GET_END(op_word));
+    } else if (op == OP_CALL_MODULE) {
+        print_field(out, c, FLD_REG,   (int)UNPACK_CALL_MODULE_DEST(op_word));
+        print_field(out, c, FLD_REG,   (int)UNPACK_CALL_MODULE_ARG_BASE(op_word));
+        print_field(out, c, FLD_COUNT, (int)UNPACK_CALL_MODULE_ARG_COUNT(op_word));
+        print_field(out, c, FLD_NAME,  (int)UNPACK_CALL_MODULE_MODULE(op_word));
+        print_field(out, c, FLD_NAME,  (int)UNPACK_CALL_MODULE_FN(op_word));
+    } else if (op == OP_CALL_BUILTIN) {
+        print_field(out, c, FLD_REG,   (int)UNPACK_CALL_BUILTIN_DEST(op_word));
+        print_field(out, c, FLD_REG,   (int)UNPACK_CALL_BUILTIN_ARG_BASE(op_word));
+        print_field(out, c, FLD_COUNT, (int)UNPACK_CALL_BUILTIN_ARG_COUNT(op_word));
+        print_field(out, c, FLD_NAME,  (int)UNPACK_CALL_BUILTIN_NAME(op_word));
+    } else if (op == OP_BINARY_FIELD) {
+        print_field(out, c, FLD_REG,   (int)UNPACK_BINARY_FIELD_DEST(op_word));
+        print_field(out, c, FLD_REG,   (int)UNPACK_BINARY_FIELD_STRUCT(op_word));
+        print_field(out, c, FLD_BINOP, (int)UNPACK_BINARY_FIELD_OP(op_word));
+        print_rk20(out, c, UNPACK_BINARY_FIELD_RK(op_word));
+        print_field(out, c, FLD_NAME,  (int)UNPACK_BINARY_FIELD_NAME(op_word));
+    } else if (op == OP_FIELD_BINARY) {
+        print_field(out, c, FLD_REG,   (int)UNPACK_FIELD_BINARY_DEST(op_word));
+        print_field(out, c, FLD_REG,   (int)UNPACK_FIELD_BINARY_STRUCT(op_word));
+        print_field(out, c, FLD_BINOP, (int)UNPACK_FIELD_BINARY_OP(op_word));
+        print_field(out, c, FLD_NAME,  (int)UNPACK_FIELD_BINARY_NAME(op_word));
+        print_rk20(out, c, UNPACK_FIELD_BINARY_RK(op_word));
     } else {
         int i = 0;
         for (; i < info->packed; i++) {

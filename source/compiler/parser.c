@@ -45,15 +45,28 @@ void reg_free(int count) {
     if (next_temp_register < reserved_floor) next_temp_register = reserved_floor;
 }
 
+/* Shared guard for every packed opcode using PACK_RK20 (OP_BINARY, OP_FIELD_SET, OP_INDEX_GET,
+   ...): an ordinary (wide, RK_CONST_FLAG-at-bit-30) rk value's index only overflows RK20's 19 bits
+   in a pathologically large chunk — 524288 registers-or-constants is far beyond any real program
+   — but truncating it silently instead of catching it would corrupt the encoded instruction rather
+   than just refuse to compile it. */
+static bool rk20_fits(int rk) {
+    return (rk & ~RK_CONST_FLAG) <= RK20_MAX_INDEX;
+}
+
+/* Guard for OP_CALL_MODULE's module_idx/fn_idx (17 bits each, PACK_CALL_MODULE) and
+   OP_FIELD_BINARY/OP_BINARY_FIELD's field_idx (14 bits, PACK_FIELD_BINARY/PACK_BINARY_FIELD) —
+   both bare (never RK-flagged) pool indices with a tighter budget than OP_FIELD_GET's 42 bits,
+   since those two opcodes' words are already full from packing an RK operand alongside them. */
+static bool pool_idx_fits(unsigned int idx, unsigned int max) {
+    return idx <= max;
+}
+
 /* Every OP_BINARY emission site funnels through here — see PACK_BINARY's own comment in vm.h for
    why this opcode gets a dedicated single-word encoding instead of the ordinary PACK2+2-wide-words
-   every other opcode uses. The guard below is the tradeoff for that compactness: rk_lhs/rk_rhs
-   arrive already resolved in parse_binary_ops's own (wider, RK_CONST_FLAG-at-bit-30) scheme, and
-   PACK_BINARY's compact RK20 fields only have 19 index bits — comfortably more than
-   FRAME_REGISTERS or any realistic constant pool, but not unconditionally safe to truncate into
-   without checking first. */
+   every other opcode uses. */
 static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
-    if ((rk_lhs & ~RK_CONST_FLAG) > RK20_MAX_INDEX || (rk_rhs & ~RK_CONST_FLAG) > RK20_MAX_INDEX) {
+    if (!rk20_fits(rk_lhs) || !rk20_fits(rk_rhs)) {
         error_at("Expression too large to compile (register/constant index exceeds the binary-op encoding's range)");
         return;
     }
@@ -87,9 +100,11 @@ int compile_node(Chunk* c, Node* node) {
 }
 
 unsigned int emit_cmp_jump_false(Chunk* c, int rk_a, Opcode cmp_op, int rk_b) {
-    chunk_emit(c, PACK1(OP_CMP_JUMP_FALSE, (int)cmp_op));
-    chunk_emit(c, rk_a);
-    chunk_emit(c, rk_b);
+    if (!rk20_fits(rk_a) || !rk20_fits(rk_b)) {
+        error_at("Expression too large to compile (register/constant index exceeds the comparison-jump encoding's range)");
+        return 0;
+    }
+    chunk_emit(c, PACK_CMP_JUMP_FALSE(cmp_op, rk_a, rk_b));
     unsigned int patch_offset = c->count;
     chunk_emit(c, 0);   /* placeholder — patched by patch_jump once the target is known */
     return patch_offset;
@@ -127,8 +142,7 @@ void emit_return(Chunk* c, int src_reg) {
    time this is emitted), so no patching is ever needed here the way emit_call's callee_offset
    sometimes does. */
 void emit_call_value(Chunk* c, int dest_reg, int arg_reg_base, int arg_count, int callee_reg) {
-    chunk_emit(c, PACK3(OP_CALL_VALUE, dest_reg, arg_reg_base, arg_count));
-    chunk_emit(c, callee_reg);
+    chunk_emit(c, PACK_REG4(OP_CALL_VALUE, dest_reg, arg_reg_base, arg_count, callee_reg));
 }
 
 void emit_print_repl(Chunk* c, int src_reg) {
@@ -140,23 +154,30 @@ void emit_array_new(Chunk* c, int dest_reg, int item_reg_base, int item_count) {
 }
 
 void emit_index_get(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
-    chunk_emit(c, PACK2(OP_INDEX_GET, dest_reg, arr_reg));
-    chunk_emit(c, rk_idx);
+    if (!rk20_fits(rk_idx)) {
+        error_at("Expression too large to compile (register/constant index exceeds the index-get encoding's range)");
+        return;
+    }
+    chunk_emit(c, PACK_INDEX_GET(dest_reg, arr_reg, rk_idx));
 }
 
 void emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val) {
-    chunk_emit(c, PACK1(OP_INDEX_SET, arr_reg));
-    chunk_emit(c, rk_idx);
-    chunk_emit(c, rk_val);
+    if (!rk20_fits(rk_idx) || !rk20_fits(rk_val)) {
+        error_at("Expression too large to compile (register/constant index exceeds the index-set encoding's range)");
+        return;
+    }
+    chunk_emit(c, PACK_INDEX_SET(arr_reg, rk_idx, rk_val));
 }
 
 /* see OP_SLICE_GET's own comment in vm.h. rk_start/rk_end are RK-encoded exactly
    like every other value operand — a missing bound is passed in as an RK-encoded null constant,
    built by the caller (parse_primary), not specially by this function. */
 void emit_slice_get(Chunk* c, int dest_reg, int arr_reg, int rk_start, int rk_end) {
-    chunk_emit(c, PACK2(OP_SLICE_GET, dest_reg, arr_reg));
-    chunk_emit(c, rk_start);
-    chunk_emit(c, rk_end);
+    if (!rk20_fits(rk_start) || !rk20_fits(rk_end)) {
+        error_at("Expression too large to compile (register/constant index exceeds the slice-get encoding's range)");
+        return;
+    }
+    chunk_emit(c, PACK_SLICE_GET(dest_reg, arr_reg, rk_start, rk_end));
 }
 
 void emit_dict_new(Chunk* c, int dest_reg, int pair_reg_base, int pair_count) {
@@ -171,42 +192,41 @@ unsigned int emit_iter_next_array(Chunk* c, int col_reg, int idx_reg, int item_d
 }
 
 unsigned int emit_iter_next_pair(Chunk* c, int col_reg, int idx_reg, int key_dest_reg, int val_dest_reg) {
-    /* Same word layout as emit_iter_range below — 4 narrow fields, val_dest_reg gets its own
-       word since only 3 fit alongside the opcode, end_target stays dedicated per the patchable-
-       jump-target rule. */
-    chunk_emit(c, PACK3(OP_ITER_NEXT_PAIR, col_reg, idx_reg, key_dest_reg));
-    chunk_emit(c, val_dest_reg);
+    /* Same word layout as emit_iter_range below — all 4 registers now fit in ONE packed word
+       (PACK_REG4, vm.h) since a register-only field only needs 7 bits, not RK's 8. end_target
+       stays in its own dedicated word regardless (hard rule: a patchable jump target is never
+       packed alongside anything else, so patch_jump's blind overwrite stays correct) — 2 words
+       total, down from 3. */
+    chunk_emit(c, PACK_REG4(OP_ITER_NEXT_PAIR, col_reg, idx_reg, key_dest_reg, val_dest_reg));
     unsigned int patch_offset = c->count;
     chunk_emit(c, 0);   /* placeholder — patched by patch_jump once the loop-exit target is known */
     return patch_offset;
 }
 
 unsigned int emit_iter_range(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg) {
-    /* 4 narrow fields, but only 3 fit alongside the opcode in one packed word — item_dest_reg
-       gets its own word rather than displacing end_target from ITS dedicated word (hard rule:
-       a patchable jump target is never packed alongside anything else, so patch_jump's blind
-       overwrite stays correct). Still 3 words total, down from 6. */
-    chunk_emit(c, PACK3(OP_ITER_RANGE, cur_reg, end_reg, step_reg));
-    chunk_emit(c, item_dest_reg);
+    /* All 4 registers packed into one word (PACK_REG4, vm.h) — end_target stays in its own
+       dedicated word regardless (hard rule: a patchable jump target is never packed alongside
+       anything else, so patch_jump's blind overwrite stays correct). 2 words total, down from 3. */
+    chunk_emit(c, PACK_REG4(OP_ITER_RANGE, cur_reg, end_reg, step_reg, item_dest_reg));
     unsigned int patch_offset = c->count;
     chunk_emit(c, 0);   /* placeholder — patched by patch_jump once the loop-exit target is known */
     return patch_offset;
 }
 
 void emit_struct_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int arg_reg_base, int arg_count) {
-    chunk_emit(c, PACK3(OP_STRUCT_NEW, dest_reg, arg_reg_base, arg_count));
-    chunk_emit(c, (int)type_name_pool_idx);
+    chunk_emit(c, PACK_STRUCT_NEW(dest_reg, arg_reg_base, arg_count, type_name_pool_idx));
 }
 
 void emit_field_get(Chunk* c, int dest_reg, int struct_reg, unsigned int field_name_pool_idx) {
-    chunk_emit(c, PACK2(OP_FIELD_GET, dest_reg, struct_reg));
-    chunk_emit(c, (int)field_name_pool_idx);
+    chunk_emit(c, PACK_FIELD_GET(dest_reg, struct_reg, field_name_pool_idx));
 }
 
 void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, int rk_val) {
-    chunk_emit(c, PACK1(OP_FIELD_SET, struct_reg));
-    chunk_emit(c, (int)field_name_pool_idx);
-    chunk_emit(c, rk_val);
+    if (!rk20_fits(rk_val) || field_name_pool_idx > 0x1FFFFFFF) {
+        error_at("Expression too large to compile (register/constant index exceeds the field-set encoding's range)");
+        return;
+    }
+    chunk_emit(c, PACK_FIELD_SET(struct_reg, field_name_pool_idx, rk_val));
 }
 
 /* ------------------------------------------------------------------ */
@@ -738,7 +758,7 @@ static int parse_string_literal(Chunk* c) {
         }
 
         int str_dest = reg_alloc();
-        chunk_emit(c, PACK2(OP_UNARY, str_dest, (int)OP_TO_STR)); chunk_emit(c, var_reg);
+        chunk_emit(c, PACK_UNARY(str_dest, OP_TO_STR, var_reg));
 
         if (result < 0) {
             result = str_dest;
@@ -971,7 +991,8 @@ static int parse_primary(Chunk* c) {
 
 /* Unary operators: each recurses into parse_unary again (not parse_primary), so chained unary
    (`!!x`, `--x`, `~~x`) works, falling to parse_primary only once no more prefix operators apply.
-   rk is RK-encoded like OP_BINARY's operands — OP_UNARY decodes it directly via vm_rk_value. */
+   rk is RK-encoded like OP_BINARY's operands — OP_UNARY packs it via PACK_UNARY/RK20 and decodes
+   it via vm_rk_value20, same scheme as OP_BINARY. */
 static int parse_unary_inner(Chunk* c) {
     Opcode unary_op;
     if      (consume(TOKEN_NOT))         unary_op = OP_NOT;
@@ -982,8 +1003,11 @@ static int parse_unary_inner(Chunk* c) {
     int rk = parse_unary(c);
     if (is_temp(rk)) reg_free(1);   /* free-then-allocate, matching every other site */
     int dest = reg_alloc();
-    chunk_emit(c, PACK2(OP_UNARY, dest, (int)unary_op));
-    chunk_emit(c, rk);
+    if (!rk20_fits(rk)) {
+        error_at("Expression too large to compile (register/constant index exceeds the unary-op encoding's range)");
+        return dest;
+    }
+    chunk_emit(c, PACK_UNARY(dest, unary_op, rk));
     return dest;
 }
 
@@ -1096,9 +1120,11 @@ static int compile_pipe(Chunk* c, int lhs) {
 
         int dest = arg_reg_base;
         if (arg_count > 1) reg_free(arg_count - 1);
-        chunk_emit(c, PACK3(OP_CALL_MODULE, dest, arg_reg_base, arg_count));
-        chunk_emit(c, (int)module_idx);
-        chunk_emit(c, (int)fn_idx);
+        if (!pool_idx_fits(module_idx, CALL_MODULE_NAME_MAX) || !pool_idx_fits(fn_idx, CALL_MODULE_NAME_MAX)) {
+            error_at("Expression too large to compile (module/function name index exceeds the module-call encoding's range)");
+            return dest;
+        }
+        chunk_emit(c, PACK_CALL_MODULE(dest, arg_reg_base, arg_count, module_idx, fn_idx));
         return dest;
     }
 
@@ -1170,11 +1196,16 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             int dest = reg_alloc();
 
             if (is_struct_name(type_name_idx)) {
-                chunk_emit(c, PACK2(OP_CHECK_SHAPE, dest, lhs));
-                chunk_emit(c, (int)type_name_idx);
+                /* lhs is always a plain register here (OP_CHECK_SHAPE's own runtime contract,
+                   unchanged by the encoding — see PACK_CHECK_SHAPE's comment in vm.h), never an
+                   RK-flagged constant, so no rk20_fits guard is needed. */
+                chunk_emit(c, PACK_CHECK_SHAPE(dest, lhs, type_name_idx));
             } else if (type_len == 6 && strncmp(type_name, "string", 6) == 0) {
-                chunk_emit(c, PACK2(OP_UNARY, dest, (int)OP_TO_STR));
-                chunk_emit(c, lhs);
+                if (!rk20_fits(lhs)) {
+                    error_at("Expression too large to compile (register/constant index exceeds the cast encoding's range)");
+                    return dest;
+                }
+                chunk_emit(c, PACK_UNARY(dest, OP_TO_STR, lhs));
             } else {
                 int cast_type;
                 if      (type_len == 7 && strncmp(type_name, "integer", 7) == 0) cast_type = CAST_INTEGER;
@@ -1185,8 +1216,11 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
                              (int)type_len, type_name);
                     return dest;
                 }
-                chunk_emit(c, PACK2(OP_CAST, dest, cast_type));
-                chunk_emit(c, lhs);
+                if (!rk20_fits(lhs)) {
+                    error_at("Expression too large to compile (register/constant index exceeds the cast encoding's range)");
+                    return dest;
+                }
+                chunk_emit(c, PACK_CAST(dest, cast_type, lhs));
             }
             lhs = dest;
             lhs_start = c->count;
@@ -1200,12 +1234,12 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
            itself emitted (short-circuit and/or, nested calls, ...). Truncating here, before RHS
            exists at all, avoids that entirely — same "only ever discard from the tail" invariant
            the RHS-is-field fusion below relies on. */
-        bool lhs_is_field = (c->count - lhs_start == 2 && (c->code[lhs_start] & 0xFF) == OP_FIELD_GET);
+        bool lhs_is_field = (c->count - lhs_start == 1 && (c->code[lhs_start] & 0xFF) == OP_FIELD_GET);
         int lhs_struct_reg = 0;
         unsigned int lhs_field_idx = 0;
         if (lhs_is_field) {
-            lhs_struct_reg = UNPACK_B(c->code[lhs_start]);
-            lhs_field_idx  = (unsigned int)c->code[lhs_start + 1];
+            lhs_struct_reg = (int)UNPACK_FIELD_GET_STRUCT(c->code[lhs_start]);
+            lhs_field_idx  = (unsigned int)UNPACK_FIELD_GET_FIELD(c->code[lhs_start]);
             c->count = lhs_start;   /* discard lhs's OP_FIELD_GET, never executed */
         }
 
@@ -1217,9 +1251,11 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             if (is_temp(lhs)) reg_free(1);
 
             int dest = reg_alloc();
-            chunk_emit(c, PACK3(OP_FIELD_BINARY, dest, lhs_struct_reg, (int)op));
-            chunk_emit(c, (int)lhs_field_idx);
-            chunk_emit(c, rhs);
+            if (!rk20_fits(rhs) || !pool_idx_fits(lhs_field_idx, FUSED_FIELD_NAME_MAX)) {
+                error_at("Expression too large to compile (register/constant/field index exceeds the fused field-op encoding's range)");
+                return lhs;
+            }
+            chunk_emit(c, PACK_FIELD_BINARY(dest, lhs_struct_reg, op, lhs_field_idx, rhs));
             lhs = dest;
             lhs_start = c->count;
             continue;
@@ -1230,21 +1266,23 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
            OP_FIELD_GET immediately followed by this function's own OP_BINARY reading its
            result back out of a register — two dispatches for one operation. Recognized here by
            checking whether the RHS we just compiled was EXACTLY one bare `struct.field` read
-           (a single OP_FIELD_GET, 4 words, nothing chained after it) — if so, discard that
+           (a single OP_FIELD_GET, 1 word, nothing chained after it) — if so, discard that
            instruction (never executed) and re-encode its two operands as this fused opcode's
            trailing operands instead. */
-        if (c->count - rhs_start == 2 && (c->code[rhs_start] & 0xFF) == OP_FIELD_GET) {
-            int struct_reg = UNPACK_B(c->code[rhs_start]);
-            int field_idx  = c->code[rhs_start + 1];
+        if (c->count - rhs_start == 1 && (c->code[rhs_start] & 0xFF) == OP_FIELD_GET) {
+            int struct_reg = (int)UNPACK_FIELD_GET_STRUCT(c->code[rhs_start]);
+            int field_idx  = (int)UNPACK_FIELD_GET_FIELD(c->code[rhs_start]);
             c->count = rhs_start;   /* discard the OP_FIELD_GET just emitted, never executed */
 
             if (is_temp(rhs)) reg_free(1);
             if (is_temp(lhs)) reg_free(1);
 
             int dest = reg_alloc();
-            chunk_emit(c, PACK3(OP_BINARY_FIELD, dest, struct_reg, (int)op));
-            chunk_emit(c, lhs);
-            chunk_emit(c, field_idx);
+            if (!rk20_fits(lhs) || !pool_idx_fits((unsigned int)field_idx, FUSED_FIELD_NAME_MAX)) {
+                error_at("Expression too large to compile (register/constant/field index exceeds the fused field-op encoding's range)");
+                return lhs;
+            }
+            chunk_emit(c, PACK_BINARY_FIELD(dest, struct_reg, op, lhs, field_idx));
             lhs = dest;
             lhs_start = c->count;
             continue;
@@ -1395,8 +1433,11 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             emit_binary(c, local_reg, compound_assign_ops[i].op, local_reg, rk_rhs);
             if (is_temp(rk_rhs)) reg_free(1);
 
-            chunk_emit(c, PACK1(OP_STORE_GLOBAL, reg));
-            chunk_emit(c, local_reg);
+            if (!rk20_fits(local_reg)) {
+                error_at("Expression too large to compile (register/constant index exceeds the store-global encoding's range)");
+                return;
+            }
+            chunk_emit(c, PACK_STORE_GLOBAL(reg, local_reg));
             reg_free(1);   /* local_reg */
             return;
         }
@@ -1549,9 +1590,11 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             int rk_rhs = parse_binary(c, 0);
             if (parse_had_error) return;
 
-            chunk_emit(c, PACK3(OP_FIELD_BINARY, field_reg, obj_reg, (int)compound_assign_ops[i].op));
-            chunk_emit(c, (int)pending_field_idx);
-            chunk_emit(c, rk_rhs);
+            if (!rk20_fits(rk_rhs) || !pool_idx_fits(pending_field_idx, FUSED_FIELD_NAME_MAX)) {
+                error_at("Expression too large to compile (register/constant/field index exceeds the fused field-op encoding's range)");
+                return;
+            }
+            chunk_emit(c, PACK_FIELD_BINARY(field_reg, obj_reg, compound_assign_ops[i].op, pending_field_idx, rk_rhs));
             if (is_temp(rk_rhs)) reg_free(1);
 
             emit_field_set(c, obj_reg, pending_field_idx, field_reg);
@@ -1985,9 +2028,11 @@ static int parse_module_call(Chunk* c) {
     int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
     if (arg_count > 1) reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
-    chunk_emit(c, PACK3(OP_CALL_MODULE, dest, base, arg_count));
-    chunk_emit(c, (int)module_idx);
-    chunk_emit(c, (int)fn_idx);
+    if (!pool_idx_fits(module_idx, CALL_MODULE_NAME_MAX) || !pool_idx_fits(fn_idx, CALL_MODULE_NAME_MAX)) {
+        error_at("Expression too large to compile (module/function name index exceeds the module-call encoding's range)");
+        return dest;
+    }
+    chunk_emit(c, PACK_CALL_MODULE(dest, base, arg_count, module_idx, fn_idx));
     return dest;
 }
 
@@ -2047,8 +2092,7 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
     int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
     if (arg_count > 1) reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
-    chunk_emit(c, PACK3(OP_CALL_BUILTIN, dest, base, arg_count));
-    chunk_emit(c, (int)name_idx);
+    chunk_emit(c, PACK_CALL_BUILTIN(dest, base, arg_count, name_idx));
     return dest;
 }
 
@@ -2057,14 +2101,20 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
    already consumed by the caller. Handles BOTH function calls and struct instantiation, resolved
    at compile time via is_struct_name rather than a runtime fallback chain. A third fallback,
    global builtins, is checked last (is_builtin_name). */
-/* Tail-call optimization. Set to c->count right after parse_call emits a bare OP_CALL/OP_CALL_VALUE
-   (not a struct construction — see the is_struct branch below, which deliberately doesn't touch
-   this); checked by parse_return to detect a true tail call. c->count only grows, and anything
-   that could wrap a call (a further postfix step, a binary operator, the multi-return comma) emits
-   more words after — so last_bare_call_end == c->count is a robust proof the whole return
-   expression is exactly one bare call. The (unsigned int)-1 sentinel means c->count can never
-   accidentally match before any call has ever been compiled. */
-static unsigned int last_bare_call_end = (unsigned int)-1;
+/* Tail-call optimization. Set right after parse_call emits a bare OP_CALL/OP_CALL_VALUE (not a
+   struct construction — see the is_struct branch below, which deliberately doesn't touch this);
+   checked by parse_return to detect a true tail call. c->count only grows, and anything that could
+   wrap a call (a further postfix step, a binary operator, the multi-return comma) emits more words
+   after — so last_bare_call_end == c->count is a robust proof the whole return expression is
+   exactly one bare call. The (unsigned int)-1 sentinel means c->count can never accidentally match
+   before any call has ever been compiled.
+     last_bare_call_start records the call's own opcode-word offset directly (captured at emission
+   time) rather than being derived as "c->count - N" — OP_CALL is 2 words (a patchable target must
+   stay in its own word) but OP_CALL_VALUE is 1 (callee_reg is a plain register, never patched, so
+   it packs alongside dest/arg_reg_base/arg_count — see PACK_REG4/emit_call_value), so a single
+   fixed backward offset can't cover both. */
+static unsigned int last_bare_call_end   = (unsigned int)-1;
+static unsigned int last_bare_call_start = (unsigned int)-1;
 
 static int parse_call(Chunk* c, unsigned int name_idx) {
     /* Functions as values: if `name_idx` is already a known variable (holding whatever value it
@@ -2154,15 +2204,18 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     }
 
     if (is_var) {
+        last_bare_call_start = c->count;
         emit_call_value(c, dest, base, arg_count, is_local_var ? var_reg : callee_reg);
         last_bare_call_end = c->count;
     } else if (is_struct) {
         emit_struct_new(c, dest, name_idx, base, arg_count);
     } else if (is_func) {
+        last_bare_call_start = c->count;
         if (needs_call_value) emit_call_value(c, dest, base, arg_count, callee_reg);
         else                   emit_call(c, dest, func_offset, base, arg_count);   /* exact arity, no receiver check — no forward-ref patching needed, is_func means already resolved */
         last_bare_call_end = c->count;
     } else {
+        last_bare_call_start = c->count;
         unsigned int patch_offset = emit_call(c, dest, func_offset, base, arg_count);
         if (is_forward_ref) pending_call_add(name_idx, patch_offset, call_site_cursor);
         last_bare_call_end = c->count;
@@ -2233,8 +2286,7 @@ static void parse_defer(Chunk* c) {
         unsigned int patch = c->count;
         chunk_emit(c, 0);
         callee_offset = c->count;
-        chunk_emit(c, PACK3(OP_CALL_BUILTIN, 0, 0, arg_count));
-        chunk_emit(c, (int)name_idx);
+        chunk_emit(c, PACK_CALL_BUILTIN(0, 0, arg_count, name_idx));
         chunk_emit(c, PACK1(OP_RETURN, 0));
         patch_jump(c, patch, c->count);
     } else {
@@ -2286,7 +2338,7 @@ static void parse_return(Chunk* c) {
         }
 
         if (last_bare_call_end == c->count) {
-            int op_slot = (int)c->count - 2;
+            int op_slot = (int)last_bare_call_start;
             int orig_op = c->code[op_slot] & 0xFF;
             if (orig_op == OP_CALL || orig_op == OP_CALL_VALUE) {
                 int tail_op = (orig_op == OP_CALL) ? OP_TAIL_CALL : OP_TAIL_CALL_VALUE;

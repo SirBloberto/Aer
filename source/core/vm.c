@@ -1725,12 +1725,10 @@ lbl_jump_if_false_reg: {
 }
 
 lbl_cmp_jump_false: {
-    Opcode cmp_op = (Opcode)UNPACK_A(op_word);
-    int rk_a      = READ();
-    int rk_b      = READ();
+    Opcode cmp_op = (Opcode)UNPACK_CMP_JUMP_OP(op_word);
     int target    = READ();
-    AerVal a = vm_rk_value(vm, c, rk_a);
-    AerVal b = vm_rk_value(vm, c, rk_b);
+    AerVal a = vm_rk_value20(vm, c, UNPACK_CMP_JUMP_RK_A(op_word));
+    AerVal b = vm_rk_value20(vm, c, UNPACK_CMP_JUMP_RK_B(op_word));
     if (!vm_truthy(vm_binary(a, b, cmp_op))) vm->ip = (unsigned int)target;
     DISPATCH();
 }
@@ -1779,10 +1777,10 @@ lbl_call: {
    a REGISTER at dispatch time (a runtime AerFunction, built by build_function_value at the point
    a function name was referenced as a value) instead of a compile-time callee_offset. */
 lbl_call_value: {
-    int dest_reg     = (int)UNPACK_A(op_word);
-    int arg_reg_base = (int)UNPACK_B(op_word);
-    int arg_count    = (int)UNPACK_C(op_word);
-    int callee_reg   = READ();
+    int dest_reg     = (int)UNPACK_REG4_A(op_word);
+    int arg_reg_base = (int)UNPACK_REG4_B(op_word);
+    int arg_count    = (int)UNPACK_REG4_C(op_word);
+    int callee_reg   = (int)UNPACK_REG4_D(op_word);
     vm_call_value(vm, c, vm->registers[callee_reg], dest_reg, arg_reg_base, arg_count,
                       cur_op == OP_TAIL_CALL_VALUE);
     DISPATCH();
@@ -1843,11 +1841,11 @@ lbl_return: {
    lbl_call_module uses, since reimplementing every stdlib function for registers would be pure
    duplication. */
 lbl_call_module: {
-    int dest_reg     = (int)UNPACK_A(op_word);
-    int arg_reg_base = (int)UNPACK_B(op_word);
-    int arg_count    = (int)UNPACK_C(op_word);
-    int module_idx   = READ();
-    int fn_idx       = READ();
+    int dest_reg     = (int)UNPACK_CALL_MODULE_DEST(op_word);
+    int arg_reg_base = (int)UNPACK_CALL_MODULE_ARG_BASE(op_word);
+    int arg_count    = (int)UNPACK_CALL_MODULE_ARG_COUNT(op_word);
+    int module_idx   = (int)UNPACK_CALL_MODULE_MODULE(op_word);
+    int fn_idx       = (int)UNPACK_CALL_MODULE_FN(op_word);
     const char* module = aer_as_string(c->pool[module_idx])->data;
     const char* fn     = aer_as_string(c->pool[fn_idx])->data;
     for (int i = 0; i < arg_count; i++) PUSH(vm->registers[arg_reg_base + i]);
@@ -1872,10 +1870,10 @@ lbl_call_module: {
    push/pop bridge to vm->stack at all. 4 local slots is headroom over every builtin's real max
    arity (2 — delete/append/assert). */
 lbl_call_builtin: {
-    int dest_reg     = (int)UNPACK_A(op_word);
-    int arg_reg_base = (int)UNPACK_B(op_word);
-    int arg_count    = (int)UNPACK_C(op_word);
-    int name_idx     = READ();
+    int dest_reg     = (int)UNPACK_CALL_BUILTIN_DEST(op_word);
+    int arg_reg_base = (int)UNPACK_CALL_BUILTIN_ARG_BASE(op_word);
+    int arg_count    = (int)UNPACK_CALL_BUILTIN_ARG_COUNT(op_word);
+    int name_idx     = (int)UNPACK_CALL_BUILTIN_NAME(op_word);
     const char* name = aer_as_string(c->pool[name_idx])->data;
     if (arg_count > 4) {
         error("Too many arguments to '%s'", name);
@@ -1903,9 +1901,8 @@ lbl_load_global: {
 
 /* write counterpart to OP_LOAD_GLOBAL, see its own comment in vm.h. */
 lbl_store_global: {
-    int global_reg = (int)UNPACK_A(op_word);
-    int rk_val     = READ();
-    vm->call_stack[0].registers[global_reg] = vm_rk_value(vm, c, rk_val);
+    int global_reg = (int)UNPACK_STORE_GLOBAL_REG(op_word);
+    vm->call_stack[0].registers[global_reg] = vm_rk_value20(vm, c, UNPACK_STORE_GLOBAL_RK(op_word));
     DISPATCH();
 }
 
@@ -1957,10 +1954,9 @@ lbl_array_new: {
    already has all bounds/negative-index logic, so nothing about indexing itself needed
    reimplementing for the register path. */
 lbl_index_get: {
-    int dest_reg = (int)UNPACK_A(op_word);
-    int arr_reg  = (int)UNPACK_B(op_word);
-    int rk_idx   = READ();
-    AerVal idx = vm_rk_value(vm, c, rk_idx);
+    int dest_reg = (int)UNPACK_INDEX_GET_DEST(op_word);
+    int arr_reg  = (int)UNPACK_INDEX_GET_ARR(op_word);
+    AerVal idx = vm_rk_value20(vm, c, UNPACK_INDEX_GET_RK(op_word));
     vm->registers[dest_reg] = vm_index_get_compute(vm->registers[arr_reg], idx);
     DISPATCH();
 }
@@ -1969,11 +1965,9 @@ lbl_index_get: {
    gc_barrier_dict call, which this is the first v3 opcode to exercise against a register-held
    reference rather than a stack-held one. */
 lbl_index_set: {
-    int arr_reg = (int)UNPACK_A(op_word);
-    int rk_idx  = READ();
-    int rk_val  = READ();
-    AerVal idx = vm_rk_value(vm, c, rk_idx);
-    AerVal val = vm_rk_value(vm, c, rk_val);
+    int arr_reg = (int)UNPACK_INDEX_SET_ARR(op_word);
+    AerVal idx = vm_rk_value20(vm, c, UNPACK_INDEX_SET_IDX(op_word));
+    AerVal val = vm_rk_value20(vm, c, UNPACK_INDEX_SET_VAL(op_word));
     vm_index_set_compute(vm->registers[arr_reg], idx, val);
     DISPATCH();
 }
@@ -1982,12 +1976,10 @@ lbl_index_set: {
    vm_slice_bounds()/pool_alloc/copy logic, reading the collection and bounds from registers and
    writing the result to one instead of stack pop/push. */
 lbl_slice_get: {
-    int dest_reg = (int)UNPACK_A(op_word);
-    int arr_reg  = (int)UNPACK_B(op_word);
-    int rk_start = READ();
-    int rk_end   = READ();
-    AerVal start_v = vm_rk_value(vm, c, rk_start);
-    AerVal end_v   = vm_rk_value(vm, c, rk_end);
+    int dest_reg = (int)UNPACK_SLICE_GET_DEST(op_word);
+    int arr_reg  = (int)UNPACK_SLICE_GET_ARR(op_word);
+    AerVal start_v = vm_rk_value20(vm, c, UNPACK_SLICE_GET_START(op_word));
+    AerVal end_v   = vm_rk_value20(vm, c, UNPACK_SLICE_GET_END(op_word));
     AerVal obj = vm->registers[arr_reg];
     if (aer_type(obj) == TYPE_ARRAY) {
         AerArray* a = aer_as_array(obj);
@@ -2022,9 +2014,9 @@ lbl_slice_get: {
    exactly: errors unless src_reg holds exactly that struct type, else passes it through
    unchanged — register-based instead of stack pop/push. */
 lbl_check_shape: {
-    int dest_reg = (int)UNPACK_A(op_word);
-    int src_reg  = (int)UNPACK_B(op_word);
-    int name_idx = READ();
+    int dest_reg = (int)UNPACK_CHECK_SHAPE_DEST(op_word);
+    int src_reg  = (int)UNPACK_CHECK_SHAPE_LHS(op_word);
+    int name_idx = (int)UNPACK_CHECK_SHAPE_NAME(op_word);
     AerVal v = vm->registers[src_reg];
     if (aer_type(v) != TYPE_ARRAY || !aer_as_array(v)->shape || aer_as_array(v)->shape->name != (unsigned int)name_idx) {
         error("Expected a '%s', got a '%s'", aer_as_string(c->pool[name_idx])->data, vm_type_name(c, v));
@@ -2112,10 +2104,10 @@ lbl_iter_next_array: {
 
 /* `for k, v in dict:` — see vm_dict_next_key (above) for the shared bucket-scan/copy-key logic. */
 lbl_iter_next_pair: {
-    int col_reg       = (int)UNPACK_A(op_word);
-    int idx_reg       = (int)UNPACK_B(op_word);
-    int key_dest_reg  = (int)UNPACK_C(op_word);
-    int val_dest_reg  = READ();
+    int col_reg       = (int)UNPACK_REG4_A(op_word);
+    int idx_reg       = (int)UNPACK_REG4_B(op_word);
+    int key_dest_reg  = (int)UNPACK_REG4_C(op_word);
+    int val_dest_reg  = (int)UNPACK_REG4_D(op_word);
     int end_target    = READ();
     AerVal col = vm->registers[col_reg];
     if (aer_type(col) != TYPE_DICT) {
@@ -2141,10 +2133,10 @@ lbl_iter_next_pair: {
    un-popped stack slots; no stack cleanup needed on exit since registers aren't a shared LIFO
    structure the way vm->stack is. */
 lbl_iter_range: {
-    int cur_reg       = (int)UNPACK_A(op_word);
-    int end_reg       = (int)UNPACK_B(op_word);
-    int step_reg      = (int)UNPACK_C(op_word);
-    int item_dest_reg = READ();
+    int cur_reg       = (int)UNPACK_REG4_A(op_word);
+    int end_reg       = (int)UNPACK_REG4_B(op_word);
+    int step_reg      = (int)UNPACK_REG4_C(op_word);
+    int item_dest_reg = (int)UNPACK_REG4_D(op_word);
     int end_target    = READ();
     AerVal cur_v  = vm->registers[cur_reg];
     AerVal end_v  = vm->registers[end_reg];
@@ -2174,10 +2166,10 @@ lbl_iter_range: {
    same chunk_find_shape() lookup, same arity check, same single-allocation struct_pool layout —
    reading args from a register range instead of popping them off the stack in reverse. */
 lbl_struct_new: {
-    int dest_reg           = (int)UNPACK_A(op_word);
-    int arg_reg_base       = (int)UNPACK_B(op_word);
-    int arg_count          = (int)UNPACK_C(op_word);
-    int type_name_pool_idx = READ();
+    int dest_reg           = (int)UNPACK_STRUCT_NEW_DEST(op_word);
+    int arg_reg_base       = (int)UNPACK_STRUCT_NEW_ARG_BASE(op_word);
+    int arg_count          = (int)UNPACK_STRUCT_NEW_ARG_COUNT(op_word);
+    int type_name_pool_idx = (int)UNPACK_STRUCT_NEW_NAME(op_word);
     const char* name = aer_as_string(c->pool[type_name_pool_idx])->data;
     Shape* shape = chunk_find_shape(c, name);
     if (!shape) { error("'%s' is not defined", name); DISPATCH(); }
@@ -2202,9 +2194,9 @@ lbl_struct_new: {
    for the shared field-slot lookup/cache. */
 lbl_field_get: {
     unsigned int site = vm->ip - 1;
-    int dest_reg   = (int)UNPACK_A(op_word);
-    int struct_reg = (int)UNPACK_B(op_word);
-    int field_idx  = READ();
+    int dest_reg   = (int)UNPACK_FIELD_GET_DEST(op_word);
+    int struct_reg = (int)UNPACK_FIELD_GET_STRUCT(op_word);
+    int field_idx  = (int)UNPACK_FIELD_GET_FIELD(op_word);
     AerArray* oa; int slot;
     if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
     vm->registers[dest_reg] = oa->items[slot];
@@ -2216,12 +2208,11 @@ lbl_field_get: {
    to a register first. */
 lbl_binary_field: {
     unsigned int site   = vm->ip - 1;
-    int dest_reg   = (int)UNPACK_A(op_word);
-    int struct_reg = (int)UNPACK_B(op_word);
-    int bin_op     = (int)UNPACK_C(op_word);
-    int rk_lhs     = READ();
-    int field_idx  = READ();
-    AerVal lhs = vm_rk_value(vm, c, rk_lhs);
+    int dest_reg   = (int)UNPACK_BINARY_FIELD_DEST(op_word);
+    int struct_reg = (int)UNPACK_BINARY_FIELD_STRUCT(op_word);
+    int bin_op     = (int)UNPACK_BINARY_FIELD_OP(op_word);
+    int field_idx  = (int)UNPACK_BINARY_FIELD_NAME(op_word);
+    AerVal lhs = vm_rk_value20(vm, c, UNPACK_BINARY_FIELD_RK(op_word));
     AerArray* oa; int slot;
     if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
     vm->registers[dest_reg] = vm_binary(lhs, oa->items[slot], (Opcode)bin_op);
@@ -2232,12 +2223,11 @@ lbl_binary_field: {
    vm.h. */
 lbl_field_binary: {
     unsigned int site   = vm->ip - 1;
-    int dest_reg   = (int)UNPACK_A(op_word);
-    int struct_reg = (int)UNPACK_B(op_word);
-    int bin_op     = (int)UNPACK_C(op_word);
-    int field_idx  = READ();
-    int rk_rhs     = READ();
-    AerVal rhs = vm_rk_value(vm, c, rk_rhs);
+    int dest_reg   = (int)UNPACK_FIELD_BINARY_DEST(op_word);
+    int struct_reg = (int)UNPACK_FIELD_BINARY_STRUCT(op_word);
+    int bin_op     = (int)UNPACK_FIELD_BINARY_OP(op_word);
+    int field_idx  = (int)UNPACK_FIELD_BINARY_NAME(op_word);
+    AerVal rhs = vm_rk_value20(vm, c, UNPACK_FIELD_BINARY_RK(op_word));
     AerArray* oa; int slot;
     if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
     vm->registers[dest_reg] = vm_binary(oa->items[slot], rhs, (Opcode)bin_op);
@@ -2260,10 +2250,9 @@ lbl_print_repl: {
    write barrier every mutating struct/array/dict write needs. */
 lbl_field_set: {
     unsigned int site = vm->ip - 1;
-    int struct_reg = (int)UNPACK_A(op_word);
-    int field_idx  = READ();
-    int rk_val     = READ();
-    AerVal val = vm_rk_value(vm, c, rk_val);
+    int struct_reg = (int)UNPACK_FIELD_SET_STRUCT(op_word);
+    int field_idx  = (int)UNPACK_FIELD_SET_FIELD(op_word);
+    AerVal val = vm_rk_value20(vm, c, UNPACK_FIELD_SET_RK(op_word));
     AerArray* oa; int slot;
     if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
     gc_barrier_array(oa, val);
@@ -2276,10 +2265,9 @@ lbl_field_set: {
    "{name}" -> string conversion), calling the existing vm_to_str() helper (shared with
    print()/lbl_to_str above) rather than reimplementing value formatting. */
 lbl_unary: {
-    int dest        = (int)UNPACK_A(op_word);
-    Opcode unary_op = (Opcode)UNPACK_B(op_word);
-    int rk          = READ();
-    AerVal v = vm_rk_value(vm, c, rk);
+    int dest        = (int)UNPACK_UNARY_DEST(op_word);
+    Opcode unary_op = (Opcode)UNPACK_UNARY_OP(op_word);
+    AerVal v = vm_rk_value20(vm, c, UNPACK_UNARY_RK(op_word));
     AerVal result;
     switch (unary_op) {
         case OP_NEGATE:
@@ -2307,10 +2295,9 @@ lbl_unary: {
 
 /* `x as integer/float/boolean` — see vm_cast() above. */
 lbl_cast: {
-    int dest      = (int)UNPACK_A(op_word);
-    int cast_type = (int)UNPACK_B(op_word);
-    int rk        = READ();
-    AerVal v = vm_rk_value(vm, c, rk);
+    int dest      = (int)UNPACK_CAST_DEST(op_word);
+    int cast_type = (int)UNPACK_CAST_TYPE(op_word);
+    AerVal v = vm_rk_value20(vm, c, UNPACK_CAST_RK(op_word));
     vm->registers[dest] = vm_cast(v, cast_type);
     DISPATCH();
 }

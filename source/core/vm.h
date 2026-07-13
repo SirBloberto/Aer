@@ -376,6 +376,211 @@ typedef enum {
 #define UNPACK_RK_B20(word) (((word) >> 24) & 0xFFFFFULL)
 #define UNPACK_RK_C20(word) (((word) >> 44) & 0xFFFFFULL)
 
+/* Slice A of the same single-word treatment, extended to the next-hottest opcodes. A register
+   field only needs 7 bits here (not RK's 8) — exactly FRAME_REGISTERS, no headroom wasted —
+   since a plain register index (unlike an RK operand) never needs a flag bit and is provably
+   always < FRAME_REGISTERS (reg_alloc/reg_reserve already refuse to hand out more). This is what
+   makes 4 registers fit alongside an opcode with bits to spare (PACK_REG4 below).
+     Patchable jump targets are deliberately EXCLUDED from every packing here, same rule OP_JUMP's
+   family already followed before this change (see PACK3's own comment above): patch_jump does a
+   blind word overwrite at the target's own offset, so any field sharing that word would be
+   clobbered. OP_ITER_RANGE/OP_ITER_NEXT_PAIR's target word is untouched by PACK_REG4 — only their
+   OTHER (non-target) fields get packed together. */
+#define PACK_REG4(op, a, b, cc, d) \
+    ( ((unsigned long long)(op) & 0xFF) \
+    | (((unsigned long long)(a)  & 0x7F) << 8) \
+    | (((unsigned long long)(b)  & 0x7F) << 15) \
+    | (((unsigned long long)(cc) & 0x7F) << 22) \
+    | (((unsigned long long)(d)  & 0x7F) << 29) )
+#define UNPACK_REG4_A(word) (((word) >> 8)  & 0x7F)
+#define UNPACK_REG4_B(word) (((word) >> 15) & 0x7F)
+#define UNPACK_REG4_C(word) (((word) >> 22) & 0x7F)
+#define UNPACK_REG4_D(word) (((word) >> 29) & 0x7F)
+
+/* OP_FIELD_GET: dest/struct_reg (7 bits each) + field_idx (a bare pool index, not RK — always a
+   constant name, never a register) get the whole remaining 42 bits, comfortably more than any
+   real pool will ever hold, so no overflow guard is needed here the way OP_BINARY's RK20 needs
+   one (a 30-bit-plus pool would already have failed elsewhere first). */
+#define PACK_FIELD_GET(dest, struct_reg, field_idx) \
+    ( ((unsigned long long)(OP_FIELD_GET)  & 0xFF) \
+    | (((unsigned long long)(dest)         & 0x7F) << 8) \
+    | (((unsigned long long)(struct_reg)   & 0x7F) << 15) \
+    | (((unsigned long long)(field_idx)    & 0x3FFFFFFFFFFULL) << 22) )
+#define UNPACK_FIELD_GET_DEST(word)   (((word) >> 8)  & 0x7F)
+#define UNPACK_FIELD_GET_STRUCT(word) (((word) >> 15) & 0x7F)
+#define UNPACK_FIELD_GET_FIELD(word)  (((word) >> 22) & 0x3FFFFFFFFFFULL)
+
+/* OP_FIELD_SET: struct_reg(7) + field_idx(29, same "always a name, always small" reasoning as
+   OP_FIELD_GET) + rk_val (RK20:20) = 64 bits exactly. */
+#define PACK_FIELD_SET(struct_reg, field_idx, rk_val) \
+    ( ((unsigned long long)(OP_FIELD_SET) & 0xFF) \
+    | (((unsigned long long)(struct_reg)  & 0x7F) << 8) \
+    | (((unsigned long long)(field_idx)   & 0x1FFFFFFFULL) << 15) \
+    | ((PACK_RK20(rk_val) & 0xFFFFFULL) << 44) )
+#define UNPACK_FIELD_SET_STRUCT(word) (((word) >> 8)  & 0x7F)
+#define UNPACK_FIELD_SET_FIELD(word)  (((word) >> 15) & 0x1FFFFFFFULL)
+#define UNPACK_FIELD_SET_RK(word)     (((word) >> 44) & 0xFFFFFULL)
+
+/* OP_INDEX_GET: dest/arr_reg (7 bits each) + rk_idx (RK20:20). */
+#define PACK_INDEX_GET(dest, arr_reg, rk_idx) \
+    ( ((unsigned long long)(OP_INDEX_GET) & 0xFF) \
+    | (((unsigned long long)(dest)    & 0x7F) << 8) \
+    | (((unsigned long long)(arr_reg) & 0x7F) << 15) \
+    | ((PACK_RK20(rk_idx) & 0xFFFFFULL) << 22) )
+#define UNPACK_INDEX_GET_DEST(word) (((word) >> 8)  & 0x7F)
+#define UNPACK_INDEX_GET_ARR(word)  (((word) >> 15) & 0x7F)
+#define UNPACK_INDEX_GET_RK(word)   (((word) >> 22) & 0xFFFFFULL)
+
+/* Slice C: OP_STORE_GLOBAL/OP_UNARY/OP_CAST/OP_CHECK_SHAPE/OP_STRUCT_NEW — none of these have a
+   patchable target (unlike OP_JUMP_IF_FALSE_REG/OP_DEFER_PUSH, which stay 2 words: see
+   emit_jump_if_false_reg/emit_defer_push's own comments — a `defer` callee_offset can be a
+   forward-reference placeholder exactly like OP_CALL's, so it needs the same dedicated word), so
+   all their fields safely fold into one word. */
+#define PACK_STORE_GLOBAL(global_reg, rk_val) \
+    ( ((unsigned long long)(OP_STORE_GLOBAL) & 0xFF) \
+    | (((unsigned long long)(global_reg) & 0x7F) << 8) \
+    | ((PACK_RK20(rk_val) & 0xFFFFFULL) << 15) )
+#define UNPACK_STORE_GLOBAL_REG(word) (((word) >> 8)  & 0x7F)
+#define UNPACK_STORE_GLOBAL_RK(word)  (((word) >> 15) & 0xFFFFFULL)
+
+/* Shared by OP_UNARY and OP_CAST — dest/reg (7) + op-or-cast-type tag (8, same width as
+   OP_BINARY's bin_op tag) + rk (RK20:20). */
+#define PACK_UNARY(dest, unary_op, rk) \
+    ( ((unsigned long long)(OP_UNARY) & 0xFF) \
+    | (((unsigned long long)(dest)     & 0x7F) << 8) \
+    | (((unsigned long long)(unary_op) & 0xFF) << 15) \
+    | ((PACK_RK20(rk) & 0xFFFFFULL) << 23) )
+#define UNPACK_UNARY_DEST(word) (((word) >> 8)  & 0x7F)
+#define UNPACK_UNARY_OP(word)   (((word) >> 15) & 0xFF)
+#define UNPACK_UNARY_RK(word)   (((word) >> 23) & 0xFFFFFULL)
+
+#define PACK_CAST(dest, cast_type, rk) \
+    ( ((unsigned long long)(OP_CAST) & 0xFF) \
+    | (((unsigned long long)(dest)      & 0x7F) << 8) \
+    | (((unsigned long long)(cast_type) & 0xFF) << 15) \
+    | ((PACK_RK20(rk) & 0xFFFFFULL) << 23) )
+#define UNPACK_CAST_DEST(word) (((word) >> 8)  & 0x7F)
+#define UNPACK_CAST_TYPE(word) (((word) >> 15) & 0xFF)
+#define UNPACK_CAST_RK(word)   (((word) >> 23) & 0xFFFFFULL)
+
+/* dest/lhs_reg (7 bits each) + type_name_idx — a bare pool index, not RK (always a compile-time
+   struct type name, never a register) — gets the remaining 42 bits, same reasoning as
+   OP_FIELD_GET's field_idx. */
+#define PACK_CHECK_SHAPE(dest, lhs_reg, type_name_idx) \
+    ( ((unsigned long long)(OP_CHECK_SHAPE) & 0xFF) \
+    | (((unsigned long long)(dest)          & 0x7F) << 8) \
+    | (((unsigned long long)(lhs_reg)       & 0x7F) << 15) \
+    | (((unsigned long long)(type_name_idx) & 0x3FFFFFFFFFFULL) << 22) )
+#define UNPACK_CHECK_SHAPE_DEST(word) (((word) >> 8)  & 0x7F)
+#define UNPACK_CHECK_SHAPE_LHS(word)  (((word) >> 15) & 0x7F)
+#define UNPACK_CHECK_SHAPE_NAME(word) (((word) >> 22) & 0x3FFFFFFFFFFULL)
+
+/* dest/arg_reg_base/arg_count (7 bits each) + type_name_pool_idx, gets the remaining 35 bits —
+   also a bare compile-time-only pool index, never patched (struct construction always resolves at
+   parse time, never a forward-reference placeholder the way a function call can be). */
+#define PACK_STRUCT_NEW(dest, arg_reg_base, arg_count, type_name_idx) \
+    ( ((unsigned long long)(OP_STRUCT_NEW) & 0xFF) \
+    | (((unsigned long long)(dest)          & 0x7F) << 8) \
+    | (((unsigned long long)(arg_reg_base)  & 0x7F) << 15) \
+    | (((unsigned long long)(arg_count)     & 0x7F) << 22) \
+    | (((unsigned long long)(type_name_idx) & 0x7FFFFFFFFULL) << 29) )
+#define UNPACK_STRUCT_NEW_DEST(word)     (((word) >> 8)  & 0x7F)
+#define UNPACK_STRUCT_NEW_ARG_BASE(word) (((word) >> 15) & 0x7F)
+#define UNPACK_STRUCT_NEW_ARG_COUNT(word) (((word) >> 22) & 0x7F)
+#define UNPACK_STRUCT_NEW_NAME(word)     (((word) >> 29) & 0x7FFFFFFFFULL)
+
+/* Slice E — the last, tightest-budget batch: OP_CMP_JUMP_FALSE/OP_INDEX_SET/OP_SLICE_GET have no
+   patchable target issue (OP_CMP_JUMP_FALSE's target still gets its own dedicated word, same rule
+   as everywhere else) but need two RK20 operands in one word; OP_CALL_MODULE/OP_CALL_BUILTIN have
+   no patchable target at all (module/function/builtin names are always literal identifiers
+   resolved at parse time, never a forward-reference placeholder); OP_FIELD_BINARY/OP_BINARY_FIELD
+   are the tightest of all — dest+struct_reg+bin_op+one RK operand already use 42 bits, leaving
+   only 14 for field_idx (16384 slots) instead of the 29-42 bits every other opcode's name/field
+   index got. Still comfortably more than any real program's field-name count specifically (as
+   opposed to its total pool size, which these two don't need to address) — guarded the same way. */
+#define PACK_CMP_JUMP_FALSE(cmp_op, rk_a, rk_b) \
+    ( ((unsigned long long)(OP_CMP_JUMP_FALSE) & 0xFF) \
+    | (((unsigned long long)(cmp_op) & 0xFF) << 8) \
+    | ((PACK_RK20(rk_a) & 0xFFFFFULL) << 16) \
+    | ((PACK_RK20(rk_b) & 0xFFFFFULL) << 36) )
+#define UNPACK_CMP_JUMP_OP(word)   (((word) >> 8)  & 0xFF)
+#define UNPACK_CMP_JUMP_RK_A(word) (((word) >> 16) & 0xFFFFFULL)
+#define UNPACK_CMP_JUMP_RK_B(word) (((word) >> 36) & 0xFFFFFULL)
+
+#define PACK_INDEX_SET(arr_reg, rk_idx, rk_val) \
+    ( ((unsigned long long)(OP_INDEX_SET) & 0xFF) \
+    | (((unsigned long long)(arr_reg) & 0x7F) << 8) \
+    | ((PACK_RK20(rk_idx) & 0xFFFFFULL) << 15) \
+    | ((PACK_RK20(rk_val) & 0xFFFFFULL) << 35) )
+#define UNPACK_INDEX_SET_ARR(word) (((word) >> 8)  & 0x7F)
+#define UNPACK_INDEX_SET_IDX(word) (((word) >> 15) & 0xFFFFFULL)
+#define UNPACK_INDEX_SET_VAL(word) (((word) >> 35) & 0xFFFFFULL)
+
+#define PACK_SLICE_GET(dest, arr_reg, rk_start, rk_end) \
+    ( ((unsigned long long)(OP_SLICE_GET) & 0xFF) \
+    | (((unsigned long long)(dest)    & 0x7F) << 8) \
+    | (((unsigned long long)(arr_reg) & 0x7F) << 15) \
+    | ((PACK_RK20(rk_start) & 0xFFFFFULL) << 22) \
+    | ((PACK_RK20(rk_end)   & 0xFFFFFULL) << 42) )
+#define UNPACK_SLICE_GET_DEST(word)  (((word) >> 8)  & 0x7F)
+#define UNPACK_SLICE_GET_ARR(word)   (((word) >> 15) & 0x7F)
+#define UNPACK_SLICE_GET_START(word) (((word) >> 22) & 0xFFFFFULL)
+#define UNPACK_SLICE_GET_END(word)   (((word) >> 42) & 0xFFFFFULL)
+
+#define CALL_MODULE_NAME_MASK  0x1FFFFULL
+#define CALL_MODULE_NAME_MAX   0x1FFFF
+#define PACK_CALL_MODULE(dest, arg_reg_base, arg_count, module_idx, fn_idx) \
+    ( ((unsigned long long)(OP_CALL_MODULE) & 0xFF) \
+    | (((unsigned long long)(dest)         & 0x7F) << 8) \
+    | (((unsigned long long)(arg_reg_base) & 0x7F) << 15) \
+    | (((unsigned long long)(arg_count)    & 0x7F) << 22) \
+    | (((unsigned long long)(module_idx) & CALL_MODULE_NAME_MASK) << 29) \
+    | (((unsigned long long)(fn_idx)     & CALL_MODULE_NAME_MASK) << 46) )
+#define UNPACK_CALL_MODULE_DEST(word)     (((word) >> 8)  & 0x7F)
+#define UNPACK_CALL_MODULE_ARG_BASE(word) (((word) >> 15) & 0x7F)
+#define UNPACK_CALL_MODULE_ARG_COUNT(word) (((word) >> 22) & 0x7F)
+#define UNPACK_CALL_MODULE_MODULE(word)  (((word) >> 29) & CALL_MODULE_NAME_MASK)
+#define UNPACK_CALL_MODULE_FN(word)      (((word) >> 46) & CALL_MODULE_NAME_MASK)
+
+#define PACK_CALL_BUILTIN(dest, arg_reg_base, arg_count, name_idx) \
+    ( ((unsigned long long)(OP_CALL_BUILTIN) & 0xFF) \
+    | (((unsigned long long)(dest)         & 0x7F) << 8) \
+    | (((unsigned long long)(arg_reg_base) & 0x7F) << 15) \
+    | (((unsigned long long)(arg_count)    & 0x7F) << 22) \
+    | (((unsigned long long)(name_idx)     & 0x7FFFFFFFFULL) << 29) )
+#define UNPACK_CALL_BUILTIN_DEST(word)     (((word) >> 8)  & 0x7F)
+#define UNPACK_CALL_BUILTIN_ARG_BASE(word) (((word) >> 15) & 0x7F)
+#define UNPACK_CALL_BUILTIN_ARG_COUNT(word) (((word) >> 22) & 0x7F)
+#define UNPACK_CALL_BUILTIN_NAME(word)    (((word) >> 29) & 0x7FFFFFFFFULL)
+
+#define FUSED_FIELD_NAME_MASK 0x3FFFULL
+#define FUSED_FIELD_NAME_MAX  0x3FFF
+#define PACK_FIELD_BINARY(dest, struct_reg, bin_op, field_idx, rk_rhs) \
+    ( ((unsigned long long)(OP_FIELD_BINARY) & 0xFF) \
+    | (((unsigned long long)(dest)       & 0x7F) << 8) \
+    | (((unsigned long long)(struct_reg) & 0x7F) << 15) \
+    | (((unsigned long long)(bin_op)     & 0xFF) << 22) \
+    | (((unsigned long long)(field_idx) & FUSED_FIELD_NAME_MASK) << 30) \
+    | ((PACK_RK20(rk_rhs) & 0xFFFFFULL) << 44) )
+#define UNPACK_FIELD_BINARY_DEST(word)   (((word) >> 8)  & 0x7F)
+#define UNPACK_FIELD_BINARY_STRUCT(word) (((word) >> 15) & 0x7F)
+#define UNPACK_FIELD_BINARY_OP(word)     (((word) >> 22) & 0xFF)
+#define UNPACK_FIELD_BINARY_NAME(word)   (((word) >> 30) & FUSED_FIELD_NAME_MASK)
+#define UNPACK_FIELD_BINARY_RK(word)     (((word) >> 44) & 0xFFFFFULL)
+
+#define PACK_BINARY_FIELD(dest, struct_reg, bin_op, rk_lhs, field_idx) \
+    ( ((unsigned long long)(OP_BINARY_FIELD) & 0xFF) \
+    | (((unsigned long long)(dest)       & 0x7F) << 8) \
+    | (((unsigned long long)(struct_reg) & 0x7F) << 15) \
+    | (((unsigned long long)(bin_op)     & 0xFF) << 22) \
+    | ((PACK_RK20(rk_lhs) & 0xFFFFFULL) << 30) \
+    | (((unsigned long long)(field_idx) & FUSED_FIELD_NAME_MASK) << 50) )
+#define UNPACK_BINARY_FIELD_DEST(word)   (((word) >> 8)  & 0x7F)
+#define UNPACK_BINARY_FIELD_STRUCT(word) (((word) >> 15) & 0x7F)
+#define UNPACK_BINARY_FIELD_OP(word)     (((word) >> 22) & 0xFF)
+#define UNPACK_BINARY_FIELD_RK(word)     (((word) >> 30) & 0xFFFFFULL)
+#define UNPACK_BINARY_FIELD_NAME(word)   (((word) >> 50) & FUSED_FIELD_NAME_MASK)
+
 /* OP_CAST operand values — target type for `x as T` (T=string compiles to OP_TO_STR instead, since that conversion already existed). */
 #define CAST_INTEGER 0
 #define CAST_FLOAT   1
