@@ -902,22 +902,34 @@ static bool values_equal(AerVal a, AerVal b) {
 }
 
 /* Split into one function per operator category, instead of a single do-everything vm_binary
-   switching on every operator — see the specialized labels in vm_run (BINARY_OP_LABEL) for why:
-   inlining ONE giant do-everything function at all 18 specialized call sites (relying purely on
-   constant-folding to shrink each down to what it needs) measurably REGRESSED on real Raspberry Pi
-   hardware — more instructions retired, not fewer, despite fewer indirect jumps in isolation —
-   evidently the fold didn't shrink every instantiation enough there to pay for 18 copies of a
-   ~170-line function. Each category function below only contains the type-check branches its own
-   operators can actually reach, so there's far less to duplicate per call site even before any
-   folding happens; vm_equality is the one still-general exception (equality is valid for every
-   type, so there's no smaller subset to extract for it).
+   switching on every operator — see the specialized labels in vm_run (BINARY_OP_LABEL) for why.
+   Two things were tried and measurably REGRESSED on real Raspberry Pi hardware before landing on
+   this shape:
+     1. Inlining ONE giant do-everything vm_binary at all 18 specialized call sites, trusting
+        constant-folding to shrink each instantiation down to just what it needs.
+     2. Splitting into these same category functions, but STILL force-inlining them at every call
+        site.
+   Both increased total instructions retired, not decreased. A minimal reproducer confirmed the
+   fold itself works fine on GCC 11.4.0/ARM (a literal-op call to an always_inline switch really
+   does collapse to just the matching case) — the actual problem is that folding only ever removes
+   the OP-DEPENDENT branches. The surrounding type-check scaffolding (is a int? is b int? is a
+   real? promote?) doesn't depend on op at all, so no amount of constant-folding touches it —
+   and forced inlining physically copies that scaffolding into vm_run once per call site (6 times
+   for vm_arith, 5 for vm_bitwise, ...) regardless. That's a straight code-size multiplication with
+   nothing folding away, which is exactly what regressed on the Pi's smaller L1 instruction cache.
+     These functions are therefore plain `static` (no inline hint at all): compiled once, called
+   normally from each of vm_run's specialized labels and from vm_binary's runtime dispatcher below.
+   Each still only contains the type-check branches its own operators can actually reach, so even
+   without inlining, the runtime switch each does have is smaller than the old monolithic one's —
+   vm_equality is the one still-general exception (equality is valid for every type, so there's no
+   smaller subset to extract for it).
      A handful of dead operator/type combinations (e.g. `[1,2] + [3,4]`, arithmetic on booleans)
-   now fall through to the generic "Type mismatch in binary expression" error at the bottom of each
+   fall through to the generic "Type mismatch in binary expression" error at the bottom of each
    function instead of a category's own worded one ("Operator not valid for arrays") — still a
    clean, correctly reported error either way, just less specific wording for what's already an
    error case; nothing in tests/ or the host API asserts on that exact string. */
 
-static inline __attribute__((always_inline)) AerVal vm_in(AerVal a, AerVal b) {
+static AerVal vm_in(AerVal a, AerVal b) {
     /* Checked separately from equality/type-mismatch below so `null in arr` isn't intercepted by
        any "null op anything-else errors" rule — this is container search, not direct comparison. */
     if (aer_type(b) == TYPE_DICT) {
@@ -944,7 +956,7 @@ static inline __attribute__((always_inline)) AerVal vm_in(AerVal a, AerVal b) {
 /* ADD/SUB/MUL/DIV/MOD/FLOOR_DIV. int/int and real/real fast paths (checked before null/promotion,
    same reasoning as the old shared vm_binary had — nbody-style code is dominated by these), then
    real-promotion fallback; ADD alone also handles string concatenation. */
-static inline __attribute__((always_inline)) AerVal vm_arith(AerVal a, AerVal b, Opcode op) {
+static AerVal vm_arith(AerVal a, AerVal b, Opcode op) {
     ValueType ta = aer_type(a), tb = aer_type(b);
     if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) {
         long long l = aer_as_int(a), rv = aer_as_int(b);
@@ -1015,7 +1027,7 @@ static inline __attribute__((always_inline)) AerVal vm_arith(AerVal a, AerVal b,
 
 /* LT/GT/LTE/GTE. Numeric only (int/int, real/real, real-promotion) — unlike equality, ordering
    isn't defined for strings/arrays/dicts/booleans in AER, so there's nothing else to check. */
-static inline __attribute__((always_inline)) AerVal vm_compare(AerVal a, AerVal b, Opcode op) {
+static AerVal vm_compare(AerVal a, AerVal b, Opcode op) {
     ValueType ta = aer_type(a), tb = aer_type(b);
     if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) {
         long long l = aer_as_int(a), rv = aer_as_int(b);
@@ -1056,7 +1068,7 @@ static inline __attribute__((always_inline)) AerVal vm_compare(AerVal a, AerVal 
 /* EQ/NEQ. Valid for every type (structural/reference equality, same rules the old shared
    vm_binary used) — the one category that stays genuinely general, since there's no smaller
    subset of types to carve out for it. */
-static inline __attribute__((always_inline)) AerVal vm_equality(AerVal a, AerVal b, Opcode op) {
+static AerVal vm_equality(AerVal a, AerVal b, Opcode op) {
     ValueType ta = aer_type(a), tb = aer_type(b);
     if (ta == TYPE_INTEGER && tb == TYPE_INTEGER)
         return aer_bool(op == OP_EQ ? aer_as_int(a) == aer_as_int(b) : aer_as_int(a) != aer_as_int(b));
@@ -1084,7 +1096,7 @@ static inline __attribute__((always_inline)) AerVal vm_equality(AerVal a, AerVal
 }
 
 /* BITWISE_AND/OR/XOR/LSHIFT/RSHIFT. Integers only — nothing else to check. */
-static inline __attribute__((always_inline)) AerVal vm_bitwise(AerVal a, AerVal b, Opcode op) {
+static AerVal vm_bitwise(AerVal a, AerVal b, Opcode op) {
     if (aer_type(a) == TYPE_INTEGER && aer_type(b) == TYPE_INTEGER) {
         long long l = aer_as_int(a), rv = aer_as_int(b);
         switch (op) {
@@ -1783,13 +1795,14 @@ lbl_move: {
    entire reason binary operators get their own encoding instead of the ordinary PACK3+wide-word
    scheme every other opcode uses. Each label calls its own small category function (vm_arith/
    vm_compare/vm_equality/vm_bitwise/vm_in, above) with a literal enum constant instead of a
-   variable decoded from op_word — since those are always_inline, the compiler still folds each
-   one's op-switch down to a single case at every one of these 18 call sites, same as calling one
-   shared vm_binary would. The difference (see those functions' own comment) is code size: each
-   category function only carries the type-check branches its own few operators can reach, so
-   there's far less to duplicate per site — inlining one do-everything vm_binary at all 18 sites
-   instead measurably regressed on real Raspberry Pi hardware (more instructions retired despite
-   fewer indirect jumps in isolation), presumably from exceeding the Pi's L1 instruction cache. */
+   variable decoded from op_word, saving that one decode step — but those functions are plain
+   `static`, not inlined (see their own comment for why: force-inlining duplicated their
+   non-op-dependent type-check scaffolding into vm_run once per call site, which regressed on the
+   Pi harder than the runtime dispatch it was meant to remove). Direct dispatch to each label still
+   gives the outer computed-goto its own per-operator target instead of funneling every operator
+   through one shared lbl_binary, and each category's own runtime switch is smaller than the old
+   monolithic vm_binary's ~17-case one — real, if more modest, wins than the folding this comment
+   used to describe. */
 #define BINARY_OP_LABEL(label, call) \
 label: { \
     int dest  = (int)UNPACK_A(op_word); \
