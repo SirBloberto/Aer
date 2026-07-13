@@ -119,7 +119,7 @@ static inline long long aer_as_int(AerVal v) {
     return (long long)p47;
 }
 
-/* The seam between AER's internal packed AerVal and the public boxed Value struct AerNativeFn's signature has always used (README's Embedding section); used by aer_host.c's aer_host_call and by aer_io.c, which builds Value results from AerVal-returning helpers like aer_make_string. */
+/* The seam between AER's internal packed AerVal and the public boxed Value struct used by AerNativeFn's signature (README's Embedding section); used by aer_host.c's aer_host_call and by aer_io.c, which builds Value results from AerVal-returning helpers like aer_make_string. */
 static inline Value aer_val_to_public(AerVal v) {
     Value out = {0};
     out.type = aer_type(v);

@@ -37,11 +37,10 @@ typedef struct {
        xmalloc, pool_alloc/pool_sweep's per-index addressing, pool_cell_state_or_null's reverse
        lookup) — elem_size rounded up to the next power of two, with stride_shift its log2, so a
        cell's index within a slab is `offset >> stride_shift` instead of `offset / elem_size`.
-       elem_size itself is almost never a compile-time constant (it's a runtime Pool field), so the
-       compiler can never strength-reduce that division into a shift on its own; profiling on real
-       hardware (Pi, nbody.aer) found this division alone (calling out to libgcc's __udivsi3 on a
-       32-bit ARM target with no reachable hardware divide) costing measurable cycles on every
-       single GC write-barrier/mark check. stride is always >= elem_size, so cells are slightly
+       elem_size is a runtime Pool field, not a compile-time constant, so the compiler can't
+       strength-reduce that division into a shift on its own; on a target with no hardware integer
+       divide (e.g. 32-bit ARM), it would instead call a software libgcc routine on every single GC
+       write-barrier/mark check. stride is always >= elem_size, so cells are slightly
        over-provisioned (real, bounded padding) in exchange for the division never happening at
        all. Computed once in pool_init and never changes after. */
     size_t          stride;

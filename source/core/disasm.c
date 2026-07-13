@@ -5,18 +5,17 @@
 #include "error.h"
 #include "value_box.h"
 
-/* Kinds of operand word this disassembler knows how to decode/print. Distinct from parser.c's
-   (unrelated, compile-time-only) OperandKind — this one describes bytecode layout, not fusability. */
+/* Kinds of operand word this disassembler knows how to decode/print. */
 typedef enum {
     FLD_END,      /* marks the end of an opcode's operand list */
     FLD_POOL,     /* pool index — resolve and print the constant's own value */
     FLD_NAME,     /* pool index known to be a TYPE_STRING name — print just the string, no quotes */
-    FLD_SLOT,     /* local slot index */
-    FLD_CACHE,    /* addr_cache slot index */
     FLD_JUMP,     /* absolute code offset this instruction may jump to */
     FLD_COUNT,    /* a raw integer (arg count, item count, arity...) */
     FLD_BINOP,    /* an Opcode value used as an operand (bin_op in a fused op, or CMP_JUMP_FALSE's comparison) */
     FLD_CAST,     /* CAST_INTEGER/CAST_FLOAT/CAST_BOOLEAN */
+    FLD_REG,      /* a plain register index (packed or wide — a register number either way) */
+    FLD_RK,       /* an RK-encoded operand: RK_CONST_FLAG set = a pool constant, else a register */
 } Field;
 
 #define MAX_FIELDS 6
@@ -26,117 +25,78 @@ typedef struct {
     const char* desc;
     Field       fields[MAX_FIELDS];
     bool        variable;   /* true only for OP_DEFINE_STRUCT — see disassemble_one */
+    /* How many of fields[] (always the FIRST `packed` of them) come from the CURRENT instruction's
+       own descriptor word (UNPACK_A/B/C, vm.h) instead of a separate word of their own — 0 for
+       an opcode with no packed fields at all (OP_JUMP, OP_DEFINE_STRUCT, OP_HALT). See
+       disassemble_one's own comment for the full reasoning. */
+    int packed;
 } OpInfo;
 
-static const OpInfo op_info[OP_HALT + 1] = {
-    [OP_PUSH]  = { "OP_PUSH",  "push a constant", {FLD_POOL} },
-    [OP_DUP_N] = { "OP_DUP_N", "duplicate the top N stack values in place", {FLD_COUNT} },
+/* OP_PRINT_REPL is the last member of the Opcode enum (vm.h). */
+#define OP_INFO_MAX OP_PRINT_REPL
 
-    [OP_LOAD]  = { "OP_LOAD",  "push a global's value (cached address if populated)", {FLD_NAME, FLD_CACHE} },
-    [OP_STORE] = { "OP_STORE", "pop and store into a global (create if new)", {FLD_NAME, FLD_CACHE} },
-    [OP_DEFINE] = { "OP_DEFINE", "pop and define/update in the innermost (global, top-level) scope", {FLD_NAME} },
-
-    [OP_LOAD_LOCAL]   = { "OP_LOAD_LOCAL",   "push this call's local slot", {FLD_SLOT} },
-    [OP_STORE_LOCAL]  = { "OP_STORE_LOCAL",  "pop and store into this call's local slot", {FLD_SLOT} },
-    [OP_DEFINE_LOCAL] = { "OP_DEFINE_LOCAL", "pop and define a local slot (first assignment to this name)", {FLD_SLOT, FLD_NAME} },
-
-    [OP_COMPOUND_NAME_CONST]  = { "OP_COMPOUND_NAME_CONST",  "fused: global OP= constant", {FLD_NAME, FLD_CACHE, FLD_BINOP, FLD_POOL} },
-    [OP_COMPOUND_NAME_NAME]   = { "OP_COMPOUND_NAME_NAME",   "fused: global OP= global", {FLD_NAME, FLD_CACHE, FLD_BINOP, FLD_NAME, FLD_CACHE} },
-    [OP_COMPOUND_LOCAL_CONST] = { "OP_COMPOUND_LOCAL_CONST", "fused: local OP= constant", {FLD_SLOT, FLD_BINOP, FLD_POOL} },
-    [OP_COMPOUND_LOCAL_LOCAL] = { "OP_COMPOUND_LOCAL_LOCAL", "fused: local OP= local", {FLD_SLOT, FLD_BINOP, FLD_SLOT} },
-    [OP_COMPOUND_LOCAL_NAME]  = { "OP_COMPOUND_LOCAL_NAME",  "fused: local OP= global", {FLD_SLOT, FLD_BINOP, FLD_NAME, FLD_CACHE} },
-    [OP_COMPOUND_NAME_LOCAL]  = { "OP_COMPOUND_NAME_LOCAL",  "fused: global OP= local", {FLD_NAME, FLD_CACHE, FLD_BINOP, FLD_SLOT} },
-
-    [OP_BINARY_LOCAL_LOCAL] = { "OP_BINARY_LOCAL_LOCAL", "fused: local OP local (expression, not assignment)", {FLD_SLOT, FLD_BINOP, FLD_SLOT} },
-    [OP_BINARY_LOCAL_CONST] = { "OP_BINARY_LOCAL_CONST", "fused: local OP constant", {FLD_SLOT, FLD_BINOP, FLD_POOL} },
-    [OP_BINARY_LOCAL_NAME]  = { "OP_BINARY_LOCAL_NAME",  "fused: local OP global", {FLD_SLOT, FLD_BINOP, FLD_NAME, FLD_CACHE} },
-    [OP_BINARY_NAME_LOCAL]  = { "OP_BINARY_NAME_LOCAL",  "fused: global OP local", {FLD_NAME, FLD_CACHE, FLD_BINOP, FLD_SLOT} },
-    [OP_BINARY_NAME_CONST]  = { "OP_BINARY_NAME_CONST",  "fused: global OP constant", {FLD_NAME, FLD_CACHE, FLD_BINOP, FLD_POOL} },
-    [OP_BINARY_NAME_NAME]   = { "OP_BINARY_NAME_NAME",   "fused: global OP global", {FLD_NAME, FLD_CACHE, FLD_BINOP, FLD_NAME, FLD_CACHE} },
-
-    [OP_COMPOUND_INDEXED_FIELD_LOCAL_LOCAL] = { "OP_COMPOUND_INDEXED_FIELD_LOCAL_LOCAL", "fused: local[local].field OP= rhs (rhs already on stack)", {FLD_SLOT, FLD_SLOT, FLD_NAME, FLD_BINOP} },
-
-    [OP_ADD] = { "OP_ADD", "pop b, a; push a + b", {0} },
-    [OP_SUB] = { "OP_SUB", "pop b, a; push a - b", {0} },
-    [OP_MUL] = { "OP_MUL", "pop b, a; push a * b", {0} },
-    [OP_DIV] = { "OP_DIV", "pop b, a; push a / b (always real)", {0} },
-    [OP_MOD] = { "OP_MOD", "pop b, a; push a % b", {0} },
-    [OP_FLOOR_DIV] = { "OP_FLOOR_DIV", "pop b, a; push floor(a / b)", {0} },
-
-    [OP_EQ]  = { "OP_EQ",  "pop b, a; push a == b", {0} },
-    [OP_NEQ] = { "OP_NEQ", "pop b, a; push a != b", {0} },
-    [OP_LT]  = { "OP_LT",  "pop b, a; push a < b",  {0} },
-    [OP_GT]  = { "OP_GT",  "pop b, a; push a > b",  {0} },
-    [OP_LTE] = { "OP_LTE", "pop b, a; push a <= b", {0} },
-    [OP_GTE] = { "OP_GTE", "pop b, a; push a >= b", {0} },
-    [OP_IN]  = { "OP_IN",  "pop b, a; push a in b (dict key or array element)", {0} },
-
-    [OP_AND]  = { "OP_AND",  "pop b, a; push a && b (as boolean)", {0} },
-    [OP_OR]   = { "OP_OR",   "pop b, a; push a || b (as boolean)", {0} },
-    [OP_PIPE] = { "OP_PIPE", "never emitted — table-driven dispatch placeholder only", {0} },
-
-    [OP_BITWISE_AND] = { "OP_BITWISE_AND", "pop b, a; push a & b",  {0} },
-    [OP_BITWISE_OR]  = { "OP_BITWISE_OR",  "pop b, a; push a | b",  {0} },
-    [OP_BITWISE_XOR] = { "OP_BITWISE_XOR", "pop b, a; push a ^ b",  {0} },
-    [OP_LSHIFT]      = { "OP_LSHIFT",      "pop b, a; push a << b", {0} },
-    [OP_RSHIFT]      = { "OP_RSHIFT",      "pop b, a; push a >> b", {0} },
-
-    [OP_NEGATE]      = { "OP_NEGATE",      "pop a; push -a", {0} },
-    [OP_NOT]         = { "OP_NOT",         "pop a; push !a (truthiness)", {0} },
-    [OP_BITWISE_NOT] = { "OP_BITWISE_NOT", "pop a; push ~a", {0} },
+static const OpInfo op_info[OP_INFO_MAX + 1] = {
+    /* OP_ADD..OP_RSHIFT/OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR are never dispatched as a
+       standalone instruction — only ever embedded as a bin_op/unary_op TAG inside OP_BINARY/
+       OP_CMP_JUMP_FALSE/OP_UNARY/OP_BINARY_FIELD/OP_FIELD_BINARY's packed word. They
+       still need a `.name`-only entry here: print_field's FLD_BINOP case calls opcode_name(word) to
+       render that embedded tag, which reads straight out of this table. Their `desc`/`fields` are
+       never used (disassemble_one only reaches those for an instruction actually fetched via
+       DISPATCH(), which these opcode values never are), so left blank. */
+    [OP_ADD] = { "OP_ADD" }, [OP_SUB] = { "OP_SUB" }, [OP_MUL] = { "OP_MUL" },
+    [OP_DIV] = { "OP_DIV" }, [OP_MOD] = { "OP_MOD" }, [OP_FLOOR_DIV] = { "OP_FLOOR_DIV" },
+    [OP_EQ] = { "OP_EQ" }, [OP_NEQ] = { "OP_NEQ" }, [OP_LT] = { "OP_LT" }, [OP_GT] = { "OP_GT" },
+    [OP_LTE] = { "OP_LTE" }, [OP_GTE] = { "OP_GTE" }, [OP_IN] = { "OP_IN" },
+    [OP_AND] = { "OP_AND" }, [OP_OR] = { "OP_OR" }, [OP_PIPE] = { "OP_PIPE" },
+    [OP_BITWISE_AND] = { "OP_BITWISE_AND" }, [OP_BITWISE_OR] = { "OP_BITWISE_OR" },
+    [OP_BITWISE_XOR] = { "OP_BITWISE_XOR" }, [OP_LSHIFT] = { "OP_LSHIFT" }, [OP_RSHIFT] = { "OP_RSHIFT" },
+    [OP_NEGATE] = { "OP_NEGATE" }, [OP_NOT] = { "OP_NOT" }, [OP_BITWISE_NOT] = { "OP_BITWISE_NOT" },
+    [OP_TO_STR] = { "OP_TO_STR" },
 
     [OP_JUMP]          = { "OP_JUMP",          "unconditional jump", {FLD_JUMP} },
-    [OP_JUMP_IF_FALSE] = { "OP_JUMP_IF_FALSE", "pop condition; jump if falsy", {FLD_JUMP} },
-    [OP_JUMP_IF_TRUE]  = { "OP_JUMP_IF_TRUE",  "pop condition; jump if truthy", {FLD_JUMP} },
-    [OP_CMP_JUMP_FALSE] = { "OP_CMP_JUMP_FALSE", "fused: pop b, a; jump if !(a <op> b)", {FLD_BINOP, FLD_JUMP} },
-
-    [OP_PUSH_SCOPE] = { "OP_PUSH_SCOPE", "push a new local scope (once per call)", {0} },
-    [OP_POP_SCOPE]  = { "OP_POP_SCOPE",  "pop the current local scope", {0} },
-
-    [OP_CALL]       = { "OP_CALL",       "call by name (global, local-held function, builtin, or struct constructor)", {FLD_NAME, FLD_COUNT, FLD_CACHE} },
-    [OP_TAIL_CALL]  = { "OP_TAIL_CALL",  "same as OP_CALL but reuses the current frame (true tail position)", {FLD_NAME, FLD_COUNT, FLD_CACHE} },
-    [OP_CALL_VALUE] = { "OP_CALL_VALUE", "pop a function value, then its args; call it", {FLD_COUNT} },
-    [OP_RETURN]     = { "OP_RETURN",     "pop return value; unwind scopes; resume at call site", {0} },
-    [OP_DEFER_PUSH] = { "OP_DEFER_PUSH", "pop args; stash a deferred call to run at OP_RETURN", {FLD_NAME, FLD_COUNT} },
-
-    [OP_ARRAY_NEW] = { "OP_ARRAY_NEW", "pop N values; push a new array", {FLD_COUNT} },
-    [OP_DICT_NEW]  = { "OP_DICT_NEW",  "pop N key/value pairs; push a new dict", {FLD_COUNT} },
-    [OP_INDEX_GET] = { "OP_INDEX_GET", "pop index, collection; push element", {0} },
-
-    [OP_INDEX_GET_LOCAL_CONST] = { "OP_INDEX_GET_LOCAL_CONST", "fused: local[constant]", {FLD_SLOT, FLD_POOL} },
-    [OP_INDEX_GET_LOCAL_LOCAL] = { "OP_INDEX_GET_LOCAL_LOCAL", "fused: local[local]", {FLD_SLOT, FLD_SLOT} },
-    [OP_INDEX_GET_LOCAL_NAME]  = { "OP_INDEX_GET_LOCAL_NAME",  "fused: local[global]", {FLD_SLOT, FLD_NAME, FLD_CACHE} },
-    [OP_INDEX_GET_NAME_CONST]  = { "OP_INDEX_GET_NAME_CONST",  "fused: global[constant]", {FLD_NAME, FLD_CACHE, FLD_POOL} },
-    [OP_INDEX_GET_NAME_LOCAL]  = { "OP_INDEX_GET_NAME_LOCAL",  "fused: global[local]", {FLD_NAME, FLD_CACHE, FLD_SLOT} },
-    [OP_INDEX_GET_NAME_NAME]   = { "OP_INDEX_GET_NAME_NAME",   "fused: global[global]", {FLD_NAME, FLD_CACHE, FLD_NAME, FLD_CACHE} },
-
-    [OP_INDEX_SET] = { "OP_INDEX_SET", "pop value, index, collection; set element", {0} },
-
-    [OP_INDEX_SET_LOCAL_CONST] = { "OP_INDEX_SET_LOCAL_CONST", "fused: local[constant] = constant", {FLD_SLOT, FLD_POOL, FLD_POOL} },
-    [OP_INDEX_SET_LOCAL_LOCAL] = { "OP_INDEX_SET_LOCAL_LOCAL", "fused: local[local] = constant", {FLD_SLOT, FLD_SLOT, FLD_POOL} },
-    [OP_INDEX_SET_LOCAL_NAME]  = { "OP_INDEX_SET_LOCAL_NAME",  "fused: local[global] = constant", {FLD_SLOT, FLD_NAME, FLD_CACHE, FLD_POOL} },
-    [OP_INDEX_SET_NAME_CONST]  = { "OP_INDEX_SET_NAME_CONST",  "fused: global[constant] = constant", {FLD_NAME, FLD_CACHE, FLD_POOL, FLD_POOL} },
-    [OP_INDEX_SET_NAME_LOCAL]  = { "OP_INDEX_SET_NAME_LOCAL",  "fused: global[local] = constant", {FLD_NAME, FLD_CACHE, FLD_SLOT, FLD_POOL} },
-    [OP_INDEX_SET_NAME_NAME]   = { "OP_INDEX_SET_NAME_NAME",   "fused: global[global] = constant", {FLD_NAME, FLD_CACHE, FLD_NAME, FLD_CACHE, FLD_POOL} },
-
-    [OP_SLICE_GET] = { "OP_SLICE_GET", "pop end, start, collection; push sub-range", {0} },
-    [OP_UNPACK]    = { "OP_UNPACK",    "peek an array on the stack; push items[index]", {FLD_COUNT} },
-    [OP_ITER_NEXT]      = { "OP_ITER_NEXT",      "for-each step over an array/string/dict-keys", {FLD_JUMP} },
-    [OP_ITER_NEXT_PAIR] = { "OP_ITER_NEXT_PAIR", "for-each step over dict key+value pairs", {FLD_JUMP} },
-    [OP_ITER_RANGE]     = { "OP_ITER_RANGE",     "for-each step over a numeric a..b[..step] range", {FLD_JUMP} },
-
     [OP_DEFINE_STRUCT] = { "OP_DEFINE_STRUCT", "register a struct type (variable-length: name, field count, then that many field/default pairs)", {FLD_NAME, FLD_COUNT}, true },
-    [OP_FIELD_GET]   = { "OP_FIELD_GET",   "pop a struct; push one field", {FLD_NAME} },
-    [OP_FIELD_SET]   = { "OP_FIELD_SET",   "pop value, struct; set one field", {FLD_NAME} },
-    [OP_CHECK_SHAPE] = { "OP_CHECK_SHAPE", "`x as Type` — verify (never convert) a struct's exact type", {FLD_NAME} },
+    [OP_HALT]          = { "OP_HALT",          "stop execution", {0} },
 
-    [OP_CALL_MODULE] = { "OP_CALL_MODULE", "call a native or file-module function by (module, function) name", {FLD_NAME, FLD_NAME, FLD_COUNT} },
-
-    [OP_PRINT_REPL] = { "OP_PRINT_REPL", "shell mode: pop and print unless null", {0} },
-    [OP_POP]        = { "OP_POP",        "pop and discard", {0} },
-    [OP_TO_STR]     = { "OP_TO_STR",     "pop; push its string representation", {0} },
-    [OP_CAST]       = { "OP_CAST",       "`x as T` for a primitive T — pop; push converted", {FLD_CAST} },
-    [OP_HALT]       = { "OP_HALT",       "stop execution", {0} },
+    /* Register-VM opcodes. `packed` narrow fields (register indices, bin_op/unary_op/cast_type
+       tags) come from the instruction's own descriptor word — see disassemble_one's own comment;
+       everything after them in fields[] is a WIDE word exactly like OP_JUMP/OP_DEFINE_STRUCT/
+       OP_HALT above. FLD_JUMP is reused for callee_offset (OP_CALL/OP_DEFER_PUSH) too — a
+       function entry point is exactly as absolute-code-address-shaped as a jump target for
+       disassembly purposes. */
+    [OP_LOADK] = { "OP_LOADK", "reg = pool constant", {FLD_REG, FLD_POOL}, false, 1 },
+    [OP_MOVE]  = { "OP_MOVE",  "reg = reg", {FLD_REG, FLD_REG}, false, 2 },
+    [OP_BINARY] = { "OP_BINARY", "reg = rk OP rk", {FLD_REG, FLD_BINOP, FLD_RK, FLD_RK}, false, 2 },
+    [OP_JUMP_IF_FALSE_REG] = { "OP_JUMP_IF_FALSE_REG", "jump if !reg, no pop", {FLD_REG, FLD_JUMP}, false, 1 },
+    [OP_CMP_JUMP_FALSE]    = { "OP_CMP_JUMP_FALSE",    "fused: jump if !(rk <op> rk)", {FLD_BINOP, FLD_RK, FLD_RK, FLD_JUMP}, false, 1 },
+    [OP_CALL]  = { "OP_CALL",  "call by compile-time-resolved offset", {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP}, false, 3 },
+    [OP_CALL_VALUE] = { "OP_CALL_VALUE", "call a runtime function value held in a register", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
+    [OP_TAIL_CALL]       = { "OP_TAIL_CALL",       "tail call by compile-time-resolved offset, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP}, false, 3 },
+    [OP_TAIL_CALL_VALUE] = { "OP_TAIL_CALL_VALUE", "tail call through a register value, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
+    [OP_CALL_GLOBAL_VALUE]      = { "OP_CALL_GLOBAL_VALUE",      "call a runtime function value held in the top-level frame's reg", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
+    [OP_TAIL_CALL_GLOBAL_VALUE] = { "OP_TAIL_CALL_GLOBAL_VALUE", "tail call through the top-level frame's reg, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
+    [OP_RETURN] = { "OP_RETURN", "return reg to caller, drain pending defers first", {FLD_REG}, false, 1 },
+    [OP_CALL_MODULE]  = { "OP_CALL_MODULE",  "call a native or file-module function by (module, function) name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_NAME}, false, 3 },
+    [OP_CALL_BUILTIN] = { "OP_CALL_BUILTIN", "global builtin (length/append/etc.) by name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME}, false, 3 },
+    [OP_LOAD_GLOBAL]  = { "OP_LOAD_GLOBAL",  "reg = top-level frame's reg (read-only)", {FLD_REG, FLD_REG}, false, 2 },
+    [OP_STORE_GLOBAL] = { "OP_STORE_GLOBAL", "top-level frame's reg = rk", {FLD_REG, FLD_RK}, false, 1 },
+    [OP_DEFER_PUSH]   = { "OP_DEFER_PUSH",   "snapshot args; run at this frame's OP_RETURN", {FLD_REG, FLD_COUNT, FLD_JUMP}, false, 2 },
+    [OP_ARRAY_NEW] = { "OP_ARRAY_NEW", "reg = new array from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT}, false, 3 },
+    [OP_INDEX_GET] = { "OP_INDEX_GET", "reg = reg[rk]", {FLD_REG, FLD_REG, FLD_RK}, false, 2 },
+    [OP_INDEX_SET] = { "OP_INDEX_SET", "reg[rk] = rk", {FLD_REG, FLD_RK, FLD_RK}, false, 1 },
+    [OP_SLICE_GET] = { "OP_SLICE_GET", "reg = reg[rk:rk]", {FLD_REG, FLD_REG, FLD_RK, FLD_RK}, false, 2 },
+    [OP_CHECK_SHAPE] = { "OP_CHECK_SHAPE", "reg = check_shape(reg, type)", {FLD_REG, FLD_REG, FLD_NAME}, false, 2 },
+    [OP_DICT_NEW]  = { "OP_DICT_NEW",  "reg = new dict from contiguous key/value reg pairs", {FLD_REG, FLD_REG, FLD_COUNT}, false, 3 },
+    [OP_ITER_NEXT_ARRAY] = { "OP_ITER_NEXT_ARRAY", "for-each step, array or dict-keys", {FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 3 },
+    [OP_ITER_NEXT_PAIR]  = { "OP_ITER_NEXT_PAIR",  "for-each step, dict key+value pairs", {FLD_REG, FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 3 },
+    [OP_ITER_RANGE]      = { "OP_ITER_RANGE",      "for-each step, numeric a..b[..step] range", {FLD_REG, FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 3 },
+    [OP_STRUCT_NEW] = { "OP_STRUCT_NEW", "reg = new struct instance from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME}, false, 3 },
+    [OP_FIELD_GET]  = { "OP_FIELD_GET",  "reg = struct.field", {FLD_REG, FLD_REG, FLD_NAME}, false, 2 },
+    [OP_FIELD_SET]  = { "OP_FIELD_SET",  "struct.field = rk", {FLD_REG, FLD_NAME, FLD_RK}, false, 1 },
+    [OP_UNARY] = { "OP_UNARY", "reg = unary_op(rk)", {FLD_REG, FLD_BINOP, FLD_RK}, false, 2 },
+    [OP_CAST]  = { "OP_CAST",  "reg = cast(rk)", {FLD_REG, FLD_CAST, FLD_RK}, false, 2 },
+    [OP_BINARY_FIELD] = { "OP_BINARY_FIELD", "fused: reg = rk OP struct.field (field on the right)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_RK, FLD_NAME}, false, 3 },
+    [OP_FIELD_BINARY] = { "OP_FIELD_BINARY", "fused: reg = struct.field OP rk (field on the left)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_NAME, FLD_RK}, false, 3 },
+    [OP_PRINT_REPL] = { "OP_PRINT_REPL", "shell mode: print reg unless null", {FLD_REG}, false, 1 },
 };
 
 static const char* cast_name(int k) {
@@ -150,8 +110,8 @@ static const char* cast_name(int k) {
 
 /* Brief, one-line rendering of a pool constant — deliberately not the full recursive formatter
    vm.c's print()/interpolation use, since a struct/array/dict is never actually stored as a pool
-   *literal* (those are always built at runtime by OP_ARRAY_NEW etc.) except a function value
-   (emit_function_value), which just gets a short tag here. */
+   *literal* (those are always built at runtime by OP_ARRAY_NEW etc.) except a function value,
+   which just gets a short tag here. */
 static void print_pool_value(FILE* out, AerVal v) {
     switch (aer_type(v)) {
         case TYPE_NULL:     fprintf(out, "null"); break;
@@ -165,14 +125,39 @@ static void print_pool_value(FILE* out, AerVal v) {
 }
 
 static const char* opcode_name(int op) {
-    return (op >= 0 && op <= OP_HALT && op_info[op].name) ? op_info[op].name : "?";
+    return (op >= 0 && op <= OP_INFO_MAX && op_info[op].name) ? op_info[op].name : "?";
+}
+
+/* Prints one field's already-extracted value, whether it came from a packed sub-field of the
+   descriptor word or a separate wide word of its own — the caller (disassemble_one) handles
+   telling the two apart; from here they're identical. */
+static void print_field(FILE* out, Chunk* c, Field kind, int word) {
+    switch (kind) {
+        case FLD_POOL: fprintf(out, "  val="); print_pool_value(out, c->pool[word]); break;
+        case FLD_NAME: fprintf(out, "  name=%s", aer_as_string(c->pool[word])->data); break;
+        case FLD_JUMP: fprintf(out, "  -> %d", word); break;
+        case FLD_COUNT: fprintf(out, "  n=%d", word); break;
+        case FLD_BINOP: fprintf(out, "  op=%s", opcode_name(word)); break;
+        case FLD_CAST: fprintf(out, "  %s", cast_name(word)); break;
+        case FLD_REG: fprintf(out, "  reg=%d", word); break;
+        case FLD_RK:
+            if (word & RK_CONST_FLAG) { fprintf(out, "  rk=const:"); print_pool_value(out, c->pool[word & ~RK_CONST_FLAG]); }
+            else                          fprintf(out, "  rk=reg%d", word);
+            break;
+        case FLD_END: break;
+    }
 }
 
 /* Decodes and prints one instruction starting at c->code[offset]; returns the offset of the next
    instruction. OP_DEFINE_STRUCT is the sole variable-length exception (its field count is read
-   from the operand stream itself, not known statically). */
+   from the operand stream itself, not known statically).
+     Every register-VM instruction packs its narrow fields (registers, bin_op/unary_op/cast_type
+   tags) into the SAME word as the opcode itself (PACK1/2/3, vm.h) — op_word is kept unmasked
+   here specifically so those can still be extracted via UNPACK_A/B/C; OP_JUMP/OP_DEFINE_STRUCT/
+   OP_HALT have packed==0, so the loop below is a no-op for them. */
 static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
-    Opcode op = (Opcode)c->code[offset];
+    int op_word = c->code[offset];
+    Opcode op = (Opcode)(op_word & 0xFF);
     const OpInfo* info = &op_info[op];
     fprintf(out, "%6u  %-28s  %s", offset, opcode_name(op), info->desc);
 
@@ -191,19 +176,15 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         }
         fprintf(out, "]");
     } else {
-        for (int i = 0; i < MAX_FIELDS && info->fields[i] != FLD_END; i++) {
+        int i = 0;
+        for (; i < info->packed; i++) {
+            unsigned int uword = (unsigned int)op_word;
+            int word = (i == 0) ? (int)UNPACK_A(uword) : (i == 1) ? (int)UNPACK_B(uword) : (int)UNPACK_C(uword);
+            print_field(out, c, info->fields[i], word);
+        }
+        for (; i < MAX_FIELDS && info->fields[i] != FLD_END; i++) {
             int word = c->code[pos++];
-            switch (info->fields[i]) {
-                case FLD_POOL: fprintf(out, "  val="); print_pool_value(out, c->pool[word]); break;
-                case FLD_NAME: fprintf(out, "  name=%s", aer_as_string(c->pool[word])->data); break;
-                case FLD_SLOT: fprintf(out, "  slot=%d", word); break;
-                case FLD_CACHE: fprintf(out, "  cache=%d", word); break;
-                case FLD_JUMP: fprintf(out, "  -> %d", word); break;
-                case FLD_COUNT: fprintf(out, "  n=%d", word); break;
-                case FLD_BINOP: fprintf(out, "  op=%s", opcode_name(word)); break;
-                case FLD_CAST: fprintf(out, "  %s", cast_name(word)); break;
-                case FLD_END: break;
-            }
+            print_field(out, c, info->fields[i], word);
         }
     }
 
@@ -236,12 +217,12 @@ void aer_disassemble(Chunk* c, FILE* out) {
 
     if (!c->debug_hits) return;   /* static-only dump if no run happened yet */
 
-    NamedCount by_op[OP_HALT + 1];
+    NamedCount by_op[OP_INFO_MAX + 1];
     int by_op_count = 0;
-    unsigned long long op_totals[OP_HALT + 1] = {0};
+    unsigned long long op_totals[OP_INFO_MAX + 1] = {0};
     offset = 0;
     while (offset < c->count) {
-        Opcode op = (Opcode)c->code[offset];
+        Opcode op = (Opcode)(c->code[offset] & 0xFF);
         if (offset < c->debug_hits_cap) op_totals[op] += c->debug_hits[offset];
         unsigned int next = offset + 1;
         const OpInfo* info = &op_info[op];
@@ -251,11 +232,12 @@ void aer_disassemble(Chunk* c, FILE* out) {
         } else {
             int n = 0;
             while (n < MAX_FIELDS && info->fields[n] != FLD_END) n++;
+            n -= info->packed;
             next = offset + 1 + (unsigned int)n;
         }
         offset = next;
     }
-    for (int i = 0; i <= OP_HALT; i++)
+    for (int i = 0; i <= OP_INFO_MAX; i++)
         if (op_totals[i] > 0) by_op[by_op_count++] = (NamedCount){ opcode_name(i), op_totals[i] };
     qsort(by_op, (size_t)by_op_count, sizeof(NamedCount), cmp_named_count_desc);
 

@@ -38,6 +38,18 @@ static bool as_double(AerVal v, double* out) {
     return false;
 }
 
+/* Pops one argument and coerces it to a double via as_double(); on failure, reports "<name>()
+   requires a number", pushes null, and returns false — every single-arg math function below
+   follows this exact pop-check-report shape. Caller should `return true` immediately when this
+   returns false (the error's already been reported and the null result already pushed). */
+static bool math_pop_double(VM* vm, const char* name, double* out) {
+    AerVal a = stdlib_pop(vm);
+    if (as_double(a, out)) return true;
+    error("%s() requires a number", name);
+    stdlib_push(vm, aer_null());
+    return false;
+}
+
 /* qsort() comparator for sort() — only called once the caller has verified every element is TYPE_STRING or every element is numeric, so no type-mismatch case needs handling here. */
 static int sort_cmp(const void* pa, const void* pb) {
     const AerVal* a = (const AerVal*)pa;
@@ -59,9 +71,8 @@ bool aer_math_call(VM* vm, Chunk* c, const char* name, int arg_count) {
     (void)c;   /* not needed yet — kept for parity with core builtins and in case a future stdlib function needs it */
 
     if (strcmp(name, "sqrt") == 0 && arg_count == 1) {
-        AerVal a = stdlib_pop(vm);
         double x;
-        if (!as_double(a, &x)) { error("sqrt() requires a number"); stdlib_push(vm, aer_null()); return true; }
+        if (!math_pop_double(vm, "sqrt", &x)) return true;
         stdlib_push(vm, aer_real(sqrt(x))); return true;
     }
     if (strcmp(name, "pow") == 0 && arg_count == 2) {
@@ -71,15 +82,13 @@ bool aer_math_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         stdlib_push(vm, aer_real(pow(x, y))); return true;
     }
     if (strcmp(name, "floor") == 0 && arg_count == 1) {
-        AerVal a = stdlib_pop(vm);
         double x;
-        if (!as_double(a, &x)) { error("floor() requires a number"); stdlib_push(vm, aer_null()); return true; }
+        if (!math_pop_double(vm, "floor", &x)) return true;
         stdlib_push(vm, aer_int((long long)floor(x))); return true;
     }
     if (strcmp(name, "ceil") == 0 && arg_count == 1) {
-        AerVal a = stdlib_pop(vm);
         double x;
-        if (!as_double(a, &x)) { error("ceil() requires a number"); stdlib_push(vm, aer_null()); return true; }
+        if (!math_pop_double(vm, "ceil", &x)) return true;
         stdlib_push(vm, aer_int((long long)ceil(x))); return true;
     }
     if (strcmp(name, "abs") == 0 && arg_count == 1) {
@@ -107,35 +116,30 @@ bool aer_math_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         stdlib_push(vm, da >= db ? a : b); return true;
     }
     if (strcmp(name, "sin") == 0 && arg_count == 1) {
-        AerVal a = stdlib_pop(vm);
         double x;
-        if (!as_double(a, &x)) { error("sin() requires a number"); stdlib_push(vm, aer_null()); return true; }
+        if (!math_pop_double(vm, "sin", &x)) return true;
         stdlib_push(vm, aer_real(sin(x))); return true;
     }
     if (strcmp(name, "cos") == 0 && arg_count == 1) {
-        AerVal a = stdlib_pop(vm);
         double x;
-        if (!as_double(a, &x)) { error("cos() requires a number"); stdlib_push(vm, aer_null()); return true; }
+        if (!math_pop_double(vm, "cos", &x)) return true;
         stdlib_push(vm, aer_real(cos(x))); return true;
     }
     if (strcmp(name, "log") == 0 && arg_count == 1) {
-        AerVal a = stdlib_pop(vm);
         double x;
-        if (!as_double(a, &x)) { error("log() requires a number"); stdlib_push(vm, aer_null()); return true; }
+        if (!math_pop_double(vm, "log", &x)) return true;
         if (x <= 0) { error("log() requires a positive number"); stdlib_push(vm, aer_null()); return true; }
         stdlib_push(vm, aer_real(log(x))); return true;
     }
     if (strcmp(name, "log2") == 0 && arg_count == 1) {
-        AerVal a = stdlib_pop(vm);
         double x;
-        if (!as_double(a, &x)) { error("log2() requires a number"); stdlib_push(vm, aer_null()); return true; }
+        if (!math_pop_double(vm, "log2", &x)) return true;
         if (x <= 0) { error("log2() requires a positive number"); stdlib_push(vm, aer_null()); return true; }
         stdlib_push(vm, aer_real(log2(x))); return true;
     }
     if (strcmp(name, "log10") == 0 && arg_count == 1) {
-        AerVal a = stdlib_pop(vm);
         double x;
-        if (!as_double(a, &x)) { error("log10() requires a number"); stdlib_push(vm, aer_null()); return true; }
+        if (!math_pop_double(vm, "log10", &x)) return true;
         if (x <= 0) { error("log10() requires a positive number"); stdlib_push(vm, aer_null()); return true; }
         stdlib_push(vm, aer_real(log10(x))); return true;
     }

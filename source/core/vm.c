@@ -24,73 +24,21 @@ static bool pools_initialized = false;
    space for shapes with fewer fields, a bounded, deliberate trade for collapsing two dependent
    pointer dereferences (header, then its separately-allocated items[]) into one on every struct
    field access. */
-#ifdef AER_V3
-/* v3 register-VM prototype — see OP_V3_*'s comment in vm.h. Entirely separate from
-   vm->stack/vm->scopes so the prototype cannot interact with or destabilize the existing
-   stack-based interpreter no matter what it's given to run.
-
-   M5 — real per-call register windowing, superseding M3's single fixed callee bank
-   (`V3_CALLEE_FRAME_BASE`, deleted) and its two bare globals (`v3_return_ip`/`v3_call_dest_reg`,
-   also deleted): those supported exactly one call level, since a second OP_V3_CALL before the
-   first returned would clobber them and corrupt the outer call's return. Now every active call
-   gets its own isolated V3_FRAME_REGISTERS-sized bank, mirroring vm->call_stack[VM_CALL_MAX]'s
-   existing role for the stack VM — nested/recursive calls can no longer clobber each other.
-   (V3_FRAME_REGISTERS itself now lives in vm.h, not here — parser_v3.c's real-source variable
-   table needs to see it too.) */
-
-/* M5 slice 12 — a `defer name(args)` statement. Unlike the stack VM's DeferredCall (whose
-   name_idx re-resolves via scope lookup at replay time, since functions there are first-class
-   values), v3 resolves the target at COMPILE time via v3_func_lookup — consistent with v3 already
-   resolving every other call site's target at compile time (functions aren't first-class values
-   in this prototype at all). `args` are snapshotted at the defer statement, same as the stack
-   VM's version — a deferred call's arguments are evaluated once, now, not re-evaluated at replay
-   time. */
-typedef struct {
-    unsigned int callee_offset;
-    AerVal       args[MAX_DEFER_ARGS];
-    int          arg_count;
-} V3DeferredCall;
-
-typedef struct {
-    AerVal       registers[V3_FRAME_REGISTERS];
-    unsigned int return_ip;   /* where to resume in the CALLER */
-    int          dest_reg;    /* which of the CALLER's registers gets the return value */
-
-    /* Pending `defer` calls, drained LIFO by lbl_v3_return before the frame unwinds — mirrors
-       CallFrame's own defers/defer_count exactly, including the lazy-xmalloc-once-and-keep
-       rationale (defer is rare, V3_FRAME_REGISTERS-sized frames are not). Unlike CallFrame, no
-       pending_return_value/defers_draining bookkeeping is needed: each v3 call gets its own
-       isolated register bank (V3CallFrame.registers), so a frame's real return value just sits in
-       its own src_reg untouched while nested deferred calls run in deeper, separate frames — there
-       is no shared mutable stack slot for a deferred call's own result to collide with. */
-    V3DeferredCall* defers;
-    int             defer_count;
-} V3CallFrame;
-
-static V3CallFrame v3_call_stack[VM_CALL_MAX];   /* reuses the stack VM's own recursion ceiling */
-static int         v3_call_depth = 0;            /* 0 = the top-level/main frame */
-
-/* Every M1-M4 opcode handler indexes this exactly as before (`v3_registers[dest]`, etc.) — only
-   its type changed, from a fixed array to a pointer repointed at the active frame's bank on every
-   call/return (lbl_v3_call/lbl_v3_return, below). This is what lets every opcode handler EXCEPT
-   those two stay completely unchanged: they transparently operate on whichever frame is currently
-   executing without needing to know call depth exists. */
-static AerVal* v3_registers = v3_call_stack[0].registers;
-
-/* Test-only accessor (source/compiler/parser_v3.c's hand-driven compiler and tests/v3_smoke_test.c
-   are the only intended callers) — reads back a v3 register's final value after a v3-only chunk
-   has run to OP_HALT. Reads whichever frame is currently active, which is frame 0 (the top level)
-   once a chunk has run to completion with every call balanced by a return. */
-AerVal v3_register_get(int slot) {
-    return v3_registers[slot];
+/* Test-only accessor (tests/smoke_test.c is the only intended caller) — reads back a register's
+   final value after a chunk has run to OP_HALT. Reads whichever frame is currently active, which
+   is frame 0 (the top level) once a chunk has run to completion with every call balanced by a
+   return. See CallFrame/DeferredCall's own comments in vm.h for the call_stack/registers/
+   call_depth fields this reads — per-VM-instance so a nested file-module VM (aer_module.c) gets
+   its own isolated call chain instead of sharing/corrupting the calling VM's in-progress one. */
+AerVal register_get(VM* vm, int slot) {
+    return vm->registers[slot];
 }
 
-/* Decodes an OP_V3_BINARY RK operand — see V3_RK_CONST_FLAG's comment in vm.h. */
-static inline AerVal vm_v3_rk_value(Chunk* c, int rk) {
-    if (rk & V3_RK_CONST_FLAG) return c->pool[rk & ~V3_RK_CONST_FLAG];
-    return v3_registers[rk];
+/* Decodes an OP_BINARY RK operand — see RK_CONST_FLAG's comment in vm.h. */
+static inline AerVal vm_rk_value(VM* vm, Chunk* c, int rk) {
+    if (rk & RK_CONST_FLAG) return c->pool[rk & ~RK_CONST_FLAG];
+    return vm->registers[rk];
 }
-#endif
 
 static void vm_pools_init_once(void) {
     if (pools_initialized) return;
@@ -262,56 +210,27 @@ static void mark_vm_roots(VM* vm) {
     for (int i = 0; i < vm->stack_top; i++)
         worklist_push(vm->stack[i]);
 
-#ifdef AER_V3
-    /* M4 — v3 registers can hold heap references (arrays/dicts), unlike M1-M3's scalars-only
-       registers. Scanned unconditionally, same as vm->stack above, not tracked for liveness: an
-       idle register is 0-bits, which decodes as TYPE_REAL 0.0 under NaN-boxing (value_box.h) and
-       is a harmless no-op leaf in mark_value's default case, so there's no cost to scanning past
-       whatever's actually live.
-       M5 — reshaped from a single flat array to every frame's bank (v3_call_stack[VM_CALL_MAX],
-       V3_FRAME_REGISTERS each). Originally blanket-scanned over all VM_CALL_MAX frames regardless
-       of v3_call_depth on the theory that over-scanning dead frames is a harmless no-op; measured
-       on real hardware (Pi, nbody.aer) this was NOT free — it was the dominant source of cache
-       misses in the whole VM (10x the stack VM's), because a GC pass that runs at recursion depth
-       ~2-3 was still walking all 64 frames' worth of cold, mostly-zeroed memory every time. Frames
-       beyond v3_call_depth are dead (already returned, defers already drained by lbl_v3_return
-       before unwind), so bounding the scan to the live call chain can't under-collect — it only
-       stops retaining garbage from frames nothing can reach anymore. */
-    for (int f = 0; f <= v3_call_depth; f++)
-        for (int i = 0; i < V3_FRAME_REGISTERS; i++)
-            worklist_push(v3_call_stack[f].registers[i]);
+    /* Registers can hold heap references (arrays/dicts/strings/functions). Scanned
+       unconditionally, not tracked for liveness: an idle register is 0-bits, which decodes as
+       TYPE_REAL 0.0 under NaN-boxing (value_box.h) and is a harmless no-op leaf in mark_value's
+       default case. Scanned per-frame, bounded to the live call chain (0..call_depth) rather than
+       all VM_CALL_MAX frames regardless of depth — a blanket scan over every frame was a real,
+       measured cache-miss hotspot, since even shallow recursion was walking every frame's worth of
+       cold, mostly-zeroed memory on every GC pass. Frames beyond call_depth are dead (already
+       returned, defers already drained by lbl_return before unwind), so bounding the scan to the
+       live call chain can't under-collect. */
+    for (int f = 0; f <= vm->call_depth; f++)
+        for (int i = 0; i < FRAME_REGISTERS; i++)
+            worklist_push(vm->call_stack[f].registers[i]);
 
-    /* M5 slice 12 — a deferred call's snapshotted args live outside v3_registers[], in each frame's
-       own defers[] side array (mirroring CallFrame's identical defer-args root below), so they need
-       their own scan; bounded to the live call chain for the same reason as the registers loop
-       just above. */
-    for (int f = 0; f <= v3_call_depth; f++) {
-        V3CallFrame* frame = &v3_call_stack[f];
-        for (int d = 0; d < frame->defer_count; d++)
-            for (int a = 0; a < frame->defers[d].arg_count; a++)
-                worklist_push(frame->defers[d].args[a]);
-    }
-#endif
-
-    for (int s = 0; s < vm->scope_depth; s++) {
-        AerScope* scope = &vm->scopes[s];
-        for (int i = 0; i < scope->count; i++)
-            worklist_push(scope->slots[i].val);
-        if (scope->overflow) {
-            HashMap* map = &scope->map;
-            for (unsigned int i = 0; i < map->capacity; i++)
-                if (map->buckets[i].key)
-                    worklist_push(*(AerVal*)map->buckets[i].payload.boxed);
-        }
-    }
-
-    for (int f = 0; f < vm->call_depth; f++) {
+    /* A deferred call's snapshotted args live outside registers[], in each frame's own
+       defers[] side array, so they need their own scan; bounded to the live call chain for the
+       same reason as the registers loop just above. */
+    for (int f = 0; f <= vm->call_depth; f++) {
         CallFrame* frame = &vm->call_stack[f];
-        if (frame->function) mark_function(frame->function);
         for (int d = 0; d < frame->defer_count; d++)
             for (int a = 0; a < frame->defers[d].arg_count; a++)
                 worklist_push(frame->defers[d].args[a]);
-        if (frame->defers_draining) worklist_push(frame->pending_return_value);
     }
 }
 
@@ -620,8 +539,6 @@ void chunk_free(Chunk* c) {
     free(c->line_mark_lines);
     for (unsigned int i = 0; i < c->import_count; i++) free(c->imported_modules[i]);
     free(c->imported_modules);
-    /* Not each entry — every populated slot is a pointer INTO vm->scopes, never separately owned. */
-    free(c->addr_cache);
     /* Not each entry — every populated slot is a Shape* owned by c->shapes, never separately owned. */
     free(c->field_cache_shape);
     free(c->field_cache_slot);
@@ -629,15 +546,6 @@ void chunk_free(Chunk* c) {
     free(c->debug_hits);
 #endif
     memset(c, 0, sizeof(*c));
-}
-
-unsigned int chunk_add_addr_cache(Chunk* c) {
-    if (c->addr_cache_count >= c->addr_cache_cap) {
-        c->addr_cache_cap = c->addr_cache_cap ? c->addr_cache_cap * 2 : 32;
-        c->addr_cache = xrealloc(c->addr_cache, sizeof(AerVal*) * c->addr_cache_cap);
-    }
-    c->addr_cache[c->addr_cache_count] = NULL;
-    return c->addr_cache_count++;
 }
 
 void chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line) {
@@ -671,15 +579,13 @@ static unsigned int lookup_runtime_line(void) {
     return chunk_line_for_offset(active_vm_for_errors->chunk, active_vm_for_errors->ip);
 }
 
-/* Wraps (data, length) — caller must already exclusively own data — in a fresh heap box; never allocates or copies the character data itself.
-   vm_pools_init_once() is normally reached via vm_init() before anything compiles, but the lexer
-   can call this (via emit_string_token, for every identifier/string token) during compilation
-   itself — e.g. v3_parse() legitimately runs lex()/v3_parse() before any VM exists yet. Without
-   this guard, string_pool is still the zero-initialized static (elem_size=0, elems_per_slab=0),
-   so pool_alloc's slab xmalloc(0*0) hands back a ~1-byte allocation that this function then
-   writes a pointer into — a real heap-buffer-overflow, confirmed via ASAN (only reachable when
-   nothing else already initialized the pools first, which every existing caller in main.c/
-   tests/v3_smoke_test.c's early tests happened to already guarantee by accident of ordering). */
+/* Wraps (data, length) — caller must already exclusively own data — in a fresh heap box; never
+   allocates or copies the character data itself. vm_pools_init_once() is normally reached via
+   vm_init() before anything compiles, but the lexer can call this (via emit_string_token, for
+   every identifier/string token) during compilation itself, before any VM exists yet. Without this
+   guard, string_pool is still the zero-initialized static (elem_size=0, elems_per_slab=0), so
+   pool_alloc's slab xmalloc(0*0) hands back a ~1-byte allocation that this function then writes a
+   pointer into — a real heap-buffer-overflow (confirmed via ASAN). */
 AerVal aer_make_string(char* data, unsigned int length) {
     vm_pools_init_once();
     AerString* s = pool_alloc(&string_pool);
@@ -759,6 +665,34 @@ Shape* chunk_find_shape(Chunk* c, const char* name) {
     return NULL;
 }
 
+/* See ChunkFunction's own comment in vm.h. Appended by func_register (parser.c) at the same
+   moment it updates its own parse-time-only lookup tables. */
+void chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offset,
+                         unsigned int arity, unsigned int min_arity, AerVal* defaults,
+                         bool has_receiver, unsigned int receiver_type) {
+    if (c->function_count >= c->function_cap) {
+        c->function_cap = c->function_cap ? c->function_cap * 2 : 8;
+        c->functions = xrealloc(c->functions, sizeof(ChunkFunction) * c->function_cap);
+    }
+    ChunkFunction* f = &c->functions[c->function_count++];
+    f->name          = name_idx;
+    f->code_offset   = code_offset;
+    f->arity         = arity;
+    f->min_arity     = min_arity;
+    f->defaults      = defaults;
+    f->has_receiver  = has_receiver;
+    f->receiver_type = receiver_type;
+}
+
+/* Newest-first, same convention as chunk_find_shape. */
+ChunkFunction* chunk_find_function(Chunk* c, const char* name) {
+    for (unsigned int i = c->function_count; i > 0; i--) {
+        ChunkFunction* f = &c->functions[i - 1];
+        if (strcmp(aer_as_string(c->pool[f->name])->data, name) == 0) return f;
+    }
+    return NULL;
+}
+
 bool chunk_is_imported(Chunk* c, const char* name, unsigned int len) {
     for (unsigned int i = 0; i < c->import_count; i++)
         if (strlen(c->imported_modules[i]) == len && strncmp(c->imported_modules[i], name, len) == 0)
@@ -791,159 +725,22 @@ bool chunk_add_import(Chunk* c, const char* name, unsigned int len,
 
 void vm_init(VM* vm, Chunk* chunk) {
     memset(vm, 0, sizeof(*vm));
-    vm->chunk       = chunk;
-    vm->scope_depth = 1;
+    vm->chunk = chunk;
     aer_stdlib_init();
     vm_pools_init_once();
     runtime_line_lookup = lookup_runtime_line;
-#ifdef AER_V3
-    /* Resets the v3 call stack for a fresh run — needed since v3_call_depth/v3_registers are
-       file-scope statics outside VM, shared across every vm_init() call in a process (e.g. a test
-       harness running several independent chunks back to back); a chunk that ended mid-call
-       (a bug, or a deliberately unbalanced test) must not leak into the next chunk's run. */
-    v3_call_depth = 0;
-    v3_registers  = v3_call_stack[0].registers;
-    v3_call_stack[0].defer_count = 0;
-#endif
+    /* Resets this VM's own v3 call stack for a fresh run — a chunk that ended mid-call (a bug, or
+       a deliberately unbalanced test) must not leak into this VM's next run. */
+    vm->call_depth = 0;
+    vm->registers  = vm->call_stack[0].registers;
+    vm->call_stack[0].defer_count = 0;
 }
 
 void vm_free(VM* vm) {
-    for (int i = 0; i < vm->scope_depth; i++)
-        if (vm->scopes[i].overflow)
-            hashmap_free(&vm->scopes[i].map);
-    /* Every call_stack slot, not just up to call_depth — a slot's lazily allocated defers array stays allocated across reuse, so any slot ever used may still hold one. */
+    /* Every call_stack slot, not just up to call_depth — a slot's lazily allocated defers array
+       persists across reuse, so any slot ever used may still hold one. */
     for (int i = 0; i < VM_CALL_MAX; i++)
         free(vm->call_stack[i].defers);
-#ifdef AER_V3
-    /* Same reasoning as the stack VM's loop just above — a v3 call_stack slot's lazily allocated
-       defers array persists across reuse, so any slot ever used may still hold one. */
-    for (int i = 0; i < VM_CALL_MAX; i++)
-        free(v3_call_stack[i].defers);
-#endif
-}
-
-/* ------------------------------------------------------------------ */
-/* Scope helpers                                                        */
-/* ------------------------------------------------------------------ */
-
-/* The current call's own (only) scope index. No closures and no per-block scoping left (see
-   parser.c's current_locals), so every local name in a function resolves to OP_LOAD_LOCAL/
-   STORE_LOCAL at parse time instead of a name-based scope walk — this only exists to locate that
-   one flat frame, never to walk multiple levels. scope_depth - 1 always equals it directly while
-   any function's own bytecode is executing (nothing pushes a scope except a call, and a call this
-   function itself makes is popped back off before control returns here), which is what
-   vm_read_local_slot/vm_write_local_slot rely on. */
-static inline int vm_scope_floor(VM* vm) {
-    return vm->scope_depth - 1;
-}
-
-/* Global scope only — scopes[0]. Used directly by OP_LOAD/OP_STORE (see OP_LOAD_LOCAL's comment
-   in vm.h: the parser only ever emits those for a true global), and as the fallback half of
-   vm_scope_get below. */
-static inline __attribute__((always_inline)) AerVal* vm_global_get(VM* vm, unsigned int name) {
-    AerScope* g = &vm->scopes[0];
-    for (int j = 0; j < g->count; j++)
-        if (g->slots[j].name == name) return &g->slots[j].val;
-    if (g->overflow) {
-        AerVal* v = (AerVal*)hashmap_get(&g->map, aer_as_string(vm->chunk->pool[name])->data);
-        if (v) return v;
-    }
-    return NULL;
-}
-
-/* Checks the current call's own local slots by name first, then falls back to vm_global_get.
-   Needed specifically by OP_CALL and defer's replay (lbl_return): unlike a plain variable
-   reference, a call site isn't resolved to LOCAL-vs-GLOBAL at parse time (see OP_DEFINE_LOCAL's
-   comment in vm.h), so calling a function value held in a parameter or local — `f = fn; f()` —
-   still needs a runtime name lookup. Only one level to check now (no per-block scoping left),
-   so this is a single linear scan, not a chain walk. */
-static inline AerVal* vm_scope_get(VM* vm, unsigned int name) {
-    AerScope* s = &vm->scopes[vm_scope_floor(vm)];
-    for (int j = 0; j < s->count; j++)
-        if (s->slots[j].name == name) return &s->slots[j].val;
-    return vm_global_get(vm, name);
-}
-
-/* For the inline address cache: is `name` a global whose address is stable for the VM's whole
-   lifetime? Only the plain slots array qualifies (vm->scopes[0] never reallocates) — an
-   overflowed global's hashmap bucket array can move on rehash, so that case just falls back to
-   vm_global_get, uncached, same as today. */
-static AerVal* vm_global_slot_address(VM* vm, unsigned int name) {
-    AerScope* g = &vm->scopes[0];
-    for (int j = 0; j < g->count; j++)
-        if (g->slots[j].name == name) return &g->slots[j].val;
-    return NULL;
-}
-
-/* Shared by lbl_load, lbl_store, and the OP_COMPOUND_NAME_*-and-OP_INDEX_*_NAME fused handlers —
-   resolves name_idx (always a true global — see vm_global_get's comment) via Chunk.addr_cache,
-   falling back to a fresh global-scope lookup on a cold site. Returns NULL if undefined (caller
-   decides what that means: error, or "define fresh"). Does NOT itself call error() — see
-   vm_resolve_name_cached below for the erroring wrapper lbl_load and the compound/index handlers
-   actually use. No invalidation logic needed: the cache holds an address, not a value. */
-static inline AerVal* vm_resolve_name_full(VM* vm, Chunk* c, unsigned int name_idx, int cache_idx) {
-    AerVal* found = c->addr_cache[cache_idx];
-    if (found) return found;
-
-    found = vm_global_get(vm, name_idx);
-    if (!found) return NULL;
-
-    AerVal* cacheable = vm_global_slot_address(vm, name_idx);
-    if (cacheable == found) c->addr_cache[cache_idx] = cacheable;
-    return found;
-}
-
-/* Shared by lbl_load and the OP_COMPOUND_NAME_* fused handlers — same resolution as
-   vm_resolve_name_full, but calls error() if undefined. Caller must check and bail via
-   DISPATCH(), same as any fallible sub-step in a fused handler. */
-static inline AerVal* vm_resolve_name_cached(VM* vm, Chunk* c, int name_idx, int cache_idx) {
-    AerVal* found = vm_resolve_name_full(vm, c, (unsigned int)name_idx, cache_idx);
-    if (!found) error("'%s' is not defined", aer_as_string(c->pool[name_idx])->data);
-    return found;
-}
-
-/* Shared by lbl_load_local and any fused handler reading a LOCAL-kind operand. */
-static inline AerVal vm_read_local_slot(VM* vm, int slot) {
-    return vm->scopes[vm_scope_floor(vm)].slots[slot].val;
-}
-
-/* Write counterpart of vm_read_local_slot; shared by lbl_store_local and the fused handlers' write-back. */
-static inline void vm_write_local_slot(VM* vm, int slot, AerVal val) {
-    vm->scopes[vm_scope_floor(vm)].slots[slot].val = val;
-}
-
-/* Always create/update in the global scope — used for top-level assignment and top-level loop vars
-   (the only remaining OP_DEFINE/OP_STORE-fallback callers; every in-function local goes through
-   OP_DEFINE_LOCAL instead — see parser.c's current_locals). */
-static inline __attribute__((always_inline)) void vm_scope_define(VM* vm, unsigned int name, AerVal val) {
-    AerScope* s = &vm->scopes[0];
-    for (int j = 0; j < s->count; j++) {
-        if (s->slots[j].name == name) { s->slots[j].val = val; return; }
-    }
-    if (s->count < SCOPE_SLOT_MAX) {
-        s->slots[s->count].name = name;
-        s->slots[s->count].val  = val;
-        s->count++;
-        return;
-    }
-    /* Spill to hashmap for scopes with more than SCOPE_SLOT_MAX variables. */
-    s->overflow = true;
-    const char* key = aer_as_string(vm->chunk->pool[name])->data;
-    AerVal* existing = (AerVal*)hashmap_get(&s->map, key);
-    if (existing) { *existing = val; return; }
-    char* k = xmalloc(strlen(key) + 1);
-    AerVal* vp = xmalloc(sizeof(AerVal));
-    strcpy(k, key);
-    *vp = val;
-    hashmap_put(&s->map, k, vp);
-}
-
-/* Update the nearest global binding if one exists, else create one — used by OP_STORE, which
-   (per vm_global_get's comment) only ever targets scopes[0] now. */
-static inline __attribute__((always_inline)) void vm_scope_set(VM* vm, unsigned int name, AerVal val) {
-    AerVal* found = vm_global_get(vm, name);
-    if (found) { *found = val; return; }
-    vm_scope_define(vm, name, val);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1156,16 +953,14 @@ static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b
         }
     }
 
-    /* Real-vs-real fast path, mirrored right after the int/int one above for the same reason —
-       nbody-style arithmetic-heavy code is dominated by this case, but until now it fell through
-       the AND/OR check, the IN check, the (failing) int/int check, a null check, and real-
-       promotion logic that's a no-op when both operands are already real, before ever reaching
-       the real/real switch below (which still has to stay — this is not a replacement for it, just
-       a fast exit before the checks a promoted-from-int operand still needs). Same case bodies as
-       that switch, duplicated rather than shared, since jumping into the middle of the block below
-       isn't simpler than just checking here first. Measured neutral in isolation on nbody.aer
-       (~2.41s vs ~2.42s baseline, within noise) — kept anyway since it's a correct simplification
-       with no added opcodes/call sites and no downside found, not because it proved a win. */
+    /* Real-vs-real fast path, mirrored right after the int/int one above: nbody-style
+       arithmetic-heavy code is dominated by this case, but without this it falls through the
+       AND/OR check, the IN check, the (failing) int/int check, a null check, and real-promotion
+       logic that's a no-op when both operands are already real, before ever reaching the real/real
+       switch below (which still has to stay — this is a fast exit before the checks a
+       promoted-from-int operand still needs, not a replacement). Same case bodies as that switch,
+       duplicated rather than shared, since jumping into the middle of the block below isn't
+       simpler than just checking here first. */
     if (aer_type(a) == TYPE_REAL && aer_type(b) == TYPE_REAL) {
         double l = aer_as_real(a), rv = aer_as_real(b);
         switch (op) {
@@ -1342,47 +1137,153 @@ static AerVal vm_default_value(AerVal dflt) {
     return dflt;
 }
 
-/* Shared by lbl_call_value and aer_module_call — arity/receiver-type check and call-frame
-   construction, identical whether the call stays in one VM or crosses into a module's own.
-   Doesn't touch the argument stack; `fn_chunk` is the function's own chunk (for error
-   messages), not necessarily target's. Not static: aer_module.c calls this too. */
-bool vm_setup_call(VM* target, Chunk* fn_chunk, AerVal fv, int arg_count,
+/* Used only by aer_module_call for a cross-module call into a v3-compiled file's exported
+   function (see ChunkFunction's own comment, vm.h) — mirrors lbl_call_value's frame-push
+   exactly (arity/receiver check, default-filling), just as a standalone function since
+   aer_module_call isn't inside vm_run's computed-goto dispatch loop. dest_reg is fixed at 0: this
+   always sets up the SECOND frame (index target->call_depth + 1) above target's own top-level
+   (frame 0), so once vm_run(target) drains back to depth 0 on return_ip's OP_HALT, the result is
+   sitting in target->call_stack[0].registers[0] — a fixed, known slot the caller
+   (aer_module_call) can read without needing any of target's own variables' registers to stay
+   predictable. */
+bool setup_call(VM* target, Chunk* fn_chunk, ChunkFunction* fn, int arg_count,
                     AerVal* args, unsigned int return_ip) {
-    if (aer_type(fv) != TYPE_FUNCTION) { error("Value is not callable"); return false; }
+    if (arg_count < (int)fn->min_arity || arg_count > (int)fn->arity) {
+        if (fn->min_arity == fn->arity)
+            error("Function expects %u arguments, got %d", fn->arity, arg_count);
+        else
+            error("Function expects between %u and %u arguments, got %d", fn->min_arity, fn->arity, arg_count);
+        return false;
+    }
+    if (fn->has_receiver) {
+        AerVal arg0 = args[0];
+        if (aer_type(arg0) != TYPE_ARRAY || !aer_as_array(arg0)->shape ||
+            aer_as_array(arg0)->shape->name != fn->receiver_type) {
+            error("Function expects its first argument to be a %s",
+                  aer_as_string(fn_chunk->pool[fn->receiver_type])->data);
+            return false;
+        }
+    }
+    if (target->call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); return false; }
+    CallFrame* callee = &target->call_stack[target->call_depth + 1];
+    for (int i = 0; i < arg_count; i++)
+        callee->registers[i] = args[i];
+    for (int i = arg_count; i < (int)fn->arity; i++)
+        callee->registers[i] = vm_default_value(fn->defaults[i - fn->min_arity]);
+    callee->return_ip   = return_ip;
+    callee->dest_reg    = 0;
+    callee->defer_count = 0;
+    target->call_depth++;
+    target->registers = target->call_stack[target->call_depth].registers;
+    target->ip = fn->code_offset;
+    return true;
+}
+
+/* Shared by lbl_call_value and lbl_call_global_value (vm_run, below) — identical in every way
+   except where `fv` comes from, factored out into a plain function since DISPATCH()'s
+   computed-goto only needs to run in the caller, after this returns (a plain C function can't
+   itself jump to a vm_run-local label, but it doesn't need to: it just does the work and lets
+   each caller DISPATCH() once it's back). `dest_reg`/`arg_reg_base`/`arg_count` are the caller's
+   own operands; `is_tail_call` is whether the calling label's own opcode was its
+   OP_TAIL_CALL_* counterpart. */
+static void vm_call_value(VM* vm, Chunk* c, AerVal fv, int dest_reg, int arg_reg_base, int arg_count,
+                              bool is_tail_call) {
+    if (aer_type(fv) != TYPE_FUNCTION) { error("Value is not callable"); return; }
     AerFunction* f = aer_as_function(fv);
     if (arg_count < (int)f->min_arity || arg_count > (int)f->arity) {
         if (f->min_arity == f->arity)
             error("Function expects %u arguments, got %d", (unsigned int)f->arity, arg_count);
         else
             error("Function expects between %u and %u arguments, got %d", (unsigned int)f->min_arity, (unsigned int)f->arity, arg_count);
-        return false;
+        return;
     }
+    /* struct-shape-checked receiver parameter (`function f(target as Type, ...)`): vm->registers
+       still points at the CALLER's own frame here (the push below hasn't happened yet), so
+       arg_reg_base indexes directly into it. */
     if (f->has_receiver) {
-        AerVal arg0 = args[0];
+        AerVal arg0 = vm->registers[arg_reg_base];
         if (aer_type(arg0) != TYPE_ARRAY || !aer_as_array(arg0)->shape ||
             aer_as_array(arg0)->shape->name != f->receiver_type) {
             error("Function expects its first argument to be a %s",
-                  aer_as_string(fn_chunk->pool[f->receiver_type])->data);
-            return false;
+                  aer_as_string(c->pool[f->receiver_type])->data);
+            return;
         }
     }
-    if (target->call_depth >= VM_CALL_MAX) { error("Call stack overflow"); return false; }
-    /* Only pushed after every failure check above — a partial push here would leave stray values a caller's own cleanup wouldn't know to pop. */
-    int missing = (int)f->arity - arg_count;
-    if (missing > 0) {
-        if (target->stack_top + missing > VM_STACK_MAX) { error("Stack overflow"); return false; }
+    /* Tail-call reuse, see OP_TAIL_CALL's own comment in vm.h. `f` is already a plain pointer by
+       this point, so overwriting its source register during the copy below — entirely possible
+       when the callee names a LOCAL variable's own permanent register, not a temp, e.g.
+       `f = some_fn; return f(x)` — can't invalidate anything already read out of it. The two
+       loops below are the same always-safe-forward-shift copy lbl_call's own comment explains,
+       done in this order (args, then defaults) specifically so every SOURCE register the arg-copy
+       loop reads is read before the defaults-fill loop can possibly overwrite it. */
+    if (is_tail_call && vm->call_stack[vm->call_depth].defer_count == 0) {
+        for (int i = 0; i < arg_count; i++)
+            vm->registers[i] = vm->registers[arg_reg_base + i];
         for (int i = arg_count; i < (int)f->arity; i++)
-            target->stack[target->stack_top++] = vm_default_value(f->defaults[i - f->min_arity]);
+            vm->registers[i] = vm_default_value(f->defaults[i - f->min_arity]);
+        vm->ip = f->code_offset;
+        return;
     }
-    CallFrame* frame = &target->call_stack[target->call_depth];
-    frame->return_ip          = return_ip;
-    frame->return_scope_depth = target->scope_depth;
-    frame->function           = f;
-    /* call_stack is a fixed, reused array — a slot's previous occupant may have left pending defers, which a fresh call must never inherit. */
-    frame->defer_count        = 0;
-    frame->defers_draining    = false;
-    target->call_depth++;
-    target->ip = f->code_offset;
+    if (vm->call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); return; }
+    CallFrame* caller = &vm->call_stack[vm->call_depth];
+    CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
+    for (int i = 0; i < arg_count; i++)
+        callee->registers[i] = caller->registers[arg_reg_base + i];
+    for (int i = arg_count; i < (int)f->arity; i++)
+        callee->registers[i] = vm_default_value(f->defaults[i - f->min_arity]);
+    callee->return_ip   = vm->ip;
+    callee->dest_reg    = dest_reg;
+    callee->defer_count = 0;
+    vm->call_depth++;
+    vm->registers = vm->call_stack[vm->call_depth].registers;
+    vm->ip = f->code_offset;
+}
+
+/* Resolves struct_reg's field (by field_idx) to an (AerArray*, item slot) pair, checking the
+   per-callsite inline cache (field_cache_shape/slot, keyed by `site` — this instruction's own
+   bytecode offset) first. Shared by every field-access opcode: lbl_field_get, the fused
+   lbl_binary_field/lbl_field_binary (both operand orders), and lbl_field_set. Returns false
+   (error already reported) if struct_reg isn't a struct instance or has no such field. */
+static bool vm_resolve_field(VM* vm, Chunk* c, unsigned int site, int struct_reg, int field_idx,
+                                 AerArray** out_oa, int* out_slot) {
+    AerVal obj = vm->registers[struct_reg];
+    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
+        error("'.' field access requires a struct instance");
+        return false;
+    }
+    AerArray* oa = aer_as_array(obj);
+    Shape* shape = oa->shape;
+    *out_oa = oa;
+    if (c->field_cache_shape[site] == shape) {
+        *out_slot = c->field_cache_slot[site];
+        return true;
+    }
+    for (unsigned int i = 0; i < shape->field_count; i++) {
+        if (shape->field_names[i] == (unsigned int)field_idx) {
+            c->field_cache_shape[site] = shape;
+            c->field_cache_slot[site]  = (int)i;
+            *out_slot = (int)i;
+            return true;
+        }
+    }
+    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
+          aer_as_string(c->pool[field_idx])->data);
+    return false;
+}
+
+/* Scans a dict's bucket array forward from *idx, skipping empty buckets, and returns an owned
+   copy of the first live key found as an AerVal (aer_make_string) — shared by lbl_iter_next_array's
+   dict branch and lbl_iter_next_pair, both of which iterate dict keys this way. *idx is left at
+   the found bucket (caller advances it by 1 after also reading the value, if needed). Returns
+   false (nothing written) once *idx reaches d->map.capacity with no more live buckets. */
+static bool vm_dict_next_key(AerDict* d, long long* idx, AerVal* out_key) {
+    while ((unsigned long long)*idx < d->map.capacity && !d->map.buckets[*idx].key) (*idx)++;
+    if ((unsigned long long)*idx >= d->map.capacity) return false;
+    unsigned int key_len = d->map.buckets[*idx].length;
+    char* key_buf = xmalloc(key_len + 1);
+    memcpy(key_buf, d->map.buckets[*idx].key, key_len);
+    key_buf[key_len] = '\0';
+    *out_key = aer_make_string(key_buf, key_len);   /* no chunk_add_pool interning — see vm_to_str's comment */
     return true;
 }
 
@@ -1597,8 +1498,7 @@ static inline void vm_index_set_compute(AerVal obj, AerVal idx, AerVal val) {
     }
 }
 
-/* Shared by lbl_cast and (M5 slice 9) lbl_v3_cast — extracted so the v3 register path can reuse
-   the exact same conversion rules without duplicating this switch. */
+/* `x as integer/float/boolean/string` conversion rules, shared by OP_CAST's handler below. */
 static AerVal vm_cast(AerVal v, int cast_type) {
     AerVal r = aer_null();
     /* atoll()/atof() only consume a leading sign/digits(/./exponent), so truncating to a fixed buffer (instead of a length-sized VLA) can't change the parsed value for a real number. */
@@ -1680,15 +1580,14 @@ bool vm_run(VM* vm) {
     /* The just-fetched instruction word, opcode and all — outer-scope for the same reason cur_op
        is: it must still be readable inside the handler body the goto jumps to, past the end of
        DISPATCH()'s own do-while block. For a plain (unpacked) instruction this is just cur_op's
-       own value with zero upper bits, unused by that handler. For a packed OP_V3_* instruction
-       (see V3_PACK3's comment in vm.h) the upper bits hold that instruction's narrow operands,
-       read via V3_UNPACK_A/B/C — every opcode value is < 256 (94 total), so masking this word
-       with & 0xFF to get cur_op is a complete no-op for every existing, unpacked instruction (its
-       own upper bits are already zero) and correctly extracts the opcode from a packed one too;
-       one shared DISPATCH() handles both without needing to know in advance which kind of
-       instruction it's about to fetch — which matters because a handful of opcodes (OP_JUMP,
-       OP_DEFINE_STRUCT, OP_HALT) are reused verbatim inside v3-compiled bytecode, reached from
-       both packed and unpacked contexts through the exact same handler code. */
+       own value with zero upper bits, unused by that handler. For a packed OP_* instruction (see
+       PACK3's comment in vm.h) the upper bits hold that instruction's narrow operands, read via
+       UNPACK_A/B/C — every opcode value is < 256, so masking this word with & 0xFF to get cur_op
+       is a complete no-op for every unpacked instruction and correctly extracts the opcode from a
+       packed one too; one shared DISPATCH() handles both without needing to know in advance which
+       kind of instruction it's about to fetch — which matters because a handful of opcodes
+       (OP_JUMP, OP_DEFINE_STRUCT, OP_HALT) are reached from both packed and unpacked contexts
+       through the exact same handler code. */
     unsigned int op_word;
 #ifdef AER_DEBUG_TOOLS
     chunk_ensure_debug_hits(c);
@@ -1706,1026 +1605,55 @@ bool vm_run(VM* vm) {
 #endif
 
     static const void* const dt[] = {
-        [OP_PUSH]           = &&lbl_push,
-        [OP_DUP_N]          = &&lbl_dup_n,
-        [OP_LOAD]           = &&lbl_load,
-        [OP_STORE]          = &&lbl_store,
-        [OP_DEFINE]         = &&lbl_define,
-        [OP_LOAD_LOCAL]     = &&lbl_load_local,
-        [OP_STORE_LOCAL]    = &&lbl_store_local,
-        [OP_DEFINE_LOCAL]   = &&lbl_define_local,
-        [OP_COMPOUND_NAME_CONST] = &&lbl_compound_name_const,
-        [OP_COMPOUND_NAME_NAME]  = &&lbl_compound_name_name,
-        [OP_COMPOUND_LOCAL_CONST] = &&lbl_compound_local_const,
-        [OP_COMPOUND_LOCAL_LOCAL] = &&lbl_compound_local_local,
-        [OP_COMPOUND_LOCAL_NAME]  = &&lbl_compound_local_name,
-        [OP_COMPOUND_NAME_LOCAL]  = &&lbl_compound_name_local,
-        [OP_BINARY_LOCAL_LOCAL] = &&lbl_binary_local_local,
-        [OP_BINARY_LOCAL_CONST] = &&lbl_binary_local_const,
-        [OP_BINARY_LOCAL_NAME]  = &&lbl_binary_local_name,
-        [OP_BINARY_NAME_LOCAL]  = &&lbl_binary_name_local,
-        [OP_BINARY_NAME_CONST]  = &&lbl_binary_name_const,
-        [OP_BINARY_NAME_NAME]   = &&lbl_binary_name_name,
-        [OP_COMPOUND_INDEXED_FIELD_LOCAL_LOCAL] = &&lbl_compound_indexed_field_local_local,
-        [OP_ADD]            = &&lbl_binary,
-        [OP_SUB]            = &&lbl_binary,
-        [OP_MUL]            = &&lbl_binary,
-        [OP_DIV]            = &&lbl_binary,
-        [OP_MOD]            = &&lbl_binary,
-        [OP_FLOOR_DIV]      = &&lbl_binary,
-        [OP_EQ]             = &&lbl_binary,
-        [OP_NEQ]            = &&lbl_binary,
-        [OP_LT]             = &&lbl_binary,
-        [OP_GT]             = &&lbl_binary,
-        [OP_LTE]            = &&lbl_binary,
-        [OP_GTE]            = &&lbl_binary,
-        [OP_IN]             = &&lbl_binary,
-        [OP_AND]            = &&lbl_binary,
-        [OP_OR]             = &&lbl_binary,
-        [OP_PIPE]           = &&lbl_binary,
-        [OP_BITWISE_AND]    = &&lbl_binary,
-        [OP_BITWISE_OR]     = &&lbl_binary,
-        [OP_BITWISE_XOR]    = &&lbl_binary,
-        [OP_LSHIFT]         = &&lbl_binary,
-        [OP_RSHIFT]         = &&lbl_binary,
-        [OP_NEGATE]         = &&lbl_negate,
-        [OP_NOT]            = &&lbl_not,
-        [OP_BITWISE_NOT]    = &&lbl_bitwise_not,
+        /* OP_ADD..OP_RSHIFT/OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR have no entries here at all —
+           they're never dispatched as a standalone instruction, only ever embedded as a
+           bin_op/unary_op TAG inside an OP_BINARY/OP_UNARY/etc. instruction's packed word (see
+           PACK3's comment above); indexing dt[] with cur_op only happens right after DISPATCH()
+           reads a genuine top-level instruction word, which is never one of these. */
         [OP_JUMP]           = &&lbl_jump,
-        [OP_JUMP_IF_FALSE]  = &&lbl_jump_if_false,
-        [OP_JUMP_IF_TRUE]   = &&lbl_jump_if_true,
-        [OP_CMP_JUMP_FALSE] = &&lbl_cmp_jump_false,
-        [OP_PUSH_SCOPE]     = &&lbl_push_scope,
-        [OP_POP_SCOPE]      = &&lbl_pop_scope,
-        [OP_CALL]           = &&lbl_call,
-        [OP_TAIL_CALL]      = &&lbl_call,
-        [OP_CALL_VALUE]     = &&lbl_call_value,
-        [OP_CALL_MODULE]    = &&lbl_call_module,
-        [OP_RETURN]         = &&lbl_return,
-        [OP_DEFER_PUSH]     = &&lbl_defer_push,
-        [OP_ARRAY_NEW]      = &&lbl_array_new,
-        [OP_DICT_NEW]       = &&lbl_dict_new,
-        [OP_INDEX_GET]      = &&lbl_index_get,
-        [OP_INDEX_GET_LOCAL_CONST] = &&lbl_index_get_local_const,
-        [OP_INDEX_GET_LOCAL_LOCAL] = &&lbl_index_get_local_local,
-        [OP_INDEX_GET_LOCAL_NAME]  = &&lbl_index_get_local_name,
-        [OP_INDEX_GET_NAME_CONST]  = &&lbl_index_get_name_const,
-        [OP_INDEX_GET_NAME_LOCAL]  = &&lbl_index_get_name_local,
-        [OP_INDEX_GET_NAME_NAME]   = &&lbl_index_get_name_name,
-        [OP_INDEX_SET]      = &&lbl_index_set,
-        [OP_INDEX_SET_LOCAL_CONST] = &&lbl_index_set_local_const,
-        [OP_INDEX_SET_LOCAL_LOCAL] = &&lbl_index_set_local_local,
-        [OP_INDEX_SET_LOCAL_NAME]  = &&lbl_index_set_local_name,
-        [OP_INDEX_SET_NAME_CONST]  = &&lbl_index_set_name_const,
-        [OP_INDEX_SET_NAME_LOCAL]  = &&lbl_index_set_name_local,
-        [OP_INDEX_SET_NAME_NAME]   = &&lbl_index_set_name_name,
-        [OP_SLICE_GET]      = &&lbl_slice_get,
         [OP_DEFINE_STRUCT]  = &&lbl_define_struct,
-        [OP_FIELD_GET]      = &&lbl_field_get,
-        [OP_FIELD_SET]      = &&lbl_field_set,
-        [OP_CHECK_SHAPE]    = &&lbl_check_shape,
-        [OP_UNPACK]         = &&lbl_unpack,
-        [OP_ITER_NEXT]      = &&lbl_iter_next,
-        [OP_ITER_NEXT_PAIR] = &&lbl_iter_next_pair,
-        [OP_ITER_RANGE]     = &&lbl_iter_range,
-        [OP_PRINT_REPL]     = &&lbl_print_repl,
-        [OP_POP]            = &&lbl_pop,
-        [OP_TO_STR]         = &&lbl_to_str,
-        [OP_CAST]           = &&lbl_cast,
         [OP_HALT]           = &&lbl_halt,
-#ifdef AER_V3
-        [OP_V3_LOADK]       = &&lbl_v3_loadk,
-        [OP_V3_MOVE]        = &&lbl_v3_move,
-        [OP_V3_BINARY]      = &&lbl_v3_binary,
-        [OP_V3_JUMP_IF_FALSE_REG] = &&lbl_v3_jump_if_false_reg,
-        [OP_V3_CMP_JUMP_FALSE]    = &&lbl_v3_cmp_jump_false,
-        [OP_V3_CALL]              = &&lbl_v3_call,
-        [OP_V3_CALL_MODULE]       = &&lbl_v3_call_module,
-        [OP_V3_CALL_BUILTIN]      = &&lbl_v3_call_builtin,
-        [OP_V3_LOAD_GLOBAL]       = &&lbl_v3_load_global,
-        [OP_V3_DEFER_PUSH]        = &&lbl_v3_defer_push,
-        [OP_V3_RETURN]            = &&lbl_v3_return,
-        [OP_V3_ARRAY_NEW]         = &&lbl_v3_array_new,
-        [OP_V3_INDEX_GET]         = &&lbl_v3_index_get,
-        [OP_V3_INDEX_SET]         = &&lbl_v3_index_set,
-        [OP_V3_DICT_NEW]          = &&lbl_v3_dict_new,
-        [OP_V3_ITER_NEXT_ARRAY]   = &&lbl_v3_iter_next_array,
-        [OP_V3_ITER_RANGE]        = &&lbl_v3_iter_range,
-        [OP_V3_STRUCT_NEW]        = &&lbl_v3_struct_new,
-        [OP_V3_FIELD_GET]         = &&lbl_v3_field_get,
-        [OP_V3_FIELD_SET]         = &&lbl_v3_field_set,
-        [OP_V3_UNARY]             = &&lbl_v3_unary,
-        [OP_V3_CAST]              = &&lbl_v3_cast,
-        [OP_V3_BINARY_FIELD]      = &&lbl_v3_binary_field,
-        [OP_V3_FIELD_BINARY]      = &&lbl_v3_field_binary,
-#endif
+        [OP_LOADK]       = &&lbl_loadk,
+        [OP_MOVE]        = &&lbl_move,
+        [OP_BINARY]      = &&lbl_binary,
+        [OP_JUMP_IF_FALSE_REG] = &&lbl_jump_if_false_reg,
+        [OP_CMP_JUMP_FALSE]    = &&lbl_cmp_jump_false,
+        [OP_CALL]              = &&lbl_call,
+        [OP_CALL_VALUE]        = &&lbl_call_value,
+        [OP_TAIL_CALL]         = &&lbl_call,
+        [OP_TAIL_CALL_VALUE]   = &&lbl_call_value,
+        [OP_CALL_GLOBAL_VALUE]      = &&lbl_call_global_value,
+        [OP_TAIL_CALL_GLOBAL_VALUE] = &&lbl_call_global_value,
+        [OP_CALL_MODULE]       = &&lbl_call_module,
+        [OP_CALL_BUILTIN]      = &&lbl_call_builtin,
+        [OP_LOAD_GLOBAL]       = &&lbl_load_global,
+        [OP_STORE_GLOBAL]      = &&lbl_store_global,
+        [OP_DEFER_PUSH]        = &&lbl_defer_push,
+        [OP_RETURN]            = &&lbl_return,
+        [OP_ARRAY_NEW]         = &&lbl_array_new,
+        [OP_INDEX_GET]         = &&lbl_index_get,
+        [OP_INDEX_SET]         = &&lbl_index_set,
+        [OP_SLICE_GET]         = &&lbl_slice_get,
+        [OP_CHECK_SHAPE]       = &&lbl_check_shape,
+        [OP_DICT_NEW]          = &&lbl_dict_new,
+        [OP_ITER_NEXT_ARRAY]   = &&lbl_iter_next_array,
+        [OP_ITER_NEXT_PAIR]    = &&lbl_iter_next_pair,
+        [OP_ITER_RANGE]        = &&lbl_iter_range,
+        [OP_STRUCT_NEW]        = &&lbl_struct_new,
+        [OP_FIELD_GET]         = &&lbl_field_get,
+        [OP_FIELD_SET]         = &&lbl_field_set,
+        [OP_UNARY]             = &&lbl_unary,
+        [OP_CAST]              = &&lbl_cast,
+        [OP_BINARY_FIELD]      = &&lbl_binary_field,
+        [OP_FIELD_BINARY]      = &&lbl_field_binary,
+        [OP_PRINT_REPL]        = &&lbl_print_repl,
     };
 
     DISPATCH();
 
-lbl_push:
-    PUSH(c->pool[READ()]);
-    DISPATCH();
-
-lbl_dup_n: {
-    int n = READ();
-    /* Bounds check (not just trusting the parser): this stays reachable from arbitrary chain
-       depth, so a corrupt/adversarial chunk shouldn't be able to read below the stack base. */
-    if (vm->stack_top < n) { error("Stack underflow"); DISPATCH(); }
-    int base = vm->stack_top - n;
-    for (int i = 0; i < n; i++) PUSH(vm->stack[base + i]);
-    DISPATCH();
-}
-
-lbl_load: {
-    int idx       = READ();
-    int cache_idx = READ();
-    /* vm_resolve_name_cached tries the global absolute-pointer cache, then a fresh global lookup — see its comment. */
-    AerVal* found = vm_resolve_name_cached(vm, c, idx, cache_idx);
-    PUSH(found ? *found : aer_null());
-    DISPATCH();
-}
-
-lbl_store: {
-    int idx       = READ();
-    int cache_idx = READ();
-    AerVal val = POP();
-    AerVal* found = vm_resolve_name_full(vm, c, (unsigned int)idx, cache_idx);
-    if (found) *found = val;
-    else       vm_scope_define(vm, (unsigned int)idx, val);
-    DISPATCH();
-}
-
-lbl_define: {
-    int idx = READ();
-    AerVal val = POP();
-    vm_scope_define(vm, (unsigned int)idx, val);
-    DISPATCH();
-}
-
-lbl_load_local: {
-    int slot = READ();
-    PUSH(vm_read_local_slot(vm, slot));
-    DISPATCH();
-}
-
-lbl_store_local: {
-    int slot = READ();
-    AerVal val = POP();
-    vm_write_local_slot(vm, slot, val);
-    DISPATCH();
-}
-
-/* First assignment to a name in this function — allocates/reinitializes its slot. Runs at the
-   current call's own base scope, same as lbl_load_local/store_local (see vm_scope_floor). Sets
-   .name (not just .val) so a call site or defer replay can still find this local by name —
-   see OP_DEFINE_LOCAL's comment in vm.h. */
-lbl_define_local: {
-    int slot = READ();
-    int name_idx = READ();
-    AerScope* s = &vm->scopes[vm_scope_floor(vm)];
-    s->slots[slot].val  = POP();
-    s->slots[slot].name = (unsigned int)name_idx;
-    if (slot >= (int)s->count) s->count = (unsigned int)slot + 1;
-    DISPATCH();
-}
-
-/* Fused `name OP= const` (e.g. `i += 1`) — see OP_COMPOUND_*'s comment in vm.h. Stack-neutral,
-   matching the unfused 4-opcode form's net-zero effect. The runtime_had_error check after each
-   fallible step replaces the intervening DISPATCH() the unfused form used to abort cleanly. */
-lbl_compound_name_const: {
-    int lhs_name_idx  = READ();
-    int lhs_cache_idx = READ();
-    Opcode bin_op     = (Opcode)READ();
-    int rhs_pool_idx  = READ();
-    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal result = vm_binary(*lhs_addr, c->pool[rhs_pool_idx], bin_op);
-    if (runtime_had_error) DISPATCH();
-    *lhs_addr = result;
-    DISPATCH();
-}
-
-/* Fused `name OP= name` (e.g. `total += i`) — same discipline as lbl_compound_name_const, RHS resolved by name; reads both operands before writing, correct for self-referential `x += x`. */
-lbl_compound_name_name: {
-    int lhs_name_idx  = READ();
-    int lhs_cache_idx = READ();
-    Opcode bin_op     = (Opcode)READ();
-    int rhs_name_idx  = READ();
-    int rhs_cache_idx = READ();
-    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal* rhs_addr = vm_resolve_name_cached(vm, c, rhs_name_idx, rhs_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal result = vm_binary(*lhs_addr, *rhs_addr, bin_op);
-    if (runtime_had_error) DISPATCH();
-    *lhs_addr = result;
-    DISPATCH();
-}
-
-/* Phase 2 — the 4 remaining compound-assignment shapes. A LOCAL operand can't fail to resolve;
-   reads/writes go through vm_read_local_slot/vm_write_local_slot, matching lbl_load_local/
-   lbl_store_local. */
-lbl_compound_local_const: {
-    int lhs_slot     = READ();
-    Opcode bin_op    = (Opcode)READ();
-    int rhs_pool_idx = READ();
-    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
-    AerVal result = vm_binary(lhs_val, c->pool[rhs_pool_idx], bin_op);
-    if (runtime_had_error) DISPATCH();
-    vm_write_local_slot(vm, lhs_slot, result);
-    DISPATCH();
-}
-
-lbl_compound_local_local: {
-    int lhs_slot  = READ();
-    Opcode bin_op = (Opcode)READ();
-    int rhs_slot  = READ();
-    /* Both read before either is written — matches the self-referential `p += p` case. */
-    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
-    AerVal rhs_val = vm_read_local_slot(vm, rhs_slot);
-    AerVal result = vm_binary(lhs_val, rhs_val, bin_op);
-    if (runtime_had_error) DISPATCH();
-    vm_write_local_slot(vm, lhs_slot, result);
-    DISPATCH();
-}
-
-lbl_compound_local_name: {
-    int lhs_slot      = READ();
-    Opcode bin_op     = (Opcode)READ();
-    int rhs_name_idx  = READ();
-    int rhs_cache_idx = READ();
-    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
-    AerVal* rhs_addr = vm_resolve_name_cached(vm, c, rhs_name_idx, rhs_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal result = vm_binary(lhs_val, *rhs_addr, bin_op);
-    if (runtime_had_error) DISPATCH();
-    vm_write_local_slot(vm, lhs_slot, result);
-    DISPATCH();
-}
-
-lbl_compound_name_local: {
-    int lhs_name_idx  = READ();
-    int lhs_cache_idx = READ();
-    Opcode bin_op     = (Opcode)READ();
-    int rhs_slot      = READ();
-    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal rhs_val = vm_read_local_slot(vm, rhs_slot);
-    AerVal result = vm_binary(*lhs_addr, rhs_val, bin_op);
-    if (runtime_had_error) DISPATCH();
-    *lhs_addr = result;
-    DISPATCH();
-}
-
-/* Fused plain binary expression (`a + b`, not an assignment) — see OP_BINARY_*'s comment in vm.h.
-   No write-back (unlike OP_COMPOUND_*), just pushes the result, so this follows lbl_binary's
-   discipline (below) rather than the compound handlers': no runtime_had_error check needed before
-   the push itself, since a transient stack value about to be discarded when the statement aborts
-   at the next DISPATCH() isn't corrupting any lasting state. A NAME operand's resolution can still
-   fail outright (undefined name), which *does* need checking before dereferencing it. */
-lbl_binary_local_local: {
-    int lhs_slot  = READ();
-    Opcode bin_op = (Opcode)READ();
-    int rhs_slot  = READ();
-    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
-    AerVal rhs_val = vm_read_local_slot(vm, rhs_slot);
-    PUSH(vm_binary(lhs_val, rhs_val, bin_op));
-    DISPATCH();
-}
-
-lbl_binary_local_const: {
-    int lhs_slot     = READ();
-    Opcode bin_op    = (Opcode)READ();
-    int rhs_pool_idx = READ();
-    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
-    PUSH(vm_binary(lhs_val, c->pool[rhs_pool_idx], bin_op));
-    DISPATCH();
-}
-
-lbl_binary_local_name: {
-    int lhs_slot      = READ();
-    Opcode bin_op     = (Opcode)READ();
-    int rhs_name_idx  = READ();
-    int rhs_cache_idx = READ();
-    AerVal lhs_val = vm_read_local_slot(vm, lhs_slot);
-    AerVal* rhs_addr = vm_resolve_name_cached(vm, c, rhs_name_idx, rhs_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    PUSH(vm_binary(lhs_val, *rhs_addr, bin_op));
-    DISPATCH();
-}
-
-lbl_binary_name_local: {
-    int lhs_name_idx  = READ();
-    int lhs_cache_idx = READ();
-    Opcode bin_op     = (Opcode)READ();
-    int rhs_slot      = READ();
-    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal rhs_val = vm_read_local_slot(vm, rhs_slot);
-    PUSH(vm_binary(*lhs_addr, rhs_val, bin_op));
-    DISPATCH();
-}
-
-lbl_binary_name_const: {
-    int lhs_name_idx  = READ();
-    int lhs_cache_idx = READ();
-    Opcode bin_op     = (Opcode)READ();
-    int rhs_pool_idx  = READ();
-    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    PUSH(vm_binary(*lhs_addr, c->pool[rhs_pool_idx], bin_op));
-    DISPATCH();
-}
-
-lbl_binary_name_name: {
-    int lhs_name_idx  = READ();
-    int lhs_cache_idx = READ();
-    Opcode bin_op     = (Opcode)READ();
-    int rhs_name_idx  = READ();
-    int rhs_cache_idx = READ();
-    AerVal* lhs_addr = vm_resolve_name_cached(vm, c, lhs_name_idx, lhs_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal* rhs_addr = vm_resolve_name_cached(vm, c, rhs_name_idx, rhs_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    PUSH(vm_binary(*lhs_addr, *rhs_addr, bin_op));
-    DISPATCH();
-}
-
-/* Compound-assignment fusion for `arr[idx].field OP= rhs` — see OP_COMPOUND_INDEXED_FIELD_LOCAL_
-   LOCAL's comment in vm.h. rhs is already computed and on the stack (parse_assignment emits the
-   rhs expression before this opcode, same as every OP_COMPOUND_* handler); arr/idx are re-read
-   directly from their local slots rather than duplicated on the stack ahead of time — no DUP_N.
-   Shares vm_index_get_compute with lbl_index_get (to resolve arr[idx] into the struct instance)
-   and the same field linear-scan lbl_field_get/lbl_field_set use (pool-index equality, no strcmp). */
-lbl_compound_indexed_field_local_local: {
-    int arr_slot      = READ();
-    int idx_slot      = READ();
-    int field_idx     = READ();
-    Opcode bin_op     = (Opcode)READ();
-    AerVal rhs_val = POP();
-    AerVal arr_val = vm_read_local_slot(vm, arr_slot);
-    AerVal idx_val = vm_read_local_slot(vm, idx_slot);
-    AerVal obj = vm_index_get_compute(arr_val, idx_val);
-    if (runtime_had_error) DISPATCH();
-    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
-        error("'.' field access requires a struct instance"); DISPATCH();
-    }
-    AerArray* oa = aer_as_array(obj);
-    Shape* shape = oa->shape;
-    for (unsigned int i = 0; i < shape->field_count; i++) {
-        if (shape->field_names[i] == (unsigned int)field_idx) {
-            AerVal result = vm_binary(oa->items[i], rhs_val, bin_op);
-            if (runtime_had_error) DISPATCH();
-            gc_barrier_array(oa, result);
-            oa->items[i] = result;
-            DISPATCH();
-        }
-    }
-    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
-          aer_as_string(c->pool[field_idx])->data);
-    DISPATCH();
-}
-
-/* All 18 binary/comparison/logical/bitwise ops share one handler.
-   cur_op holds whichever opcode was dispatched here. */
-lbl_binary: {
-    AerVal b = POP(), a = POP();
-    PUSH(vm_binary(a, b, cur_op));
-    DISPATCH();
-}
-
-lbl_negate: {
-    AerVal v = POP();
-    if      (aer_type(v) == TYPE_INTEGER) PUSH(aer_int(-aer_as_int(v)));
-    else if (aer_type(v) == TYPE_REAL)    PUSH(aer_real(-aer_as_real(v)));
-    else { error("Negation requires a numeric type"); PUSH(aer_null()); }
-    DISPATCH();
-}
-
-lbl_not: {
-    AerVal v = POP();
-    PUSH(aer_bool(!vm_truthy(v)));
-    DISPATCH();
-}
-
-lbl_bitwise_not: {
-    AerVal v = POP();
-    if (aer_type(v) != TYPE_INTEGER) { error("Bitwise NOT requires an integer"); PUSH(aer_null()); }
-    else PUSH(aer_int(~aer_as_int(v)));
-    DISPATCH();
-}
-
 lbl_jump: {
     int target = READ();
     vm->ip = (unsigned int)target;
-    DISPATCH();
-}
-
-lbl_jump_if_false: {
-    int target = READ();
-    if (!vm_truthy(POP())) vm->ip = (unsigned int)target;
-    DISPATCH();
-}
-
-lbl_jump_if_true: {
-    int target = READ();
-    if (vm_truthy(POP())) vm->ip = (unsigned int)target;
-    DISPATCH();
-}
-
-/* Fused comparison + conditional branch — see OP_CMP_JUMP_FALSE's comment in vm.h. Same
-   type-dispatch and error behavior as lbl_binary + lbl_jump_if_false's unfused pair: on an
-   error (vm_binary calls error()), vm_truthy of whatever dummy value it returned decides an
-   irrelevant, never-observed branch, and DISPATCH() aborts before that matters — identical
-   discipline to lbl_binary's own PUSH-then-DISPATCH. */
-lbl_cmp_jump_false: {
-    int cmp_op = READ();
-    int target = READ();
-    AerVal b = POP(), a = POP();
-    if (!vm_truthy(vm_binary(a, b, (Opcode)cmp_op))) vm->ip = (unsigned int)target;
-    DISPATCH();
-}
-
-/* One per call now, not one per if/for block (see parser.c's current_locals) — VM_SCOPE_MAX is
-   sized off VM_CALL_MAX accordingly, so this can only run out of room alongside the call stack. */
-lbl_push_scope: {
-    if (vm->scope_depth >= VM_SCOPE_MAX) { error("Scope stack overflow"); return false; }
-    AerScope* ns = &vm->scopes[vm->scope_depth++];
-    ns->count    = 0;
-    ns->overflow = false;
-    ns->map      = (HashMap){0};
-    DISPATCH();
-}
-
-lbl_pop_scope:
-    if (vm->scope_depth <= 1) { error("Scope stack underflow"); return false; }
-    --vm->scope_depth;
-    if (vm->scopes[vm->scope_depth].overflow)
-        hashmap_free(&vm->scopes[vm->scope_depth].map);
-    DISPATCH();
-
-lbl_print_repl: {
-    AerVal v = POP();
-    if (aer_type(v) != TYPE_NULL) {
-        vm_print_value(c, v, false);
-        printf("\n");
-    }
-    DISPATCH();
-}
-
-lbl_call: {
-    int name_idx   = READ();
-    int arg_count  = READ();
-    int cache_idx  = READ();
-    AerVal* fv = c->addr_cache[cache_idx];
-    if (!fv) {
-        fv = vm_scope_get(vm, (unsigned int)name_idx);
-        /* Only cache when the global IS the winning resolution — a local binding shadowing a same-named global must keep winning every call, not just before the cache populated. */
-        AerVal* cacheable = vm_global_slot_address(vm, (unsigned int)name_idx);
-        if (cacheable && cacheable == fv) c->addr_cache[cache_idx] = cacheable;
-    }
-    const char* name = aer_as_string(c->pool[name_idx])->data;
-
-    /* Built-in functions */
-    if (!fv) {
-        if (strcmp(name, "length") == 0 && arg_count == 1) {
-            AerVal a = POP();
-            AerVal r;
-            if      (aer_type(a) == TYPE_ARRAY)  r = aer_int((long long)aer_as_array(a)->count);
-            else if (aer_type(a) == TYPE_STRING) r = aer_int((long long)aer_as_string(a)->length);
-            else if (aer_type(a) == TYPE_DICT)   r = aer_int((long long)aer_as_dict(a)->map.count);
-            else { error("length() requires an array, dict, or string"); r = aer_int(0); }
-            PUSH(r); DISPATCH();
-        }
-        if (strcmp(name, "delete") == 0 && arg_count == 2) {
-            AerVal key = POP();
-            AerVal obj = POP();
-            if (aer_type(obj) == TYPE_DICT) {
-                if (aer_type(key) != TYPE_STRING) { error("delete() key must be a string"); PUSH(aer_null()); DISPATCH(); }
-                AerString* ks = aer_as_string(key);
-                unsigned int klen = ks->length;
-                if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); PUSH(aer_null()); DISPATCH(); }
-                char kbuf[VM_KEY_MAX + 1];
-                memcpy(kbuf, ks->data, klen);
-                kbuf[klen] = '\0';
-                dictmap_remove(&aer_as_dict(obj)->map, kbuf);
-                PUSH(obj); DISPATCH();
-            }
-            if (aer_type(obj) == TYPE_ARRAY) {
-                AerArray* a = aer_as_array(obj);
-                if (a->shape) { error("delete() cannot remove fields from a struct instance — structs have a fixed shape"); PUSH(aer_null()); DISPATCH(); }
-                if (aer_type(key) != TYPE_INTEGER) { error("Array delete() index must be an integer"); PUSH(aer_null()); DISPATCH(); }
-                long long i = aer_as_int(key);
-                if (i < 0) i += (long long)a->count;
-                if (i < 0 || (unsigned long long)i >= a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(key), a->count); PUSH(aer_null()); DISPATCH(); }
-                /* Shift-based, preserves order; overlapping ranges need memmove not memcpy (deleting the last element is a harmless zero-length copy). */
-                memmove(&a->items[i], &a->items[i + 1], (size_t)(a->count - (unsigned long long)i - 1) * sizeof(AerVal));
-                a->count--;
-                PUSH(obj); DISPATCH();
-            }
-            error("delete() requires a dict or array");
-            PUSH(aer_null()); DISPATCH();
-        }
-        if (strcmp(name, "append") == 0 && arg_count == 2) {
-            AerVal val = POP();
-            AerVal arr = POP();
-            if (aer_type(arr) != TYPE_ARRAY) { error("append() requires an array"); PUSH(aer_null()); DISPATCH(); }
-            AerArray* a = aer_as_array(arr);
-            if (a->shape) { error("append() cannot add fields to a struct instance — structs have a fixed shape"); PUSH(aer_null()); DISPATCH(); }
-            if (a->count >= a->capacity) {
-                a->capacity = a->capacity ? a->capacity * 2 : 4;
-                a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
-            }
-            gc_barrier_array(a, val);
-            a->items[a->count++] = val;
-            PUSH(arr); DISPATCH();
-        }
-        if (strcmp(name, "print") == 0 && arg_count == 1) {
-            vm_print_value(c, POP(), false);
-            printf("\n");
-            PUSH(aer_null()); DISPATCH();
-        }
-        if (strcmp(name, "type") == 0 && arg_count == 1) {
-            AerVal v = POP();
-            const char* tn = vm_type_name(c, v);
-            /* Copies — see vm_call_builtin's identical type() case. */
-            unsigned int tn_len = (unsigned int)strlen(tn);
-            char* tn_buf = xmalloc(tn_len + 1);
-            memcpy(tn_buf, tn, tn_len + 1);
-            PUSH(aer_make_string(tn_buf, tn_len)); DISPATCH();   /* no chunk_add_pool interning — see vm_to_str's comment */
-        }
-        if (strcmp(name, "assert") == 0 && arg_count == 2) {
-            AerVal msg  = POP();
-            AerVal cond = POP();
-            if (aer_type(msg) != TYPE_STRING) {
-                error("assert() requires a string message as its second argument");
-                PUSH(aer_null()); DISPATCH();
-            }
-            /* Deliberately skips error()/runtime_had_error — a failed assertion reports and execution keeps running, unlike every other runtime fault. */
-            if (!vm_truthy(cond)) {
-                assert_failure_count++;
-                AerString* ms = aer_as_string(msg);
-                printf("ASSERT FAILED: %.*s\n", (int)ms->length, ms->data);
-            }
-            PUSH(aer_null()); DISPATCH();
-        }
-        if (strcmp(name, "panic") == 0 && arg_count == 1) {
-            AerVal msg = POP();
-            if (aer_type(msg) != TYPE_STRING) {
-                error("panic() requires a string message");
-                PUSH(aer_null()); DISPATCH();
-            }
-            /* error() sets runtime_had_error — DISPATCH()'s check aborts on the next dispatch, same path as any other runtime fault. */
-            {
-                AerString* ms = aer_as_string(msg);
-                error("panic: %.*s", (int)ms->length, ms->data);
-            }
-            PUSH(aer_null()); DISPATCH();
-        }
-
-        /* Not a variable, not a builtin — instantiation: Point(1, 2). Fewer args than fields is allowed (trailing fields take defaults); more is not. */
-        Shape* shape = chunk_find_shape(c, name);
-        if (shape) {
-            if ((unsigned int)arg_count > shape->field_count) {
-                error("'%s' takes at most %u argument%s, got %d",
-                      name, shape->field_count, shape->field_count == 1 ? "" : "s", arg_count);
-                for (int i = 0; i < arg_count; i++) POP();
-                PUSH(aer_null()); DISPATCH();
-            }
-            /* struct_pool cell holds the AerArray header AND its field storage in one allocation —
-               items points right after the header instead of a separate xmalloc (see vm_pools_init_once). */
-            AerArray* a = pool_alloc(&struct_pool);
-            a->count = a->capacity = shape->field_count;
-            a->items = (AerVal*)((char*)a + sizeof(AerArray));
-            a->shape = shape;
-            for (int i = arg_count - 1; i >= 0; i--) a->items[i] = POP();
-            for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
-                a->items[i] = vm_default_value(shape->field_defaults[i]);
-            PUSH(aer_array_val(a)); DISPATCH();
-        }
-
-        error("'%s' is not defined", name);
-        for (int i = 0; i < arg_count; i++) POP();
-        PUSH(aer_null()); DISPATCH();
-    }
-
-    if (aer_type(*fv) != TYPE_FUNCTION) {
-        error("'%s' is not a function", name);
-        for (int i = 0; i < arg_count; i++) POP();
-        PUSH(aer_null()); DISPATCH();
-    }
-    {
-    AerFunction* fvf = aer_as_function(*fv);
-    if (arg_count < (int)fvf->min_arity || arg_count > (int)fvf->arity) {
-        if (fvf->min_arity == fvf->arity)
-            error("'%s' expects %u arguments, got %d", name, (unsigned int)fvf->arity, arg_count);
-        else
-            error("'%s' expects between %u and %u arguments, got %d", name, (unsigned int)fvf->min_arity, (unsigned int)fvf->arity, arg_count);
-        for (int i = 0; i < arg_count; i++) POP();
-        PUSH(aer_null()); DISPATCH();
-    }
-    /* Omitted trailing args get pushed here, so the callee's OP_DEFINE_LOCAL sequence still sees exactly `arity` values. */
-    for (int i = arg_count; i < (int)fvf->arity; i++) PUSH(vm_default_value(fvf->defaults[i - fvf->min_arity]));
-    arg_count = (int)fvf->arity;
-    if (fvf->has_receiver) {
-        AerVal arg0 = vm->stack[vm->stack_top - arg_count];
-        if (aer_type(arg0) != TYPE_ARRAY || !aer_as_array(arg0)->shape ||
-            aer_as_array(arg0)->shape->name != fvf->receiver_type) {
-            error("'%s' expects its first argument to be a %s",
-                  name, aer_as_string(c->pool[fvf->receiver_type])->data);
-            for (int i = 0; i < arg_count; i++) POP();
-            PUSH(aer_null()); DISPATCH();
-        }
-    }
-    /* OP_TAIL_CALL shares this whole handler with OP_CALL and diverges only past this point,
-       once fv is confirmed callable with matching arity/receiver. Reusing the current frame is
-       only safe with no pending defers (they'd need to run before this frame is discarded, and
-       there's no return value yet to hand back mid-call), so a tail call with pending defers
-       just falls through to the normal stack-growing path below. */
-    if (cur_op == OP_TAIL_CALL) {
-        CallFrame* caller = &vm->call_stack[vm->call_depth - 1];
-        if (caller->defer_count == 0) {
-            int base = caller->return_scope_depth;
-            while (vm->scope_depth > base) {
-                --vm->scope_depth;
-                if (vm->scopes[vm->scope_depth].overflow)
-                    hashmap_free(&vm->scopes[vm->scope_depth].map);
-            }
-            caller->function = fvf;
-            vm->ip = fvf->code_offset;
-            DISPATCH();
-        }
-    }
-    if (vm->call_depth >= VM_CALL_MAX) { error("Call stack overflow"); return false; }
-    {
-        CallFrame* frame = &vm->call_stack[vm->call_depth];
-        frame->return_ip          = vm->ip;
-        frame->return_scope_depth = vm->scope_depth;
-        frame->function           = fvf;
-        /* See vm_setup_call's identical reset — reused call_stack slots must never inherit a previous occupant's pending defers. */
-        frame->defer_count        = 0;
-        frame->defers_draining    = false;
-    }
-    vm->call_depth++;
-    vm->ip = fvf->code_offset;
-    DISPATCH();
-    }
-}
-
-lbl_return: {
-    /* Address of this OP_RETURN itself (vm->ip already advanced past it); used as a deferred call's return_ip so its own OP_RETURN lands back here to check for further pending defers. */
-    unsigned int return_addr = vm->ip - 1;
-    CallFrame* frame = &vm->call_stack[vm->call_depth - 1];
-    AerVal popped = POP();
-    if (!frame->defers_draining) {
-        /* First visit for this call: `popped` is the real return value. */
-        frame->pending_return_value = popped;
-        frame->defers_draining      = true;
-    }
-    /* Otherwise `popped` is a just-finished deferred call's own result, discarded here. */
-
-    while (frame->defer_count > 0) {
-        DeferredCall dc = frame->defers[--frame->defer_count];
-        const char* dname = aer_as_string(c->pool[dc.name_idx])->data;
-        AerVal* dfv = vm_scope_get(vm, dc.name_idx);
-
-        if (dfv) {
-            if (aer_type(*dfv) != TYPE_FUNCTION) {
-                error("'%s' is not a function", dname);
-            } else {
-                for (int i = 0; i < dc.arg_count; i++) PUSH(dc.args[i]);
-                AerVal* dargs = &vm->stack[vm->stack_top - dc.arg_count];
-                if (vm_setup_call(vm, c, *dfv, dc.arg_count, dargs, return_addr)) {
-                    /* Resumes inside the deferred call's bytecode; when it returns, execution re-enters lbl_return for THIS frame, rechecking defer_count. */
-                    DISPATCH();
-                }
-                for (int i = 0; i < dc.arg_count; i++) POP();   /* vm_setup_call failed; error() already called */
-            }
-        } else {
-            AerVal result;
-            bool handled = vm_call_builtin(c, dname, dc.args, dc.arg_count, &result);
-            if (!handled) error("'%s' is not defined", dname);
-        }
-        if (runtime_had_error) DISPATCH();   /* uniform abort, same as every other error path */
-    }
-
-    int base = frame->return_scope_depth;
-    while (vm->scope_depth > base) {
-        --vm->scope_depth;
-        if (vm->scopes[vm->scope_depth].overflow)
-            hashmap_free(&vm->scopes[vm->scope_depth].map);
-    }
-    AerVal ret = frame->pending_return_value;
-    frame->defers_draining = false;
-    vm->ip = vm->call_stack[--vm->call_depth].return_ip;
-    PUSH(ret);
-    DISPATCH();
-}
-
-lbl_defer_push: {
-    int name_idx  = READ();
-    int arg_count = READ();
-    CallFrame* frame = &vm->call_stack[vm->call_depth - 1];
-    /* arg_count > MAX_DEFER_ARGS is already rejected at parse time; this is just a defensive backstop against dc->args[] overflow. */
-    if (arg_count > MAX_DEFER_ARGS) {
-        error("Too many arguments to a deferred call (max %d)", MAX_DEFER_ARGS);
-        for (int i = 0; i < arg_count; i++) POP();
-        DISPATCH();
-    }
-    if (frame->defer_count >= MAX_DEFERS_PER_CALL) {
-        error("Too many deferred calls in one function (max %d)", MAX_DEFERS_PER_CALL);
-        for (int i = 0; i < arg_count; i++) POP();
-        DISPATCH();
-    }
-    /* Lazily allocated, kept (not freed) once allocated, so a later call reusing this call_stack slot finds it already there. */
-    if (!frame->defers) frame->defers = xmalloc(sizeof(DeferredCall) * MAX_DEFERS_PER_CALL);
-    DeferredCall* dc = &frame->defers[frame->defer_count++];
-    dc->name_idx  = (unsigned int)name_idx;
-    dc->arg_count = arg_count;
-    for (int i = arg_count - 1; i >= 0; i--) dc->args[i] = POP();
-    DISPATCH();
-}
-
-lbl_call_value: {
-    int arg_count = READ();
-    AerVal fv = vm->stack[vm->stack_top - arg_count - 1];
-    AerVal* args = &vm->stack[vm->stack_top - arg_count];
-    if (!vm_setup_call(vm, c, fv, arg_count, args, vm->ip)) {
-        for (int i = 0; i <= arg_count; i++) POP();
-        PUSH(aer_null()); DISPATCH();
-    }
-    /* vm_setup_call may have pushed default values for omitted trailing params, so the
-       true count now on the stack is the function's own arity, not the original arg_count. */
-    int final_count = (int)aer_as_function(fv)->arity;
-    /* Shift args down one slot to overwrite the function value — done after vm_setup_call since it reads args[0] (the receiver) from its original position. */
-    memmove(&vm->stack[vm->stack_top - final_count - 1], args, (size_t)final_count * sizeof(AerVal));
-    vm->stack_top--;
-    DISPATCH();
-}
-
-lbl_call_module: {
-    int module_idx = READ();
-    int fn_idx     = READ();
-    int arg_count  = READ();
-    const char* module = aer_as_string(c->pool[module_idx])->data;
-    const char* fn     = aer_as_string(c->pool[fn_idx])->data;
-    bool handled = false;
-    if      (strcmp(module, "math")   == 0) handled = aer_math_call(vm, c, fn, arg_count);
-    else if (strcmp(module, "random") == 0) handled = aer_random_call(vm, c, fn, arg_count);
-    else if (strcmp(module, "string") == 0) handled = aer_string_call(vm, c, fn, arg_count);
-    else if (strcmp(module, "time")   == 0) handled = aer_time_call(vm, c, fn, arg_count);
-    else if (strcmp(module, "json")   == 0) handled = aer_json_call(vm, c, fn, arg_count);
-    else if (aer_host_is_module(module, (unsigned int)strlen(module)))
-                                             handled = aer_host_call(vm, module, fn, arg_count);
-    else                                     handled = aer_module_call(vm, module, fn, arg_count);
-    if (handled) DISPATCH();
-    /* The module matched but `fn` wasn't one of its functions — e.g. wrong module, or undefined at the file-module's top level. */
-    error("'%s' has no function '%s'", module, fn);
-    for (int i = 0; i < arg_count; i++) POP();
-    PUSH(aer_null()); DISPATCH();
-}
-
-lbl_array_new: {
-    int count = READ();
-    AerArray* a = pool_alloc(&array_pool);
-    a->capacity = count > 0 ? (unsigned int)count : 4;
-    a->count    = (unsigned int)count;
-    a->items    = xmalloc(sizeof(AerVal) * a->capacity);
-    a->shape    = NULL;
-    for (int i = count - 1; i >= 0; i--)
-        a->items[i] = POP();
-    PUSH(aer_array_val(a));
-    DISPATCH();
-}
-
-lbl_unpack: {
-    int idx = READ();
-    AerVal arr = vm->stack[vm->stack_top - 1];   /* peek — do not pop */
-    if (aer_type(arr) != TYPE_ARRAY) { error("Cannot unpack a non-array"); PUSH(aer_null()); DISPATCH(); }
-    AerArray* a = aer_as_array(arr);
-    if ((unsigned int)idx >= a->count) {
-        error("Cannot unpack index %d: array has %u element%s",
-              idx, a->count, a->count == 1 ? "" : "s");
-        PUSH(aer_null()); DISPATCH();
-    }
-    PUSH(a->items[idx]);
-    DISPATCH();
-}
-
-lbl_dict_new: {
-    int count = READ();
-    AerDict* d = pool_alloc(&dict_pool);
-    memset(&d->map, 0, sizeof(d->map));
-    d->map.is_inline = true;   /* AerDict stores AerVal inline, not boxed — see hashtable.h */
-    /* Stack: key0, val0, key1, val1, ..., keyN-1, valN-1 (valN-1 on top) */
-    for (int i = count - 1; i >= 0; i--) {
-        AerVal val = POP();
-        AerVal key = POP();
-        if (aer_type(key) != TYPE_STRING) { error("Dict keys must be strings"); continue; }
-        AerString* ks = aer_as_string(key);
-        unsigned int klen = ks->length;
-        char* k = xmalloc(klen + 1);
-        memcpy(k, ks->data, klen);
-        k[klen] = '\0';
-        dictmap_put(&d->map, k, val);
-    }
-    PUSH(aer_dict_val(d));
-    DISPATCH();
-}
-
-lbl_index_get: {
-    AerVal idx = POP();
-    AerVal obj = POP();
-    PUSH(vm_index_get_compute(obj, idx));
-    DISPATCH();
-}
-
-/* Fused `name[index]` reads. Reads both operands directly, computes via the shared
-   vm_index_get_compute, then pushes the result — unlike Part 1's compound-assignment family
-   this isn't stack-neutral. A NAME-kind operand can fail to resolve; check runtime_had_error
-   and DISPATCH() immediately rather than indexing with garbage, same as OP_COMPOUND_NAME_*. */
-lbl_index_get_local_const: {
-    int arr_slot = READ();
-    int idx_pool = READ();
-    AerVal obj = vm_read_local_slot(vm, arr_slot);
-    AerVal idx = c->pool[idx_pool];
-    PUSH(vm_index_get_compute(obj, idx));
-    DISPATCH();
-}
-
-lbl_index_get_local_local: {
-    int arr_slot = READ();
-    int idx_slot = READ();
-    AerVal obj = vm_read_local_slot(vm, arr_slot);
-    AerVal idx = vm_read_local_slot(vm, idx_slot);
-    PUSH(vm_index_get_compute(obj, idx));
-    DISPATCH();
-}
-
-lbl_index_get_local_name: {
-    int arr_slot      = READ();
-    int idx_name_idx  = READ();
-    int idx_cache_idx = READ();
-    AerVal obj = vm_read_local_slot(vm, arr_slot);
-    AerVal* idx_addr = vm_resolve_name_cached(vm, c, idx_name_idx, idx_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    PUSH(vm_index_get_compute(obj, *idx_addr));
-    DISPATCH();
-}
-
-lbl_index_get_name_const: {
-    int arr_name_idx  = READ();
-    int arr_cache_idx = READ();
-    int idx_pool      = READ();
-    AerVal* obj_addr = vm_resolve_name_cached(vm, c, arr_name_idx, arr_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal idx = c->pool[idx_pool];
-    PUSH(vm_index_get_compute(*obj_addr, idx));
-    DISPATCH();
-}
-
-lbl_index_get_name_local: {
-    int arr_name_idx  = READ();
-    int arr_cache_idx = READ();
-    int idx_slot      = READ();
-    AerVal* obj_addr = vm_resolve_name_cached(vm, c, arr_name_idx, arr_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal idx = vm_read_local_slot(vm, idx_slot);
-    PUSH(vm_index_get_compute(*obj_addr, idx));
-    DISPATCH();
-}
-
-lbl_index_get_name_name: {
-    int arr_name_idx  = READ();
-    int arr_cache_idx = READ();
-    int idx_name_idx  = READ();
-    int idx_cache_idx = READ();
-    AerVal* obj_addr = vm_resolve_name_cached(vm, c, arr_name_idx, arr_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal* idx_addr = vm_resolve_name_cached(vm, c, idx_name_idx, idx_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    PUSH(vm_index_get_compute(*obj_addr, *idx_addr));
-    DISPATCH();
-}
-
-lbl_index_set: {
-    AerVal val = POP();
-    AerVal idx = POP();
-    AerVal obj = POP();
-    vm_index_set_compute(obj, idx, val);
-    DISPATCH();
-}
-
-/* Compile-time-fused `name[index] = <literal>` writes — mirrors OP_INDEX_GET_*'s scheme
-   (see that comment in vm.h), just for the write side. All three of array/index/value are
-   resolved directly from this opcode's own operands, not the stack — no separate LOAD/PUSH
-   bytecode runs for any of them, so there's no intermediate point where something else could
-   run and see array/index/value in a half-updated state. The value is restricted to a bare
-   CONST (parser.c's parse_assignment) — see its comment for why that restriction specifically
-   is what makes resolving array/index "after" the value (in this opcode, unavoidably, since it's
-   one dispatch) safe. Recognized only for a single, unchained bracket assignment; a chained write
-   (a.b[i] = v) or a struct field write keeps using the generic OP_INDEX_SET/OP_FIELD_SET. */
-lbl_index_set_local_const: {
-    int arr_slot = READ();
-    int idx_pool = READ();
-    int val_pool = READ();
-    AerVal obj = vm_read_local_slot(vm, arr_slot);
-    AerVal idx = c->pool[idx_pool];
-    vm_index_set_compute(obj, idx, c->pool[val_pool]);
-    DISPATCH();
-}
-
-lbl_index_set_local_local: {
-    int arr_slot = READ();
-    int idx_slot = READ();
-    int val_pool = READ();
-    AerVal obj = vm_read_local_slot(vm, arr_slot);
-    AerVal idx = vm_read_local_slot(vm, idx_slot);
-    vm_index_set_compute(obj, idx, c->pool[val_pool]);
-    DISPATCH();
-}
-
-lbl_index_set_local_name: {
-    int arr_slot      = READ();
-    int idx_name_idx  = READ();
-    int idx_cache_idx = READ();
-    int val_pool      = READ();
-    AerVal obj = vm_read_local_slot(vm, arr_slot);
-    AerVal* idx_addr = vm_resolve_name_cached(vm, c, idx_name_idx, idx_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    vm_index_set_compute(obj, *idx_addr, c->pool[val_pool]);
-    DISPATCH();
-}
-
-lbl_index_set_name_const: {
-    int arr_name_idx  = READ();
-    int arr_cache_idx = READ();
-    int idx_pool      = READ();
-    int val_pool      = READ();
-    AerVal* obj_addr = vm_resolve_name_cached(vm, c, arr_name_idx, arr_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    vm_index_set_compute(*obj_addr, c->pool[idx_pool], c->pool[val_pool]);
-    DISPATCH();
-}
-
-lbl_index_set_name_local: {
-    int arr_name_idx  = READ();
-    int arr_cache_idx = READ();
-    int idx_slot      = READ();
-    int val_pool      = READ();
-    AerVal* obj_addr = vm_resolve_name_cached(vm, c, arr_name_idx, arr_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal idx = vm_read_local_slot(vm, idx_slot);
-    vm_index_set_compute(*obj_addr, idx, c->pool[val_pool]);
-    DISPATCH();
-}
-
-lbl_index_set_name_name: {
-    int arr_name_idx  = READ();
-    int arr_cache_idx = READ();
-    int idx_name_idx  = READ();
-    int idx_cache_idx = READ();
-    int val_pool      = READ();
-    AerVal* obj_addr = vm_resolve_name_cached(vm, c, arr_name_idx, arr_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    AerVal* idx_addr = vm_resolve_name_cached(vm, c, idx_name_idx, idx_cache_idx);
-    if (runtime_had_error) DISPATCH();
-    vm_index_set_compute(*obj_addr, *idx_addr, c->pool[val_pool]);
-    DISPATCH();
-}
-
-lbl_slice_get: {
-    AerVal end_v   = POP();
-    AerVal start_v = POP();
-    AerVal obj     = POP();
-    if (aer_type(obj) == TYPE_ARRAY) {
-        AerArray* a = aer_as_array(obj);
-        if (a->shape) { error("Structs cannot be sliced"); PUSH(aer_null()); DISPATCH(); }
-        long long start, end;
-        if (!vm_slice_bounds(start_v, end_v, (long long)a->count, &start, &end)) { PUSH(aer_null()); DISPATCH(); }
-        unsigned int n = (unsigned int)(end - start);
-        AerArray* r = pool_alloc(&array_pool);
-        r->count    = n;
-        r->capacity = n > 0 ? n : 4;
-        r->items    = xmalloc(sizeof(AerVal) * r->capacity);
-        r->shape    = NULL;   /* a slice is always a plain array, even of a struct */
-        for (unsigned int i = 0; i < n; i++) r->items[i] = a->items[start + i];
-        PUSH(aer_array_val(r));
-    } else if (aer_type(obj) == TYPE_STRING) {
-        AerString* os = aer_as_string(obj);
-        long long start, end;
-        if (!vm_slice_bounds(start_v, end_v, (long long)os->length, &start, &end)) { PUSH(aer_null()); DISPATCH(); }
-        /* Copies rather than pointing into obj's own buffer, since obj could be collected later while this slice is still alive. */
-        unsigned int sub_len = (unsigned int)(end - start);
-        char* sub_buf = xmalloc(sub_len + 1);
-        memcpy(sub_buf, os->data + start, sub_len);
-        sub_buf[sub_len] = '\0';
-        PUSH(aer_make_string(sub_buf, sub_len));   /* no chunk_add_pool interning — see vm_to_str's comment */
-    } else {
-        error("Cannot slice this type");
-        PUSH(aer_null());
-    }
     DISPATCH();
 }
 
@@ -2747,230 +1675,52 @@ lbl_define_struct: {
     DISPATCH();
 }
 
-lbl_field_get: {
-    unsigned int site = vm->ip - 1;   /* the opcode's own word — see field_cache_shape's comment */
-    int field_idx = READ();
-    AerVal obj = POP();
-    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
-        error("'.' field access requires a struct instance");
-        PUSH(aer_null()); DISPATCH();
-    }
-    AerArray* oa = aer_as_array(obj);
-    Shape* shape = oa->shape;
-    if (c->field_cache_shape[site] == shape) {
-        PUSH(oa->items[c->field_cache_slot[site]]); DISPATCH();
-    }
-    /* field_idx and shape->field_names[i] are chunk_add_pool-deduped indices, so an identical field name always yields the identical index — comparing indices is equivalent to strcmp, without one. */
-    for (unsigned int i = 0; i < shape->field_count; i++) {
-        if (shape->field_names[i] == (unsigned int)field_idx) {
-            c->field_cache_shape[site] = shape;
-            c->field_cache_slot[site]  = (int)i;
-            PUSH(oa->items[i]); DISPATCH();
-        }
-    }
-    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
-          aer_as_string(c->pool[field_idx])->data);
-    PUSH(aer_null()); DISPATCH();
-}
-
-lbl_field_set: {
-    unsigned int site = vm->ip - 1;
-    int field_idx = READ();
-    AerVal val = POP();
-    AerVal obj = POP();
-    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
-        error("'.' field access requires a struct instance"); DISPATCH();
-    }
-    AerArray* oa = aer_as_array(obj);
-    Shape* shape = oa->shape;
-    if (c->field_cache_shape[site] == shape) {
-        gc_barrier_array(oa, val);
-        oa->items[c->field_cache_slot[site]] = val; DISPATCH();
-    }
-    /* See lbl_field_get's comment — same pool-index equivalence. */
-    for (unsigned int i = 0; i < shape->field_count; i++) {
-        if (shape->field_names[i] == (unsigned int)field_idx) {
-            c->field_cache_shape[site] = shape;
-            c->field_cache_slot[site]  = (int)i;
-            gc_barrier_array(oa, val);
-            oa->items[i] = val; DISPATCH();
-        }
-    }
-    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
-          aer_as_string(c->pool[field_idx])->data);
-    DISPATCH();
-}
-
-lbl_check_shape: {
-    int name_idx = READ();
-    AerVal v = POP();
-    if (aer_type(v) != TYPE_ARRAY || !aer_as_array(v)->shape || aer_as_array(v)->shape->name != (unsigned int)name_idx) {
-        error("Expected a '%s', got a '%s'", aer_as_string(c->pool[name_idx])->data, vm_type_name(c, v));
-        PUSH(aer_null()); DISPATCH();
-    }
-    PUSH(v);
-    DISPATCH();
-}
-
-lbl_iter_next: {
-    int end_addr = READ();
-    AerVal* idx_v = &vm->stack[vm->stack_top - 1];
-    AerVal* col   = &vm->stack[vm->stack_top - 2];
-    long long idx = aer_as_int(*idx_v);
-    if (aer_type(*col) == TYPE_ARRAY) {
-        AerArray* a = aer_as_array(*col);
-        if ((unsigned long long)idx >= a->count) {
-            vm->stack_top -= 2; vm->ip = (unsigned int)end_addr;
-        } else {
-            *idx_v = aer_int(idx + 1);
-            PUSH(a->items[idx]);
-        }
-    } else if (aer_type(*col) == TYPE_DICT) {
-        AerDict* d = aer_as_dict(*col);
-        while ((unsigned long long)idx < d->map.capacity && !d->map.buckets[idx].key)
-            idx++;
-        if ((unsigned long long)idx >= d->map.capacity) {
-            vm->stack_top -= 2; vm->ip = (unsigned int)end_addr;
-        } else {
-            *idx_v = aer_int(idx + 1);
-            /* Copies the key rather than pointing into the hashmap's buffer, since the entry could be removed/overwritten while this string is still alive. */
-            unsigned int key_len = d->map.buckets[idx].length;
-            char* key_buf = xmalloc(key_len + 1);
-            memcpy(key_buf, d->map.buckets[idx].key, key_len);
-            key_buf[key_len] = '\0';
-            PUSH(aer_make_string(key_buf, key_len));   /* no chunk_add_pool interning — see vm_to_str's comment */
-        }
-    } else if (aer_type(*col) == TYPE_STRING) {
-        AerString* cs = aer_as_string(*col);
-        if ((unsigned long long)idx >= cs->length) {
-            vm->stack_top -= 2; vm->ip = (unsigned int)end_addr;
-        } else {
-            *idx_v = aer_int(idx + 1);
-            char* ch_buf = xmalloc(2);
-            ch_buf[0] = cs->data[idx];
-            ch_buf[1] = '\0';
-            PUSH(aer_make_string(ch_buf, 1));   /* no chunk_add_pool interning — see vm_to_str's comment */
-        }
-    } else { error("Cannot iterate over this type"); vm->stack_top -= 2; vm->ip = (unsigned int)end_addr; }
-    DISPATCH();
-}
-
-lbl_iter_next_pair: {
-    int end_addr = READ();
-    AerVal* idx_v = &vm->stack[vm->stack_top - 1];
-    AerVal* col   = &vm->stack[vm->stack_top - 2];
-    long long idx = aer_as_int(*idx_v);
-    if (aer_type(*col) != TYPE_DICT) { error("for k, v requires a dict"); vm->stack_top -= 2; vm->ip = (unsigned int)end_addr; DISPATCH(); }
-    AerDict* d = aer_as_dict(*col);
-    while ((unsigned long long)idx < d->map.capacity && !d->map.buckets[idx].key)
-        idx++;
-    if ((unsigned long long)idx >= d->map.capacity) {
-        vm->stack_top -= 2; vm->ip = (unsigned int)end_addr;
-    } else {
-        *idx_v = aer_int(idx + 1);
-        /* Copies the key — see lbl_iter_next's identical comment on this pattern. */
-        unsigned int key_len = d->map.buckets[idx].length;
-        char* key_buf = xmalloc(key_len + 1);
-        memcpy(key_buf, d->map.buckets[idx].key, key_len);
-        key_buf[key_len] = '\0';
-        PUSH(aer_make_string(key_buf, key_len));   /* key — no chunk_add_pool interning, see vm_to_str's comment */
-        PUSH(d->map.buckets[idx].payload.inline_val);           /* value */
-    }
-    DISPATCH();
-}
-
-lbl_iter_range: {
-    int end_addr = READ();
-    /* Stack: [cur, end, step] — step is always present (parser defaults to 1), so no branch is needed. Direction is inferred from cur vs end, not the step's sign, so `10..0..2` still descends. */
-    AerVal* cur_v  = &vm->stack[vm->stack_top - 3];
-    AerVal* end_v  = &vm->stack[vm->stack_top - 2];
-    AerVal* step_v = &vm->stack[vm->stack_top - 1];
-    if (aer_type(*cur_v) != TYPE_INTEGER || aer_type(*end_v) != TYPE_INTEGER || aer_type(*step_v) != TYPE_INTEGER) {
-        error("Range bounds and step must be integers"); vm->stack_top -= 3; vm->ip = (unsigned int)end_addr; DISPATCH();
-    }
-    long long cur = aer_as_int(*cur_v), rng_end = aer_as_int(*end_v), step = aer_as_int(*step_v);
-    if (step <= 0) {
-        error("Range step must be a positive integer (direction is inferred from the bounds, not the step's sign)");
-        vm->stack_top -= 3; vm->ip = (unsigned int)end_addr; DISPATCH();
-    }
-    bool ascending = cur < rng_end;
-    /* >= / <= rather than == : a step that doesn't evenly divide the range must still stop cleanly instead of stepping past rng_end and never hitting it exactly. */
-    if (ascending ? (cur >= rng_end) : (cur <= rng_end)) {
-        vm->stack_top -= 3; vm->ip = (unsigned int)end_addr;
-    } else {
-        PUSH(*cur_v);
-        *cur_v = aer_int(cur + (ascending ? step : -step));
-    }
-    DISPATCH();
-}
-
-lbl_to_str: {
-    /* Not PUSH(vm_to_str(vm, POP())) directly — PUSH's macro body and POP() would both modify vm->stack_top within one unsequenced expression (a real -Wsequence-point issue). */
-    AerVal v = POP();
-    PUSH(vm_to_str(vm, v));
-    DISPATCH();
-}
-
-lbl_cast: {
-    int cast_type = READ();
-    AerVal v = POP();
-    PUSH(vm_cast(v, cast_type));
-    DISPATCH();
-}
-
-lbl_pop:
-    POP();
-    DISPATCH();
-
-#ifdef AER_V3
-/* v3 register-VM prototype, M1 — see OP_V3_*'s comment in vm.h. Stack-neutral: none of these three
-   touch vm->stack/vm->scopes/PUSH/POP at all, only v3_registers[] and (for LOADK) the chunk pool —
-   the whole point of keeping this genuinely isolated from the live interpreter. */
-lbl_v3_loadk: {
-    int dest = (int)V3_UNPACK_A(op_word);
+/* See OP_LOADK/OP_MOVE/OP_BINARY's own comments in vm.h. */
+lbl_loadk: {
+    int dest = (int)UNPACK_A(op_word);
     int pool_idx = READ();
-    v3_registers[dest] = c->pool[pool_idx];
+    vm->registers[dest] = c->pool[pool_idx];
     DISPATCH();
 }
 
-lbl_v3_move: {
-    int dest = (int)V3_UNPACK_A(op_word);
-    int src  = (int)V3_UNPACK_B(op_word);
-    v3_registers[dest] = v3_registers[src];
+lbl_move: {
+    int dest = (int)UNPACK_A(op_word);
+    int src  = (int)UNPACK_B(op_word);
+    vm->registers[dest] = vm->registers[src];
     DISPATCH();
 }
 
-/* dest/bin_op are packed into op_word (see V3_PACK3's comment in vm.h); rk_b/rk_c are wide
+/* dest/bin_op are packed into op_word (see PACK3's comment in vm.h); rk_b/rk_c are wide
    RK-encoded operands (register or constant), each still its own dedicated word, read via
    READ() exactly as before this opcode was packed. */
-lbl_v3_binary: {
-    int dest      = (int)V3_UNPACK_A(op_word);
-    Opcode bin_op = (Opcode)V3_UNPACK_B(op_word);
+lbl_binary: {
+    int dest      = (int)UNPACK_A(op_word);
+    Opcode bin_op = (Opcode)UNPACK_B(op_word);
     int rk_b      = READ();
     int rk_c      = READ();
-    AerVal b = vm_v3_rk_value(c, rk_b);
-    AerVal cc = vm_v3_rk_value(c, rk_c);
-    v3_registers[dest] = vm_binary(b, cc, bin_op);
+    AerVal b = vm_rk_value(vm, c, rk_b);
+    AerVal cc = vm_rk_value(vm, c, rk_c);
+    vm->registers[dest] = vm_binary(b, cc, bin_op);
     DISPATCH();
 }
 
-/* M2 — control flow. Stack-neutral, same as the M1 opcodes above — reads v3_registers[]/the chunk
+/* M2 — control flow. Stack-neutral, same as the M1 opcodes above — reads vm->registers[]/the chunk
    pool only, never pops/pushes anything, and OP_JUMP (reused as-is for unconditional jumps) is
    already stack-neutral too. */
-lbl_v3_jump_if_false_reg: {
-    int reg    = (int)V3_UNPACK_A(op_word);
+lbl_jump_if_false_reg: {
+    int reg    = (int)UNPACK_A(op_word);
     int target = READ();
-    if (!vm_truthy(v3_registers[reg])) vm->ip = (unsigned int)target;
+    if (!vm_truthy(vm->registers[reg])) vm->ip = (unsigned int)target;
     DISPATCH();
 }
 
-lbl_v3_cmp_jump_false: {
-    Opcode cmp_op = (Opcode)V3_UNPACK_A(op_word);
+lbl_cmp_jump_false: {
+    Opcode cmp_op = (Opcode)UNPACK_A(op_word);
     int rk_a      = READ();
     int rk_b      = READ();
     int target    = READ();
-    AerVal a = vm_v3_rk_value(c, rk_a);
-    AerVal b = vm_v3_rk_value(c, rk_b);
+    AerVal a = vm_rk_value(vm, c, rk_a);
+    AerVal b = vm_rk_value(vm, c, rk_b);
     if (!vm_truthy(vm_binary(a, b, cmp_op))) vm->ip = (unsigned int)target;
     DISPATCH();
 }
@@ -2981,53 +1731,90 @@ lbl_v3_cmp_jump_false: {
    an isolated frame instead of a shared fixed range. Mirrors the stack VM's own overflow check
    (vm.c's vm_setup_call: `if (target->call_depth >= VM_CALL_MAX) { error("Call stack overflow");
    ... }`) almost verbatim — same ceiling, same error-then-DISPATCH() discipline. */
-lbl_v3_call: {
-    int dest_reg      = (int)V3_UNPACK_A(op_word);
-    int arg_reg_base  = (int)V3_UNPACK_B(op_word);
-    int arg_count     = (int)V3_UNPACK_C(op_word);
+lbl_call: {
+    int dest_reg      = (int)UNPACK_A(op_word);
+    int arg_reg_base  = (int)UNPACK_B(op_word);
+    int arg_count     = (int)UNPACK_C(op_word);
     int callee_offset = READ();
-    if (v3_call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); DISPATCH(); }
-    V3CallFrame* caller = &v3_call_stack[v3_call_depth];
-    V3CallFrame* callee = &v3_call_stack[v3_call_depth + 1];
+    /* tail-call reuse, see OP_TAIL_CALL's own comment in vm.h. The copy below iterates
+       i in INCREASING order with dest_i (== i) always <= source_i (== arg_reg_base + i, and
+       arg_reg_base is never negative) — the same "shift toward a lower-or-equal address" pattern
+       memmove(dest, src, n) uses when dest <= src, which is always safe to do element-by-element
+       forward regardless of how much the two ranges overlap (each register is read as a source at
+       most once, always before whichever later iteration — if any — overwrites it as a
+       destination). So this needs no special-casing for overlap, whether or not it aliases the
+       CALLEE's own parameter registers (which may have nothing to do with the CALLER's own
+       reserved_floor — a genuinely different function's arity). */
+    if (cur_op == OP_TAIL_CALL && vm->call_stack[vm->call_depth].defer_count == 0) {
+        for (int i = 0; i < arg_count; i++)
+            vm->registers[i] = vm->registers[arg_reg_base + i];
+        vm->ip = (unsigned int)callee_offset;
+        DISPATCH();
+    }
+    if (vm->call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); DISPATCH(); }
+    CallFrame* caller = &vm->call_stack[vm->call_depth];
+    CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = caller->registers[arg_reg_base + i];
     callee->return_ip   = vm->ip;   /* already past this instruction's operands — the correct resume point */
     callee->dest_reg    = dest_reg;
     callee->defer_count = 0;   /* reused call_stack slots must never inherit a previous occupant's pending defers */
-    v3_call_depth++;
-    v3_registers = v3_call_stack[v3_call_depth].registers;
+    vm->call_depth++;
+    vm->registers = vm->call_stack[vm->call_depth].registers;
     vm->ip = (unsigned int)callee_offset;
     DISPATCH();
 }
 
-/* src_reg is a plain 0-based index into the CALLEE's own frame — no more "absolute index into a
-   shared fixed bank" caveat, since every call now owns an isolated bank. return_ip/dest_reg live
-   in the callee's own frame (not a single shared global), which is exactly what makes nested/
-   recursive calls safe: an outer call's return info can't be clobbered by an inner one.
-     M5 slice 12 — before actually returning, drains this frame's pending defers LIFO, one per
-   visit: each is set up as an inline call into a fresh, deeper v3_call_stack slot whose return_ip
-   points back at THIS SAME OP_V3_RETURN instruction (reenter_addr, computed the same way the
-   stack VM's lbl_return computes its own self-re-entry address), so the deferred call's own
-   eventual OP_V3_RETURN re-dispatches here and rechecks defer_count, same LIFO-drain-before-
-   real-return shape as lbl_return's while loop. Simpler than the stack VM's version: since every
-   v3 call already owns an isolated register bank, this frame's `result` (once finally read, after
-   defer_count reaches 0) can't be clobbered by a deferred call's own return value the way a
-   shared value-stack slot could — no pending_return_value/defers_draining flag needed. */
-lbl_v3_return: {
-    int src_reg = (int)V3_UNPACK_A(op_word);
-    unsigned int reenter_addr = vm->ip - 1;   /* this OP_V3_RETURN's own address: now one packed word (opcode + src_reg together) instead of two */
-    V3CallFrame* callee = &v3_call_stack[v3_call_depth];
+/* Functions as values. Same frame-push/bulk-copy shape as lbl_call, but the target is read from
+   a REGISTER at dispatch time (a runtime AerFunction, built by build_function_value at the point
+   a function name was referenced as a value) instead of a compile-time callee_offset. */
+lbl_call_value: {
+    int dest_reg     = (int)UNPACK_A(op_word);
+    int arg_reg_base = (int)UNPACK_B(op_word);
+    int arg_count    = (int)UNPACK_C(op_word);
+    int callee_reg   = READ();
+    vm_call_value(vm, c, vm->registers[callee_reg], dest_reg, arg_reg_base, arg_count,
+                      cur_op == OP_TAIL_CALL_VALUE);
+    DISPATCH();
+}
+
+/* See OP_CALL_GLOBAL_VALUE's own comment in vm.h. Identical to lbl_call_value in every way except
+   where `fv` comes from — vm->call_stack[0].registers[global_reg] (frame 0, read fresh every
+   dispatch, mirroring OP_LOAD_GLOBAL) instead of a register in the CURRENT frame. */
+lbl_call_global_value: {
+    int dest_reg     = (int)UNPACK_A(op_word);
+    int arg_reg_base = (int)UNPACK_B(op_word);
+    int arg_count    = (int)UNPACK_C(op_word);
+    int global_reg   = READ();
+    vm_call_value(vm, c, vm->call_stack[0].registers[global_reg], dest_reg, arg_reg_base, arg_count,
+                      cur_op == OP_TAIL_CALL_GLOBAL_VALUE);
+    DISPATCH();
+}
+
+/* src_reg is a plain 0-based index into the CALLEE's own frame. return_ip/dest_reg live in the
+   callee's own frame (not a single shared global), which is exactly what makes nested/recursive
+   calls safe: an outer call's return info can't be clobbered by an inner one.
+     Before actually returning, drains this frame's pending defers LIFO, one per visit: each is
+   set up as an inline call into a fresh, deeper vm->call_stack slot whose return_ip points back at
+   THIS SAME OP_RETURN instruction (reenter_addr), so the deferred call's own eventual OP_RETURN
+   re-dispatches here and rechecks defer_count. Since every call already owns an isolated register
+   bank, this frame's `result` (once finally read, after defer_count reaches 0) can't be clobbered
+   by a deferred call's own return value — no separate pending-return-value tracking needed. */
+lbl_return: {
+    int src_reg = (int)UNPACK_A(op_word);
+    unsigned int reenter_addr = vm->ip - 1;   /* this OP_RETURN's own address: now one packed word (opcode + src_reg together) instead of two */
+    CallFrame* callee = &vm->call_stack[vm->call_depth];
 
     if (callee->defer_count > 0) {
-        if (v3_call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); DISPATCH(); }
-        V3DeferredCall dc = callee->defers[--callee->defer_count];
-        V3CallFrame* next = &v3_call_stack[v3_call_depth + 1];
+        if (vm->call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); DISPATCH(); }
+        DeferredCall dc = callee->defers[--callee->defer_count];
+        CallFrame* next = &vm->call_stack[vm->call_depth + 1];
         for (int i = 0; i < dc.arg_count; i++) next->registers[i] = dc.args[i];
         next->return_ip   = reenter_addr;
         next->dest_reg    = -1;   /* sentinel: a deferred call's own return value is always discarded, never written anywhere (register 0 may be a live variable in the frame it would otherwise land in) */
         next->defer_count = 0;
-        v3_call_depth++;
-        v3_registers = v3_call_stack[v3_call_depth].registers;
+        vm->call_depth++;
+        vm->registers = vm->call_stack[vm->call_depth].registers;
         vm->ip = dc.callee_offset;
         DISPATCH();
     }
@@ -3035,25 +1822,25 @@ lbl_v3_return: {
     AerVal result = callee->registers[src_reg];
     unsigned int return_ip = callee->return_ip;
     int dest_reg = callee->dest_reg;
-    v3_call_depth--;
-    v3_registers = v3_call_stack[v3_call_depth].registers;
-    if (dest_reg >= 0) v3_registers[dest_reg] = result;   /* dest_reg == -1: a deferred call's discarded result */
+    vm->call_depth--;
+    vm->registers = vm->call_stack[vm->call_depth].registers;
+    if (dest_reg >= 0) vm->registers[dest_reg] = result;   /* dest_reg == -1: a deferred call's discarded result */
     vm->ip = return_ip;
     DISPATCH();
 }
 
-/* See OP_V3_CALL_MODULE's comment in vm.h — bridges to the exact same stack-based stdlib dispatch
+/* See OP_CALL_MODULE's comment in vm.h — bridges to the exact same stack-based stdlib dispatch
    lbl_call_module uses, since reimplementing every stdlib function for registers would be pure
    duplication. */
-lbl_v3_call_module: {
-    int dest_reg     = (int)V3_UNPACK_A(op_word);
-    int arg_reg_base = (int)V3_UNPACK_B(op_word);
-    int arg_count    = (int)V3_UNPACK_C(op_word);
+lbl_call_module: {
+    int dest_reg     = (int)UNPACK_A(op_word);
+    int arg_reg_base = (int)UNPACK_B(op_word);
+    int arg_count    = (int)UNPACK_C(op_word);
     int module_idx   = READ();
     int fn_idx       = READ();
     const char* module = aer_as_string(c->pool[module_idx])->data;
     const char* fn     = aer_as_string(c->pool[fn_idx])->data;
-    for (int i = 0; i < arg_count; i++) PUSH(v3_registers[arg_reg_base + i]);
+    for (int i = 0; i < arg_count; i++) PUSH(vm->registers[arg_reg_base + i]);
     bool handled = false;
     if      (strcmp(module, "math")   == 0) handled = aer_math_call(vm, c, fn, arg_count);
     else if (strcmp(module, "random") == 0) handled = aer_random_call(vm, c, fn, arg_count);
@@ -3063,57 +1850,65 @@ lbl_v3_call_module: {
     else if (aer_host_is_module(module, (unsigned int)strlen(module)))
                                              handled = aer_host_call(vm, module, fn, arg_count);
     else                                     handled = aer_module_call(vm, module, fn, arg_count);
-    if (handled) { v3_registers[dest_reg] = POP(); DISPATCH(); }
+    if (handled) { vm->registers[dest_reg] = POP(); DISPATCH(); }
     error("'%s' has no function '%s'", module, fn);
     for (int i = 0; i < arg_count; i++) POP();
-    v3_registers[dest_reg] = aer_null();
+    vm->registers[dest_reg] = aer_null();
     DISPATCH();
 }
 
-/* See OP_V3_CALL_BUILTIN's comment in vm.h — vm_call_builtin() already takes a plain AerVal*
-   array (built for deferred-call replay, vm.c above), so unlike OP_V3_CALL_MODULE this needs no
+/* See OP_CALL_BUILTIN's comment in vm.h — vm_call_builtin() already takes a plain AerVal*
+   array (built for deferred-call replay, vm.c above), so unlike OP_CALL_MODULE this needs no
    push/pop bridge to vm->stack at all. 4 local slots is headroom over every builtin's real max
    arity (2 — delete/append/assert). */
-lbl_v3_call_builtin: {
-    int dest_reg     = (int)V3_UNPACK_A(op_word);
-    int arg_reg_base = (int)V3_UNPACK_B(op_word);
-    int arg_count    = (int)V3_UNPACK_C(op_word);
+lbl_call_builtin: {
+    int dest_reg     = (int)UNPACK_A(op_word);
+    int arg_reg_base = (int)UNPACK_B(op_word);
+    int arg_count    = (int)UNPACK_C(op_word);
     int name_idx     = READ();
     const char* name = aer_as_string(c->pool[name_idx])->data;
     if (arg_count > 4) {
         error("Too many arguments to '%s'", name);
-        v3_registers[dest_reg] = aer_null();
+        vm->registers[dest_reg] = aer_null();
         DISPATCH();
     }
     AerVal args[4];
-    for (int i = 0; i < arg_count; i++) args[i] = v3_registers[arg_reg_base + i];
+    for (int i = 0; i < arg_count; i++) args[i] = vm->registers[arg_reg_base + i];
     AerVal out;
     bool handled = vm_call_builtin(c, name, args, arg_count, &out);
     if (!handled) error("'%s' is not defined, or was called with the wrong number of arguments", name);
-    v3_registers[dest_reg] = out;
+    vm->registers[dest_reg] = out;
     DISPATCH();
 }
 
-/* See OP_V3_LOAD_GLOBAL's comment in vm.h — always reads frame 0 directly, never the currently
+/* See OP_LOAD_GLOBAL's comment in vm.h — always reads frame 0 directly, never the currently
    active frame, since a function's own registers are a completely separate bank from the
    top-level's. */
-lbl_v3_load_global: {
-    int dest_reg   = (int)V3_UNPACK_A(op_word);
-    int global_reg = (int)V3_UNPACK_B(op_word);
-    v3_registers[dest_reg] = v3_call_stack[0].registers[global_reg];
+lbl_load_global: {
+    int dest_reg   = (int)UNPACK_A(op_word);
+    int global_reg = (int)UNPACK_B(op_word);
+    vm->registers[dest_reg] = vm->call_stack[0].registers[global_reg];
     DISPATCH();
 }
 
-/* See V3DeferredCall's comment (above) and OP_V3_DEFER_PUSH's (vm.h) — snapshots arg_count
-   register values into the CURRENT frame's own deferred-call list now; lbl_v3_return drains this
+/* write counterpart to OP_LOAD_GLOBAL, see its own comment in vm.h. */
+lbl_store_global: {
+    int global_reg = (int)UNPACK_A(op_word);
+    int rk_val     = READ();
+    vm->call_stack[0].registers[global_reg] = vm_rk_value(vm, c, rk_val);
+    DISPATCH();
+}
+
+/* See DeferredCall's comment (above) and OP_DEFER_PUSH's (vm.h) — snapshots arg_count
+   register values into the CURRENT frame's own deferred-call list now; lbl_return drains this
    list LIFO before the frame actually returns. Overflow checks mirror the stack VM's
-   lbl_defer_push exactly (arg_count is already rejected at parse time by v3_parse_defer, this is
+   lbl_defer_push exactly (arg_count is already rejected at parse time by parse_defer, this is
    just a defensive backstop). */
-lbl_v3_defer_push: {
-    int arg_reg_base  = (int)V3_UNPACK_A(op_word);
-    int arg_count     = (int)V3_UNPACK_B(op_word);
+lbl_defer_push: {
+    int arg_reg_base  = (int)UNPACK_A(op_word);
+    int arg_count     = (int)UNPACK_B(op_word);
     int callee_offset = READ();
-    V3CallFrame* frame = &v3_call_stack[v3_call_depth];
+    CallFrame* frame = &vm->call_stack[vm->call_depth];
     if (arg_count > MAX_DEFER_ARGS) {
         error("Too many arguments to a deferred call (max %d)", MAX_DEFER_ARGS);
         DISPATCH();
@@ -3122,73 +1917,127 @@ lbl_v3_defer_push: {
         error("Too many deferred calls in one function (max %d)", MAX_DEFERS_PER_CALL);
         DISPATCH();
     }
-    if (!frame->defers) frame->defers = xmalloc(sizeof(V3DeferredCall) * MAX_DEFERS_PER_CALL);
-    V3DeferredCall* dc = &frame->defers[frame->defer_count++];
+    if (!frame->defers) frame->defers = xmalloc(sizeof(DeferredCall) * MAX_DEFERS_PER_CALL);
+    DeferredCall* dc = &frame->defers[frame->defer_count++];
     dc->callee_offset = (unsigned int)callee_offset;
     dc->arg_count      = arg_count;
-    for (int i = 0; i < arg_count; i++) dc->args[i] = v3_registers[arg_reg_base + i];
+    for (int i = 0; i < arg_count; i++) dc->args[i] = vm->registers[arg_reg_base + i];
     DISPATCH();
 }
 
-/* M4 — the register-VM analog of lbl_array_new (above): same pool_alloc/capacity/items/shape
-   setup, but the source is an already-in-order register range instead of N stack pops, so the
-   copy runs forward (lbl_array_new copies backward specifically to undo the stack's LIFO pop
-   order — registers have no such inversion to undo). This is the first v3 opcode that puts a
-   heap pointer in v3_registers[] — see mark_vm_roots's new AER_V3 block, required before this
-   opcode could be safe to use across a GC cycle. */
-lbl_v3_array_new: {
-    int dest_reg      = (int)V3_UNPACK_A(op_word);
-    int item_reg_base = (int)V3_UNPACK_B(op_word);
-    int item_count    = (int)V3_UNPACK_C(op_word);
+/* Builds a new array from an already-in-order register range (pool_alloc/capacity/items/shape
+   setup) — this and every opcode below that can put a heap pointer into vm->registers[] rely on
+   mark_vm_roots's registers scan to keep it alive across a GC cycle. */
+lbl_array_new: {
+    int dest_reg      = (int)UNPACK_A(op_word);
+    int item_reg_base = (int)UNPACK_B(op_word);
+    int item_count    = (int)UNPACK_C(op_word);
     AerArray* a = pool_alloc(&array_pool);
     a->capacity = item_count > 0 ? (unsigned int)item_count : 4;
     a->count    = (unsigned int)item_count;
     a->items    = xmalloc(sizeof(AerVal) * a->capacity);
     a->shape    = NULL;
     for (int i = 0; i < item_count; i++)
-        a->items[i] = v3_registers[item_reg_base + i];
-    v3_registers[dest_reg] = aer_array_val(a);
+        a->items[i] = vm->registers[item_reg_base + i];
+    vm->registers[dest_reg] = aer_array_val(a);
     DISPATCH();
 }
 
 /* Reuses vm_index_get_compute (above) as-is — already type-generic (array/dict/string) and
    already has all bounds/negative-index logic, so nothing about indexing itself needed
    reimplementing for the register path. */
-lbl_v3_index_get: {
-    int dest_reg = (int)V3_UNPACK_A(op_word);
-    int arr_reg  = (int)V3_UNPACK_B(op_word);
+lbl_index_get: {
+    int dest_reg = (int)UNPACK_A(op_word);
+    int arr_reg  = (int)UNPACK_B(op_word);
     int rk_idx   = READ();
-    AerVal idx = vm_v3_rk_value(c, rk_idx);
-    v3_registers[dest_reg] = vm_index_get_compute(v3_registers[arr_reg], idx);
+    AerVal idx = vm_rk_value(vm, c, rk_idx);
+    vm->registers[dest_reg] = vm_index_get_compute(vm->registers[arr_reg], idx);
     DISPATCH();
 }
 
 /* Reuses vm_index_set_compute (above) as-is — including its internal gc_barrier_array/
    gc_barrier_dict call, which this is the first v3 opcode to exercise against a register-held
    reference rather than a stack-held one. */
-lbl_v3_index_set: {
-    int arr_reg = (int)V3_UNPACK_A(op_word);
+lbl_index_set: {
+    int arr_reg = (int)UNPACK_A(op_word);
     int rk_idx  = READ();
     int rk_val  = READ();
-    AerVal idx = vm_v3_rk_value(c, rk_idx);
-    AerVal val = vm_v3_rk_value(c, rk_val);
-    vm_index_set_compute(v3_registers[arr_reg], idx, val);
+    AerVal idx = vm_rk_value(vm, c, rk_idx);
+    AerVal val = vm_rk_value(vm, c, rk_val);
+    vm_index_set_compute(vm->registers[arr_reg], idx, val);
+    DISPATCH();
+}
+
+/* Mirrors lbl_slice_get's own array/string branches (vm.c, above) exactly — same
+   vm_slice_bounds()/pool_alloc/copy logic, reading the collection and bounds from registers and
+   writing the result to one instead of stack pop/push. */
+lbl_slice_get: {
+    int dest_reg = (int)UNPACK_A(op_word);
+    int arr_reg  = (int)UNPACK_B(op_word);
+    int rk_start = READ();
+    int rk_end   = READ();
+    AerVal start_v = vm_rk_value(vm, c, rk_start);
+    AerVal end_v   = vm_rk_value(vm, c, rk_end);
+    AerVal obj = vm->registers[arr_reg];
+    if (aer_type(obj) == TYPE_ARRAY) {
+        AerArray* a = aer_as_array(obj);
+        if (a->shape) { error("Structs cannot be sliced"); vm->registers[dest_reg] = aer_null(); DISPATCH(); }
+        long long start, end;
+        if (!vm_slice_bounds(start_v, end_v, (long long)a->count, &start, &end)) { vm->registers[dest_reg] = aer_null(); DISPATCH(); }
+        unsigned int n = (unsigned int)(end - start);
+        AerArray* r = pool_alloc(&array_pool);
+        r->count    = n;
+        r->capacity = n > 0 ? n : 4;
+        r->items    = xmalloc(sizeof(AerVal) * r->capacity);
+        r->shape    = NULL;   /* a slice is always a plain array, even of a struct */
+        for (unsigned int i = 0; i < n; i++) r->items[i] = a->items[start + i];
+        vm->registers[dest_reg] = aer_array_val(r);
+    } else if (aer_type(obj) == TYPE_STRING) {
+        AerString* os = aer_as_string(obj);
+        long long start, end;
+        if (!vm_slice_bounds(start_v, end_v, (long long)os->length, &start, &end)) { vm->registers[dest_reg] = aer_null(); DISPATCH(); }
+        unsigned int sub_len = (unsigned int)(end - start);
+        char* sub_buf = xmalloc(sub_len + 1);
+        memcpy(sub_buf, os->data + start, sub_len);
+        sub_buf[sub_len] = '\0';
+        vm->registers[dest_reg] = aer_make_string(sub_buf, sub_len);   /* no chunk_add_pool interning — see vm_to_str's comment */
+    } else {
+        error("Cannot slice this type");
+        vm->registers[dest_reg] = aer_null();
+    }
+    DISPATCH();
+}
+
+/* `x as Point` where Point is a known struct type. Mirrors lbl_check_shape (above)
+   exactly: errors unless src_reg holds exactly that struct type, else passes it through
+   unchanged — register-based instead of stack pop/push. */
+lbl_check_shape: {
+    int dest_reg = (int)UNPACK_A(op_word);
+    int src_reg  = (int)UNPACK_B(op_word);
+    int name_idx = READ();
+    AerVal v = vm->registers[src_reg];
+    if (aer_type(v) != TYPE_ARRAY || !aer_as_array(v)->shape || aer_as_array(v)->shape->name != (unsigned int)name_idx) {
+        error("Expected a '%s', got a '%s'", aer_as_string(c->pool[name_idx])->data, vm_type_name(c, v));
+        vm->registers[dest_reg] = aer_null();
+        DISPATCH();
+    }
+    vm->registers[dest_reg] = v;
     DISPATCH();
 }
 
 /* Mirrors lbl_dict_new (above) exactly — same pool_alloc/memset/is_inline setup, same
    key-must-be-string validation and owned-copy-of-the-key discipline — reading pairs from an
    already-in-order register range instead of popping them off the stack in reverse. */
-lbl_v3_dict_new: {
-    int dest_reg      = (int)V3_UNPACK_A(op_word);
-    int pair_reg_base = (int)V3_UNPACK_B(op_word);
-    int pair_count    = (int)V3_UNPACK_C(op_word);
+lbl_dict_new: {
+    int dest_reg      = (int)UNPACK_A(op_word);
+    int pair_reg_base = (int)UNPACK_B(op_word);
+    int pair_count    = (int)UNPACK_C(op_word);
     AerDict* d = pool_alloc(&dict_pool);
     memset(&d->map, 0, sizeof(d->map));
     d->map.is_inline = true;   /* AerDict stores AerVal inline, not boxed — see hashtable.h */
     for (int i = 0; i < pair_count; i++) {
-        AerVal key = v3_registers[pair_reg_base + 2 * i];
-        AerVal val = v3_registers[pair_reg_base + 2 * i + 1];
+        AerVal key = vm->registers[pair_reg_base + 2 * i];
+        AerVal val = vm->registers[pair_reg_base + 2 * i + 1];
         if (aer_type(key) != TYPE_STRING) { error("Dict keys must be strings"); continue; }
         AerString* ks = aer_as_string(key);
         unsigned int klen = ks->length;
@@ -3197,31 +2046,83 @@ lbl_v3_dict_new: {
         k[klen] = '\0';
         dictmap_put(&d->map, k, val);
     }
-    v3_registers[dest_reg] = aer_dict_val(d);
+    vm->registers[dest_reg] = aer_dict_val(d);
     DISPATCH();
 }
 
 /* Mirrors lbl_iter_next's TYPE_ARRAY branch (above) exactly — same bounds check/advance/fetch —
    reading col/idx from registers instead of peeking the stack, and with no stack slots to pop on
    exit (see this opcode's own comment in vm.h for why). */
-lbl_v3_iter_next_array: {
-    int col_reg       = (int)V3_UNPACK_A(op_word);
-    int idx_reg       = (int)V3_UNPACK_B(op_word);
-    int item_dest_reg = (int)V3_UNPACK_C(op_word);
+lbl_iter_next_array: {
+    int col_reg       = (int)UNPACK_A(op_word);
+    int idx_reg       = (int)UNPACK_B(op_word);
+    int item_dest_reg = (int)UNPACK_C(op_word);
     int end_target    = READ();
-    AerVal col = v3_registers[col_reg];
+    AerVal col = vm->registers[col_reg];
+    long long idx = aer_as_int(vm->registers[idx_reg]);
+    if (aer_type(col) == TYPE_DICT) {
+        /* Single-variable `for k in dict:` yields keys. */
+        AerVal key;
+        if (!vm_dict_next_key(aer_as_dict(col), &idx, &key)) {
+            vm->ip = (unsigned int)end_target;
+            DISPATCH();
+        }
+        vm->registers[item_dest_reg] = key;
+        vm->registers[idx_reg]       = aer_int(idx + 1);
+        DISPATCH();
+    }
+    if (aer_type(col) == TYPE_STRING) {
+        /* `for c in string:` yields one-character strings, same as `for k in dict:` yields keys
+           above rather than a dedicated opcode. */
+        AerString* cs = aer_as_string(col);
+        if ((unsigned long long)idx >= cs->length) {
+            vm->ip = (unsigned int)end_target;
+            DISPATCH();
+        }
+        char* ch_buf = xmalloc(2);
+        ch_buf[0] = cs->data[idx];
+        ch_buf[1] = '\0';
+        vm->registers[item_dest_reg] = aer_make_string(ch_buf, 1);   /* no chunk_add_pool interning — see vm_to_str's comment */
+        vm->registers[idx_reg]       = aer_int(idx + 1);
+        DISPATCH();
+    }
     if (aer_type(col) != TYPE_ARRAY) {
-        error("v3 M4 slice only supports iterating arrays");
+        error("'for x in ...' only supports arrays, dicts, and strings");
         DISPATCH();
     }
     AerArray* a = aer_as_array(col);
-    long long idx = aer_as_int(v3_registers[idx_reg]);
     if ((unsigned long long)idx >= a->count) {
         vm->ip = (unsigned int)end_target;
         DISPATCH();
     }
-    v3_registers[item_dest_reg] = a->items[idx];
-    v3_registers[idx_reg]       = aer_int(idx + 1);
+    vm->registers[item_dest_reg] = a->items[idx];
+    vm->registers[idx_reg]       = aer_int(idx + 1);
+    DISPATCH();
+}
+
+/* `for k, v in dict:` — see vm_dict_next_key (above) for the shared bucket-scan/copy-key logic. */
+lbl_iter_next_pair: {
+    int col_reg       = (int)UNPACK_A(op_word);
+    int idx_reg       = (int)UNPACK_B(op_word);
+    int key_dest_reg  = (int)UNPACK_C(op_word);
+    int val_dest_reg  = READ();
+    int end_target    = READ();
+    AerVal col = vm->registers[col_reg];
+    if (aer_type(col) != TYPE_DICT) {
+        error("for k, v requires a dict");
+        vm->ip = (unsigned int)end_target;
+        DISPATCH();
+    }
+    AerDict* d = aer_as_dict(col);
+    long long idx = aer_as_int(vm->registers[idx_reg]);
+    AerVal key;
+    if (!vm_dict_next_key(d, &idx, &key)) {
+        vm->ip = (unsigned int)end_target;
+        DISPATCH();
+    }
+    vm->registers[key_dest_reg] = key;
+    vm->registers[val_dest_reg] = d->map.buckets[idx].payload.inline_val;
+    vm->registers[idx_reg]      = aer_int(idx + 1);
     DISPATCH();
 }
 
@@ -3229,15 +2130,15 @@ lbl_v3_iter_next_array: {
    exit-condition exactly (vm.c, above), reading/writing three plain registers instead of three
    un-popped stack slots; no stack cleanup needed on exit since registers aren't a shared LIFO
    structure the way vm->stack is. */
-lbl_v3_iter_range: {
-    int cur_reg       = (int)V3_UNPACK_A(op_word);
-    int end_reg       = (int)V3_UNPACK_B(op_word);
-    int step_reg      = (int)V3_UNPACK_C(op_word);
+lbl_iter_range: {
+    int cur_reg       = (int)UNPACK_A(op_word);
+    int end_reg       = (int)UNPACK_B(op_word);
+    int step_reg      = (int)UNPACK_C(op_word);
     int item_dest_reg = READ();
     int end_target    = READ();
-    AerVal cur_v  = v3_registers[cur_reg];
-    AerVal end_v  = v3_registers[end_reg];
-    AerVal step_v = v3_registers[step_reg];
+    AerVal cur_v  = vm->registers[cur_reg];
+    AerVal end_v  = vm->registers[end_reg];
+    AerVal step_v = vm->registers[step_reg];
     if (aer_type(cur_v) != TYPE_INTEGER || aer_type(end_v) != TYPE_INTEGER || aer_type(step_v) != TYPE_INTEGER) {
         error("Range bounds and step must be integers");
         vm->ip = (unsigned int)end_target;
@@ -3254,18 +2155,18 @@ lbl_v3_iter_range: {
         vm->ip = (unsigned int)end_target;
         DISPATCH();
     }
-    v3_registers[item_dest_reg] = cur_v;
-    v3_registers[cur_reg]       = aer_int(cur + (ascending ? step : -step));
+    vm->registers[item_dest_reg] = cur_v;
+    vm->registers[cur_reg]       = aer_int(cur + (ascending ? step : -step));
     DISPATCH();
 }
 
 /* Mirrors lbl_call's struct-instantiation fallback (above, around line 2137) almost verbatim —
    same chunk_find_shape() lookup, same arity check, same single-allocation struct_pool layout —
    reading args from a register range instead of popping them off the stack in reverse. */
-lbl_v3_struct_new: {
-    int dest_reg           = (int)V3_UNPACK_A(op_word);
-    int arg_reg_base       = (int)V3_UNPACK_B(op_word);
-    int arg_count          = (int)V3_UNPACK_C(op_word);
+lbl_struct_new: {
+    int dest_reg           = (int)UNPACK_A(op_word);
+    int arg_reg_base       = (int)UNPACK_B(op_word);
+    int arg_count          = (int)UNPACK_C(op_word);
     int type_name_pool_idx = READ();
     const char* name = aer_as_string(c->pool[type_name_pool_idx])->data;
     Shape* shape = chunk_find_shape(c, name);
@@ -3280,158 +2181,95 @@ lbl_v3_struct_new: {
     a->items = (AerVal*)((char*)a + sizeof(AerArray));
     a->shape = shape;
     for (int i = 0; i < arg_count; i++)
-        a->items[i] = v3_registers[arg_reg_base + i];
+        a->items[i] = vm->registers[arg_reg_base + i];
     for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
         a->items[i] = vm_default_value(shape->field_defaults[i]);
-    v3_registers[dest_reg] = aer_array_val(a);
+    vm->registers[dest_reg] = aer_array_val(a);
     DISPATCH();
 }
 
-/* Mirrors lbl_field_get (above) exactly — same pool-index field-name scan — reading struct_reg
-   from a register instead of popping the stack. */
-lbl_v3_field_get: {
+/* Reading struct_reg from a register instead of popping the stack; see vm_resolve_field (above)
+   for the shared field-slot lookup/cache. */
+lbl_field_get: {
     unsigned int site = vm->ip - 1;
-    int dest_reg   = (int)V3_UNPACK_A(op_word);
-    int struct_reg = (int)V3_UNPACK_B(op_word);
+    int dest_reg   = (int)UNPACK_A(op_word);
+    int struct_reg = (int)UNPACK_B(op_word);
     int field_idx  = READ();
-    AerVal obj = v3_registers[struct_reg];
-    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
-        error("'.' field access requires a struct instance");
-        DISPATCH();
-    }
-    AerArray* oa = aer_as_array(obj);
-    Shape* shape = oa->shape;
-    if (c->field_cache_shape[site] == shape) {
-        v3_registers[dest_reg] = oa->items[c->field_cache_slot[site]];
-        DISPATCH();
-    }
-    for (unsigned int i = 0; i < shape->field_count; i++) {
-        if (shape->field_names[i] == (unsigned int)field_idx) {
-            c->field_cache_shape[site] = shape;
-            c->field_cache_slot[site]  = (int)i;
-            v3_registers[dest_reg] = oa->items[i];
-            DISPATCH();
-        }
-    }
-    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
-          aer_as_string(c->pool[field_idx])->data);
+    AerArray* oa; int slot;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
+    vm->registers[dest_reg] = oa->items[slot];
     DISPATCH();
 }
 
-/* Fusion opcode — see its own comment in vm.h. Same inline-cache mechanism as lbl_v3_field_get
-   (a distinct site, since this instruction lives at its own, different bytecode offset), just
-   feeding the field value straight into vm_binary instead of writing it to a register first. */
-lbl_v3_binary_field: {
+/* Fusion opcode — see its own comment in vm.h and vm_resolve_field (above) for the shared
+   field-slot lookup/cache. Feeds the field value straight into vm_binary instead of writing it
+   to a register first. */
+lbl_binary_field: {
     unsigned int site   = vm->ip - 1;
-    int dest_reg   = (int)V3_UNPACK_A(op_word);
-    int struct_reg = (int)V3_UNPACK_B(op_word);
-    int bin_op     = (int)V3_UNPACK_C(op_word);
+    int dest_reg   = (int)UNPACK_A(op_word);
+    int struct_reg = (int)UNPACK_B(op_word);
+    int bin_op     = (int)UNPACK_C(op_word);
     int rk_lhs     = READ();
     int field_idx  = READ();
-    AerVal lhs = vm_v3_rk_value(c, rk_lhs);
-    AerVal obj = v3_registers[struct_reg];
-    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
-        error("'.' field access requires a struct instance");
-        DISPATCH();
-    }
-    AerArray* oa = aer_as_array(obj);
-    Shape* shape = oa->shape;
-    if (c->field_cache_shape[site] == shape) {
-        v3_registers[dest_reg] = vm_binary(lhs, oa->items[c->field_cache_slot[site]], (Opcode)bin_op);
-        DISPATCH();
-    }
-    for (unsigned int i = 0; i < shape->field_count; i++) {
-        if (shape->field_names[i] == (unsigned int)field_idx) {
-            c->field_cache_shape[site] = shape;
-            c->field_cache_slot[site]  = (int)i;
-            v3_registers[dest_reg] = vm_binary(lhs, oa->items[i], (Opcode)bin_op);
-            DISPATCH();
-        }
-    }
-    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
-          aer_as_string(c->pool[field_idx])->data);
+    AerVal lhs = vm_rk_value(vm, c, rk_lhs);
+    AerArray* oa; int slot;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
+    vm->registers[dest_reg] = vm_binary(lhs, oa->items[slot], (Opcode)bin_op);
     DISPATCH();
 }
 
-/* Mirror of lbl_v3_binary_field for the other operand order — see OP_V3_FIELD_BINARY's own
-   comment in vm.h. Own field_cache site, same as every other field-access opcode. */
-lbl_v3_field_binary: {
+/* Mirror of lbl_binary_field for the other operand order — see OP_FIELD_BINARY's own comment in
+   vm.h. */
+lbl_field_binary: {
     unsigned int site   = vm->ip - 1;
-    int dest_reg   = (int)V3_UNPACK_A(op_word);
-    int struct_reg = (int)V3_UNPACK_B(op_word);
-    int bin_op     = (int)V3_UNPACK_C(op_word);
+    int dest_reg   = (int)UNPACK_A(op_word);
+    int struct_reg = (int)UNPACK_B(op_word);
+    int bin_op     = (int)UNPACK_C(op_word);
     int field_idx  = READ();
     int rk_rhs     = READ();
-    AerVal rhs = vm_v3_rk_value(c, rk_rhs);
-    AerVal obj = v3_registers[struct_reg];
-    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
-        error("'.' field access requires a struct instance");
-        DISPATCH();
-    }
-    AerArray* oa = aer_as_array(obj);
-    Shape* shape = oa->shape;
-    if (c->field_cache_shape[site] == shape) {
-        v3_registers[dest_reg] = vm_binary(oa->items[c->field_cache_slot[site]], rhs, (Opcode)bin_op);
-        DISPATCH();
-    }
-    for (unsigned int i = 0; i < shape->field_count; i++) {
-        if (shape->field_names[i] == (unsigned int)field_idx) {
-            c->field_cache_shape[site] = shape;
-            c->field_cache_slot[site]  = (int)i;
-            v3_registers[dest_reg] = vm_binary(oa->items[i], rhs, (Opcode)bin_op);
-            DISPATCH();
-        }
-    }
-    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
-          aer_as_string(c->pool[field_idx])->data);
+    AerVal rhs = vm_rk_value(vm, c, rk_rhs);
+    AerArray* oa; int slot;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
+    vm->registers[dest_reg] = vm_binary(oa->items[slot], rhs, (Opcode)bin_op);
     DISPATCH();
 }
 
-/* Mirrors lbl_field_set (above) exactly, including its gc_barrier_array call — the first v3
-   opcode to exercise that barrier for a struct instance rather than an array/dict. */
-lbl_v3_field_set: {
+/* register-based counterpart of lbl_print_repl (vm.c, above): same
+   print-unless-null-then-newline behavior, reading a register instead of popping the stack. */
+lbl_print_repl: {
+    int src_reg = (int)UNPACK_A(op_word);
+    AerVal v = vm->registers[src_reg];
+    if (aer_type(v) != TYPE_NULL) {
+        vm_print_value(c, v, false);
+        printf("\n");
+    }
+    DISPATCH();
+}
+
+/* See vm_resolve_field (above) for the shared field-slot lookup/cache. gc_barrier_array is the
+   write barrier every mutating struct/array/dict write needs. */
+lbl_field_set: {
     unsigned int site = vm->ip - 1;
-    int struct_reg = (int)V3_UNPACK_A(op_word);
+    int struct_reg = (int)UNPACK_A(op_word);
     int field_idx  = READ();
     int rk_val     = READ();
-    AerVal obj = v3_registers[struct_reg];
-    AerVal val = vm_v3_rk_value(c, rk_val);
-    if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
-        error("'.' field access requires a struct instance");
-        DISPATCH();
-    }
-    AerArray* oa = aer_as_array(obj);
-    Shape* shape = oa->shape;
-    if (c->field_cache_shape[site] == shape) {
-        gc_barrier_array(oa, val);
-        oa->items[c->field_cache_slot[site]] = val;
-        DISPATCH();
-    }
-    for (unsigned int i = 0; i < shape->field_count; i++) {
-        if (shape->field_names[i] == (unsigned int)field_idx) {
-            c->field_cache_shape[site] = shape;
-            c->field_cache_slot[site]  = (int)i;
-            gc_barrier_array(oa, val);
-            oa->items[i] = val;
-            DISPATCH();
-        }
-    }
-    error("'%s' has no field '%s'", aer_as_string(c->pool[shape->name])->data,
-          aer_as_string(c->pool[field_idx])->data);
+    AerVal val = vm_rk_value(vm, c, rk_val);
+    AerArray* oa; int slot;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
+    gc_barrier_array(oa, val);
+    oa->items[slot] = val;
     DISPATCH();
 }
 
-/* Merges lbl_negate/lbl_not/lbl_bitwise_not (above, ~line 1967) into one handler keyed by
-   unary_op, same "reuse the stack VM's Opcode value as an operand tag" convention lbl_v3_binary
-   already uses — reading an RK operand (register or constant) instead of popping the stack.
-   M5 slice 9 folded OP_TO_STR in too (string interpolation's "{name}" -> string conversion) —
-   same one-opcode-per-mechanism-family shape, calling the existing vm_to_str() helper (shared
-   with print()/lbl_to_str above) rather than reimplementing value formatting. */
-lbl_v3_unary: {
-    int dest        = (int)V3_UNPACK_A(op_word);
-    Opcode unary_op = (Opcode)V3_UNPACK_B(op_word);
+/* One handler for negate/not/bitwise-not, keyed by unary_op — same "reuse the Opcode value as an
+   operand tag" convention lbl_binary uses. Also folds in OP_TO_STR (string interpolation's
+   "{name}" -> string conversion), calling the existing vm_to_str() helper (shared with
+   print()/lbl_to_str above) rather than reimplementing value formatting. */
+lbl_unary: {
+    int dest        = (int)UNPACK_A(op_word);
+    Opcode unary_op = (Opcode)UNPACK_B(op_word);
     int rk          = READ();
-    AerVal v = vm_v3_rk_value(c, rk);
+    AerVal v = vm_rk_value(vm, c, rk);
     AerVal result;
     switch (unary_op) {
         case OP_NEGATE:
@@ -3453,21 +2291,19 @@ lbl_v3_unary: {
             result = aer_null();
             break;
     }
-    v3_registers[dest] = result;
+    vm->registers[dest] = result;
     DISPATCH();
 }
 
-/* `x as integer/float/boolean` — reuses the extracted vm_cast() helper (above, shared with
-   lbl_cast) directly, no logic duplicated. */
-lbl_v3_cast: {
-    int dest      = (int)V3_UNPACK_A(op_word);
-    int cast_type = (int)V3_UNPACK_B(op_word);
+/* `x as integer/float/boolean` — see vm_cast() above. */
+lbl_cast: {
+    int dest      = (int)UNPACK_A(op_word);
+    int cast_type = (int)UNPACK_B(op_word);
     int rk        = READ();
-    AerVal v = vm_v3_rk_value(c, rk);
-    v3_registers[dest] = vm_cast(v, cast_type);
+    AerVal v = vm_rk_value(vm, c, rk);
+    vm->registers[dest] = vm_cast(v, cast_type);
     DISPATCH();
 }
-#endif
 
 lbl_halt:
     return true;

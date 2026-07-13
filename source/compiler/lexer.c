@@ -41,6 +41,10 @@ const char* current_source_start()  { return current->start; }
 const char* current_source_cursor() { return current->buffer; }
 const char* current_source_name()   { return current->name; }
 
+/* See this function's own comment in lexer.h — a deliberately narrow escape hatch for reporting a
+   deferred error at a saved earlier position, not a general-purpose seek. */
+void lexer_set_cursor(const char* pos) { current->buffer = (char*)pos; }
+
 /* For parser.c to tag bytecode with its source line (Chunk.line_mark_offsets) — same scan as error_at(), just returning the number. */
 unsigned int current_source_line() {
     unsigned int line = 1;

@@ -142,6 +142,12 @@ bool aer_module_load(const char* name, unsigned int len,
     /* Save the importing file's lexer position and lookahead token so parsing can resume exactly where it left off once this nested read+lex+parse+run cycle (which reuses the same global lexer/parser state) completes. */
     LexerState* saved       = lexer_save_state();
     Token       saved_token = token;
+    /* Same idea for the parser's own compile-time tables (function/variable/struct registries, the
+       pending-forward-reference list, etc.) — all file-scope statics in parser.c shared by
+       whichever parse() call is innermost. Without this, compiling the imported file here would
+       corrupt the importing file's own still-in-progress compile the moment this call returns. See
+       parser_save_state's own comment in parser.c/.h. */
+    ParserState* saved_parser = parser_save_state();
 
     Chunk* mchunk = xmalloc(sizeof(Chunk));
     VM*    mvm    = xmalloc(sizeof(VM));
@@ -175,6 +181,7 @@ bool aer_module_load(const char* name, unsigned int len,
 
     lexer_restore_state(saved);
     token = saved_token;
+    parser_restore_state(saved_parser);
     loading_depth--;
 
     if (!ok) {
@@ -197,45 +204,33 @@ bool aer_module_load(const char* name, unsigned int len,
     return true;
 }
 
-/* Finds a TYPE_FUNCTION value named `fn` among the module's top-level bindings — inline scope slots, then the hashmap-overflow path if it spilled past SCOPE_SLOT_MAX. Mirrors vm_scope_get but only scopes[0], since a file-module's own code always runs at call_depth 0. */
-static AerVal* find_module_function(FileModule* m, const char* fn) {
-    AerScope* g = &m->vm->scopes[0];
-    for (int j = 0; j < g->count; j++) {
-        unsigned int name_idx = g->slots[j].name;
-        if (strcmp(aer_as_string(m->chunk->pool[name_idx])->data, fn) != 0) continue;
-        AerVal* v = &g->slots[j].val;
-        return aer_type(*v) == TYPE_FUNCTION ? v : NULL;
-    }
-    if (g->overflow) {
-        AerVal* v = (AerVal*)hashmap_get(&g->map, fn);
-        if (v && aer_type(*v) == TYPE_FUNCTION) return v;
-    }
-    return NULL;
+/* Finds a compiled TYPE_FUNCTION registration named `fn` among the module's exported functions
+   — see ChunkFunction's own comment (vm.h) for why this is a Chunk-level registry rather than a
+   runtime scope-by-name scan: the register VM never writes named bindings into any scope at all. */
+static ChunkFunction* find_module_function(FileModule* m, const char* fn) {
+    return chunk_find_function(m->chunk, fn);
 }
 
 bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) {
     FileModule* m = find_module(module, (unsigned int)strlen(module));
     if (!m) return false;
 
-    AerVal* fv = find_module_function(m, fn);
-    if (!fv) return false;
+    ChunkFunction* fnreg = find_module_function(m, fn);
+    if (!fnreg) return false;
 
     VM* mv = m->vm;
 
-    /* Copy args left-to-right onto the module's own isolated stack before validating, so vm_setup_call can read args[0] (the receiver, if any) exactly like lbl_call_value's in-VM call does. */
-    if (mv->stack_top + arg_count > VM_STACK_MAX) {
-        error("Stack overflow");
-        vm->stack_top -= arg_count;
-        push_null_result(vm);
-        return true;
-    }
-    AerVal* args = &mv->stack[mv->stack_top];
-    for (int i = 0; i < arg_count; i++) mv->stack[mv->stack_top++] = vm->stack[vm->stack_top - arg_count + i];
+    /* Args are already sitting in the CALLING vm's own stack (lbl_call_module pushed them there
+       before calling here) — no need to copy them anywhere first, setup_call reads straight out
+       of this pointer and copies each one into the callee's own register bank immediately, with no
+       allocation in between. */
+    AerVal* args = &vm->stack[vm->stack_top - arg_count];
     vm->stack_top -= arg_count;
 
-    /* Trampoline: vm_setup_call (shared with lbl_call_value) sets up a call frame whose return address is this module's own top-level HALT, so vm_run(mv) executes exactly one call and stops. */
-    if (!vm_setup_call(mv, m->chunk, *fv, arg_count, args, m->halt_addr)) {
-        mv->stack_top -= arg_count;   /* undo the copy above — validation failed */
+    /* Trampoline: setup_call pushes a real call frame whose return address is this module's
+       own top-level HALT, so vm_run(mv) executes exactly one call and stops — see its own comment
+       (vm.c) for why the result always lands in mv->call_stack[0].registers[0]. */
+    if (!setup_call(mv, m->chunk, fnreg, arg_count, args, m->halt_addr)) {
         push_null_result(vm);
         return true;
     }
@@ -245,12 +240,12 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
     vm_run(mv);
     vm_gc_unsuppress();
     /* runtime_had_error deliberately stays true on failure here (unlike aer_module_load's parse-time path) — DISPATCH()'s next check aborts the calling vm's execution too, exactly like a same-VM call error. */
-    if (runtime_had_error || mv->stack_top <= 0) {
+    if (runtime_had_error) {
         push_null_result(vm);
         return true;
     }
 
-    AerVal ret = mv->stack[--mv->stack_top];
+    AerVal ret = mv->call_stack[0].registers[0];
     if (vm->stack_top < VM_STACK_MAX) vm->stack[vm->stack_top++] = ret;
     return true;
 }

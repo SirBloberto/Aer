@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include "value.h"
 
-/* Shared open-addressing engine behind HashMap (boxed) and DictMap (inline) — same probing/load-factor/rehash; boxed payloads survive a rehash for callers retaining a pointer (AerScope's overflow storage), inline is safe when nothing retains a pointer across mutation (AerDict). is_inline defaults false on zero-init like HashMap; only lbl_dict_new (vm.c) opts a DictMap into inline mode. */
+/* Shared open-addressing engine behind HashMap (boxed) and DictMap (inline) — same probing/load-factor/rehash; boxed payloads survive a rehash for callers retaining a pointer (e.g. Chunk's name_index), inline is safe when nothing retains a pointer across mutation (AerDict). is_inline defaults false on zero-init like HashMap; only lbl_dict_new (vm.c) opts a DictMap into inline mode. */
 typedef union {
     void*  boxed;
     AerVal inline_val;

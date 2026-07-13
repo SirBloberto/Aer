@@ -16,12 +16,10 @@ endif
 
 FLAGS := -O2 -g -Wall -Wextra -I include -I source -I source/compiler -I source/core -I source/utilities
 
-# parser_v3.c is excluded here — it references AER_V3-gated opcodes (vm.h) that don't exist in a
-# normal build; it's compiled only by test-v3 below, which defines AER_V3 for its whole build.
-SOURCE := $(filter-out source/compiler/parser_v3.c,$(wildcard source/*.c source/compiler/*.c source/core/*.c source/utilities/*.c))
+SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/utilities/*.c)
 OBJECT := $(patsubst source/%.c,object/%.o,$(SOURCE))
 
-# Everything except main.c — conflicts with test-embed's own main() below.
+# Everything except main.c — conflicts with test-embed's/test-smoke's own main() below.
 LIBOBJECT := $(filter-out object/main.o,$(OBJECT))
 
 all: $(OBJECT)
@@ -73,34 +71,15 @@ test-embed: $(LIBOBJECT)
 	gcc $(FLAGS) -o binary/embed_smoke_test$(EXE) $(LIBOBJECT) object/embed_smoke_test.o -lm $(WINLIBS)
 	./binary/embed_smoke_test$(EXE)
 
-# v3 register-VM prototype, M1 (source/compiler/parser_v3.c/.h, AER_V3-gated code in vm.c/vm.h) —
-# entirely absent from every other target, including `all`, same isolation precedent as
-# AER_DEBUG_TOOLS/debug-tools above: this session found repeatedly that even unused new code can
-# measurably shift hot-path performance via layout effects, so this needs to be genuinely absent
-# from a normal build, not just unreachable. tests/v3_smoke_test.c has its own main(), so main.c is
-# excluded here too, matching test-embed's pattern; parser_v3.c is added back in since it's
-# excluded from the main SOURCE list above.
-V3SOURCE := $(filter-out source/main.c,$(SOURCE)) source/compiler/parser_v3.c
-
-test-v3:
+# Register-VM unit test (tests/smoke_test.c) — exercises the allocator and opcodes directly,
+# below the level of a real .aer file (hand-built register trees, REPL-persistence behavior, etc.),
+# complementing the `test` target's end-to-end .aer coverage. Has its own main(), so main.c is
+# excluded here too, matching test-embed's pattern above.
+test-smoke: $(LIBOBJECT)
 	@mkdir -p binary object
-	gcc $(FLAGS) -DAER_V3 -c tests/v3_smoke_test.c -o object/v3_smoke_test.o
-	gcc $(FLAGS) -DAER_V3 -o binary/v3_smoke_test$(EXE) $(V3SOURCE) object/v3_smoke_test.o -lm $(WINLIBS)
-	./binary/v3_smoke_test$(EXE)
-
-# Standalone CLI runner (tests/v3_run_file.c) so a real .aer file can actually be run through v3 —
-# same isolation precedent as test-v3 above (never part of `all`/aer.exe).
-#   make build-v3          — build binary/v3_run_file only, no run (use this before perf/timing —
-#                             run-v3 below always recompiles unconditionally, so timing THAT target
-#                             would fold gcc's build time into the measurement)
-#   make run-v3 FILE=x.aer — build (if needed — see above) and run in one step, for quick manual checks
-build-v3:
-	@mkdir -p binary object
-	gcc $(FLAGS) -DAER_V3 -c tests/v3_run_file.c -o object/v3_run_file.o
-	gcc $(FLAGS) -DAER_V3 -o binary/v3_run_file$(EXE) $(V3SOURCE) object/v3_run_file.o -lm $(WINLIBS)
-
-run-v3: build-v3
-	./binary/v3_run_file$(EXE) $(FILE)
+	gcc $(FLAGS) -c tests/smoke_test.c -o object/smoke_test.o
+	gcc $(FLAGS) -o binary/smoke_test$(EXE) $(LIBOBJECT) object/smoke_test.o -lm $(WINLIBS)
+	./binary/smoke_test$(EXE)
 
 # ASAN build for tests/fuzz.py — catches non-crashing memory bugs a plain build misses.
 # Needs libasan (standard on Linux/macOS); may not link on a bare MinGW/MSYS2 install.
@@ -120,10 +99,7 @@ fuzz: asan
 # with -fprofile-generate and runs it against nbody.aer (the actual workload this targets) plus the
 # full test suite (broader code-path coverage), producing real execution-frequency data in
 # object-pgo/*.gcda; pass 2 recompiles with -fprofile-use so gcc lays out hot/cold code from that
-# real profile instead of static heuristics. Directly targets the code-layout/icache sensitivity
-# this session's benchmarking turned up (three opcode-level micro-optimizations measured worse than
-# predicted, apparently from shifted code layout, not the logic itself — see the register-VM
-# scoping plan's "Result" section) rather than guessing at layout by hand.
+# real profile instead of static heuristics.
 PGO_DIR := object-pgo
 
 pgo: $(SOURCE)

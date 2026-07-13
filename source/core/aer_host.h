@@ -5,7 +5,7 @@
 
 #define MAX_HOST_FUNCTIONS 64
 
-/* A host-registered native function. `args` is a Value array built fresh for this call (aer_host_call converts each argument from AerVal) — valid only for the call's duration, not a live pointer into the VM's stack as before NaN-boxing (no host function ever relied on that, so it's a doc fix, not a behavior change). Returns the result directly; call error() (error.h) to report a failure. */
+/* A host-registered native function. `args` is a Value array built fresh for this call (aer_host_call converts each argument from AerVal) — valid only for the call's duration, not a live pointer into the VM's stack. Returns the result directly; call error() (error.h) to report a failure. */
 typedef Value (*AerNativeFn)(VM* vm, int arg_count, Value* args, void* userdata);
 
 /* Registers fn as module.name, callable once a script does `import module`; call before parsing/running any script that references it (typically right after vm_init()). Process-global, not per-VM. Returns false if the registry is full. */

@@ -28,6 +28,11 @@ int main(int argc, char** argv) {
     vm_init(&vm, &chunk);
     /* Opt-in host capability, not a built-in module (see aer_io.h) — the reference CLI grants file access; an embedding host that wants a sandboxed script simply doesn't call this. */
     aer_io_register();
+    /* Once, at process start — parse() (called from run(), below) accumulates state (variable/
+       function/struct tables, the register allocator) across every call for the rest of the
+       process's life; resetting it here and never again is what lets a REPL session's later lines
+       see an earlier line's variables/functions. See parser_reset's own comment (parser.c). */
+    parser_reset();
 
     int status = 0;
     if (argc == 1) {
@@ -50,14 +55,14 @@ int main(int argc, char** argv) {
 static void run() {
     /* Append new code after any previous bytecode — preserves function bodies compiled in earlier REPL calls. */
     unsigned int start = chunk.count;
-    vm.ip         = start;
-    vm.stack_top  = 0;
+    vm.ip            = start;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     lex();
+    /* parse() never resets its own tables (parser_reset, called once in main() above, already did
+       that) and has its own per-statement rollback/recovery, so it's safe to call repeatedly —
+       once per REPL line, or once for a whole file. */
     parse(&chunk);
     chunk_emit(&chunk, OP_HALT);
     runtime_had_error = false;

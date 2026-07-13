@@ -64,13 +64,21 @@ static Value host_add(VM* vm, int arg_count, Value* args, void* userdata) {
 
 /* Mirrors main.c's run() — parse+run whatever text shell() was just
    handed, appended after any existing bytecode. Not calling into main.c
-   itself; this is what a host's own equivalent of run() looks like. */
+   itself; this is what a host's own equivalent of run() looks like.
+     error_at()/error() (error.c) set runtime_had_error alongside parse_had_error
+   unconditionally — even a compile error that parse()'s own per-statement recovery
+   fully recovers from leaves runtime_had_error stuck true, and DISPATCH() (vm.c) aborts
+   vm_run() before its first instruction whenever that flag is set. main.c's run() resets
+   it right before vm_run() for exactly this reason; without the same reset here, a
+   recovered parse error in one shell() segment silently no-ops every later run_appended()
+   call's execution too, not just the segment that actually errored. */
 static bool run_appended(Chunk* chunk, VM* vm) {
     unsigned int start = chunk->count;
     vm->ip = start;
     lex();
     parse(chunk);
     chunk_emit(chunk, OP_HALT);
+    runtime_had_error = false;
     return vm_run(vm);
 }
 
@@ -81,6 +89,7 @@ int main(void) {
     VM    vm;
     chunk_init(&chunk);
     vm_init(&vm, &chunk);
+    parser_reset();
     mode = MODE_RUN;   /* the mode that used to exit(1) on any runtime error */
 
     /* A script that deliberately errors at runtime. Before this phase,
@@ -101,12 +110,9 @@ int main(void) {
        reusing the same VM* after an error must reset stack/call/scope
        state itself, applied here by hand, exactly like main.c's run()
        does between REPL statements. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
 
     shell("print(2 + 2)\n");
@@ -124,12 +130,9 @@ int main(void) {
        plus two blank lines plus "bad = x.y" — chunk_line_for_offset() and
        current_runtime_line (source/core/vm.c, source/utilities/error.c)
        are what make this work. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     shell("x = 1\n\n\nbad = x.y\n");
     ok = run_appended(&chunk, &vm);
@@ -173,25 +176,16 @@ int main(void) {
        over-apply; tests/test.aer proves the true-tail-call case reuses
        the frame (completes far past 64 levels) — this is the negative
        case that can't run there, since it deliberately aborts the file. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     shell("function not_tail(n):\n    if n <= 0:\n        return 0\n    return not_tail(n - 1) + 0\n\nnot_tail(1000)\n");
     ok = run_appended(&chunk, &vm);
 
     check(!ok, "deep non-tail recursion still overflows the call stack — tail-call detection did not over-apply");
-    /* VM_SCOPE_MAX and VM_CALL_MAX are both 64, but the scope stack starts
-       with the global scope already occupying slot 1 — so it reaches its
-       limit one call earlier than the call stack does, and "Scope stack
-       overflow" is actually the one that fires first. Either is a correct,
-       equally valid proof that deep non-tail recursion still hits a real
-       resource limit. */
     check(strstr(aer_last_error(), "overflow") != NULL,
-          "the failure is specifically a stack overflow (call or scope), not some other error");
+          "the failure is specifically a call stack overflow, not some other error");
 
     /* AER_PATH search paths — resolve_path() (aer_module.c) only reaches its
        AER_PATH fallback once the same-directory candidate misses. shell()
@@ -200,12 +194,9 @@ int main(void) {
        the repo root when run via `make test-embed` — where
        searchpath_helper.aer does not exist; it only exists under tests/.
        Setting AER_PATH=tests here is what makes the import succeed at all. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     set_aer_path("tests");
     shell("import searchpath_helper\nassert(searchpath_helper.quadruple(5) == 20, \"quadruple via AER_PATH-resolved import\")\n");
@@ -224,12 +215,9 @@ int main(void) {
        name. import itself emits no bytecode either way, so vm_run() alone
        can't observe this — the failure only shows up as a parse-time error
        (aer_had_error()), not a false `ok`. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     shell("import io\n");
     run_appended(&chunk, &vm);
@@ -244,12 +232,9 @@ int main(void) {
        Asserting a collection actually ran and that the live-cell count
        stayed far below the iteration count is the only real proof
        reclamation happened, not just that nothing crashed. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     shell("for i in 0..5000:\n    temp = [i, i * 2, i * 3]\n");
     ok = run_appended(&chunk, &vm);
@@ -266,12 +251,9 @@ int main(void) {
        more collections than the default for the same workload. Restored
        to the defaults immediately after, so it doesn't affect the ceiling
        tests below. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     aer_gc_configure(20, 0);   /* tiny minor threshold; 0 leaves the major cadence alone */
     unsigned int minors_before;
@@ -290,12 +272,9 @@ int main(void) {
        keeps genuinely-live memory growing (not throwaway garbage) to
        abort with a normal, recoverable runtime error instead of growing
        forever. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     aer_gc_set_ceiling(50);
     shell("permanent = []\nfor i in 0..5000:\n    append(permanent, [i, i * 2, i * 3])\n");
@@ -309,12 +288,9 @@ int main(void) {
     /* Disabling the ceiling (0) lets the same shape of script succeed —
        proves it doesn't wrongly reject once unset, not just that a tiny
        one rejects. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     aer_gc_set_ceiling(0);
     shell("permanent2 = []\nfor i in 0..5000:\n    append(permanent2, [i, i * 2, i * 3])\n");
@@ -333,12 +309,9 @@ int main(void) {
        got compiled at all, and a later reference to n1 failed with a
        confusing, seemingly unrelated "'n1' is not defined" — see
        recovered_at_boundary in parser.c. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     /* x.y += 1 used to be this test's broken statement, back when compound
        field/index assignment (parser.c's parse_assignment) wasn't supported
@@ -362,12 +335,9 @@ int main(void) {
        observed by inspecting VM state *after* an aborted statement, which
        needs the REPL-style statement-level abort this embedding harness
        already exercises above — file mode (MODE_RUN) would just exit. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     shell("compound_x = 5\n");
     run_appended(&chunk, &vm);
@@ -388,12 +358,9 @@ int main(void) {
        checked from tests/test.aer (MODE_RUN exits on the first runtime
        error, so there's no way to observe "this expression errored, then
        execution continued" from inside that file). */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     shell("ig_smoke_arr = [1, 2, 3]\n");
     run_appended(&chunk, &vm);
@@ -412,12 +379,9 @@ int main(void) {
     /* A malformed `for` while-condition (found by tests/fuzz.py) used to still compile into
        a real, infinite back-edge loop despite the reported error. Can't be tested from a
        normal .aer file (the hang IS the bug) — here we just confirm the call returns. */
-    vm.stack_top  = 0;
+    vm.stack_top     = 0;
     vm.call_depth = 0;
-    while (vm.scope_depth > 1) {
-        AerScope* s = &vm.scopes[--vm.scope_depth];
-        if (s->overflow) hashmap_free(&s->map);
-    }
+    vm.registers  = vm.call_stack[0].registers;
     aer_clear_error();
     shell("malformed_for_x = 1\nfor malformed_for_x !  print(\"body\")\n    malformed_for_x = 2\nmalformed_for_after = \"reached\"\n");
     run_appended(&chunk, &vm);
