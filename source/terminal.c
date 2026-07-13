@@ -167,7 +167,8 @@ void start_terminal(char* name) {
        against the modulo-indexed scheme once history exceeds COMMAND_SIZE
        bytes across sessions. */
     char temp[COMMAND_SIZE];
-    fread(temp, 1, read_size, history);
+    size_t got = fread(temp, 1, read_size, history);
+    read_size = (unsigned int)got;
     unsigned long logical_start = history_length - read_size;
     for (unsigned int k = 0; k < read_size; k++)
         history_buffer[(logical_start + k) % COMMAND_SIZE] = temp[k];

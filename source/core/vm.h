@@ -310,7 +310,7 @@ typedef enum {
     OP_PRINT_REPL, /* operand: src_reg — prints registers[src_reg] unless it's TYPE_NULL */
 } Opcode;
 
-/* RK encoding for OP_BINARY's operands — see vm_rk_value (vm.c). Pool indices are always
+/* RK encoding for most opcodes' operands — see vm_rk_value (vm.c). Pool indices are always
    small non-negative ints in practice, nowhere near this bit, so reusing it as a "this is a
    constant, not a register" flag is safe and simple (matches Lua's own BITRK convention). */
 #define RK_CONST_FLAG (1 << 30)
@@ -345,6 +345,36 @@ typedef enum {
 #define UNPACK_A(word) (((word) >> 8)  & 0xFF)
 #define UNPACK_B(word) (((word) >> 16) & 0xFF)
 #define UNPACK_C(word) (((word) >> 24) & 0xFF)
+
+/* OP_BINARY alone gets a dedicated single-64-bit-word encoding: it's the single hottest opcode in
+   arithmetic-heavy code (over a third of all dispatches on nbody.aer), and the ordinary PACK3/RK
+   scheme above still costs it 3 separate code-array fetches per dispatch (op_word, rk_b, rk_c) —
+   one DISPATCH() fetch of op_word, then two more READ()s just to find out what to compute. Once
+   code[] is a 64-bit-word array (see Chunk's own comment above), opcode(8) + dest(8) + bin_op(8) +
+   two 20-bit RK operands (52 bits) fits in one word with room to spare, cutting OP_BINARY to the
+   ONE fetch DISPATCH() already does for every opcode, unconditionally.
+     This compact RK operand needs its own (narrower) flag/index split — RK20_CONST_FLAG at bit 19
+   rather than RK_CONST_FLAG's bit 30 — since 20 bits total has to hold both the flag and the
+   index. 19 index bits (524288 slots) is still enormous headroom over both FRAME_REGISTERS (128)
+   and any realistic constant-pool size, but genuinely large generated programs could in principle
+   exceed it — see emit_binary's own guard (parser.c), which reports a clean compile error rather
+   than silently truncating a resolved rk_lhs/rk_rhs from parse_binary_ops's ordinary (wider)
+   RK_CONST_FLAG scheme down into this one. */
+#define RK20_CONST_FLAG (1ULL << 19)
+#define RK20_INDEX_MASK 0x7FFFFULL
+#define RK20_MAX_INDEX  0x7FFFF
+#define PACK_RK20(rk) \
+    (((rk) & RK_CONST_FLAG) \
+        ? (RK20_CONST_FLAG | ((unsigned long long)((rk) & ~RK_CONST_FLAG) & RK20_INDEX_MASK)) \
+        : ((unsigned long long)(rk) & RK20_INDEX_MASK))
+#define PACK_BINARY(dest, bin_op, rk_b, rk_c) \
+    ( ((unsigned long long)(OP_BINARY) & 0xFF) \
+    | (((unsigned long long)(dest)   & 0xFF) << 8) \
+    | (((unsigned long long)(bin_op) & 0xFF) << 16) \
+    | ((PACK_RK20(rk_b) & 0xFFFFFULL) << 24) \
+    | ((PACK_RK20(rk_c) & 0xFFFFFULL) << 44) )
+#define UNPACK_RK_B20(word) (((word) >> 24) & 0xFFFFFULL)
+#define UNPACK_RK_C20(word) (((word) >> 44) & 0xFFFFFULL)
 
 /* OP_CAST operand values — target type for `x as T` (T=string compiles to OP_TO_STR instead, since that conversion already existed). */
 #define CAST_INTEGER 0
@@ -384,11 +414,15 @@ typedef struct {
 
 /* ------------------------------------------------------------------ */
 /* Bytecode chunk                                                       */
-/* code[] is a flat int array: each instruction is one opcode int, optionally followed by one operand int (or, for a packed OP_* instruction, further narrow fields packed into that same word — see PACK3). */
+/* code[] is a flat 64-bit-word array: each instruction is one opcode word, optionally followed by
+   one or more operand words (or, for a packed OP_* instruction, further fields packed into that
+   same word — see PACK3/PACK_BINARY). Widened from a 32-bit int array so OP_BINARY (the single
+   hottest opcode — see PACK_BINARY's own comment) can pack its whole instruction, RK operands
+   included, into ONE word instead of three. */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    int*         code;
+    unsigned long long* code;
     unsigned int count, capacity;
 
     AerVal*      pool;           /* constants and variable names — all deduplicated by value */
@@ -501,7 +535,7 @@ typedef struct {
 
 void         chunk_init(Chunk* c);
 void         chunk_free(Chunk* c);
-void         chunk_emit(Chunk* c, int word);
+void         chunk_emit(Chunk* c, unsigned long long word);
 
 /* Records that bytecode from `offset` onward belongs to source `line`, once per statement not instruction (see line_mark_offsets); no-op if offset doesn't strictly increase from the last mark. */
 void         chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line);

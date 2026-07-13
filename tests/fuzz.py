@@ -4,11 +4,17 @@
 result under a timeout. Goal: crashes/hangs (memory safety), not wrong output.
 
 Best run against an ASAN build (`make asan`/`make fuzz`) so non-crashing bugs
-still get caught. Known non-actionable "hang": a mutated numeric literal can
-make a recursive seed fixture (e.g. test_perf_fusion.aer's is_even/is_odd)
-loop forever via tail recursion — a property of that fixture's own logic,
-not an AER bug. Check whether a saved tests/fuzz_crashes/ repro is minimal
-and seed-independent before treating a "hang" as a real finding.
+still get caught. A meaningful hang RATE is expected and not by itself a
+finding: AER's loops are unrestricted, so mutating a comparison operator or a
+range bound/step in any seed (not just one fixture) can trivially produce a
+genuinely-infinite loop by AER's own semantics — the halting problem means no
+static check can rule this out in general. Slower hardware (e.g. a Raspberry
+Pi) also widens the gap between "genuinely infinite" and "just a lot of
+iterations", pushing more merely-slow mutations over the --seconds timeout
+without any interpreter bug involved. Before treating a "hang" as a real
+finding: check the saved tests/fuzz_crashes/ repro is minimal and
+seed-independent, and confirm it doesn't just take a while to run to
+completion under a generous timeout (`--seconds`) on the machine in question.
 
 Usage: python3 tests/fuzz.py [--iterations N] [--binary PATH] [--seconds S] [--seed N]
 """

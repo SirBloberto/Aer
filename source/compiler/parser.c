@@ -45,6 +45,21 @@ void reg_free(int count) {
     if (next_temp_register < reserved_floor) next_temp_register = reserved_floor;
 }
 
+/* Every OP_BINARY emission site funnels through here — see PACK_BINARY's own comment in vm.h for
+   why this opcode gets a dedicated single-word encoding instead of the ordinary PACK2+2-wide-words
+   every other opcode uses. The guard below is the tradeoff for that compactness: rk_lhs/rk_rhs
+   arrive already resolved in parse_binary_ops's own (wider, RK_CONST_FLAG-at-bit-30) scheme, and
+   PACK_BINARY's compact RK20 fields only have 19 index bits — comfortably more than
+   FRAME_REGISTERS or any realistic constant pool, but not unconditionally safe to truncate into
+   without checking first. */
+static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
+    if ((rk_lhs & ~RK_CONST_FLAG) > RK20_MAX_INDEX || (rk_rhs & ~RK_CONST_FLAG) > RK20_MAX_INDEX) {
+        error_at("Expression too large to compile (register/constant index exceeds the binary-op encoding's range)");
+        return;
+    }
+    chunk_emit(c, PACK_BINARY(dest, op, rk_lhs, rk_rhs));
+}
+
 int compile_node(Chunk* c, Node* node) {
     if (node->kind == NODE_CONST) {
         unsigned int pool_idx = chunk_add_pool(c, node->const_value);
@@ -67,9 +82,7 @@ int compile_node(Chunk* c, Node* node) {
     if (!(rk_lhs & RK_CONST_FLAG) && node->lhs->kind == NODE_BINARY) reg_free(1);
 
     int dest = reg_alloc();
-    chunk_emit(c, PACK2(OP_BINARY, dest, (int)node->bin_op));
-    chunk_emit(c, rk_lhs);
-    chunk_emit(c, rk_rhs);
+    emit_binary(c, dest, node->bin_op, rk_lhs, rk_rhs);
     return dest;
 }
 
@@ -697,8 +710,7 @@ static int parse_string_literal(Chunk* c) {
             } else {
                 if (is_temp(result)) reg_free(1);
                 int dest = reg_alloc();
-                chunk_emit(c, PACK2(OP_BINARY, dest, (int)OP_ADD));
-                chunk_emit(c, result); chunk_emit(c, rk_seg);
+                emit_binary(c, dest, OP_ADD, result, rk_seg);
                 result = dest;
             }
         }
@@ -734,8 +746,7 @@ static int parse_string_literal(Chunk* c) {
             if (is_temp(str_dest)) reg_free(1);
             if (is_temp(result))   reg_free(1);
             int dest = reg_alloc();
-            chunk_emit(c, PACK2(OP_BINARY, dest, (int)OP_ADD));
-            chunk_emit(c, result); chunk_emit(c, str_dest);
+            emit_binary(c, dest, OP_ADD, result, str_dest);
             result = dest;
         }
         i++;   /* skip '}' */
@@ -1244,9 +1255,7 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
         if (is_temp(lhs)) reg_free(1);
 
         int dest = reg_alloc();
-        chunk_emit(c, PACK2(OP_BINARY, dest, (int)op));
-        chunk_emit(c, lhs);
-        chunk_emit(c, rhs);
+        emit_binary(c, dest, op, lhs, rhs);
         lhs = dest;
         lhs_start = c->count;
     }
@@ -1383,9 +1392,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
 
             int rk_rhs = parse_binary(c, 0);
             if (parse_had_error) return;
-            chunk_emit(c, PACK2(OP_BINARY, local_reg, (int)compound_assign_ops[i].op));
-            chunk_emit(c, local_reg);
-            chunk_emit(c, rk_rhs);
+            emit_binary(c, local_reg, compound_assign_ops[i].op, local_reg, rk_rhs);
             if (is_temp(rk_rhs)) reg_free(1);
 
             chunk_emit(c, PACK1(OP_STORE_GLOBAL, reg));
@@ -1396,9 +1403,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
 
         int rk_rhs = parse_binary(c, 0);
         if (parse_had_error) return;
-        chunk_emit(c, PACK2(OP_BINARY, reg, (int)compound_assign_ops[i].op));
-        chunk_emit(c, reg);
-        chunk_emit(c, rk_rhs);
+        emit_binary(c, reg, compound_assign_ops[i].op, reg, rk_rhs);
         if (is_temp(rk_rhs)) reg_free(1);
         return;
     }
@@ -1558,9 +1563,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             int rk_rhs = parse_binary(c, 0);
             if (parse_had_error) return;
 
-            chunk_emit(c, PACK2(OP_BINARY, item_reg, (int)compound_assign_ops[i].op));
-            chunk_emit(c, item_reg);
-            chunk_emit(c, rk_rhs);
+            emit_binary(c, item_reg, compound_assign_ops[i].op, item_reg, rk_rhs);
             if (is_temp(rk_rhs)) reg_free(1);
 
             emit_index_set(c, obj_reg, pending_rk_idx, item_reg);

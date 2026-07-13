@@ -65,7 +65,11 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
        disassembly purposes. */
     [OP_LOADK] = { "OP_LOADK", "reg = pool constant", {FLD_REG, FLD_POOL}, false, 1 },
     [OP_MOVE]  = { "OP_MOVE",  "reg = reg", {FLD_REG, FLD_REG}, false, 2 },
-    [OP_BINARY] = { "OP_BINARY", "reg = rk OP rk", {FLD_REG, FLD_BINOP, FLD_RK, FLD_RK}, false, 2 },
+    /* OP_BINARY is the sole exception to the "packed fields come from A/B/C, everything else is a
+       separate wide word" rule described above: its whole instruction (dest, bin_op, AND both RK
+       operands) is packed into ONE word (PACK_BINARY, vm.h), so it has no trailing wide fields at
+       all — disassemble_one special-cases it rather than going through the generic field loop. */
+    [OP_BINARY] = { "OP_BINARY", "reg = rk OP rk", {FLD_REG, FLD_BINOP}, false, 2 },
     [OP_JUMP_IF_FALSE_REG] = { "OP_JUMP_IF_FALSE_REG", "jump if !reg, no pop", {FLD_REG, FLD_JUMP}, false, 1 },
     [OP_CMP_JUMP_FALSE]    = { "OP_CMP_JUMP_FALSE",    "fused: jump if !(rk <op> rk)", {FLD_BINOP, FLD_RK, FLD_RK, FLD_JUMP}, false, 1 },
     [OP_CALL]  = { "OP_CALL",  "call by compile-time-resolved offset", {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP}, false, 3 },
@@ -155,8 +159,13 @@ static void print_field(FILE* out, Chunk* c, Field kind, int word) {
    tags) into the SAME word as the opcode itself (PACK1/2/3, vm.h) — op_word is kept unmasked
    here specifically so those can still be extracted via UNPACK_A/B/C; OP_JUMP/OP_DEFINE_STRUCT/
    OP_HALT have packed==0, so the loop below is a no-op for them. */
+static void print_rk20(FILE* out, Chunk* c, unsigned long long rk) {
+    if (rk & RK20_CONST_FLAG) { fprintf(out, "  rk=const:"); print_pool_value(out, c->pool[rk & RK20_INDEX_MASK]); }
+    else                          fprintf(out, "  rk=reg%llu", rk & RK20_INDEX_MASK);
+}
+
 static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
-    int op_word = c->code[offset];
+    unsigned long long op_word = c->code[offset];
     Opcode op = (Opcode)(op_word & 0xFF);
     const OpInfo* info = &op_info[op];
     fprintf(out, "%6u  %-28s  %s", offset, opcode_name(op), info->desc);
@@ -164,17 +173,26 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     unsigned int pos = offset + 1;
     if (info->variable) {
         /* OP_DEFINE_STRUCT: name pool idx, field_count, then field_count * (field-name, default) pairs. */
-        int name_idx    = c->code[pos++];
-        int field_count = c->code[pos++];
+        int name_idx    = (int)c->code[pos++];
+        int field_count = (int)c->code[pos++];
         fprintf(out, "  name=%s fields=%d [", aer_as_string(c->pool[name_idx])->data, field_count);
         for (int i = 0; i < field_count; i++) {
-            int fname_idx = c->code[pos++];
-            int fdefault_idx = c->code[pos++];
+            int fname_idx = (int)c->code[pos++];
+            int fdefault_idx = (int)c->code[pos++];
             if (i > 0) fprintf(out, ", ");
             fprintf(out, "%s=", aer_as_string(c->pool[fname_idx])->data);
             print_pool_value(out, c->pool[fdefault_idx]);
         }
         fprintf(out, "]");
+    } else if (op == OP_BINARY) {
+        /* Packed single-word encoding (PACK_BINARY, vm.h) — dest/bin_op still come from A/B like
+           any other packed opcode, but both RK operands live in THIS SAME word (bits 24-43/44-63)
+           instead of trailing words, so they're decoded here rather than through the generic
+           fields[]-driven loop below (which OP_BINARY's own op_info entry has no entries left for). */
+        print_field(out, c, FLD_REG,   (int)UNPACK_A(op_word));
+        print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
+        print_rk20(out, c, UNPACK_RK_B20(op_word));
+        print_rk20(out, c, UNPACK_RK_C20(op_word));
     } else {
         int i = 0;
         for (; i < info->packed; i++) {
@@ -183,7 +201,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
             print_field(out, c, info->fields[i], word);
         }
         for (; i < MAX_FIELDS && info->fields[i] != FLD_END; i++) {
-            int word = c->code[pos++];
+            int word = (int)c->code[pos++];
             print_field(out, c, info->fields[i], word);
         }
     }
@@ -227,7 +245,7 @@ void aer_disassemble(Chunk* c, FILE* out) {
         unsigned int next = offset + 1;
         const OpInfo* info = &op_info[op];
         if (info->variable) {
-            int field_count = c->code[offset + 2];
+            int field_count = (int)c->code[offset + 2];
             next = offset + 2 + (unsigned int)field_count * 2 + 1;
         } else {
             int n = 0;

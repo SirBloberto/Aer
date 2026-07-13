@@ -34,10 +34,19 @@ AerVal register_get(VM* vm, int slot) {
     return vm->registers[slot];
 }
 
-/* Decodes an OP_BINARY RK operand — see RK_CONST_FLAG's comment in vm.h. */
+/* Decodes an ordinary (32-bit, RK_CONST_FLAG-at-bit-30) RK operand — see RK_CONST_FLAG's comment
+   in vm.h. Used by every opcode except the packed-single-word OP_BINARY below, which has its own
+   narrower RK20 scheme instead. */
 static inline AerVal vm_rk_value(VM* vm, Chunk* c, int rk) {
     if (rk & RK_CONST_FLAG) return c->pool[rk & ~RK_CONST_FLAG];
     return vm->registers[rk];
+}
+
+/* Decodes one of PACK_BINARY's compact 20-bit RK operands (RK20_CONST_FLAG at bit 19, vm.h) —
+   the packed-single-word OP_BINARY's own RK scheme, distinct from vm_rk_value's above. */
+static inline AerVal vm_rk_value20(VM* vm, Chunk* c, unsigned long long rk) {
+    if (rk & RK20_CONST_FLAG) return c->pool[rk & RK20_INDEX_MASK];
+    return vm->registers[rk & RK20_INDEX_MASK];
 }
 
 static void vm_pools_init_once(void) {
@@ -594,10 +603,10 @@ AerVal aer_make_string(char* data, unsigned int length) {
     return aer_string_val(s);
 }
 
-void chunk_emit(Chunk* c, int word) {
+void chunk_emit(Chunk* c, unsigned long long word) {
     if (c->count >= c->capacity) {
         c->capacity = c->capacity ? c->capacity * 2 : 64;
-        c->code = xrealloc(c->code, sizeof(int) * c->capacity);
+        c->code = xrealloc(c->code, sizeof(unsigned long long) * c->capacity);
     }
     c->code[c->count++] = word;
 }
@@ -1244,7 +1253,7 @@ static void vm_call_value(VM* vm, Chunk* c, AerVal fv, int dest_reg, int arg_reg
    bytecode offset) first. Shared by every field-access opcode: lbl_field_get, the fused
    lbl_binary_field/lbl_field_binary (both operand orders), and lbl_field_set. Returns false
    (error already reported) if struct_reg isn't a struct instance or has no such field. */
-static bool vm_resolve_field(VM* vm, Chunk* c, unsigned int site, int struct_reg, int field_idx,
+static inline __attribute__((always_inline)) bool vm_resolve_field(VM* vm, Chunk* c, unsigned int site, int struct_reg, int field_idx,
                                  AerArray** out_oa, int* out_slot) {
     AerVal obj = vm->registers[struct_reg];
     if (aer_type(obj) != TYPE_ARRAY || !aer_as_array(obj)->shape) {
@@ -1587,8 +1596,10 @@ bool vm_run(VM* vm) {
        packed one too; one shared DISPATCH() handles both without needing to know in advance which
        kind of instruction it's about to fetch — which matters because a handful of opcodes
        (OP_JUMP, OP_DEFINE_STRUCT, OP_HALT) are reached from both packed and unpacked contexts
-       through the exact same handler code. */
-    unsigned int op_word;
+       through the exact same handler code. Kept the full 64 bits wide (not truncated to 32) so
+       OP_BINARY's packed RK operands (bits 24-63 — see PACK_BINARY, vm.h) survive; every other
+       opcode's packed fields still live in the low 32 bits exactly as before. */
+    unsigned long long op_word;
 #ifdef AER_DEBUG_TOOLS
     chunk_ensure_debug_hits(c);
 #endif
@@ -1599,9 +1610,9 @@ bool vm_run(VM* vm) {
 #define POP()      (vm->stack_top > 0 ? vm->stack[--vm->stack_top] : (error("Stack underflow"), aer_null()))
 /* active_vm_for_errors = vm is just a pointer store; the line-lookup binary search only runs inside error() when a fault fires, not per-opcode as an earlier version did. */
 #ifdef AER_DEBUG_TOOLS
-#define DISPATCH() do { if (runtime_had_error) return false; gc_maybe_collect(vm); active_vm_for_errors = vm; unsigned int op_ip = vm->ip; op_word = (unsigned int)READ(); cur_op = (Opcode)(op_word & 0xFF); c->debug_hits[op_ip]++; goto *dt[cur_op]; } while(0)
+#define DISPATCH() do { if (runtime_had_error) return false; gc_maybe_collect(vm); active_vm_for_errors = vm; unsigned int op_ip = vm->ip; op_word = READ(); cur_op = (Opcode)(op_word & 0xFF); c->debug_hits[op_ip]++; goto *dt[cur_op]; } while(0)
 #else
-#define DISPATCH() do { if (runtime_had_error) return false; gc_maybe_collect(vm); active_vm_for_errors = vm; op_word = (unsigned int)READ(); cur_op = (Opcode)(op_word & 0xFF); goto *dt[cur_op]; } while(0)
+#define DISPATCH() do { if (runtime_had_error) return false; gc_maybe_collect(vm); active_vm_for_errors = vm; op_word = READ(); cur_op = (Opcode)(op_word & 0xFF); goto *dt[cur_op]; } while(0)
 #endif
 
     static const void* const dt[] = {
@@ -1690,16 +1701,15 @@ lbl_move: {
     DISPATCH();
 }
 
-/* dest/bin_op are packed into op_word (see PACK3's comment in vm.h); rk_b/rk_c are wide
-   RK-encoded operands (register or constant), each still its own dedicated word, read via
-   READ() exactly as before this opcode was packed. */
+/* Whole instruction — dest, bin_op, AND both RK operands — packed into the single op_word DISPATCH()
+   already fetched (see PACK_BINARY's comment in vm.h). No further READ() at all: this is the
+   entire reason OP_BINARY gets its own encoding instead of the ordinary PACK3+wide-word scheme
+   every other opcode uses. */
 lbl_binary: {
     int dest      = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
-    int rk_b      = READ();
-    int rk_c      = READ();
-    AerVal b = vm_rk_value(vm, c, rk_b);
-    AerVal cc = vm_rk_value(vm, c, rk_c);
+    AerVal b  = vm_rk_value20(vm, c, UNPACK_RK_B20(op_word));
+    AerVal cc = vm_rk_value20(vm, c, UNPACK_RK_C20(op_word));
     vm->registers[dest] = vm_binary(b, cc, bin_op);
     DISPATCH();
 }
