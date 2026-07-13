@@ -901,50 +901,57 @@ static bool values_equal(AerVal a, AerVal b) {
     return false;
 }
 
-static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b, Opcode op) {
-    /* Logical ops work on any type via truthiness */
-    if (op == OP_AND || op == OP_OR) {
-        return aer_bool((op == OP_AND) ? (vm_truthy(a) && vm_truthy(b))
-                                        : (vm_truthy(a) || vm_truthy(b)));
-    }
+/* Split into one function per operator category, instead of a single do-everything vm_binary
+   switching on every operator — see the specialized labels in vm_run (BINARY_OP_LABEL) for why:
+   inlining ONE giant do-everything function at all 18 specialized call sites (relying purely on
+   constant-folding to shrink each down to what it needs) measurably REGRESSED on real Raspberry Pi
+   hardware — more instructions retired, not fewer, despite fewer indirect jumps in isolation —
+   evidently the fold didn't shrink every instantiation enough there to pay for 18 copies of a
+   ~170-line function. Each category function below only contains the type-check branches its own
+   operators can actually reach, so there's far less to duplicate per call site even before any
+   folding happens; vm_equality is the one still-general exception (equality is valid for every
+   type, so there's no smaller subset to extract for it).
+     A handful of dead operator/type combinations (e.g. `[1,2] + [3,4]`, arithmetic on booleans)
+   now fall through to the generic "Type mismatch in binary expression" error at the bottom of each
+   function instead of a category's own worded one ("Operator not valid for arrays") — still a
+   clean, correctly reported error either way, just less specific wording for what's already an
+   error case; nothing in tests/ or the host API asserts on that exact string. */
 
-    /* Checked before null-handling below so `null in arr` isn't intercepted by the "null op anything-else errors" rule, which is about direct comparison, not container search. */
-    if (op == OP_IN) {
-        if (aer_type(b) == TYPE_DICT) {
-            if (aer_type(a) != TYPE_STRING) { error("Left side of 'in' must be a string when testing dict membership"); return aer_bool(false); }
-            AerString* as = aer_as_string(a);
-            unsigned int klen = as->length;
-            if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return aer_bool(false); }
-            char kbuf[VM_KEY_MAX + 1];
-            memcpy(kbuf, as->data, klen);
-            kbuf[klen] = '\0';
-            return aer_bool(dictmap_get(&aer_as_dict(b)->map, kbuf) != NULL);
+static inline __attribute__((always_inline)) AerVal vm_in(AerVal a, AerVal b) {
+    /* Checked separately from equality/type-mismatch below so `null in arr` isn't intercepted by
+       any "null op anything-else errors" rule — this is container search, not direct comparison. */
+    if (aer_type(b) == TYPE_DICT) {
+        if (aer_type(a) != TYPE_STRING) { error("Left side of 'in' must be a string when testing dict membership"); return aer_bool(false); }
+        AerString* as = aer_as_string(a);
+        unsigned int klen = as->length;
+        if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return aer_bool(false); }
+        char kbuf[VM_KEY_MAX + 1];
+        memcpy(kbuf, as->data, klen);
+        kbuf[klen] = '\0';
+        return aer_bool(dictmap_get(&aer_as_dict(b)->map, kbuf) != NULL);
+    }
+    if (aer_type(b) == TYPE_ARRAY) {
+        AerArray* arr = aer_as_array(b);
+        for (unsigned int i = 0; i < arr->count; i++) {
+            if (values_equal(a, arr->items[i])) return aer_bool(true);
         }
-        if (aer_type(b) == TYPE_ARRAY) {
-            AerArray* arr = aer_as_array(b);
-            for (unsigned int i = 0; i < arr->count; i++) {
-                if (values_equal(a, arr->items[i])) return aer_bool(true);
-            }
-            return aer_bool(false);
-        }
-        error("Right side of 'in' must be a dict or array");
         return aer_bool(false);
     }
+    error("Right side of 'in' must be a dict or array");
+    return aer_bool(false);
+}
 
-    /* Computed once and reused through both fast paths below — aer_type() is cheap, but the
-       int/int and real/real checks used to each call it fresh on the same, unchanged a/b,
-       paying for the is-boxed test twice on every binary op that reaches the real/real path
-       (the common case for arithmetic-heavy code like nbody). Not reused past the real-promotion
-       below, since that reassigns a/b — types genuinely change there. */
+/* ADD/SUB/MUL/DIV/MOD/FLOOR_DIV. int/int and real/real fast paths (checked before null/promotion,
+   same reasoning as the old shared vm_binary had — nbody-style code is dominated by these), then
+   real-promotion fallback; ADD alone also handles string concatenation. */
+static inline __attribute__((always_inline)) AerVal vm_arith(AerVal a, AerVal b, Opcode op) {
     ValueType ta = aer_type(a), tb = aer_type(b);
-
-    /* Integer-vs-integer fast path, checked before null/real-promotion below — the common case for arithmetic-heavy code, and neither branch applies once both are integers. */
     if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) {
         long long l = aer_as_int(a), rv = aer_as_int(b);
         switch (op) {
-            case OP_ADD:         return aer_int(l + rv);
-            case OP_SUB:         return aer_int(l - rv);
-            case OP_MUL:         return aer_int(l * rv);
+            case OP_ADD: return aer_int(l + rv);
+            case OP_SUB: return aer_int(l - rv);
+            case OP_MUL: return aer_int(l * rv);
             case OP_DIV:
                 if (rv == 0) { error("Division by zero"); return aer_int(0); }
                 return aer_real((double)l / (double)rv);
@@ -954,29 +961,9 @@ static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b
             case OP_MOD:
                 if (rv == 0) { error("Modulo by zero"); return aer_int(0); }
                 return aer_int(l % rv);
-            case OP_LSHIFT:      return aer_int(l << rv);
-            case OP_RSHIFT:      return aer_int(l >> rv);
-            case OP_BITWISE_AND: return aer_int(l &  rv);
-            case OP_BITWISE_OR:  return aer_int(l |  rv);
-            case OP_BITWISE_XOR: return aer_int(l ^  rv);
-            case OP_EQ:  return aer_bool(l == rv);
-            case OP_NEQ: return aer_bool(l != rv);
-            case OP_LT:  return aer_bool(l <  rv);
-            case OP_GT:  return aer_bool(l >  rv);
-            case OP_LTE: return aer_bool(l <= rv);
-            case OP_GTE: return aer_bool(l >= rv);
             default: error("Operator not valid for integers"); return aer_int(0);
         }
     }
-
-    /* Real-vs-real fast path, mirrored right after the int/int one above: nbody-style
-       arithmetic-heavy code is dominated by this case, but without this it falls through the
-       AND/OR check, the IN check, the (failing) int/int check, a null check, and real-promotion
-       logic that's a no-op when both operands are already real, before ever reaching the real/real
-       switch below (which still has to stay — this is a fast exit before the checks a
-       promoted-from-int operand still needs, not a replacement). Same case bodies as that switch,
-       duplicated rather than shared, since jumping into the middle of the block below isn't
-       simpler than just checking here first. */
     if (ta == TYPE_REAL && tb == TYPE_REAL) {
         double l = aer_as_real(a), rv = aer_as_real(b);
         switch (op) {
@@ -990,28 +977,11 @@ static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b
                 if (rv == 0.0) { error("Division by zero"); return aer_real(0.0); }
                 return aer_real(floor(l / rv));
             case OP_MOD: return aer_real(fmod(l, rv));
-            case OP_EQ:  return aer_bool(l == rv);
-            case OP_NEQ: return aer_bool(l != rv);
-            case OP_LT:  return aer_bool(l <  rv);
-            case OP_GT:  return aer_bool(l >  rv);
-            case OP_LTE: return aer_bool(l <= rv);
-            case OP_GTE: return aer_bool(l >= rv);
             default: error("Operator not valid for reals"); return aer_real(0.0);
         }
     }
-
-    /* null equality: null == null is true; null op anything-else errors */
-    if (ta == TYPE_NULL || tb == TYPE_NULL) {
-        if (op == OP_EQ)  return aer_bool(ta == TYPE_NULL && tb == TYPE_NULL);
-        if (op == OP_NEQ) return aer_bool(!(ta == TYPE_NULL && tb == TYPE_NULL));
-        error("Operator not valid for null"); return aer_bool(false);
-    }
-
-    if (ta == TYPE_REAL || tb == TYPE_REAL) {
-        a = vm_promote_real(a);
-        b = vm_promote_real(b);
-    }
-
+    if (ta == TYPE_NULL || tb == TYPE_NULL) { error("Operator not valid for null"); return aer_bool(false); }
+    if (ta == TYPE_REAL || tb == TYPE_REAL) { a = vm_promote_real(a); b = vm_promote_real(b); }
     if (aer_type(a) == TYPE_REAL && aer_type(b) == TYPE_REAL) {
         double l = aer_as_real(a), rv = aer_as_real(b);
         switch (op) {
@@ -1025,55 +995,134 @@ static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b
                 if (rv == 0.0) { error("Division by zero"); return aer_real(0.0); }
                 return aer_real(floor(l / rv));
             case OP_MOD: return aer_real(fmod(l, rv));
-            case OP_EQ:  return aer_bool(l == rv);
-            case OP_NEQ: return aer_bool(l != rv);
+            default: error("Operator not valid for reals"); return aer_real(0.0);
+        }
+    }
+    if (op == OP_ADD && aer_type(a) == TYPE_STRING && aer_type(b) == TYPE_STRING) {
+        AerString* as = aer_as_string(a);
+        AerString* bs = aer_as_string(b);
+        unsigned int len = as->length + bs->length;
+        char* buf = xmalloc(len + 1);
+        memcpy(buf, as->data, as->length);
+        memcpy(buf + as->length, bs->data, bs->length);
+        buf[len] = '\0';
+        /* aer_make_string takes ownership of buf directly; no pool interning needed since this string is used once, right here (see vm_to_str's comment). */
+        return aer_make_string(buf, len);
+    }
+    error("Type mismatch in binary expression");
+    return aer_bool(false);
+}
+
+/* LT/GT/LTE/GTE. Numeric only (int/int, real/real, real-promotion) — unlike equality, ordering
+   isn't defined for strings/arrays/dicts/booleans in AER, so there's nothing else to check. */
+static inline __attribute__((always_inline)) AerVal vm_compare(AerVal a, AerVal b, Opcode op) {
+    ValueType ta = aer_type(a), tb = aer_type(b);
+    if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) {
+        long long l = aer_as_int(a), rv = aer_as_int(b);
+        switch (op) {
             case OP_LT:  return aer_bool(l <  rv);
             case OP_GT:  return aer_bool(l >  rv);
             case OP_LTE: return aer_bool(l <= rv);
             case OP_GTE: return aer_bool(l >= rv);
-            default: error("Operator not valid for reals"); return aer_real(0.0);
+            default: error("Operator not valid for integers"); return aer_bool(false);
         }
     }
-
-    if (aer_type(a) == TYPE_BOOLEAN && aer_type(b) == TYPE_BOOLEAN) {
-        if (op == OP_EQ)  return aer_bool(aer_as_bool(a) == aer_as_bool(b));
-        if (op == OP_NEQ) return aer_bool(aer_as_bool(a) != aer_as_bool(b));
-        error("Operator not valid for booleans"); return aer_bool(false);
+    if (ta == TYPE_REAL && tb == TYPE_REAL) {
+        double l = aer_as_real(a), rv = aer_as_real(b);
+        switch (op) {
+            case OP_LT:  return aer_bool(l <  rv);
+            case OP_GT:  return aer_bool(l >  rv);
+            case OP_LTE: return aer_bool(l <= rv);
+            case OP_GTE: return aer_bool(l >= rv);
+            default: error("Operator not valid for reals"); return aer_bool(false);
+        }
     }
+    if (ta == TYPE_NULL || tb == TYPE_NULL) { error("Operator not valid for null"); return aer_bool(false); }
+    if (ta == TYPE_REAL || tb == TYPE_REAL) { a = vm_promote_real(a); b = vm_promote_real(b); }
+    if (aer_type(a) == TYPE_REAL && aer_type(b) == TYPE_REAL) {
+        double l = aer_as_real(a), rv = aer_as_real(b);
+        switch (op) {
+            case OP_LT:  return aer_bool(l <  rv);
+            case OP_GT:  return aer_bool(l >  rv);
+            case OP_LTE: return aer_bool(l <= rv);
+            case OP_GTE: return aer_bool(l >= rv);
+            default: error("Operator not valid for reals"); return aer_bool(false);
+        }
+    }
+    error("Type mismatch in binary expression");
+    return aer_bool(false);
+}
 
+/* EQ/NEQ. Valid for every type (structural/reference equality, same rules the old shared
+   vm_binary used) — the one category that stays genuinely general, since there's no smaller
+   subset of types to carve out for it. */
+static inline __attribute__((always_inline)) AerVal vm_equality(AerVal a, AerVal b, Opcode op) {
+    ValueType ta = aer_type(a), tb = aer_type(b);
+    if (ta == TYPE_INTEGER && tb == TYPE_INTEGER)
+        return aer_bool(op == OP_EQ ? aer_as_int(a) == aer_as_int(b) : aer_as_int(a) != aer_as_int(b));
+    if (ta == TYPE_REAL && tb == TYPE_REAL)
+        return aer_bool(op == OP_EQ ? aer_as_real(a) == aer_as_real(b) : aer_as_real(a) != aer_as_real(b));
+    if (ta == TYPE_NULL || tb == TYPE_NULL)
+        return aer_bool(op == OP_EQ ? (ta == TYPE_NULL && tb == TYPE_NULL) : !(ta == TYPE_NULL && tb == TYPE_NULL));
+    if (ta == TYPE_REAL || tb == TYPE_REAL) { a = vm_promote_real(a); b = vm_promote_real(b); }
+    if (aer_type(a) == TYPE_REAL && aer_type(b) == TYPE_REAL)
+        return aer_bool(op == OP_EQ ? aer_as_real(a) == aer_as_real(b) : aer_as_real(a) != aer_as_real(b));
+    if (aer_type(a) == TYPE_BOOLEAN && aer_type(b) == TYPE_BOOLEAN)
+        return aer_bool(op == OP_EQ ? aer_as_bool(a) == aer_as_bool(b) : aer_as_bool(a) != aer_as_bool(b));
     if (aer_type(a) == TYPE_STRING && aer_type(b) == TYPE_STRING) {
         AerString* as = aer_as_string(a);
         AerString* bs = aer_as_string(b);
-        bool eq = as->length == bs->length &&
-                  strncmp(as->data, bs->data, as->length) == 0;
-        if (op == OP_EQ)  return aer_bool(eq);
-        if (op == OP_NEQ) return aer_bool(!eq);
-        if (op == OP_ADD) {
-            unsigned int len = as->length + bs->length;
-            char* buf = xmalloc(len + 1);
-            memcpy(buf, as->data, as->length);
-            memcpy(buf + as->length, bs->data, bs->length);
-            buf[len] = '\0';
-            /* aer_make_string takes ownership of buf directly; no pool interning needed since this string is used once, right here (see vm_to_str's comment). */
-            return aer_make_string(buf, len);
-        }
-        error("Operator not valid for strings"); return aer_bool(false);
+        bool eq = as->length == bs->length && strncmp(as->data, bs->data, as->length) == 0;
+        return aer_bool(op == OP_EQ ? eq : !eq);
     }
-
-    if (aer_type(a) == TYPE_ARRAY && aer_type(b) == TYPE_ARRAY) {
-        if (op == OP_EQ)  return aer_bool(aer_as_array(a) == aer_as_array(b));
-        if (op == OP_NEQ) return aer_bool(aer_as_array(a) != aer_as_array(b));
-        error("Operator not valid for arrays"); return aer_bool(false);
-    }
-
-    if (aer_type(a) == TYPE_DICT && aer_type(b) == TYPE_DICT) {
-        if (op == OP_EQ)  return aer_bool(aer_as_dict(a) == aer_as_dict(b));
-        if (op == OP_NEQ) return aer_bool(aer_as_dict(a) != aer_as_dict(b));
-        error("Operator not valid for dicts"); return aer_bool(false);
-    }
-
+    if (aer_type(a) == TYPE_ARRAY && aer_type(b) == TYPE_ARRAY)
+        return aer_bool(op == OP_EQ ? aer_as_array(a) == aer_as_array(b) : aer_as_array(a) != aer_as_array(b));
+    if (aer_type(a) == TYPE_DICT && aer_type(b) == TYPE_DICT)
+        return aer_bool(op == OP_EQ ? aer_as_dict(a) == aer_as_dict(b) : aer_as_dict(a) != aer_as_dict(b));
     error("Type mismatch in binary expression");
     return aer_bool(false);
+}
+
+/* BITWISE_AND/OR/XOR/LSHIFT/RSHIFT. Integers only — nothing else to check. */
+static inline __attribute__((always_inline)) AerVal vm_bitwise(AerVal a, AerVal b, Opcode op) {
+    if (aer_type(a) == TYPE_INTEGER && aer_type(b) == TYPE_INTEGER) {
+        long long l = aer_as_int(a), rv = aer_as_int(b);
+        switch (op) {
+            case OP_LSHIFT:      return aer_int(l << rv);
+            case OP_RSHIFT:      return aer_int(l >> rv);
+            case OP_BITWISE_AND: return aer_int(l &  rv);
+            case OP_BITWISE_OR:  return aer_int(l |  rv);
+            case OP_BITWISE_XOR: return aer_int(l ^  rv);
+            default: error("Operator not valid for integers"); return aer_int(0);
+        }
+    }
+    error("Type mismatch in binary expression");
+    return aer_bool(false);
+}
+
+/* Thin runtime dispatcher — only ever reached from the handful of places that still carry a
+   genuinely runtime bin_op tag instead of a compile-time-known one: OP_CMP_JUMP_FALSE's fused
+   condition, and OP_BINARY_FIELD/OP_FIELD_BINARY's fused field-access forms (the field name isn't
+   resolved until the struct's shape lookup, so those can't specialize per-operator the way the 18
+   direct opcodes in vm_run do). OP_AND/OP_OR/OP_PIPE never reach here — real ones are intercepted
+   at parse time (short-circuit jumps / call desugaring, see vm.h) — so the default case is dead
+   in practice, same as it always was. */
+static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b, Opcode op) {
+    switch (op) {
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_FLOOR_DIV:
+            return vm_arith(a, b, op);
+        case OP_LT: case OP_GT: case OP_LTE: case OP_GTE:
+            return vm_compare(a, b, op);
+        case OP_EQ: case OP_NEQ:
+            return vm_equality(a, b, op);
+        case OP_BITWISE_AND: case OP_BITWISE_OR: case OP_BITWISE_XOR: case OP_LSHIFT: case OP_RSHIFT:
+            return vm_bitwise(a, b, op);
+        case OP_IN:
+            return vm_in(a, b);
+        default:
+            error("Type mismatch in binary expression");
+            return aer_bool(false);
+    }
 }
 
 static AerVal vm_to_str(VM* vm, AerVal v) {
@@ -1732,39 +1781,41 @@ lbl_move: {
 /* Whole instruction — dest AND both RK operands — packed into the single op_word DISPATCH()
    already fetched (see PACK_BINARY's comment in vm.h). No further READ() at all: this is the
    entire reason binary operators get their own encoding instead of the ordinary PACK3+wide-word
-   scheme every other opcode uses. The operator itself is passed to vm_binary as a literal enum
-   constant (not a variable decoded from op_word) — since vm_binary is always_inline, the compiler
-   constant-folds away every branch in it that doesn't apply to that specific operator (the AND/OR/
-   IN checks, the other type-switch cases, ...), leaving straight-line code. That's the entire
-   point of having 18 labels instead of decoding one shared bin_op tag and switching on it at
-   runtime — this used to cost a second indirect branch on top of DISPATCH()'s own, for every
-   single arithmetic/comparison/bitwise op. */
-#define BINARY_OP_LABEL(label, opc) \
+   scheme every other opcode uses. Each label calls its own small category function (vm_arith/
+   vm_compare/vm_equality/vm_bitwise/vm_in, above) with a literal enum constant instead of a
+   variable decoded from op_word — since those are always_inline, the compiler still folds each
+   one's op-switch down to a single case at every one of these 18 call sites, same as calling one
+   shared vm_binary would. The difference (see those functions' own comment) is code size: each
+   category function only carries the type-check branches its own few operators can reach, so
+   there's far less to duplicate per site — inlining one do-everything vm_binary at all 18 sites
+   instead measurably regressed on real Raspberry Pi hardware (more instructions retired despite
+   fewer indirect jumps in isolation), presumably from exceeding the Pi's L1 instruction cache. */
+#define BINARY_OP_LABEL(label, call) \
 label: { \
     int dest  = (int)UNPACK_A(op_word); \
     AerVal b  = vm_rk_value20(vm, c, UNPACK_RK_B20(op_word)); \
     AerVal cc = vm_rk_value20(vm, c, UNPACK_RK_C20(op_word)); \
-    vm->registers[dest] = vm_binary(b, cc, opc); \
+    vm->registers[dest] = call; \
     DISPATCH(); \
 }
-BINARY_OP_LABEL(lbl_add, OP_ADD)
-BINARY_OP_LABEL(lbl_sub, OP_SUB)
-BINARY_OP_LABEL(lbl_mul, OP_MUL)
-BINARY_OP_LABEL(lbl_div, OP_DIV)
-BINARY_OP_LABEL(lbl_mod, OP_MOD)
-BINARY_OP_LABEL(lbl_floor_div, OP_FLOOR_DIV)
-BINARY_OP_LABEL(lbl_eq,  OP_EQ)
-BINARY_OP_LABEL(lbl_neq, OP_NEQ)
-BINARY_OP_LABEL(lbl_lt,  OP_LT)
-BINARY_OP_LABEL(lbl_gt,  OP_GT)
-BINARY_OP_LABEL(lbl_lte, OP_LTE)
-BINARY_OP_LABEL(lbl_gte, OP_GTE)
-BINARY_OP_LABEL(lbl_in,  OP_IN)
-BINARY_OP_LABEL(lbl_bitwise_and, OP_BITWISE_AND)
-BINARY_OP_LABEL(lbl_bitwise_or,  OP_BITWISE_OR)
-BINARY_OP_LABEL(lbl_bitwise_xor, OP_BITWISE_XOR)
-BINARY_OP_LABEL(lbl_lshift, OP_LSHIFT)
-BINARY_OP_LABEL(lbl_rshift, OP_RSHIFT)
+BINARY_OP_LABEL(lbl_add, vm_arith(b, cc, OP_ADD))
+BINARY_OP_LABEL(lbl_sub, vm_arith(b, cc, OP_SUB))
+BINARY_OP_LABEL(lbl_mul, vm_arith(b, cc, OP_MUL))
+BINARY_OP_LABEL(lbl_div, vm_arith(b, cc, OP_DIV))
+BINARY_OP_LABEL(lbl_mod, vm_arith(b, cc, OP_MOD))
+BINARY_OP_LABEL(lbl_floor_div, vm_arith(b, cc, OP_FLOOR_DIV))
+BINARY_OP_LABEL(lbl_eq,  vm_equality(b, cc, OP_EQ))
+BINARY_OP_LABEL(lbl_neq, vm_equality(b, cc, OP_NEQ))
+BINARY_OP_LABEL(lbl_lt,  vm_compare(b, cc, OP_LT))
+BINARY_OP_LABEL(lbl_gt,  vm_compare(b, cc, OP_GT))
+BINARY_OP_LABEL(lbl_lte, vm_compare(b, cc, OP_LTE))
+BINARY_OP_LABEL(lbl_gte, vm_compare(b, cc, OP_GTE))
+BINARY_OP_LABEL(lbl_in,  vm_in(b, cc))
+BINARY_OP_LABEL(lbl_bitwise_and, vm_bitwise(b, cc, OP_BITWISE_AND))
+BINARY_OP_LABEL(lbl_bitwise_or,  vm_bitwise(b, cc, OP_BITWISE_OR))
+BINARY_OP_LABEL(lbl_bitwise_xor, vm_bitwise(b, cc, OP_BITWISE_XOR))
+BINARY_OP_LABEL(lbl_lshift, vm_bitwise(b, cc, OP_LSHIFT))
+BINARY_OP_LABEL(lbl_rshift, vm_bitwise(b, cc, OP_RSHIFT))
 #undef BINARY_OP_LABEL
 
 /* M2 — control flow. Stack-neutral, same as the M1 opcodes above — reads vm->registers[]/the chunk
