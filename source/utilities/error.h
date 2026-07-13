@@ -1,6 +1,7 @@
 #ifndef ERROR_H
 #define ERROR_H
 
+#include <setjmp.h>
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -12,6 +13,15 @@ typedef enum Mode {
 extern Mode         mode;
 extern bool         parse_had_error;
 extern bool         runtime_had_error;
+
+/* NULL outside any vm_run() call (e.g. while parsing) — error()/error_at() only longjmp when this
+   is set, so a parse-time error keeps its old "set flags, return normally" behavior and the
+   parser's own recursive-descent recovery still runs unchanged. Set by vm_run() itself (vm.c) to
+   the address of a jmp_buf local to that call, saving/restoring whatever was there before, so
+   nested vm_run() calls (cross-module calls) each catch their own errors locally — nothing about
+   the flag-based cascade aer_module_call/aer_module_load already do (checking runtime_had_error
+   right after their own nested vm_run() returns) needed to change. */
+extern jmp_buf* runtime_error_unwind_target;
 
 /* Incremented by assert() on failure; deliberately not runtime_had_error, since DISPATCH() aborts vm_run on that flag but a failed assertion should report and keep going. */
 extern unsigned int assert_failure_count;

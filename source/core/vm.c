@@ -1595,6 +1595,21 @@ static void chunk_ensure_field_cache(Chunk* c) {
 
 bool vm_run(VM* vm) {
     Chunk* c = vm->chunk;
+    /* Installs this call's own catch point for error()/error_at() to longjmp back to, saving
+       whatever was previously active so a nested vm_run() (cross-module calls, via setup_call/
+       aer_module_call) catches its own errors and unwinds no further than here — restored before
+       every return below, so the caller's own catch point (if any) is exactly as it was. Nothing
+       about aer_module_load/aer_module_call's own post-call `if (runtime_had_error)` cascade
+       logic needed to change: runtime_had_error is still set by error() exactly as before, still
+       read by those call sites exactly where they already read it; only the per-instruction
+       DISPATCH() flag check is gone, replaced by jumping directly here the moment an error fires. */
+    jmp_buf  catch_point;
+    jmp_buf* saved_unwind_target = runtime_error_unwind_target;
+    runtime_error_unwind_target  = &catch_point;
+    if (setjmp(catch_point) != 0) {
+        runtime_error_unwind_target = saved_unwind_target;
+        return false;
+    }
     Opcode cur_op;
     /* The just-fetched instruction word, opcode and all — outer-scope for the same reason cur_op
        is: it must still be readable inside the handler body the goto jumps to, past the end of
@@ -1628,9 +1643,15 @@ bool vm_run(VM* vm) {
    not assumed) have no call at all, not a skipped one — a real Lua-style zero-cost dispatch for
    the common case, unlike the opcode_can_allocate[] gate this replaces (which still paid a
    lookup+branch on every dispatch, including the allocating ones, and measured as a net loss). */
-#define DISPATCH() do { if (runtime_had_error) return false; active_vm_for_errors = vm; unsigned int op_ip = vm->ip; op_word = READ(); cur_op = (Opcode)(op_word & 0xFF); c->debug_hits[op_ip]++; goto *dt[cur_op]; } while(0)
+/* No error check here anymore — error()/error_at() longjmp straight back to this call's own
+   catch_point (see vm_run's preamble, above) the moment a fault fires, instead of setting a flag
+   for the next DISPATCH() to notice. That was the last unconditional per-instruction cost left in
+   this macro after the GC-check relocation (see gc_maybe_collect's own comment, DISPATCH()'s
+   longtime neighbor) — this closes the other half of the gap explained to the user against Lua's
+   longjmp-based error propagation. */
+#define DISPATCH() do { active_vm_for_errors = vm; unsigned int op_ip = vm->ip; op_word = READ(); cur_op = (Opcode)(op_word & 0xFF); c->debug_hits[op_ip]++; goto *dt[cur_op]; } while(0)
 #else
-#define DISPATCH() do { if (runtime_had_error) return false; active_vm_for_errors = vm; op_word = READ(); cur_op = (Opcode)(op_word & 0xFF); goto *dt[cur_op]; } while(0)
+#define DISPATCH() do { active_vm_for_errors = vm; op_word = READ(); cur_op = (Opcode)(op_word & 0xFF); goto *dt[cur_op]; } while(0)
 #endif
 
     static const void* const dt[] = {
@@ -2338,5 +2359,6 @@ lbl_cast: {
 }
 
 lbl_halt:
+    runtime_error_unwind_target = saved_unwind_target;
     return true;
 }

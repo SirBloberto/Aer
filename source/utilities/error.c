@@ -10,6 +10,7 @@ bool         parse_had_error    = false;
 bool         runtime_had_error  = false;
 unsigned int assert_failure_count = 0;
 unsigned int (*runtime_line_lookup)(void) = NULL;
+jmp_buf*     runtime_error_unwind_target  = NULL;
 
 #define ERROR_MSG_MAX 2048
 
@@ -109,6 +110,14 @@ void error(char* format, ...) {
 
     parse_had_error   = true;
     runtime_had_error = true;
+
+    /* Jumps straight back to the currently-executing vm_run() call's own dispatch loop instead of
+       waiting for its next DISPATCH() to notice the flag (there is no such per-instruction check
+       anymore — see DISPATCH()'s own comment, vm.c). NULL here means no vm_run() call is active
+       (a parse-time error, or error()/error_at() called from parser.c) — falls through to the
+       same "set flags, return normally" behavior this always had, letting the parser's own
+       recursive-descent recovery run unchanged. */
+    if (runtime_error_unwind_target) longjmp(*runtime_error_unwind_target, 1);
 }
 
 /* Print a message pinpointing the current token in the source. */
@@ -154,4 +163,12 @@ void error_at(char* format, ...) {
 
     parse_had_error   = true;
     runtime_had_error = true;
+
+    /* Jumps straight back to the currently-executing vm_run() call's own dispatch loop instead of
+       waiting for its next DISPATCH() to notice the flag (there is no such per-instruction check
+       anymore — see DISPATCH()'s own comment, vm.c). NULL here means no vm_run() call is active
+       (a parse-time error, or error()/error_at() called from parser.c) — falls through to the
+       same "set flags, return normally" behavior this always had, letting the parser's own
+       recursive-descent recovery run unchanged. */
+    if (runtime_error_unwind_target) longjmp(*runtime_error_unwind_target, 1);
 }
