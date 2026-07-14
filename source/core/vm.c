@@ -12,8 +12,7 @@
 #include "value_box.h"
 
 /* Slab pools for heap types confirmed (via every free() site) to never be freed individually — alloc-speed only. Guarded since vm_init() reruns per VM/module import and would otherwise leak slabs. */
-/* long_pool: heap fallback for a TYPE_INTEGER outside AerVal's 47-bit inline range (value_box.h's AER_BIGFLAG_BIT); one boxed value is immutable, so no write barrier needed. */
-static Pool string_pool, array_pool, dict_pool, function_pool, long_pool, struct_pool;
+static Pool string_pool, array_pool, dict_pool, function_pool, struct_pool;
 static bool pools_initialized = false;
 
 /* struct_pool holds struct instances (AerArray with shape != NULL) as ONE allocation instead of
@@ -55,25 +54,8 @@ static void vm_pools_init_once(void) {
     pool_init(&array_pool,    sizeof(AerArray),    256);
     pool_init(&dict_pool,     sizeof(AerDict),      64);
     pool_init(&function_pool, sizeof(AerFunction),  64);
-    pool_init(&long_pool,     sizeof(long long),    64);
     pool_init(&struct_pool,   sizeof(AerArray) + MAX_STRUCT_FIELDS * sizeof(AerVal), 64);
     pools_initialized = true;
-}
-
-/* AerVal's factory for TYPE_INTEGER (defined here, not value_box.h, since it needs long_pool): in-range values encode inline, out-of-range values get one long_pool cell. */
-AerVal aer_int(long long n) {
-    if (n >= AER_INT47_MIN && n <= AER_INT47_MAX) {
-        AerVal v;
-        v.bits = AER_BOXED_TEST | ((uint64_t)TYPE_INTEGER << AER_TAG_SHIFT) |
-                 ((uint64_t)n & AER_INT47_MASK);
-        return v;
-    }
-    long long* box = pool_alloc(&long_pool);
-    *box = n;
-    AerVal v;
-    v.bits = AER_BOXED_TEST | ((uint64_t)TYPE_INTEGER << AER_TAG_SHIFT) |
-             AER_BIGFLAG_BIT | ((uint64_t)(uintptr_t)box & AER_INT47_MASK);
-    return v;
 }
 
 /* ------------------------------------------------------------------ */
@@ -87,8 +69,7 @@ static bool value_is_young(AerVal v) {
         case TYPE_ARRAY:    return pool_is_young(&array_pool,    aer_as_array(v));
         case TYPE_DICT:     return pool_is_young(&dict_pool,     aer_as_dict(v));
         case TYPE_FUNCTION: return pool_is_young(&function_pool, aer_as_function(v));
-        case TYPE_INTEGER:  return aer_int_is_boxed(v) && pool_is_young(&long_pool, aer_int_box_ptr(v));
-        default:            return false;
+        default:            return false;   /* null/boolean/integer/real have no heap cell — integers are never boxed under the tagged representation */
     }
 }
 
@@ -200,12 +181,8 @@ static void mark_value(AerVal v) {
         case TYPE_FUNCTION:
             mark_function(aer_as_function(v));
             break;
-        case TYPE_INTEGER:
-            /* Only an out-of-range integer has a heap cell (AER_BIGFLAG_BIT); a leaf like TYPE_STRING. */
-            if (aer_int_is_boxed(v)) pool_mark(&long_pool, aer_int_box_ptr(v));
-            break;
         default:
-            break;   /* null/boolean/real (and an inline integer) reference no heap cell */
+            break;   /* null/boolean/integer/real reference no heap cell — integers are never boxed under the tagged representation */
     }
 }
 
@@ -262,7 +239,6 @@ static void free_string(void* cell)   { free(((AerString*)cell)->data); }
 static void free_array(void* cell)    { free(((AerArray*)cell)->items); }
 static void free_dict(void* cell)     { dictmap_free(&((AerDict*)cell)->map); }   /* already frees every entry's key */
 static void free_function(void* cell) { (void)cell; }   /* nothing to free — no closure upvalues array anymore */
-static void free_long(void* cell)     { (void)cell; }   /* a bare long long — no heap references, immutable once created */
 static void free_struct(void* cell)   { (void)cell; }   /* items lives inline in this same cell — nothing separate to free */
 
 /* ------------------------------------------------------------------ */
@@ -275,7 +251,6 @@ static void gc_collect(VM* vm, bool minor) {
     pool_clear_marks(&array_pool);
     pool_clear_marks(&dict_pool);
     pool_clear_marks(&function_pool);
-    pool_clear_marks(&long_pool);
     pool_clear_marks(&struct_pool);
 
     mark_vm_roots(vm);
@@ -330,7 +305,6 @@ static void gc_collect(VM* vm, bool minor) {
     pool_sweep(&array_pool,    minor, free_array);
     pool_sweep(&dict_pool,     minor, free_dict);
     pool_sweep(&function_pool, minor, free_function);
-    pool_sweep(&long_pool,     minor, free_long);
     pool_sweep(&struct_pool,   minor, free_struct);
 }
 
@@ -356,8 +330,8 @@ static void gc_reset_alloc_counts(void) {
 /* Shared by aer_gc_stats and gc_maybe_collect's ceiling check — one place walking all pools' cell_state, not two. */
 static unsigned int gc_count_live_cells(void) {
     unsigned int total = 0;
-    Pool* pools[] = { &string_pool, &array_pool, &dict_pool, &function_pool, &long_pool, &struct_pool };
-    for (unsigned int p = 0; p < 6; p++) {
+    Pool* pools[] = { &string_pool, &array_pool, &dict_pool, &function_pool, &struct_pool };
+    for (unsigned int p = 0; p < 5; p++) {
         Pool* pool = pools[p];
         for (unsigned int i = 0; i < pool->slab_count; i++) {
             unsigned int count = (i == pool->slab_count - 1) ? pool->next_index : pool->elems_per_slab;
@@ -500,9 +474,6 @@ void aer_debug_memory_report(FILE* out) {
         }
     }
     fprintf(out, "  function header %10llu B  payload %10llu B\n", fn_hdr, fn_payload);
-
-    unsigned long long long_hdr = (unsigned long long)long_pool.slab_count * long_pool.elems_per_slab * long_pool.stride;
-    fprintf(out, "  long     reserved %9llu B (no separate payload)\n", long_hdr);
 
     /* struct_pool cells are fixed-size (sizeof(AerArray) + MAX_STRUCT_FIELDS*sizeof(AerVal)) —
        "header" here is the fixed per-cell reservation, "payload" is the sum of each live
@@ -1000,6 +971,93 @@ static inline __attribute__((always_inline)) AerVal vm_binary(AerVal a, AerVal b
         }
     }
 
+    /* null equality: null == null is true; null op anything-else errors */
+    if (ta == TYPE_NULL || tb == TYPE_NULL) {
+        if (op == OP_EQ)  return aer_bool(ta == TYPE_NULL && tb == TYPE_NULL);
+        if (op == OP_NEQ) return aer_bool(!(ta == TYPE_NULL && tb == TYPE_NULL));
+        error("Operator not valid for null"); return aer_bool(false);
+    }
+
+    if (ta == TYPE_REAL || tb == TYPE_REAL) {
+        a = vm_promote_real(a);
+        b = vm_promote_real(b);
+    }
+
+    if (aer_type(a) == TYPE_REAL && aer_type(b) == TYPE_REAL) {
+        double l = aer_as_real(a), rv = aer_as_real(b);
+        switch (op) {
+            case OP_ADD: return aer_real(l + rv);
+            case OP_SUB: return aer_real(l - rv);
+            case OP_MUL: return aer_real(l * rv);
+            case OP_DIV:
+                if (rv == 0.0) { error("Division by zero"); return aer_real(0.0); }
+                return aer_real(l / rv);
+            case OP_FLOOR_DIV:
+                if (rv == 0.0) { error("Division by zero"); return aer_real(0.0); }
+                return aer_real(floor(l / rv));
+            case OP_MOD: return aer_real(fmod(l, rv));
+            case OP_EQ:  return aer_bool(l == rv);
+            case OP_NEQ: return aer_bool(l != rv);
+            case OP_LT:  return aer_bool(l <  rv);
+            case OP_GT:  return aer_bool(l >  rv);
+            case OP_LTE: return aer_bool(l <= rv);
+            case OP_GTE: return aer_bool(l >= rv);
+            default: error("Operator not valid for reals"); return aer_real(0.0);
+        }
+    }
+
+    if (aer_type(a) == TYPE_BOOLEAN && aer_type(b) == TYPE_BOOLEAN) {
+        if (op == OP_EQ)  return aer_bool(aer_as_bool(a) == aer_as_bool(b));
+        if (op == OP_NEQ) return aer_bool(aer_as_bool(a) != aer_as_bool(b));
+        error("Operator not valid for booleans"); return aer_bool(false);
+    }
+
+    if (aer_type(a) == TYPE_STRING && aer_type(b) == TYPE_STRING) {
+        AerString* as = aer_as_string(a);
+        AerString* bs = aer_as_string(b);
+        bool eq = as->length == bs->length &&
+                  strncmp(as->data, bs->data, as->length) == 0;
+        if (op == OP_EQ)  return aer_bool(eq);
+        if (op == OP_NEQ) return aer_bool(!eq);
+        if (op == OP_ADD) {
+            unsigned int len = as->length + bs->length;
+            char* buf = xmalloc(len + 1);
+            memcpy(buf, as->data, as->length);
+            memcpy(buf + as->length, bs->data, bs->length);
+            buf[len] = '\0';
+            /* aer_make_string takes ownership of buf directly; no pool interning needed since this string is used once, right here (see vm_to_str's comment). */
+            return aer_make_string(buf, len);
+        }
+        error("Operator not valid for strings"); return aer_bool(false);
+    }
+
+    if (aer_type(a) == TYPE_ARRAY && aer_type(b) == TYPE_ARRAY) {
+        if (op == OP_EQ)  return aer_bool(aer_as_array(a) == aer_as_array(b));
+        if (op == OP_NEQ) return aer_bool(aer_as_array(a) != aer_as_array(b));
+        error("Operator not valid for arrays"); return aer_bool(false);
+    }
+
+    if (aer_type(a) == TYPE_DICT && aer_type(b) == TYPE_DICT) {
+        if (op == OP_EQ)  return aer_bool(aer_as_dict(a) == aer_as_dict(b));
+        if (op == OP_NEQ) return aer_bool(aer_as_dict(a) != aer_as_dict(b));
+        error("Operator not valid for dicts"); return aer_bool(false);
+    }
+
+    error("Type mismatch in binary expression");
+    return aer_bool(false);
+}
+
+/* Cold path for the per-operator OP_ADD/OP_SUB/.../OP_GTE labels in vm_run() (see PACK_BINARY's
+   own comment, vm.h) — everything vm_binary() handles after its int/int and real/real fast paths,
+   which each label now checks locally before ever calling here. Deliberately a real, non-inlined
+   function rather than always_inline like vm_binary() itself: this path only runs for the rare
+   case (anything that isn't int-int or real-real arithmetic/comparison), so the ARM32
+   argument-passing cost that motivates vm_binary's own always_inline doesn't matter here — and
+   NOT inlining it avoids duplicating this whole body across all ~17 per-operator labels, the
+   icache-bloat hazard this codebase already measured as a real regression once (see
+   vm_binary_icache_split notes). ta/tb are passed in rather than recomputed since every caller
+   already computed them for its own fast-path check. */
+static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
     /* null equality: null == null is true; null op anything-else errors */
     if (ta == TYPE_NULL || tb == TYPE_NULL) {
         if (op == OP_EQ)  return aer_bool(ta == TYPE_NULL && tb == TYPE_NULL);
@@ -1655,17 +1713,37 @@ bool vm_run(VM* vm) {
 #endif
 
     static const void* const dt[] = {
-        /* OP_ADD..OP_RSHIFT/OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR have no entries here at all —
-           they're never dispatched as a standalone instruction, only ever embedded as a
-           bin_op/unary_op TAG inside an OP_BINARY/OP_UNARY/etc. instruction's packed word (see
-           PACK3's comment above); indexing dt[] with cur_op only happens right after DISPATCH()
-           reads a genuine top-level instruction word, which is never one of these. */
+        /* OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR have no entries here at all — they're never
+           dispatched as a standalone instruction, only ever embedded as a unary_op TAG inside an
+           OP_UNARY instruction's packed word (see PACK3's comment above). OP_ADD..OP_RSHIFT/OP_IN
+           below, by contrast, ARE real top-level dispatch targets now — true single-level dispatch
+           for binary operators (see PACK_BINARY's own comment, vm.h): each one is dispatched
+           directly by DISPATCH()'s computed-goto instead of riding along as a second-level
+           bin_op tag re-dispatched via vm_binary()'s runtime switch. OP_AND/OP_OR/OP_PIPE still
+           have no entries — still genuinely never dispatched (see their own comment, vm.h). */
+        [OP_ADD]         = &&lbl_add,
+        [OP_SUB]         = &&lbl_sub,
+        [OP_MUL]         = &&lbl_mul,
+        [OP_DIV]         = &&lbl_div,
+        [OP_MOD]         = &&lbl_mod,
+        [OP_FLOOR_DIV]   = &&lbl_floor_div,
+        [OP_EQ]          = &&lbl_eq,
+        [OP_NEQ]         = &&lbl_neq,
+        [OP_LT]          = &&lbl_lt,
+        [OP_GT]          = &&lbl_gt,
+        [OP_LTE]         = &&lbl_lte,
+        [OP_GTE]         = &&lbl_gte,
+        [OP_IN]          = &&lbl_in,
+        [OP_BITWISE_AND] = &&lbl_bitwise_and,
+        [OP_BITWISE_OR]  = &&lbl_bitwise_or,
+        [OP_BITWISE_XOR] = &&lbl_bitwise_xor,
+        [OP_LSHIFT]      = &&lbl_lshift,
+        [OP_RSHIFT]      = &&lbl_rshift,
         [OP_JUMP]           = &&lbl_jump,
         [OP_DEFINE_STRUCT]  = &&lbl_define_struct,
         [OP_HALT]           = &&lbl_halt,
         [OP_LOADK]       = &&lbl_loadk,
         [OP_MOVE]        = &&lbl_move,
-        [OP_BINARY]      = &&lbl_binary,
         [OP_JUMP_IF_FALSE_REG] = &&lbl_jump_if_false_reg,
         [OP_CMP_JUMP_FALSE]    = &&lbl_cmp_jump_false,
         [OP_CALL]              = &&lbl_call,
@@ -1740,17 +1818,120 @@ lbl_move: {
     DISPATCH();
 }
 
-/* Whole instruction — dest, bin_op, AND both RK operands — packed into the single op_word DISPATCH()
-   already fetched (see PACK_BINARY's comment in vm.h). No further READ() at all: this is the
-   entire reason OP_BINARY gets its own encoding instead of the ordinary PACK3+wide-word scheme
-   every other opcode uses. */
-lbl_binary: {
-    int dest      = (int)UNPACK_A(op_word);
-    Opcode bin_op = (Opcode)UNPACK_B(op_word);
-    AerVal b  = vm_rk_value20(vm, c, UNPACK_RK_B20(op_word));
-    AerVal cc = vm_rk_value20(vm, c, UNPACK_RK_C20(op_word));
-    vm->registers[dest] = vm_binary(b, cc, bin_op);
-    gc_maybe_collect(vm);   /* vm_binary can allocate (aer_int overflow-box, aer_make_string ADD concat); result already rooted above */
+/* Dest + both RK operands packed into the single op_word DISPATCH() already fetched (see
+   PACK_BINARY's comment in vm.h) — no further READ() at all. Each operator below is its own
+   top-level dispatch target (true single-level dispatch, matching Lua's per-operator opcodes)
+   instead of a shared OP_BINARY re-dispatching via vm_binary()'s runtime switch: DISPATCH()'s
+   computed-goto already picked the exact right label, so there's no second jump to make. Each
+   label checks its own int/int (and, where it applies, real/real) fast path locally — the common
+   case for arithmetic-heavy code — and falls back to vm_binary_cold() (a real, non-inlined
+   function; see its own comment above) only for anything else: nulls, strings, booleans, arrays,
+   dicts, or a genuinely mixed int/real pair needing promotion. BINARY_OP_INT_REAL is for operators
+   with both a fast int/int and fast real/real case; BINARY_OP_INT_ONLY is for the five bitwise/
+   shift operators, which have no real/real meaning (vm_binary_cold's real/real switch already
+   errors "Operator not valid for reals" for these, same as vm_binary's always has). */
+#define BINARY_OP_INT_REAL(NAME, OPENUM, INT_STMT, REAL_STMT) \
+lbl_##NAME: { \
+    int dest = (int)UNPACK_A(op_word); \
+    AerVal ra = vm_rk_value20(vm, c, UNPACK_RK_B20(op_word)); \
+    AerVal rb = vm_rk_value20(vm, c, UNPACK_RK_C20(op_word)); \
+    ValueType ta = aer_type(ra), tb = aer_type(rb); \
+    AerVal result; \
+    if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) { \
+        long long l = aer_as_int(ra), rv = aer_as_int(rb); \
+        INT_STMT \
+    } else if (ta == TYPE_REAL && tb == TYPE_REAL) { \
+        double l = aer_as_real(ra), rv = aer_as_real(rb); \
+        REAL_STMT \
+    } else { \
+        result = vm_binary_cold(ra, rb, OPENUM, ta, tb); \
+    } \
+    vm->registers[dest] = result; \
+    gc_maybe_collect(vm); \
+    DISPATCH(); \
+}
+#define BINARY_OP_INT_ONLY(NAME, OPENUM, INT_STMT) \
+lbl_##NAME: { \
+    int dest = (int)UNPACK_A(op_word); \
+    AerVal ra = vm_rk_value20(vm, c, UNPACK_RK_B20(op_word)); \
+    AerVal rb = vm_rk_value20(vm, c, UNPACK_RK_C20(op_word)); \
+    ValueType ta = aer_type(ra), tb = aer_type(rb); \
+    AerVal result; \
+    if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) { \
+        long long l = aer_as_int(ra), rv = aer_as_int(rb); \
+        INT_STMT \
+    } else { \
+        result = vm_binary_cold(ra, rb, OPENUM, ta, tb); \
+    } \
+    vm->registers[dest] = result; \
+    gc_maybe_collect(vm); \
+    DISPATCH(); \
+}
+
+BINARY_OP_INT_REAL(add, OP_ADD, { result = aer_int(l + rv); }, { result = aer_real(l + rv); })
+BINARY_OP_INT_REAL(sub, OP_SUB, { result = aer_int(l - rv); }, { result = aer_real(l - rv); })
+BINARY_OP_INT_REAL(mul, OP_MUL, { result = aer_int(l * rv); }, { result = aer_real(l * rv); })
+BINARY_OP_INT_REAL(div, OP_DIV,
+    { if (rv == 0) { error("Division by zero"); result = aer_int(0); } else { result = aer_real((double)l / (double)rv); } },
+    { if (rv == 0.0) { error("Division by zero"); result = aer_real(0.0); } else { result = aer_real(l / rv); } })
+BINARY_OP_INT_REAL(floor_div, OP_FLOOR_DIV,
+    { if (rv == 0) { error("Division by zero"); result = aer_int(0); } else { result = aer_int((long long)floor((double)l / (double)rv)); } },
+    { if (rv == 0.0) { error("Division by zero"); result = aer_real(0.0); } else { result = aer_real(floor(l / rv)); } })
+BINARY_OP_INT_REAL(mod, OP_MOD,
+    { if (rv == 0) { error("Modulo by zero"); result = aer_int(0); } else { result = aer_int(l % rv); } },
+    { result = aer_real(fmod(l, rv)); })
+BINARY_OP_INT_REAL(eq,  OP_EQ,  { result = aer_bool(l == rv); }, { result = aer_bool(l == rv); })
+BINARY_OP_INT_REAL(neq, OP_NEQ, { result = aer_bool(l != rv); }, { result = aer_bool(l != rv); })
+BINARY_OP_INT_REAL(lt,  OP_LT,  { result = aer_bool(l <  rv); }, { result = aer_bool(l <  rv); })
+BINARY_OP_INT_REAL(gt,  OP_GT,  { result = aer_bool(l >  rv); }, { result = aer_bool(l >  rv); })
+BINARY_OP_INT_REAL(lte, OP_LTE, { result = aer_bool(l <= rv); }, { result = aer_bool(l <= rv); })
+BINARY_OP_INT_REAL(gte, OP_GTE, { result = aer_bool(l >= rv); }, { result = aer_bool(l >= rv); })
+BINARY_OP_INT_ONLY(bitwise_and, OP_BITWISE_AND, { result = aer_int(l & rv); })
+BINARY_OP_INT_ONLY(bitwise_or,  OP_BITWISE_OR,  { result = aer_int(l | rv); })
+BINARY_OP_INT_ONLY(bitwise_xor, OP_BITWISE_XOR, { result = aer_int(l ^ rv); })
+BINARY_OP_INT_ONLY(lshift, OP_LSHIFT, { result = aer_int(l << rv); })
+BINARY_OP_INT_ONLY(rshift, OP_RSHIFT, { result = aer_int(l >> rv); })
+
+#undef BINARY_OP_INT_REAL
+#undef BINARY_OP_INT_ONLY
+
+/* `in` has no int/int or real/real fast path of its own — dict-key lookup or an array element
+   scan either way — so it's just its own label with the same dict/array logic vm_binary() used to
+   share with every other operator via its runtime switch, verbatim. */
+lbl_in: {
+    int dest = (int)UNPACK_A(op_word);
+    AerVal a = vm_rk_value20(vm, c, UNPACK_RK_B20(op_word));
+    AerVal b = vm_rk_value20(vm, c, UNPACK_RK_C20(op_word));
+    AerVal result;
+    if (aer_type(b) == TYPE_DICT) {
+        if (aer_type(a) != TYPE_STRING) {
+            error("Left side of 'in' must be a string when testing dict membership");
+            result = aer_bool(false);
+        } else {
+            AerString* as = aer_as_string(a);
+            unsigned int klen = as->length;
+            if (klen > VM_KEY_MAX) {
+                error("Dict key too long (max %d bytes)", VM_KEY_MAX);
+                result = aer_bool(false);
+            } else {
+                char kbuf[VM_KEY_MAX + 1];
+                memcpy(kbuf, as->data, klen);
+                kbuf[klen] = '\0';
+                result = aer_bool(dictmap_get(&aer_as_dict(b)->map, kbuf) != NULL);
+            }
+        }
+    } else if (aer_type(b) == TYPE_ARRAY) {
+        AerArray* arr = aer_as_array(b);
+        bool found = false;
+        for (unsigned int i = 0; i < arr->count; i++) {
+            if (values_equal(a, arr->items[i])) { found = true; break; }
+        }
+        result = aer_bool(found);
+    } else {
+        error("Right side of 'in' must be a dict or array");
+        result = aer_bool(false);
+    }
+    vm->registers[dest] = result;
     DISPATCH();
 }
 

@@ -211,10 +211,10 @@ int main(void) {
         unsigned int exit_patch = emit_cmp_jump_false(&c, /*rk_i=*/1, OP_LT, /*rk_5=*/(int)pool_five | RK_CONST_FLAG);
 
         /* sum = sum + i — writes directly into register 0, no new allocation. */
-        chunk_emit(&c, PACK_BINARY(0, OP_ADD, 0, 1));
+        chunk_emit(&c, PACK_BINARY(OP_ADD, 0, 0, 1));
 
         /* i = i + 1 — writes directly into register 1, no new allocation. */
-        chunk_emit(&c, PACK_BINARY(1, OP_ADD, 1, (int)pool_one | RK_CONST_FLAG));
+        chunk_emit(&c, PACK_BINARY(OP_ADD, 1, 1, (int)pool_one | RK_CONST_FLAG));
 
         chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
 
@@ -309,11 +309,11 @@ int main(void) {
                                                                 /*rk_1=*/(int)pool_1 | RK_CONST_FLAG);
 
         /* Recursive case (n > 1): reg1 = n - 1; reg2 = factorial(reg1); reg3 = n * reg2; return reg3 */
-        chunk_emit(&c, PACK_BINARY(1, OP_SUB, 0, (int)pool_1 | RK_CONST_FLAG));
+        chunk_emit(&c, PACK_BINARY(OP_SUB, 1, 0, (int)pool_1 | RK_CONST_FLAG));
 
         emit_call(&c, /*dest_reg=*/2, callee_offset, /*arg_reg_base=*/1, /*arg_count=*/1);
 
-        chunk_emit(&c, PACK_BINARY(3, OP_MUL, 0, 2));
+        chunk_emit(&c, PACK_BINARY(OP_MUL, 3, 0, 2));
         emit_return(&c, 3);
 
         /* Base case (n <= 1): return 1. OP_RETURN above jumps away, so this is only ever
@@ -419,7 +419,7 @@ int main(void) {
         emit_array_new(&c, /*dest=*/5, /*item_reg_base=*/0, /*item_count=*/3);
 
         /* i = i + 1 */
-        chunk_emit(&c, PACK_BINARY(4, OP_ADD, 4, (int)pool_one | RK_CONST_FLAG));
+        chunk_emit(&c, PACK_BINARY(OP_ADD, 4, 4, (int)pool_one | RK_CONST_FLAG));
 
         chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
         patch_jump(&c, exit_patch, c.count);
@@ -539,7 +539,7 @@ int main(void) {
                                                             /*item_dest_reg=*/6);
 
         /* sum = sum + item */
-        chunk_emit(&c, PACK_BINARY(5, OP_ADD, 5, 6));
+        chunk_emit(&c, PACK_BINARY(OP_ADD, 5, 5, 6));
 
         chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
         patch_jump(&c, exit_patch, c.count);

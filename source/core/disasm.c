@@ -36,20 +36,41 @@ typedef struct {
 #define OP_INFO_MAX OP_PRINT_REPL
 
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
-    /* OP_ADD..OP_RSHIFT/OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR are never dispatched as a
-       standalone instruction — only ever embedded as a bin_op/unary_op TAG inside OP_BINARY/
-       OP_CMP_JUMP_FALSE/OP_UNARY/OP_BINARY_FIELD/OP_FIELD_BINARY's packed word. They
-       still need a `.name`-only entry here: print_field's FLD_BINOP case calls opcode_name(word) to
-       render that embedded tag, which reads straight out of this table. Their `desc`/`fields` are
-       never used (disassemble_one only reaches those for an instruction actually fetched via
-       DISPATCH(), which these opcode values never are), so left blank. */
-    [OP_ADD] = { "OP_ADD" }, [OP_SUB] = { "OP_SUB" }, [OP_MUL] = { "OP_MUL" },
-    [OP_DIV] = { "OP_DIV" }, [OP_MOD] = { "OP_MOD" }, [OP_FLOOR_DIV] = { "OP_FLOOR_DIV" },
-    [OP_EQ] = { "OP_EQ" }, [OP_NEQ] = { "OP_NEQ" }, [OP_LT] = { "OP_LT" }, [OP_GT] = { "OP_GT" },
-    [OP_LTE] = { "OP_LTE" }, [OP_GTE] = { "OP_GTE" }, [OP_IN] = { "OP_IN" },
+    /* OP_ADD..OP_RSHIFT/OP_IN are now real top-level dispatch targets, one opcode per operator
+       (true single-level dispatch — see PACK_BINARY's own comment, vm.h) instead of riding along
+       as a bin_op TAG inside a shared OP_BINARY word. Each gets a full entry, special-cased below
+       in disassemble_one exactly like OP_BINARY used to be (dest + both RK operands all live in
+       the one descriptor word, nothing trails) — see binary_op_dispatched(). `fields`/`packed`
+       aren't actually read for special-cased opcodes (only `.name`/`.desc` are), kept here purely
+       for documentation, matching the convention every other packed opcode in this table uses. */
+    [OP_ADD] = { "OP_ADD", "reg = rk + rk", {FLD_REG}, false, 1 },
+    [OP_SUB] = { "OP_SUB", "reg = rk - rk", {FLD_REG}, false, 1 },
+    [OP_MUL] = { "OP_MUL", "reg = rk * rk", {FLD_REG}, false, 1 },
+    [OP_DIV] = { "OP_DIV", "reg = rk / rk", {FLD_REG}, false, 1 },
+    [OP_MOD] = { "OP_MOD", "reg = rk % rk", {FLD_REG}, false, 1 },
+    [OP_FLOOR_DIV] = { "OP_FLOOR_DIV", "reg = rk // rk", {FLD_REG}, false, 1 },
+    [OP_EQ]  = { "OP_EQ",  "reg = rk == rk", {FLD_REG}, false, 1 },
+    [OP_NEQ] = { "OP_NEQ", "reg = rk != rk", {FLD_REG}, false, 1 },
+    [OP_LT]  = { "OP_LT",  "reg = rk < rk",  {FLD_REG}, false, 1 },
+    [OP_GT]  = { "OP_GT",  "reg = rk > rk",  {FLD_REG}, false, 1 },
+    [OP_LTE] = { "OP_LTE", "reg = rk <= rk", {FLD_REG}, false, 1 },
+    [OP_GTE] = { "OP_GTE", "reg = rk >= rk", {FLD_REG}, false, 1 },
+    [OP_IN]  = { "OP_IN",  "reg = rk in rk", {FLD_REG}, false, 1 },
+    [OP_BITWISE_AND] = { "OP_BITWISE_AND", "reg = rk & rk",  {FLD_REG}, false, 1 },
+    [OP_BITWISE_OR]  = { "OP_BITWISE_OR",  "reg = rk | rk",  {FLD_REG}, false, 1 },
+    [OP_BITWISE_XOR] = { "OP_BITWISE_XOR", "reg = rk ^ rk",  {FLD_REG}, false, 1 },
+    [OP_LSHIFT] = { "OP_LSHIFT", "reg = rk << rk", {FLD_REG}, false, 1 },
+    [OP_RSHIFT] = { "OP_RSHIFT", "reg = rk >> rk", {FLD_REG}, false, 1 },
+
+    /* OP_AND/OP_OR/OP_PIPE/OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR are never dispatched as a
+       standalone instruction — OP_AND/OP_OR/OP_PIPE purely as parser.c operator-token lookup tags
+       (see their own comment, vm.h), the unary ones only ever embedded as a unary_op TAG inside
+       OP_UNARY's packed word. They still need a `.name`-only entry here: print_field's FLD_BINOP
+       case calls opcode_name(word) to render an embedded tag like that, which reads straight out
+       of this table. Their `desc`/`fields` are never used (disassemble_one only reaches those for
+       an instruction actually fetched via DISPATCH(), which these opcode values never are), so
+       left blank. */
     [OP_AND] = { "OP_AND" }, [OP_OR] = { "OP_OR" }, [OP_PIPE] = { "OP_PIPE" },
-    [OP_BITWISE_AND] = { "OP_BITWISE_AND" }, [OP_BITWISE_OR] = { "OP_BITWISE_OR" },
-    [OP_BITWISE_XOR] = { "OP_BITWISE_XOR" }, [OP_LSHIFT] = { "OP_LSHIFT" }, [OP_RSHIFT] = { "OP_RSHIFT" },
     [OP_NEGATE] = { "OP_NEGATE" }, [OP_NOT] = { "OP_NOT" }, [OP_BITWISE_NOT] = { "OP_BITWISE_NOT" },
     [OP_TO_STR] = { "OP_TO_STR" },
 
@@ -180,6 +201,21 @@ static void print_rk20(FILE* out, Chunk* c, unsigned long long rk) {
     else                          fprintf(out, "  rk=reg%llu", rk & RK20_INDEX_MASK);
 }
 
+/* True for the 18 per-operator opcodes sharing PACK_BINARY's encoding (dest + both RK operands,
+   all in the one descriptor word — see PACK_BINARY's own comment, vm.h). Each used to be a single
+   bin_op TAG value inside a shared OP_BINARY word; now each is its own top-level dispatch target,
+   but the word shape (and so the decoding needed here) is identical across all of them. */
+static bool binary_op_dispatched(Opcode op) {
+    switch (op) {
+        case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_FLOOR_DIV:
+        case OP_EQ: case OP_NEQ: case OP_LT: case OP_GT: case OP_LTE: case OP_GTE: case OP_IN:
+        case OP_BITWISE_AND: case OP_BITWISE_OR: case OP_BITWISE_XOR: case OP_LSHIFT: case OP_RSHIFT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     unsigned long long op_word = c->code[offset];
     Opcode op = (Opcode)(op_word & 0xFF);
@@ -200,13 +236,14 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
             print_pool_value(out, c->pool[fdefault_idx]);
         }
         fprintf(out, "]");
-    } else if (op == OP_BINARY) {
-        /* Packed single-word encoding (PACK_BINARY, vm.h) — dest/bin_op still come from A/B like
-           any other packed opcode, but both RK operands live in THIS SAME word (bits 24-43/44-63)
-           instead of trailing words, so they're decoded here rather than through the generic
-           fields[]-driven loop below (which OP_BINARY's own op_info entry has no entries left for). */
-        print_field(out, c, FLD_REG,   (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
+    } else if (binary_op_dispatched(op)) {
+        /* Packed single-word encoding (PACK_BINARY, vm.h) — dest comes from A like any other
+           packed opcode, and both RK operands live in THIS SAME word (bits 16-35/36-55) instead of
+           trailing words, so they're decoded here rather than through the generic fields[]-driven
+           loop below (which each of these opcodes' own op_info entry has no entries left for).
+           There's no bin_op field to print anymore — the opcode itself (already printed via
+           opcode_name() above) IS the operator. */
+        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rk20(out, c, UNPACK_RK_B20(op_word));
         print_rk20(out, c, UNPACK_RK_C20(op_word));
     } else if (op == OP_INDEX_GET) {

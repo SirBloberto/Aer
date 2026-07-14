@@ -346,13 +346,20 @@ typedef enum {
 #define UNPACK_B(word) (((word) >> 16) & 0xFF)
 #define UNPACK_C(word) (((word) >> 24) & 0xFF)
 
-/* OP_BINARY alone gets a dedicated single-64-bit-word encoding: it's the single hottest opcode in
-   arithmetic-heavy code (over a third of all dispatches on nbody.aer), and the ordinary PACK3/RK
-   scheme above still costs it 3 separate code-array fetches per dispatch (op_word, rk_b, rk_c) —
-   one DISPATCH() fetch of op_word, then two more READ()s just to find out what to compute. Once
-   code[] is a 64-bit-word array (see Chunk's own comment above), opcode(8) + dest(8) + bin_op(8) +
-   two 20-bit RK operands (52 bits) fits in one word with room to spare, cutting OP_BINARY to the
-   ONE fetch DISPATCH() already does for every opcode, unconditionally.
+/* Binary operators each get their own top-level opcode (OP_ADD, OP_SUB, OP_EQ, ... OP_IN) dispatched
+   directly by vm_run()'s computed-goto — true single-level dispatch, matching Lua's per-operator
+   opcodes, instead of routing every arithmetic/comparison/bitwise op through one shared OP_BINARY
+   opcode that then re-dispatches internally via a runtime switch (see vm_binary()'s own comment,
+   vm.c, for why that second level cost real per-dispatch instructions). All of them still share
+   this single dedicated 64-bit-word encoding — it's the hottest opcode class in arithmetic-heavy
+   code (over a third of all dispatches on nbody.aer), and the ordinary PACK3/RK scheme above still
+   costs 3 separate code-array fetches per dispatch (op_word, rk_b, rk_c) — one DISPATCH() fetch of
+   op_word, then two more READ()s just to find out what to compute. Once code[] is a 64-bit-word
+   array (see Chunk's own comment above), opcode(8) + dest(8) + two 20-bit RK operands (48 bits)
+   fits in one word with room to spare (8 bits unused, bits 56-63), cutting every binary op to the
+   ONE fetch DISPATCH() already does for every opcode, unconditionally. There's no separate bin_op
+   field anymore — the operator IS the opcode now, so the field that used to carry it as data is
+   simply gone, not narrowed elsewhere; the two RK operands keep their original 20-bit width.
      This compact RK operand needs its own (narrower) flag/index split — RK20_CONST_FLAG at bit 19
    rather than RK_CONST_FLAG's bit 30 — since 20 bits total has to hold both the flag and the
    index. 19 index bits (524288 slots) is still enormous headroom over both FRAME_REGISTERS (128)
@@ -367,14 +374,13 @@ typedef enum {
     (((rk) & RK_CONST_FLAG) \
         ? (RK20_CONST_FLAG | ((unsigned long long)((rk) & ~RK_CONST_FLAG) & RK20_INDEX_MASK)) \
         : ((unsigned long long)(rk) & RK20_INDEX_MASK))
-#define PACK_BINARY(dest, bin_op, rk_b, rk_c) \
-    ( ((unsigned long long)(OP_BINARY) & 0xFF) \
-    | (((unsigned long long)(dest)   & 0xFF) << 8) \
-    | (((unsigned long long)(bin_op) & 0xFF) << 16) \
-    | ((PACK_RK20(rk_b) & 0xFFFFFULL) << 24) \
-    | ((PACK_RK20(rk_c) & 0xFFFFFULL) << 44) )
-#define UNPACK_RK_B20(word) (((word) >> 24) & 0xFFFFFULL)
-#define UNPACK_RK_C20(word) (((word) >> 44) & 0xFFFFFULL)
+#define PACK_BINARY(op, dest, rk_b, rk_c) \
+    ( ((unsigned long long)(op)   & 0xFF) \
+    | (((unsigned long long)(dest) & 0xFF) << 8) \
+    | ((PACK_RK20(rk_b) & 0xFFFFFULL) << 16) \
+    | ((PACK_RK20(rk_c) & 0xFFFFFULL) << 36) )
+#define UNPACK_RK_B20(word) (((word) >> 16) & 0xFFFFFULL)
+#define UNPACK_RK_C20(word) (((word) >> 36) & 0xFFFFFULL)
 
 /* Slice A of the same single-word treatment, extended to the next-hottest opcodes. A register
    field only needs 7 bits here (not RK's 8) — exactly FRAME_REGISTERS, no headroom wasted —

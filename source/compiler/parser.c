@@ -70,7 +70,7 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
         error_at("Expression too large to compile (register/constant index exceeds the binary-op encoding's range)");
         return;
     }
-    chunk_emit(c, PACK_BINARY(dest, op, rk_lhs, rk_rhs));
+    chunk_emit(c, PACK_BINARY(op, dest, rk_lhs, rk_rhs));
 }
 
 int compile_node(Chunk* c, Node* node) {

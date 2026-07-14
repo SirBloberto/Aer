@@ -28,19 +28,27 @@ typedef enum ValueType {
     TYPE_DICT,
 } ValueType;
 
-/* AerVal: the internal, NaN-boxed 8-byte runtime value — every VM stack slot,
-   scope variable, array element, dict entry, and struct field is one of
-   these, not a Value. A word is a genuine IEEE-754 double UNLESS it matches
-   a reserved bit pattern (sign=0, exponent=0x7FF, quiet-bit=1) — that region
-   is repurposed to carry one of the 8 ValueTypes above in 3 tag bits plus a
-   48-bit payload (a pointer, or — for TYPE_INTEGER — a 47-bit inline integer
-   with a heap-boxed 64-bit fallback for the rare overflow case). See
-   value_box.h for the full encode/decode logic and accessor functions;
-   nothing outside that header and vm.c's `long_pool` wiring should ever read
-   `.bits`/`.dbl` directly. */
-typedef union AerVal {
-    uint64_t bits;
-    double   dbl;
+/* AerVal: the internal runtime value, as an explicit tagged union — every VM stack slot, scope
+   variable, array element, dict entry, and struct field is one of these, not a Value. Replaced a
+   NaN-boxed 8-byte encoding (a genuine double unless it matched a reserved bit pattern, which was
+   then reinterpreted as a 3-bit tag + packed payload) after measuring, via direct machine-code
+   disassembly against Lua's equivalent value representation, that NaN-boxing's decode cost
+   (masking and shifting a word to test and extract that tag on every single touch) was the
+   dominant remaining cost gap in the whole interpreter — a plain tag field is one aligned load,
+   no decode at all. See value_box.h for the accessor functions.
+     The tag MUST default to TYPE_NULL (0) on zero-init — mark_vm_roots (vm.c) scans every
+   register unconditionally, relying on a never-yet-written register decoding as a harmless leaf
+   value. TYPE_NULL is declared first in ValueType above specifically so this holds automatically
+   for any zero-initialized AerVal, the same invariant this file already documents for the public
+   Value struct above ("zero-value; (Value){0} is null"). */
+typedef struct AerVal {
+    ValueType tag;
+    union {
+        bool      b;
+        long long i;
+        double    d;
+        void*     ptr;
+    } as;
 } AerVal;
 
 typedef union ValueData {
