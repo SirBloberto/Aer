@@ -63,9 +63,6 @@ void  pool_free(Pool* p, void* cell);
 /* Sets cell's mark bit; returns true if already set — the mark phase's guard against recursing into an already-visited cell. */
 bool  pool_mark(Pool* p, void* cell);
 
-/* Sets cell's generation bit to old. */
-void  pool_promote(Pool* p, void* cell);
-
 bool  pool_is_young(Pool* p, void* cell);
 
 /* True if cell is already on the free-list — a remembered-set entry can outlive its cell (entries are never removed, see vm.c), so retracing the set must check this before dereferencing. */

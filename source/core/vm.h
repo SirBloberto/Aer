@@ -329,14 +329,13 @@ typedef enum {
     /* "Primitive pass" — raw (unboxed) arithmetic on locals the compiler proved are always the
        same primitive type (parser.c's var_kind/RK_RAW_*_FLAG). Operands are CallFrame.raw_ints/
        raw_reals slot indices, never RK-encoded (no register-vs-constant runtime check at all —
-       the parser already knows statically which form applies, see PACK_RAW_ARITH_RR/IMM's own
-       comments). Comparisons produce an ordinary boxed boolean (they feed a branch, not further
+       the parser already knows statically which form applies, see PACK_RAW_ARITH_RR's own
+       comment). Comparisons produce an ordinary boxed boolean (they feed a branch, not further
        raw arithmetic — no raw boolean type exists). OP_BOX_INT/OP_BOX_REAL are the only bridge
        from raw storage back to a normal tagged AerVal register. */
     OP_RAW_LOAD_INT, OP_RAW_LOAD_REAL,
     OP_RAW_ADD_INT, OP_RAW_SUB_INT, OP_RAW_MUL_INT, OP_RAW_DIV_INT,
     OP_RAW_MOD_INT, OP_RAW_FLOOR_DIV_INT,
-    OP_RAW_ADD_INT_IMM, OP_RAW_SUB_INT_IMM, OP_RAW_MUL_INT_IMM,
     OP_RAW_ADD_REAL, OP_RAW_SUB_REAL, OP_RAW_MUL_REAL, OP_RAW_DIV_REAL,
     OP_RAW_LT_INT, OP_RAW_GT_INT, OP_RAW_LTE_INT, OP_RAW_GTE_INT,
     OP_RAW_LT_REAL, OP_RAW_GT_REAL, OP_RAW_LTE_REAL, OP_RAW_GTE_REAL,
@@ -604,23 +603,6 @@ typedef enum {
 #define UNPACK_RAW_ARITH_RR_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x1FU)
 #define UNPACK_RAW_ARITH_RR_A(word)    ((((uint32_t)(word)) >> 12) & 0x1FU)
 #define UNPACK_RAW_ARITH_RR_B(word)    ((((uint32_t)(word)) >> 17) & 0x1FU)
-
-/* Integer-only register-immediate form — real immediates don't fit a spare word field at double
-   precision; a real literal goes through PACK_RAW_LOAD_REAL first instead. imm is a signed 15-bit
-   field (-16384..16383), comfortably covering realistic step constants (loop increments, small
-   deltas) with no constant-pool lookup at all. op(7) + dest(5) + src(5) + imm(15) = 32 bits,
-   entirely in the low word. */
-#define PACK_RAW_ARITH_IMM(op, dest, src, imm) \
-    ( ((uint64_t)(op)    & 0x7F) \
-    | (((uint64_t)(dest) & 0x1F) << 7) \
-    | (((uint64_t)(src)  & 0x1F) << 12) \
-    | (((uint64_t)(imm)  & 0x7FFFULL) << 17) )
-#define UNPACK_RAW_ARITH_IMM_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x1FU)
-#define UNPACK_RAW_ARITH_IMM_SRC(word)  ((((uint32_t)(word)) >> 12) & 0x1FU)
-/* Sign-extend the 15-bit field: shift it up so its own sign bit lands on the int32's sign bit,
-   then an arithmetic right shift by the same amount restores the correct negative value. */
-#define UNPACK_RAW_ARITH_IMM_VALUE(word) \
-    (((int32_t)((((uint32_t)(word)) >> 17) << 17)) >> 17)
 
 /* Comparisons produce an ordinary BOXED boolean — they feed a branch, not further raw arithmetic,
    so no raw boolean type exists. dest is a normal registers[] index (7 bits); a/b are raw-slot

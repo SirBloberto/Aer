@@ -152,9 +152,6 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_RAW_DIV_INT]       = { "OP_RAW_DIV_INT",       "rawr = rawi / rawi (int/int division always promotes to real)", {FLD_REG}, false, 1 },
     [OP_RAW_MOD_INT]       = { "OP_RAW_MOD_INT",       "rawi = rawi % rawi", {FLD_REG}, false, 1 },
     [OP_RAW_FLOOR_DIV_INT] = { "OP_RAW_FLOOR_DIV_INT", "rawi = floor(rawi / rawi)", {FLD_REG}, false, 1 },
-    [OP_RAW_ADD_INT_IMM]   = { "OP_RAW_ADD_INT_IMM",   "rawi = rawi + imm", {FLD_REG}, false, 1 },
-    [OP_RAW_SUB_INT_IMM]   = { "OP_RAW_SUB_INT_IMM",   "rawi = rawi - imm", {FLD_REG}, false, 1 },
-    [OP_RAW_MUL_INT_IMM]   = { "OP_RAW_MUL_INT_IMM",   "rawi = rawi * imm", {FLD_REG}, false, 1 },
     [OP_RAW_ADD_REAL]      = { "OP_RAW_ADD_REAL",      "rawr = rawr + rawr", {FLD_REG}, false, 1 },
     [OP_RAW_SUB_REAL]      = { "OP_RAW_SUB_REAL",      "rawr = rawr - rawr", {FLD_REG}, false, 1 },
     [OP_RAW_MUL_REAL]      = { "OP_RAW_MUL_REAL",      "rawr = rawr * rawr", {FLD_REG}, false, 1 },
@@ -437,10 +434,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rawr(out, (int)UNPACK_RAW_ARITH_RR_DEST(op_word));
         print_rawr(out, (int)UNPACK_RAW_ARITH_RR_A(op_word));
         print_rawr(out, (int)UNPACK_RAW_ARITH_RR_B(op_word));
-    } else if (op == OP_RAW_ADD_INT_IMM || op == OP_RAW_SUB_INT_IMM || op == OP_RAW_MUL_INT_IMM) {
-        print_rawi(out, (int)UNPACK_RAW_ARITH_IMM_DEST(op_word));
-        print_rawi(out, (int)UNPACK_RAW_ARITH_IMM_SRC(op_word));
-        fprintf(out, "  imm=%d", UNPACK_RAW_ARITH_IMM_VALUE(op_word));
     } else if (op == OP_RAW_LT_INT || op == OP_RAW_GT_INT || op == OP_RAW_LTE_INT || op == OP_RAW_GTE_INT) {
         print_field(out, c, FLD_REG, (int)UNPACK_RAW_CMP_DEST(op_word));
         print_rawi(out, (int)UNPACK_RAW_CMP_A(op_word));

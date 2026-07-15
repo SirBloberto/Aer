@@ -91,10 +91,6 @@ bool pool_mark(Pool* p, void* cell) {
     return false;
 }
 
-void pool_promote(Pool* p, void* cell) {
-    *pool_cell_state(p, cell) |= POOL_OLD;
-}
-
 bool pool_is_young(Pool* p, void* cell) {
     return (*pool_cell_state(p, cell) & POOL_OLD) == 0;
 }

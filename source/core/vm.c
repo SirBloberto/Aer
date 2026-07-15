@@ -1770,9 +1770,6 @@ bool vm_run(VM* vm) {
         [OP_RAW_DIV_INT]       = &&lbl_raw_div_int,
         [OP_RAW_MOD_INT]       = &&lbl_raw_mod_int,
         [OP_RAW_FLOOR_DIV_INT] = &&lbl_raw_floor_div_int,
-        [OP_RAW_ADD_INT_IMM]   = &&lbl_raw_add_int_imm,
-        [OP_RAW_SUB_INT_IMM]   = &&lbl_raw_sub_int_imm,
-        [OP_RAW_MUL_INT_IMM]   = &&lbl_raw_mul_int_imm,
         [OP_RAW_ADD_REAL]      = &&lbl_raw_add_real,
         [OP_RAW_SUB_REAL]      = &&lbl_raw_sub_real,
         [OP_RAW_MUL_REAL]      = &&lbl_raw_mul_real,
@@ -2706,30 +2703,6 @@ lbl_raw_floor_div_int: {
     int64_t rv = vm->raw_ints[b];
     if (rv == 0) { error("Division by zero"); vm->raw_ints[dest] = 0; }
     else vm->raw_ints[dest] = (int64_t)floor((double)vm->raw_ints[a] / (double)rv);
-    DISPATCH();
-}
-
-lbl_raw_add_int_imm: {
-    int dest = (int)UNPACK_RAW_ARITH_IMM_DEST(op_word);
-    int src  = (int)UNPACK_RAW_ARITH_IMM_SRC(op_word);
-    int imm  = UNPACK_RAW_ARITH_IMM_VALUE(op_word);
-    vm->raw_ints[dest] = vm->raw_ints[src] + imm;
-    DISPATCH();
-}
-
-lbl_raw_sub_int_imm: {
-    int dest = (int)UNPACK_RAW_ARITH_IMM_DEST(op_word);
-    int src  = (int)UNPACK_RAW_ARITH_IMM_SRC(op_word);
-    int imm  = UNPACK_RAW_ARITH_IMM_VALUE(op_word);
-    vm->raw_ints[dest] = vm->raw_ints[src] - imm;
-    DISPATCH();
-}
-
-lbl_raw_mul_int_imm: {
-    int dest = (int)UNPACK_RAW_ARITH_IMM_DEST(op_word);
-    int src  = (int)UNPACK_RAW_ARITH_IMM_SRC(op_word);
-    int imm  = UNPACK_RAW_ARITH_IMM_VALUE(op_word);
-    vm->raw_ints[dest] = vm->raw_ints[src] * imm;
     DISPATCH();
 }
 
