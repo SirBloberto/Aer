@@ -28,11 +28,11 @@ static inline AerVal aer_real(double d) {
     AerVal v; v.tag = TYPE_REAL; v.as.d = d; return v;
 }
 
-/* No boxed-integer path exists under this representation — a plain `long long` fits the value
+/* No boxed-integer path exists under this representation — a plain `int64_t` fits the value
    union at any magnitude, no heap fallback needed (the old NaN-boxed encoding could only fit an
    inline 47-bit integer and needed a heap-boxed `long_pool` cell for the rare overflow case;
    that whole mechanism — long_pool, aer_int_boxed, aer_int_is_boxed/aer_int_box_ptr — is gone). */
-static inline AerVal aer_int(long long n) {
+static inline AerVal aer_int(int64_t n) {
     AerVal v; v.tag = TYPE_INTEGER; v.as.i = n; return v;
 }
 
@@ -47,7 +47,7 @@ static inline AerVal aer_dict_val(AerDict* d)          { return aer_box_ptr(TYPE
 
 static inline bool      aer_as_bool(AerVal v) { return v.as.b; }
 static inline double    aer_as_real(AerVal v) { return v.as.d; }
-static inline long long aer_as_int(AerVal v)  { return v.as.i; }
+static inline int64_t aer_as_int(AerVal v)  { return v.as.i; }
 
 static inline AerString*   aer_as_string(AerVal v)   { return (AerString*)v.as.ptr; }
 static inline AerFunction* aer_as_function(AerVal v) { return (AerFunction*)v.as.ptr; }
@@ -71,6 +71,7 @@ static inline Value aer_val_to_public(AerVal v) {
         case TYPE_FUNCTION: out.data.function = aer_as_function(v); break;
         case TYPE_ARRAY:    out.data.array    = aer_as_array(v);    break;
         case TYPE_DICT:     out.data.dict     = aer_as_dict(v);     break;
+        case TYPE_ANY:      break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
     }
     return out;
 }
@@ -89,6 +90,7 @@ static inline AerVal aer_val_from_public(Value v) {
         case TYPE_FUNCTION: return aer_function_val(v.data.function);
         case TYPE_ARRAY:    return aer_array_val(v.data.array);
         case TYPE_DICT:     return aer_dict_val(v.data.dict);
+        case TYPE_ANY:      break;   /* never a real Value's type — only Shape.field_types[] uses it */
     }
     return aer_null();
 }

@@ -1280,6 +1280,23 @@ game, a config parser) simply doesn't call it, and its scripts have none.
 | Pipe rejects nested calls in target args | `x \|> f(g(1))` is a parse error, at any depth | Assign the inner call to a variable first: `t = g(1); x \|> f(t)` |
 | Windows REPL doesn't support piped/redirected stdin | `aer.exe < commands.txt` fails — `_getch()` reads the console directly, bypassing redirection | Run `aer.exe script.aer` (file mode) instead — unaffected, since it never touches the raw-mode terminal code. A file-mode script can still read the piped data itself via `io.stdin()`/`io.read()` (see [Standard Library](#standard-library)) |
 
+### Known bugs
+
+- **Windows builds crash the whole process on any runtime error, instead of reporting it.**
+  `vm_run()`'s error path unwinds via `setjmp`/`longjmp` back to a catch point instead of
+  threading an error flag through every dispatch (a real, measured perf win — see the dispatch-
+  overhead work above). On Linux this is a plain, portable `longjmp`; on Windows, MinGW's
+  `longjmp` performs a full SEH-based stack unwind (`RtlUnwind`), which fails with
+  `STATUS_BAD_STACK` when called from inside `vm_run`'s computed-goto dispatch loop — confirmed
+  via GDB, independent of `-flto` (ruled out as the cause). Any script that hits a runtime error
+  (division by zero, an undefined variable, a malformed loop condition, `panic()`, ...) crashes
+  the process outright on Windows instead of printing the error and (for an embedding host)
+  returning `false` from `vm_run()`. Linux/Raspberry Pi builds are unaffected — confirmed via the
+  full embedding test suite (`make test-embed`), which passes cleanly there. Not yet fixed; the
+  likely fix is switching the Windows build to GCC's `__builtin_setjmp`/`__builtin_longjmp`
+  (bypasses SEH validation entirely — a known workaround for this class of MinGW issue), which
+  needs its own careful testing before landing.
+
 ### Hard limits
 
 | Limit | Default cap |

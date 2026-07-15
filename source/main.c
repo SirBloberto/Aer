@@ -59,6 +59,8 @@ static void run() {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     lex();
     /* parse() never resets its own tables (parser_reset, called once in main() above, already did
        that) and has its own per-statement rollback/recovery, so it's safe to call repeatedly —

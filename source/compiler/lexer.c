@@ -149,7 +149,7 @@ static void emit(TokenType type, unsigned int length) {
     current->buffer += length;
 }
 
-static void emit_integer(long long integer, unsigned int length) {
+static void emit_integer(int64_t integer, unsigned int length) {
     token.value = aer_int(integer);
     emit(TOKEN_INTEGER, length);
 }
@@ -211,7 +211,7 @@ static void lex_number() {
             return;
         }
         char* end; errno = 0;
-        long long val = strtoll(buf, &end, 16);
+        int64_t val = strtoll(buf, &end, 16);
         if (errno == ERANGE) error_at("Integer literal overflow");
         if (isalpha((unsigned char)*end) || *end == '_')
             error_at("Invalid character after integer literal");
@@ -221,7 +221,7 @@ static void lex_number() {
 
     /* lex() only calls lex_number() on a digit, so int_len is always >= 1 — safe to fall through from error_at() below without an explicit return. */
     char* end; errno = 0;
-    long long int_val = strtoll(buf, &end, 10);
+    int64_t int_val = strtoll(buf, &end, 10);
     if (errno == ERANGE) error_at("Integer literal overflow");
     unsigned int int_len = (unsigned int)(end - buf);
 

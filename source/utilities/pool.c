@@ -34,9 +34,18 @@ static void pool_grow(Pool* p) {
     p->next_index = 0;
 }
 
-/* Maps a cell pointer to its state byte via a linear scan over the pool's slabs (fine at this project's scale); every cell pool_alloc ever handed out is found here by construction. */
+/* Maps a cell pointer to its state byte via a linear scan over the pool's slabs; every cell
+   pool_alloc ever handed out is found here by construction. Scanned NEWEST slab first, not oldest:
+   pool_alloc always bump-allocates fresh cells from the newest slab once the free list is empty,
+   and the hottest caller (gc_barrier_array, called on every array/dict/struct-field write) is
+   disproportionately likely to be checking a cell that was itself just allocated — e.g. a freshly
+   constructed array getting its first element written. Found via perf: this function (previously
+   oldest-first) was consistently 2-3% of nbody.aer's total cycles despite the comment above once
+   calling it "fine at this project's scale" — a long-running, allocation-heavy program accumulates
+   many slabs, and an oldest-first scan pays the full slab_count-1 traversal for exactly the
+   allocations most likely to be looked up again immediately. */
 static unsigned char* pool_cell_state_or_null(Pool* p, void* cell) {
-    for (unsigned int i = 0; i < p->slab_count; i++) {
+    for (unsigned int i = p->slab_count; i-- > 0; ) {
         char*  slab       = p->slabs[i];
         size_t slab_bytes = p->stride * p->elems_per_slab;
         if ((char*)cell >= slab && (char*)cell < slab + slab_bytes) {

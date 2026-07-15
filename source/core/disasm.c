@@ -32,8 +32,9 @@ typedef struct {
     int packed;
 } OpInfo;
 
-/* OP_PRINT_REPL is the last member of the Opcode enum (vm.h). */
-#define OP_INFO_MAX OP_PRINT_REPL
+/* OP_RAW_LOAD_INT_POOL is the last member of the Opcode enum (vm.h) — the "primitive pass" raw-
+   arithmetic family appended after OP_PRINT_REPL. */
+#define OP_INFO_MAX OP_RAW_LOAD_INT_POOL
 
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* OP_ADD..OP_RSHIFT/OP_IN are now real top-level dispatch targets, one opcode per operator
@@ -138,6 +139,45 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_BINARY_FIELD] = { "OP_BINARY_FIELD", "fused: reg = rk OP struct.field (field on the right)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_RK, FLD_NAME}, false, 5 },
     [OP_FIELD_BINARY] = { "OP_FIELD_BINARY", "fused: reg = struct.field OP rk (field on the left)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_NAME, FLD_RK}, false, 5 },
     [OP_PRINT_REPL] = { "OP_PRINT_REPL", "shell mode: print reg unless null", {FLD_REG}, false, 1 },
+
+    /* "Primitive pass" raw-arithmetic family (vm.h's OP_RAW_LOAD_INT comment) — all special-cased
+       in disassemble_one below exactly like OP_UNARY/OP_CAST above (their own custom packed
+       shape, not the generic fields[]-driven loop), so fields[]/packed here are unused and kept
+       purely for documentation, same convention every other special-cased opcode's entry follows. */
+    [OP_RAW_LOAD_INT]      = { "OP_RAW_LOAD_INT",      "rawi = imm", {FLD_REG}, false, 1 },
+    [OP_RAW_LOAD_REAL]     = { "OP_RAW_LOAD_REAL",     "rawr = pool constant", {FLD_REG}, false, 1 },
+    [OP_RAW_ADD_INT]       = { "OP_RAW_ADD_INT",       "rawi = rawi + rawi", {FLD_REG}, false, 1 },
+    [OP_RAW_SUB_INT]       = { "OP_RAW_SUB_INT",       "rawi = rawi - rawi", {FLD_REG}, false, 1 },
+    [OP_RAW_MUL_INT]       = { "OP_RAW_MUL_INT",       "rawi = rawi * rawi", {FLD_REG}, false, 1 },
+    [OP_RAW_DIV_INT]       = { "OP_RAW_DIV_INT",       "rawr = rawi / rawi (int/int division always promotes to real)", {FLD_REG}, false, 1 },
+    [OP_RAW_MOD_INT]       = { "OP_RAW_MOD_INT",       "rawi = rawi % rawi", {FLD_REG}, false, 1 },
+    [OP_RAW_FLOOR_DIV_INT] = { "OP_RAW_FLOOR_DIV_INT", "rawi = floor(rawi / rawi)", {FLD_REG}, false, 1 },
+    [OP_RAW_ADD_INT_IMM]   = { "OP_RAW_ADD_INT_IMM",   "rawi = rawi + imm", {FLD_REG}, false, 1 },
+    [OP_RAW_SUB_INT_IMM]   = { "OP_RAW_SUB_INT_IMM",   "rawi = rawi - imm", {FLD_REG}, false, 1 },
+    [OP_RAW_MUL_INT_IMM]   = { "OP_RAW_MUL_INT_IMM",   "rawi = rawi * imm", {FLD_REG}, false, 1 },
+    [OP_RAW_ADD_REAL]      = { "OP_RAW_ADD_REAL",      "rawr = rawr + rawr", {FLD_REG}, false, 1 },
+    [OP_RAW_SUB_REAL]      = { "OP_RAW_SUB_REAL",      "rawr = rawr - rawr", {FLD_REG}, false, 1 },
+    [OP_RAW_MUL_REAL]      = { "OP_RAW_MUL_REAL",      "rawr = rawr * rawr", {FLD_REG}, false, 1 },
+    [OP_RAW_DIV_REAL]      = { "OP_RAW_DIV_REAL",      "rawr = rawr / rawr", {FLD_REG}, false, 1 },
+    [OP_RAW_LT_INT]        = { "OP_RAW_LT_INT",        "reg = rawi < rawi", {FLD_REG}, false, 1 },
+    [OP_RAW_GT_INT]        = { "OP_RAW_GT_INT",        "reg = rawi > rawi", {FLD_REG}, false, 1 },
+    [OP_RAW_LTE_INT]       = { "OP_RAW_LTE_INT",       "reg = rawi <= rawi", {FLD_REG}, false, 1 },
+    [OP_RAW_GTE_INT]       = { "OP_RAW_GTE_INT",       "reg = rawi >= rawi", {FLD_REG}, false, 1 },
+    [OP_RAW_LT_REAL]       = { "OP_RAW_LT_REAL",       "reg = rawr < rawr", {FLD_REG}, false, 1 },
+    [OP_RAW_GT_REAL]       = { "OP_RAW_GT_REAL",       "reg = rawr > rawr", {FLD_REG}, false, 1 },
+    [OP_RAW_LTE_REAL]      = { "OP_RAW_LTE_REAL",      "reg = rawr <= rawr", {FLD_REG}, false, 1 },
+    [OP_RAW_GTE_REAL]      = { "OP_RAW_GTE_REAL",      "reg = rawr >= rawr", {FLD_REG}, false, 1 },
+    [OP_BOX_INT]           = { "OP_BOX_INT",           "reg = box(rawi)", {FLD_REG}, false, 1 },
+    [OP_BOX_REAL]          = { "OP_BOX_REAL",          "reg = box(rawr)", {FLD_REG}, false, 1 },
+    [OP_RAW_MOVE_INT]      = { "OP_RAW_MOVE_INT",      "rawi = rawi", {FLD_REG}, false, 1 },
+    [OP_RAW_MOVE_REAL]     = { "OP_RAW_MOVE_REAL",     "rawr = rawr", {FLD_REG}, false, 1 },
+    [OP_RAW_ADD_INT_BOXED]  = { "OP_RAW_ADD_INT_BOXED",  "rawi += reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_SUB_INT_BOXED]  = { "OP_RAW_SUB_INT_BOXED",  "rawi -= reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_MUL_INT_BOXED]  = { "OP_RAW_MUL_INT_BOXED",  "rawi *= reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_ADD_REAL_BOXED] = { "OP_RAW_ADD_REAL_BOXED", "rawr += reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_SUB_REAL_BOXED] = { "OP_RAW_SUB_REAL_BOXED", "rawr -= reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_MUL_REAL_BOXED] = { "OP_RAW_MUL_REAL_BOXED", "rawr *= reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_LOAD_INT_POOL]  = { "OP_RAW_LOAD_INT_POOL",  "rawi = pool constant", {FLD_REG}, false, 1 },
 };
 
 static const char* cast_name(int k) {
@@ -196,10 +236,25 @@ static void print_field(FILE* out, Chunk* c, Field kind, int word) {
    tags) into the SAME word as the opcode itself (PACK1/2/3, vm.h) — op_word is kept unmasked
    here specifically so those can still be extracted via UNPACK_A/B/C; OP_JUMP/OP_DEFINE_STRUCT/
    OP_HALT have packed==0, so the loop below is a no-op for them. */
-static void print_rk20(FILE* out, Chunk* c, unsigned long long rk) {
+static void print_rk20(FILE* out, Chunk* c, uint64_t rk) {
     if (rk & RK20_CONST_FLAG) { fprintf(out, "  rk=const:"); print_pool_value(out, c->pool[rk & RK20_INDEX_MASK]); }
     else                          fprintf(out, "  rk=reg%llu", rk & RK20_INDEX_MASK);
 }
+
+/* Same as print_rk20 above, for PACK_BINARY's narrower 9-bit RK operands (RK9_CONST_FLAG/
+   RK9_INDEX_MASK, vm.h). */
+static void print_rk9(FILE* out, Chunk* c, uint64_t rk) {
+    if (rk & RK9_CONST_FLAG) { fprintf(out, "  rk=const:"); print_pool_value(out, c->pool[rk & RK9_INDEX_MASK]); }
+    else                         fprintf(out, "  rk=reg%llu", rk & RK9_INDEX_MASK);
+}
+
+/* "Primitive pass" raw-slot printers — CallFrame.raw_ints/raw_reals indices, never RK-encoded
+   (see PACK_RAW_ARITH_RR's own comment, vm.h, for why there's no register-vs-constant flag here
+   at all). Kept as separate tiny helpers, one per array, purely so a reader scanning a
+   disassembly dump can immediately tell a raw slot from a normal registers[] index (FLD_REG's
+   "reg=%d") or an RK operand ("rk=..."). */
+static void print_rawi(FILE* out, int slot) { fprintf(out, "  rawi=%d", slot); }
+static void print_rawr(FILE* out, int slot) { fprintf(out, "  rawr=%d", slot); }
 
 /* True for the 18 per-operator opcodes sharing PACK_BINARY's encoding (dest + both RK operands,
    all in the one descriptor word — see PACK_BINARY's own comment, vm.h). Each used to be a single
@@ -217,48 +272,65 @@ static bool binary_op_dispatched(Opcode op) {
 }
 
 static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
-    unsigned long long op_word = c->code[offset];
-    Opcode op = (Opcode)(op_word & 0xFF);
+    uint64_t op_word = c->code[offset];
+    /* Masked to 7 bits (0x7F), matching DISPATCH()'s mask in vm.c exactly — must stay in sync,
+       since PACK_BINARY's dest field now starts at bit 7 (vm.h); an 8-bit mask here would leak
+       dest's LSB into the decoded opcode whenever dest is odd. */
+    Opcode op = (Opcode)(op_word & 0x7F);
     const OpInfo* info = &op_info[op];
     fprintf(out, "%6u  %-28s  %s", offset, opcode_name(op), info->desc);
 
     unsigned int pos = offset + 1;
     if (info->variable) {
-        /* OP_DEFINE_STRUCT: name pool idx, field_count, then field_count * (field-name, default) pairs. */
+        /* OP_DEFINE_STRUCT: name pool idx, field_count, then field_count * (field-name, default,
+           field-type) triples — the trailing type word was added by the typed-struct-fields
+           feature (parse_struct, parser.c) but never wired up here, so this loop kept reading only
+           2 words per field: every field after the first was decoded 1 word short, eventually
+           reading an unrelated word (a field-type enum value, or a later opcode's own operand) as a
+           pool index and crashing in aer_as_string. Found via gdb on a real segfault disassembling
+           nbody.aer's own (untyped) Body struct. */
         int name_idx    = (int)c->code[pos++];
         int field_count = (int)c->code[pos++];
         fprintf(out, "  name=%s fields=%d [", aer_as_string(c->pool[name_idx])->data, field_count);
+        static const char* const field_type_names[] = {
+            "null", "boolean", "integer", "real", "string", "function", "array", "dict"
+        };
         for (int i = 0; i < field_count; i++) {
-            int fname_idx = (int)c->code[pos++];
+            int fname_idx    = (int)c->code[pos++];
             int fdefault_idx = (int)c->code[pos++];
+            int ftype        = (int)c->code[pos++];
             if (i > 0) fprintf(out, ", ");
-            fprintf(out, "%s=", aer_as_string(c->pool[fname_idx])->data);
+            fprintf(out, "%s", aer_as_string(c->pool[fname_idx])->data);
+            if (ftype != TYPE_ANY) fprintf(out, ": %s", field_type_names[ftype]);
+            fprintf(out, "=");
             print_pool_value(out, c->pool[fdefault_idx]);
         }
         fprintf(out, "]");
     } else if (binary_op_dispatched(op)) {
-        /* Packed single-word encoding (PACK_BINARY, vm.h) — dest comes from A like any other
-           packed opcode, and both RK operands live in THIS SAME word (bits 16-35/36-55) instead of
-           trailing words, so they're decoded here rather than through the generic fields[]-driven
-           loop below (which each of these opcodes' own op_info entry has no entries left for).
-           There's no bin_op field to print anymore — the opcode itself (already printed via
-           opcode_name() above) IS the operator. */
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rk20(out, c, UNPACK_RK_B20(op_word));
-        print_rk20(out, c, UNPACK_RK_C20(op_word));
+        /* Packed single-word encoding (PACK_BINARY, vm.h) — dest and both RK operands live
+           entirely within the low 32 bits of this same word (opcode:7 + dest:7 + RK9:9 + RK9:9),
+           not the wider RK20 scheme every other packed opcode still uses, so they're decoded here
+           via the narrower UNPACK_BINARY_DEST/UNPACK_RK_B9/C9 macros and print_rk9 (not print_rk20)
+           rather than through the generic fields[]-driven loop below (which each of these opcodes'
+           own op_info entry has no entries left for). There's no bin_op field to print anymore —
+           the opcode itself (already printed via opcode_name() above) IS the operator. */
+        print_field(out, c, FLD_REG, (int)UNPACK_BINARY_DEST(op_word));
+        print_rk9(out, c, UNPACK_RK_B9(op_word));
+        print_rk9(out, c, UNPACK_RK_C9(op_word));
     } else if (op == OP_INDEX_GET) {
-        /* Slice A of the same treatment — see PACK_INDEX_GET's comment in vm.h. */
+        /* Tier 1, narrow RK9 encoding now (PACK_INDEX_GET's own comment, vm.h) — not RK20. */
         print_field(out, c, FLD_REG, (int)UNPACK_INDEX_GET_DEST(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_INDEX_GET_ARR(op_word));
-        print_rk20(out, c, UNPACK_INDEX_GET_RK(op_word));
+        print_rk9(out, c, UNPACK_INDEX_GET_RK(op_word));
     } else if (op == OP_FIELD_GET) {
         print_field(out, c, FLD_REG,  (int)UNPACK_FIELD_GET_DEST(op_word));
         print_field(out, c, FLD_REG,  (int)UNPACK_FIELD_GET_STRUCT(op_word));
         print_field(out, c, FLD_NAME, (int)UNPACK_FIELD_GET_FIELD(op_word));
     } else if (op == OP_FIELD_SET) {
+        /* Tier 1, narrow RK9 encoding now (PACK_FIELD_SET's own comment, vm.h) — not RK20. */
         print_field(out, c, FLD_REG,  (int)UNPACK_FIELD_SET_STRUCT(op_word));
         print_field(out, c, FLD_NAME, (int)UNPACK_FIELD_SET_FIELD(op_word));
-        print_rk20(out, c, UNPACK_FIELD_SET_RK(op_word));
+        print_rk9(out, c, UNPACK_FIELD_SET_RK(op_word));
     } else if (op == OP_ITER_RANGE || op == OP_ITER_NEXT_PAIR) {
         /* 4 registers packed via PACK_REG4 (vm.h); the loop-exit target still gets its own
            trailing word regardless — a patchable jump target is never packed alongside anything
@@ -278,16 +350,17 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_COUNT, (int)UNPACK_REG4_C(op_word));
         print_field(out, c, FLD_REG,   (int)UNPACK_REG4_D(op_word));
     } else if (op == OP_STORE_GLOBAL) {
+        /* Tier 1, narrow RK9 encoding now (PACK_STORE_GLOBAL's own comment, vm.h) — not RK20. */
         print_field(out, c, FLD_REG, (int)UNPACK_STORE_GLOBAL_REG(op_word));
-        print_rk20(out, c, UNPACK_STORE_GLOBAL_RK(op_word));
+        print_rk9(out, c, UNPACK_STORE_GLOBAL_RK(op_word));
     } else if (op == OP_UNARY) {
         print_field(out, c, FLD_REG,   (int)UNPACK_UNARY_DEST(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_UNARY_OP(op_word));
-        print_rk20(out, c, UNPACK_UNARY_RK(op_word));
+        print_rk9(out, c, UNPACK_UNARY_RK(op_word));
     } else if (op == OP_CAST) {
         print_field(out, c, FLD_REG,  (int)UNPACK_CAST_DEST(op_word));
         print_field(out, c, FLD_CAST, (int)UNPACK_CAST_TYPE(op_word));
-        print_rk20(out, c, UNPACK_CAST_RK(op_word));
+        print_rk9(out, c, UNPACK_CAST_RK(op_word));
     } else if (op == OP_CHECK_SHAPE) {
         print_field(out, c, FLD_REG,  (int)UNPACK_CHECK_SHAPE_DEST(op_word));
         print_field(out, c, FLD_REG,  (int)UNPACK_CHECK_SHAPE_LHS(op_word));
@@ -315,11 +388,18 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rk20(out, c, UNPACK_SLICE_GET_START(op_word));
         print_rk20(out, c, UNPACK_SLICE_GET_END(op_word));
     } else if (op == OP_CALL_MODULE) {
+        static const char* const call_module_id_names[] = {
+            "math", "random", "string", "time", "json", "dynamic"
+        };
         print_field(out, c, FLD_REG,   (int)UNPACK_CALL_MODULE_DEST(op_word));
         print_field(out, c, FLD_REG,   (int)UNPACK_CALL_MODULE_ARG_BASE(op_word));
         print_field(out, c, FLD_COUNT, (int)UNPACK_CALL_MODULE_ARG_COUNT(op_word));
         print_field(out, c, FLD_NAME,  (int)UNPACK_CALL_MODULE_MODULE(op_word));
         print_field(out, c, FLD_NAME,  (int)UNPACK_CALL_MODULE_FN(op_word));
+        /* Trailing word (see OP_CALL_MODULE's own comment, vm.h): module_id, resolved once at
+           parse time so the VM can switch on it instead of running a strcmp chain per call. */
+        int module_id = (int)c->code[pos++];
+        fprintf(out, "  id=%s", call_module_id_names[module_id]);
     } else if (op == OP_CALL_BUILTIN) {
         print_field(out, c, FLD_REG,   (int)UNPACK_CALL_BUILTIN_DEST(op_word));
         print_field(out, c, FLD_REG,   (int)UNPACK_CALL_BUILTIN_ARG_BASE(op_word));
@@ -337,6 +417,60 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_BINOP, (int)UNPACK_FIELD_BINARY_OP(op_word));
         print_field(out, c, FLD_NAME,  (int)UNPACK_FIELD_BINARY_NAME(op_word));
         print_rk20(out, c, UNPACK_FIELD_BINARY_RK(op_word));
+    } else if (op == OP_RAW_LOAD_INT) {
+        print_rawi(out, (int)UNPACK_RAW_LOAD_INT_DEST(op_word));
+        fprintf(out, "  imm=%d", UNPACK_RAW_LOAD_INT_IMM(op_word));
+    } else if (op == OP_RAW_LOAD_REAL) {
+        print_rawr(out, (int)UNPACK_RAW_LOAD_REAL_DEST(op_word));
+        fprintf(out, "  val=");
+        print_pool_value(out, c->pool[UNPACK_RAW_LOAD_REAL_POOL(op_word)]);
+    } else if (op == OP_RAW_ADD_INT || op == OP_RAW_SUB_INT || op == OP_RAW_MUL_INT ||
+               op == OP_RAW_DIV_INT || op == OP_RAW_MOD_INT || op == OP_RAW_FLOOR_DIV_INT) {
+        /* OP_RAW_DIV_INT is the sole exception: dest addresses raw_reals[], not raw_ints[] (int/
+           int division always promotes to real — see this opcode's own comment, vm.c) — the two
+           operands are still raw_ints[] either way, so only the dest printer differs here. */
+        if (op == OP_RAW_DIV_INT) print_rawr(out, (int)UNPACK_RAW_ARITH_RR_DEST(op_word));
+        else                      print_rawi(out, (int)UNPACK_RAW_ARITH_RR_DEST(op_word));
+        print_rawi(out, (int)UNPACK_RAW_ARITH_RR_A(op_word));
+        print_rawi(out, (int)UNPACK_RAW_ARITH_RR_B(op_word));
+    } else if (op == OP_RAW_ADD_REAL || op == OP_RAW_SUB_REAL || op == OP_RAW_MUL_REAL || op == OP_RAW_DIV_REAL) {
+        print_rawr(out, (int)UNPACK_RAW_ARITH_RR_DEST(op_word));
+        print_rawr(out, (int)UNPACK_RAW_ARITH_RR_A(op_word));
+        print_rawr(out, (int)UNPACK_RAW_ARITH_RR_B(op_word));
+    } else if (op == OP_RAW_ADD_INT_IMM || op == OP_RAW_SUB_INT_IMM || op == OP_RAW_MUL_INT_IMM) {
+        print_rawi(out, (int)UNPACK_RAW_ARITH_IMM_DEST(op_word));
+        print_rawi(out, (int)UNPACK_RAW_ARITH_IMM_SRC(op_word));
+        fprintf(out, "  imm=%d", UNPACK_RAW_ARITH_IMM_VALUE(op_word));
+    } else if (op == OP_RAW_LT_INT || op == OP_RAW_GT_INT || op == OP_RAW_LTE_INT || op == OP_RAW_GTE_INT) {
+        print_field(out, c, FLD_REG, (int)UNPACK_RAW_CMP_DEST(op_word));
+        print_rawi(out, (int)UNPACK_RAW_CMP_A(op_word));
+        print_rawi(out, (int)UNPACK_RAW_CMP_B(op_word));
+    } else if (op == OP_RAW_LT_REAL || op == OP_RAW_GT_REAL || op == OP_RAW_LTE_REAL || op == OP_RAW_GTE_REAL) {
+        print_field(out, c, FLD_REG, (int)UNPACK_RAW_CMP_DEST(op_word));
+        print_rawr(out, (int)UNPACK_RAW_CMP_A(op_word));
+        print_rawr(out, (int)UNPACK_RAW_CMP_B(op_word));
+    } else if (op == OP_BOX_INT) {
+        print_field(out, c, FLD_REG, (int)UNPACK_BOX_DEST(op_word));
+        print_rawi(out, (int)UNPACK_BOX_SRC(op_word));
+    } else if (op == OP_BOX_REAL) {
+        print_field(out, c, FLD_REG, (int)UNPACK_BOX_DEST(op_word));
+        print_rawr(out, (int)UNPACK_BOX_SRC(op_word));
+    } else if (op == OP_RAW_MOVE_INT) {
+        print_rawi(out, (int)UNPACK_RAW_MOVE_DEST(op_word));
+        print_rawi(out, (int)UNPACK_RAW_MOVE_SRC(op_word));
+    } else if (op == OP_RAW_MOVE_REAL) {
+        print_rawr(out, (int)UNPACK_RAW_MOVE_DEST(op_word));
+        print_rawr(out, (int)UNPACK_RAW_MOVE_SRC(op_word));
+    } else if (op == OP_RAW_ADD_INT_BOXED || op == OP_RAW_SUB_INT_BOXED || op == OP_RAW_MUL_INT_BOXED) {
+        print_rawi(out, (int)UNPACK_RAW_ARITH_BOXED_SLOT(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_RAW_ARITH_BOXED_REG(op_word));
+    } else if (op == OP_RAW_ADD_REAL_BOXED || op == OP_RAW_SUB_REAL_BOXED || op == OP_RAW_MUL_REAL_BOXED) {
+        print_rawr(out, (int)UNPACK_RAW_ARITH_BOXED_SLOT(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_RAW_ARITH_BOXED_REG(op_word));
+    } else if (op == OP_RAW_LOAD_INT_POOL) {
+        print_rawi(out, (int)UNPACK_RAW_LOAD_INT_POOL_DEST(op_word));
+        fprintf(out, "  val=");
+        print_pool_value(out, c->pool[UNPACK_RAW_LOAD_INT_POOL_POOL(op_word)]);
     } else {
         int i = 0;
         for (; i < info->packed; i++) {
@@ -358,17 +492,17 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     return pos;
 }
 
-typedef struct { const char* name; unsigned long long hits; } NamedCount;
+typedef struct { const char* name; uint64_t hits; } NamedCount;
 
 static int cmp_named_count_desc(const void* a, const void* b) {
-    unsigned long long ha = ((const NamedCount*)a)->hits, hb = ((const NamedCount*)b)->hits;
+    uint64_t ha = ((const NamedCount*)a)->hits, hb = ((const NamedCount*)b)->hits;
     return (ha < hb) - (ha > hb);
 }
 
-typedef struct { unsigned int line; unsigned long long hits; } LineCount;
+typedef struct { unsigned int line; uint64_t hits; } LineCount;
 
 static int cmp_line_count_desc(const void* a, const void* b) {
-    unsigned long long ha = ((const LineCount*)a)->hits, hb = ((const LineCount*)b)->hits;
+    uint64_t ha = ((const LineCount*)a)->hits, hb = ((const LineCount*)b)->hits;
     return (ha < hb) - (ha > hb);
 }
 
@@ -381,10 +515,10 @@ void aer_disassemble(Chunk* c, FILE* out) {
 
     NamedCount by_op[OP_INFO_MAX + 1];
     int by_op_count = 0;
-    unsigned long long op_totals[OP_INFO_MAX + 1] = {0};
+    uint64_t op_totals[OP_INFO_MAX + 1] = {0};
     offset = 0;
     while (offset < c->count) {
-        Opcode op = (Opcode)(c->code[offset] & 0xFF);
+        Opcode op = (Opcode)(c->code[offset] & 0x7F);
         if (offset < c->debug_hits_cap) op_totals[op] += c->debug_hits[offset];
         unsigned int next = offset + 1;
         const OpInfo* info = &op_info[op];

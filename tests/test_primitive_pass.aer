@@ -1,0 +1,253 @@
+#!/usr/bin/env aer
+# AER test suite — the "primitive pass" (raw unboxed storage for provably-monotype int/real
+# locals, source/core/vm.h's OP_RAW_* family + parser.c's var_kind). Ground-truth coverage: every
+# result here must match exactly what the fully-boxed VM would have produced, since this feature
+# is purely an internal storage optimization — no AER program's observable behavior should change.
+# Machine-checked via assert(): a clean run exits 0; any failure prints "ASSERT FAILED: ..." and
+# the process exits nonzero (see main.c/error.c).
+
+# ------------------------------------------------------------------ #
+# Raw arithmetic — int and real, matching boxed semantics exactly     #
+# ------------------------------------------------------------------ #
+
+function raw_int_arith():
+    a = 10
+    b = 3
+    sum = a + b
+    diff = a - b
+    prod = a * b
+    quot = a / b          # int/int division always promotes to real, even when raw
+    rem = a % b
+    fdiv = a // b
+    return [sum, diff, prod, quot, rem, fdiv]
+
+r = raw_int_arith()
+assert(r[0] == 13 && r[1] == 7 && r[2] == 30, "raw int add/sub/mul match boxed semantics")
+assert(r[3] == 10.0 / 3.0, "raw int division promotes to real (matching OP_DIV's own boxed semantics)")
+assert(r[4] == 1 && r[5] == 3, "raw int mod/floor_div stay integer")
+
+# OP_RAW_LOAD_INT's immediate is a signed 20-bit field (-524288..524287) — a literal outside that
+# range must go through the constant pool (OP_RAW_LOAD_INT_POOL), not be silently truncated. Real
+# bug found exactly this way: a raw loop bound of 20,000,000 truncated to 77,056, silently running
+# a 20-million-iteration loop only 77,056 times — wrong output, no crash, no compile error.
+function large_raw_literal():
+    big = 20000000
+    small = 5
+    return [big, big + 1, big * 2]
+
+bl = large_raw_literal()
+assert(bl[0] == 20000000, "a raw int literal outside OP_RAW_LOAD_INT's 20-bit immediate range loads correctly via the pool fallback")
+assert(bl[1] == 20000001 && bl[2] == 40000000, "arithmetic on a pool-loaded large raw literal is still correct")
+
+function large_raw_loop_bound():
+    total = 0
+    i = 0
+    for i < 600000:          # 600000 exceeds OP_RAW_LOAD_INT's 20-bit signed range (max 524287)
+        total += 1
+        i += 1
+    return total
+
+assert(large_raw_loop_bound() == 600000, "a loop bounded by a raw literal over the 20-bit immediate range runs the correct number of iterations, not a truncated count")
+
+function raw_real_arith():
+    a = 2.5
+    b = 4.0
+    return [a + b, a - b, a * b, a / b]
+
+rr = raw_real_arith()
+assert(rr[0] == 6.5 && rr[1] == -1.5 && rr[2] == 10.0 && rr[3] == 0.625, "raw real arithmetic matches boxed semantics")
+
+# ------------------------------------------------------------------ #
+# Shadow transition — a raw-tracked name reassigned to a different    #
+# type (unconditionally, so the shadow is always safe — see the       #
+# primitive-pass memory for why an unconditional plain-assignment      #
+# shadow never has the loop-repetition problem compound assign does)   #
+# ------------------------------------------------------------------ #
+
+function shadow_transition():
+    x = 5                  # x starts raw-int
+    before = x + 1          # raw arithmetic while it's still an int
+    x = "now a string"      # shadows to boxed
+    return [before, x]
+
+s = shadow_transition()
+assert(s[0] == 6, "raw arithmetic before the shadow used the correct raw int value")
+assert(s[1] == "now a string", "the variable correctly holds the new type after shadowing")
+
+# ------------------------------------------------------------------ #
+# Branch disqualification — a FRESH name first assigned different      #
+# types down mutually-exclusive branches must never go raw (the        #
+# phi/merge problem) — both paths must still produce correct results   #
+# ------------------------------------------------------------------ #
+
+function branch_disqualification(flag):
+    if flag:
+        y = 5
+    else:
+        y = "text"
+    return y
+
+assert(branch_disqualification(true) == 5, "branch-local int path still correct")
+assert(branch_disqualification(false) == "text", "branch-local string path still correct")
+
+# A branch reassigning an EXISTING raw name to the SAME kind must stay raw and correct —
+# this is the common, safe case (accumulators inside if/loop bodies) that must NOT be
+# needlessly restricted just because it's inside a branch.
+function branch_same_kind_reassignment(flag):
+    total = 0
+    if flag:
+        total = total + 100
+    else:
+        total = total + 1
+    return total
+
+assert(branch_same_kind_reassignment(true) == 100, "same-kind reassignment inside an if-branch stays raw and correct")
+assert(branch_same_kind_reassignment(false) == 1, "same-kind reassignment inside an else-branch stays raw and correct")
+
+# ------------------------------------------------------------------ #
+# Compound assignment on a raw-tracked local — inside a loop AND a     #
+# branch, same-kind (the accumulator/physics-variable pattern this     #
+# whole feature targets)                                               #
+# ------------------------------------------------------------------ #
+
+function compound_assign_raw(n):
+    total = 0
+    i = 1
+    for i <= n:
+        if i % 2 == 0:
+            total += i
+        i += 1
+    return total
+
+assert(compound_assign_raw(10) == 30, "compound += on raw locals inside a loop+branch, summing even numbers 2+4+6+8+10")
+
+# ------------------------------------------------------------------ #
+# Escape sites — a raw local used somewhere that needs a real boxed    #
+# AerVal: call argument, return value, container element, string       #
+# interpolation, comparison against a dynamic/boxed value               #
+# ------------------------------------------------------------------ #
+
+function identity(v):
+    return v
+
+function escape_sites():
+    n = 42
+    passed_through = identity(n)          # call argument
+    arr = [n, n + 1]                      # array element
+    d = {"key": n}                        # dict value
+    interpolated = "value is {n}"          # string interpolation
+    return [passed_through, arr[0], arr[1], d["key"], interpolated]
+
+es = escape_sites()
+assert(es[0] == 42, "raw local passed as a call argument boxes correctly")
+assert(es[1] == 42 && es[2] == 43, "raw locals written into array elements box correctly")
+assert(es[3] == 42, "raw local written into a dict value boxes correctly")
+assert(es[4] == "value is 42", "raw local interpolated into a string boxes correctly")
+
+struct Holder:
+    value = 0
+function escape_to_struct():
+    n = 7
+    h = Holder(n)          # struct construction argument
+    h.value = n * 2        # struct field write from a raw expression
+    return h.value
+
+assert(escape_to_struct() == 14, "raw local used in struct construction and field-set boxes correctly")
+
+# ------------------------------------------------------------------ #
+# A field-read-derived value must never be classified raw itself       #
+# (raw composability only chains through literals/already-raw values,  #
+# never through a container read) — otherwise the OP_FIELD_BINARY/     #
+# OP_BINARY_FIELD fusion in parse_binary_ops could misfire.            #
+# ------------------------------------------------------------------ #
+
+struct Vec:
+    x = 0.0
+function field_derived_not_raw():
+    v = Vec(3.0)
+    result = v.x + 1        # v.x is a field read — result computed correctly either way
+    return result
+
+assert(field_derived_not_raw() == 4.0, "arithmetic on a struct-field read produces the correct value")
+
+# ------------------------------------------------------------------ #
+# A raw local used as a while-loop condition (the OP_RAW_LT/GT/LTE/    #
+# GTE family — closes the "boxes every iteration" gap the design       #
+# doc flagged)                                                          #
+# ------------------------------------------------------------------ #
+
+function raw_while_condition(limit):
+    count = 0
+    x = 0
+    for x < limit:
+        count += 1
+        x += 1
+    return count
+
+assert(raw_while_condition(7) == 7, "a raw local used directly in a while-style loop condition terminates correctly")
+
+# ------------------------------------------------------------------ #
+# Globals never go raw — a top-level (module-scope) numeric variable   #
+# behaves exactly as before (no per-call-frame raw storage exists at   #
+# global scope)                                                        #
+# ------------------------------------------------------------------ #
+
+global_counter = 0
+function bump_global():
+    global_counter += 1
+    return global_counter
+
+bump_global()
+bump_global()
+assert(bump_global() == 3, "a top-level numeric variable (never raw-eligible) still behaves correctly across calls")
+
+# ------------------------------------------------------------------ #
+# Raw-slot overflow — a function with more raw-eligible locals than    #
+# the 32-slot budget must gracefully fall back to boxed, not crash     #
+# or silently truncate                                                 #
+# ------------------------------------------------------------------ #
+
+function many_raw_locals():
+    v0 = 0
+    v1 = 1
+    v2 = 2
+    v3 = 3
+    v4 = 4
+    v5 = 5
+    v6 = 6
+    v7 = 7
+    v8 = 8
+    v9 = 9
+    v10 = 10
+    v11 = 11
+    v12 = 12
+    v13 = 13
+    v14 = 14
+    v15 = 15
+    v16 = 16
+    v17 = 17
+    v18 = 18
+    v19 = 19
+    v20 = 20
+    v21 = 21
+    v22 = 22
+    v23 = 23
+    v24 = 24
+    v25 = 25
+    v26 = 26
+    v27 = 27
+    v28 = 28
+    v29 = 29
+    v30 = 30
+    v31 = 31
+    v32 = 32
+    v33 = 33
+    v34 = 34
+    v35 = 35
+    return (v0 + v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11 + v12 + v13 + v14 + v15 +
+            v16 + v17 + v18 + v19 + v20 + v21 + v22 + v23 + v24 + v25 + v26 + v27 + v28 + v29 +
+            v30 + v31 + v32 + v33 + v34 + v35)
+
+assert(many_raw_locals() == 630, "a function with 36 int locals (over the 32 raw-int-slot budget) still computes correctly via graceful fallback to boxed for the overflow")
+
+print("test_primitive_pass.aer: all assertions passed.")

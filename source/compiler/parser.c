@@ -11,9 +11,57 @@
 static int next_temp_register = 0;
 static int reserved_floor     = 0;
 
+/* Raw-slot allocators for CallFrame.raw_ints/raw_reals ("primitive pass"), mirroring reg_alloc/
+   reg_free/reg_reserve's exact shape for boxed registers above — EXCEPT overflow: reg_reserve
+   refuses to compile past FRAME_REGISTERS (a real ceiling with no fallback), but running out of
+   raw slots for one variable must never break compilation for the whole program, so
+   raw_int_alloc/raw_real_alloc return -1 on overflow instead of calling error_at, and every caller
+   treats -1 as "fall back to ordinary boxed storage for this one value" (see
+   try_emit_binary_raw/parse_assignment, further down). Declared here (not nearer var_kind, their
+   more natural home) because reg_reset below needs to reset them too. */
+static int raw_int_next_temp = 0, raw_int_reserved_floor = 0;
+static int raw_real_next_temp = 0, raw_real_reserved_floor = 0;
+
+static int raw_int_alloc(void) {
+    if (raw_int_next_temp >= RAW_REGISTERS_INT) return -1;
+    return raw_int_next_temp++;
+}
+static void raw_int_free(int count) {
+    raw_int_next_temp -= count;
+    if (raw_int_next_temp < raw_int_reserved_floor) raw_int_next_temp = raw_int_reserved_floor;
+}
+static int raw_real_alloc(void) {
+    if (raw_real_next_temp >= RAW_REGISTERS_REAL) return -1;
+    return raw_real_next_temp++;
+}
+static void raw_real_free(int count) {
+    raw_real_next_temp -= count;
+    if (raw_real_next_temp < raw_real_reserved_floor) raw_real_next_temp = raw_real_reserved_floor;
+}
+
+/* Reserves a NEW permanent raw slot for a variable's first assignment — the raw-slot analog of
+   var_slot claiming reserved_floor for a new boxed local. Returns -1 on overflow (caller falls
+   back to boxed, per this file's graceful-degradation rule for raw storage). */
+static int raw_int_reserve_one(void) {
+    if (raw_int_reserved_floor >= RAW_REGISTERS_INT) return -1;
+    int slot = raw_int_reserved_floor;
+    raw_int_reserved_floor++;
+    raw_int_next_temp = raw_int_reserved_floor;
+    return slot;
+}
+static int raw_real_reserve_one(void) {
+    if (raw_real_reserved_floor >= RAW_REGISTERS_REAL) return -1;
+    int slot = raw_real_reserved_floor;
+    raw_real_reserved_floor++;
+    raw_real_next_temp = raw_real_reserved_floor;
+    return slot;
+}
+
 void reg_reset(void) {
     next_temp_register = 0;
     reserved_floor     = 0;
+    raw_int_next_temp = 0;  raw_int_reserved_floor = 0;
+    raw_real_next_temp = 0; raw_real_reserved_floor = 0;
 }
 
 /* Must refuse to hand out/reserve a register >= FRAME_REGISTERS, the literal size of
@@ -45,13 +93,23 @@ void reg_free(int count) {
     if (next_temp_register < reserved_floor) next_temp_register = reserved_floor;
 }
 
-/* Shared guard for every packed opcode using PACK_RK20 (OP_BINARY, OP_FIELD_SET, OP_INDEX_GET,
-   ...): an ordinary (wide, RK_CONST_FLAG-at-bit-30) rk value's index only overflows RK20's 19 bits
-   in a pathologically large chunk — 524288 registers-or-constants is far beyond any real program
-   — but truncating it silently instead of catching it would corrupt the encoded instruction rather
-   than just refuse to compile it. */
+/* Shared guard for every packed opcode using PACK_RK20 (OP_FIELD_SET, OP_INDEX_GET, the fused
+   field-arithmetic ops, ... — everything except OP_BINARY's own family, see rk9_fits below): an
+   ordinary (wide, RK_CONST_FLAG-at-bit-30) rk value's index only overflows RK20's 19 bits in a
+   pathologically large chunk — 524288 registers-or-constants is far beyond any real program — but
+   truncating it silently instead of catching it would corrupt the encoded instruction rather than
+   just refuse to compile it. */
 static bool rk20_fits(int rk) {
     return (rk & ~RK_CONST_FLAG) <= RK20_MAX_INDEX;
+}
+
+/* Same guard, narrower threshold, for OP_BINARY's own family (arithmetic/comparison/bitwise/OP_IN
+   — see PACK_BINARY's own comment in vm.h for why that word uses a 9-bit RK field instead of
+   RK20's 20 bits). 256 registers-or-constants is still comfortably above both FRAME_REGISTERS
+   (128) and the largest constant pool measured across every .aer file in this repo (~100
+   entries) — same "refuse to compile, never silently truncate" discipline as rk20_fits. */
+static bool rk9_fits(int rk) {
+    return (rk & ~RK_CONST_FLAG) <= RK9_MAX_INDEX;
 }
 
 /* Guard for OP_CALL_MODULE's module_idx/fn_idx (17 bits each, PACK_CALL_MODULE) and
@@ -62,11 +120,21 @@ static bool pool_idx_fits(unsigned int idx, unsigned int max) {
     return idx <= max;
 }
 
+/* "Primitive pass" — defined further down (needs var_kind/raw allocator state declared first),
+   forward-declared here so emit_binary (which needs it) can come before them. */
+static int box_if_raw(Chunk* c, int rk);
+
 /* Every OP_BINARY emission site funnels through here — see PACK_BINARY's own comment in vm.h for
    why this opcode gets a dedicated single-word encoding instead of the ordinary PACK2+2-wide-words
-   every other opcode uses. */
+   every other opcode uses. Boxes any raw-flagged operand first (box_if_raw) — a no-op for an
+   already-plain register or RK_CONST_FLAG constant — so every one of this function's existing call
+   sites stays correct without needing to know raw storage exists at all; only parse_binary_ops's
+   own main arithmetic loop tries the native raw-composing path (try_emit_binary_raw) BEFORE ever
+   reaching here. */
 static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
-    if (!rk20_fits(rk_lhs) || !rk20_fits(rk_rhs)) {
+    rk_lhs = box_if_raw(c, rk_lhs);
+    rk_rhs = box_if_raw(c, rk_rhs);
+    if (!rk9_fits(rk_lhs) || !rk9_fits(rk_rhs)) {
         error_at("Expression too large to compile (register/constant index exceeds the binary-op encoding's range)");
         return;
     }
@@ -100,6 +168,8 @@ int compile_node(Chunk* c, Node* node) {
 }
 
 unsigned int emit_cmp_jump_false(Chunk* c, int rk_a, Opcode cmp_op, int rk_b) {
+    rk_a = box_if_raw(c, rk_a);
+    rk_b = box_if_raw(c, rk_b);
     if (!rk20_fits(rk_a) || !rk20_fits(rk_b)) {
         error_at("Expression too large to compile (register/constant index exceeds the comparison-jump encoding's range)");
         return 0;
@@ -154,7 +224,8 @@ void emit_array_new(Chunk* c, int dest_reg, int item_reg_base, int item_count) {
 }
 
 void emit_index_get(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
-    if (!rk20_fits(rk_idx)) {
+    rk_idx = box_if_raw(c, rk_idx);
+    if (!rk9_fits(rk_idx)) {
         error_at("Expression too large to compile (register/constant index exceeds the index-get encoding's range)");
         return;
     }
@@ -162,6 +233,8 @@ void emit_index_get(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
 }
 
 void emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val) {
+    rk_idx = box_if_raw(c, rk_idx);
+    rk_val = box_if_raw(c, rk_val);
     if (!rk20_fits(rk_idx) || !rk20_fits(rk_val)) {
         error_at("Expression too large to compile (register/constant index exceeds the index-set encoding's range)");
         return;
@@ -173,6 +246,8 @@ void emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val) {
    like every other value operand — a missing bound is passed in as an RK-encoded null constant,
    built by the caller (parse_primary), not specially by this function. */
 void emit_slice_get(Chunk* c, int dest_reg, int arr_reg, int rk_start, int rk_end) {
+    rk_start = box_if_raw(c, rk_start);
+    rk_end   = box_if_raw(c, rk_end);
     if (!rk20_fits(rk_start) || !rk20_fits(rk_end)) {
         error_at("Expression too large to compile (register/constant index exceeds the slice-get encoding's range)");
         return;
@@ -222,7 +297,8 @@ void emit_field_get(Chunk* c, int dest_reg, int struct_reg, unsigned int field_n
 }
 
 void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, int rk_val) {
-    if (!rk20_fits(rk_val) || field_name_pool_idx > 0x1FFFFFFF) {
+    rk_val = box_if_raw(c, rk_val);
+    if (!rk9_fits(rk_val) || field_name_pool_idx > RK9_MAX_INDEX) {
         error_at("Expression too large to compile (register/constant index exceeds the field-set encoding's range)");
         return;
     }
@@ -268,6 +344,7 @@ static bool parse_literal_default(Chunk* c, AerVal* out);
 static void parse_return(Chunk* c);
 static void parse_struct(Chunk* c);
 static bool at_module_name(Chunk* c);
+static int  module_call_id(AerString* name);
 static int  parse_module_call(Chunk* c);
 static void parse_import(Chunk* c);
 static void parse_defer(Chunk* c);
@@ -282,6 +359,27 @@ static int  parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base)
 static unsigned int var_names[FRAME_REGISTERS];
 static int          var_regs[FRAME_REGISTERS];
 static int          var_count = 0;
+
+/* "Primitive pass" — per-variable storage kind, parallel to var_names/var_regs. VAR_BOXED means
+   var_regs[i] is an ordinary registers[] index (today's only behavior); VAR_RAW_INT/VAR_RAW_REAL
+   mean it's a CallFrame.raw_ints/raw_reals slot instead. A name earns RAW_INT/RAW_REAL only when
+   its first assignment is provably an int/real literal or an already-raw expression (see
+   rk_raw_kind), only inside a function body (function_depth > 0 — globals always stay boxed, they
+   have no per-call-frame raw storage to live in) and only outside any if/else branch
+   (branch_depth == 0 — assigning different types down mutually-exclusive branches, read after the
+   join, can't be resolved without real dataflow analysis; disqualifying on sight avoids that
+   entirely). Transitions are one-way: RAW_* -> VAR_BOXED ("shadow" — a fresh boxed register,
+   rebind the name, abandon the old raw slot) is allowed on any later mismatch; VAR_BOXED -> RAW_*
+   is never allowed (kept simple on purpose — see the plan file for why parameters and
+   already-boxed names never get promoted). */
+typedef enum { VAR_BOXED, VAR_RAW_INT, VAR_RAW_REAL } VarKind;
+static VarKind var_kind[FRAME_REGISTERS];
+
+/* Nonzero while compiling an if/else branch body — see var_kind's own comment above for why this
+   disqualifies raw storage. Mirrors function_depth's own "a plain counter is enough" reasoning
+   (parse_if/parse_if_expr bodies can nest, so this does need to be a real counter, not a 0/1 flag,
+   unlike function_depth). */
+static int branch_depth = 0;
 
 /* Nonzero while compiling a function body — lets parse_return reject a top-level `return`. No
    nesting to track (named functions can't nest), so a plain counter (0 or 1) is enough, not a
@@ -333,6 +431,18 @@ static int var_slot(unsigned int name_idx) {
     int reg = reserved_floor;
     var_names[var_count] = name_idx;
     var_regs[var_count]  = reg;
+    /* var_kind[] is a persistent, module-wide static array shared across every function's
+       compilation (only var_count bounds which indices are "in use" at any given moment) — a
+       PAST function's raw-tracked local can leave VAR_RAW_INT/VAR_RAW_REAL sitting at whatever
+       index this new, entirely unrelated name just landed on (the save/restore around a function
+       body only copies back saved_var_count many entries, correctly shrinking var_count, but never
+       zeroes the higher indices it stops covering). A real bug found exactly this way: a fresh
+       top-level `r = f()` landed on index 0, which a PREVIOUSLY-compiled function's own raw-int
+       local had occupied, silently inheriting VAR_RAW_INT and reading garbage from raw_ints[0]
+       instead of r's real (boxed) value. var_slot is the ONE place every fresh name is created —
+       explicitly resetting the kind here closes this for every caller (parameters, for-in loop
+       variables, destructuring, and parse_assignment's own "ordinary boxed" fallback) at once. */
+    var_kind[var_count]  = VAR_BOXED;
     var_count++;
     reserved_floor++;                        /* permanently protects this register from the temp allocator */
     next_temp_register = reserved_floor;   /* resync — see this function's own comment for why that's always safe */
@@ -365,18 +475,232 @@ static bool var_lookup(unsigned int name_idx, int* out_reg) {
 /* Register-value equivalent of compile_node's "was this a NODE_BINARY" check (only
    meaningful for a hand-built tree) — works for any RK operand since a temp always lives at/above
    the reserved floor, a permanent variable register always below it. static int
-   reserved_floor's declaration (top of this file) makes this valid here. */
+   reserved_floor's declaration (top of this file) makes this valid here.
+     A raw-flagged rk (RK_RAW_INT_FLAG/RK_RAW_REAL_FLAG) is never a registers[]-watermark temp —
+   it lives in a completely separate array (CallFrame.raw_ints/raw_reals) with its own allocator —
+   so it must return false here, checked FIRST: its numeric value (with a high flag bit set) would
+   otherwise compare as "huge, so >= reserved_floor" by pure coincidence, which would make a caller
+   wrongly call reg_free() against the BOXED allocator for a value that was never allocated from
+   it. */
 static bool is_temp(int rk) {
+    if (rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
     return !(rk & RK_CONST_FLAG) && rk >= reserved_floor;
 }
 
-/* Ensures rk is a plain register (not RK-const), materializing a constant into a fresh temp via
-   OP_LOADK if needed — OP_JUMP_IF_FALSE_REG needs an actual register operand, no RK form. */
+/* Boxes a raw-flagged rk operand into an ordinary tagged-AerVal register (a no-op for anything
+   else — a plain register or an RK_CONST_FLAG constant, both already understood by every existing
+   consumer). This is the one bridge between raw storage and the rest of the compiler: every
+   function that treats rk as "either a register or a constant" (materialize, arg_materialize,
+   emit_binary's non-raw-composing fallback, parse_unary_inner, cast handling, ...) must call this
+   first, or a raw slot index gets misread as an ordinary registers[] index by code that has no
+   idea raw storage exists. Frees the raw slot afterward if it was a temp (>= the kind's own
+   reserved floor) — never a permanent variable's own slot — so a value that only ever needed
+   boxing once doesn't permanently waste raw-slot budget. */
+static int box_if_raw(Chunk* c, int rk) {
+    if (rk & RK_RAW_INT_FLAG) {
+        int slot = rk & RK_RAW_SLOT_MASK;
+        int dest = reg_alloc();
+        chunk_emit(c, PACK_BOX(OP_BOX_INT, dest, slot));
+        if (slot >= raw_int_reserved_floor) raw_int_free(1);
+        return dest;
+    }
+    if (rk & RK_RAW_REAL_FLAG) {
+        int slot = rk & RK_RAW_SLOT_MASK;
+        int dest = reg_alloc();
+        chunk_emit(c, PACK_BOX(OP_BOX_REAL, dest, slot));
+        if (slot >= raw_real_reserved_floor) raw_real_free(1);
+        return dest;
+    }
+    return rk;
+}
+
+/* If name_idx currently exists and is raw-tracked, shadows it to a fresh boxed register in place
+   (same shadow logic as parse_assignment/compound-assignment's own raw->boxed transitions) — a
+   no-op for a name that's new or already boxed. Needed before any var_slot call whose caller is
+   about to write a genuinely non-raw kind of value straight into the name's register (destructuring
+   targets, for-in loop variables) — var_slot itself has no kind awareness, so calling it on an
+   EXISTING raw name would hand back the bare raw-slot index with no distinguishing flag, silently
+   misread as an ordinary registers[] index by whatever writes into it next (a real bug found this
+   way: reusing a previously-raw-int name as a for-in loop variable). */
+static void ensure_boxed(Chunk* c, unsigned int name_idx) {
+    int existing_idx = -1;
+    for (int i = 0; i < var_count; i++) if (var_names[i] == name_idx) { existing_idx = i; break; }
+    if (existing_idx < 0 || var_kind[existing_idx] == VAR_BOXED) return;
+
+    int old_slot = var_regs[existing_idx];
+    Opcode box_op = (var_kind[existing_idx] == VAR_RAW_INT) ? OP_BOX_INT : OP_BOX_REAL;
+    if (reserved_floor >= FRAME_REGISTERS) { error_at("Too many variables (max %d)", FRAME_REGISTERS); return; }
+    int new_reg = reserved_floor;
+    reserved_floor++;
+    next_temp_register = reserved_floor;
+    chunk_emit(c, PACK_BOX(box_op, new_reg, old_slot));
+    var_regs[existing_idx] = new_reg;
+    var_kind[existing_idx] = VAR_BOXED;
+    if (function_depth == 0) {
+        for (int i = 0; i < global_count; i++)
+            if (global_names[i] == name_idx) { global_regs[i] = new_reg; break; }
+    }
+}
+
+/* Ensures rk is a plain register (not RK-const, not raw-flagged), materializing a constant into a
+   fresh temp via OP_LOADK if needed (or boxing a raw value via box_if_raw) — OP_JUMP_IF_FALSE_REG
+   needs an actual register operand, no RK/raw form. */
 static int materialize(Chunk* c, int rk) {
+    rk = box_if_raw(c, rk);
     if (!(rk & RK_CONST_FLAG)) return rk;
     int reg = reg_alloc();
     chunk_emit(c, PACK1(OP_LOADK, reg)); chunk_emit(c, rk & ~RK_CONST_FLAG);
     return reg;
+}
+
+/* Returns the current value of a local variable as an rk operand, with RK_RAW_INT_FLAG/
+   RK_RAW_REAL_FLAG set for a raw-tracked name instead of a plain register number — every reader of
+   a variable's value must go through this (not raw var_regs[i]) or a raw slot index gets misread
+   as an ordinary registers[] index by a consumer that doesn't know to check (this was a real bug
+   found in review: string interpolation fed var_lookup's plain result straight into OP_TO_STR). */
+static bool var_lookup_rk(unsigned int name_idx, int* out_rk) {
+    for (int i = 0; i < var_count; i++) {
+        if (var_names[i] != name_idx) continue;
+        switch (var_kind[i]) {
+            case VAR_RAW_INT:  *out_rk = RK_RAW_INT_FLAG  | var_regs[i]; break;
+            case VAR_RAW_REAL: *out_rk = RK_RAW_REAL_FLAG | var_regs[i]; break;
+            default:           *out_rk = var_regs[i]; break;
+        }
+        return true;
+    }
+    return false;
+}
+
+typedef enum { RAWK_NONE, RAWK_INT, RAWK_REAL } RawKind;
+
+/* Whether rk is raw-composable, and as which kind: either an already-raw operand (RK_RAW_INT_FLAG/
+   RK_RAW_REAL_FLAG) or a compile-time int/real literal constant (RK_CONST_FLAG whose pool value is
+   TYPE_INTEGER/TYPE_REAL) — anything else (a plain boxed register, a non-numeric constant) is
+   RAWK_NONE. This is the ONLY gate that decides whether an expression can compose as raw —
+   deliberately narrow: a function call result, a container read, a string, a struct/array/dict, or
+   a plain dynamic register is never raw-composable, so raw-tracked variables can never carry
+   anything but a provably-int/real value (see var_kind's own comment for why that matters for the
+   phi/merge problem and for the fusion-optimization interaction in parse_binary_ops). */
+static RawKind rk_raw_kind(Chunk* c, int rk) {
+    if (rk & RK_RAW_INT_FLAG)  return RAWK_INT;
+    if (rk & RK_RAW_REAL_FLAG) return RAWK_REAL;
+    if (rk & RK_CONST_FLAG) {
+        AerVal v = c->pool[rk & ~RK_CONST_FLAG];
+        if (aer_type(v) == TYPE_INTEGER) return RAWK_INT;
+        if (aer_type(v) == TYPE_REAL)    return RAWK_REAL;
+    }
+    return RAWK_NONE;
+}
+
+/* Materializes an already-raw-kind-confirmed rk (per rk_raw_kind) into an actual raw_ints/
+   raw_reals slot: an already-raw operand's slot is reused directly (no copy); a literal constant
+   is loaded into a fresh slot via OP_RAW_LOAD_INT/REAL. Returns -1 on raw-slot-budget overflow —
+   caller falls back to the ordinary boxed path for the whole expression in that case (see
+   try_emit_binary_raw). */
+static int raw_materialize(Chunk* c, int rk, RawKind kind) {
+    if (kind == RAWK_INT) {
+        if (rk & RK_RAW_INT_FLAG) return rk & RK_RAW_SLOT_MASK;
+        unsigned int pool_idx = rk & ~RK_CONST_FLAG;
+        int64_t v = aer_as_int(c->pool[pool_idx]);
+        int slot = raw_int_alloc();
+        if (slot < 0) return -1;
+        /* OP_RAW_LOAD_INT's immediate is a signed 20-bit field (-524288..524287) — a literal
+           outside that range must go through the pool instead of being silently truncated. Real
+           bug found exactly this way: `i < 20000000` packed 20000000 into 20 bits, silently
+           becoming 77056, so a supposedly-20-million-iteration loop only ran 77056 times — wrong
+           output, not a crash, not a compile error, found only by cross-checking a benchmark's
+           result against the expected sum. */
+        if (v >= -524288 && v <= 524287) {
+            chunk_emit(c, PACK_RAW_LOAD_INT(slot, (int)v));
+        } else {
+            chunk_emit(c, PACK_RAW_LOAD_INT_POOL(slot, pool_idx));
+        }
+        return slot;
+    } else {
+        if (rk & RK_RAW_REAL_FLAG) return rk & RK_RAW_SLOT_MASK;
+        unsigned int pool_idx = rk & ~RK_CONST_FLAG;   /* real literal already lives in the pool as a full double */
+        int slot = raw_real_alloc();
+        if (slot < 0) return -1;
+        chunk_emit(c, PACK_RAW_LOAD_REAL(slot, pool_idx));
+        return slot;
+    }
+}
+
+/* Tries to emit a native raw-storage op for `op` when both rk_lhs/rk_rhs are the same raw-composable
+   kind (rk_raw_kind) — returns false (emitting nothing) if the operator has no raw-native form or
+   the operand kinds don't match, in which case the caller falls back to the ordinary boxed
+   emit_binary/PACK_BINARY path. Only ADD/SUB/MUL/DIV/MOD/FLOOR_DIV and the 4 ordering comparisons
+   (LT/GT/LTE/GTE) are raw-native (see vm.h's OP_RAW_* family) — EQ/NEQ and everything else
+   (bitwise, AND/OR, IN, ...) always go through the boxed path, deliberately: this keeps the raw
+   opcode surface to exactly what nbody-style hot loops need, not a full duplicate ISA. */
+static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int* out_rk) {
+    RawKind kind_lhs = rk_raw_kind(c, rk_lhs);
+    RawKind kind_rhs = rk_raw_kind(c, rk_rhs);
+    if (kind_lhs == RAWK_NONE || kind_rhs == RAWK_NONE || kind_lhs != kind_rhs) return false;
+    bool int_kind = (kind_lhs == RAWK_INT);
+
+    Opcode raw_op;
+    bool is_cmp = false;
+    bool div_int_promotes_to_real = false;   /* OP_DIV on two ints still yields a real, matching
+                                                  the boxed BINARY_OP_INT_REAL(div, ...) semantic —
+                                                  see OP_RAW_DIV_INT's own comment, vm.c */
+    if (int_kind) {
+        switch (op) {
+            case OP_ADD: raw_op = OP_RAW_ADD_INT; break;
+            case OP_SUB: raw_op = OP_RAW_SUB_INT; break;
+            case OP_MUL: raw_op = OP_RAW_MUL_INT; break;
+            case OP_DIV: raw_op = OP_RAW_DIV_INT; div_int_promotes_to_real = true; break;
+            case OP_MOD: raw_op = OP_RAW_MOD_INT; break;
+            case OP_FLOOR_DIV: raw_op = OP_RAW_FLOOR_DIV_INT; break;
+            case OP_LT:  raw_op = OP_RAW_LT_INT;  is_cmp = true; break;
+            case OP_GT:  raw_op = OP_RAW_GT_INT;  is_cmp = true; break;
+            case OP_LTE: raw_op = OP_RAW_LTE_INT; is_cmp = true; break;
+            case OP_GTE: raw_op = OP_RAW_GTE_INT; is_cmp = true; break;
+            default: return false;
+        }
+    } else {
+        switch (op) {
+            case OP_ADD: raw_op = OP_RAW_ADD_REAL; break;
+            case OP_SUB: raw_op = OP_RAW_SUB_REAL; break;
+            case OP_MUL: raw_op = OP_RAW_MUL_REAL; break;
+            case OP_DIV: raw_op = OP_RAW_DIV_REAL; break;
+            case OP_LT:  raw_op = OP_RAW_LT_REAL;  is_cmp = true; break;
+            case OP_GT:  raw_op = OP_RAW_GT_REAL;  is_cmp = true; break;
+            case OP_LTE: raw_op = OP_RAW_LTE_REAL; is_cmp = true; break;
+            case OP_GTE: raw_op = OP_RAW_GTE_REAL; is_cmp = true; break;
+            default: return false;   /* no raw MOD/FLOOR_DIV for real */
+        }
+    }
+
+    int slot_lhs = raw_materialize(c, rk_lhs, kind_lhs);
+    int slot_rhs = raw_materialize(c, rk_rhs, kind_lhs);   /* same kind, confirmed above */
+    if (slot_lhs < 0 || slot_rhs < 0) return false;   /* raw-slot budget exhausted: fall back to boxed */
+
+    /* Free-then-allocate, RHS then LHS, matching this file's universal discipline — only frees a
+       slot that was actually a temp (>= the kind's reserved floor), never a permanent variable's
+       own slot. */
+    int floor_now = int_kind ? raw_int_reserved_floor : raw_real_reserved_floor;
+    if (slot_rhs >= floor_now) { if (int_kind) raw_int_free(1); else raw_real_free(1); }
+    if (slot_lhs >= floor_now) { if (int_kind) raw_int_free(1); else raw_real_free(1); }
+
+    if (is_cmp) {
+        int dest = reg_alloc();
+        chunk_emit(c, PACK_RAW_CMP(raw_op, dest, slot_lhs, slot_rhs));
+        *out_rk = dest;
+        return true;
+    }
+    if (div_int_promotes_to_real) {
+        int dest = raw_real_alloc();
+        if (dest < 0) return false;   /* extremely unlikely right after freeing 2 int slots, but stay safe */
+        chunk_emit(c, PACK_RAW_ARITH_RR(raw_op, dest, slot_lhs, slot_rhs));
+        *out_rk = RK_RAW_REAL_FLAG | dest;
+        return true;
+    }
+    int dest = int_kind ? raw_int_alloc() : raw_real_alloc();
+    if (dest < 0) return false;
+    chunk_emit(c, PACK_RAW_ARITH_RR(raw_op, dest, slot_lhs, slot_rhs));
+    *out_rk = (int_kind ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest;
+    return true;
 }
 
 /* function name -> instruction offset, separate from var_names (a function needs a jump target,
@@ -592,6 +916,7 @@ static void struct_register(unsigned int name_idx) {
    leftover value instead. Only a bare constant or an existing permanent variable register (neither
    of which touched the temp watermark) still needs an actual fresh register. */
 static int arg_materialize(Chunk* c, int rk) {
+    rk = box_if_raw(c, rk);
     if (!(rk & RK_CONST_FLAG) && is_temp(rk) && rk == next_temp_register - 1) {
         return rk;
     }
@@ -750,12 +1075,18 @@ static int parse_string_literal(Chunk* c) {
         unsigned int name_pool_idx = chunk_add_pool(c, aer_make_string(name_buf, name_len));
 
         int var_reg;
-        if (!var_lookup(name_pool_idx, &var_reg)) {
+        if (!var_lookup_rk(name_pool_idx, &var_reg)) {
             error_at("'%.*s' is not defined (an interpolated name must already have a value)",
                      (int)name_len, s + var_start);
             i++;
             continue;
         }
+        /* var_lookup_rk, not raw var_lookup — a raw-tracked name must be boxed before feeding it
+           to OP_TO_STR (bypasses materialize/emit_binary entirely, so this needs its own explicit
+           box_if_raw call; found as a real gap in review — left as var_lookup's plain result, this
+           would silently print whatever unrelated boxed value happens to sit at that register
+           number instead of the interpolated variable's actual value). */
+        var_reg = box_if_raw(c, var_reg);
 
         int str_dest = reg_alloc();
         chunk_emit(c, PACK_UNARY(str_dest, OP_TO_STR, var_reg));
@@ -854,10 +1185,16 @@ static int parse_primary_inner(Chunk* c) {
 
         /* A name not among the CURRENT function's own locals may still be a top-level variable,
            readable via OP_LOAD_GLOBAL (see global_names's own comment). Checked only when
-           var_lookup (non-creating) misses, so a local always shadows a global of the same
-           name. */
+           var_lookup_rk (non-creating) misses, so a local always shadows a global of the same
+           name.
+             var_lookup_rk (not raw var_lookup) — a raw-tracked name returns an RK_RAW_INT_FLAG/
+           RK_RAW_REAL_FLAG-tagged operand here instead of a plain register, which is what lets a
+           bare reference to it compose through further arithmetic (try_emit_binary_raw) without
+           boxing; every consumer that can't handle that (materialize, arg_materialize, emit_binary,
+           postfix-chain indexing/field-access, ...) already boxes it back via box_if_raw before
+           doing anything unsafe with it. */
         int reg;
-        if (var_lookup(name_idx, &reg)) return reg;
+        if (var_lookup_rk(name_idx, &reg)) return reg;
         if (function_depth > 0) {
             int global_reg;
             if (global_lookup(name_idx, &global_reg)) {
@@ -1001,9 +1338,12 @@ static int parse_unary_inner(Chunk* c) {
     else return parse_primary(c);
 
     int rk = parse_unary(c);
+    rk = box_if_raw(c, rk);   /* no raw-native unary form exists (see try_emit_binary_raw's own
+                                  scope comment) — box first, or a raw slot index gets misread as
+                                  an ordinary registers[] index by rk9_fits/PACK_UNARY below */
     if (is_temp(rk)) reg_free(1);   /* free-then-allocate, matching every other site */
     int dest = reg_alloc();
-    if (!rk20_fits(rk)) {
+    if (!rk9_fits(rk)) {
         error_at("Expression too large to compile (register/constant index exceeds the unary-op encoding's range)");
         return dest;
     }
@@ -1095,6 +1435,7 @@ static int compile_pipe(Chunk* c, int lhs) {
        consuming the identifier so a module name is never mistaken for an ordinary function/struct
        name below. */
     if (chunk_is_imported(c, aer_as_string(token.value)->data, aer_as_string(token.value)->length)) {
+        int module_id = module_call_id(aer_as_string(token.value));
         unsigned int module_idx = chunk_add_pool(c, token.value);
         lex();
         require(TOKEN_DOT, "expected '.' after module name");
@@ -1125,6 +1466,7 @@ static int compile_pipe(Chunk* c, int lhs) {
             return dest;
         }
         chunk_emit(c, PACK_CALL_MODULE(dest, arg_reg_base, arg_count, module_idx, fn_idx));
+        chunk_emit(c, module_id);
         return dest;
     }
 
@@ -1192,6 +1534,11 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             unsigned int type_len = aer_as_string(token.value)->length;
             lex();
 
+            /* A raw-tracked lhs (`x as string`/`as integer`/... where x is a raw int/real local)
+               has no raw-native cast form — box it first, or rk9_fits/PACK_CHECK_SHAPE below would
+               misread a raw slot index as an ordinary registers[] index. */
+            lhs = box_if_raw(c, lhs);
+
             if (is_temp(lhs)) reg_free(1);
             int dest = reg_alloc();
 
@@ -1201,7 +1548,7 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
                    RK-flagged constant, so no rk20_fits guard is needed. */
                 chunk_emit(c, PACK_CHECK_SHAPE(dest, lhs, type_name_idx));
             } else if (type_len == 6 && strncmp(type_name, "string", 6) == 0) {
-                if (!rk20_fits(lhs)) {
+                if (!rk9_fits(lhs)) {
                     error_at("Expression too large to compile (register/constant index exceeds the cast encoding's range)");
                     return dest;
                 }
@@ -1216,7 +1563,7 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
                              (int)type_len, type_name);
                     return dest;
                 }
-                if (!rk20_fits(lhs)) {
+                if (!rk9_fits(lhs)) {
                     error_at("Expression too large to compile (register/constant index exceeds the cast encoding's range)");
                     return dest;
                 }
@@ -1247,6 +1594,11 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
         int rhs = parse_binary(c, prec);   /* same precedence as floor -> left-associative */
 
         if (lhs_is_field) {
+            /* lhs is always the OP_FIELD_GET result here (never raw — a container field read is
+               never raw-composable, see rk_raw_kind's own comment), but rhs is a genuinely
+               separate expression that could be a raw variable/literal — box it, or rk20_fits/
+               PACK_FIELD_BINARY below would misread a raw slot index as an ordinary register. */
+            rhs = box_if_raw(c, rhs);
             if (is_temp(rhs)) reg_free(1);
             if (is_temp(lhs)) reg_free(1);
 
@@ -1274,6 +1626,10 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             int field_idx  = (int)UNPACK_FIELD_GET_FIELD(c->code[rhs_start]);
             c->count = rhs_start;   /* discard the OP_FIELD_GET just emitted, never executed */
 
+            /* rhs is always the OP_FIELD_GET result here (never raw), but lhs is a genuinely
+               separate expression that could be a raw variable/literal — box it, same reasoning
+               as the lhs_is_field branch above. */
+            lhs = box_if_raw(c, lhs);
             if (is_temp(rhs)) reg_free(1);
             if (is_temp(lhs)) reg_free(1);
 
@@ -1284,6 +1640,20 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             }
             chunk_emit(c, PACK_BINARY_FIELD(dest, struct_reg, op, lhs, field_idx));
             lhs = dest;
+            lhs_start = c->count;
+            continue;
+        }
+
+        /* "Primitive pass" — try composing lhs/rhs as a native raw op (both provably int/real,
+           either an already-raw variable or a literal, see rk_raw_kind) before falling to the
+           ordinary boxed path. Handles its own operand freeing/dest allocation entirely (raw slots
+           and boxed registers are separate allocator spaces) — false means "not raw-composable",
+           in which case lhs/rhs still need the existing free/emit_binary treatment below (which
+           boxes them via emit_binary's own box_if_raw call if either happened to be raw-flagged
+           but incompatible with the other). */
+        int raw_result;
+        if (try_emit_binary_raw(c, op, lhs, rhs, &raw_result)) {
+            lhs = raw_result;
             lhs_start = c->count;
             continue;
         }
@@ -1354,6 +1724,9 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
 
         int target_regs[MAX_DESTRUCT];
         for (unsigned int i = 0; i < count; i++) {
+            ensure_boxed(c, names[i]);   /* a destructuring target is always a plain boxed write —
+                                             never raw-composable — so any existing raw-tracked
+                                             name must shadow to boxed BEFORE var_slot looks it up */
             target_regs[i] = var_slot(names[i]);
             if (target_regs[i] < 0) return;   /* error_at already called */
         }
@@ -1376,7 +1749,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         }
 
         for (unsigned int i = 0; i < count; i++) {
-            unsigned int pool_i = chunk_add_pool(c, aer_int((long long)i));
+            unsigned int pool_i = chunk_add_pool(c, aer_int((int64_t)i));
             emit_index_get(c, target_regs[i], arr_reg, (int)pool_i | RK_CONST_FLAG);
         }
         reg_free(1);   /* arr_reg — always a temp, guaranteed by arg_materialize */
@@ -1386,6 +1759,115 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
     if (consume(TOKEN_ASSIGN)) {
         int rk_val = parse_binary(c, 0);
         if (parse_had_error) return;
+
+        /* "Primitive pass" classification — looked up AFTER parsing the RHS, not before: a
+           self-referential first assignment (`x = x + 1` where x doesn't exist yet) creates x as
+           a side effect of parsing the RHS (parse_primary_inner's var_slot fallback), always
+           boxed — checking "does name_idx exist yet" only now naturally folds that case into the
+           ordinary "existing, boxed" path below with no separate special-casing needed. */
+        int existing_idx = -1;
+        for (int i = 0; i < var_count; i++) if (var_names[i] == name_idx) { existing_idx = i; break; }
+
+        if (existing_idx < 0) {
+            /* Fresh name. Eligible for raw storage iff: inside a function body (function_depth >
+               0 — a top-level/global name always stays boxed, it has no per-call-frame raw
+               storage to live in), outside any if/else branch (branch_depth == 0 — see var_kind's
+               own comment for the phi/merge problem this avoids), and the RHS is provably int/real
+               (rk_raw_kind — a literal, or an already-raw expression). */
+            RawKind rhs_kind = rk_raw_kind(c, rk_val);
+            if (function_depth > 0 && branch_depth == 0 && rhs_kind != RAWK_NONE) {
+                int slot = (rhs_kind == RAWK_INT) ? raw_int_reserve_one() : raw_real_reserve_one();
+                if (slot >= 0) {
+                    int src_slot = raw_materialize(c, rk_val, rhs_kind);
+                    if (src_slot < 0) {
+                        /* Raw-slot budget exhausted mid-materialize (reserve succeeded but a
+                           literal's own temp load didn't) — release the reservation, fall through
+                           to the ordinary boxed path below. */
+                        if (rhs_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1);
+                    } else {
+                        if (src_slot != slot) {
+                            /* Direct analog of the boxed path's "reg != rk_val -> MOVE" case. */
+                            Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
+                            chunk_emit(c, PACK_RAW_MOVE(move_op, slot, src_slot));
+                            int floor_now = (rhs_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
+                            if (src_slot >= floor_now) { if (rhs_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
+                        }
+                        var_names[var_count] = name_idx;
+                        var_regs[var_count]  = slot;
+                        var_kind[var_count]  = (rhs_kind == RAWK_INT) ? VAR_RAW_INT : VAR_RAW_REAL;
+                        var_count++;
+                        return;
+                    }
+                }
+            }
+        } else if (var_kind[existing_idx] != VAR_BOXED) {
+            /* Reassigning a name that's CURRENTLY raw-tracked. Stays raw (writing into its own
+               EXISTING slot, no shadow) whenever the new value is still the same raw kind —
+               regardless of branch/loop nesting: the slot's IDENTITY never changes here (still
+               the same raw_ints/raw_reals index the compiler has always known this name by), so
+               there's no phi/merge ambiguity to avoid the way rule 5 exists for — that rule is
+               about a FRESH name's slot assignment being ambiguous across branches, not about an
+               in-place update to an already-settled slot. If the branch that reassigns it doesn't
+               run, the slot simply keeps whichever earlier same-kind value it already had — always
+               valid, same as an ordinary boxed variable reassigned inside an if today. Otherwise
+               (a genuine kind mismatch): shadow to a FRESH boxed register — var_slot must never be
+               called here, since for a currently-raw name it would return the STALE RAW SLOT INDEX
+               as if it were an ordinary registers[] index. */
+            RawKind rhs_kind = rk_raw_kind(c, rk_val);
+            VarKind cur = var_kind[existing_idx];
+            bool same_kind = (cur == VAR_RAW_INT && rhs_kind == RAWK_INT) ||
+                                 (cur == VAR_RAW_REAL && rhs_kind == RAWK_REAL);
+            if (same_kind) {
+                int dest_slot = var_regs[existing_idx];
+                int src_slot  = raw_materialize(c, rk_val, rhs_kind);
+                if (src_slot >= 0) {
+                    if (src_slot != dest_slot) {
+                        Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
+                        chunk_emit(c, PACK_RAW_MOVE(move_op, dest_slot, src_slot));
+                        int floor_now = (rhs_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
+                        if (src_slot >= floor_now) { if (rhs_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
+                    }
+                    return;
+                }
+                /* raw-slot budget exhausted materializing the RHS: fall through to the shadow
+                   path below instead of leaving the variable half-updated. */
+            }
+            /* Shadow to boxed — mirrors var_slot's own register-claiming logic exactly (reserve
+               reserved_floor, bump it, resync next_temp_register), but rebinds an EXISTING
+               var_names/var_kind entry in place instead of appending a new one. Safe regardless of
+               loop/branch nesting: a plain assignment always OVERWRITES with a brand new value
+               (LOADK/MOVE below never depends on old_slot's value), so re-executing this shadow on
+               every loop iteration is merely a wasted box, never a correctness problem — unlike
+               compound assignment's shadow (see its own comment), which explicitly needs old_slot's
+               value to compute the new one and so genuinely can't tolerate repeated execution. */
+            rk_val = box_if_raw(c, rk_val);
+            if (reserved_floor >= FRAME_REGISTERS) {
+                error_at("Too many variables (max %d)", FRAME_REGISTERS);
+                return;
+            }
+            int new_reg = reserved_floor;
+            reserved_floor++;
+            next_temp_register = reserved_floor;
+            var_regs[existing_idx] = new_reg;
+            var_kind[existing_idx] = VAR_BOXED;
+            if (function_depth == 0) {
+                for (int i = 0; i < global_count; i++)
+                    if (global_names[i] == name_idx) { global_regs[i] = new_reg; break; }
+            }
+            if (rk_val & RK_CONST_FLAG) {
+                chunk_emit(c, PACK1(OP_LOADK, new_reg)); chunk_emit(c, rk_val & ~RK_CONST_FLAG);
+            } else if (new_reg != rk_val) {
+                chunk_emit(c, PACK2(OP_MOVE, new_reg, rk_val));
+                if (is_temp(rk_val)) reg_free(1);
+            }
+            return;
+        }
+
+        /* Ordinary boxed path — unchanged existing behavior (a fresh name that wasn't raw-eligible,
+           or a reassignment of an already-boxed name). rk_val is boxed first in case it happens to
+           be raw-flagged (a raw-composed RHS assigned to a name that can't itself be raw: a global,
+           a branch-local first assignment, or a raw-budget overflow above). */
+        rk_val = box_if_raw(c, rk_val);
         int reg = var_slot(name_idx);
         if (reg < 0) return;   /* error_at already called */
         if (rk_val & RK_CONST_FLAG) {
@@ -1408,6 +1890,102 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
 
     for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
         if (!consume(compound_assign_ops[i].tok)) continue;
+
+        /* "Primitive pass" — a compound-assignment target that's CURRENTLY raw-tracked needs its
+           own path entirely: var_lookup below returns a bare register-shaped int with no
+           distinguishing flag, so passing it straight into emit_binary as both dest AND an rk
+           operand (the code just past this block) would silently misread a raw slot index as an
+           ordinary registers[] index — a real silent-wrong-answer bug, not a crash, found in
+           review. Stays raw (native op, written back into its own EXISTING slot, no shadow) for
+           +=/-=/*= with a same-kind RHS, regardless of branch/loop nesting — the slot's identity
+           never changes here, so there's no phi/merge ambiguity (same reasoning as plain
+           assignment's own reassignment case). /= always shadows (int/int division promotes to
+           real, changing the variable's own kind mid-compound-op) and so does any kind mismatch. */
+        int existing_idx = -1;
+        for (int j = 0; j < var_count; j++) if (var_names[j] == name_idx) { existing_idx = j; break; }
+
+        if (existing_idx >= 0 && var_kind[existing_idx] != VAR_BOXED) {
+            RawKind cur_kind = (var_kind[existing_idx] == VAR_RAW_INT) ? RAWK_INT : RAWK_REAL;
+            Opcode boxed_op = compound_assign_ops[i].op;
+            bool native_op_exists = (boxed_op == OP_ADD || boxed_op == OP_SUB || boxed_op == OP_MUL);
+
+            int rk_rhs = parse_binary(c, 0);
+            if (parse_had_error) return;
+            RawKind rhs_kind = rk_raw_kind(c, rk_rhs);
+
+            if (native_op_exists && rhs_kind == cur_kind) {
+                int dest_slot = var_regs[existing_idx];
+                int rhs_slot  = raw_materialize(c, rk_rhs, rhs_kind);
+                if (rhs_slot >= 0) {
+                    Opcode raw_op;
+                    if (cur_kind == RAWK_INT) raw_op = (boxed_op == OP_ADD) ? OP_RAW_ADD_INT : (boxed_op == OP_SUB) ? OP_RAW_SUB_INT : OP_RAW_MUL_INT;
+                    else                       raw_op = (boxed_op == OP_ADD) ? OP_RAW_ADD_REAL : (boxed_op == OP_SUB) ? OP_RAW_SUB_REAL : OP_RAW_MUL_REAL;
+                    chunk_emit(c, PACK_RAW_ARITH_RR(raw_op, dest_slot, dest_slot, rhs_slot));
+                    int floor_now = (cur_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
+                    if (rhs_slot >= floor_now) { if (cur_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
+                    return;
+                }
+                /* raw-slot budget exhausted materializing the RHS: fall through to the shadow
+                   path below instead of leaving the variable half-updated. */
+            }
+
+            /* RHS is an ORDINARY BOXED value — not a literal, not an already-raw expression, so
+               rk_raw_kind can't tell its type at compile time (found via nbody.aer's own
+               `energy()`: `e += 0.5 * bim * (...)` where bim/vx/vy/vz are struct-field reads —
+               never raw-composable by rule 4 — so the product is a plain boxed register even
+               though it's always real at runtime). Rather than shadow (which would hit the
+               loop_depth restriction below for exactly this common pattern), accumulate directly
+               into the EXISTING raw slot with a runtime tag check — no shadow, no allocation, the
+               slot's identity never changes, so this is safe to repeat every loop iteration. Only
+               when the kind genuinely ISN'T already known to mismatch at compile time (rhs_kind ==
+               RAWK_NONE) — a provably-different raw kind (e.g. cur_kind REAL, rhs a raw INT
+               expression) still goes to the shadow path below, which gives a clearer diagnosis
+               when it can't proceed (or just works, outside a loop) instead of a guaranteed
+               runtime error every time. */
+            if (native_op_exists && rhs_kind == RAWK_NONE) {
+                int dest_slot = var_regs[existing_idx];
+                int boxed_reg = materialize(c, rk_rhs);
+                Opcode raw_op;
+                if (cur_kind == RAWK_INT) raw_op = (boxed_op == OP_ADD) ? OP_RAW_ADD_INT_BOXED : (boxed_op == OP_SUB) ? OP_RAW_SUB_INT_BOXED : OP_RAW_MUL_INT_BOXED;
+                else                       raw_op = (boxed_op == OP_ADD) ? OP_RAW_ADD_REAL_BOXED : (boxed_op == OP_SUB) ? OP_RAW_SUB_REAL_BOXED : OP_RAW_MUL_REAL_BOXED;
+                chunk_emit(c, PACK_RAW_ARITH_BOXED(raw_op, dest_slot, boxed_reg));
+                if (is_temp(boxed_reg)) reg_free(1);
+                return;
+            }
+
+            /* Shadow to boxed: box the CURRENT raw value into a fresh, permanent boxed register,
+               then perform the compound op using it (new = box(old) OP rhs) — unlike plain
+               assignment's shadow, this genuinely depends on old_slot's value, so repeating this
+               code (a loop body re-executing it) would re-read the ORIGINAL stale value every
+               iteration and discard whatever new_reg had accumulated — a real, silent-corruption
+               bug found exactly this way. There's no single-pass fix (the earlier code, compiled
+               while this name was still raw, can't be retroactively changed), so refuse to compile
+               rather than silently corrupt, same discipline this file already uses for rk9_fits/
+               rk20_fits/reg_reserve overflow. This only fires for a genuine kind mismatch (/=, or
+               a truly different type) — the common, safe same-kind case already returned above. */
+            if (loop_depth > 0) {
+                error_at("This compound assignment would change '%s' from a fixed numeric type to a different type, but it's inside a loop — not supported (restructure so the type change happens outside any loop)",
+                         aer_as_string(c->pool[name_idx])->data);
+                return;
+            }
+            int old_slot = var_regs[existing_idx];
+            Opcode box_op = (cur_kind == RAWK_INT) ? OP_BOX_INT : OP_BOX_REAL;
+            if (reserved_floor >= FRAME_REGISTERS) { error_at("Too many variables (max %d)", FRAME_REGISTERS); return; }
+            int new_reg = reserved_floor;
+            reserved_floor++;
+            next_temp_register = reserved_floor;
+            chunk_emit(c, PACK_BOX(box_op, new_reg, old_slot));
+            var_regs[existing_idx] = new_reg;
+            var_kind[existing_idx] = VAR_BOXED;
+            if (function_depth == 0) {
+                for (int j = 0; j < global_count; j++)
+                    if (global_names[j] == name_idx) { global_regs[j] = new_reg; break; }
+            }
+            rk_rhs = box_if_raw(c, rk_rhs);
+            emit_binary(c, new_reg, boxed_op, new_reg, rk_rhs);
+            if (is_temp(rk_rhs)) reg_free(1);
+            return;
+        }
 
         /* Non-creating lookup — compound assignment to a name with no prior value has no
            sensible register to read from, so it's a compile-time error here. A name that isn't a
@@ -1433,7 +2011,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             emit_binary(c, local_reg, compound_assign_ops[i].op, local_reg, rk_rhs);
             if (is_temp(rk_rhs)) reg_free(1);
 
-            if (!rk20_fits(local_reg)) {
+            if (!rk9_fits(local_reg)) {
                 error_at("Expression too large to compile (register/constant index exceeds the store-global encoding's range)");
                 return;
             }
@@ -1456,7 +2034,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
     if (equal(TOKEN_PIPE)) {
         int reg;
         unsigned int lhs_start = c->count;
-        if (!var_lookup(name_idx, &reg)) {
+        if (!var_lookup_rk(name_idx, &reg)) {
             if (function_depth > 0 && global_lookup(name_idx, &reg)) {
                 int dest = reg_alloc();
                 chunk_emit(c, PACK2(OP_LOAD_GLOBAL, dest, reg));
@@ -1589,6 +2167,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
 
             int rk_rhs = parse_binary(c, 0);
             if (parse_had_error) return;
+            rk_rhs = box_if_raw(c, rk_rhs);   /* no raw-native fused field-op form exists */
 
             if (!rk20_fits(rk_rhs) || !pool_idx_fits(pending_field_idx, FUSED_FIELD_NAME_MAX)) {
                 error_at("Expression too large to compile (register/constant/field index exceeds the fused field-op encoding's range)");
@@ -1741,7 +2320,14 @@ static void parse_if(Chunk* c) {
     unsigned int patch_jif = emit_jump_if_false_reg(c, reg_cond);
     if (is_temp(reg_cond)) reg_free(1);
 
+    /* "Primitive pass" — branch_depth disqualifies any variable assigned while it's nonzero from
+       ever being raw-tracked (see var_kind's own comment): a name assigned different types down
+       mutually-exclusive branches, read after the join, can't be resolved by this single-pass
+       compiler without real dataflow analysis. A plain counter (not a 0/1 flag) since if/else can
+       nest. */
+    branch_depth++;
     parse_block(c);
+    branch_depth--;
     if (parse_had_error) return;
 
     if (consume(TOKEN_ELSE)) {
@@ -1751,7 +2337,9 @@ static void parse_if(Chunk* c) {
         unsigned int patch_jmp = c->count;
         chunk_emit(c, 0);
         patch_jump(c, patch_jif, c->count);
+        branch_depth++;
         parse_block(c);
+        branch_depth--;
         patch_jump(c, patch_jmp, c->count);
     } else {
         patch_jump(c, patch_jif, c->count);
@@ -1775,8 +2363,15 @@ static int parse_if_expr(Chunk* c) {
 
     int result_reg = reg_alloc();
 
+    /* branch_depth: see parse_if's own comment — expressions can't currently contain assignments,
+       so this can't matter yet, but costs nothing and guards against a future grammar change
+       silently reintroducing the phi/merge problem this counter exists to avoid. */
+    branch_depth++;
     int rk_then = parse_binary(c, 0);
+    branch_depth--;
     if (parse_had_error) return result_reg;
+    rk_then = box_if_raw(c, rk_then);   /* a bare raw variable reference (not an assignment) can
+                                            legitimately be this branch's value — box before MOVE */
     if (rk_then & RK_CONST_FLAG) {
         chunk_emit(c, PACK1(OP_LOADK, result_reg)); chunk_emit(c, rk_then & ~RK_CONST_FLAG);
     } else if (rk_then != result_reg) {
@@ -1792,8 +2387,11 @@ static int parse_if_expr(Chunk* c) {
     if (consume(TOKEN_ELSE)) {
         require(TOKEN_COLON, "expected ':' after else");
         if (parse_had_error) return result_reg;
+        branch_depth++;
         int rk_else = parse_binary(c, 0);
+        branch_depth--;
         if (parse_had_error) return result_reg;
+        rk_else = box_if_raw(c, rk_else);
         if (rk_else & RK_CONST_FLAG) {
             chunk_emit(c, PACK1(OP_LOADK, result_reg)); chunk_emit(c, rk_else & ~RK_CONST_FLAG);
         } else if (rk_else != result_reg) {
@@ -1848,6 +2446,10 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
    it, so the temp allocator can never hand out the exact register the loop variable was just
    assigned. */
 static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
+    ensure_boxed(c, loop_var_name);   /* a for-in loop variable always holds a plain iterated
+                                          element (array/dict/string item) — never raw — so an
+                                          existing raw-tracked name of the same spelling must
+                                          shadow to boxed BEFORE var_slot looks it up */
     int item_reg = var_slot(loop_var_name);
     if (item_reg < 0) return;
 
@@ -1924,6 +2526,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
    errors otherwise) — reserves BOTH loop variables' permanent registers before compiling the
    collection expression, same ordering reason parse_for_in's own comment gives. */
 static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_name) {
+    ensure_boxed(c, key_name);   /* same reasoning as parse_for_in's own ensure_boxed call */
+    ensure_boxed(c, val_name);
     int key_reg = var_slot(key_name);
     if (key_reg < 0) return;
     int val_reg = var_slot(val_name);
@@ -1975,8 +2579,16 @@ static void parse_for_while(Chunk* c) {
             parse_for_in(c, name_idx);
             return;
         }
-        int reg = var_slot(name_idx);
-        if (reg < 0) return;
+        /* var_lookup_rk (not raw var_slot) — an EXISTING raw-tracked name's var_slot lookup would
+           return its bare raw-slot index with no distinguishing flag, misread by everything below
+           as an ordinary registers[] index (a real bug found here: `for i <= n:` with a raw-int
+           `i` silently compared garbage instead of i's actual value). var_slot only as a fallback,
+           for a genuinely new name (the same creating behavior this line always had). */
+        int reg;
+        if (!var_lookup_rk(name_idx, &reg)) {
+            reg = var_slot(name_idx);
+            if (reg < 0) return;
+        }
         unsigned int loop_top = c->count;
         /* Runs the shared postfix-chain helper before climbing to binary ops, so `for
            <postfix-chain>:` (the linked-list-traversal idiom, `for cur.next:`) resolves the chain
@@ -2007,7 +2619,23 @@ static bool at_module_name(Chunk* c) {
    (parse_contiguous_exprs), same as every other call site; OP_CALL_MODULE's handler (vm.c)
    bridges to the shared stdlib dispatch (aer_math_call/aer_string_call/etc.) rather than
    reimplementing every stdlib function for registers — see its comment in vm.h. */
+/* Resolves a literal module name to its CALL_MODULE_* id (vm.h) at compile time — a module name in
+   `module.fn(...)` is always a literal identifier, never a value that could vary at runtime, so
+   there's no ambiguity to defer: unlike a struct field's actual type (only knowable once an object
+   exists at runtime), which module this is IS already fully known here. Returns CALL_MODULE_DYNAMIC
+   for anything not one of the fixed core built-ins (a host-registered module or a user file
+   import) — those remain genuinely only resolvable by name, at runtime. */
+static int module_call_id(AerString* name) {
+    if (name->length == 4 && strncmp(name->data, "math", 4) == 0)   return CALL_MODULE_MATH;
+    if (name->length == 6 && strncmp(name->data, "random", 6) == 0) return CALL_MODULE_RANDOM;
+    if (name->length == 6 && strncmp(name->data, "string", 6) == 0) return CALL_MODULE_STRING;
+    if (name->length == 4 && strncmp(name->data, "time", 4) == 0)   return CALL_MODULE_TIME;
+    if (name->length == 4 && strncmp(name->data, "json", 4) == 0)   return CALL_MODULE_JSON;
+    return CALL_MODULE_DYNAMIC;
+}
+
 static int parse_module_call(Chunk* c) {
+    int module_id = module_call_id(aer_as_string(token.value));
     unsigned int module_idx = chunk_add_pool(c, token.value);
     lex();
     if (!consume(TOKEN_DOT)) {
@@ -2033,19 +2661,62 @@ static int parse_module_call(Chunk* c) {
         return dest;
     }
     chunk_emit(c, PACK_CALL_MODULE(dest, base, arg_count, module_idx, fn_idx));
+    chunk_emit(c, module_id);
     return dest;
 }
 
-/* `import module[.sub]*` — top level only (checked via function_depth; an import inside an if/for
-   block at top level is accepted, a narrow known gap). Doesn't check chunk_add_import's return
-   value — a failed import is silently not registered, and a later module.function() call against
-   it just falls through to "unknown function". */
+/* `import "path" [as name]` — the quoted form, for paths the dotted form can't express: explicit
+   relative components (`"../shared/utils"`) or an absolute path (`"/opt/aer/lib"`, `"C:/lib"`).
+   The path is used exactly as written (never dot-converted — a literal ".." must survive intact),
+   optionally already carrying a ".aer" suffix. Bare native/host module names (math, string, ...)
+   are deliberately not reachable this way — chunk_add_import's native-module check keys off the
+   bound name, and a quoted path always means "look on disk," so `import "math"` would just try
+   (and fail) to open math.aer; the dotted form remains the only way to import those. */
+static void parse_import_path(Chunk* c) {
+    AerString* path_str = aer_as_string(token.value);
+    unsigned int path_len = path_str->length;
+    char path_buf[256];
+    if (path_len == 0 || path_len >= sizeof(path_buf)) { error_at("Import path is empty or too long"); return; }
+    memcpy(path_buf, path_str->data, path_len);
+    lex();
+
+    char alias_buf[64];
+    unsigned int alias_len;
+    if (consume(TOKEN_AS)) {
+        if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a name after 'as'"); return; }
+        AerString* alias = aer_as_string(token.value);
+        alias_len = alias->length;
+        if (alias_len == 0 || alias_len >= sizeof(alias_buf)) { error_at("Import alias too long"); return; }
+        memcpy(alias_buf, alias->data, alias_len);
+        lex();
+    } else {
+        /* Derive the bound name from the last path segment, stripping a trailing ".aer". */
+        unsigned int end = path_len;
+        if (end > 4 && strncmp(path_buf + end - 4, ".aer", 4) == 0) end -= 4;
+        unsigned int start = 0;
+        for (unsigned int i = 0; i < end; i++)
+            if (path_buf[i] == '/' || path_buf[i] == '\\') start = i + 1;
+        alias_len = end - start;
+        if (alias_len == 0 || alias_len >= sizeof(alias_buf)) {
+            error_at("Cannot derive a module name from this path; add 'as name'");
+            return;
+        }
+        memcpy(alias_buf, path_buf + start, alias_len);
+    }
+    chunk_add_import(c, alias_buf, alias_len, path_buf, path_len);
+}
+
+/* `import module[.sub]*` or `import "path" [as name]` — top level only (checked via
+   function_depth; an import inside an if/for block at top level is accepted, a narrow known gap).
+   Doesn't check chunk_add_import's return value — a failed import is silently not registered, and
+   a later module.function() call against it just falls through to "unknown function". */
 static void parse_import(Chunk* c) {
     if (function_depth != 0) {
         error_at("'import' is only allowed at the top level of a file, not inside a function");
         return;
     }
-    if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a module name after 'import'"); return; }
+    if (token.type == TOKEN_STRING) { parse_import_path(c); return; }
+    if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a module name or a quoted path after 'import'"); return; }
 
     char path_buf[256];
     unsigned int path_len = 0, bind_start = 0, bind_len = 0;
@@ -2339,10 +3010,10 @@ static void parse_return(Chunk* c) {
 
         if (last_bare_call_end == c->count) {
             int op_slot = (int)last_bare_call_start;
-            int orig_op = c->code[op_slot] & 0xFF;
+            int orig_op = c->code[op_slot] & 0x7F;
             if (orig_op == OP_CALL || orig_op == OP_CALL_VALUE) {
                 int tail_op = (orig_op == OP_CALL) ? OP_TAIL_CALL : OP_TAIL_CALL_VALUE;
-                c->code[op_slot] = (c->code[op_slot] & ~0xFF) | tail_op;
+                c->code[op_slot] = (c->code[op_slot] & ~0x7F) | tail_op;
                 return;
             }
         }
@@ -2412,14 +3083,22 @@ static int parse_function_expr(Chunk* c) {
 
     unsigned int saved_var_names[FRAME_REGISTERS];
     int          saved_var_regs[FRAME_REGISTERS];
+    VarKind      saved_var_kind[FRAME_REGISTERS];
     int saved_var_count      = var_count;
     int saved_next_temp      = next_temp_register;
     int saved_reserved_floor = reserved_floor;
+    int saved_raw_int_next_temp      = raw_int_next_temp;
+    int saved_raw_int_reserved_floor = raw_int_reserved_floor;
+    int saved_raw_real_next_temp      = raw_real_next_temp;
+    int saved_raw_real_reserved_floor = raw_real_reserved_floor;
     memcpy(saved_var_names, var_names, sizeof(unsigned int) * (size_t)var_count);
     memcpy(saved_var_regs,  var_regs,  sizeof(int) * (size_t)var_count);
+    memcpy(saved_var_kind,  var_kind,  sizeof(VarKind) * (size_t)var_count);
     var_count          = 0;
     next_temp_register = 0;
     reserved_floor     = 0;
+    raw_int_next_temp = 0;  raw_int_reserved_floor = 0;
+    raw_real_next_temp = 0; raw_real_reserved_floor = 0;
 
     function_depth++;
     for (int i = 0; i < param_count; i++) var_slot(param_names[i]);
@@ -2436,8 +3115,11 @@ static int parse_function_expr(Chunk* c) {
     var_count = saved_var_count;
     memcpy(var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
     memcpy(var_regs,  saved_var_regs,  sizeof(int) * (size_t)saved_var_count);
+    memcpy(var_kind,  saved_var_kind,  sizeof(VarKind) * (size_t)saved_var_count);
     next_temp_register = saved_next_temp;
     reserved_floor     = saved_reserved_floor;
+    raw_int_next_temp = saved_raw_int_next_temp;   raw_int_reserved_floor = saved_raw_int_reserved_floor;
+    raw_real_next_temp = saved_raw_real_next_temp; raw_real_reserved_floor = saved_raw_real_reserved_floor;
 
     patch_jump(c, patch, c->count);
 
@@ -2522,14 +3204,22 @@ static void parse_function(Chunk* c) {
        needed since named functions can't nest. */
     unsigned int saved_var_names[FRAME_REGISTERS];
     int          saved_var_regs[FRAME_REGISTERS];
+    VarKind      saved_var_kind[FRAME_REGISTERS];
     int saved_var_count      = var_count;
     int saved_next_temp      = next_temp_register;
     int saved_reserved_floor = reserved_floor;
+    int saved_raw_int_next_temp      = raw_int_next_temp;
+    int saved_raw_int_reserved_floor = raw_int_reserved_floor;
+    int saved_raw_real_next_temp      = raw_real_next_temp;
+    int saved_raw_real_reserved_floor = raw_real_reserved_floor;
     memcpy(saved_var_names, var_names, sizeof(unsigned int) * (size_t)var_count);
     memcpy(saved_var_regs,  var_regs,  sizeof(int) * (size_t)var_count);
+    memcpy(saved_var_kind,  var_kind,  sizeof(VarKind) * (size_t)var_count);
     var_count          = 0;
     next_temp_register = 0;
     reserved_floor     = 0;
+    raw_int_next_temp = 0;  raw_int_reserved_floor = 0;
+    raw_real_next_temp = 0; raw_real_reserved_floor = 0;
 
     /* Register the function BEFORE compiling its body — func_start is already known, so a
        self-recursive call inside the body resolves correctly. A call to any other not-yet-defined
@@ -2565,8 +3255,11 @@ static void parse_function(Chunk* c) {
     var_count = saved_var_count;
     memcpy(var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
     memcpy(var_regs,  saved_var_regs,  sizeof(int) * (size_t)saved_var_count);
+    memcpy(var_kind,  saved_var_kind,  sizeof(VarKind) * (size_t)saved_var_count);
     next_temp_register = saved_next_temp;
     reserved_floor     = saved_reserved_floor;
+    raw_int_next_temp = saved_raw_int_next_temp;   raw_int_reserved_floor = saved_raw_int_reserved_floor;
+    raw_real_next_temp = saved_raw_real_next_temp; raw_real_reserved_floor = saved_raw_real_reserved_floor;
 
     patch_jump(c, patch, c->count);
 }
@@ -2586,7 +3279,7 @@ static bool parse_literal_default(Chunk* c, AerVal* out) {
         negative = true;
     }
     if (token.type == TOKEN_INTEGER) {
-        long long n = aer_as_int(token.value);
+        int64_t n = aer_as_int(token.value);
         *out = aer_int(negative ? -n : n);
     } else if (token.type == TOKEN_REAL) {
         double d = aer_as_real(token.value);
@@ -2627,6 +3320,18 @@ static bool parse_literal_default(Chunk* c, AerVal* out) {
    registers the type name so a later `Name(args)` call site resolves to construction
    (parse_call). Field defaults share the same literal set (including `[]`/`{}`) via
    parse_literal_default above. */
+/* Maps the four primitive type keywords `as` already recognizes (README's cast section) to a
+   ValueType, for an optional `field: type` struct-field annotation. Returns false (and reports no
+   error itself — the caller knows the context) if name/len don't match any of them. */
+static bool parse_field_type_name(const char* name, unsigned int len, ValueType* out) {
+    if      (len == 7 && strncmp(name, "integer", 7) == 0) *out = TYPE_INTEGER;
+    else if (len == 5 && strncmp(name, "float",   5) == 0) *out = TYPE_REAL;
+    else if (len == 6 && strncmp(name, "string",  6) == 0) *out = TYPE_STRING;
+    else if (len == 7 && strncmp(name, "boolean", 7) == 0) *out = TYPE_BOOLEAN;
+    else return false;
+    return true;
+}
+
 static void parse_struct(Chunk* c) {
     if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected struct name"); return; }
     unsigned int name_idx = chunk_add_pool(c, token.value);
@@ -2638,6 +3343,7 @@ static void parse_struct(Chunk* c) {
 
     unsigned int field_names[MAX_STRUCT_FIELDS];
     AerVal       field_defaults[MAX_STRUCT_FIELDS];
+    ValueType    field_types[MAX_STRUCT_FIELDS];
     unsigned int field_count = 0;
 
     while (!equal(TOKEN_END_OF_FILE) && !equal(TOKEN_DEDENT)) {
@@ -2647,15 +3353,48 @@ static void parse_struct(Chunk* c) {
 
         unsigned int fname = chunk_add_pool(c, token.value);
         lex();
+
+        /* Optional `: type` — reuses the same four primitive-type keywords `as` recognizes.
+           Declaring a type requires an explicit, matching default: a typed field with no default
+           would otherwise fall back to null (every bare field's usual default), which would
+           silently violate the very "this field is always this type" invariant the fused
+           field-arithmetic opcodes below rely on to skip a runtime check. */
+        ValueType ftype = TYPE_ANY;
+        bool has_type = consume(TOKEN_COLON);
+        if (has_type) {
+            if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a type name after ':'"); return; }
+            const char* type_name = aer_as_string(token.value)->data;
+            unsigned int type_len = aer_as_string(token.value)->length;
+            if (!parse_field_type_name(type_name, type_len, &ftype)) {
+                error_at("Unknown type '%.*s' in struct field declaration (must be integer/float/string/boolean)",
+                         (int)type_len, type_name);
+                return;
+            }
+            lex();
+        }
+
         AerVal dflt = aer_null();
-        if (consume(TOKEN_ASSIGN)) {
+        bool has_default = consume(TOKEN_ASSIGN);
+        if (has_default) {
             if (!parse_literal_default(c, &dflt)) {
                 error_at("Struct field defaults must be a literal value");
                 return;
             }
         }
+        if (has_type) {
+            if (!has_default) {
+                error_at("A typed struct field ('%.*s: ...') must have an explicit default value",
+                         (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
+                return;
+            }
+            if (aer_type(dflt) != ftype) {
+                error_at("Struct field default's type doesn't match its declared type");
+                return;
+            }
+        }
         field_names[field_count]    = fname;
         field_defaults[field_count] = dflt;
+        field_types[field_count]    = ftype;
         field_count++;
 
         if (!equal(TOKEN_DEDENT) && !equal(TOKEN_END_OF_FILE))
@@ -2672,6 +3411,7 @@ static void parse_struct(Chunk* c) {
     for (unsigned int i = 0; i < field_count; i++) {
         chunk_emit(c, (int)field_names[i]);
         chunk_emit(c, (int)chunk_add_pool(c, field_defaults[i]));
+        chunk_emit(c, (int)field_types[i]);
     }
 
     struct_register(name_idx);
@@ -2758,9 +3498,13 @@ void parser_reset(void) {
 struct ParserState {
     unsigned int  var_names[FRAME_REGISTERS];
     int           var_regs[FRAME_REGISTERS];
+    VarKind       var_kind[FRAME_REGISTERS];
     int           var_count;
     int           next_temp_register;
     int           reserved_floor;
+    int           raw_int_next_temp,  raw_int_reserved_floor;
+    int           raw_real_next_temp, raw_real_reserved_floor;
+    int           branch_depth;
     int           function_depth;
     unsigned int  global_names[FRAME_REGISTERS];
     int           global_regs[FRAME_REGISTERS];
@@ -2797,9 +3541,15 @@ ParserState* parser_save_state(void) {
 
     memcpy(s->var_names, var_names, sizeof(var_names));
     memcpy(s->var_regs,  var_regs,  sizeof(var_regs));
+    memcpy(s->var_kind,  var_kind,  sizeof(var_kind));
     s->var_count = var_count;                 var_count = 0;
     s->next_temp_register = next_temp_register;
     s->reserved_floor      = reserved_floor;
+    s->raw_int_next_temp = raw_int_next_temp;
+    s->raw_int_reserved_floor = raw_int_reserved_floor;
+    s->raw_real_next_temp = raw_real_next_temp;
+    s->raw_real_reserved_floor = raw_real_reserved_floor;   /* reg_reset() below zeroes all 4, matching how next_temp_register/reserved_floor are handled */
+    s->branch_depth = branch_depth;           branch_depth = 0;
     s->function_depth = function_depth;       function_depth = 0;
 
     memcpy(s->global_names, global_names, sizeof(global_names));
@@ -2851,9 +3601,15 @@ void parser_restore_state(ParserState* s) {
 
     memcpy(var_names, s->var_names, sizeof(var_names));
     memcpy(var_regs,  s->var_regs,  sizeof(var_regs));
+    memcpy(var_kind,  s->var_kind,  sizeof(var_kind));
     var_count = s->var_count;
     next_temp_register = s->next_temp_register;
     reserved_floor     = s->reserved_floor;
+    raw_int_next_temp = s->raw_int_next_temp;
+    raw_int_reserved_floor = s->raw_int_reserved_floor;
+    raw_real_next_temp = s->raw_real_next_temp;
+    raw_real_reserved_floor = s->raw_real_reserved_floor;
+    branch_depth       = s->branch_depth;
     function_depth     = s->function_depth;
 
     memcpy(global_names, s->global_names, sizeof(global_names));
@@ -2934,12 +3690,12 @@ void parse(Chunk* c) {
         bool any_pending_error = false;
         for (int i = 0; i < pending_count; i++) {
             unsigned int patch_offset = pending_calls[i].patch_offset;
-            int orig_op = c->code[patch_offset - 1] & 0xFF;
+            int orig_op = c->code[patch_offset - 1] & 0x7F;
             int global_reg;
             if ((orig_op == OP_CALL || orig_op == OP_TAIL_CALL) &&
                 global_lookup(pending_calls[i].name_idx, &global_reg)) {
                 int new_op = (orig_op == OP_CALL) ? OP_CALL_GLOBAL_VALUE : OP_TAIL_CALL_GLOBAL_VALUE;
-                c->code[patch_offset - 1] = (c->code[patch_offset - 1] & ~0xFF) | new_op;
+                c->code[patch_offset - 1] = (c->code[patch_offset - 1] & ~0x7F) | new_op;
                 c->code[patch_offset] = global_reg;
                 continue;
             }

@@ -65,7 +65,7 @@ static Value io_open(VM* vm, int arg_count, Value* args, void* userdata) {
 /* Shared by io_read/io_write/io_close — a handle is a bounds-checked index into open_files; anything else is a wrong-type arg (caller's job to reject) or a stale/closed handle (this function's job). */
 static FILE* handle_file(Value h) {
     if (h.type != TYPE_INTEGER) return NULL;
-    long long i = h.data.integer;
+    int64_t i = h.data.integer;
     if (i < 0 || i >= MAX_OPEN_FILES) return NULL;
     return open_files[i];
 }

@@ -86,6 +86,8 @@ static bool run_repl_line(Chunk* c, VM* vm, const char* src) {
     vm->stack_top     = 0;
     vm->call_depth = 0;
     vm->registers  = vm->call_stack[0].registers;
+    vm->raw_ints   = vm->call_stack[0].raw_ints;
+    vm->raw_reals  = vm->call_stack[0].raw_reals;
     shell((char*)src);
     lex();
     parse(c);

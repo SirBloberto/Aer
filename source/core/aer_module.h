@@ -3,7 +3,14 @@
 
 #include "vm.h"
 
-/* Resolves `path_name`.aer (dots become dir separators, e.g. "sub.mid" -> "sub/mid.aer") relative to the importing file's directory, then reads/parses/runs it synchronously in its own Chunk and VM (never the caller's, keeping globals from colliding); registers it under `name` (see chunk_add_import), caches by name (a second import is a no-op), and detects circular imports via a "currently loading" stack. Returns false on failure, having already called error_at()/error(). */
+/* Resolves `path_name` (already using real '/' separators — a dotted import like `a.b` has its dots
+   turned into '/' by the parser before this is called) to `path_name`.aer, either absolute or
+   relative to the importing file's directory (falling back to AER_PATH), then reads/parses/runs it
+   synchronously in its own Chunk and VM (never the caller's, keeping globals from colliding);
+   registers it under `name` (see chunk_add_import — the bound identifier a program calls it by,
+   independent of the path), caches by name (a second import is a no-op), and detects circular
+   imports via a "currently loading" stack. Returns false on failure, having already called
+   error_at()/error(). */
 bool aer_module_load(const char* name, unsigned int len,
                       const char* path_name, unsigned int path_len);
 

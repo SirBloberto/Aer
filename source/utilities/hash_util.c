@@ -1,8 +1,8 @@
 #include <string.h>
 #include "hash_util.h"
 
-unsigned long long hash_key(const char* key) {
-    unsigned long long hash = 0xcbf29ce484222325ULL;
+uint64_t hash_key(const char* key) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
     for (; *key; key++) {
         hash ^= (unsigned char)*key;
         hash *= 0x100000001b3ULL;

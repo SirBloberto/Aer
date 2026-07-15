@@ -84,17 +84,17 @@ bool aer_math_call(VM* vm, Chunk* c, const char* name, int arg_count) {
     if (strcmp(name, "floor") == 0 && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "floor", &x)) return true;
-        stdlib_push(vm, aer_int((long long)floor(x))); return true;
+        stdlib_push(vm, aer_int((int64_t)floor(x))); return true;
     }
     if (strcmp(name, "ceil") == 0 && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "ceil", &x)) return true;
-        stdlib_push(vm, aer_int((long long)ceil(x))); return true;
+        stdlib_push(vm, aer_int((int64_t)ceil(x))); return true;
     }
     if (strcmp(name, "abs") == 0 && arg_count == 1) {
         AerVal a = stdlib_pop(vm);
         if (aer_type(a) == TYPE_INTEGER) {
-            long long n = aer_as_int(a);
+            int64_t n = aer_as_int(a);
             stdlib_push(vm, aer_int(n < 0 ? -n : n)); return true;
         }
         if (aer_type(a) == TYPE_REAL) {
@@ -178,11 +178,11 @@ bool aer_random_call(VM* vm, Chunk* c, const char* name, int arg_count) {
     if (strcmp(name, "randint") == 0 && arg_count == 2) {
         AerVal hi = stdlib_pop(vm); AerVal lo = stdlib_pop(vm);
         if (aer_type(lo) != TYPE_INTEGER || aer_type(hi) != TYPE_INTEGER) { error("randint() requires two integers"); stdlib_push(vm, aer_null()); return true; }
-        long long lo_n = aer_as_int(lo), hi_n = aer_as_int(hi);
+        int64_t lo_n = aer_as_int(lo), hi_n = aer_as_int(hi);
         if (hi_n < lo_n) { error("randint() requires min <= max"); stdlib_push(vm, aer_null()); return true; }
-        long long span = hi_n - lo_n + 1;
+        int64_t span = hi_n - lo_n + 1;
         /* rand() % span is slightly biased toward the low end for spans that don't evenly divide RAND_MAX+1 — a known simplification; rejection sampling would fix it but isn't worth the complexity. */
-        stdlib_push(vm, aer_int(lo_n + (long long)(rand() % span))); return true;
+        stdlib_push(vm, aer_int(lo_n + (int64_t)(rand() % span))); return true;
     }
     if (strcmp(name, "seed") == 0 && arg_count == 1) {
         AerVal a = stdlib_pop(vm);
@@ -300,12 +300,12 @@ bool aer_string_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         AerVal n_v = stdlib_pop(vm); AerVal s_v = stdlib_pop(vm);
         if (aer_type(s_v) != TYPE_STRING) { error("string.repeat() requires a string"); stdlib_push(vm, aer_null()); return true; }
         if (aer_type(n_v) != TYPE_INTEGER) { error("string.repeat() count must be an integer"); stdlib_push(vm, aer_null()); return true; }
-        long long n = aer_as_int(n_v);
+        int64_t n = aer_as_int(n_v);
         if (n < 0) { error("string.repeat() count must not be negative"); stdlib_push(vm, aer_null()); return true; }
         AerString* ss = aer_as_string(s_v);
         unsigned int total = ss->length * (unsigned int)n;
         char* buf = xmalloc(total + 1);
-        for (long long i = 0; i < n; i++) memcpy(buf + (unsigned int)i * ss->length, ss->data, ss->length);
+        for (int64_t i = 0; i < n; i++) memcpy(buf + (unsigned int)i * ss->length, ss->data, ss->length);
         buf[total] = '\0';
         stdlib_push(vm, aer_make_string(buf, total)); return true;
     }

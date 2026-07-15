@@ -22,7 +22,7 @@ void hashtable_put(HashTable* t, char* key, HashPayload value) {
     } else if ((t->count * 100) / t->capacity >= HASHTABLE_HIGH)
         rehash(t);
 
-    unsigned long long hash   = hash_key(key);
+    uint64_t hash   = hash_key(key);
     unsigned int        length = (unsigned int)strlen(key);
 
     for (unsigned int i = 0; i < t->capacity; i++) {
@@ -46,7 +46,7 @@ void hashtable_put(HashTable* t, char* key, HashPayload value) {
 
 HashPayload* hashtable_get(HashTable* t, const char* key) {
     if (!t->buckets) return NULL;
-    unsigned long long hash   = hash_key(key);
+    uint64_t hash   = hash_key(key);
     unsigned int        length = (unsigned int)strlen(key);
     for (unsigned int i = 0; i < t->capacity; i++) {
         HashTableEntry* entry = &t->buckets[(hash + i) % t->capacity];
@@ -58,7 +58,7 @@ HashPayload* hashtable_get(HashTable* t, const char* key) {
 
 void hashtable_remove(HashTable* t, const char* key) {
     if (!t->buckets) return;
-    unsigned long long hash   = hash_key(key);
+    uint64_t hash   = hash_key(key);
     unsigned int        length = (unsigned int)strlen(key);
     unsigned int        cap    = t->capacity;
     unsigned int        start  = (unsigned int)(hash % cap);

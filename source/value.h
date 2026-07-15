@@ -26,6 +26,10 @@ typedef enum ValueType {
     TYPE_FUNCTION,
     TYPE_ARRAY,
     TYPE_DICT,
+    /* Not a real value tag — never written into an AerVal.tag, only into Shape.field_types[] (see
+       Shape's own comment, vm.h) to mean "this struct field has no declared type." Appended last
+       so it can't disturb TYPE_NULL's load-bearing == 0 invariant or any existing tag value. */
+    TYPE_ANY,
 } ValueType;
 
 /* AerVal: the internal runtime value, as an explicit tagged union — every VM stack slot, scope
@@ -45,7 +49,7 @@ typedef struct AerVal {
     ValueType tag;
     union {
         bool      b;
-        long long i;
+        int64_t i;
         double    d;
         void*     ptr;
     } as;
@@ -53,7 +57,7 @@ typedef struct AerVal {
 
 typedef union ValueData {
     char   boolean;
-    long long integer;
+    int64_t integer;
     double real;
     /* string/function are heap-allocated, not inline structs, so this union
        stays sized to a pointer instead of bloating every Value to fit their

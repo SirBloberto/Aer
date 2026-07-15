@@ -113,6 +113,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
 
     shell("print(2 + 2)\n");
@@ -133,6 +135,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     shell("x = 1\n\n\nbad = x.y\n");
     ok = run_appended(&chunk, &vm);
@@ -179,6 +183,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     shell("function not_tail(n):\n    if n <= 0:\n        return 0\n    return not_tail(n - 1) + 0\n\nnot_tail(1000)\n");
     ok = run_appended(&chunk, &vm);
@@ -197,6 +203,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     set_aer_path("tests");
     shell("import searchpath_helper\nassert(searchpath_helper.quadruple(5) == 20, \"quadruple via AER_PATH-resolved import\")\n");
@@ -218,6 +226,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     shell("import io\n");
     run_appended(&chunk, &vm);
@@ -235,6 +245,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     shell("for i in 0..5000:\n    temp = [i, i * 2, i * 3]\n");
     ok = run_appended(&chunk, &vm);
@@ -254,6 +266,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     aer_gc_configure(20, 0);   /* tiny minor threshold; 0 leaves the major cadence alone */
     unsigned int minors_before;
@@ -275,6 +289,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     aer_gc_set_ceiling(50);
     shell("permanent = []\nfor i in 0..5000:\n    append(permanent, [i, i * 2, i * 3])\n");
@@ -291,6 +307,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     aer_gc_set_ceiling(0);
     shell("permanent2 = []\nfor i in 0..5000:\n    append(permanent2, [i, i * 2, i * 3])\n");
@@ -312,6 +330,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     /* x.y += 1 used to be this test's broken statement, back when compound
        field/index assignment (parser.c's parse_assignment) wasn't supported
@@ -338,6 +358,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     shell("compound_x = 5\n");
     run_appended(&chunk, &vm);
@@ -361,6 +383,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     shell("ig_smoke_arr = [1, 2, 3]\n");
     run_appended(&chunk, &vm);
@@ -382,6 +406,8 @@ int main(void) {
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     shell("malformed_for_x = 1\nfor malformed_for_x !  print(\"body\")\n    malformed_for_x = 2\nmalformed_for_after = \"reached\"\n");
     run_appended(&chunk, &vm);
@@ -393,6 +419,25 @@ int main(void) {
     run_appended(&chunk, &vm);
     check(aer_assert_failure_count() == 0,
           "execution continued past the malformed for-loop instead of looping forever");
+
+    /* "Primitive pass" — a compound assignment that would change a raw-tracked local's own
+       type (here: int /= promoting to real) is a compile error when it's textually inside a
+       loop, not silently miscompiled — see project_aer_primitive_pass_step2 memory for why:
+       the shadow-to-boxed transition needs the variable's OLD value, but the box instruction
+       that reads it is bytecode that would re-execute every loop iteration, discarding
+       whatever the boxed register had accumulated. Can't be tested from a normal .aer file the
+       same way the malformed-for-loop case above can't — the compile error would abort the
+       whole script before any assert() runs. */
+    vm.stack_top     = 0;
+    vm.call_depth = 0;
+    vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
+    aer_clear_error();
+    shell("function loop_shadow_div():\n    p_raw = 4\n    for k in 0..3:\n        if k == 1:\n            p_raw /= 2\n    return p_raw\n");
+    run_appended(&chunk, &vm);
+    check(aer_had_error(),
+          "compound-assigning a raw-tracked local to a different type inside a loop is a compile error, not silent corruption");
 
     /* aer_module_free_all — searchpath_helper (loaded earlier via AER_PATH) proves there's
        something in the registry to tear down; aer_module_get(0, ...) going from true to

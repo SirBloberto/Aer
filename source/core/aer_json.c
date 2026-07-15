@@ -125,6 +125,7 @@ static bool json_encode_value(Chunk* c, AerVal v, JsonBuf* b) {
             jb_append_char(b, '}');
             break;
         }
+        case TYPE_ANY: break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
     }
     return true;
 }

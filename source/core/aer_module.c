@@ -37,12 +37,19 @@ static FileModule* find_module(const char* name, unsigned int len) {
     return NULL;
 }
 
+/* True if `name` already ends in ".aer" — quoted import paths may spell the extension out
+   explicitly (`import "../utils.aer"`), dotted-identifier imports never do. */
+static bool has_aer_ext(const char* name, unsigned int len) {
+    return len >= 4 && strncmp(name + len - 4, ".aer", 4) == 0;
+}
+
 static char* join_path(const char* dir, size_t dir_len, const char* name, unsigned int len) {
-    char* path = xmalloc(dir_len + len + 4 /* ".aer" */ + 1 /* NUL */);
+    bool ext = has_aer_ext(name, len);
+    char* path = xmalloc(dir_len + len + (ext ? 0 : 4) + 1 /* NUL */);
     memcpy(path, dir, dir_len);
     memcpy(path + dir_len, name, len);
-    memcpy(path + dir_len + len, ".aer", 4);
-    path[dir_len + len + 4] = '\0';
+    if (!ext) memcpy(path + dir_len + len, ".aer", 4);
+    path[dir_len + len + (ext ? 0 : 4)] = '\0';
     return path;
 }
 
@@ -53,10 +60,30 @@ static bool file_exists(const char* path) {
     return true;
 }
 
-/* Resolves `name`.aer relative to the currently-lexed file's directory (dots become dir separators, e.g. "sub.mid" -> "sub/mid.aer"); if missing, falls back to AER_PATH, a PATH_LIST_SEP-separated list searched in order (like PYTHONPATH); if still not found, returns the same-directory candidate anyway so aer_module_load's read_file() produces the usual "Cannot open file" error. */
-static char* resolve_path(const char* dotted_name, unsigned int len) {
-    char* name = xmalloc(len);
-    for (unsigned int i = 0; i < len; i++) name[i] = dotted_name[i] == '.' ? '/' : dotted_name[i];
+/* True for a path that's already fully qualified and shouldn't be joined against the importing
+   file's directory or searched for on AER_PATH: a leading '/' or '\' (Unix-style, and also how
+   Windows accepts a rooted path on the current drive), or a drive letter like "C:/" / "C:\". */
+static bool is_absolute_path(const char* p, unsigned int len) {
+    if (len == 0) return false;
+    if (p[0] == '/' || p[0] == '\\') return true;
+    if (len >= 2 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') return true;
+    return false;
+}
+
+/* Resolves an import path to a real file on disk. `path_name` is used exactly as written —
+   dotted-identifier imports (`import a.b`) arrive here with dots already turned into '/' by the
+   parser; quoted-path imports (`import "../a/b"`) arrive with whatever separators/relative
+   components the user wrote, untouched (so a literal ".." is never mistaken for the dotted-name
+   convention and mangled into extra separators).
+
+   An absolute path (leading '/' or a drive letter) is used as-is, with no directory-joining or
+   AER_PATH search — the caller already said exactly where to look. Otherwise this resolves
+   relative to the currently-lexed file's directory; if missing there, falls back to AER_PATH, a
+   PATH_LIST_SEP-separated list searched in order (like PYTHONPATH); if still not found, returns
+   the same-directory candidate anyway so aer_module_load's read_file() produces the usual "Cannot
+   open file" error. */
+static char* resolve_path(const char* path_name, unsigned int len) {
+    if (is_absolute_path(path_name, len)) return join_path("", 0, path_name, len);
 
     const char* base = current_source_name();
     const char* slash = NULL;
@@ -64,8 +91,8 @@ static char* resolve_path(const char* dotted_name, unsigned int len) {
         if (*p == '/' || *p == '\\') slash = p;
     size_t dir_len = slash ? (size_t)(slash - base + 1) : 0;
 
-    char* same_dir_path = join_path(base, dir_len, name, len);
-    if (file_exists(same_dir_path)) { free(name); return same_dir_path; }
+    char* same_dir_path = join_path(base, dir_len, path_name, len);
+    if (file_exists(same_dir_path)) return same_dir_path;
 
     const char* aer_path = getenv("AER_PATH");
     if (aer_path) {
@@ -80,15 +107,14 @@ static char* resolve_path(const char* dotted_name, unsigned int len) {
                 char* dirbuf = xmalloc(joined_dir_len);
                 memcpy(dirbuf, start, entry_len);
                 if (needs_sep) dirbuf[entry_len] = '/';
-                char* candidate = join_path(dirbuf, joined_dir_len, name, len);
+                char* candidate = join_path(dirbuf, joined_dir_len, path_name, len);
                 free(dirbuf);
-                if (file_exists(candidate)) { free(same_dir_path); free(name); return candidate; }
+                if (file_exists(candidate)) { free(same_dir_path); return candidate; }
                 free(candidate);
             }
             start = *end ? end + 1 : end;
         }
     }
-    free(name);
     return same_dir_path;
 }
 

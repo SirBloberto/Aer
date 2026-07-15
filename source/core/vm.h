@@ -24,7 +24,7 @@ typedef enum {
        before emitting a real OP_BINARY, routing them to short-circuiting jumps instead, since
        they can't evaluate both sides unconditionally the way every other binary op does); kept as
        enum values purely because parser.c's operator-token lookup table still tags `and`/`or`
-       tokens with these, and vm_binary() itself still has a (dead but harmless) branch for them. */
+       tokens with these, and vm_binary_cold() itself still has a (dead but harmless) branch for them. */
     OP_AND, OP_OR,
     OP_PIPE,            /* never dispatched either — `x |> f(args)` desugars to a call at parse time; kept as a lookup-table tag only, same reason as OP_AND/OP_OR */
 
@@ -141,7 +141,24 @@ typedef enum {
        function (aer_module_call, aer_module.c) — that path runs the imported file's OWN call
        chain (VM.call_stack), not this one. Stack-neutral from the caller's perspective —
        vm->stack_top ends exactly where it started. */
-    OP_CALL_MODULE, /* operands: dest_reg, module_pool_idx, fn_pool_idx, arg_reg_base, arg_count */
+    /* operands: dest_reg, module_pool_idx, fn_pool_idx, arg_reg_base, arg_count (all packed into
+       one word, PACK_CALL_MODULE), plus one trailing plain word: module_id (CALL_MODULE_MATH etc.,
+       below) — resolved at parse time (the module name in `module.fn(...)` is always a literal
+       identifier, never ambiguous), so the VM can switch on a small int instead of running a
+       strcmp chain against every known built-in module's name on every single call. Perf finding:
+       aer_math_call + its own strcmp + the outer module-name strcmp were ~2.8-3% of nbody.aer's
+       cycles, almost entirely the OUTER module-name check (the inner per-function strcmp inside
+       aer_math_call etc. is untouched by this — see its own dispatch, vm.c). CALL_MODULE_DYNAMIC
+       means "not a known core built-in" (a host-registered module or a user file import) — those
+       are genuinely only resolvable by name at runtime, so that path still runs the original
+       strcmp/aer_host_is_module logic unchanged. Couldn't fit this as a packed bit-field instead:
+       PACK_CALL_MODULE already uses 63 of the word's 64 bits, and shrinking module_idx/fn_idx's
+       17-bit pool-index fields to make room would risk breaking large programs with many string
+       constants (unlike FIELD_NAME's narrower 14-bit budget, a pool index here isn't scoped to
+       just module/function names — chunk_add_pool's global dedup means it reflects total pool
+       position, so a big program could plausibly exceed a shrunk field). A trailing word matches
+       the same convention already used by OP_LOADK/OP_DEFINE_STRUCT/etc. */
+    OP_CALL_MODULE,
 
     /* Global builtins (length/delete/append/print/type/assert/panic) called bare, e.g.
        `length(arr)`. Bridges to vm_call_builtin() (vm.c), which takes a plain AerVal* array, so
@@ -308,12 +325,60 @@ typedef enum {
     /* REPL/shell-mode support. A bare call/module-call/pipe-chain statement's result, when
        mode == MODE_SHELL, is printed (unless null) instead of just sitting unread in a register. */
     OP_PRINT_REPL, /* operand: src_reg — prints registers[src_reg] unless it's TYPE_NULL */
+
+    /* "Primitive pass" — raw (unboxed) arithmetic on locals the compiler proved are always the
+       same primitive type (parser.c's var_kind/RK_RAW_*_FLAG). Operands are CallFrame.raw_ints/
+       raw_reals slot indices, never RK-encoded (no register-vs-constant runtime check at all —
+       the parser already knows statically which form applies, see PACK_RAW_ARITH_RR/IMM's own
+       comments). Comparisons produce an ordinary boxed boolean (they feed a branch, not further
+       raw arithmetic — no raw boolean type exists). OP_BOX_INT/OP_BOX_REAL are the only bridge
+       from raw storage back to a normal tagged AerVal register. */
+    OP_RAW_LOAD_INT, OP_RAW_LOAD_REAL,
+    OP_RAW_ADD_INT, OP_RAW_SUB_INT, OP_RAW_MUL_INT, OP_RAW_DIV_INT,
+    OP_RAW_MOD_INT, OP_RAW_FLOOR_DIV_INT,
+    OP_RAW_ADD_INT_IMM, OP_RAW_SUB_INT_IMM, OP_RAW_MUL_INT_IMM,
+    OP_RAW_ADD_REAL, OP_RAW_SUB_REAL, OP_RAW_MUL_REAL, OP_RAW_DIV_REAL,
+    OP_RAW_LT_INT, OP_RAW_GT_INT, OP_RAW_LTE_INT, OP_RAW_GTE_INT,
+    OP_RAW_LT_REAL, OP_RAW_GT_REAL, OP_RAW_LTE_REAL, OP_RAW_GTE_REAL,
+    OP_BOX_INT, OP_BOX_REAL,
+    /* raw-to-raw copy, needed when a freshly computed raw value doesn't already sit in the exact
+       slot a variable's first assignment reserved for it (parser.c's raw_int_reserve_one/
+       raw_real_reserve_one) — the direct analog of OP_MOVE for raw_ints/raw_reals instead of
+       registers[]. */
+    OP_RAW_MOVE_INT, OP_RAW_MOVE_REAL,
+    /* Compound-assignment accumulation of an ORDINARY BOXED value straight into a raw slot, in
+       place — no shadow at all, since the slot's identity never changes. Exists for exactly the
+       "accumulate a boxed arithmetic result into a raw accumulator" pattern (found via nbody.aer's
+       own `energy()`: `e += 0.5 * bim * (...)` where bim/vx/vy/vz are struct-field reads, so the
+       RHS is an ordinary boxed register — never provably raw at compile time — even though it's
+       always real at runtime). A runtime tag check on the boxed operand decides: matching type ->
+       accumulate directly into the raw slot; mismatched type -> the same "Type mismatch in binary
+       expression" runtime error the boxed VM already gives for this. Only ADD/SUB/MUL — matching
+       the existing raw-raw compound-assign family's own scope (DIV/MOD/FLOOR_DIV always shadow). */
+    OP_RAW_ADD_INT_BOXED, OP_RAW_SUB_INT_BOXED, OP_RAW_MUL_INT_BOXED,
+    OP_RAW_ADD_REAL_BOXED, OP_RAW_SUB_REAL_BOXED, OP_RAW_MUL_REAL_BOXED,
+    /* OP_RAW_LOAD_INT's immediate is a signed 20-bit field (-524288..524287) — a literal outside
+       that range must NOT be silently truncated (a real bug found exactly this way: `i < 20000000`
+       packed 20000000 into 20 bits, silently becoming 77056, running a supposedly-20M-iteration
+       loop only 77056 times). This is the pool-based fallback, mirroring OP_RAW_LOAD_REAL's own
+       "always resolve genuinely large constants through the pool" approach — parser.c's
+       raw_materialize picks this over OP_RAW_LOAD_INT whenever the literal doesn't fit. */
+    OP_RAW_LOAD_INT_POOL,
 } Opcode;
 
 /* RK encoding for most opcodes' operands — see vm_rk_value (vm.c). Pool indices are always
    small non-negative ints in practice, nowhere near this bit, so reusing it as a "this is a
    constant, not a register" flag is safe and simple (matches Lua's own BITRK convention). */
 #define RK_CONST_FLAG (1 << 30)
+
+/* parser.c-internal operand tags for the "primitive pass" — orthogonal to RK_CONST_FLAG (a
+   different bit), used only inside the compiler's own single-int rk return channel to mark "this
+   value lives in CallFrame.raw_ints/raw_reals, not registers[]", never emitted into a packed
+   instruction word directly (PACK_RAW_* macros take a plain slot index once the flag has already
+   been stripped by the caller). Bits 28/29 were unused by every existing rk convention. */
+#define RK_RAW_INT_FLAG  (1 << 29)
+#define RK_RAW_REAL_FLAG (1 << 28)
+#define RK_RAW_SLOT_MASK 0x1F
 
 /* Per-call register bank size (vm.h's CallFrame) — also visible here since parser.c's
    variable table needs to know the ceiling on distinct variable names in one frame. 128
@@ -322,6 +387,16 @@ typedef enum {
    index is still one packed byte, this only widens how many distinct values that byte can name.
    A program needing more than 128 would still need a spill mechanism this prototype doesn't have. */
 #define FRAME_REGISTERS 128
+
+/* Raw (unboxed) scratch register counts for the "primitive pass" (CallFrame.raw_ints/raw_reals,
+   this file). Deliberately much smaller than FRAME_REGISTERS — only locals the compiler proves
+   are provably-monotype primitives ever land here, a narrow subset of a function's variables in
+   practice. 32 each is generous headroom over anything seen in this repo's own test files;
+   exceeding it falls back to ordinary boxed storage for the overflow names (parser.c's raw-slot
+   allocator), never a compile error, never silent truncation. 5 bits each in the packed opcode
+   words below (PACK_RAW_ARITH_RR etc.) is an exact fit for 32. */
+#define RAW_REGISTERS_INT  32
+#define RAW_REGISTERS_REAL 32
 
 /* Packed-instruction descriptor word — every operand used to get its own full 32-bit word
    regardless of how small its value actually was (a register index only ever needs a handful of
@@ -349,38 +424,66 @@ typedef enum {
 /* Binary operators each get their own top-level opcode (OP_ADD, OP_SUB, OP_EQ, ... OP_IN) dispatched
    directly by vm_run()'s computed-goto — true single-level dispatch, matching Lua's per-operator
    opcodes, instead of routing every arithmetic/comparison/bitwise op through one shared OP_BINARY
-   opcode that then re-dispatches internally via a runtime switch (see vm_binary()'s own comment,
+   opcode that then re-dispatches internally via a runtime switch (see vm_binary_cold()'s own comment,
    vm.c, for why that second level cost real per-dispatch instructions). All of them still share
-   this single dedicated 64-bit-word encoding — it's the hottest opcode class in arithmetic-heavy
-   code (over a third of all dispatches on nbody.aer), and the ordinary PACK3/RK scheme above still
-   costs 3 separate code-array fetches per dispatch (op_word, rk_b, rk_c) — one DISPATCH() fetch of
-   op_word, then two more READ()s just to find out what to compute. Once code[] is a 64-bit-word
-   array (see Chunk's own comment above), opcode(8) + dest(8) + two 20-bit RK operands (48 bits)
-   fits in one word with room to spare (8 bits unused, bits 56-63), cutting every binary op to the
-   ONE fetch DISPATCH() already does for every opcode, unconditionally. There's no separate bin_op
-   field anymore — the operator IS the opcode now, so the field that used to carry it as data is
-   simply gone, not narrowed elsewhere; the two RK operands keep their original 20-bit width.
-     This compact RK operand needs its own (narrower) flag/index split — RK20_CONST_FLAG at bit 19
-   rather than RK_CONST_FLAG's bit 30 — since 20 bits total has to hold both the flag and the
-   index. 19 index bits (524288 slots) is still enormous headroom over both FRAME_REGISTERS (128)
-   and any realistic constant-pool size, but genuinely large generated programs could in principle
-   exceed it — see emit_binary's own guard (parser.c), which reports a clean compile error rather
-   than silently truncating a resolved rk_lhs/rk_rhs from parse_binary_ops's ordinary (wider)
-   RK_CONST_FLAG scheme down into this one. */
+   this single dedicated word encoding — it's the hottest opcode class in arithmetic-heavy code
+   (over a third of all dispatches on nbody.aer).
+     Packed to fit entirely within the LOW 32 bits of the 64-bit code word — opcode(7) + dest(7) +
+   two 9-bit RK operands (32 bits total) — instead of the wider 8+8+20+20 layout every other packed
+   opcode still uses. code[] stays a uint64_t array (DISPATCH() is untouched), but on this 32-bit
+   ARM target a uint64_t is fetched as two 32-bit registers; a field that straddles that boundary
+   needs a shift-and-OR reconstruction across both registers before it's usable (confirmed via
+   disassembly: ~30 of lbl_add's ~71 instructions were exactly this). Fitting entirely in the low
+   word means that reconstruction never happens for OP_ADD/SUB/MUL/... — the upper register is
+   never touched at all. Opcode uses 7 bits, not 8, matching DISPATCH()'s mask (vm.c) — 62 Opcode
+   values fit with 66 to spare (headroom for future opcodes, e.g. concurrency primitives, without
+   a second redesign; 6 bits would leave only 2 spare). Dest is 7 bits, exactly FRAME_REGISTERS
+   (128) — unchanged from today, no capacity regression — no flag needed (a plain register index
+   is provably always < FRAME_REGISTERS, same reasoning PACK_REG4 above already uses). Each RK
+   operand gets 9 bits (1 flag + 8 index = 256 slots) — comfortably above both FRAME_REGISTERS and
+   the largest constant pool measured across every .aer file in this repo (~100 entries,
+   tests/test_core.aer) — narrower than RK20's 19 index bits, but RK20 was deliberately oversized
+   "far beyond any real program" (see its own comment below); this reuses the identical overflow
+   story at a smaller, still-generous threshold: emit_binary's rk9_fits guard (parser.c) reports a
+   clean compile error, never silent truncation, if a program's resolved rk value ever actually
+   exceeds it. */
+#define RK9_CONST_FLAG (1U << 8)
+#define RK9_INDEX_MASK 0xFFU
+#define RK9_MAX_INDEX  0xFF
+#define PACK_RK9(rk) \
+    (((rk) & RK_CONST_FLAG) \
+        ? (RK9_CONST_FLAG | ((uint64_t)((rk) & ~RK_CONST_FLAG) & RK9_INDEX_MASK)) \
+        : ((uint64_t)(rk) & RK9_INDEX_MASK))
+#define PACK_BINARY(op, dest, rk_b, rk_c) \
+    ( ((uint64_t)(op)   & 0x7F) \
+    | (((uint64_t)(dest) & 0x7F) << 7) \
+    | ((PACK_RK9(rk_b) & 0x1FFULL) << 14) \
+    | ((PACK_RK9(rk_c) & 0x1FFULL) << 23) )
+/* Cast to uint32_t before shifting, not just masking after — `word` is a uint64_t (Chunk.code's
+   element type), and every field this word needs lives in its low 32 bits (PACK_BINARY's own
+   comment above), but the compiler has no way to know that from the type alone: a shift on an
+   ordinary uint64_t is a genuine 64-bit operation that reconstructs its result from both halves
+   of a register pair on this 32-bit ARM target, exactly the tax this whole redesign exists to
+   remove — confirmed by disassembly showing the reconstruction was still happening even after the
+   PACK_BINARY layout change, until this cast was added. The explicit (uint32_t) truncation tells
+   the compiler the upper 32 bits are irrelevant, so the shift becomes a single-register operation. */
+#define UNPACK_BINARY_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
+#define UNPACK_RK_B9(word)       ((((uint32_t)(word)) >> 14) & 0x1FFU)
+#define UNPACK_RK_C9(word)       ((((uint32_t)(word)) >> 23) & 0x1FFU)
+
+/* RK20 — the wider (1 flag + 19 index) RK sub-encoding every OTHER 64-bit packed opcode below still
+   uses (OP_FIELD_SET, OP_INDEX_GET, the fused field-arithmetic ops, etc.). 19 index bits (524288
+   slots) is enormous headroom over both FRAME_REGISTERS (128) and any realistic constant-pool size,
+   but genuinely large generated programs could in principle exceed it — see emit_binary's own guard
+   (parser.c), which reports a clean compile error rather than silently truncating a resolved
+   rk_lhs/rk_rhs down into this scheme. */
 #define RK20_CONST_FLAG (1ULL << 19)
 #define RK20_INDEX_MASK 0x7FFFFULL
 #define RK20_MAX_INDEX  0x7FFFF
 #define PACK_RK20(rk) \
     (((rk) & RK_CONST_FLAG) \
-        ? (RK20_CONST_FLAG | ((unsigned long long)((rk) & ~RK_CONST_FLAG) & RK20_INDEX_MASK)) \
-        : ((unsigned long long)(rk) & RK20_INDEX_MASK))
-#define PACK_BINARY(op, dest, rk_b, rk_c) \
-    ( ((unsigned long long)(op)   & 0xFF) \
-    | (((unsigned long long)(dest) & 0xFF) << 8) \
-    | ((PACK_RK20(rk_b) & 0xFFFFFULL) << 16) \
-    | ((PACK_RK20(rk_c) & 0xFFFFFULL) << 36) )
-#define UNPACK_RK_B20(word) (((word) >> 16) & 0xFFFFFULL)
-#define UNPACK_RK_C20(word) (((word) >> 36) & 0xFFFFFULL)
+        ? (RK20_CONST_FLAG | ((uint64_t)((rk) & ~RK_CONST_FLAG) & RK20_INDEX_MASK)) \
+        : ((uint64_t)(rk) & RK20_INDEX_MASK))
 
 /* Slice A of the same single-word treatment, extended to the next-hottest opcodes. A register
    field only needs 7 bits here (not RK's 8) — exactly FRAME_REGISTERS, no headroom wasted —
@@ -393,11 +496,11 @@ typedef enum {
    clobbered. OP_ITER_RANGE/OP_ITER_NEXT_PAIR's target word is untouched by PACK_REG4 — only their
    OTHER (non-target) fields get packed together. */
 #define PACK_REG4(op, a, b, cc, d) \
-    ( ((unsigned long long)(op) & 0xFF) \
-    | (((unsigned long long)(a)  & 0x7F) << 8) \
-    | (((unsigned long long)(b)  & 0x7F) << 15) \
-    | (((unsigned long long)(cc) & 0x7F) << 22) \
-    | (((unsigned long long)(d)  & 0x7F) << 29) )
+    ( ((uint64_t)(op) & 0xFF) \
+    | (((uint64_t)(a)  & 0x7F) << 8) \
+    | (((uint64_t)(b)  & 0x7F) << 15) \
+    | (((uint64_t)(cc) & 0x7F) << 22) \
+    | (((uint64_t)(d)  & 0x7F) << 29) )
 #define UNPACK_REG4_A(word) (((word) >> 8)  & 0x7F)
 #define UNPACK_REG4_B(word) (((word) >> 15) & 0x7F)
 #define UNPACK_REG4_C(word) (((word) >> 22) & 0x7F)
@@ -408,75 +511,202 @@ typedef enum {
    real pool will ever hold, so no overflow guard is needed here the way OP_BINARY's RK20 needs
    one (a 30-bit-plus pool would already have failed elsewhere first). */
 #define PACK_FIELD_GET(dest, struct_reg, field_idx) \
-    ( ((unsigned long long)(OP_FIELD_GET)  & 0xFF) \
-    | (((unsigned long long)(dest)         & 0x7F) << 8) \
-    | (((unsigned long long)(struct_reg)   & 0x7F) << 15) \
-    | (((unsigned long long)(field_idx)    & 0x3FFFFFFFFFFULL) << 22) )
+    ( ((uint64_t)(OP_FIELD_GET)  & 0xFF) \
+    | (((uint64_t)(dest)         & 0x7F) << 8) \
+    | (((uint64_t)(struct_reg)   & 0x7F) << 15) \
+    | (((uint64_t)(field_idx)    & 0x3FFFFFFFFFFULL) << 22) )
 #define UNPACK_FIELD_GET_DEST(word)   (((word) >> 8)  & 0x7F)
 #define UNPACK_FIELD_GET_STRUCT(word) (((word) >> 15) & 0x7F)
 #define UNPACK_FIELD_GET_FIELD(word)  (((word) >> 22) & 0x3FFFFFFFFFFULL)
 
-/* OP_FIELD_SET: struct_reg(7) + field_idx(29, same "always a name, always small" reasoning as
-   OP_FIELD_GET) + rk_val (RK20:20) = 64 bits exactly. */
+/* OP_FIELD_SET: Tier 1 (see PACK_BINARY's own comment for the general rationale) — op(7) +
+   struct_reg(7) + field_idx(9, matching RK9's own pool-index budget — a field name is always a
+   small, dedup'd pool index, same "far more than any real program's field count" headroom
+   reasoning as RK9 itself) + rk_val (RK9:9) = 32 bits exactly, entirely in the low word. This is
+   the single hottest opcode measured on nbody.aer (30M hits) — the opcode most worth narrowing. */
 #define PACK_FIELD_SET(struct_reg, field_idx, rk_val) \
-    ( ((unsigned long long)(OP_FIELD_SET) & 0xFF) \
-    | (((unsigned long long)(struct_reg)  & 0x7F) << 8) \
-    | (((unsigned long long)(field_idx)   & 0x1FFFFFFFULL) << 15) \
-    | ((PACK_RK20(rk_val) & 0xFFFFFULL) << 44) )
-#define UNPACK_FIELD_SET_STRUCT(word) (((word) >> 8)  & 0x7F)
-#define UNPACK_FIELD_SET_FIELD(word)  (((word) >> 15) & 0x1FFFFFFFULL)
-#define UNPACK_FIELD_SET_RK(word)     (((word) >> 44) & 0xFFFFFULL)
+    ( ((uint64_t)(OP_FIELD_SET) & 0x7F) \
+    | (((uint64_t)(struct_reg)  & 0x7F) << 7) \
+    | (((uint64_t)(field_idx)   & 0x1FFULL) << 14) \
+    | ((PACK_RK9(rk_val) & 0x1FFULL) << 23) )
+#define UNPACK_FIELD_SET_STRUCT(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
+#define UNPACK_FIELD_SET_FIELD(word)  ((((uint32_t)(word)) >> 14) & 0x1FFU)
+#define UNPACK_FIELD_SET_RK(word)     ((((uint32_t)(word)) >> 23) & 0x1FFU)
 
-/* OP_INDEX_GET: dest/arr_reg (7 bits each) + rk_idx (RK20:20). */
+/* OP_INDEX_GET: Tier 1 — op(7) + dest(7) + arr_reg(7) + rk_idx(RK9:9) = 30 bits, entirely in the
+   low word. Second-hottest opcode measured on nbody.aer (22.5M hits). */
 #define PACK_INDEX_GET(dest, arr_reg, rk_idx) \
-    ( ((unsigned long long)(OP_INDEX_GET) & 0xFF) \
-    | (((unsigned long long)(dest)    & 0x7F) << 8) \
-    | (((unsigned long long)(arr_reg) & 0x7F) << 15) \
-    | ((PACK_RK20(rk_idx) & 0xFFFFFULL) << 22) )
-#define UNPACK_INDEX_GET_DEST(word) (((word) >> 8)  & 0x7F)
-#define UNPACK_INDEX_GET_ARR(word)  (((word) >> 15) & 0x7F)
-#define UNPACK_INDEX_GET_RK(word)   (((word) >> 22) & 0xFFFFFULL)
+    ( ((uint64_t)(OP_INDEX_GET) & 0x7F) \
+    | (((uint64_t)(dest)    & 0x7F) << 7) \
+    | (((uint64_t)(arr_reg) & 0x7F) << 14) \
+    | ((PACK_RK9(rk_idx) & 0x1FFULL) << 21) )
+#define UNPACK_INDEX_GET_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
+#define UNPACK_INDEX_GET_ARR(word)  ((((uint32_t)(word)) >> 14) & 0x7FU)
+#define UNPACK_INDEX_GET_RK(word)   ((((uint32_t)(word)) >> 21) & 0x1FFU)
 
 /* Slice C: OP_STORE_GLOBAL/OP_UNARY/OP_CAST/OP_CHECK_SHAPE/OP_STRUCT_NEW — none of these have a
    patchable target (unlike OP_JUMP_IF_FALSE_REG/OP_DEFER_PUSH, which stay 2 words: see
    emit_jump_if_false_reg/emit_defer_push's own comments — a `defer` callee_offset can be a
    forward-reference placeholder exactly like OP_CALL's, so it needs the same dedicated word), so
    all their fields safely fold into one word. */
+/* Tier 1 — op(7) + global_reg(7) + rk_val (RK9:9) = 23 bits, entirely in the low word. */
 #define PACK_STORE_GLOBAL(global_reg, rk_val) \
-    ( ((unsigned long long)(OP_STORE_GLOBAL) & 0xFF) \
-    | (((unsigned long long)(global_reg) & 0x7F) << 8) \
-    | ((PACK_RK20(rk_val) & 0xFFFFFULL) << 15) )
-#define UNPACK_STORE_GLOBAL_REG(word) (((word) >> 8)  & 0x7F)
-#define UNPACK_STORE_GLOBAL_RK(word)  (((word) >> 15) & 0xFFFFFULL)
+    ( ((uint64_t)(OP_STORE_GLOBAL) & 0x7F) \
+    | (((uint64_t)(global_reg) & 0x7F) << 7) \
+    | ((PACK_RK9(rk_val) & 0x1FFULL) << 14) )
+#define UNPACK_STORE_GLOBAL_REG(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
+#define UNPACK_STORE_GLOBAL_RK(word)  ((((uint32_t)(word)) >> 14) & 0x1FFU)
 
-/* Shared by OP_UNARY and OP_CAST — dest/reg (7) + op-or-cast-type tag (8, same width as
-   OP_BINARY's bin_op tag) + rk (RK20:20). */
+/* Shared by OP_UNARY and OP_CAST, Tier 1 — dest(7) + unary_op(7, an actual Opcode value like
+   OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR, so it needs the same width as opcode itself, not a
+   narrow tag) + rk (RK9:9) = op(7)+7+7+9 = 30 bits, entirely in the low word. */
 #define PACK_UNARY(dest, unary_op, rk) \
-    ( ((unsigned long long)(OP_UNARY) & 0xFF) \
-    | (((unsigned long long)(dest)     & 0x7F) << 8) \
-    | (((unsigned long long)(unary_op) & 0xFF) << 15) \
-    | ((PACK_RK20(rk) & 0xFFFFFULL) << 23) )
-#define UNPACK_UNARY_DEST(word) (((word) >> 8)  & 0x7F)
-#define UNPACK_UNARY_OP(word)   (((word) >> 15) & 0xFF)
-#define UNPACK_UNARY_RK(word)   (((word) >> 23) & 0xFFFFFULL)
+    ( ((uint64_t)(OP_UNARY) & 0x7F) \
+    | (((uint64_t)(dest)     & 0x7F) << 7) \
+    | (((uint64_t)(unary_op) & 0x7F) << 14) \
+    | ((PACK_RK9(rk) & 0x1FFULL) << 21) )
+#define UNPACK_UNARY_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
+#define UNPACK_UNARY_OP(word)   ((((uint32_t)(word)) >> 14) & 0x7FU)
+#define UNPACK_UNARY_RK(word)   ((((uint32_t)(word)) >> 21) & 0x1FFU)
 
+/* cast_type is CAST_INTEGER/FLOAT/BOOLEAN (below) — a genuinely small, dedicated 3-value tag,
+   unlike unary_op above, so 4 bits (some headroom over the 3 values that exist today) is enough:
+   op(7) + dest(7) + cast_type(4) + rk (RK9:9) = 27 bits, entirely in the low word. */
 #define PACK_CAST(dest, cast_type, rk) \
-    ( ((unsigned long long)(OP_CAST) & 0xFF) \
-    | (((unsigned long long)(dest)      & 0x7F) << 8) \
-    | (((unsigned long long)(cast_type) & 0xFF) << 15) \
-    | ((PACK_RK20(rk) & 0xFFFFFULL) << 23) )
-#define UNPACK_CAST_DEST(word) (((word) >> 8)  & 0x7F)
-#define UNPACK_CAST_TYPE(word) (((word) >> 15) & 0xFF)
-#define UNPACK_CAST_RK(word)   (((word) >> 23) & 0xFFFFFULL)
+    ( ((uint64_t)(OP_CAST) & 0x7F) \
+    | (((uint64_t)(dest)      & 0x7F) << 7) \
+    | (((uint64_t)(cast_type) & 0xFULL) << 14) \
+    | ((PACK_RK9(rk) & 0x1FFULL) << 18) )
+#define UNPACK_CAST_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
+#define UNPACK_CAST_TYPE(word) ((((uint32_t)(word)) >> 14) & 0xFU)
+#define UNPACK_CAST_RK(word)   ((((uint32_t)(word)) >> 18) & 0x1FFU)
+
+/* "Primitive pass" raw-arithmetic encodings (see OP_RAW_LOAD_INT's own enum comment above and
+   CallFrame.raw_ints/raw_reals). Unlike PACK_BINARY's RK9, there is no register-vs-constant flag
+   bit anywhere here: the parser already knows statically, at compile time, whether an operand is
+   a raw slot or an immediate — that certainty is the entire point of this feature, so encoding a
+   runtime-checked flag here would just reintroduce the exact branch this is meant to eliminate.
+   Raw slot indices need only 5 bits (RAW_REGISTERS_INT/REAL == 32, vm.h above), not the 7 a real
+   registers[] index needs. All casts to (uint32_t) before shifting are required, not decorative —
+   op_word is a uint64_t, and a shift on it is a genuine 64-bit operation regardless of whether the
+   useful bits fit in 32 unless the compiler is told so explicitly (see PACK_BINARY's own comment
+   for the disassembly-confirmed bug this guards against). */
+
+/* op(7) + dest(5) + a(5) + b(5) = 22 bits — op is baked in per call site (OP_RAW_ADD_INT,
+   OP_RAW_SUB_INT, ... one shared packed shape across many opcodes, same convention PACK_BINARY
+   uses). dest/a/b are all raw_ints[] or all raw_reals[] indices, never mixed — the caller (vm.c's
+   opcode handler) already knows which array from the opcode itself. */
+#define PACK_RAW_ARITH_RR(op, dest, a, b) \
+    ( ((uint64_t)(op)    & 0x7F) \
+    | (((uint64_t)(dest) & 0x1F) << 7) \
+    | (((uint64_t)(a)    & 0x1F) << 12) \
+    | (((uint64_t)(b)    & 0x1F) << 17) )
+#define UNPACK_RAW_ARITH_RR_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x1FU)
+#define UNPACK_RAW_ARITH_RR_A(word)    ((((uint32_t)(word)) >> 12) & 0x1FU)
+#define UNPACK_RAW_ARITH_RR_B(word)    ((((uint32_t)(word)) >> 17) & 0x1FU)
+
+/* Integer-only register-immediate form — real immediates don't fit a spare word field at double
+   precision; a real literal goes through PACK_RAW_LOAD_REAL first instead. imm is a signed 15-bit
+   field (-16384..16383), comfortably covering realistic step constants (loop increments, small
+   deltas) with no constant-pool lookup at all. op(7) + dest(5) + src(5) + imm(15) = 32 bits,
+   entirely in the low word. */
+#define PACK_RAW_ARITH_IMM(op, dest, src, imm) \
+    ( ((uint64_t)(op)    & 0x7F) \
+    | (((uint64_t)(dest) & 0x1F) << 7) \
+    | (((uint64_t)(src)  & 0x1F) << 12) \
+    | (((uint64_t)(imm)  & 0x7FFFULL) << 17) )
+#define UNPACK_RAW_ARITH_IMM_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x1FU)
+#define UNPACK_RAW_ARITH_IMM_SRC(word)  ((((uint32_t)(word)) >> 12) & 0x1FU)
+/* Sign-extend the 15-bit field: shift it up so its own sign bit lands on the int32's sign bit,
+   then an arithmetic right shift by the same amount restores the correct negative value. */
+#define UNPACK_RAW_ARITH_IMM_VALUE(word) \
+    (((int32_t)((((uint32_t)(word)) >> 17) << 17)) >> 17)
+
+/* Comparisons produce an ordinary BOXED boolean — they feed a branch, not further raw arithmetic,
+   so no raw boolean type exists. dest is a normal registers[] index (7 bits); a/b are raw-slot
+   indices (5 bits each). op(7) + dest(7) + a(5) + b(5) = 24 bits. */
+#define PACK_RAW_CMP(op, dest, a, b) \
+    ( ((uint64_t)(op)    & 0x7F) \
+    | (((uint64_t)(dest) & 0x7F) << 7) \
+    | (((uint64_t)(a)    & 0x1F) << 14) \
+    | (((uint64_t)(b)    & 0x1F) << 19) )
+#define UNPACK_RAW_CMP_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
+#define UNPACK_RAW_CMP_A(word)    ((((uint32_t)(word)) >> 14) & 0x1FU)
+#define UNPACK_RAW_CMP_B(word)    ((((uint32_t)(word)) >> 19) & 0x1FU)
+
+/* dest is a raw_ints[] index (5 bits); imm is a signed 20-bit immediate baked directly into the
+   word (-524288..524287) — no constant-pool lookup needed for integer literals. op(7) + dest(5) +
+   imm(20) = 32 bits. */
+#define PACK_RAW_LOAD_INT(dest, imm) \
+    ( ((uint64_t)(OP_RAW_LOAD_INT) & 0x7F) \
+    | (((uint64_t)(dest) & 0x1F) << 7) \
+    | (((uint64_t)(imm)  & 0xFFFFFULL) << 12) )
+#define UNPACK_RAW_LOAD_INT_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x1FU)
+#define UNPACK_RAW_LOAD_INT_IMM(word) \
+    (((int32_t)((((uint32_t)(word)) >> 12) << 12)) >> 12)
+
+/* Real literals need full double precision, so — like OP_LOADK — they're sourced from the existing
+   constant pool rather than a packed immediate. dest is a raw_reals[] index (5 bits); pool_idx
+   gets the rest (20 bits) — comfortably above the largest pool measured in this repo (~100
+   entries), same generous-with-a-compile-time-guard story RK9/RK20 already use (parser.c's
+   raw-slot allocator reports a clean compile error, never silent truncation, if it's ever
+   exceeded). */
+#define PACK_RAW_LOAD_REAL(dest, pool_idx) \
+    ( ((uint64_t)(OP_RAW_LOAD_REAL) & 0x7F) \
+    | (((uint64_t)(dest)     & 0x1F) << 7) \
+    | (((uint64_t)(pool_idx) & 0xFFFFFULL) << 12) )
+#define UNPACK_RAW_LOAD_REAL_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x1FU)
+#define UNPACK_RAW_LOAD_REAL_POOL(word) ((((uint32_t)(word)) >> 12) & 0xFFFFFU)
+
+/* Pool-based fallback for an integer literal too large for OP_RAW_LOAD_INT's 20-bit immediate —
+   see the opcode's own comment. Identical shape to PACK_RAW_LOAD_REAL. */
+#define PACK_RAW_LOAD_INT_POOL(dest, pool_idx) \
+    ( ((uint64_t)(OP_RAW_LOAD_INT_POOL) & 0x7F) \
+    | (((uint64_t)(dest)     & 0x1F) << 7) \
+    | (((uint64_t)(pool_idx) & 0xFFFFFULL) << 12) )
+#define UNPACK_RAW_LOAD_INT_POOL_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x1FU)
+#define UNPACK_RAW_LOAD_INT_POOL_POOL(word) ((((uint32_t)(word)) >> 12) & 0xFFFFFU)
+
+/* The only bridge between raw storage and normal tagged AerVal registers. dest is a normal
+   registers[] index (7 bits); src is a raw_ints[]/raw_reals[] index (5 bits) — op (OP_BOX_INT or
+   OP_BOX_REAL) says which array. */
+#define PACK_BOX(op, dest, src) \
+    ( ((uint64_t)(op)    & 0x7F) \
+    | (((uint64_t)(dest) & 0x7F) << 7) \
+    | (((uint64_t)(src)  & 0x1F) << 14) )
+#define UNPACK_BOX_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
+#define UNPACK_BOX_SRC(word)  ((((uint32_t)(word)) >> 14) & 0x1FU)
+
+/* Raw-to-raw copy (OP_RAW_MOVE_INT/REAL) — both dest and src are raw_ints[]/raw_reals[] indices
+   (5 bits each, same array for both — op says which). Needed when a variable's first assignment
+   reserves its own permanent raw slot but the RHS's computed value ends up sitting in a different
+   (temp) slot — the direct analog of OP_MOVE for raw storage. */
+#define PACK_RAW_MOVE(op, dest, src) \
+    ( ((uint64_t)(op)   & 0x7F) \
+    | (((uint64_t)(dest) & 0x1F) << 7) \
+    | (((uint64_t)(src)  & 0x1F) << 12) )
+#define UNPACK_RAW_MOVE_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x1FU)
+#define UNPACK_RAW_MOVE_SRC(word)  ((((uint32_t)(word)) >> 12) & 0x1FU)
+
+/* Compound-assign accumulation of a boxed value into a raw slot, in place (OP_RAW_*_BOXED, see
+   their own Opcode-enum comment). slot is always used as BOTH the read and write operand (dest ==
+   a — an in-place accumulation, the only way this family is ever emitted), so only one raw-slot
+   field is needed; boxed_reg is a normal registers[] index. slot(5) + boxed_reg(7) = 12 bits. */
+#define PACK_RAW_ARITH_BOXED(op, slot, boxed_reg) \
+    ( ((uint64_t)(op)        & 0x7F) \
+    | (((uint64_t)(slot)     & 0x1F) << 7) \
+    | (((uint64_t)(boxed_reg) & 0x7F) << 12) )
+#define UNPACK_RAW_ARITH_BOXED_SLOT(word)  ((((uint32_t)(word)) >> 7)  & 0x1FU)
+#define UNPACK_RAW_ARITH_BOXED_REG(word)   ((((uint32_t)(word)) >> 12) & 0x7FU)
 
 /* dest/lhs_reg (7 bits each) + type_name_idx — a bare pool index, not RK (always a compile-time
    struct type name, never a register) — gets the remaining 42 bits, same reasoning as
    OP_FIELD_GET's field_idx. */
 #define PACK_CHECK_SHAPE(dest, lhs_reg, type_name_idx) \
-    ( ((unsigned long long)(OP_CHECK_SHAPE) & 0xFF) \
-    | (((unsigned long long)(dest)          & 0x7F) << 8) \
-    | (((unsigned long long)(lhs_reg)       & 0x7F) << 15) \
-    | (((unsigned long long)(type_name_idx) & 0x3FFFFFFFFFFULL) << 22) )
+    ( ((uint64_t)(OP_CHECK_SHAPE) & 0xFF) \
+    | (((uint64_t)(dest)          & 0x7F) << 8) \
+    | (((uint64_t)(lhs_reg)       & 0x7F) << 15) \
+    | (((uint64_t)(type_name_idx) & 0x3FFFFFFFFFFULL) << 22) )
 #define UNPACK_CHECK_SHAPE_DEST(word) (((word) >> 8)  & 0x7F)
 #define UNPACK_CHECK_SHAPE_LHS(word)  (((word) >> 15) & 0x7F)
 #define UNPACK_CHECK_SHAPE_NAME(word) (((word) >> 22) & 0x3FFFFFFFFFFULL)
@@ -485,11 +715,11 @@ typedef enum {
    also a bare compile-time-only pool index, never patched (struct construction always resolves at
    parse time, never a forward-reference placeholder the way a function call can be). */
 #define PACK_STRUCT_NEW(dest, arg_reg_base, arg_count, type_name_idx) \
-    ( ((unsigned long long)(OP_STRUCT_NEW) & 0xFF) \
-    | (((unsigned long long)(dest)          & 0x7F) << 8) \
-    | (((unsigned long long)(arg_reg_base)  & 0x7F) << 15) \
-    | (((unsigned long long)(arg_count)     & 0x7F) << 22) \
-    | (((unsigned long long)(type_name_idx) & 0x7FFFFFFFFULL) << 29) )
+    ( ((uint64_t)(OP_STRUCT_NEW) & 0xFF) \
+    | (((uint64_t)(dest)          & 0x7F) << 8) \
+    | (((uint64_t)(arg_reg_base)  & 0x7F) << 15) \
+    | (((uint64_t)(arg_count)     & 0x7F) << 22) \
+    | (((uint64_t)(type_name_idx) & 0x7FFFFFFFFULL) << 29) )
 #define UNPACK_STRUCT_NEW_DEST(word)     (((word) >> 8)  & 0x7F)
 #define UNPACK_STRUCT_NEW_ARG_BASE(word) (((word) >> 15) & 0x7F)
 #define UNPACK_STRUCT_NEW_ARG_COUNT(word) (((word) >> 22) & 0x7F)
@@ -505,8 +735,8 @@ typedef enum {
    index got. Still comfortably more than any real program's field-name count specifically (as
    opposed to its total pool size, which these two don't need to address) — guarded the same way. */
 #define PACK_CMP_JUMP_FALSE(cmp_op, rk_a, rk_b) \
-    ( ((unsigned long long)(OP_CMP_JUMP_FALSE) & 0xFF) \
-    | (((unsigned long long)(cmp_op) & 0xFF) << 8) \
+    ( ((uint64_t)(OP_CMP_JUMP_FALSE) & 0xFF) \
+    | (((uint64_t)(cmp_op) & 0xFF) << 8) \
     | ((PACK_RK20(rk_a) & 0xFFFFFULL) << 16) \
     | ((PACK_RK20(rk_b) & 0xFFFFFULL) << 36) )
 #define UNPACK_CMP_JUMP_OP(word)   (((word) >> 8)  & 0xFF)
@@ -514,8 +744,8 @@ typedef enum {
 #define UNPACK_CMP_JUMP_RK_B(word) (((word) >> 36) & 0xFFFFFULL)
 
 #define PACK_INDEX_SET(arr_reg, rk_idx, rk_val) \
-    ( ((unsigned long long)(OP_INDEX_SET) & 0xFF) \
-    | (((unsigned long long)(arr_reg) & 0x7F) << 8) \
+    ( ((uint64_t)(OP_INDEX_SET) & 0xFF) \
+    | (((uint64_t)(arr_reg) & 0x7F) << 8) \
     | ((PACK_RK20(rk_idx) & 0xFFFFFULL) << 15) \
     | ((PACK_RK20(rk_val) & 0xFFFFFULL) << 35) )
 #define UNPACK_INDEX_SET_ARR(word) (((word) >> 8)  & 0x7F)
@@ -523,9 +753,9 @@ typedef enum {
 #define UNPACK_INDEX_SET_VAL(word) (((word) >> 35) & 0xFFFFFULL)
 
 #define PACK_SLICE_GET(dest, arr_reg, rk_start, rk_end) \
-    ( ((unsigned long long)(OP_SLICE_GET) & 0xFF) \
-    | (((unsigned long long)(dest)    & 0x7F) << 8) \
-    | (((unsigned long long)(arr_reg) & 0x7F) << 15) \
+    ( ((uint64_t)(OP_SLICE_GET) & 0xFF) \
+    | (((uint64_t)(dest)    & 0x7F) << 8) \
+    | (((uint64_t)(arr_reg) & 0x7F) << 15) \
     | ((PACK_RK20(rk_start) & 0xFFFFFULL) << 22) \
     | ((PACK_RK20(rk_end)   & 0xFFFFFULL) << 42) )
 #define UNPACK_SLICE_GET_DEST(word)  (((word) >> 8)  & 0x7F)
@@ -536,12 +766,12 @@ typedef enum {
 #define CALL_MODULE_NAME_MASK  0x1FFFFULL
 #define CALL_MODULE_NAME_MAX   0x1FFFF
 #define PACK_CALL_MODULE(dest, arg_reg_base, arg_count, module_idx, fn_idx) \
-    ( ((unsigned long long)(OP_CALL_MODULE) & 0xFF) \
-    | (((unsigned long long)(dest)         & 0x7F) << 8) \
-    | (((unsigned long long)(arg_reg_base) & 0x7F) << 15) \
-    | (((unsigned long long)(arg_count)    & 0x7F) << 22) \
-    | (((unsigned long long)(module_idx) & CALL_MODULE_NAME_MASK) << 29) \
-    | (((unsigned long long)(fn_idx)     & CALL_MODULE_NAME_MASK) << 46) )
+    ( ((uint64_t)(OP_CALL_MODULE) & 0xFF) \
+    | (((uint64_t)(dest)         & 0x7F) << 8) \
+    | (((uint64_t)(arg_reg_base) & 0x7F) << 15) \
+    | (((uint64_t)(arg_count)    & 0x7F) << 22) \
+    | (((uint64_t)(module_idx) & CALL_MODULE_NAME_MASK) << 29) \
+    | (((uint64_t)(fn_idx)     & CALL_MODULE_NAME_MASK) << 46) )
 #define UNPACK_CALL_MODULE_DEST(word)     (((word) >> 8)  & 0x7F)
 #define UNPACK_CALL_MODULE_ARG_BASE(word) (((word) >> 15) & 0x7F)
 #define UNPACK_CALL_MODULE_ARG_COUNT(word) (((word) >> 22) & 0x7F)
@@ -549,11 +779,11 @@ typedef enum {
 #define UNPACK_CALL_MODULE_FN(word)      (((word) >> 46) & CALL_MODULE_NAME_MASK)
 
 #define PACK_CALL_BUILTIN(dest, arg_reg_base, arg_count, name_idx) \
-    ( ((unsigned long long)(OP_CALL_BUILTIN) & 0xFF) \
-    | (((unsigned long long)(dest)         & 0x7F) << 8) \
-    | (((unsigned long long)(arg_reg_base) & 0x7F) << 15) \
-    | (((unsigned long long)(arg_count)    & 0x7F) << 22) \
-    | (((unsigned long long)(name_idx)     & 0x7FFFFFFFFULL) << 29) )
+    ( ((uint64_t)(OP_CALL_BUILTIN) & 0xFF) \
+    | (((uint64_t)(dest)         & 0x7F) << 8) \
+    | (((uint64_t)(arg_reg_base) & 0x7F) << 15) \
+    | (((uint64_t)(arg_count)    & 0x7F) << 22) \
+    | (((uint64_t)(name_idx)     & 0x7FFFFFFFFULL) << 29) )
 #define UNPACK_CALL_BUILTIN_DEST(word)     (((word) >> 8)  & 0x7F)
 #define UNPACK_CALL_BUILTIN_ARG_BASE(word) (((word) >> 15) & 0x7F)
 #define UNPACK_CALL_BUILTIN_ARG_COUNT(word) (((word) >> 22) & 0x7F)
@@ -562,11 +792,11 @@ typedef enum {
 #define FUSED_FIELD_NAME_MASK 0x3FFFULL
 #define FUSED_FIELD_NAME_MAX  0x3FFF
 #define PACK_FIELD_BINARY(dest, struct_reg, bin_op, field_idx, rk_rhs) \
-    ( ((unsigned long long)(OP_FIELD_BINARY) & 0xFF) \
-    | (((unsigned long long)(dest)       & 0x7F) << 8) \
-    | (((unsigned long long)(struct_reg) & 0x7F) << 15) \
-    | (((unsigned long long)(bin_op)     & 0xFF) << 22) \
-    | (((unsigned long long)(field_idx) & FUSED_FIELD_NAME_MASK) << 30) \
+    ( ((uint64_t)(OP_FIELD_BINARY) & 0xFF) \
+    | (((uint64_t)(dest)       & 0x7F) << 8) \
+    | (((uint64_t)(struct_reg) & 0x7F) << 15) \
+    | (((uint64_t)(bin_op)     & 0xFF) << 22) \
+    | (((uint64_t)(field_idx) & FUSED_FIELD_NAME_MASK) << 30) \
     | ((PACK_RK20(rk_rhs) & 0xFFFFFULL) << 44) )
 #define UNPACK_FIELD_BINARY_DEST(word)   (((word) >> 8)  & 0x7F)
 #define UNPACK_FIELD_BINARY_STRUCT(word) (((word) >> 15) & 0x7F)
@@ -575,12 +805,12 @@ typedef enum {
 #define UNPACK_FIELD_BINARY_RK(word)     (((word) >> 44) & 0xFFFFFULL)
 
 #define PACK_BINARY_FIELD(dest, struct_reg, bin_op, rk_lhs, field_idx) \
-    ( ((unsigned long long)(OP_BINARY_FIELD) & 0xFF) \
-    | (((unsigned long long)(dest)       & 0x7F) << 8) \
-    | (((unsigned long long)(struct_reg) & 0x7F) << 15) \
-    | (((unsigned long long)(bin_op)     & 0xFF) << 22) \
+    ( ((uint64_t)(OP_BINARY_FIELD) & 0xFF) \
+    | (((uint64_t)(dest)       & 0x7F) << 8) \
+    | (((uint64_t)(struct_reg) & 0x7F) << 15) \
+    | (((uint64_t)(bin_op)     & 0xFF) << 22) \
     | ((PACK_RK20(rk_lhs) & 0xFFFFFULL) << 30) \
-    | (((unsigned long long)(field_idx) & FUSED_FIELD_NAME_MASK) << 50) )
+    | (((uint64_t)(field_idx) & FUSED_FIELD_NAME_MASK) << 50) )
 #define UNPACK_BINARY_FIELD_DEST(word)   (((word) >> 8)  & 0x7F)
 #define UNPACK_BINARY_FIELD_STRUCT(word) (((word) >> 15) & 0x7F)
 #define UNPACK_BINARY_FIELD_OP(word)     (((word) >> 22) & 0xFF)
@@ -592,6 +822,17 @@ typedef enum {
 #define CAST_FLOAT   1
 #define CAST_BOOLEAN 2
 
+/* OP_CALL_MODULE's trailing module_id word (see its own comment above) — resolved once at parse
+   time (parse_module_call, parser.c) by comparing the literal module name against this fixed,
+   known set of core built-ins. CALL_MODULE_DYNAMIC covers everything else (host-registered modules,
+   user file imports) — genuinely only resolvable by name at runtime. */
+#define CALL_MODULE_MATH     0
+#define CALL_MODULE_RANDOM   1
+#define CALL_MODULE_STRING   2
+#define CALL_MODULE_TIME     3
+#define CALL_MODULE_JSON     4
+#define CALL_MODULE_DYNAMIC  5
+
 #define MAX_STRUCT_FIELDS 16
 #define MAX_DEFERS_PER_CALL 8  /* max pending `defer` statements per function call */
 #define MAX_DEFER_ARGS      8  /* max arguments to a single deferred call */
@@ -602,6 +843,11 @@ struct Shape {
     unsigned int field_count;
     unsigned int field_names[MAX_STRUCT_FIELDS];     /* pool indices, declaration order       */
     AerVal       field_defaults[MAX_STRUCT_FIELDS];
+    /* TYPE_ANY (value.h) means "no declared type" — every field defaults to it, so existing
+       structs (and the whole rest of the codebase) are unaffected. A non-TYPE_ANY entry is
+       enforced once at OP_FIELD_SET/construction (vm.c) and then trusted everywhere else — the
+       fused field-arithmetic opcodes use it to skip a runtime type check on that side entirely. */
+    ValueType    field_types[MAX_STRUCT_FIELDS];
 };
 
 /* A function's persistent, runtime-visible registration — appended to Chunk.functions by
@@ -633,7 +879,7 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    unsigned long long* code;
+    uint64_t* code;
     unsigned int count, capacity;
 
     AerVal*      pool;           /* constants and variable names — all deduplicated by value */
@@ -683,7 +929,7 @@ typedef struct {
        starts at is ever incremented (see DISPATCH() in vm.c), operand words stay 0. Grown in
        lockstep with `code` by chunk_ensure_debug_hits (vm.c), called once at the top of vm_run.
        Entirely absent from a normal build — see source/core/disasm.h. */
-    unsigned long long* debug_hits;
+    uint64_t* debug_hits;
     unsigned int         debug_hits_cap;
 #endif
 } Chunk;
@@ -714,6 +960,18 @@ typedef struct {
    in-progress one. */
 typedef struct {
     AerVal       registers[FRAME_REGISTERS];
+
+    /* Raw (unboxed) scratch for the "primitive pass" — locals the compiler proved are always the
+       same primitive type across their whole life (parser.c's var_kind/RK_RAW_*_FLAG) get a bare
+       int64_t/double here instead of a tagged AerVal, so their arithmetic can skip both the RK
+       register-vs-constant flag check and the tag check entirely (see PACK_RAW_ARITH_RR's own
+       comment, this file). Pure per-call scratch: never GC-scanned (integers/reals never had heap
+       cells even in boxed AerVal form, vm.c's value_is_young), never read before written within an
+       activation, never crosses a call boundary directly — only a raw value's BOXED form (via
+       OP_BOX_INT/OP_BOX_REAL) ever does. */
+    int64_t      raw_ints[RAW_REGISTERS_INT];
+    double       raw_reals[RAW_REGISTERS_REAL];
+
     unsigned int return_ip;   /* where to resume in the CALLER */
     int          dest_reg;    /* which of the CALLER's registers gets the return value */
 
@@ -737,16 +995,20 @@ typedef struct {
     AerVal       stack[VM_STACK_MAX];
     int          stack_top;
 
-    /* registers always points at call_stack[call_depth].registers — repointed on every
-       call/return. */
+    /* registers/raw_ints/raw_reals always point at call_stack[call_depth]'s own arrays —
+       repointed together on every call/return (the same handful of sites that already repoint
+       registers now repoint all three; a tail call reuses the current frame in place, so none of
+       the three need repointing there). */
     CallFrame  call_stack[VM_CALL_MAX];
     AerVal*      registers;
+    int64_t*     raw_ints;
+    double*      raw_reals;
     int          call_depth;
 } VM;
 
 void         chunk_init(Chunk* c);
 void         chunk_free(Chunk* c);
-void         chunk_emit(Chunk* c, unsigned long long word);
+void         chunk_emit(Chunk* c, uint64_t word);
 
 /* Records that bytecode from `offset` onward belongs to source `line`, once per statement not instruction (see line_mark_offsets); no-op if offset doesn't strictly increase from the last mark. */
 void         chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line);
