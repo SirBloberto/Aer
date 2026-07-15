@@ -141,32 +141,6 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
     chunk_emit(c, PACK_BINARY(op, dest, rk_lhs, rk_rhs));
 }
 
-int compile_node(Chunk* c, Node* node) {
-    if (node->kind == NODE_CONST) {
-        unsigned int pool_idx = chunk_add_pool(c, node->const_value);
-        return (int)pool_idx | RK_CONST_FLAG;
-    }
-    if (node->kind == NODE_REG) {
-        return node->reg;   /* already live — an RK "register" operand, not const-flagged */
-    }
-
-    int rk_lhs = compile_node(c, node->lhs);
-    int rk_rhs = compile_node(c, node->rhs);
-
-    /* Free operand registers (if this node allocated them — a CONST or an already-reserved REG
-       leaf never does) BEFORE allocating the result's register, so the result reuses the lowest
-       just-freed slot instead of growing the watermark further. Exactly Lua's own free-then-
-       allocate discipline (lcode.c) — this is what keeps register usage compact across a deep
-       expression tree instead of growing linearly with tree size. Only free slots THIS call
-       allocated: a NODE_REG leaf's register belongs to whatever reserved it, not to us. */
-    if (!(rk_rhs & RK_CONST_FLAG) && node->rhs->kind == NODE_BINARY) reg_free(1);
-    if (!(rk_lhs & RK_CONST_FLAG) && node->lhs->kind == NODE_BINARY) reg_free(1);
-
-    int dest = reg_alloc();
-    emit_binary(c, dest, node->bin_op, rk_lhs, rk_rhs);
-    return dest;
-}
-
 unsigned int emit_cmp_jump_false(Chunk* c, int rk_a, Opcode cmp_op, int rk_b) {
     rk_a = box_if_raw(c, rk_a);
     rk_b = box_if_raw(c, rk_b);
@@ -2751,6 +2725,19 @@ static bool is_builtin_name(Chunk* c, unsigned int name_idx) {
     return false;
 }
 
+/* Resolves a literal builtin name to its CALL_BUILTIN_* id (vm.h) at compile time, exactly
+   mirroring module_call_id's reasoning below — only ever called after is_builtin_name has already
+   confirmed a match, so every name reaching here is one of these seven. */
+static int builtin_call_id(AerString* name) {
+    if (name->length == 6 && strncmp(name->data, "length", 6) == 0) return CALL_BUILTIN_LENGTH;
+    if (name->length == 6 && strncmp(name->data, "delete", 6) == 0) return CALL_BUILTIN_DELETE;
+    if (name->length == 6 && strncmp(name->data, "append", 6) == 0) return CALL_BUILTIN_APPEND;
+    if (name->length == 5 && strncmp(name->data, "print", 5) == 0) return CALL_BUILTIN_PRINT;
+    if (name->length == 4 && strncmp(name->data, "type", 4) == 0) return CALL_BUILTIN_TYPE;
+    if (name->length == 6 && strncmp(name->data, "assert", 6) == 0) return CALL_BUILTIN_ASSERT;
+    return CALL_BUILTIN_PANIC;
+}
+
 /* `length(args)` etc. — same contiguous-register argument materialization and result-register
    reuse as parse_call, just emitting OP_CALL_BUILTIN instead. `name_idx` is already
    consumed and confirmed to be a builtin name by the caller. */
@@ -2764,6 +2751,7 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
     if (arg_count > 1) reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
     chunk_emit(c, PACK_CALL_BUILTIN(dest, base, arg_count, name_idx));
+    chunk_emit(c, (uint64_t)builtin_call_id(aer_as_string(c->pool[name_idx])));
     return dest;
 }
 
@@ -2958,6 +2946,7 @@ static void parse_defer(Chunk* c) {
         chunk_emit(c, 0);
         callee_offset = c->count;
         chunk_emit(c, PACK_CALL_BUILTIN(0, 0, arg_count, name_idx));
+        chunk_emit(c, (uint64_t)builtin_call_id(aer_as_string(c->pool[name_idx])));
         chunk_emit(c, PACK1(OP_RETURN, 0));
         patch_jump(c, patch, c->count);
     } else {

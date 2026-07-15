@@ -109,15 +109,22 @@ int main(void) {
         chunk_init(&c);
         reg_reset();
 
-        Node two   = { .kind = NODE_CONST, .const_value = aer_int(2) };
-        Node three = { .kind = NODE_CONST, .const_value = aer_int(3) };
-        Node four  = { .kind = NODE_CONST, .const_value = aer_int(4) };
-        Node five  = { .kind = NODE_CONST, .const_value = aer_int(5) };
-        Node add_l = { .kind = NODE_BINARY, .bin_op = OP_ADD, .lhs = &two,  .rhs = &three };
-        Node add_r = { .kind = NODE_BINARY, .bin_op = OP_ADD, .lhs = &four, .rhs = &five  };
-        Node mul   = { .kind = NODE_BINARY, .bin_op = OP_MUL, .lhs = &add_l, .rhs = &add_r };
+        int rk_2 = (int)chunk_add_pool(&c, aer_int(2)) | RK_CONST_FLAG;
+        int rk_3 = (int)chunk_add_pool(&c, aer_int(3)) | RK_CONST_FLAG;
+        int reg_add_l = reg_alloc();
+        chunk_emit(&c, PACK_BINARY(OP_ADD, reg_add_l, rk_2, rk_3));
 
-        int result_reg = compile_node(&c, &mul);
+        int rk_4 = (int)chunk_add_pool(&c, aer_int(4)) | RK_CONST_FLAG;
+        int rk_5 = (int)chunk_add_pool(&c, aer_int(5)) | RK_CONST_FLAG;
+        int reg_add_r = reg_alloc();
+        chunk_emit(&c, PACK_BINARY(OP_ADD, reg_add_r, rk_4, rk_5));
+
+        /* Free both temps before allocating the result's register, matching Lua's own
+           free-then-allocate discipline (lcode.c) — this is what keeps register usage compact
+           across a deep expression tree instead of growing linearly with tree size. */
+        reg_free(2);
+        int result_reg = reg_alloc();
+        chunk_emit(&c, PACK_BINARY(OP_MUL, result_reg, reg_add_l, reg_add_r));
         chunk_emit(&c, OP_HALT);
 
         VM vm;
@@ -132,8 +139,8 @@ int main(void) {
     }
 
     /* Test 2: a*a + b*b with a=3, b=4 — "locals" set up via OP_LOADK into reserved registers,
-       proving NODE_REG leaves (an already-live register, not a fresh constant) compile
-       correctly and are never freed by the allocator. */
+       proving an already-live register operand (not a fresh constant) is read correctly and is
+       never freed by the allocator. */
     {
         Chunk c;
         chunk_init(&c);
@@ -145,15 +152,14 @@ int main(void) {
         chunk_emit(&c, PACK1(OP_LOADK, 1)); chunk_emit(&c, (int)pool_b);  /* reg 1 = 4 */
         reg_reserve(2);   /* registers 0,1 are now "locals" — never freed/reallocated below */
 
-        Node a1 = { .kind = NODE_REG, .reg = 0 };
-        Node a2 = { .kind = NODE_REG, .reg = 0 };
-        Node b1 = { .kind = NODE_REG, .reg = 1 };
-        Node b2 = { .kind = NODE_REG, .reg = 1 };
-        Node a_sq = { .kind = NODE_BINARY, .bin_op = OP_MUL, .lhs = &a1, .rhs = &a2 };
-        Node b_sq = { .kind = NODE_BINARY, .bin_op = OP_MUL, .lhs = &b1, .rhs = &b2 };
-        Node sum  = { .kind = NODE_BINARY, .bin_op = OP_ADD, .lhs = &a_sq, .rhs = &b_sq };
+        int reg_a_sq = reg_alloc();
+        chunk_emit(&c, PACK_BINARY(OP_MUL, reg_a_sq, 0, 0));   /* a*a — reg 0 is the reserved "local" a, never freed */
+        int reg_b_sq = reg_alloc();
+        chunk_emit(&c, PACK_BINARY(OP_MUL, reg_b_sq, 1, 1));   /* b*b — reg 1 is the reserved "local" b */
 
-        int result_reg = compile_node(&c, &sum);
+        reg_free(2);   /* both squared results were temps — free before the final add's allocation */
+        int result_reg = reg_alloc();
+        chunk_emit(&c, PACK_BINARY(OP_ADD, result_reg, reg_a_sq, reg_b_sq));
         chunk_emit(&c, OP_HALT);
 
         VM vm;
@@ -175,11 +181,9 @@ int main(void) {
         chunk_init(&c);
         reg_reset();
 
-        Node one  = { .kind = NODE_CONST, .const_value = aer_int(1) };
-        Node zero = { .kind = NODE_CONST, .const_value = aer_int(0) };
-        Node div  = { .kind = NODE_BINARY, .bin_op = OP_DIV, .lhs = &one, .rhs = &zero };
-
-        compile_node(&c, &div);
+        int rk_1 = (int)chunk_add_pool(&c, aer_int(1)) | RK_CONST_FLAG;
+        int rk_0 = (int)chunk_add_pool(&c, aer_int(0)) | RK_CONST_FLAG;
+        chunk_emit(&c, PACK_BINARY(OP_DIV, reg_alloc(), rk_1, rk_0));
         chunk_emit(&c, OP_HALT);
 
         VM vm;
@@ -192,10 +196,9 @@ int main(void) {
        proving OP_CMP_JUMP_FALSE (the fused register-operand comparison+branch) and the reused,
        stack-neutral OP_JUMP work correctly together for real control flow, not just straight-line
        arithmetic. sum/i are "locals" in reserved registers 0/1; the loop body writes directly into
-       them (a compound-assignment shape, not a fresh temp via compile_node — parser.c's tree
-       compiler is for general expressions feeding a *new* result, this is the simpler "assign back
-       into an already-live register" shape, same distinction the real parser draws between
-       OP_BINARY_* and OP_COMPOUND_*). Expected: sum == 0+1+2+3+4 == 10. */
+       them (a compound-assignment shape feeding an EXISTING register, not a fresh temp — same
+       distinction the real parser draws between OP_BINARY_* and OP_COMPOUND_*). Expected:
+       sum == 0+1+2+3+4 == 10. */
     {
         Chunk c;
         chunk_init(&c);
@@ -259,10 +262,8 @@ int main(void) {
         reg_reserve(1);   /* register 0 is the callee's "x" argument */
 
         unsigned int callee_offset = c.count;
-        Node x1 = { .kind = NODE_REG, .reg = 0 };
-        Node x2 = { .kind = NODE_REG, .reg = 0 };
-        Node x_sq = { .kind = NODE_BINARY, .bin_op = OP_MUL, .lhs = &x1, .rhs = &x2 };
-        int result_reg = compile_node(&c, &x_sq);
+        int result_reg = reg_alloc();
+        chunk_emit(&c, PACK_BINARY(OP_MUL, result_reg, 0, 0));   /* x*x — reg 0 is the callee's own "x" argument */
         emit_return(&c, result_reg);
 
         patch_jump(&c, skip_callee_patch, c.count);   /* caller code starts right here */

@@ -5,7 +5,6 @@
 #include <time.h>
 #include "aer_stdlib.h"
 #include "error.h"
-#include "value_box.h"
 
 void aer_stdlib_init(void) {
     srand((unsigned int)time(NULL));

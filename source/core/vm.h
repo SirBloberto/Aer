@@ -4,7 +4,6 @@
 #include "hashmap.h"
 #include "value.h"
 #include "dictmap.h"
-#include "value_box.h"
 
 /* Defined here (after dictmap.h) using DictMap not HashMap: dict values are stored inline with
    their key. */
@@ -163,12 +162,16 @@ typedef enum {
     /* Global builtins (length/delete/append/print/type/assert/panic) called bare, e.g.
        `length(arr)`. Bridges to vm_call_builtin() (vm.c), which takes a plain AerVal* array, so
        unlike OP_CALL_MODULE this needs no push/pop bridge to vm->stack at all — registers are
-       copied into a small local array and passed straight through. Struct construction
-       (vm_call_builtin's other fallback branch, via chunk_find_shape) is never reached here —
-       struct construction is already resolved at compile time (is_struct_name/OP_STRUCT_NEW), so
-       only the seven builtin names above are ever checked at parse time (is_builtin_name,
-       parser.c) before this opcode is emitted. */
-    OP_CALL_BUILTIN, /* operands: dest_reg, name_pool_idx, arg_reg_base, arg_count */
+       copied into a small local array and passed straight through. Struct construction is never
+       reached here — it's already resolved at compile time (is_struct_name/OP_STRUCT_NEW), so only
+       the seven builtin names above are ever checked at parse time (is_builtin_name, parser.c)
+       before this opcode is emitted.
+         Same trailing-word convention as OP_CALL_MODULE: the builtin's name is always a literal
+       identifier, resolved once at parse time (builtin_call_id, parser.c) to a small int
+       (CALL_BUILTIN_LENGTH etc., below) so the VM switches on it instead of running a strcmp
+       chain against all seven names on every single call. */
+    OP_CALL_BUILTIN, /* operands: dest_reg, name_pool_idx, arg_reg_base, arg_count (packed,
+                            PACK_CALL_BUILTIN), plus one trailing plain word: builtin_id */
 
     /* Reading a top-level ("global") variable from inside a function body. Per-call register
        windowing means a function's own registers are never the top-level frame's registers, so
@@ -814,6 +817,18 @@ typedef enum {
 #define CALL_MODULE_TIME     3
 #define CALL_MODULE_JSON     4
 #define CALL_MODULE_DYNAMIC  5
+
+/* OP_CALL_BUILTIN's trailing builtin_id word (see its own comment above) — resolved once at parse
+   time (builtin_call_id, parser.c). No DYNAMIC case: unlike a module name, a builtin call site is
+   only ever emitted after is_builtin_name (parser.c) already confirmed the name is one of these
+   seven, so builtin_call_id always finds a match. */
+#define CALL_BUILTIN_LENGTH 0
+#define CALL_BUILTIN_DELETE 1
+#define CALL_BUILTIN_APPEND 2
+#define CALL_BUILTIN_PRINT  3
+#define CALL_BUILTIN_TYPE   4
+#define CALL_BUILTIN_ASSERT 5
+#define CALL_BUILTIN_PANIC  6
 
 #define MAX_STRUCT_FIELDS 16
 #define MAX_DEFERS_PER_CALL 8  /* max pending `defer` statements per function call */

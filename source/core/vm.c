@@ -9,7 +9,6 @@
 #include "error.h"
 #include "pool.h"
 #include "vm.h"
-#include "value_box.h"
 
 /* Slab pools for heap types confirmed (via every free() site) to never be freed individually — alloc-speed only. Guarded since vm_init() reruns per VM/module import and would otherwise leak slabs. */
 static Pool string_pool, array_pool, dict_pool, function_pool, struct_pool;
@@ -1329,116 +1328,107 @@ AerFunction* vm_new_function(void) {
     return pool_alloc(&function_pool);
 }
 
-/* Resolves name as a builtin or struct call against a plain args[] array (not POP()ing from
-   the operand stack) — used only by deferred-call replay in lbl_return, whose args are already
-   staged in a bounded DeferredCall; lbl_call keeps its own POP()-based version since its
-   arg_count is parser-unbounded. Returns true if `name` was recognized, result in *out. */
-static bool vm_call_builtin(Chunk* c, const char* name, AerVal* args, int arg_count, AerVal* out) {
+/* builtin_id was resolved once, at parse time (builtin_call_id, parser.c) — a switch on a small
+   int instead of a strcmp chain against all seven builtin names on every single call, mirroring
+   OP_CALL_MODULE's own module_id fix. Struct construction is never reached here: it's already
+   resolved at compile time (is_struct_name/OP_STRUCT_NEW, parser.c), so `builtin_id` is always one
+   of the seven cases below — confirmed via OP_CALL_BUILTIN's only two emission sites, both gated
+   behind is_builtin_name. Returns true if arg_count matched builtin_id's expected arity, result in
+   *out. */
+static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_count, AerVal* out) {
     *out = aer_null();
 
-    if (strcmp(name, "length") == 0 && arg_count == 1) {
-        AerVal a = args[0];
-        if      (aer_type(a) == TYPE_ARRAY)  *out = aer_int((int64_t)aer_as_array(a)->count);
-        else if (aer_type(a) == TYPE_STRING) *out = aer_int((int64_t)aer_as_string(a)->length);
-        else if (aer_type(a) == TYPE_DICT)   *out = aer_int((int64_t)aer_as_dict(a)->map.count);
-        else error("length() requires an array, dict, or string");
-        return true;
-    }
-    if (strcmp(name, "delete") == 0 && arg_count == 2) {
-        AerVal obj = args[0], key = args[1];
-        if (aer_type(obj) == TYPE_DICT) {
-            if (aer_type(key) != TYPE_STRING) { error("delete() key must be a string"); return true; }
-            AerString* ks = aer_as_string(key);
-            unsigned int klen = ks->length;
-            if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return true; }
-            char kbuf[VM_KEY_MAX + 1];
-            memcpy(kbuf, ks->data, klen);
-            kbuf[klen] = '\0';
-            dictmap_remove(&aer_as_dict(obj)->map, kbuf);
-            *out = obj;
+    switch (builtin_id) {
+        case CALL_BUILTIN_LENGTH: {
+            if (arg_count != 1) return false;
+            AerVal a = args[0];
+            if      (aer_type(a) == TYPE_ARRAY)  *out = aer_int((int64_t)aer_as_array(a)->count);
+            else if (aer_type(a) == TYPE_STRING) *out = aer_int((int64_t)aer_as_string(a)->length);
+            else if (aer_type(a) == TYPE_DICT)   *out = aer_int((int64_t)aer_as_dict(a)->map.count);
+            else error("length() requires an array, dict, or string");
             return true;
         }
-        if (aer_type(obj) == TYPE_ARRAY) {
-            AerArray* a = aer_as_array(obj);
-            if (a->shape) { error("delete() cannot remove fields from a struct instance — structs have a fixed shape"); return true; }
-            if (aer_type(key) != TYPE_INTEGER) { error("Array delete() index must be an integer"); return true; }
-            int64_t i = aer_as_int(key);
-            if (i < 0) i += (int64_t)a->count;
-            if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(key), a->count); return true; }
-            memmove(&a->items[i], &a->items[i + 1], (size_t)(a->count - (uint64_t)i - 1) * sizeof(AerVal));
-            a->count--;
-            *out = obj;
+        case CALL_BUILTIN_DELETE: {
+            if (arg_count != 2) return false;
+            AerVal obj = args[0], key = args[1];
+            if (aer_type(obj) == TYPE_DICT) {
+                if (aer_type(key) != TYPE_STRING) { error("delete() key must be a string"); return true; }
+                AerString* ks = aer_as_string(key);
+                unsigned int klen = ks->length;
+                if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return true; }
+                char kbuf[VM_KEY_MAX + 1];
+                memcpy(kbuf, ks->data, klen);
+                kbuf[klen] = '\0';
+                dictmap_remove(&aer_as_dict(obj)->map, kbuf);
+                *out = obj;
+                return true;
+            }
+            if (aer_type(obj) == TYPE_ARRAY) {
+                AerArray* a = aer_as_array(obj);
+                if (a->shape) { error("delete() cannot remove fields from a struct instance — structs have a fixed shape"); return true; }
+                if (aer_type(key) != TYPE_INTEGER) { error("Array delete() index must be an integer"); return true; }
+                int64_t i = aer_as_int(key);
+                if (i < 0) i += (int64_t)a->count;
+                if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(key), a->count); return true; }
+                memmove(&a->items[i], &a->items[i + 1], (size_t)(a->count - (uint64_t)i - 1) * sizeof(AerVal));
+                a->count--;
+                *out = obj;
+                return true;
+            }
+            error("delete() requires a dict or array");
             return true;
         }
-        error("delete() requires a dict or array");
-        return true;
-    }
-    if (strcmp(name, "append") == 0 && arg_count == 2) {
-        AerVal arr = args[0], val = args[1];
-        if (aer_type(arr) != TYPE_ARRAY) { error("append() requires an array"); return true; }
-        AerArray* a = aer_as_array(arr);
-        if (a->shape) { error("append() cannot add fields to a struct instance — structs have a fixed shape"); return true; }
-        if (a->count >= a->capacity) {
-            a->capacity = a->capacity ? a->capacity * 2 : 4;
-            a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
+        case CALL_BUILTIN_APPEND: {
+            if (arg_count != 2) return false;
+            AerVal arr = args[0], val = args[1];
+            if (aer_type(arr) != TYPE_ARRAY) { error("append() requires an array"); return true; }
+            AerArray* a = aer_as_array(arr);
+            if (a->shape) { error("append() cannot add fields to a struct instance — structs have a fixed shape"); return true; }
+            if (a->count >= a->capacity) {
+                a->capacity = a->capacity ? a->capacity * 2 : 4;
+                a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
+            }
+            gc_barrier_array(a, val);
+            a->items[a->count++] = val;
+            *out = arr;
+            return true;
         }
-        gc_barrier_array(a, val);
-        a->items[a->count++] = val;
-        *out = arr;
-        return true;
-    }
-    if (strcmp(name, "print") == 0 && arg_count == 1) {
-        vm_print_value(c, args[0], false);
-        printf("\n");
-        return true;
-    }
-    if (strcmp(name, "type") == 0 && arg_count == 1) {
-        const char* tn = vm_type_name(c, args[0]);
-        /* Copies rather than pointing at a static literal or the chunk's pool data — AerString always owns its data, no exceptions. */
-        unsigned int tn_len = (unsigned int)strlen(tn);
-        char* tn_buf = xmalloc(tn_len + 1);
-        memcpy(tn_buf, tn, tn_len + 1);
-        *out = aer_make_string(tn_buf, tn_len);   /* no chunk_add_pool interning — see vm_to_str's comment */
-        return true;
-    }
-    if (strcmp(name, "assert") == 0 && arg_count == 2) {
-        AerVal cond = args[0], msg = args[1];
-        if (aer_type(msg) != TYPE_STRING) { error("assert() requires a string message as its second argument"); return true; }
-        if (!vm_truthy(cond)) {
-            assert_failure_count++;
+        case CALL_BUILTIN_PRINT: {
+            if (arg_count != 1) return false;
+            vm_print_value(c, args[0], false);
+            printf("\n");
+            return true;
+        }
+        case CALL_BUILTIN_TYPE: {
+            if (arg_count != 1) return false;
+            const char* tn = vm_type_name(c, args[0]);
+            /* Copies rather than pointing at a static literal or the chunk's pool data — AerString always owns its data, no exceptions. */
+            unsigned int tn_len = (unsigned int)strlen(tn);
+            char* tn_buf = xmalloc(tn_len + 1);
+            memcpy(tn_buf, tn, tn_len + 1);
+            *out = aer_make_string(tn_buf, tn_len);   /* no chunk_add_pool interning — see vm_to_str's comment */
+            return true;
+        }
+        case CALL_BUILTIN_ASSERT: {
+            if (arg_count != 2) return false;
+            AerVal cond = args[0], msg = args[1];
+            if (aer_type(msg) != TYPE_STRING) { error("assert() requires a string message as its second argument"); return true; }
+            if (!vm_truthy(cond)) {
+                assert_failure_count++;
+                AerString* ms = aer_as_string(msg);
+                printf("ASSERT FAILED: %.*s\n", (int)ms->length, ms->data);
+            }
+            return true;
+        }
+        case CALL_BUILTIN_PANIC: {
+            if (arg_count != 1) return false;
+            AerVal msg = args[0];
+            if (aer_type(msg) != TYPE_STRING) { error("panic() requires a string message"); return true; }
             AerString* ms = aer_as_string(msg);
-            printf("ASSERT FAILED: %.*s\n", (int)ms->length, ms->data);
-        }
-        return true;
-    }
-    if (strcmp(name, "panic") == 0 && arg_count == 1) {
-        AerVal msg = args[0];
-        if (aer_type(msg) != TYPE_STRING) { error("panic() requires a string message"); return true; }
-        AerString* ms = aer_as_string(msg);
-        error("panic: %.*s", (int)ms->length, ms->data);
-        return true;
-    }
-
-    Shape* shape = chunk_find_shape(c, name);
-    if (shape) {
-        if ((unsigned int)arg_count > shape->field_count) {
-            error("'%s' takes at most %u argument%s, got %d",
-                  name, shape->field_count, shape->field_count == 1 ? "" : "s", arg_count);
+            error("panic: %.*s", (int)ms->length, ms->data);
             return true;
         }
-        /* struct_pool cell holds the AerArray header AND its field storage in one allocation —
-           items points right after the header instead of a separate xmalloc (see vm_pools_init_once). */
-        AerArray* a = pool_alloc(&struct_pool);
-        a->count = a->capacity = shape->field_count;
-        a->items = (AerVal*)((char*)a + sizeof(AerArray));
-        a->shape = shape;
-        for (int i = 0; i < arg_count; i++) a->items[i] = args[i];
-        for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
-            a->items[i] = vm_default_value(shape->field_defaults[i]);
-        *out = aer_array_val(a);
-        return true;
     }
-
     return false;
 }
 
@@ -2142,14 +2132,14 @@ lbl_call_module: {
 }
 
 /* See OP_CALL_BUILTIN's comment in vm.h — vm_call_builtin() already takes a plain AerVal*
-   array (built for deferred-call replay, vm.c above), so unlike OP_CALL_MODULE this needs no
-   push/pop bridge to vm->stack at all. 4 local slots is headroom over every builtin's real max
-   arity (2 — delete/append/assert). */
+   array, so unlike OP_CALL_MODULE this needs no push/pop bridge to vm->stack at all. 4 local
+   slots is headroom over every builtin's real max arity (2 — delete/append/assert). */
 lbl_call_builtin: {
     int dest_reg     = (int)UNPACK_CALL_BUILTIN_DEST(op_word);
     int arg_reg_base = (int)UNPACK_CALL_BUILTIN_ARG_BASE(op_word);
     int arg_count    = (int)UNPACK_CALL_BUILTIN_ARG_COUNT(op_word);
     int name_idx     = (int)UNPACK_CALL_BUILTIN_NAME(op_word);
+    int builtin_id   = (int)READ();
     const char* name = aer_as_string(c->pool[name_idx])->data;
     if (arg_count > 4) {
         error("Too many arguments to '%s'", name);
@@ -2159,7 +2149,7 @@ lbl_call_builtin: {
     AerVal args[4];
     for (int i = 0; i < arg_count; i++) args[i] = vm->registers[arg_reg_base + i];
     AerVal out;
-    bool handled = vm_call_builtin(c, name, args, arg_count, &out);
+    bool handled = vm_call_builtin(c, builtin_id, args, arg_count, &out);
     if (!handled) error("'%s' is not defined, or was called with the wrong number of arguments", name);
     vm->registers[dest_reg] = out;
     gc_maybe_collect(vm);   /* vm_call_builtin: struct_pool site + aer_make_string (type()) */

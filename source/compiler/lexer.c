@@ -5,7 +5,6 @@
 #include <ctype.h>
 #include "error.h"
 #include "lexer.h"
-#include "value_box.h"
 
 typedef struct File {
     char* name;

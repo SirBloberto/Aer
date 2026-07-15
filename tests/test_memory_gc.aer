@@ -91,33 +91,28 @@ interp_pt = InterpPoint(1, 2)
 assert("pt is {interp_pt}" == "pt is InterpPoint\{x: 1, y: 2}", "interpolating a struct shows its fields, not a placeholder")
 
 # ------------------------------------------------------------------ #
-# 32. Integer boundary — AerVal's inline 47-bit fast path and its      #
-#     heap-boxed 64-bit overflow fallback (see value_box.h)            #
+# 32. Large-integer arithmetic — every AerVal integer is a plain int64_t #
+#     (value.h), no inline/boxed distinction or overflow fallback       #
 # ------------------------------------------------------------------ #
 
-# Exactly at the inline range's edges — must stay correct without ever
-# touching the overflow path.
 int47_max = 70368744177663    #  2^46 - 1
 int47_min = -70368744177664    # -2^46
-assert(int47_max == 70368744177663, "the largest inline-representable integer round-trips exactly")
-assert(int47_min == -70368744177664, "the smallest inline-representable integer round-trips exactly")
-assert(int47_max + 1 == 70368744177664, "arithmetic crossing the inline boundary still produces the correct value")
+assert(int47_max == 70368744177663, "a large positive integer round-trips exactly")
+assert(int47_min == -70368744177664, "a large negative integer round-trips exactly")
+assert(int47_max + 1 == 70368744177664, "arithmetic at this magnitude still produces the correct value")
 
-# One past each edge — forces the heap-boxed long_pool fallback. AER's
-# documented 64-bit integer range must hold exactly here, not just within
-# the inline fast path.
-big_pos = 70368744177664       #  2^46      (one past int47_max)
-big_neg = -70368744177665       # -2^46 - 1  (one past int47_min)
-assert(big_pos == 70368744177664, "an integer one past the inline range's top edge round-trips exactly (long_pool fallback)")
-assert(big_neg == -70368744177665, "an integer one past the inline range's bottom edge round-trips exactly (long_pool fallback)")
-assert(big_pos - 1 == int47_max, "arithmetic between a boxed and an inline integer still produces the correct (inline-range) value")
-assert(big_pos + big_neg == -1, "arithmetic between two boxed integers still produces the correct value")
+big_pos = 70368744177664       #  2^46
+big_neg = -70368744177665       # -2^46 - 1
+assert(big_pos == 70368744177664, "an integer past 2^46 round-trips exactly")
+assert(big_neg == -70368744177665, "a negative integer past -2^46 round-trips exactly")
+assert(big_pos - 1 == int47_max, "arithmetic between these values still produces the correct value")
+assert(big_pos + big_neg == -1, "arithmetic between two large integers still produces the correct value")
 
 # Comfortably beyond even that — well within long long's real range, nowhere
 # near actually overflowing 64 bits.
 huge = 9223372036854775           # ~2^63 / 1000, still far under LLONG_MAX
-assert(huge == 9223372036854775, "a large boxed integer round-trips exactly")
-assert(huge * 2 == 18446744073709550, "arithmetic on a large boxed integer stays exact")
+assert(huge == 9223372036854775, "a large integer round-trips exactly")
+assert(huge * 2 == 18446744073709550, "arithmetic on a large integer stays exact")
 
 # ------------------------------------------------------------------ #
 # 35. Parameter-slot capacity — SCOPE_SLOT_MAX/MAX_PARAMS fix           #

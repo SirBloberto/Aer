@@ -6,9 +6,8 @@
 /* The register-VM compiler — real lexer output in, real bytecode out; this is the only parser
    AER has (see the register-based bytecode plan, jazzy-floating-starlight.md, for the full design
    history). reg_reset/reg_reserve/reg_alloc/reg_free below are the register allocator this file's
-   compile_node/parse functions share; compile_node and the Node type remain from the original
-   hand-built-tree milestone that first exercised the allocator before any real source integration
-   existed — still used by tests/smoke_test.c below the level of a real .aer file. */
+   compile functions share; tests/smoke_test.c also drives them directly, below the level of a
+   real .aer file, to hand-build bytecode and exercise the VM in isolation from the lexer/parser. */
 
 /* Register allocator, modeled directly on Lua's own compiler (lparser.c/lcode.c's
    FuncState.freereg) — a watermark that grows when a sub-expression needs a temp register and
@@ -20,22 +19,6 @@ void reg_reset(void);
 void reg_reserve(int count);
 int  reg_alloc(void);
 void reg_free(int count);
-
-typedef enum { NODE_CONST, NODE_REG, NODE_BINARY } NodeKind;
-
-typedef struct Node {
-    NodeKind kind;
-    AerVal     const_value;    /* NODE_CONST */
-    int        reg;            /* NODE_REG — an already-live register (e.g. a reserved "local") */
-    Opcode     bin_op;         /* NODE_BINARY */
-    struct Node *lhs, *rhs;  /* NODE_BINARY */
-} Node;
-
-/* Compiles `node` into `c`, emitting OP_BINARY instructions via the allocator above. Returns an
-   RK-encoded operand (see RK_CONST_FLAG, vm.h) usable directly as a parent node's operand — a
-   constant or already-live register leaf never allocates anything of its own, only a BINARY node's
-   result does, since it must survive to be read by its parent. */
-int compile_node(Chunk* c, Node* node);
 
 /* Control flow for the register-operand opcodes. Each emits its instruction with a 0 placeholder
    for `target` and returns the OFFSET of that placeholder word — pass it to patch_jump once the

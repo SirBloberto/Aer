@@ -3,7 +3,6 @@
 #include <string.h>
 #include "disasm.h"
 #include "error.h"
-#include "value_box.h"
 
 /* Kinds of operand word this disassembler knows how to decode/print. */
 typedef enum {
@@ -110,8 +109,14 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* No patchable target at all — module/function/builtin names are always literal identifiers
        resolved at parse time — so everything packs into one word (PACK_CALL_MODULE/
        PACK_CALL_BUILTIN, vm.h). Special-cased in disassemble_one. */
-    [OP_CALL_MODULE]  = { "OP_CALL_MODULE",  "call a native or file-module function by (module, function) name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_NAME}, false, 5 },
-    [OP_CALL_BUILTIN] = { "OP_CALL_BUILTIN", "global builtin (length/append/etc.) by name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME}, false, 4 },
+    /* The trailing FLD_COUNT past `packed` fields in both entries below is a pure word-count
+       placeholder for the per-opcode-summary walk (aer_disassemble) — the real trailing word
+       (module_id/builtin_id) is decoded and printed specially in disassemble_one, not through the
+       generic fields[] loop. Without it, that walk would think these opcodes are 1 word long
+       instead of 2, misaligning every instruction after one — the same class of bug already found
+       and fixed once in this file (see the opcode-mask fix, aer_disassemble). */
+    [OP_CALL_MODULE]  = { "OP_CALL_MODULE",  "call a native or file-module function by (module, function) name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_NAME, FLD_COUNT}, false, 5 },
+    [OP_CALL_BUILTIN] = { "OP_CALL_BUILTIN", "global builtin (length/append/etc.) by name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_COUNT}, false, 4 },
     [OP_LOAD_GLOBAL]  = { "OP_LOAD_GLOBAL",  "reg = top-level frame's reg (read-only)", {FLD_REG, FLD_REG}, false, 2 },
     [OP_STORE_GLOBAL] = { "OP_STORE_GLOBAL", "top-level frame's reg = rk", {FLD_REG, FLD_RK}, false, 2 },
     [OP_DEFER_PUSH]   = { "OP_DEFER_PUSH",   "snapshot args; run at this frame's OP_RETURN", {FLD_REG, FLD_COUNT, FLD_JUMP}, false, 2 },
@@ -398,10 +403,17 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         int module_id = (int)c->code[pos++];
         fprintf(out, "  id=%s", call_module_id_names[module_id]);
     } else if (op == OP_CALL_BUILTIN) {
+        static const char* const call_builtin_id_names[] = {
+            "length", "delete", "append", "print", "type", "assert", "panic"
+        };
         print_field(out, c, FLD_REG,   (int)UNPACK_CALL_BUILTIN_DEST(op_word));
         print_field(out, c, FLD_REG,   (int)UNPACK_CALL_BUILTIN_ARG_BASE(op_word));
         print_field(out, c, FLD_COUNT, (int)UNPACK_CALL_BUILTIN_ARG_COUNT(op_word));
         print_field(out, c, FLD_NAME,  (int)UNPACK_CALL_BUILTIN_NAME(op_word));
+        /* Trailing word (see OP_CALL_BUILTIN's own comment, vm.h): builtin_id, resolved once at
+           parse time so the VM can switch on it instead of running a strcmp chain per call. */
+        int builtin_id = (int)c->code[pos++];
+        fprintf(out, "  id=%s", call_builtin_id_names[builtin_id]);
     } else if (op == OP_BINARY_FIELD) {
         print_field(out, c, FLD_REG,   (int)UNPACK_BINARY_FIELD_DEST(op_word));
         print_field(out, c, FLD_REG,   (int)UNPACK_BINARY_FIELD_STRUCT(op_word));

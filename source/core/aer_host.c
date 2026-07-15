@@ -1,9 +1,8 @@
 #include <string.h>
 #include "aer_host.h"
 #include "error.h"
-#include "value_box.h"
 
-/* aer_val_to_public/aer_val_from_public (value_box.h) are the one seam between internal packed AerVal and the public boxed Value AerNativeFn has always used — converted once per host call, so the VM's hot dispatch loop never pays this cost for scripts that don't call a host function. */
+/* aer_val_to_public/aer_val_from_public (value.h) are the one seam between internal packed AerVal and the public boxed Value AerNativeFn has always used — converted once per host call, so the VM's hot dispatch loop never pays this cost for scripts that don't call a host function. */
 
 typedef struct {
     char*       module;

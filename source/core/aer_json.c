@@ -4,7 +4,6 @@
 #include <string.h>
 #include "aer_json.h"
 #include "error.h"
-#include "value_box.h"
 
 /* Stack helpers — same private-per-file pattern as aer_stdlib.c's (each native-module file has its own copy, matching vm_run's PUSH()/POP() not existing outside vm.c). */
 static bool stdlib_push(VM* vm, AerVal v) {

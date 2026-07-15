@@ -5,7 +5,6 @@
 #include "error.h"
 #include "lexer.h"
 #include "parser.h"
-#include "value_box.h"
 
 #ifdef _WIN32
 #define PATH_LIST_SEP ';'
