@@ -1,7 +1,7 @@
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include "error.h"
-#include "hash_util.h"
 #include "hashtable.h"
 
 #define HASHTABLE_INIT_SIZE 16
@@ -10,12 +10,21 @@
 
 static void rehash(HashTable* t);
 
-/* The only real difference between boxed and inline tables: boxed payloads own a separate allocation to free on overwrite/remove/clear; inline owns nothing. */
-static void free_payload(HashTable* t, HashPayload p) {
-    if (!t->is_inline) free(p.boxed);
+static uint64_t hash_key(const char* key) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    for (; *key; key++) {
+        hash ^= (unsigned char)*key;
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
 }
 
-void hashtable_put(HashTable* t, char* key, HashPayload value) {
+static bool hash_match(const char* entry_key, unsigned int entry_length,
+                        const char* key, unsigned int length) {
+    return entry_key && entry_length == length && strcmp(entry_key, key) == 0;
+}
+
+void hashtable_put(HashTable* t, char* key, AerVal value) {
     if (!t->buckets) {
         t->buckets  = xcalloc(HASHTABLE_INIT_SIZE, sizeof(HashTableEntry));
         t->capacity = HASHTABLE_INIT_SIZE;
@@ -28,8 +37,7 @@ void hashtable_put(HashTable* t, char* key, HashPayload value) {
     for (unsigned int i = 0; i < t->capacity; i++) {
         HashTableEntry* entry = &t->buckets[(hash + i) % t->capacity];
         if (hash_match(entry->key, entry->length, key, length)) {
-            /* Key already present (e.g. duplicate key in a dict literal): caller's key duplicates the entry's own, and the old payload is about to be orphaned. */
-            free_payload(t, entry->payload);
+            /* Key already present (e.g. duplicate key in a dict literal) — just overwrite the payload. */
             free(key);
             entry->payload = value;
             return;
@@ -44,7 +52,7 @@ void hashtable_put(HashTable* t, char* key, HashPayload value) {
     }
 }
 
-HashPayload* hashtable_get(HashTable* t, const char* key) {
+AerVal* hashtable_get(HashTable* t, const char* key) {
     if (!t->buckets) return NULL;
     uint64_t hash   = hash_key(key);
     unsigned int        length = (unsigned int)strlen(key);
@@ -54,6 +62,24 @@ HashPayload* hashtable_get(HashTable* t, const char* key) {
         if (entry->key == NULL) return NULL;
     }
     return NULL;
+}
+
+/* Inserts into buckets already sized for it, never growing/rehashing — used only by
+   hashtable_remove's repair loop below, where t->capacity must stay fixed across every
+   reinsertion (rehash mid-loop would strand pos/cap in the old array's coordinates). */
+static void hashtable_put_raw(HashTable* t, char* key, AerVal value) {
+    uint64_t hash   = hash_key(key);
+    unsigned int length = (unsigned int)strlen(key);
+    for (unsigned int i = 0; i < t->capacity; i++) {
+        HashTableEntry* entry = &t->buckets[(hash + i) % t->capacity];
+        if (entry->key == NULL) {
+            entry->key     = key;
+            entry->payload = value;
+            entry->length  = length;
+            t->count++;
+            return;
+        }
+    }
 }
 
 void hashtable_remove(HashTable* t, const char* key) {
@@ -74,17 +100,16 @@ void hashtable_remove(HashTable* t, const char* key) {
 
     /* Free and clear the slot */
     free(t->buckets[found].key);
-    free_payload(t, t->buckets[found].payload);
     t->buckets[found] = (HashTableEntry){0};
     t->count--;
 
-    /* Reinsert entries in the probe chain that may now be unreachable: advance to the next empty slot, removing and reinserting each to restore the invariant. */
+    /* Reinsert entries in the probe chain that may now be unreachable: advance to the next empty slot, removing and reinserting each to restore the invariant. hashtable_put_raw (not hashtable_put) is load-bearing here — it never rehashes, so cap/pos stay valid against t->buckets for the whole loop. */
     unsigned int pos = (found + 1) % cap;
     while (t->buckets[pos].key) {
         HashTableEntry e = t->buckets[pos];
         t->buckets[pos] = (HashTableEntry){0};
         t->count--;
-        hashtable_put(t, e.key, e.payload);
+        hashtable_put_raw(t, e.key, e.payload);
         pos = (pos + 1) % cap;
     }
 }
@@ -95,7 +120,6 @@ void hashtable_clear(HashTable* t) {
         HashTableEntry* e = &t->buckets[i];
         if (e->key) {
             free(e->key);
-            free_payload(t, e->payload);
             *e = (HashTableEntry){0};
         }
     }
@@ -113,7 +137,6 @@ static void rehash(HashTable* t) {
     while ((t->count * 100) / capacity >= HASHTABLE_LOW)
         capacity *= 2;
 
-    /* Copies is_inline (and every other field) forward automatically, so the grown copy stays in whatever mode this table was already in. */
     HashTable copy = *t;
     copy.buckets  = xcalloc(capacity, sizeof(HashTableEntry));
     copy.capacity = capacity;

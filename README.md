@@ -1253,7 +1253,7 @@ exercised end-to-end, and `source/core/aer_host.h` for the full registry API.
 Build and run the embedding smoke test (a minimal, complete example of everything above,
 including the deliberate-error and VM-reuse cases) with `make test-embed`.
 
-**`aer_io_register()`** (`source/core/aer_io.h`) is the same registration mechanism applied to an
+**`aer_io_register()`** (`source/stdlib/aer_io.h`) is the same registration mechanism applied to an
 AER-provided (not host-defined) capability — see [File I/O](#file-io--io-an-opt-in-host-capability-not-a-native-module).
 It's not called automatically by `vm_init()` — `source/main.c` calls it explicitly, once, right
 after `vm_init()`, so the reference CLI's scripts get file access. A different embedding host (a
@@ -1491,8 +1491,9 @@ any error, before this check is ever reached.
 the bytecode counter; the pool, global scope, and struct registry persist so variables, functions,
 and struct types survive between lines.
 
-**Native and file-based modules:** `source/core/aer_stdlib.c` dispatches the hardcoded native
-modules (`math`, `random`, `string`, `time`) by name. `source/core/aer_module.c` handles file-based
+**Native and file-based modules:** the hardcoded native modules (`math`, `random`, `string`, `time`)
+each dispatch by name from their own file in `source/stdlib/` (`aer_math.c` and friends).
+`source/core/aer_module.c` handles file-based
 imports — each imported file gets its own `Chunk` and `VM`, run to completion once at import time;
 calling one of its functions later uses a small trampoline that copies arguments across the VM
 boundary, sets up a call frame via the shared `vm_setup_call`, and runs the module's own VM just far
@@ -1724,10 +1725,14 @@ raises a normal AER runtime error instead of risking a stack overflow.
 | `source/compiler/lexer.h/c` | Source text → token stream, indent/dedent tracking |
 | `source/compiler/parser.h/c` | Single-pass compiler: tokens → bytecode, escape processing |
 | `source/core/vm.h/c` | Bytecode chunk, VM, scope chain, struct-type registry, dispatch loop, built-ins |
-| `source/core/aer_stdlib.h/c` | Native stdlib modules (`math`, `random`, `string`, `time`), dispatched separately from core builtins |
+| `source/stdlib/aer_stdlib.h` | Declares the entire native-module surface (math/random/string/time/json/io) — one header for a fixed, closed set |
+| `source/stdlib/aer_stdlib.c` | Native-module registry: `aer_stdlib_init()`, `aer_stdlib_is_native_module()` |
+| `source/stdlib/aer_math.c` / `aer_random.c` / `aer_string.c` / `aer_time.c` | One file per hardcoded native module, dispatched by `vm.c`'s `OP_CALL_MODULE` switch |
+| `source/stdlib/aer_json.c` | `json` module — encode/decode, dispatched the same way as the four above |
+| `source/stdlib/aer_io.c` | `io` module (file open/read/write/close) — opt-in per host via `aer_io_register()`, not hardcoded like the others |
 | `source/core/aer_module.h/c` | File-based `import` — resolution, isolated per-file `Chunk`/`VM`, cross-VM call trampoline |
 | `source/core/aer_host.h/c` | Host-registered native function registry (`aer_register_function`) — reached from AER the same way as `math`/`random`/`string` |
-| `source/utilities/hashmap.h/c` | FNV-1a open-addressing hashmap (one per scope/dict) |
+| `source/utilities/hashtable.h/c` | FNV-1a open-addressing table (one per scope/dict), shared by `Chunk`'s name index and `AerDict` |
 | `source/utilities/pool.h/c` | Slab (bump/arena) allocator for heap types that are never individually freed — `AerString`/`AerArray`/`AerDict`/`AerFunction` headers |
 | `source/utilities/error.h/c` | Error reporting with source location and column pointer; recoverable-error sink (callback or stderr), `aer_report_fatal` for genuinely unrecoverable conditions, `assert_failure_count` |
 | `include/aer.h` | Public embedding API: version constant, error callback/query functions, custom native-function registration (see [Embedding](#embedding)) |

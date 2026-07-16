@@ -19,9 +19,9 @@ endif
 # cross-TU call/return overhead no matter how small the callee is. Measured real win on nbody.aer:
 # ~4.4% fewer instructions, ~5-7% fewer cycles/faster wall clock, on top of everything else this
 # session landed. All 3 test suites verified unaffected before making this the default.
-FLAGS := -O2 -g -flto -Wall -Wextra -I include -I source -I source/compiler -I source/core -I source/utilities
+FLAGS := -O2 -g -flto -Wall -Wextra -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities
 
-SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/utilities/*.c)
+SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/stdlib/*.c source/utilities/*.c)
 OBJECT := $(patsubst source/%.c,object/%.o,$(SOURCE))
 
 # Everything except main.c — conflicts with test-embed's/test-smoke's own main() below.
@@ -37,7 +37,7 @@ object/%.o: source/%.c
 
 # No -g — smaller binary, no debug symbols. Use `all` (the default) for anything that
 # might need gdb or a readable ASAN/fuzzer backtrace; this is for a release artifact only.
-PERFORMANCE_FLAGS := -O2 -Wall -Wextra -I include -I source -I source/compiler -I source/core -I source/utilities
+PERFORMANCE_FLAGS := -O2 -Wall -Wextra -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities
 
 performance: $(SOURCE)
 	@mkdir -p binary

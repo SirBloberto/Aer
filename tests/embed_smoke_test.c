@@ -214,7 +214,7 @@ int main(void) {
     check(aer_assert_failure_count() == 0,
           "the AER_PATH-resolved module's function returned the correct value");
 
-    /* io is a host-registered module (source/core/aer_io.h), not a hardcoded
+    /* io is a host-registered module (source/stdlib/aer_io.h), not a hardcoded
        native one — see aer_io_register(). This test binary deliberately
        never calls it (unlike source/main.c, which does), proving file
        access really is opt-in per embedding host: `import io` here falls

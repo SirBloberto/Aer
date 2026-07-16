@@ -232,7 +232,7 @@ dict_pairs    = expression ':' expression (',' expression ':' expression)*
 # ------------------------------------------------------------------ #
 
 # Not core builtins — require `import` (see import_stmt above) and are
-# dispatched separately (source/core/aer_stdlib.c, not vm.c's lbl_call
+# dispatched separately (source/stdlib/aer_stdlib.c, not vm.c's lbl_call
 # core-builtin chain). Only two hardcoded native modules exist:
 
 # import math

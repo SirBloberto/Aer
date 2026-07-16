@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "aer.h"
-#include "aer_io.h"
+#include "aer_stdlib.h"
 #include "aer_module.h"
 #include "disasm.h"
 #include "error.h"

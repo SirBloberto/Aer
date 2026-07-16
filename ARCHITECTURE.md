@@ -7,8 +7,9 @@ underneath it.
 
 Source map: `source/compiler/{lexer,parser}.c` (front end), `source/core/vm.{c,h}` (bytecode
 format + the VM itself), `source/value.h` (value representation and its accessors),
-`source/utilities/pool.{c,h}` (allocator), `source/core/aer_*.c` (stdlib/host/module bridges),
-`source/core/disasm.c` (debug-only disassembler/profiler).
+`source/utilities/pool.{c,h}` (allocator), `source/stdlib/aer_*.c` (built-in library modules:
+math/random/string/time/json/io), `source/core/aer_module.c`/`aer_host.c` (import and
+host-embedding mechanisms), `source/core/disasm.c` (debug-only disassembler/profiler).
 
 ---
 

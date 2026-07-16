@@ -2725,9 +2725,7 @@ static bool is_builtin_name(Chunk* c, unsigned int name_idx) {
     return false;
 }
 
-/* Resolves a literal builtin name to its CALL_BUILTIN_* id (vm.h) at compile time, exactly
-   mirroring module_call_id's reasoning below — only ever called after is_builtin_name has already
-   confirmed a match, so every name reaching here is one of these seven. */
+/* Mirrors module_call_id below — only called after is_builtin_name confirms a match. */
 static int builtin_call_id(AerString* name) {
     if (name->length == 6 && strncmp(name->data, "length", 6) == 0) return CALL_BUILTIN_LENGTH;
     if (name->length == 6 && strncmp(name->data, "delete", 6) == 0) return CALL_BUILTIN_DELETE;
@@ -3295,7 +3293,6 @@ static bool parse_literal_default(Chunk* c, AerVal* out) {
         if (token.type != TOKEN_CLOSE_BRACE) return false;
         AerDict* d = vm_new_dict();
         memset(&d->map, 0, sizeof(d->map));
-        d->map.is_inline = true;
         *out = aer_dict_val(d);
     } else {
         return false;

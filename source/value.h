@@ -110,7 +110,7 @@ struct AerString {
     unsigned int length;
 };
 
-/* AerDict is defined in vm.h (needs HashMap which is in hashmap.h) */
+/* AerDict is defined in vm.h (needs HashTable which is in hashtable.h) */
 
 /* Wraps an existing (data, length) pair in a fresh heap-allocated AerString
    box and returns it as a TYPE_STRING AerVal. The caller must pass a buffer
@@ -121,17 +121,8 @@ struct AerString {
    embedding surface) — see include/aer.h for what host code actually uses. */
 AerVal aer_make_string(char* data, unsigned int length);
 
-/* Accessor functions for AerVal's tagged-union representation above — every read/write of an
-   AerVal's payload goes through one of these, never a direct `.as.x` elsewhere, so the
-   representation itself can be swapped again (as it already has once — see AerVal's own comment)
-   without touching call sites. Replaced a NaN-boxing scheme after measuring, via direct
-   machine-code disassembly against Lua's own value representation, that NaN-boxing's decode cost
-   (masking/shifting a packed word on every single value touch) was the dominant remaining cost gap
-   in the interpreter — real measured result on nbody.aer: -11.2% instructions, -62.5% instructions
-   on an isolated pure-arithmetic loop, and a 3.3x drop in cache misses despite AerVal's size
-   growing (8 -> 16 bytes) — the NaN-boxing decode logic this replaced turned out to cost real
-   memory traffic of its own (64-bit mask constants too wide for an ARM immediate operand, loaded
-   from a literal pool on every type check). */
+/* Accessors for AerVal above — every read/write of its payload goes through one of these, never a
+   direct `.as.x` elsewhere, so the representation can change again without touching call sites. */
 
 static inline ValueType aer_type(AerVal v) { return v.tag; }
 
@@ -173,12 +164,19 @@ static inline AerFunction* aer_as_function(AerVal v) { return (AerFunction*)v.as
 static inline AerArray*    aer_as_array(AerVal v)     { return (AerArray*)v.as.ptr; }
 static inline AerDict*     aer_as_dict(AerVal v)      { return (AerDict*)v.as.ptr; }
 
+/* Integer and real are both "a number" as far as most native-module math/time functions are
+   concerned — coerces either into a plain double, false for any other type. */
+static inline bool aer_as_double(AerVal v, double* out) {
+    if (aer_type(v) == TYPE_INTEGER) { *out = (double)aer_as_int(v); return true; }
+    if (aer_type(v) == TYPE_REAL)    { *out = aer_as_real(v);        return true; }
+    return false;
+}
+
 /* The seam between AER's internal AerVal and the public boxed Value struct used by AerNativeFn's
    signature (README's Embedding section); used by aer_host.c's aer_host_call and by aer_io.c,
    which builds Value results from AerVal-returning helpers like aer_make_string. Value was
-   already a plain tagged struct (never NaN-boxed), so this seam needed no changes at all when
-   AerVal's own representation changed underneath it — the whole point of keeping the two types
-   distinct (see Value's own forward-declaration comment above). */
+   already a plain tagged struct (never NaN-boxed), so this seam needed no changes when AerVal's
+   own representation changed underneath it. */
 static inline Value aer_val_to_public(AerVal v) {
     Value out = {0};
     out.type = aer_type(v);

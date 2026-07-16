@@ -1,14 +1,12 @@
 #ifndef VM_H
 #define VM_H
 
-#include "hashmap.h"
+#include "error.h"
+#include "hashtable.h"
 #include "value.h"
-#include "dictmap.h"
 
-/* Defined here (after dictmap.h) using DictMap not HashMap: dict values are stored inline with
-   their key. */
 struct AerDict {
-    DictMap map;
+    HashTable map;
 };
 
 typedef enum {
@@ -165,13 +163,9 @@ typedef enum {
        copied into a small local array and passed straight through. Struct construction is never
        reached here — it's already resolved at compile time (is_struct_name/OP_STRUCT_NEW), so only
        the seven builtin names above are ever checked at parse time (is_builtin_name, parser.c)
-       before this opcode is emitted.
-         Same trailing-word convention as OP_CALL_MODULE: the builtin's name is always a literal
-       identifier, resolved once at parse time (builtin_call_id, parser.c) to a small int
-       (CALL_BUILTIN_LENGTH etc., below) so the VM switches on it instead of running a strcmp
-       chain against all seven names on every single call. */
-    OP_CALL_BUILTIN, /* operands: dest_reg, name_pool_idx, arg_reg_base, arg_count (packed,
-                            PACK_CALL_BUILTIN), plus one trailing plain word: builtin_id */
+       before this opcode is emitted. Trailing word: builtin_id, same convention as OP_CALL_MODULE's
+       module_id. */
+    OP_CALL_BUILTIN, /* operands: dest_reg, name_pool_idx, arg_reg_base, arg_count, builtin_id */
 
     /* Reading a top-level ("global") variable from inside a function body. Per-call register
        windowing means a function's own registers are never the top-level frame's registers, so
@@ -818,10 +812,8 @@ typedef enum {
 #define CALL_MODULE_JSON     4
 #define CALL_MODULE_DYNAMIC  5
 
-/* OP_CALL_BUILTIN's trailing builtin_id word (see its own comment above) — resolved once at parse
-   time (builtin_call_id, parser.c). No DYNAMIC case: unlike a module name, a builtin call site is
-   only ever emitted after is_builtin_name (parser.c) already confirmed the name is one of these
-   seven, so builtin_call_id always finds a match. */
+/* OP_CALL_BUILTIN's trailing builtin_id word — no DYNAMIC case, unlike CALL_MODULE_*: every call
+   site is already gated behind is_builtin_name, so builtin_call_id always matches. */
 #define CALL_BUILTIN_LENGTH 0
 #define CALL_BUILTIN_DELETE 1
 #define CALL_BUILTIN_APPEND 2
@@ -883,7 +875,7 @@ typedef struct {
     unsigned int pool_count, pool_cap;
 
     /* name -> pool index, for O(1) dedup of TYPE_STRING pool entries (chunk_add_pool, vm.c); owns an independent copy of each key. */
-    HashMap      name_index;
+    HashTable    name_index;
 
     /* Struct type registry appended to by OP_DEFINE_STRUCT; redeclaring a struct appends rather than replaces so old Shape pointers stay valid, and chunk_find_shape() searches newest-first. */
     Shape**      shapes;
@@ -1003,6 +995,21 @@ typedef struct {
     int          call_depth;
 } VM;
 
+/* Bounds-checked push/pop against vm->stack (see the stack field's own comment above) for use
+   outside vm_run's dispatch loop, where its file-scoped PUSH()/POP() macros aren't reachable —
+   every native-module file (aer_stdlib.c, aer_json.c) needs exactly this, so it lives here once
+   instead of each keeping its own copy. */
+static inline bool vm_stack_push(VM* vm, AerVal v) {
+    if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return false; }
+    vm->stack[vm->stack_top++] = v;
+    return true;
+}
+
+static inline AerVal vm_stack_pop(VM* vm) {
+    if (vm->stack_top <= 0) { error("Stack underflow"); return aer_null(); }
+    return vm->stack[--vm->stack_top];
+}
+
 void         chunk_init(Chunk* c);
 void         chunk_free(Chunk* c);
 void         chunk_emit(Chunk* c, uint64_t word);
@@ -1060,7 +1067,7 @@ bool setup_call(VM* target, Chunk* fn_chunk, ChunkFunction* fn, int arg_count,
 /* Returns an uninitialized AerArray header from vm.c's internal slab pool, as if xmalloc'd directly (every in-file vm.c site still uses pool_alloc); exposed only because aer_stdlib.c's string.split() needs one and the pool isn't a raw global outside vm.c. */
 AerArray* vm_new_array(void);
 
-/* Same idea, for AerDict — exposed for aer_json.c's json.decode(); caller must set map.is_inline = true and zero the rest of map itself (see lbl_dict_new's call site in vm.c). */
+/* Same idea, for AerDict — exposed for aer_json.c's json.decode(); caller must zero-init map itself (see lbl_dict_new's call site in vm.c). */
 AerDict* vm_new_dict(void);
 
 /* Same idea, for AerFunction — exposed for parser.c's build_function_value. Must come from

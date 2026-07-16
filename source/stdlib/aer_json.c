@@ -2,20 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "aer_json.h"
+#include "aer_stdlib.h"
 #include "error.h"
-
-/* Stack helpers — same private-per-file pattern as aer_stdlib.c's (each native-module file has its own copy, matching vm_run's PUSH()/POP() not existing outside vm.c). */
-static bool stdlib_push(VM* vm, AerVal v) {
-    if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return false; }
-    vm->stack[vm->stack_top++] = v;
-    return true;
-}
-
-static AerVal stdlib_pop(VM* vm) {
-    if (vm->stack_top <= 0) { error("Stack underflow"); return aer_null(); }
-    return vm->stack[--vm->stack_top];
-}
 
 /* Growable string buffer — vm.c's StrBuilder is `static` (private to vm.c), so this file needs its own copy, same as aer_io.c's make_pair/make_error. */
 typedef struct { char* buf; size_t len; size_t cap; } JsonBuf;
@@ -119,7 +107,7 @@ static bool json_encode_value(Chunk* c, AerVal v, JsonBuf* b) {
                 first = false;
                 json_encode_string(b, e->key, e->length);
                 jb_append_char(b, ':');
-                if (!json_encode_value(c, e->payload.inline_val, b)) return false;
+                if (!json_encode_value(c, e->payload, b)) return false;
             }
             jb_append_char(b, '}');
             break;
@@ -280,7 +268,6 @@ static AerVal json_parse_object(JsonParser* p) {
     p->pos++;   /* '{' */
     AerDict* d = vm_new_dict();
     memset(&d->map, 0, sizeof(d->map));
-    d->map.is_inline = true;
 
     json_skip_ws(p);
     if (p->pos < p->len && p->s[p->pos] == '}') { p->pos++; return aer_dict_val(d); }
@@ -303,7 +290,7 @@ static AerVal json_parse_object(JsonParser* p) {
         char* k = xmalloc(ks->length + 1);
         memcpy(k, ks->data, ks->length);
         k[ks->length] = '\0';
-        dictmap_put(&d->map, k, val);
+        hashtable_put(&d->map, k, val);
 
         json_skip_ws(p);
         if (p->pos >= p->len) { json_set_error(p, "Unterminated object in JSON"); return aer_null(); }
@@ -347,22 +334,22 @@ static AerVal json_decode(AerString* input, char** err_out) {
 
 bool aer_json_call(VM* vm, Chunk* c, const char* name, int arg_count) {
     if (strcmp(name, "encode") == 0 && arg_count == 1) {
-        AerVal v = stdlib_pop(vm);
+        AerVal v = vm_stack_pop(vm);
         JsonBuf b;
         jb_init(&b);
         if (!json_encode_value(c, v, &b)) {
             free(b.buf);
-            stdlib_push(vm, aer_null());
+            vm_stack_push(vm, aer_null());
             return true;
         }
-        stdlib_push(vm, aer_make_string(b.buf, (unsigned int)b.len));
+        vm_stack_push(vm, aer_make_string(b.buf, (unsigned int)b.len));
         return true;
     }
     if (strcmp(name, "decode") == 0 && arg_count == 1) {
-        AerVal s_v = stdlib_pop(vm);
+        AerVal s_v = vm_stack_pop(vm);
         if (aer_type(s_v) != TYPE_STRING) {
             error("json.decode() requires a string");
-            stdlib_push(vm, aer_null());
+            vm_stack_push(vm, aer_null());
             return true;
         }
 
@@ -382,7 +369,7 @@ bool aer_json_call(VM* vm, Chunk* c, const char* name, int arg_count) {
             r->items[0] = value;
             r->items[1] = aer_null();
         }
-        stdlib_push(vm, aer_array_val(r));
+        vm_stack_push(vm, aer_array_val(r));
         return true;
     }
 

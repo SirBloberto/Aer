@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "aer_host.h"
-#include "aer_json.h"
 #include "aer_module.h"
 #include "aer_stdlib.h"
 #include "error.h"
@@ -185,11 +184,11 @@ static void mark_value(AerVal v) {
         }
         case TYPE_DICT:
             if (!pool_mark(&dict_pool, aer_as_dict(v))) {
-                DictMap* map = &aer_as_dict(v)->map;
+                HashTable* map = &aer_as_dict(v)->map;
                 for (unsigned int i = 0; i < map->capacity; i++)
                     if (map->buckets[i].key)
-                        worklist_push(map->buckets[i].payload.inline_val);
-                /* Bucket keys are plain dictmap-owned char*, not Values — nothing to push. */
+                        worklist_push(map->buckets[i].payload);
+                /* Bucket keys are plain owned char*, not Values — nothing to push. */
             }
             break;
         case TYPE_FUNCTION:
@@ -251,7 +250,7 @@ static void mark_chunk_roots(Chunk* chunk) {
 
 static void free_string(void* cell)   { free(((AerString*)cell)->data); }
 static void free_array(void* cell)    { free(((AerArray*)cell)->items); }
-static void free_dict(void* cell)     { dictmap_free(&((AerDict*)cell)->map); }   /* already frees every entry's key */
+static void free_dict(void* cell)     { hashtable_free(&((AerDict*)cell)->map); }   /* already frees every entry's key */
 static void free_function(void* cell) { (void)cell; }   /* nothing to free — no closure upvalues array anymore */
 static void free_struct(void* cell)   { (void)cell; }   /* items lives inline in this same cell — nothing separate to free */
 
@@ -302,9 +301,9 @@ static void gc_collect(VM* vm, bool minor) {
                     break;
                 }
                 case REMEMBERED_DICT: {
-                    DictMap* map = &((AerDict*)e->ptr)->map;
+                    HashTable* map = &((AerDict*)e->ptr)->map;
                     for (unsigned int j = 0; j < map->capacity; j++)
-                        if (map->buckets[j].key) worklist_push(map->buckets[j].payload.inline_val);
+                        if (map->buckets[j].key) worklist_push(map->buckets[j].payload);
                     break;
                 }
             }
@@ -528,7 +527,7 @@ void chunk_free(Chunk* c) {
     for (unsigned int i = 0; i < c->pool_count; i++)
         if (aer_type(c->pool[i]) == TYPE_STRING) free(aer_as_string(c->pool[i])->data);
     free(c->pool);
-    hashmap_free(&c->name_index);
+    hashtable_free(&c->name_index);
     free(c->line_mark_offsets);
     free(c->line_mark_lines);
     for (unsigned int i = 0; i < c->import_count; i++) free(c->imported_modules[i]);
@@ -615,8 +614,8 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
         memcpy(key, vs->data, vs->length);
         key[vs->length] = '\0';
 
-        unsigned int* existing = (unsigned int*)hashmap_get(&c->name_index, key);
-        if (existing) { free(key); return *existing; }
+        AerVal* existing = hashtable_get(&c->name_index, key);
+        if (existing) { free(key); return (unsigned int)aer_as_int(*existing); }
 
         /* vs->data was already an owned, single-reference buffer at every call site (e.g. the
            lexer's emit_string_token freshly xmalloc's one per token) — free it before replacing
@@ -630,9 +629,7 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
 
         /* Independent copy, not an alias of c->pool[idx]'s, so both can be freed independently without a double-free. */
         char* index_key = xstrdup(key);
-        unsigned int* idx_box = xmalloc(sizeof(unsigned int));
-        *idx_box = idx;
-        hashmap_put(&c->name_index, index_key, idx_box);
+        hashtable_put(&c->name_index, index_key, aer_int((int64_t)idx));
         return idx;
     }
 
@@ -830,7 +827,7 @@ static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuilder* 
                 sb_append(sb, "\"");
                 sb_append(sb, e->key);
                 sb_append(sb, "\": ");
-                vm_format_value(c, e->payload.inline_val, true, sb);
+                vm_format_value(c, e->payload, true, sb);
             }
             sb_append(sb, "}");
             break;
@@ -992,7 +989,7 @@ static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueT
             char kbuf[VM_KEY_MAX + 1];
             memcpy(kbuf, as->data, klen);
             kbuf[klen] = '\0';
-            return aer_bool(dictmap_get(&aer_as_dict(b)->map, kbuf) != NULL);
+            return aer_bool(hashtable_get(&aer_as_dict(b)->map, kbuf) != NULL);
         }
         if (aer_type(b) == TYPE_ARRAY) {
             AerArray* arr = aer_as_array(b);
@@ -1153,7 +1150,6 @@ static AerVal vm_default_value(AerVal dflt) {
     if (aer_type(dflt) == TYPE_DICT) {
         AerDict* d = pool_alloc(&dict_pool);
         memset(&d->map, 0, sizeof(d->map));
-        d->map.is_inline = true;
         return aer_dict_val(d);
     }
     return dflt;
@@ -1328,13 +1324,8 @@ AerFunction* vm_new_function(void) {
     return pool_alloc(&function_pool);
 }
 
-/* builtin_id was resolved once, at parse time (builtin_call_id, parser.c) — a switch on a small
-   int instead of a strcmp chain against all seven builtin names on every single call, mirroring
-   OP_CALL_MODULE's own module_id fix. Struct construction is never reached here: it's already
-   resolved at compile time (is_struct_name/OP_STRUCT_NEW, parser.c), so `builtin_id` is always one
-   of the seven cases below — confirmed via OP_CALL_BUILTIN's only two emission sites, both gated
-   behind is_builtin_name. Returns true if arg_count matched builtin_id's expected arity, result in
-   *out. */
+/* builtin_id is resolved at parse time (builtin_call_id) — always one of the cases below. Returns
+   true if arg_count matched, result in *out. */
 static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_count, AerVal* out) {
     *out = aer_null();
 
@@ -1359,7 +1350,7 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
                 char kbuf[VM_KEY_MAX + 1];
                 memcpy(kbuf, ks->data, klen);
                 kbuf[klen] = '\0';
-                dictmap_remove(&aer_as_dict(obj)->map, kbuf);
+                hashtable_remove(&aer_as_dict(obj)->map, kbuf);
                 *out = obj;
                 return true;
             }
@@ -1463,7 +1454,7 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         char kbuf[VM_KEY_MAX + 1];
         memcpy(kbuf, is->data, klen);
         kbuf[klen] = '\0';
-        AerVal* found = dictmap_get(&aer_as_dict(obj)->map, kbuf);
+        AerVal* found = hashtable_get(&aer_as_dict(obj)->map, kbuf);
         if (!found) { *out = aer_null(); return; }
         *out = *found; return;
     } else if (aer_type(obj) == TYPE_STRING) {
@@ -1508,14 +1499,14 @@ static inline void vm_index_set_compute(AerVal obj, AerVal idx, AerVal val) {
         memcpy(kbuf, is->data, klen);
         kbuf[klen] = '\0';
         gc_barrier_dict(aer_as_dict(obj), val);
-        AerVal* existing = dictmap_get(&aer_as_dict(obj)->map, kbuf);
+        AerVal* existing = hashtable_get(&aer_as_dict(obj)->map, kbuf);
         if (existing) {
             *existing = val;   /* update in place — no allocation */
         } else {
             char* k = xmalloc(klen + 1);
             memcpy(k, is->data, klen);
             k[klen] = '\0';
-            dictmap_put(&aer_as_dict(obj)->map, k, val);
+            hashtable_put(&aer_as_dict(obj)->map, k, val);
         }
     } else if (aer_type(obj) == TYPE_STRING) {
         error("Strings are immutable — cannot assign to an index");
@@ -1934,7 +1925,7 @@ lbl_in: {
                 char kbuf[VM_KEY_MAX + 1];
                 memcpy(kbuf, as->data, klen);
                 kbuf[klen] = '\0';
-                result = aer_bool(dictmap_get(&aer_as_dict(b)->map, kbuf) != NULL);
+                result = aer_bool(hashtable_get(&aer_as_dict(b)->map, kbuf) != NULL);
             }
         }
     } else if (aer_type(b) == TYPE_ARRAY) {
@@ -2297,16 +2288,15 @@ lbl_check_shape: {
     DISPATCH();
 }
 
-/* Mirrors lbl_dict_new (above) exactly — same pool_alloc/memset/is_inline setup, same
-   key-must-be-string validation and owned-copy-of-the-key discipline — reading pairs from an
-   already-in-order register range instead of popping them off the stack in reverse. */
+/* Mirrors lbl_dict_new (above) exactly — same pool_alloc/memset setup, same key-must-be-string
+   validation and owned-copy-of-the-key discipline — reading pairs from an already-in-order
+   register range instead of popping them off the stack in reverse. */
 lbl_dict_new: {
     int dest_reg      = (int)UNPACK_A(op_word);
     int pair_reg_base = (int)UNPACK_B(op_word);
     int pair_count    = (int)UNPACK_C(op_word);
     AerDict* d = pool_alloc(&dict_pool);
     memset(&d->map, 0, sizeof(d->map));
-    d->map.is_inline = true;   /* AerDict stores AerVal inline, not boxed — see hashtable.h */
     for (int i = 0; i < pair_count; i++) {
         AerVal key = vm->registers[pair_reg_base + 2 * i];
         AerVal val = vm->registers[pair_reg_base + 2 * i + 1];
@@ -2316,7 +2306,7 @@ lbl_dict_new: {
         char* k = xmalloc(klen + 1);
         memcpy(k, ks->data, klen);
         k[klen] = '\0';
-        dictmap_put(&d->map, k, val);
+        hashtable_put(&d->map, k, val);
     }
     vm->registers[dest_reg] = aer_dict_val(d);
     gc_maybe_collect(vm);   /* pool_alloc(&dict_pool) above; result already rooted */
@@ -2397,7 +2387,7 @@ lbl_iter_next_pair: {
         DISPATCH();
     }
     vm->registers[key_dest_reg] = key;
-    vm->registers[val_dest_reg] = d->map.buckets[idx].payload.inline_val;
+    vm->registers[val_dest_reg] = d->map.buckets[idx].payload;
     vm->registers[idx_reg]      = aer_int(idx + 1);
     gc_maybe_collect(vm);   /* vm_dict_next_key's owned-copy key string, or aer_int's overflow-box path */
     DISPATCH();

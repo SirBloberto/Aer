@@ -1,12 +1,11 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include "aer_io.h"
+#include "aer_stdlib.h"
 #include "aer_host.h"
 #include "error.h"
-#include "vm.h"
 
-/* io is a host-registered module, not hardcoded like math/random/string (aer_stdlib.c) — see aer_io.h; registered once by main.c, and embed_smoke_test.c deliberately never registers it, proving file access is opt-in. */
+/* io is a host-registered module, not hardcoded like math/random/string — see aer_stdlib.h; registered once by main.c, and embed_smoke_test.c deliberately never registers it, proving file access is opt-in. */
 
 #define MAX_OPEN_FILES 16
 
