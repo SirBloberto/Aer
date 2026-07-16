@@ -53,12 +53,13 @@ A second, *public* type exists for the embedding boundary: `Value` (`value.h`), 
 non-tagged-union struct (`{ ValueType type; ValueData data; }`) used only in `AerNativeFn`'s
 signature (host-registered functions, `include/aer.h`). `aer_val_to_public`/`aer_val_from_public`
 are the seam between the two — `Value` was never NaN-boxed, so this seam needed no changes when
-`AerVal`'s own internal representation changed underneath it. This is deliberately **not** the same
-type as `AerVal`, and deliberately not merged into one: `AerVal`'s internal shape has already
-changed once (NaN-boxing → tagged union) and survived without forcing every embedding host to
-recompile against a different public struct layout. Merging them would trade that proven ABI
-insulation for eliminating a small, mechanical conversion function — a bad trade if the internal
-representation ever needs to change again.
+`AerVal`'s own internal representation changed underneath it. This is currently **not** the same
+type as `AerVal`: `AerVal`'s internal shape has already changed once (NaN-boxing → tagged union)
+and survived without forcing every embedding host to recompile against a different public struct
+layout. Merging them now would trade that proven ABI insulation for eliminating a small,
+mechanical conversion function. **Deferred, not rejected**: revisit once `AerVal`'s own
+representation is no longer expected to change — merging while it's still actively iterating would
+give up real insulation for a marginal simplification.
 
 ---
 
