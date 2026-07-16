@@ -60,7 +60,9 @@ TESTS := tests/test_core.aer \
          tests/test_stdlib_modules.aer \
          tests/test_memory_gc.aer \
          tests/test_perf_fusion.aer \
-         tests/test_primitive_pass.aer
+         tests/test_primitive_pass.aer \
+         tests/test_dict_pool_stress.aer \
+         tests/test_io_mode_enforcement.aer
 
 test: all
 	@for t in $(TESTS); do \

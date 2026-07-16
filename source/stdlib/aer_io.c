@@ -10,6 +10,7 @@
 #define MAX_OPEN_FILES 16
 
 static FILE* open_files[MAX_OPEN_FILES];
+static char  open_modes[MAX_OPEN_FILES];
 
 /* Builds a Go-style (ok, err) pair the same way string.split does — a "multi-return" is just a TYPE_ARRAY Value (see parse_return/OP_UNPACK), so that's all `value, err = io.open(...)` needs. */
 static Value make_pair(Value ok, Value err) {
@@ -56,6 +57,7 @@ static Value io_open(VM* vm, int arg_count, Value* args, void* userdata) {
         return make_pair((Value){0}, make_error(buf));
     }
     open_files[slot] = fp;
+    open_modes[slot] = mode[0];
 
     Value handle = {0}; handle.type = TYPE_INTEGER; handle.data.integer = slot;
     return make_pair(handle, (Value){0});
@@ -92,6 +94,8 @@ static Value io_read(VM* vm, int arg_count, Value* args, void* userdata) {
     }
     FILE* fp = handle_file(args[0]);
     if (!fp) return make_pair((Value){0}, make_error("Invalid or closed file handle"));
+    if (open_modes[args[0].data.integer] != 'r')
+        return make_pair((Value){0}, make_error("File handle is not open for reading"));
 
     if (fseek(fp, 0, SEEK_END) != 0) return io_read_until_eof(fp);
     long size = ftell(fp);
@@ -113,6 +117,8 @@ static Value io_write(VM* vm, int arg_count, Value* args, void* userdata) {
     }
     FILE* fp = handle_file(args[0]);
     if (!fp) return make_pair((Value){0}, make_error("Invalid or closed file handle"));
+    if (open_modes[args[0].data.integer] == 'r')
+        return make_pair((Value){0}, make_error("File handle is not open for writing"));
 
     unsigned int n       = args[1].data.string->length;
     size_t       written = fwrite(args[1].data.string->data, 1, n, fp);
@@ -148,6 +154,7 @@ static Value io_stdin(VM* vm, int arg_count, Value* args, void* userdata) {
 
 void aer_io_register(void) {
     open_files[0] = stdin;
+    open_modes[0] = 'r';
     aer_register_function("io", "open",  io_open,  NULL);
     aer_register_function("io", "read",  io_read,  NULL);
     aer_register_function("io", "write", io_write, NULL);

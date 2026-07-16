@@ -24,4 +24,17 @@ void    hashtable_remove(HashTable* t, const char* key);
 void    hashtable_clear(HashTable* t);
 void    hashtable_free(HashTable* t);
 
+/* Every owned key copy backing either a Chunk's name_index or an AerDict goes through this pair,
+   not a bare xmalloc/memcpy — see hashtable.c's size-classed key/bucket-array pools. Truncates at
+   the first embedded NUL byte: hash_match already compares keys via strlen+strcmp, so bytes past a
+   NUL are already invisible to every get/put/remove — truncating here keeps the allocated size and
+   hashtable_put's own strlen-derived entry->length identical, which the pool's size-class lookup
+   depends on. `len` is the strlen-equivalent (entry->length), not len+1 — the NUL terminator is
+   accounted for internally. */
+char* hashtable_key_dup(const char* data, unsigned int len, unsigned int* out_len);
+void  hashtable_key_free(char* key, unsigned int len);
+
+/* Idempotent; must be called (directly or via vm_pools_init_once) before any hashtable_put. */
+void  hashtable_pools_init_once(void);
+
 #endif

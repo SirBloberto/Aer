@@ -287,9 +287,7 @@ static AerVal json_parse_object(JsonParser* p) {
         AerVal val = json_parse_value(p);
         if (p->err) return aer_null();
 
-        char* k = xmalloc(ks->length + 1);
-        memcpy(k, ks->data, ks->length);
-        k[ks->length] = '\0';
+        char* k = hashtable_key_dup(ks->data, ks->length, NULL);
         hashtable_put(&d->map, k, val);
 
         json_skip_ws(p);

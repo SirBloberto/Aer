@@ -68,6 +68,7 @@ static void vm_pools_init_once(void) {
     pool_init(&dict_pool,     sizeof(AerDict),      64);
     pool_init(&function_pool, sizeof(AerFunction),  64);
     pool_init(&struct_pool,   sizeof(AerArray) + MAX_STRUCT_FIELDS * sizeof(AerVal), 64);
+    hashtable_pools_init_once();
     pools_initialized = true;
 }
 
@@ -123,11 +124,18 @@ static void gc_remember(void* ptr, RememberedKind kind) {
     remembered_count++;
 }
 
+/* Set once, forever, the first time gc_run_collection_cycle actually runs — never cleared. Guards
+   gc_barrier_array/gc_barrier_dict: POOL_OLD is only ever set by pool_sweep's promotion step, which
+   only ever runs inside a collection cycle, so before this flag is true nothing in any pool can be
+   old — the write barrier is provably a no-op for every write until then, not just usually one. */
+static bool gc_ever_collected = false;
+
 /* Write barrier for array item writes (index-assign, append, struct field-set via lbl_field_set —
    a struct is an array with a shape, now backed by struct_pool instead of array_pool — see
    vm_pools_init_once). Branches on a->shape to pick the right pool/remembered-kind pair, mirroring
    gc_barrier_dict's single-pool pattern but for whichever of the two pools actually owns `a`. */
 static void gc_barrier_array(AerArray* a, AerVal new_value) {
+    if (!gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
     Pool* p = a->shape ? &struct_pool : &array_pool;
     if (pool_is_young(p, a)) return;   /* young containers are already
                                           re-traced normally next cycle */
@@ -138,6 +146,7 @@ static void gc_barrier_array(AerArray* a, AerVal new_value) {
 /* Write barrier for dict entry writes (both the update-in-place and
    new-entry paths in lbl_index_set). `d` is always dict_pool-tracked. */
 static void gc_barrier_dict(AerDict* d, AerVal new_value) {
+    if (!gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
     if (pool_is_young(&dict_pool, d)) return;
     if (!value_is_young(new_value)) return;
     gc_remember(d, REMEMBERED_DICT);
@@ -340,7 +349,7 @@ static void gc_reset_alloc_counts(void) {
     pool_total_alloc_count = 0;
 }
 
-/* Shared by aer_gc_stats and gc_maybe_collect's ceiling check — one place walking all pools' cell_state, not two. */
+/* Shared by aer_gc_stats and gc_maybe_collect's ceiling check — one place walking all pools' cell state, not two. */
 static unsigned int gc_count_live_cells(void) {
     unsigned int total = 0;
     Pool* pools[] = { &string_pool, &array_pool, &dict_pool, &function_pool, &struct_pool };
@@ -348,8 +357,10 @@ static unsigned int gc_count_live_cells(void) {
         Pool* pool = pools[p];
         for (unsigned int i = 0; i < pool->slab_count; i++) {
             unsigned int count = (i == pool->slab_count - 1) ? pool->next_index : pool->elems_per_slab;
-            for (unsigned int j = 0; j < count; j++)
-                if (!(pool->cell_state[i][j] & POOL_FREE)) total++;
+            for (unsigned int j = 0; j < count; j++) {
+                char* cell = pool->slabs[i] + (size_t)j * pool->stride;
+                if (!(*(unsigned char*)cell & POOL_FREE)) total++;
+            }
         }
     }
     return total;
@@ -373,6 +384,7 @@ void aer_gc_set_ceiling(unsigned int max_live_cells) {
    ever runs between two complete opcodes, where stack/scope/call-frame invariants are
    self-consistent (no handler leaves those half-updated across its own DISPATCH() call). */
 static void gc_run_collection_cycle(VM* vm) {
+    gc_ever_collected = true;
     gc_collect(vm, true);
     minor_collections_run++;
     gc_reset_alloc_counts();
@@ -421,7 +433,7 @@ void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
 /* Byte-accurate memory report — aer_gc_stats() only gives a live *cell* count, which understates
    real usage for string/array/dict: their pool cell is a fixed-size header only, the actual
    payload (string bytes, array items[], dict hash buckets) is a separate xmalloc'd/xrealloc'd
-   allocation the pool system doesn't track at all. Walks each pool's cell_state the same way
+   allocation the pool system doesn't track at all. Walks each pool the same way
    gc_count_live_cells does, but reads each live cell's own size fields instead of just counting. */
 void aer_debug_memory_report(FILE* out) {
     fprintf(out, "\n--- memory ---\n");
@@ -432,8 +444,8 @@ void aer_debug_memory_report(FILE* out) {
         for (unsigned int i = 0; i < p->slab_count; i++) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
-                if (p->cell_state[i][j] & POOL_FREE) continue;
                 AerString* s = (AerString*)(p->slabs[i] + (size_t)j * p->stride);
+                if (s->gc_state & POOL_FREE) continue;
                 str_hdr += sizeof(AerString);
                 str_payload += s->length;
             }
@@ -447,8 +459,8 @@ void aer_debug_memory_report(FILE* out) {
         for (unsigned int i = 0; i < p->slab_count; i++) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
-                if (p->cell_state[i][j] & POOL_FREE) continue;
                 AerArray* a = (AerArray*)(p->slabs[i] + (size_t)j * p->stride);
+                if (a->gc_state & POOL_FREE) continue;
                 arr_hdr += sizeof(AerArray);
                 arr_payload += (uint64_t)a->capacity * sizeof(AerVal);
             }
@@ -462,8 +474,8 @@ void aer_debug_memory_report(FILE* out) {
         for (unsigned int i = 0; i < p->slab_count; i++) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
-                if (p->cell_state[i][j] & POOL_FREE) continue;
                 AerDict* d = (AerDict*)(p->slabs[i] + (size_t)j * p->stride);
+                if (d->gc_state & POOL_FREE) continue;
                 dict_hdr += sizeof(AerDict);
                 dict_payload += (uint64_t)d->map.capacity * sizeof(HashTableEntry);
                 for (unsigned int b = 0; b < d->map.capacity; b++)
@@ -479,8 +491,8 @@ void aer_debug_memory_report(FILE* out) {
         for (unsigned int i = 0; i < p->slab_count; i++) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
-                if (p->cell_state[i][j] & POOL_FREE) continue;
                 AerFunction* f = (AerFunction*)(p->slabs[i] + (size_t)j * p->stride);
+                if (f->gc_state & POOL_FREE) continue;
                 fn_hdr += sizeof(AerFunction);
                 if (f->defaults) fn_payload += (uint64_t)(f->arity - f->min_arity) * sizeof(AerVal);
             }
@@ -499,9 +511,9 @@ void aer_debug_memory_report(FILE* out) {
         for (unsigned int i = 0; i < p->slab_count; i++) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
-                if (p->cell_state[i][j] & POOL_FREE) continue;
-                struct_hdr += p->stride;
                 AerArray* a = (AerArray*)(p->slabs[i] + (size_t)j * p->stride);
+                if (a->gc_state & POOL_FREE) continue;
+                struct_hdr += p->stride;
                 struct_payload += (uint64_t)a->count * sizeof(AerVal);
             }
         }
@@ -532,6 +544,15 @@ void chunk_free(Chunk* c) {
     free(c->line_mark_lines);
     for (unsigned int i = 0; i < c->import_count; i++) free(c->imported_modules[i]);
     free(c->imported_modules);
+    /* functions[]/shapes[] are otherwise deliberately left unfreed for a chunk's whole life (see
+       their own comments, vm.h) since a Chunk normally lives for the process's life anyway — but
+       chunk_free itself is only ever reached via aer_module_free_all(), the one path that exists
+       specifically so an embedding host can reclaim memory WITHOUT exiting the process, so it must
+       actually free everything rather than rely on process exit to do it. */
+    for (unsigned int i = 0; i < c->function_count; i++) free(c->functions[i].defaults);
+    free(c->functions);
+    for (unsigned int i = 0; i < c->shape_count; i++) free(c->shapes[i]);
+    free(c->shapes);
     /* Not each entry — every populated slot is a Shape* owned by c->shapes, never separately owned. */
     free(c->field_cache_shape);
     free(c->field_cache_slot);
@@ -628,7 +649,7 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
         unsigned int idx = chunk_pool_append(c, v);
 
         /* Independent copy, not an alias of c->pool[idx]'s, so both can be freed independently without a double-free. */
-        char* index_key = xstrdup(key);
+        char* index_key = hashtable_key_dup(key, (unsigned int)strlen(key), NULL);
         hashtable_put(&c->name_index, index_key, aer_int((int64_t)idx));
         return idx;
     }
@@ -1503,9 +1524,7 @@ static inline void vm_index_set_compute(AerVal obj, AerVal idx, AerVal val) {
         if (existing) {
             *existing = val;   /* update in place — no allocation */
         } else {
-            char* k = xmalloc(klen + 1);
-            memcpy(k, is->data, klen);
-            k[klen] = '\0';
+            char* k = hashtable_key_dup(is->data, klen, NULL);
             hashtable_put(&aer_as_dict(obj)->map, k, val);
         }
     } else if (aer_type(obj) == TYPE_STRING) {
@@ -1910,22 +1929,22 @@ lbl_in: {
     int dest = (int)UNPACK_BINARY_DEST(op_word);
     AerVal a = *vm_rk_ptr9(vm, const_pool, UNPACK_RK_B9(op_word));
     AerVal b = *vm_rk_ptr9(vm, const_pool, UNPACK_RK_C9(op_word));
-    AerVal result;
+    AerVal* result = &vm->registers[dest];
     if (aer_type(b) == TYPE_DICT) {
         if (aer_type(a) != TYPE_STRING) {
             error("Left side of 'in' must be a string when testing dict membership");
-            result = aer_bool(false);
+            *result = aer_bool(false);
         } else {
             AerString* as = aer_as_string(a);
             unsigned int klen = as->length;
             if (klen > VM_KEY_MAX) {
                 error("Dict key too long (max %d bytes)", VM_KEY_MAX);
-                result = aer_bool(false);
+                *result = aer_bool(false);
             } else {
                 char kbuf[VM_KEY_MAX + 1];
                 memcpy(kbuf, as->data, klen);
                 kbuf[klen] = '\0';
-                result = aer_bool(hashtable_get(&aer_as_dict(b)->map, kbuf) != NULL);
+                *result = aer_bool(hashtable_get(&aer_as_dict(b)->map, kbuf) != NULL);
             }
         }
     } else if (aer_type(b) == TYPE_ARRAY) {
@@ -1934,12 +1953,11 @@ lbl_in: {
         for (unsigned int i = 0; i < arr->count; i++) {
             if (values_equal(a, arr->items[i])) { found = true; break; }
         }
-        result = aer_bool(found);
+        *result = aer_bool(found);
     } else {
         error("Right side of 'in' must be a dict or array");
-        result = aer_bool(false);
+        *result = aer_bool(false);
     }
-    vm->registers[dest] = result;
     DISPATCH();
 }
 
@@ -2139,10 +2157,8 @@ lbl_call_builtin: {
     }
     AerVal args[4];
     for (int i = 0; i < arg_count; i++) args[i] = vm->registers[arg_reg_base + i];
-    AerVal out;
-    bool handled = vm_call_builtin(c, builtin_id, args, arg_count, &out);
+    bool handled = vm_call_builtin(c, builtin_id, args, arg_count, &vm->registers[dest_reg]);
     if (!handled) error("'%s' is not defined, or was called with the wrong number of arguments", name);
-    vm->registers[dest_reg] = out;
     gc_maybe_collect(vm);   /* vm_call_builtin: struct_pool site + aer_make_string (type()) */
     DISPATCH();
 }
@@ -2302,10 +2318,7 @@ lbl_dict_new: {
         AerVal val = vm->registers[pair_reg_base + 2 * i + 1];
         if (aer_type(key) != TYPE_STRING) { error("Dict keys must be strings"); continue; }
         AerString* ks = aer_as_string(key);
-        unsigned int klen = ks->length;
-        char* k = xmalloc(klen + 1);
-        memcpy(k, ks->data, klen);
-        k[klen] = '\0';
+        char* k = hashtable_key_dup(ks->data, ks->length, NULL);
         hashtable_put(&d->map, k, val);
     }
     vm->registers[dest_reg] = aer_dict_val(d);
@@ -2570,28 +2583,27 @@ lbl_unary: {
     int dest        = (int)UNPACK_UNARY_DEST(op_word);
     Opcode unary_op = (Opcode)UNPACK_UNARY_OP(op_word);
     AerVal v = *vm_rk_ptr9(vm, const_pool, UNPACK_UNARY_RK(op_word));
-    AerVal result;
+    AerVal* result = &vm->registers[dest];
     switch (unary_op) {
         case OP_NEGATE:
-            if      (aer_type(v) == TYPE_INTEGER) result = aer_int(-aer_as_int(v));
-            else if (aer_type(v) == TYPE_REAL)     result = aer_real(-aer_as_real(v));
-            else { error("Negation requires a numeric type"); result = aer_null(); }
+            if      (aer_type(v) == TYPE_INTEGER) *result = aer_int(-aer_as_int(v));
+            else if (aer_type(v) == TYPE_REAL)     *result = aer_real(-aer_as_real(v));
+            else { error("Negation requires a numeric type"); *result = aer_null(); }
             break;
         case OP_NOT:
-            result = aer_bool(!vm_truthy(v));
+            *result = aer_bool(!vm_truthy(v));
             break;
         case OP_BITWISE_NOT:
-            if (aer_type(v) != TYPE_INTEGER) { error("Bitwise NOT requires an integer"); result = aer_null(); }
-            else result = aer_int(~aer_as_int(v));
+            if (aer_type(v) != TYPE_INTEGER) { error("Bitwise NOT requires an integer"); *result = aer_null(); }
+            else *result = aer_int(~aer_as_int(v));
             break;
         case OP_TO_STR:
-            result = vm_to_str(vm, v);
+            *result = vm_to_str(vm, v);
             break;
         default:
-            result = aer_null();
+            *result = aer_null();
             break;
     }
-    vm->registers[dest] = result;
     gc_maybe_collect(vm);   /* OP_NEGATE/OP_BITWISE_NOT overflow-box path, OP_TO_STR's vm_to_str/aer_make_string */
     DISPATCH();
 }

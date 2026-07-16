@@ -200,14 +200,19 @@ char* handle_terminal() {
             if (history_position < 2) continue;  /* underflow guard */
             reset();
             clear();
+            /* The ring only holds the most recent COMMAND_SIZE bytes — anything
+               before this floor has been overwritten by wraparound and would
+               alias unrelated bytes if the scan below were allowed past it. */
+            unsigned long floor_pos = (history_length > COMMAND_SIZE) ? (history_length - COMMAND_SIZE) : 0;
             /* Step back past the trailing newline of the previous entry */
             unsigned long pos = history_position - 2;
             unsigned long start = pos;
-            while (pos > 0 && history_buffer[pos % COMMAND_SIZE] != '\n')
+            while (pos > floor_pos && history_buffer[pos % COMMAND_SIZE] != '\n')
                 pos--;
             /* If we stopped on a newline, move past it */
-            unsigned long entry_start = (history_buffer[pos % COMMAND_SIZE] == '\n') ? pos + 1 : pos;
+            unsigned long entry_start = (pos > floor_pos && history_buffer[pos % COMMAND_SIZE] == '\n') ? pos + 1 : pos;
             unsigned long entry_len   = start - entry_start + 1;
+            if (entry_len > (unsigned long)(buffer_length - 1)) entry_len = (unsigned long)(buffer_length - 1);
             for (unsigned long i = 0; i < entry_len; i++)
                 buffer[i] = history_buffer[(entry_start + i) % COMMAND_SIZE];
             position = length = (int)entry_len;
@@ -226,6 +231,7 @@ char* handle_terminal() {
             while (pos < history_length && history_buffer[pos % COMMAND_SIZE] != '\n')
                 pos++;
             unsigned long entry_len = pos - entry_start;
+            if (entry_len > (unsigned long)(buffer_length - 1)) entry_len = (unsigned long)(buffer_length - 1);
             for (unsigned long i = 0; i < entry_len; i++)
                 buffer[i] = history_buffer[(entry_start + i) % COMMAND_SIZE];
             position = length = (int)entry_len;
@@ -252,7 +258,19 @@ char* handle_terminal() {
             length--;
 
         } else if (key == NEW_LINE) {
+            /* length can equal buffer_length exactly (insert only grows the
+               buffer before writing the char AT length, so it never grows
+               for the byte written just past it) — reserve room here for
+               both the newline and the NUL below before writing either. */
+            if (length + 2 > buffer_length) {
+                buffer_length *= 2;
+                buffer = xrealloc(buffer, buffer_length);
+            }
             buffer[length] = '\n';
+            /* Backspace/Delete shrink `length` without clearing the vacated
+               tail, so without this, main.c's strlen(line) could read past
+               the newline into a stale byte from a longer previous edit. */
+            buffer[length + 1] = '\0';
             if (length != 0) {
                 /* Persist to history file */
                 fwrite(buffer, 1, length + 1, history);

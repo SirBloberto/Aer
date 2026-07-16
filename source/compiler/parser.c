@@ -1808,12 +1808,25 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             }
             /* Shadow to boxed — mirrors var_slot's own register-claiming logic exactly (reserve
                reserved_floor, bump it, resync next_temp_register), but rebinds an EXISTING
-               var_names/var_kind entry in place instead of appending a new one. Safe regardless of
-               loop/branch nesting: a plain assignment always OVERWRITES with a brand new value
-               (LOADK/MOVE below never depends on old_slot's value), so re-executing this shadow on
-               every loop iteration is merely a wasted box, never a correctness problem — unlike
-               compound assignment's shadow (see its own comment), which explicitly needs old_slot's
-               value to compute the new one and so genuinely can't tolerate repeated execution. */
+               var_names/var_kind entry in place instead of appending a new one.
+                 NOT generally safe regardless of loop nesting, despite what this comment used to
+               claim: that reasoning covers only the shadow's OWN bytecode (the LOADK/MOVE below,
+               which indeed never depends on old_slot). It missed that rk_val — the RHS this name's
+               own OLD (raw) value was already parsed and folded into, for a self-referential
+               assignment like `total = total + x` — is computed by bytecode emitted BEFORE this
+               shadow decision, while the name was still raw, and that bytecode is what actually
+               re-runs every loop iteration. Once shadowed, nothing ever writes to the abandoned raw
+               slot again, so a looped self-referential shadow reads the same frozen pre-loop value
+               every single iteration — a real, silent-wrong-answer bug found exactly this way
+               (`total = 0; for ...: total = total + length(s)` never accumulates). Same fix as
+               compound assignment's shadow (see its own comment): no single-pass way to retroactively
+               fix bytecode already emitted earlier in this same loop body, so refuse to compile
+               rather than silently corrupt. */
+            if (loop_depth > 0) {
+                error_at("This assignment would change '%s' from a fixed numeric type to a different type, but it's inside a loop — not supported (restructure so the type change happens outside any loop)",
+                         aer_as_string(c->pool[name_idx])->data);
+                return;
+            }
             rk_val = box_if_raw(c, rk_val);
             if (reserved_floor >= FRAME_REGISTERS) {
                 error_at("Too many variables (max %d)", FRAME_REGISTERS);
@@ -1871,8 +1884,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
            operand (the code just past this block) would silently misread a raw slot index as an
            ordinary registers[] index — a real silent-wrong-answer bug, not a crash, found in
            review. Stays raw (native op, written back into its own EXISTING slot, no shadow) for
-           +=/-=/*= with a same-kind RHS, regardless of branch/loop nesting — the slot's identity
-           never changes here, so there's no phi/merge ambiguity (same reasoning as plain
+           +=, -=, or *= with a same-kind RHS, regardless of branch/loop nesting — the slot's
+           identity never changes here, so there's no phi/merge ambiguity (same reasoning as plain
            assignment's own reassignment case). /= always shadows (int/int division promotes to
            real, changing the variable's own kind mid-compound-op) and so does any kind mismatch. */
         int existing_idx = -1;

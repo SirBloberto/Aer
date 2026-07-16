@@ -210,6 +210,14 @@ bool aer_module_load(const char* name, unsigned int len,
     loading_depth--;
 
     if (!ok) {
+        /* mchunk/mvm were already fully allocated and initialized above (chunk_init/vm_init, plus
+           whatever the failed parse/run itself emitted) — never registered into modules[], so
+           aer_module_free_all() has no way to ever reach them; free everything here instead,
+           mirroring aer_module_free_all's own per-module cleanup. */
+        vm_free(mvm);
+        chunk_free(mchunk);
+        free(mvm);
+        free(mchunk);
         free(path);
         return false;
     }
@@ -251,6 +259,24 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
        allocation in between. */
     AerVal* args = &vm->stack[vm->stack_top - arg_count];
     vm->stack_top -= arg_count;
+
+    /* mv is reused across every future call into this module for the process's whole life — a
+       PRIOR call's runtime error unwinds via longjmp straight past OP_RETURN's normal
+       call_depth-- (vm.c), so a failed call can leave mv->call_depth stuck above 0. setup_call
+       always pushes its new frame at mv->call_depth+1 and hardcodes the callee's dest_reg to 0,
+       meaning the result of THIS call would land in mv->call_stack[mv->call_depth].registers[0] —
+       not mv->call_stack[0].registers[0], which is what the read below always assumes. Left
+       unreset, this isn't just an eventual "Call stack overflow" after enough failures (bounded by
+       VM_CALL_MAX) — the very next call after any single failed one silently reads whatever stale
+       value already sits in frame 0's register 0, returning a wrong result with no error at all.
+       Mirrors main.c's run()'s own defensive reset before every top-level statement — unconditional,
+       not just after a detected failure, since a successful call already restores call_depth to 0
+       itself (OP_RETURN), so resetting here is always safe and costs nothing extra. */
+    mv->call_depth = 0;
+    mv->stack_top  = 0;
+    mv->registers  = mv->call_stack[0].registers;
+    mv->raw_ints   = mv->call_stack[0].raw_ints;
+    mv->raw_reals  = mv->call_stack[0].raw_reals;
 
     /* Trampoline: setup_call pushes a real call frame whose return address is this module's
        own top-level HALT, so vm_run(mv) executes exactly one call and stops — see its own comment

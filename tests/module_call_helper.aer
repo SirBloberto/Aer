@@ -1,0 +1,5 @@
+function boom():
+    return 1 / 0
+
+function good(n):
+    return n * 10

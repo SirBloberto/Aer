@@ -235,6 +235,44 @@ int main(void) {
     check(aer_had_error(),
           "import io fails in a host that never called aer_io_register() — file access is opt-in per host, not ambient");
 
+    /* aer_module_call's mv (a file-module's own reused VM) didn't reset call_depth/stack_top after
+       a runtime error inside a module function — the error unwinds via longjmp straight past
+       OP_RETURN's normal call_depth--, so setup_call's next call pushes its frame at the wrong
+       depth and its hardcoded dest_reg=0 write lands in the wrong frame's register 0, not
+       mv->call_stack[0].registers[0] where aer_module_call always reads the result from. Not just
+       an eventual "Call stack overflow" after enough failures — the very next call after a single
+       failure silently returns whatever stale value already sat there, no error at all. */
+    vm.stack_top     = 0;
+    vm.call_depth = 0;
+    vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
+    aer_clear_error();
+    shell("import module_call_helper\n");
+    run_appended(&chunk, &vm);
+
+    vm.stack_top     = 0;
+    vm.call_depth = 0;
+    vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
+    aer_clear_error();
+    shell("module_call_helper.boom()\n");
+    run_appended(&chunk, &vm);
+    check(aer_had_error(), "a runtime error inside a module function is reported, not silently swallowed");
+
+    vm.stack_top     = 0;
+    vm.call_depth = 0;
+    vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
+    aer_clear_error();
+    shell("assert(module_call_helper.good(5) == 50, \"a call after a prior failed call still returns the correct value, not a stale one from the wrong call frame\")\n");
+    bool ok_after_module_error = run_appended(&chunk, &vm);
+    check(ok_after_module_error, "the call after a prior module-function failure runs without error");
+    check(aer_assert_failure_count() == 0,
+          "good(5) returns 50, not null or any other stale value left over from boom()'s failed call");
+
     /* Generational GC — aer_gc_stats() introspection. Allocates far more
        short-lived arrays than MINOR_GC_THRESHOLD (2048, vm.c) — each loop
        iteration overwrites `temp`, so only the last one stays reachable,
@@ -256,7 +294,12 @@ int main(void) {
 
     check(ok, "a script allocating heavily in a loop still runs to completion");
     check(minor_collections > 0, "at least one minor collection actually ran under allocation pressure");
-    check(live_cells < 1000,
+    /* live_cells counts every currently-live pool cell in the whole shared VM, not just this
+       loop's own allocations — it also includes every object still held by earlier tests in this
+       same file (module registrations, function registries, etc.), so this bound isn't "this
+       loop's own leftovers," it's "still far below the 5000 iterations that ran," with headroom for
+       the file's own accumulated baseline growing over time as more tests get added. */
+    check(live_cells < 2000,
           "live cell count stayed far below the 5000 iterations that ran — reclamation, not just non-crashing");
 
     /* aer_gc_configure — a much smaller minor threshold should trigger far
@@ -438,6 +481,24 @@ int main(void) {
     run_appended(&chunk, &vm);
     check(aer_had_error(),
           "compound-assigning a raw-tracked local to a different type inside a loop is a compile error, not silent corruption");
+
+    /* Same hazard, but via a PLAIN self-referential assignment (`total = total + x`), not `+=` —
+       found live: this path's shadow used to be treated as unconditionally safe on the theory that
+       a plain assignment always overwrites with a brand-new value, missing that the RHS itself can
+       read the variable's own OLD (raw) value before the shadow, and that read is bytecode that
+       re-executes every loop iteration, always seeing the same frozen pre-loop value instead of
+       accumulating. Same fix, same reasoning as the compound case above: a compile error, not a
+       silent wrong answer. */
+    vm.stack_top     = 0;
+    vm.call_depth = 0;
+    vm.registers  = vm.call_stack[0].registers;
+    vm.raw_ints   = vm.call_stack[0].raw_ints;
+    vm.raw_reals  = vm.call_stack[0].raw_reals;
+    aer_clear_error();
+    shell("function loop_shadow_plain():\n    total_raw = 0\n    k = 0\n    for k < 3:\n        x = length(\"ab\")\n        total_raw = total_raw + x\n        k = k + 1\n    return total_raw\n");
+    run_appended(&chunk, &vm);
+    check(aer_had_error(),
+          "plain-assigning a raw-tracked local to a boxed value inside a loop is a compile error, not silent corruption");
 
     /* aer_module_free_all — searchpath_helper (loaded earlier via AER_PATH) proves there's
        something in the registry to tear down; aer_module_get(0, ...) going from true to

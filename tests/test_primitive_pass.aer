@@ -59,9 +59,9 @@ assert(rr[0] == 6.5 && rr[1] == -1.5 && rr[2] == 10.0 && rr[3] == 0.625, "raw re
 
 # ------------------------------------------------------------------ #
 # Shadow transition — a raw-tracked name reassigned to a different    #
-# type (unconditionally, so the shadow is always safe — see the       #
-# primitive-pass memory for why an unconditional plain-assignment      #
-# shadow never has the loop-repetition problem compound assign does)   #
+# type, UNCONDITIONALLY (outside any loop). A plain-assignment shadow  #
+# textually inside a loop is a compile error instead (same hazard as   #
+# compound assignment's own loop restriction) — see embed_smoke_test.c #
 # ------------------------------------------------------------------ #
 
 function shadow_transition():

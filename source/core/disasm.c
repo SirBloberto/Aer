@@ -31,8 +31,8 @@ typedef struct {
     int packed;
 } OpInfo;
 
-/* OP_RAW_LOAD_INT_POOL is the last member of the Opcode enum (vm.h) — the "primitive pass" raw-
-   arithmetic family appended after OP_PRINT_REPL. */
+/* OP_RAW_LOAD_INT_POOL is the last member of the Opcode enum (vm.h) — appended after the
+   "primitive pass" raw-arithmetic family, which itself was appended after OP_PRINT_REPL. */
 #define OP_INFO_MAX OP_RAW_LOAD_INT_POOL
 
 static const OpInfo op_info[OP_INFO_MAX + 1] = {

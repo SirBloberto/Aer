@@ -1,0 +1,22 @@
+import io
+
+scratch_path = "tests/io_mode_scratch.txt"
+
+# A handle's mode is enforced, not just advisory — reading a write-only handle
+# used to silently succeed with an empty string instead of erroring.
+wf, wf_open_err = io.open(scratch_path, "w")
+assert(wf_open_err == null, "io.open() in write mode succeeds")
+_, wf_write_err = io.write(wf, "written but never read back")
+assert(wf_write_err == null, "io.write() on a write-mode handle succeeds")
+wf_content, wf_read_err = io.read(wf)
+assert(wf_content == null && wf_read_err != null,
+       "io.read() on a write-only handle errors instead of silently returning an empty string")
+io.close(wf)
+
+rf, rf_open_err = io.open(scratch_path, "r")
+assert(rf_open_err == null, "io.open() in read mode succeeds")
+_, rf_write_err = io.write(rf, "should not be allowed")
+assert(rf_write_err != null, "io.write() on a read-only handle errors instead of silently doing nothing")
+io.close(rf)
+
+print("test_io_mode_enforcement.aer: all assertions passed.")

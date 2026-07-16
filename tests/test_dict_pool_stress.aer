@@ -1,0 +1,104 @@
+# Dict payload pooling (hashtable.c's size-classed key/bucket-array pools) stress coverage.
+# Existing dict coverage in test_collections.aer is light (one dict, one delete(), no rehash, no
+# fallback path) — this exercises the specific patterns the pooling change needs to get right:
+# multi-tier rehash growth, scrambled removal/reinsertion, both fallback paths (oversized key,
+# oversized bucket array), an embedded-NUL key, and Chunk.name_index (the shared, easy-to-forget
+# consumer of the same pools that isn't dict-shaped from an AER author's perspective).
+
+import json
+
+# --- Rehash stress: force many tier transitions ---
+d = {}
+i = 0
+for i < 2000:
+    d["key_{i}"] = i
+    i += 1
+assert(length(d) == 2000, "2000 distinct keys all inserted correctly across multiple rehash cycles")
+i = 0
+ok = true
+for i < 2000:
+    if d["key_{i}"] != i:
+        ok = false
+    i += 1
+assert(ok, "every one of 2000 keys reads back its correct value after repeated rehashing")
+
+# --- Removal stress: delete in scrambled (non-insertion) order, interleaved with fresh inserts ---
+d2 = {}
+i = 0
+for i < 500:
+    d2["k_{i}"] = i
+    i += 1
+i = 0
+for i < 500:
+    scrambled = (i * 137) % 500
+    delete(d2, "k_{scrambled}")
+    d2["fresh_{i}"] = i * 2
+    i += 1
+assert(length(d2) == 500, "500 keys remain after 500 scrambled deletes interleaved with 500 fresh inserts")
+i = 0
+ok2 = true
+for i < 500:
+    if d2["fresh_{i}"] != i * 2:
+        ok2 = false
+    i += 1
+assert(ok2, "every fresh_ key survives correctly after the scrambled-delete/reinsert churn")
+
+# --- Explicit fallback forcing: an oversized key (past the largest 128-byte key tier) ---
+long_key = ""
+i = 0
+for i < 20:
+    long_key += "0123456789"
+    i += 1
+assert(length(long_key) == 200, "long_key is 200 bytes, past the largest 128-byte key tier")
+d3 = {}
+d3[long_key] = "fallback works"
+assert(d3[long_key] == "fallback works", "a key past the largest tier correctly falls back to plain malloc, not corrupted")
+
+# --- Explicit fallback forcing: a dict pushed past the largest 256-capacity bucket tier ---
+d4 = {}
+i = 0
+for i < 300:
+    d4["b_{i}"] = i
+    i += 1
+assert(length(d4) == 300, "a dict grown past capacity 256 correctly falls back to plain xcalloc for its bucket array")
+assert(d4["b_0"] == 0 && d4["b_299"] == 299, "values at both ends of a fallback-sized dict are still correct")
+
+# --- Embedded-NUL regression: JSON's own unicode-codepoint escape for NUL decodes to a literal
+# NUL byte mid-key. Built via concatenation, not one literal, so the escape sequence never appears
+# as a single authored substring in this source file itself — this tests JSON's runtime decoder
+# producing the embedded NUL, not a raw NUL byte sitting in the .aer source.
+backslash = "\\"
+json_src = "\{\"ab" + backslash + "u0000cd\": 42}"
+decoded, err = json.decode(json_src)
+assert(err == null, "JSON with an embedded NUL escape in a key decodes without error")
+found_embedded_nul_key = false
+for k in decoded:
+    if length(k) == 2:
+        found_embedded_nul_key = true
+assert(found_embedded_nul_key, "the embedded-NUL key round-trips through insert/lookup, truncated to its 2 visible bytes by hash_match's strlen-based comparison, matching hashtable_key_dup's own truncation")
+
+# --- name_index stress: many distinct string/identifier literals in one file, not script-visible
+# as a "dict" at all, but backed by the exact same size-classed pools ---
+s0 = "lit_0"
+s1 = "lit_1"
+s2 = "lit_2"
+s3 = "lit_3"
+s4 = "lit_4"
+s5 = "lit_5"
+s6 = "lit_6"
+s7 = "lit_7"
+s8 = "lit_8"
+s9 = "lit_9"
+s10 = "lit_10"
+s11 = "lit_11"
+s12 = "lit_12"
+s13 = "lit_13"
+s14 = "lit_14"
+s15 = "lit_15"
+s16 = "lit_16"
+s17 = "lit_17"
+s18 = "lit_18"
+s19 = "lit_19"
+assert(s0 == "lit_0" && s19 == "lit_19", "many distinct string literals in one chunk all resolve correctly through name_index's own pooled keys")
+
+print("test_dict_pool_stress.aer: all assertions passed.")

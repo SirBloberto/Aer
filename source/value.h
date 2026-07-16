@@ -76,20 +76,30 @@ struct Value {
     ValueData data;
 };
 
-/* Defined after AerVal so items[] can use the complete internal value type */
+/* Defined after AerVal so items[] can use the complete internal value type.
+   gc_state must be first — pool.c treats every pool-managed struct's leading byte as its GC
+   state, generically, without knowing the rest of the layout (see pool.h). Costs real alignment
+   padding (items needs pointer alignment) in exchange for pool.c never needing to load a per-pool
+   offset before touching it — a variable-offset version was tried and measured a real ~7% slower
+   wall-clock on sieve.aer (the added `Pool*` load + add on every write-barrier check outweighed
+   the memory saved), so it was reverted in favor of this simpler, faster, universal-offset-0
+   design — see pool.h's file comment and project memory for the measured trade-off. */
 struct AerArray {
+    unsigned char gc_state;
     AerVal*      items;
     unsigned int count;
     unsigned int capacity;
     Shape*       shape;   /* NULL for ordinary arrays; set for struct instances */
 };
+_Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* Pointer first, then the two pool-index-sized ints (code_offset/receiver_type can each exceed
-   65535 in a large program's constant pool, so they stay full width), then the two fields bounded
-   by a language-level cap (arity/min_arity <= MAX_PARAMS == SCOPE_SLOT_MAX == 32, comfortably
-   inside uint16_t), then the single bool — 24 bytes on a 64-bit build now that closures (and their
-   upvalues array) are gone; every AerFunction is a plain function value. */
+/* gc_state first, same reasoning as AerArray above. Then pointer, then the two pool-index-sized
+   ints (code_offset/receiver_type can each exceed 65535 in a large program's constant pool, so
+   they stay full width), then the two fields bounded by a language-level cap (arity/min_arity <=
+   MAX_PARAMS == SCOPE_SLOT_MAX == 32, comfortably inside uint16_t), then the single bool — every
+   AerFunction is a plain function value now that closures (and their upvalues array) are gone. */
 struct AerFunction {
+    unsigned char gc_state;
     AerVal*      defaults;        /* NULL if min_arity == arity; else (arity - min_arity) compile-time-literal values */
     unsigned int code_offset;
     unsigned int receiver_type;   /* pool index of Type's name, if has_receiver */
@@ -97,6 +107,7 @@ struct AerFunction {
     uint16_t     min_arity;       /* params [0, min_arity) are required; [min_arity, arity) use defaults[] below, in order */
     bool         has_receiver;    /* true if param 0 was declared `p as Type` */
 };
+_Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
 /* `data` is always owned by the AerString — every construction site (lexer
    tokenizing, string ops in vm.c, stdlib functions) hands aer_make_string() a
@@ -104,11 +115,14 @@ struct AerFunction {
    another string/buffer. This is load-bearing for the garbage collector
    (see Memory and Security in the README): sweeping an AerString always
    frees `data` unconditionally, so a borrowed pointer would double-free or
-   dangle the moment either the borrower or the lender is collected. */
+   dangle the moment either the borrower or the lender is collected.
+   gc_state first, same reasoning as AerArray above. */
 struct AerString {
+    unsigned char gc_state;
     char*        data;
     unsigned int length;
 };
+_Static_assert(offsetof(struct AerString, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
 /* AerDict is defined in vm.h (needs HashTable which is in hashtable.h) */
 

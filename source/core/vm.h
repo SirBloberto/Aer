@@ -5,9 +5,12 @@
 #include "hashtable.h"
 #include "value.h"
 
+/* gc_state first — see pool.h and AerArray's own comment (value.h) for why. */
 struct AerDict {
-    HashTable map;
+    unsigned char gc_state;
+    HashTable     map;
 };
+_Static_assert(offsetof(struct AerDict, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
 typedef enum {
     /* Binary arithmetic */
@@ -853,7 +856,11 @@ typedef struct {
     unsigned int code_offset;
     unsigned int arity;
     unsigned int min_arity;
-    AerVal*      defaults;       /* xmalloc'd array of (arity - min_arity) values, or NULL — owned, never freed (matches Shape's own no-cleanup precedent) */
+    AerVal*      defaults;       /* xmalloc'd array of (arity - min_arity) values, or NULL — owned;
+                                     left alone for the chunk's normal life (matches Shape's own
+                                     no-cleanup precedent, since a Chunk usually lives for the whole
+                                     process anyway), freed only by chunk_free's own explicit
+                                     teardown (aer_module_free_all) */
     bool         has_receiver;
     unsigned int receiver_type;  /* meaningful only when has_receiver */
 } ChunkFunction;
