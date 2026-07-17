@@ -55,34 +55,12 @@ function not_tail(n):
 assert(not_tail(20) == 0, "a call wrapped by another operator is correctly excluded from tail-call optimization")
 
 # ------------------------------------------------------------------ #
-# 29A. Call-site inline caching (a call target resolved to a global's    #
-#      address, not a snapshot of its value — see Chunk.call_cache)     #
-# ------------------------------------------------------------------ #
-
-# call_greet's call to `greet` gets cached (as an address) the first time
-# it runs. Reassigning `greet` afterward must still be visible on the next
-# call through that same cached site — proving the cache reads live state
-# every time, not a stale snapshot from whenever it was first populated.
-function greet_v1(n):
-    return "hello " + n
-function call_greet(n):
-    return greet(n)
-greet = greet_v1
-assert(call_greet("a") == "hello a", "a cached call site resolves normally before any reassignment")
-assert(call_greet("b") == "hello b", "...and again, now via the populated cache")
-
-function greet_v2(n):
-    return "goodbye " + n
-greet = greet_v2
-assert(call_greet("c") == "goodbye c", "reassigning the global after the call site is cached is still reflected immediately")
-
-# ------------------------------------------------------------------ #
-# 29B. Call-cache shadowing bug — a parameter sharing a name with an   #
-#      existing global function must keep winning on every call       #
-#      through the same call site, not just the first one before the  #
-#      cache populated (a real bug found and fixed this round: the     #
-#      cache used to populate on "a global with this name exists       #
-#      somewhere," not "the global is the winning resolution").        #
+# 29A. functions as values, passed as a parameter — a parameter        #
+#      sharing a name with an existing global FUNCTION must keep       #
+#      winning on every call through the same call site (functions     #
+#      live in a separate registry from top-level variables, so a      #
+#      parameter shadowing a function name is unaffected by the        #
+#      top-level-variable shadow ban — see test_errors_scope.aer).     #
 # ------------------------------------------------------------------ #
 
 function cache_helper():
@@ -99,38 +77,25 @@ assert(cache_wrapper(local_helper_2) == "local helper 2", "second call must stil
 assert(cache_wrapper(cache_helper) == "global helper", "passing the global itself still works, unrelated to the cache")
 
 # ------------------------------------------------------------------ #
-# 29C. Global LOAD/STORE inline caching (Chunk.addr_cache, extended    #
-#      from call targets to plain variable access)                    #
+# 29C. Top-level variables are entirely off-limits inside a function — #
+#      no reads, no writes, and a parameter can't reuse the name       #
+#      either (see test_errors_scope.aer for the full rule). A         #
+#      top-level read-then-write loop, with no function involved,      #
+#      still works exactly as before.                                  #
 # ------------------------------------------------------------------ #
 
-# Assignment inside a function is always local now, so a function can no longer read-then-write
-# a global by bare name (see tests/test_errors_scope.aer's shadow_outer) — the read-then-write
-# repetition this used to cover moves to a top-level loop instead, still the same cached
-# LOAD/STORE site hit on every iteration.
 lc_total = 0
 for lc_i in 0..5:
     lc_total = lc_total + 1
-assert(lc_total == 5, "a global read-then-written through the same cached LOAD/STORE site stays correct across repeated top-level iterations")
+assert(lc_total == 5, "a top-level variable read-then-written every iteration of a top-level loop stays correct")
 
-# A function can still freely READ a global recursively — only writing it by bare name is gone.
-function lc_recurse_read(n, acc):
+# A function reads/writes this kind of state only through an explicitly passed reference —
+# the same pattern test_errors_scope.aer's Counter/bump example establishes.
+function lc_recurse_read(n, acc, total):
     if n <= 0:
         return acc
-    return lc_recurse_read(n - 1, acc + lc_total)   # same OP_LOAD site, hit many times via recursion
-assert(lc_recurse_read(4, 0) == 20, "the same cached global LOAD site stays correct across recursive calls")
-
-lc_greeting = "hello"
-function lc_say():
-    return lc_greeting           # OP_LOAD on a global, cached after the first call
-assert(lc_say() == "hello", "a cached global load resolves normally before any reassignment")
-lc_greeting = "goodbye"
-assert(lc_say() == "goodbye", "reassigning the global after the load site is cached is still reflected immediately")
-
-function lc_shadow_test(lc_total):
-    return lc_total + 100        # parameter named the same as the global — OP_LOAD_LOCAL, not addr_cache
-assert(lc_shadow_test(1) == 101, "a parameter shadowing a same-named global still resolves to the parameter")
-assert(lc_shadow_test(2) == 102, "...and again — must not read the global's cached address")
-assert(lc_total == 5, "the global itself is untouched by the shadowing parameter's own writes")
+    return lc_recurse_read(n - 1, acc + total, total)
+assert(lc_recurse_read(4, 0, lc_total) == 20, "a value passed explicitly through every level of a recursive call stays correct")
 
 # ------------------------------------------------------------------ #
 # 33. Compound assignment — ground-truth coverage before opcode        #
@@ -161,16 +126,15 @@ ca_gt_d = 1
 ca_gt_d += ca_one()
 assert(ca_gt_d == 2, "compound assignment with a non-simple (call) RHS still works")
 
-# Parameter LHS (the fast OP_LOAD_LOCAL/OP_STORE_LOCAL path) with each RHS
-# kind: CONST, another parameter (LOCAL), and a global (NAME).
-ca_global_rhs = 10
-function ca_param_compound(p, q):
+# Parameter LHS with each RHS kind: CONST, another parameter, and a third
+# parameter (standing in for what used to be a bare global read).
+function ca_param_compound(p, q, r):
     p += 1          # LOCAL += CONST
     q += p          # LOCAL += LOCAL
-    p += ca_global_rhs   # LOCAL += NAME
+    p += r          # LOCAL += LOCAL (a third parameter)
     return p, q
-ca_r1, ca_r2 = ca_param_compound(5, 100)
-assert(ca_r1 == 16, "parameter += CONST, then += NAME, accumulates correctly")
+ca_r1, ca_r2 = ca_param_compound(5, 100, 10)
+assert(ca_r1 == 16, "parameter += CONST, then += another parameter, accumulates correctly")
 assert(ca_r2 == 106, "parameter += another parameter (LOCAL += LOCAL)")
 
 # Ordinary NON-parameter local inside a function body — this is the "NAME,
@@ -202,21 +166,19 @@ assert(ig_arr[2] == 30, "NAME[CONST] fuses to OP_INDEX_GET_NAME_CONST")
 ig_idx = 3
 assert(ig_arr[ig_idx] == 40, "NAME[NAME] fuses to OP_INDEX_GET_NAME_NAME")
 
-# NAME arr, LOCAL index — index is a parameter inside a function body.
-function ig_name_local(i):
-    return ig_arr[i]
-assert(ig_name_local(1) == 20, "NAME[LOCAL] fuses to OP_INDEX_GET_NAME_LOCAL")
+# arr and index both passed as parameters.
+function ig_name_local(arr, i):
+    return arr[i]
+assert(ig_name_local(ig_arr, 1) == 20, "arr[i] through two parameters")
 
-# LOCAL arr, CONST/LOCAL/NAME index — arr is itself a parameter.
+# LOCAL arr, CONST/LOCAL index — arr is itself a parameter.
 function ig_local_const(a):
     return a[0]
 function ig_local_local(a, i):
     return a[i]
-function ig_local_name(a):
-    return a[ig_idx]
 assert(ig_local_const(ig_arr) == 10, "LOCAL[CONST] fuses to OP_INDEX_GET_LOCAL_CONST")
 assert(ig_local_local(ig_arr, 4) == 50, "LOCAL[LOCAL] fuses to OP_INDEX_GET_LOCAL_LOCAL")
-assert(ig_local_name(ig_arr) == 40, "LOCAL[NAME] fuses to OP_INDEX_GET_LOCAL_NAME")
+assert(ig_local_local(ig_arr, ig_idx) == 40, "arr[idx] where idx is passed through, matching the value the removed NAME index case used")
 
 # Dict and string indexing through the same fused NAME[CONST]/NAME[NAME]
 # paths — the handler stays fully polymorphic, matching lbl_index_get.
@@ -317,25 +279,22 @@ is_idx = 3
 is_arr[is_idx] = 88
 assert(is_arr[3] == 88, "NAME[NAME] = CONST fuses to OP_INDEX_SET_NAME_NAME")
 
-# NAME arr, LOCAL index, CONST value — fuses to OP_INDEX_SET_NAME_LOCAL.
-function is_name_local(i):
-    is_arr[i] = 77
-    return is_arr[i]
-assert(is_name_local(1) == 77, "NAME[LOCAL] = CONST fuses to OP_INDEX_SET_NAME_LOCAL")
+# arr and index both passed as parameters.
+function is_name_local(arr, i):
+    arr[i] = 77
+    return arr[i]
+assert(is_name_local(is_arr, 1) == 77, "arr[i] = CONST through two parameters")
 
-# LOCAL arr, CONST/LOCAL/NAME index, CONST value — arr is itself a parameter.
+# LOCAL arr, CONST/LOCAL index, CONST value — arr is itself a parameter.
 function is_local_const(a):
     a[0] = 1
     return a[0]
 function is_local_local(a, i):
     a[i] = 2
     return a[i]
-function is_local_name(a):
-    a[is_idx] = 3
-    return a[is_idx]
 assert(is_local_const([0, 0]) == 1, "LOCAL[CONST] = CONST fuses to OP_INDEX_SET_LOCAL_CONST")
 assert(is_local_local([0, 0, 0], 1) == 2, "LOCAL[LOCAL] = CONST fuses to OP_INDEX_SET_LOCAL_LOCAL")
-assert(is_local_name([0, 0, 0, 0]) == 3, "LOCAL[NAME] = CONST fuses to OP_INDEX_SET_LOCAL_NAME")
+assert(is_local_local([0, 0, 0, 0], is_idx) == 2, "arr[idx] = CONST where idx is passed through, matching the value the removed NAME index case used")
 
 # Dict indexing still works through the same fused NAME[CONST] path — the
 # handler stays fully polymorphic, matching lbl_index_set.
@@ -357,22 +316,25 @@ assert(is_nested[0][1] == 222, "arr[0][1] = CONST (chained bracket) does not fus
 is_val_name = 55
 is_arr[0] = is_val_name
 assert(is_arr[0] == 55, "arr[CONST_idx] = NAME does not fuse but still works")
-function is_val_local(x):
-    is_arr[1] = x
-    return is_arr[1]
-assert(is_val_local(66) == 66, "arr[CONST_idx] = LOCAL does not fuse but still works")
+function is_val_local(arr, x):
+    arr[1] = x
+    return arr[1]
+assert(is_val_local(is_arr, 66) == 66, "arr[CONST_idx] = LOCAL does not fuse but still works")
 
 # The evaluation-order hazard this restriction specifically guards against:
 # a value expression (a call) that reassigns the very variable used as the
 # index. Correct behavior is array-then-index-then-value order (matching
 # the unfused semantics), i.e. the index used is the value BEFORE the call
-# runs — not whatever the call changed it to.
-is_order_idx = 0
+# runs — not whatever the call changed it to. The side-effecting write now
+# goes through an explicitly passed 1-element array (a function can't
+# reassign a top-level variable by bare name any more), same mutation
+# pattern as every other cross-function-boundary write in this suite.
+is_order_idx = [0]
 is_order_arr = [100, 200]
-function is_order_side_effect():
-    is_order_idx = 1     # reassigns the index variable as a side effect
+function is_order_side_effect(idx):
+    idx[0] = 1     # reassigns the index holder as a side effect
     return 999
-is_order_arr[is_order_idx] = is_order_side_effect()
+is_order_arr[is_order_idx[0]] = is_order_side_effect(is_order_idx)
 assert(is_order_arr[0] == 999 && is_order_arr[1] == 200,
        "arr[i] = f() writes to the index i had BEFORE f() ran, not after — proof the value-must-be-CONST restriction correctly forces this through the unfused, correctly-ordered path")
 

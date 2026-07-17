@@ -99,8 +99,6 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_CALL_VALUE] = { "OP_CALL_VALUE", "call a runtime function value held in a register", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 4 },
     [OP_TAIL_CALL]       = { "OP_TAIL_CALL",       "tail call by compile-time-resolved offset, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP}, false, 3 },
     [OP_TAIL_CALL_VALUE] = { "OP_TAIL_CALL_VALUE", "tail call through a register value, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 4 },
-    [OP_CALL_GLOBAL_VALUE]      = { "OP_CALL_GLOBAL_VALUE",      "call a runtime function value held in the top-level frame's reg", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
-    [OP_TAIL_CALL_GLOBAL_VALUE] = { "OP_TAIL_CALL_GLOBAL_VALUE", "tail call through the top-level frame's reg, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
     [OP_RETURN] = { "OP_RETURN", "return reg to caller", {FLD_REG}, false, 1 },
     /* No patchable target at all — module/function/builtin names are always literal identifiers
        resolved at parse time — so everything packs into one word (PACK_CALL_MODULE/
@@ -109,8 +107,6 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
        real trailing word is decoded/printed specially in disassemble_one below. */
     [OP_CALL_MODULE]  = { "OP_CALL_MODULE",  "call a native or file-module function by (module, function) name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_NAME, FLD_COUNT}, false, 5 },
     [OP_CALL_BUILTIN] = { "OP_CALL_BUILTIN", "global builtin (length/append/etc.) by name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_COUNT}, false, 4 },
-    [OP_LOAD_GLOBAL]  = { "OP_LOAD_GLOBAL",  "reg = top-level frame's reg (read-only)", {FLD_REG, FLD_REG}, false, 2 },
-    [OP_STORE_GLOBAL] = { "OP_STORE_GLOBAL", "top-level frame's reg = rk", {FLD_REG, FLD_RK}, false, 2 },
     [OP_ARRAY_NEW] = { "OP_ARRAY_NEW", "reg = new array from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT}, false, 3 },
     /* OP_INDEX_GET/OP_ITER_NEXT_PAIR/OP_ITER_RANGE_PREP/OP_ITER_RANGE_LOOP/OP_FIELD_GET/
        OP_FIELD_SET are the Slice A
@@ -370,10 +366,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG,   (int)UNPACK_REG4_B(op_word));
         print_field(out, c, FLD_COUNT, (int)UNPACK_REG4_C(op_word));
         print_field(out, c, FLD_REG,   (int)UNPACK_REG4_D(op_word));
-    } else if (op == OP_STORE_GLOBAL) {
-        /* Tier 1, narrow RK9 encoding now (PACK_STORE_GLOBAL's own comment, vm.h) — not RK20. */
-        print_field(out, c, FLD_REG, (int)UNPACK_STORE_GLOBAL_REG(op_word));
-        print_rk9(out, c, UNPACK_STORE_GLOBAL_RK(op_word));
     } else if (op == OP_UNARY) {
         print_field(out, c, FLD_REG,   (int)UNPACK_UNARY_DEST(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_UNARY_OP(op_word));

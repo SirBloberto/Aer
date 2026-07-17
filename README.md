@@ -592,32 +592,37 @@ Mutual recursion between two functions gets the same treatment.
 
 ### Scope inside a function
 
-Assignment inside a function body is **always local**, unconditionally — the same name at module
-level (or in a different function) is never reached or shadowed silently, because it's never
-reached at all:
+A top-level variable is **entirely off-limits inside a function** — not readable, not
+assignable, and its name can't be reused for a local or a parameter either. One name means one
+variable, everywhere; a function's only inputs are its parameters, and its only output is its
+return value:
 
 ```
 outer = 10
 
-function shadow_outer():
-    outer = 99      # creates a fresh local — does not touch the global above
-    return outer
+# function read_it():
+#     return outer      # error: 'outer' is a top-level variable — not accessible inside a
+#                        # function; pass it as a parameter (or rename)
+# function shadow_it(outer):    # error, for the same reason — the PARAMETER name collides too
+#     return outer
 
-print(shadow_outer())    # 99
-print(outer)              # 10 — unchanged
+function read_it(v):
+    return v             # v is a parameter, not the top-level name — this is fine
+
+print(read_it(outer))     # 10
 ```
 
-A function can still freely *read* any global by name — only *assigning* to a name is always
-local. To share state across calls, mutate something you were explicitly given a reference to (a
-struct, array, or dict — all reference types), instead of relying on a function reaching outward by
-bare name:
+This is stricter than "assignment is always local" — it's "the name doesn't exist in here at
+all." To share state across calls, mutate something you were explicitly given a reference to (a
+struct, array, or dict — all reference types), instead of relying on a function reaching outward
+by bare name:
 
 ```
 struct Counter:
-    value
+    value: integer = 0
 
 function bump(c):
-    c.value += 1     # mutates the struct's own field, not a name lookup
+    c.value += 1     # mutates the struct's own field, passed in explicitly
 
 shared = Counter(0)
 bump(shared)
@@ -625,12 +630,9 @@ bump(shared)
 print(shared.value)    # 2
 ```
 
-AER has no closures: a function's data access is always either its own parameters/locals, or a
-reference explicitly passed to it — never an implicit reach into an enclosing function's variables.
-An anonymous function nested inside another function's body can only see its own parameters and
-locals, plus true globals, exactly like a named function; referencing a name that belongs only to
-the *enclosing* function fails at runtime with a plain `'x' is not defined`, not anything silently
-wrong.
+A function's data access is always either its own parameters/locals, or a reference explicitly
+passed to it — never an implicit reach into an enclosing scope. An anonymous function nested
+inside another function's body follows the same rule.
 
 ### Anonymous Function Expressions
 

@@ -34,17 +34,19 @@ assert(err == "division by zero", "safe_div returns an error message when the di
 
 outer = 10
 
-function read_outer():
-    return outer                     # can read outer scope
+# A top-level variable is entirely off-limits inside a function — no reads, no writes, and a
+# local/parameter can't reuse its name either. One name means one variable, everywhere; data
+# enters a function through parameters and leaves through its return value.
+# function read_outer():
+#     return outer            # would error: 'outer' is a top-level variable — not accessible
+#                              # inside a function; pass it as a parameter (or rename)
+# function shadow_outer(outer):   # would ALSO error: this parameter name shadows the global
+#     return outer
 
-assert(read_outer() == 10, "function reads the outer/global scope")
+function read_it(v):
+    return v                        # v is a parameter, not the global — this is fine
 
-function shadow_outer():
-    outer = 99                       # assignment inside a function is always local —
-    return outer                     # this creates a fresh local, it never reaches the global
-
-assert(shadow_outer() == 99, "assignment inside a function creates a local...")
-assert(outer == 10, "...and the outer/global binding is left untouched")
+assert(read_it(outer) == 10, "the value has to be passed in explicitly; a function has no ambient access to it")
 
 # To update shared state from inside a function, mutate something you were explicitly
 # given a reference to (a struct/array/dict), not a bare name — see the Scope section

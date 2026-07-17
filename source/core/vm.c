@@ -1246,11 +1246,10 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
     return true;
 }
 
-/* Shared by lbl_call_value and lbl_call_global_value (vm_run, below) — identical in every way
-   except where `fv` comes from, factored out into a plain function since DISPATCH()'s
+/* Used by lbl_call_value (vm_run, below), factored out into a plain function since DISPATCH()'s
    computed-goto only needs to run in the caller, after this returns (a plain C function can't
    itself jump to a vm_run-local label, but it doesn't need to: it just does the work and lets
-   each caller DISPATCH() once it's back). `dest_reg`/`arg_reg_base`/`arg_count` are the caller's
+   the caller DISPATCH() once it's back). `dest_reg`/`arg_reg_base`/`arg_count` are the caller's
    own operands; `is_tail_call` is whether the calling label's own opcode was its
    OP_TAIL_CALL_* counterpart. */
 static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int arg_count,
@@ -1719,9 +1718,9 @@ bool vm_run(VM* vm) {
 #ifdef AER_DEBUG_TOOLS
 /* gc_maybe_collect() is no longer called from here — see each allocating label's own call,
    placed by hand right after its result is stored into a VM-visible root (a register, or for
-   OP_CALL_VALUE/OP_CALL_GLOBAL_VALUE's non-tail path, after call_depth++ makes the new frame
+   OP_CALL_VALUE's non-tail path, after call_depth++ makes the new frame
    part of mark_vm_roots's 0..call_depth scan). Labels that can never reach pool_alloc (MOVE,
-   JUMP, FIELD_GET/SET, LOAD/STORE_GLOBAL, OP_CALL/OP_TAIL_CALL — confirmed by direct inspection,
+   JUMP, FIELD_GET/SET, OP_CALL/OP_TAIL_CALL — confirmed by direct inspection,
    not assumed) have no call at all, not a skipped one — a real Lua-style zero-cost dispatch for
    the common case, unlike the opcode_can_allocate[] gate this replaces (which still paid a
    lookup+branch on every dispatch, including the allocating ones, and measured as a net loss). */
@@ -1780,12 +1779,8 @@ bool vm_run(VM* vm) {
         [OP_CALL_VALUE]        = &&lbl_call_value,
         [OP_TAIL_CALL]         = &&lbl_call,
         [OP_TAIL_CALL_VALUE]   = &&lbl_call_value,
-        [OP_CALL_GLOBAL_VALUE]      = &&lbl_call_global_value,
-        [OP_TAIL_CALL_GLOBAL_VALUE] = &&lbl_call_global_value,
         [OP_CALL_MODULE]       = &&lbl_call_module,
         [OP_CALL_BUILTIN]      = &&lbl_call_builtin,
-        [OP_LOAD_GLOBAL]       = &&lbl_load_global,
-        [OP_STORE_GLOBAL]      = &&lbl_store_global,
         [OP_RETURN]            = &&lbl_return,
         [OP_ARRAY_NEW]         = &&lbl_array_new,
         [OP_INDEX_GET]         = &&lbl_index_get,
@@ -2110,21 +2105,6 @@ lbl_call_value: {
     DISPATCH();
 }
 
-/* See OP_CALL_GLOBAL_VALUE's own comment in vm.h. Identical to lbl_call_value in every way except
-   where `fv` comes from — vm->call_stack[0].registers[global_reg] (frame 0, read fresh every
-   dispatch, mirroring OP_LOAD_GLOBAL) instead of a register in the CURRENT frame. */
-lbl_call_global_value: {
-    int dest_reg     = (int)UNPACK_A(op_word);
-    int arg_reg_base = (int)UNPACK_B(op_word);
-    int arg_count    = (int)UNPACK_C(op_word);
-    int global_reg   = READ();
-    /* See lbl_call_value's own comment above — same reload-after-call reasoning. */
-    vm_call_value(vm, vm->call_stack[0].registers[global_reg], dest_reg, arg_reg_base, arg_count,
-                      cur_op == OP_TAIL_CALL_GLOBAL_VALUE);
-    ip = vm->ip;
-    DISPATCH();
-}
-
 /* src_reg is a plain 0-based index into the CALLEE's own frame. return_ip/dest_reg live in the
    callee's own frame (not a single shared global), which is exactly what makes nested/recursive
    calls safe: an outer call's return info can't be clobbered by an inner one. */
@@ -2204,23 +2184,6 @@ lbl_call_builtin: {
     if (!handled) error("'%s' is not defined, or was called with the wrong number of arguments",
                         aer_as_string(c->pool[name_idx])->data);
     gc_maybe_collect(vm);   /* vm_call_builtin: struct_pool site + aer_make_string (type()) */
-    DISPATCH();
-}
-
-/* See OP_LOAD_GLOBAL's comment in vm.h — always reads frame 0 directly, never the currently
-   active frame, since a function's own registers are a completely separate bank from the
-   top-level's. */
-lbl_load_global: {
-    int dest_reg   = (int)UNPACK_A(op_word);
-    int global_reg = (int)UNPACK_B(op_word);
-    vm->registers[dest_reg] = vm->call_stack[0].registers[global_reg];
-    DISPATCH();
-}
-
-/* write counterpart to OP_LOAD_GLOBAL, see its own comment in vm.h. */
-lbl_store_global: {
-    int global_reg = (int)UNPACK_STORE_GLOBAL_REG(op_word);
-    vm->call_stack[0].registers[global_reg] = *vm_rk_ptr9(vm, const_pool, UNPACK_STORE_GLOBAL_RK(op_word));
     DISPATCH();
 }
 

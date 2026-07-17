@@ -187,21 +187,6 @@ function raw_while_condition(limit):
 assert(raw_while_condition(7) == 7, "a raw local used directly in a while-style loop condition terminates correctly")
 
 # ------------------------------------------------------------------ #
-# Globals never go raw — a top-level (module-scope) numeric variable   #
-# behaves exactly as before (no per-call-frame raw storage exists at   #
-# global scope)                                                        #
-# ------------------------------------------------------------------ #
-
-global_counter = 0
-function bump_global():
-    global_counter += 1
-    return global_counter
-
-bump_global()
-bump_global()
-assert(bump_global() == 3, "a top-level numeric variable (never raw-eligible) still behaves correctly across calls")
-
-# ------------------------------------------------------------------ #
 # Raw-slot overflow — a function with more raw-eligible locals than    #
 # the 32-slot budget must gracefully fall back to boxed, not crash     #
 # or silently truncate                                                 #

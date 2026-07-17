@@ -14,7 +14,7 @@ struct Body:
     vz: float = 0.0
     mass: float = 0.0
 
-function offset_momentum(bodies):
+function offset_momentum(bodies, solar_mass):
     px, py, pz = 0.0, 0.0, 0.0
     num_bodies = length(bodies)
     for i in 0..num_bodies:
@@ -22,9 +22,9 @@ function offset_momentum(bodies):
         py += bodies[i].vy * bodies[i].mass
         pz += bodies[i].vz * bodies[i].mass
 
-    bodies[0].vx = - px / SOLAR_MASS
-    bodies[0].vy = - py / SOLAR_MASS
-    bodies[0].vz = - pz / SOLAR_MASS
+    bodies[0].vx = - px / solar_mass
+    bodies[0].vy = - py / solar_mass
+    bodies[0].vz = - pz / solar_mass
 
 
 function energy(bodies):
@@ -122,7 +122,7 @@ bodies[4].vz = -9.51592254519715870e-05 * DAYS_PER_YEAR
 bodies[4].mass = 5.15138902046611451e-05 * SOLAR_MASS
 
 start = time.now()
-offset_momentum(bodies)
+offset_momentum(bodies, SOLAR_MASS)
 a = energy(bodies)
 for i in 0..500000:
     advance(bodies, 0.01)

@@ -122,14 +122,14 @@ else:
 assert(short_circuit_result == "safe", "&& short-circuits before a null index/compare runs")
 
 # || short-circuit: second side skipped when first is true
-boom_called = false
-function boom():
-    boom_called = true
+boom_log = []
+function boom(log):
+    append(log, true)
     return false
 short_circuited = false
-if true || boom():
+if true || boom(boom_log):
     short_circuited = true
-assert(short_circuited && !boom_called, "|| short-circuits, boom() never called")
+assert(short_circuited && length(boom_log) == 0, "|| short-circuits, boom() never called")
 
 # in — membership test for arrays and dicts
 nums = [1, 2, 3]
@@ -154,25 +154,25 @@ assert((1 << 4) == 16, "left shift")
 assert((16 >> 2) == 4, "right shift")
 
 # Bitwise compound assigns
-v = 0xFF
-v &= 0x0F
-assert(v == 15, "&= compound assign")
+bw = 0xFF
+bw &= 0x0F
+assert(bw == 15, "&= compound assign")
 
-v = 0
-v |= 3
-assert(v == 3, "|= compound assign")
+bw = 0
+bw |= 3
+assert(bw == 3, "|= compound assign")
 
-v = 7
-v ^= 2
-assert(v == 5, "^= compound assign")
+bw = 7
+bw ^= 2
+assert(bw == 5, "^= compound assign")
 
-v = 1
-v <<= 3
-assert(v == 8, "<<= compound assign")
+bw = 1
+bw <<= 3
+assert(bw == 8, "<<= compound assign")
 
-v = 16
-v >>= 2
-assert(v == 4, ">>= compound assign")
+bw = 16
+bw >>= 2
+assert(bw == 4, ">>= compound assign")
 
 # ------------------------------------------------------------------ #
 # 6. `as` — type casting                                               #

@@ -105,14 +105,14 @@ assert(ca_dict["count"] == 2, "dict value += a constant")
 # The index expression itself must be evaluated exactly ONCE — proof the
 # chain isn't re-run for the write half (a real risk this feature could
 # have introduced: `a[f()] += 1` silently calling f() twice).
-ca_call_count = 0
-function ca_side_effecting_index():
-    ca_call_count += 1
+ca_call_count = [0]
+function ca_side_effecting_index(count):
+    count[0] += 1
     return 0
 ca_side_arr = [10]
-ca_side_arr[ca_side_effecting_index()] += 1
+ca_side_arr[ca_side_effecting_index(ca_call_count)] += 1
 assert(ca_side_arr[0] == 11, "a[f()] += 1 applies the update correctly")
-assert(ca_call_count == 1, "...and f() was called exactly once, not once per read/write half")
+assert(ca_call_count[0] == 1, "...and f() was called exactly once, not once per read/write half")
 
 # ------------------------------------------------------------------ #
 # 38. Non-primitive struct field defaults — '[]' and '{}' (empty       #

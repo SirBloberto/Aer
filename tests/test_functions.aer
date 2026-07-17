@@ -136,17 +136,17 @@ assert(length(basket.items) == 3 && basket.items[2] == "added",
 # statement cases above: previously only a bare `name(args)` call was
 # recognized as a statement; `queue[i](args)` hit the same "compound
 # assignment" error pipe chains used to.
-call_log = []
-function log_a():
-    append(call_log, "a")
-function log_b():
-    append(call_log, "b")
+function log_a(log):
+    append(log, "a")
+function log_b(log):
+    append(log, "b")
 
+call_log = []
 queue = [log_a, log_b]
 for i in 0..length(queue):
-    queue[i]()
+    queue[i](call_log)
 assert(length(call_log) == 2 && call_log[0] == "a" && call_log[1] == "b",
-       "calling a function value via queue[i]() works as a bare statement")
+       "calling a function value via queue[i](args) works as a bare statement")
 
 # ------------------------------------------------------------------ #
 # 19. Multiple return values                                           #

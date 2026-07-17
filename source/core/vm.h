@@ -103,28 +103,6 @@ typedef enum {
     OP_TAIL_CALL,        /* same operands as OP_CALL; dest_reg is unused (ignored) here */
     OP_TAIL_CALL_VALUE,  /* same operands as OP_CALL_VALUE; dest_reg is unused (ignored) here */
 
-    /* A call to a name that, at the point it was compiled, wasn't yet a variable, a known
-       function, a struct, or a builtin (parse_call's forward-reference/pending-call path,
-       parser.c) — but by the end of THIS parse() call turned out to be an ordinary top-level
-       (global) VARIABLE, later holding a function value (`function call_greet(n): return
-       greet(n)` compiled BEFORE `greet = greet_v1` ever runs). The pending-call mechanism can only
-       patch a bytecode OFFSET (patch_jump) once a matching NAME is registered as a FUNCTION —
-       it never was here, since `greet` is never declared `function greet(...)`, only ever assigned
-       a function value. Fixed by retargeting, not by extending that mechanism: at drain time
-       (parse's own end-of-call check), if the still-unresolved name turns out to be a known
-       global after all, the call's ALREADY-EMITTED OP_CALL/OP_TAIL_CALL word is patched (same
-       byte-level opcode swap OP_TAIL_CALL's own patch uses) to this opcode instead, and its wide
-       word — originally a placeholder callee_offset — becomes a global register index instead.
-       This fits in exactly the same 2-word shape a plain OP_CALL already reserved, so no
-       bytecode needs to shift and no other jump target needs re-patching.
-         Same runtime shape as OP_CALL_VALUE otherwise (arity check, default-filling, frame push)
-       — just resolving `fv` from call_stack[0].registers[global_reg]
-       (mirroring OP_LOAD_GLOBAL's own read) instead of a register in the CURRENT frame, so a
-       later reassignment of the global (`greet = greet_v2`) is picked up immediately on the very
-       next call through this same call site — it's read fresh every dispatch, never cached. */
-    OP_CALL_GLOBAL_VALUE,      /* operands: dest_reg, arg_reg_base, arg_count, global_reg */
-    OP_TAIL_CALL_GLOBAL_VALUE, /* same operands; dest_reg is unused (ignored) here */
-
     /* Module/stdlib calls (module.function(args)). Bridges into shared stdlib infrastructure
        (aer_math_call() and friends, vm.c) rather than reimplementing every stdlib function for a
        register calling convention: pushes arg_count values from the registers onto vm->stack,
@@ -161,22 +139,6 @@ typedef enum {
        before this opcode is emitted. Trailing word: builtin_id, same convention as OP_CALL_MODULE's
        module_id. */
     OP_CALL_BUILTIN, /* operands: dest_reg, name_pool_idx, arg_reg_base, arg_count, builtin_id */
-
-    /* Reading a top-level ("global") variable from inside a function body. Per-call register
-       windowing means a function's own registers are never the top-level frame's registers, so
-       this always reads call_stack[0] specifically (vm.c), regardless of which frame is
-       currently executing, since the top-level frame is never popped mid-run. */
-    OP_LOAD_GLOBAL, /* operands: dest_reg, global_reg — registers[dest_reg] =
-                          call_stack[0].registers[global_reg] */
-
-    /* Write counterpart to OP_LOAD_GLOBAL, needed for `name OP= expr` inside a function when
-       `name` isn't a local of the CURRENT function but IS an existing top-level variable: a plain
-       `name = expr` is always local in this language (a first assignment always DEFINES a fresh
-       local, full stop) — but `name += expr` falls back to a global read-modify-write via this
-       opcode when the name isn't a local (parse_assignment's compound-assignment branch,
-       parser.c). */
-    OP_STORE_GLOBAL, /* operands: global_reg, rk_val — call_stack[0].registers[global_reg] =
-                            vm_rk_value(rk_val) */
 
     /* Registers can hold heap-allocated values (arrays/dicts/strings/functions), which is why
        mark_vm_roots (vm.c) scans all of registers[] for every live frame. */
@@ -616,17 +578,9 @@ typedef enum {
 #define UNPACK_INDEX_GET_ARR(word)  ((((uint32_t)(word)) >> 14) & 0x7FU)
 #define UNPACK_INDEX_GET_RK(word)   ((((uint32_t)(word)) >> 21) & 0x1FFU)
 
-/* Slice C: OP_STORE_GLOBAL/OP_UNARY/OP_CAST/OP_CHECK_SHAPE/OP_STRUCT_NEW — none of these have a
+/* Slice C: OP_UNARY/OP_CAST/OP_CHECK_SHAPE/OP_STRUCT_NEW — none of these have a
    patchable target (unlike OP_JUMP_IF_FALSE_REG, which stays 2 words — see
    emit_jump_if_false_reg's own comment), so all their fields safely fold into one word. */
-/* Tier 1 — op(7) + global_reg(7) + rk_val (RK9:9) = 23 bits, entirely in the low word. */
-#define PACK_STORE_GLOBAL(global_reg, rk_val) \
-    ( ((uint64_t)(OP_STORE_GLOBAL) & 0x7F) \
-    | (((uint64_t)(global_reg) & 0x7F) << 7) \
-    | ((PACK_RK9(rk_val) & 0x1FFULL) << 14) )
-#define UNPACK_STORE_GLOBAL_REG(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
-#define UNPACK_STORE_GLOBAL_RK(word)  ((((uint32_t)(word)) >> 14) & 0x1FFU)
-
 /* Shared by OP_UNARY and OP_CAST, Tier 1 — dest(7) + unary_op(7, an actual Opcode value like
    OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR, so it needs the same width as opcode itself, not a
    narrow tag) + rk (RK9:9) = op(7)+7+7+9 = 30 bits, entirely in the low word. */

@@ -367,14 +367,15 @@ static int branch_depth = 0;
    needs to check it too. */
 static int function_depth = 0;
 
-/* Top-level ("global") variable names: a name not found among the CURRENT function's own locals
-   (var_lookup) may still be a top-level variable, readable (never assignable — assignment inside a
-   function is always local) from inside any function body. Updated in lockstep with var_names by
-   var_slot itself, but ONLY while function_depth == 0 — var_names gets reset/restored around a
-   function body but this table doesn't, so it keeps accumulating every top-level name defined so
-   far across a function def and back out again. A global defined AFTER a function that reads it
-   (textually) won't be visible to that function — same "no forward references" limitation as
-   functions/structs, not a new gap. */
+/* Top-level ("global") variable names — kept SOLELY to detect one thing: a name used inside a
+   function body that already exists as a top-level variable. Top-level variables are entirely
+   off-limits inside a function — no reads, no writes, and a local/parameter can't reuse the name
+   either (one name means one variable, everywhere; see var_slot's own shadow-ban check, the actual
+   enforcement point). global_regs exists only because global_lookup's signature still reports a
+   register (unused by every caller now — each one just checks the bool and reports the ban). This
+   table is updated in lockstep with var_names by var_slot itself, but ONLY while function_depth ==
+   0 — var_names gets reset/restored around a function body but this table doesn't, so it keeps
+   accumulating every top-level name defined so far across a function def and back out again. */
 static unsigned int global_names[FRAME_REGISTERS];
 static int          global_regs[FRAME_REGISTERS];
 static int          global_count = 0;
@@ -396,9 +397,25 @@ static int          global_count = 0;
      Once reg/index do diverge for some name, var_regs[] is what makes name lookup still resolve to
    the correct actual register — the array position and the real register are no longer assumed to
    be the same number. */
-static int var_slot(unsigned int name_idx) {
+static int var_slot(Chunk* c, unsigned int name_idx) {
     for (int i = 0; i < var_count; i++)
         if (var_names[i] == name_idx) return var_regs[i];
+    /* Shadowing a top-level variable's name is a compile error, not a silent fresh local — one
+       name means one variable everywhere. Catches all three ways this could happen: a bare
+       reference falling through to here (the name is read but doesn't resolve to a local),
+       declaring a fresh local with this name, and naming a parameter after it (parameters are
+       registered via this same function). function_depth == 0 (the name IS the top-level
+       definition itself) is exempt, and so is a name already local to the CURRENT function (the
+       var_names scan above already returned for that case). */
+    if (function_depth > 0) {
+        for (int i = 0; i < global_count; i++) {
+            if (global_names[i] == name_idx) {
+                error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
+                         aer_as_string(c->pool[name_idx])->data);
+                return -1;
+            }
+        }
+    }
     /* Checks reserved_floor — the register `reg` below is about to become — not var_count; the two
        can diverge (see this function's own comment above), and a for-loop's iteration-state
        promotion raises reserved_floor without touching var_count, so checking var_count here let a
@@ -435,8 +452,10 @@ static int var_slot(unsigned int name_idx) {
     return reg;
 }
 
-/* Non-creating — a name found here is a top-level variable, readable from inside a function body
-   (see global_names's own comment). */
+/* Non-creating — a name found here is a top-level variable, which every caller now treats as
+   grounds to report the shadow-ban error, not to read or write it (see global_names's own
+   comment). out_reg is unused by every current caller but kept so a caller can still identify
+   which entry matched, if that's ever useful again. */
 static bool global_lookup(unsigned int name_idx, int* out_reg) {
     for (int i = 0; i < global_count; i++)
         if (global_names[i] == name_idx) { *out_reg = global_regs[i]; return true; }
@@ -517,10 +536,11 @@ static void ensure_boxed(Chunk* c, unsigned int name_idx) {
     chunk_emit(c, PACK_BOX(box_op, new_reg, old_slot));
     var_regs[existing_idx] = new_reg;
     var_kind[existing_idx] = VAR_BOXED;
-    if (function_depth == 0) {
-        for (int i = 0; i < global_count; i++)
-            if (global_names[i] == name_idx) { global_regs[i] = new_reg; break; }
-    }
+    /* No global_regs update needed here: this path only ever runs on a RAW-tracked name (the
+       early return above), and raw tracking never applies to a top-level name (function_depth ==
+       0 is required for a name to enter global_names — see var_slot — but function_depth > 0 is
+       required for a name to become raw-tracked in the first place), so name_idx can never be in
+       global_names at this point. */
 }
 
 /* Ensures rk is a plain register (not RK-const, not raw-flagged), materializing a constant into a
@@ -1255,26 +1275,17 @@ static int parse_primary_inner(Chunk* c) {
             }
         }
 
-        /* A name not among the CURRENT function's own locals may still be a top-level variable,
-           readable via OP_LOAD_GLOBAL (see global_names's own comment). Checked only when
-           var_lookup_rk (non-creating) misses, so a local always shadows a global of the same
-           name.
-             var_lookup_rk (not raw var_lookup) — a raw-tracked name returns an RK_RAW_INT_FLAG/
+        /* var_lookup_rk (not raw var_lookup) — a raw-tracked name returns an RK_RAW_INT_FLAG/
            RK_RAW_REAL_FLAG-tagged operand here instead of a plain register, which is what lets a
            bare reference to it compose through further arithmetic (try_emit_binary_raw) without
            boxing; every consumer that can't handle that (materialize, arg_materialize, emit_binary,
            postfix-chain indexing/field-access, ...) already boxes it back via box_if_raw before
-           doing anything unsafe with it. */
+           doing anything unsafe with it. A name not among the CURRENT function's own locals falls
+           through to var_slot below — if it's a top-level variable, var_slot's own shadow-ban
+           check reports the "not accessible inside a function" error; if it's genuinely new, the
+           existing prototype permissiveness creates a fresh local. */
         int reg;
         if (var_lookup_rk(name_idx, &reg)) return reg;
-        if (function_depth > 0) {
-            int global_reg;
-            if (global_lookup(name_idx, &global_reg)) {
-                int dest = reg_alloc();
-                chunk_emit(c, PACK2(OP_LOAD_GLOBAL, dest, global_reg));
-                return dest;
-            }
-        }
 
         /* Functions as values (bare-name case): a name that isn't a variable/global but IS a
            known function, referenced here WITHOUT a following '(' (so this isn't a call at all —
@@ -1293,7 +1304,7 @@ static int parse_primary_inner(Chunk* c) {
             return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
         }
 
-        reg = var_slot(name_idx);   /* not a known local, global, or function — existing
+        reg = var_slot(c, name_idx);   /* not a known local, global, or function — existing
                                            prototype permissiveness: silently creates a fresh local
                                            (unchanged) */
         return reg < 0 ? 0 : reg;      /* reg<0: error_at already called */
@@ -1825,7 +1836,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             ensure_boxed(c, names[i]);   /* a destructuring target is always a plain boxed write —
                                              never raw-composable — so any existing raw-tracked
                                              name must shadow to boxed BEFORE var_slot looks it up */
-            target_regs[i] = var_slot(names[i]);
+            target_regs[i] = var_slot(c, names[i]);
             if (target_regs[i] < 0) return;   /* error_at already called */
         }
 
@@ -1867,6 +1878,19 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         for (int i = 0; i < var_count; i++) if (var_names[i] == name_idx) { existing_idx = i; break; }
 
         if (existing_idx < 0) {
+            /* Shadow-ban check FIRST, before the raw-eligible fast path below gets a chance to
+               register this name directly (bypassing var_slot's own identical check) — a fresh
+               name matching an existing top-level variable is a compile error regardless of
+               whether its RHS would otherwise qualify for raw storage. */
+            if (function_depth > 0) {
+                for (int i = 0; i < global_count; i++) {
+                    if (global_names[i] == name_idx) {
+                        error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
+                                 aer_as_string(c->pool[name_idx])->data);
+                        return;
+                    }
+                }
+            }
             /* Fresh name. Eligible for raw storage iff: inside a function body (function_depth >
                0 — a top-level/global name always stays boxed, it has no per-call-frame raw
                storage to live in), outside any if/else branch (branch_depth == 0 — see var_kind's
@@ -1961,10 +1985,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             next_temp_register = reserved_floor;
             var_regs[existing_idx] = new_reg;
             var_kind[existing_idx] = VAR_BOXED;
-            if (function_depth == 0) {
-                for (int i = 0; i < global_count; i++)
-                    if (global_names[i] == name_idx) { global_regs[i] = new_reg; break; }
-            }
+            /* No global_regs update needed — see ensure_boxed's identical reasoning: this path
+               only runs on a currently-raw-tracked name, which can never be in global_names. */
             if (rk_val & RK_CONST_FLAG) {
                 chunk_emit(c, PACK1(OP_LOADK, new_reg)); chunk_emit(c, rk_val & ~RK_CONST_FLAG);
             } else if (new_reg != rk_val) {
@@ -1979,7 +2001,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
            be raw-flagged (a raw-composed RHS assigned to a name that can't itself be raw: a global,
            a branch-local first assignment, or a raw-budget overflow above). */
         rk_val = box_if_raw(c, rk_val);
-        int reg = var_slot(name_idx);
+        int reg = var_slot(c, name_idx);
         if (reg < 0) return;   /* error_at already called */
         if (rk_val & RK_CONST_FLAG) {
             chunk_emit(c, PACK1(OP_LOADK, reg)); chunk_emit(c, rk_val & ~RK_CONST_FLAG);
@@ -2088,10 +2110,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             chunk_emit(c, PACK_BOX(box_op, new_reg, old_slot));
             var_regs[existing_idx] = new_reg;
             var_kind[existing_idx] = VAR_BOXED;
-            if (function_depth == 0) {
-                for (int j = 0; j < global_count; j++)
-                    if (global_names[j] == name_idx) { global_regs[j] = new_reg; break; }
-            }
+            /* No global_regs update needed — see ensure_boxed's identical reasoning. */
             rk_rhs = box_if_raw(c, rk_rhs);
             emit_binary(c, new_reg, boxed_op, new_reg, rk_rhs);
             if (is_temp(rk_rhs)) reg_free(1);
@@ -2100,34 +2119,18 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
 
         /* Non-creating lookup — compound assignment to a name with no prior value has no
            sensible register to read from, so it's a compile-time error here. A name that isn't a
-           local of the current function but IS an existing top-level global falls back to a
-           global read-modify-write (OP_LOAD_GLOBAL + OP_BINARY + OP_STORE_GLOBAL) instead of
-           erroring — see OP_STORE_GLOBAL's own comment in vm.h. */
+           local of the current function but IS an existing top-level global is the same
+           shadow-ban error var_slot enforces for a bare reference — top-level variables are
+           entirely off-limits inside a function, read or write. */
         int reg;
-        bool is_global = false;
         if (!var_lookup(name_idx, &reg)) {
-            if (!(function_depth > 0 && global_lookup(name_idx, &reg))) {
-                error_at("Compound assignment target must already have a value (no assigning to an undefined name this way)");
+            int dummy_reg;
+            if (function_depth > 0 && global_lookup(name_idx, &dummy_reg)) {
+                error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
+                         aer_as_string(c->pool[name_idx])->data);
                 return;
             }
-            is_global = true;
-        }
-
-        if (is_global) {
-            int local_reg = reg_alloc();
-            chunk_emit(c, PACK2(OP_LOAD_GLOBAL, local_reg, reg));
-
-            int rk_rhs = parse_binary(c, 0);
-            if (parse_had_error) return;
-            emit_binary(c, local_reg, compound_assign_ops[i].op, local_reg, rk_rhs);
-            if (is_temp(rk_rhs)) reg_free(1);
-
-            if (!rk9_fits(local_reg)) {
-                error_at("Expression too large to compile (register/constant index exceeds the store-global encoding's range)");
-                return;
-            }
-            chunk_emit(c, PACK_STORE_GLOBAL(reg, local_reg));
-            reg_free(1);   /* local_reg */
+            error_at("Compound assignment target must already have a value (no assigning to an undefined name this way)");
             return;
         }
 
@@ -2146,15 +2149,15 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         int reg;
         unsigned int lhs_start = c->count;
         if (!var_lookup_rk(name_idx, &reg)) {
-            if (function_depth > 0 && global_lookup(name_idx, &reg)) {
-                int dest = reg_alloc();
-                chunk_emit(c, PACK2(OP_LOAD_GLOBAL, dest, reg));
-                reg = dest;
-            } else {
-                error_at("'%s' is not defined (a pipe chain's source must already have a value)",
+            int dummy_reg;
+            if (function_depth > 0 && global_lookup(name_idx, &dummy_reg)) {
+                error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
                          aer_as_string(c->pool[name_idx])->data);
                 return;
             }
+            error_at("'%s' is not defined (a pipe chain's source must already have a value)",
+                     aer_as_string(c->pool[name_idx])->data);
+            return;
         }
         int rk_result = parse_binary_ops(c, 0, reg, lhs_start);
         discard_statement_result(c, rk_result);
@@ -2186,19 +2189,11 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
     if (var_lookup(name_idx, &obj_reg)) {
         obj_is_base = true;
     } else if (function_depth > 0 && global_lookup(name_idx, &obj_reg)) {
-        /* `name` isn't a local of the current function but IS an existing top-level global — this
-           is `name[idx] = v`/`name.field = v`, a READ of whatever `name` already refers to
-           (arrays/structs are heap references — mutating through ANY register holding a copy of
-           that same reference correctly mutates the one underlying object), never a definition of
-           `name` itself. Calling var_slot (creating) unconditionally here would, on a miss,
-           silently define a fresh, garbage-valued local shadowing the global instead of reading
-           it. Loads the global into a fresh temp (obj_is_base = false) instead — treated exactly
-           like any other non-base chain temp by every consumer below (safe to overwrite in place
-           for a later hop, freed at the very end). */
-        int global_reg = obj_reg;
-        obj_reg = reg_alloc();
-        chunk_emit(c, PACK2(OP_LOAD_GLOBAL, obj_reg, global_reg));
-        obj_is_base = false;
+        /* `name` isn't a local of the current function but IS an existing top-level global —
+           same shadow-ban error var_slot enforces for a bare reference. */
+        error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
+                 aer_as_string(c->pool[name_idx])->data);
+        return;
     } else {
         error_at("'%s' is not defined (an indexed/field write target must already have a value)",
                  aer_as_string(c->pool[name_idx])->data);
@@ -2637,7 +2632,7 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
                                           element (array/dict/string item) — never raw — so an
                                           existing raw-tracked name of the same spelling must
                                           shadow to boxed BEFORE var_slot looks it up */
-    int item_reg = var_slot(loop_var_name);
+    int item_reg = var_slot(c, loop_var_name);
     if (item_reg < 0) return;
 
     int rk_start = parse_binary(c, 0);   /* the range's start, or the whole collection if no '..' follows */
@@ -2748,9 +2743,9 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
 static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_name) {
     ensure_boxed(c, key_name);   /* same reasoning as parse_for_in's own ensure_boxed call */
     ensure_boxed(c, val_name);
-    int key_reg = var_slot(key_name);
+    int key_reg = var_slot(c, key_name);
     if (key_reg < 0) return;
-    int val_reg = var_slot(val_name);
+    int val_reg = var_slot(c, val_name);
     if (val_reg < 0) return;
 
     int rk_col = parse_binary(c, 0);
@@ -2806,7 +2801,7 @@ static void parse_for_while(Chunk* c) {
            for a genuinely new name (the same creating behavior this line always had). */
         int reg;
         if (!var_lookup_rk(name_idx, &reg)) {
-            reg = var_slot(name_idx);
+            reg = var_slot(c, name_idx);
             if (reg < 0) return;
         }
         unsigned int loop_top = c->count;
@@ -3044,19 +3039,26 @@ static int parse_packed_array_new(Chunk* c, unsigned int name_idx) {
 }
 
 static int parse_call(Chunk* c, unsigned int name_idx) {
-    /* Functions as values: if `name_idx` is already a known variable (holding whatever value it
-       was assigned — possibly a function value), this is a call THROUGH that variable, not a call
-       BY NAME — resolved via OP_CALL_VALUE at runtime instead of the compile-time name resolution
-       below. Same local-shadows-global-shadows-function precedence parse_primary_inner's own
-       bare-reference case uses. A global's register number is only valid in FRAME 0 — var_reg is
-       captured now but only actually materialized into a local temp further down, AFTER dest/arg
-       registers are settled, so that temp ends up on top of the register stack and can be freed
-       correctly (LIFO) once the call is emitted; materializing it here instead would leave it
-       stranded below dest, unfreeable without corrupting the allocator's watermark. */
+    /* Functions as values: if `name_idx` is already a known LOCAL variable (holding whatever value
+       it was assigned — possibly a function value), this is a call THROUGH that variable, not a
+       call BY NAME — resolved via OP_CALL_VALUE at runtime instead of the compile-time name
+       resolution below. var_reg is captured now but only actually materialized into a local temp
+       further down, AFTER dest/arg registers are settled, so that temp ends up on top of the
+       register stack and can be freed correctly (LIFO) once the call is emitted.
+         A top-level variable of this name is never callable from inside a function — same
+       shadow-ban var_slot enforces for a bare reference — reported here immediately so it isn't
+       mistaken for a forward-referencing call to a not-yet-defined function. */
     int  var_reg = -1;
-    bool is_local_var  = var_lookup(name_idx, &var_reg);
-    bool is_global_var = !is_local_var && function_depth > 0 && global_lookup(name_idx, &var_reg);
-    bool is_var = is_local_var || is_global_var;
+    bool is_local_var = var_lookup(name_idx, &var_reg);
+    if (!is_local_var && function_depth > 0) {
+        int dummy_reg;
+        if (global_lookup(name_idx, &dummy_reg)) {
+            error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
+                     aer_as_string(c->pool[name_idx])->data);
+            return 0;
+        }
+    }
+    bool is_var = is_local_var;
 
     bool is_struct = !is_var && is_struct_name(name_idx);
     unsigned int func_offset = 0, func_arity = 0, func_min_arity = 0, func_max_registers = 0;
@@ -3102,21 +3104,18 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
        the base register for a call's result, same compact-register-use philosophy as
        compile_node's free-then-allocate discipline elsewhere. Determined BEFORE any callee_reg
        below is allocated (and before the compaction free at the very end), so a call needing an
-       extra register just for its callee (a materialized global, or a freshly built function
-       value for the padding case) always lands ABOVE dest/the args, never
-       aliasing one of them — seemingly harmless reordering that actually matters: reg_free() is
-       a pure watermark rewind with no memory of what a register held, so allocating a new temp
-       AFTER compacting (this function's own original, buggy order) could silently hand out the
-       very register an omitted-defaults call's remaining argument was still sitting in. */
+       extra register just for its callee (a freshly built function value for the padding case)
+       always lands ABOVE dest/the args, never aliasing one of them — seemingly harmless
+       reordering that actually matters: reg_free() is a pure watermark rewind with no memory of
+       what a register held, so allocating a new temp AFTER compacting (this function's own
+       original, buggy order) could silently hand out the very register an omitted-defaults
+       call's remaining argument was still sitting in. */
     int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
 
-    bool needs_callee_reg = (is_var && is_global_var) || needs_call_value;
+    bool needs_callee_reg = needs_call_value;
     int callee_reg = -1;
-    if (is_global_var) {
-        callee_reg = reg_alloc();
-        chunk_emit(c, PACK2(OP_LOAD_GLOBAL, callee_reg, var_reg));
-    } else if (needs_call_value) {
+    if (needs_call_value) {
         AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
                                              func_max_registers);
         callee_reg = reg_alloc();
@@ -3125,7 +3124,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
 
     if (is_var) {
         last_bare_call_start = c->count;
-        emit_call_value(c, dest, base, arg_count, is_local_var ? var_reg : callee_reg);
+        emit_call_value(c, dest, base, arg_count, var_reg);
         last_bare_call_end = c->count;
     } else if (is_struct) {
         emit_struct_new(c, dest, name_idx, base, arg_count);
@@ -3281,7 +3280,7 @@ static int parse_function_expr(Chunk* c) {
     raw_real_next_temp = 0; raw_real_reserved_floor = 0;
 
     function_depth++;
-    for (int i = 0; i < param_count; i++) var_slot(param_names[i]);
+    for (int i = 0; i < param_count; i++) var_slot(c, param_names[i]);
 
     parse_block(c);
     function_depth--;
@@ -3415,7 +3414,7 @@ static void parse_function(Chunk* c) {
        function_depth > 0, and a parameter is never a global no matter how early in this
        function's compilation it's registered. */
     function_depth++;
-    for (int i = 0; i < param_count; i++) var_slot(param_names[i]);
+    for (int i = 0; i < param_count; i++) var_slot(c, param_names[i]);
 
     parse_block(c);
     function_depth--;
@@ -3801,15 +3800,16 @@ void parser_restore_state(ParserState* s) {
    pending list (pending_call_add) never got defined anywhere in this call. A forward reference's
    failure can only be discovered here, at the very end — by then the statement that made the call
    already compiled "successfully" and was never rolled back, so a still-live OP_CALL with a bogus
-   target needs to be dealt with directly rather than via the per-statement rollback
-   above. Each is reported at its own original call site via a saved/restored cursor override
-   (lexer_set_cursor), then either: retargeted to OP_CALL_GLOBAL_VALUE/OP_TAIL_CALL_GLOBAL_VALUE if
-   the name turned out to be an ordinary top-level variable holding a function value rather than a
-   registered function (`greet` assigned before ever being called, say); or, if never defined at
-   all, neutralized by overwriting the instruction's own packed opcode word with a bare OP_HALT —
-   not just patching the offset to jump to OP_HALT elsewhere, which would still run the call's own
-   arg-copy/frame-swap side effects first. Drained unconditionally so a later, separate parse() call
-   always starts clean — forward references only resolve within one call, never across two. */
+   target needs to be dealt with directly rather than via the per-statement rollback above. Each
+   is reported at its own original call site via a saved/restored cursor override
+   (lexer_set_cursor), neutralized by overwriting the instruction's own packed opcode word with a
+   bare OP_HALT — not just patching the offset to jump to OP_HALT elsewhere, which would still run
+   the call's own arg-copy/frame-swap side effects first. A name that turns out to be an ordinary
+   top-level variable rather than a registered function is reported the same way, not retargeted
+   to a global-reading opcode — top-level variables are never callable from inside a function, and
+   at the top level a genuinely forward-referenced call to a not-yet-assigned variable is simply
+   never valid either way. Drained unconditionally so a later, separate parse() call always starts
+   clean — forward references only resolve within one call, never across two. */
 void parse(Chunk* c) {
     any_compile_error = false;
     while (!equal(TOKEN_END_OF_FILE)) {
@@ -3837,15 +3837,6 @@ void parse(Chunk* c) {
         bool any_pending_error = false;
         for (int i = 0; i < pending_count; i++) {
             unsigned int patch_offset = pending_calls[i].patch_offset;
-            int orig_op = c->code[patch_offset - 1] & 0x7F;
-            int global_reg;
-            if ((orig_op == OP_CALL || orig_op == OP_TAIL_CALL) &&
-                global_lookup(pending_calls[i].name_idx, &global_reg)) {
-                int new_op = (orig_op == OP_CALL) ? OP_CALL_GLOBAL_VALUE : OP_TAIL_CALL_GLOBAL_VALUE;
-                c->code[patch_offset - 1] = (c->code[patch_offset - 1] & ~0x7F) | new_op;
-                c->code[patch_offset] = global_reg;
-                continue;
-            }
             c->code[patch_offset - 1] = OP_HALT;
             lexer_set_cursor(pending_calls[i].call_site_cursor);
             error_at("Unknown function or struct type '%s' (never defined anywhere in this compile — not a valid forward reference, module call, or struct construction target)",

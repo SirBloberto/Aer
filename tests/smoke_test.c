@@ -1358,10 +1358,9 @@ int main(void) {
         chunk_free(&c);
     }
 
-    /* Test 61 (feature completeness): a top-level ("global") variable is readable from inside a
-       function body via OP_LOAD_GLOBAL, mirroring parser.c's own local-miss-falls-back-to-
-       global read. `SCALE` (register 0) is defined before `scaled` is called; `scaled`'s own
-       parameter `x` shadows nothing since there's no name collision here. */
+    /* Test 61 (feature completeness): a top-level ("global") variable is entirely off-limits
+       inside a function — no reads, no writes — so `scaled` reading `SCALE` by bare name is a
+       compile error, not a silent global load. The value has to be passed in explicitly. */
     {
         Chunk c;
         chunk_init(&c);
@@ -1370,14 +1369,27 @@ int main(void) {
             "SCALE = 10\n"
             "function scaled(x):\n    return x * SCALE\n"
             "y = scaled(4)\n");
-        check(ok, "real source function reading a top-level global (SCALE) ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 40, "y == 40 — 4 * SCALE (SCALE read correctly from inside scaled())");
+        check(!ok, "a function reading a top-level variable by bare name is a compile error");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        VM vm;
+        bool ok = run_source(&c, &vm,
+            "SCALE = 10\n"
+            "function scaled(x, scale):\n    return x * scale\n"
+            "y = scaled(4, SCALE)\n");
+        check(ok, "the same computation works once the value is passed in as a parameter");
+        check(aer_as_int(register_get(&vm, 1)) == 40, "y == 40 — 4 * SCALE, passed in explicitly");
         check(aer_as_int(register_get(&vm, 0)) == 10, "SCALE == 10 — unchanged by the call");
         chunk_free(&c);
     }
 
-    /* Test 62 (feature completeness): assignment inside a function is always local — it must NOT
-       silently write through to a same-named global. */
+    /* Test 62 (feature completeness): a fresh local name inside a function that collides with an
+       existing top-level variable's name is a compile error — one name means one variable,
+       everywhere, so there is no shadowing to fall back to (the old behavior this replaces: a
+       same-named local silently shadowed the global rather than ever touching it). */
     {
         Chunk c;
         chunk_init(&c);
@@ -1386,9 +1398,20 @@ int main(void) {
             "x = 1\n"
             "function set_local():\n    x = 99\n    return x\n"
             "y = set_local()\n");
-        check(ok, "real source function-local assignment shadowing a global ran without error");
+        check(!ok, "a function-local name colliding with an existing top-level variable is a compile error");
+        chunk_free(&c);
+    }
+    {
+        Chunk c;
+        chunk_init(&c);
+        VM vm;
+        bool ok = run_source(&c, &vm,
+            "x = 1\n"
+            "function set_local():\n    z = 99\n    return z\n"
+            "y = set_local()\n");
+        check(ok, "a differently-named function-local works fine, unaffected by the unrelated top-level x");
         check(aer_as_int(register_get(&vm, 1)) == 99, "y == 99 — set_local()'s own return value");
-        check(aer_as_int(register_get(&vm, 0)) == 1, "x == 1 at top level — unchanged; the function's 'x = 99' was local, not a write-through to the global");
+        check(aer_as_int(register_get(&vm, 0)) == 1, "x == 1 at top level — untouched, set_local() never referenced it");
         chunk_free(&c);
     }
 
@@ -1656,12 +1679,13 @@ int main(void) {
     /* Test 70 (feature completeness — M6 slice 4, functions as values, bare-name case): `fn =
        double` (a bare function name referenced as a value, not called) then `fn(21)` (calling
        through the variable) — previously silently created a fresh, garbage-valued local instead
-       (the bug this fixes). Also covers calling through a variable read as a GLOBAL from inside a
-       different function's body (`call_it`'s own `fn(x)`), which needs OP_LOAD_GLOBAL to
-       materialize the value into a local temp first, not a raw register reference into frame 0 —
-       the trickier register-allocation-ordering half of this fix (see parse_call's own
-       comment). No default parameters here (`double`/`call_it` both take exactly one required
-       argument) — v3 doesn't parse default parameters yet, a separate, still-open gap. */
+       (the bug this fixes). Also covers calling through a variable holding a function value from
+       inside a DIFFERENT function's body (`call_it`'s own `f(x)`) — `f` is a parameter here, not a
+       top-level variable read by bare name (top-level variables are entirely inaccessible inside a
+       function, see test_errors_scope.aer), so this still exercises "call through a variable that
+       isn't the current function's own arg 0" without depending on that removed mechanism. No
+       default parameters here (`double`/`call_it` both take exactly the required arguments) — v3
+       doesn't parse default parameters yet, a separate, still-open gap. */
     {
         Chunk c;
         chunk_init(&c);
@@ -1673,13 +1697,13 @@ int main(void) {
             "fn = double\n"
             "y = fn(21)\n"
             "\n"
-            "function call_it(x):\n"
-            "    return fn(x)\n"
+            "function call_it(f, x):\n"
+            "    return f(x)\n"
             "\n"
-            "z = call_it(10)\n");
-        check(ok, "real source functions-as-values (bare-name reference + call-through-variable, both local and global) ran without error");
+            "z = call_it(fn, 10)\n");
+        check(ok, "real source functions-as-values (bare-name reference + call-through-variable, both top-level and through a parameter) ran without error");
         check(aer_as_int(register_get(&vm, 1)) == 42, "y == 42 — fn(21) called through a local variable holding double's function value");
-        check(aer_as_int(register_get(&vm, 2)) == 20, "z == 20 — call_it(10) = fn(10), fn read as a GLOBAL from inside a different function's body");
+        check(aer_as_int(register_get(&vm, 2)) == 20, "z == 20 — call_it(fn, 10) = fn(10), fn passed through as a parameter into a different function's body");
         chunk_free(&c);
     }
 
