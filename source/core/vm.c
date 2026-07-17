@@ -692,8 +692,7 @@ Shape* chunk_find_shape(Chunk* c, const char* name) {
 /* See ChunkFunction's own comment in vm.h. Appended by func_register (parser.c) at the same
    moment it updates its own parse-time-only lookup tables. */
 void chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offset,
-                         unsigned int arity, unsigned int min_arity, AerVal* defaults,
-                         bool has_receiver, unsigned int receiver_type) {
+                         unsigned int arity, unsigned int min_arity, AerVal* defaults) {
     if (c->function_count >= c->function_cap) {
         c->function_cap = c->function_cap ? c->function_cap * 2 : 8;
         c->functions = xrealloc(c->functions, sizeof(ChunkFunction) * c->function_cap);
@@ -704,8 +703,6 @@ void chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offse
     f->arity         = arity;
     f->min_arity     = min_arity;
     f->defaults      = defaults;
-    f->has_receiver  = has_receiver;
-    f->receiver_type = receiver_type;
     /* Safe placeholder until parse_function patches in the real captured peak after the body
        finishes compiling — see ChunkFunction's own comment. Never an under-allocation even for the
        one case that can read it before the patch runs (self-reference from within this same
@@ -1213,14 +1210,14 @@ static AerVal vm_default_value(AerVal dflt) {
 
 /* Used only by aer_module_call for a cross-module call into a v3-compiled file's exported
    function (see ChunkFunction's own comment, vm.h) — mirrors lbl_call_value's frame-push
-   exactly (arity/receiver check, default-filling), just as a standalone function since
+   exactly (arity check, default-filling), just as a standalone function since
    aer_module_call isn't inside vm_run's computed-goto dispatch loop. dest_reg is fixed at 0: this
    always sets up the SECOND frame (index target->call_depth + 1) above target's own top-level
    (frame 0), so once vm_run(target) drains back to depth 0 on return_ip's OP_HALT, the result is
    sitting in target->call_stack[0].registers[0] — a fixed, known slot the caller
    (aer_module_call) can read without needing any of target's own variables' registers to stay
    predictable. */
-bool setup_call(VM* target, Chunk* fn_chunk, ChunkFunction* fn, int arg_count,
+bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
                     AerVal* args, unsigned int return_ip) {
     if (arg_count < (int)fn->min_arity || arg_count > (int)fn->arity) {
         if (fn->min_arity == fn->arity)
@@ -1228,15 +1225,6 @@ bool setup_call(VM* target, Chunk* fn_chunk, ChunkFunction* fn, int arg_count,
         else
             error("Function expects between %u and %u arguments, got %d", fn->min_arity, fn->arity, arg_count);
         return false;
-    }
-    if (fn->has_receiver) {
-        AerVal arg0 = args[0];
-        if (aer_type(arg0) != TYPE_ARRAY || !aer_as_array(arg0)->shape ||
-            aer_as_array(arg0)->shape->name != fn->receiver_type) {
-            error("Function expects its first argument to be a %s",
-                  aer_as_string(fn_chunk->pool[fn->receiver_type])->data);
-            return false;
-        }
     }
     if (target->call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); return false; }
     CallFrame* caller = &target->call_stack[target->call_depth];
@@ -1265,7 +1253,7 @@ bool setup_call(VM* target, Chunk* fn_chunk, ChunkFunction* fn, int arg_count,
    each caller DISPATCH() once it's back). `dest_reg`/`arg_reg_base`/`arg_count` are the caller's
    own operands; `is_tail_call` is whether the calling label's own opcode was its
    OP_TAIL_CALL_* counterpart. */
-static void vm_call_value(VM* vm, Chunk* c, AerVal fv, int dest_reg, int arg_reg_base, int arg_count,
+static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int arg_count,
                               bool is_tail_call) {
     if (aer_type(fv) != TYPE_FUNCTION) { error("Value is not callable"); return; }
     AerFunction* f = aer_as_function(fv);
@@ -1275,18 +1263,6 @@ static void vm_call_value(VM* vm, Chunk* c, AerVal fv, int dest_reg, int arg_reg
         else
             error("Function expects between %u and %u arguments, got %d", (unsigned int)f->min_arity, (unsigned int)f->arity, arg_count);
         return;
-    }
-    /* struct-shape-checked receiver parameter (`function f(target as Type, ...)`): vm->registers
-       still points at the CALLER's own frame here (the push below hasn't happened yet), so
-       arg_reg_base indexes directly into it. */
-    if (f->has_receiver) {
-        AerVal arg0 = vm->registers[arg_reg_base];
-        if (aer_type(arg0) != TYPE_ARRAY || !aer_as_array(arg0)->shape ||
-            aer_as_array(arg0)->shape->name != f->receiver_type) {
-            error("Function expects its first argument to be a %s",
-                  aer_as_string(c->pool[f->receiver_type])->data);
-            return;
-        }
     }
     /* Tail-call reuse, see OP_TAIL_CALL's own comment in vm.h. `f` is already a plain pointer by
        this point, so overwriting its source register during the copy below — entirely possible
@@ -2128,7 +2104,7 @@ lbl_call_value: {
     /* vm_call_value writes a new vm->ip internally (function entry) or leaves it untouched (an
        error return) — either way, ip must be reloaded from it before the next READ(), since
        DISPATCH() only writes vm->ip, it doesn't read it back. */
-    vm_call_value(vm, c, vm->registers[callee_reg], dest_reg, arg_reg_base, arg_count,
+    vm_call_value(vm, vm->registers[callee_reg], dest_reg, arg_reg_base, arg_count,
                       cur_op == OP_TAIL_CALL_VALUE);
     ip = vm->ip;
     DISPATCH();
@@ -2143,7 +2119,7 @@ lbl_call_global_value: {
     int arg_count    = (int)UNPACK_C(op_word);
     int global_reg   = READ();
     /* See lbl_call_value's own comment above — same reload-after-call reasoning. */
-    vm_call_value(vm, c, vm->call_stack[0].registers[global_reg], dest_reg, arg_reg_base, arg_count,
+    vm_call_value(vm, vm->call_stack[0].registers[global_reg], dest_reg, arg_reg_base, arg_count,
                       cur_op == OP_TAIL_CALL_GLOBAL_VALUE);
     ip = vm->ip;
     DISPATCH();

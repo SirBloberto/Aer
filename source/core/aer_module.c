@@ -281,7 +281,7 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
     /* Trampoline: setup_call pushes a real call frame whose return address is this module's
        own top-level HALT, so vm_run(mv) executes exactly one call and stops — see its own comment
        (vm.c) for why the result always lands in mv->call_stack[0].registers[0]. */
-    if (!setup_call(mv, m->chunk, fnreg, arg_count, args, m->halt_addr)) {
+    if (!setup_call(mv, fnreg, arg_count, args, m->halt_addr)) {
         push_null_result(vm);
         return true;
     }

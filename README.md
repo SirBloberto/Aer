@@ -295,7 +295,7 @@ AER is dynamically typed. There are eight underlying value types:
 | Integer | `0`, `42`, `-7` | `long long`; true division always returns Real |
 | Real | `3.14`, `-0.5` | `double` |
 | String | `"hello"` | Immutable; supports indexing, slicing, iteration, interpolation and escapes |
-| Function | `function foo(): ...` | First-class; stores code offset, arity, and an optional struct-typed receiver |
+| Function | `function foo(): ...` | First-class; stores code offset and arity |
 | Array | `[1, 2, 3]` | Mutable; reference semantics — see [Lists](#lists) |
 | Dict | `{"a": 1}` | Mutable string-keyed; reference semantics — see [Maps](#maps) |
 
@@ -523,8 +523,7 @@ for i in 0..10:
 ## Functions
 
 Functions are defined with `function` and return a value with `return`. A bare `return` or
-falling off the end of a function returns `null`. Parameters are dynamically typed except an
-optional struct-typed receiver on the first parameter (see [Structs](#structs)). Recursive
+falling off the end of a function returns `null`. Parameters are dynamically typed. Recursive
 and mutually recursive functions work without forward declarations.
 
 A function body is always the indented block form, same as `if`/`else`:
@@ -783,23 +782,17 @@ instance:
 # append(p1, 1)    # error: structs have a fixed shape
 ```
 
-**Struct-typed receiver parameters** are AER's substitute for methods — only the first parameter
-of a function may carry `as Type`, and it's enforced at every call site, not just documentation:
+AER has no methods — all functions live in one flat global scope. A function that operates on a
+struct just takes it as a plain parameter:
 
 ```
-function point_translate(p as Point, dx, dy):
+function point_translate(p, dx, dy):
     return Point(p.x + dx, p.y + dy)
 
-point_translate(p1, 1.0, 1.0)   # ok
-# point_translate(some_other_struct, 1.0, 1.0)   # errors: expects its first argument to be a Point
+point_translate(p1, 1.0, 1.0)
 ```
 
-There is no struct-namespaced method table — all functions live in one flat global scope; a
-receiver only *enforces* which values a function accepts, it doesn't let two different functions
-share a name the way `point.translate()` vs. `circle.translate()` would in a language with real
-methods.
-
-`x as Point` used outside a function signature is the standalone form of the same check — see
+`x as Point` is a standalone runtime shape check, not part of a function signature — see
 [Casting and Shape-Checking](#casting-and-shape-checking--as).
 
 ## Method Calls and Pipes
@@ -976,9 +969,6 @@ how AER's single-pass compiler works:
   importing program's own same-named globals.
 - **Member access is call-only**, matching the native modules — `helpers.double(x)` works,
   `helpers.SOME_CONSTANT` does not.
-- **A struct-typed receiver parameter doesn't work across a module boundary** — struct shape names
-  are resolved against pool indices, and each file has its own separate pool. Plain values (numbers,
-  strings, arrays, dicts, functions) pass through fine.
 - **Importing the same file twice is a no-op**, cached by import name. **Circular imports are
   rejected** with a parse-time error.
 - Module names are cached process-wide by the name given to `import`, not by resolved path — two
@@ -992,8 +982,8 @@ Each file-module is a fully separate VM and namespace — nothing crosses that b
 
 - Cross-file access is always explicitly qualified (`module.function()`), never ambient. There's no
   way to reach into an imported file's globals except by calling one of its functions.
-- Struct types are scoped to the file that declares them (reinforced by the struct-receiver
-  limitation above — a shape name is only meaningful within its own file's pool).
+- Struct types are scoped to the file that declares them — a shape name is only meaningful within
+  its own file's pool.
 - Two files can each freely define a same-named function or struct with zero collision, precisely
   because nothing crosses the boundary implicitly. `helpers.aer` and `main.aer` can both define
   `double(n)` without either one shadowing or conflicting with the other.
@@ -1287,12 +1277,12 @@ game, a config parser) simply doesn't call it, and its scripts have none.
   `vm_run()`'s return value and `aer_last_error()` (see [Embedding](#embedding)) — what's still
   missing is *AER script code* catching its own errors, a deliberate non-goal.
 - File-based `import` is call-only and parse-time-executed — no access to a module's non-function
-  bindings, no cross-module struct receivers, no re-exporting one module's bindings through
-  another, no path-keyed module cache. See [Modularity](#modularity) for the full list.
+  bindings, no re-exporting one module's bindings through another, no path-keyed module cache. See
+  [Modularity](#modularity) for the full list.
 - No variadic functions or keyword arguments. Default parameters exist (trailing, literal-only —
   see [Functions](#functions)), matching the same restriction struct field defaults already have.
-- No general type annotations — the only typed position is a struct-typed receiver on a function's
-  first parameter (`p as Point`), checked at runtime, not statically inferred.
+- No general type annotations on function parameters — struct fields are the only mandatory-typed
+  position (see [Structs](#structs)).
 - No struct methods namespaced by type — see [Structs](#structs).
 - No concurrency of any kind — see [Concurrency](#concurrency).
 
@@ -1363,10 +1353,10 @@ avoiding any heap allocation per iteration.
 compile time. A `LoopContext` struct tracks the entry scope depth and the number of iterator slots
 on the value stack, so both are unwound correctly on early exit.
 
-Struct declarations (`parse_struct`) and receiver-typed parameters (`p as Point`) resolve the
-struct's identity at **runtime**, not parse time — exactly like a function name, a struct isn't
-known to exist until the statement that declares it actually executes. The parser just emits the
-field list and defers name resolution to the VM's shape registry.
+Struct declarations (`parse_struct`) resolve the struct's identity at **runtime**, not parse time —
+exactly like a function name, a struct isn't known to exist until the statement that declares it
+actually executes. The parser just emits the field list and defers name resolution to the VM's
+shape registry.
 
 `import` is resolved entirely at parse time (see [Modularity](#modularity)) — a file-based import
 runs the imported file's code synchronously, in an isolated `Chunk`/`VM`, before the importing
@@ -1403,10 +1393,9 @@ loop ends).
 
 **Call stack:** a static array of `CallFrame`s (return address, scope depth — doubling as the
 scope-lookup floor described above). `OP_CALL` saves a frame and jumps to the function's bytecode
-offset; if the callee declared a struct-typed receiver on parameter 0, the argument's shape is
-checked against it before the jump. `OP_RETURN` unwinds all scopes back to the saved depth, restores
-the instruction pointer, and pushes the return value. This call-setup logic (arity check, receiver
-check, frame construction) is factored into a single shared helper, `vm_setup_call`, used both for an
+offset. `OP_RETURN` unwinds all scopes back to the saved depth, restores
+the instruction pointer, and pushes the return value. This call-setup logic (arity check, frame
+construction) is factored into a single shared helper, `vm_setup_call`, used both for an
 ordinary in-VM call and for invoking a file-module's function across the VM boundary (see below).
 
 **Inline caching for call targets and globals:** each `OP_CALL`/`OP_TAIL_CALL`/`OP_LOAD`/`OP_STORE`

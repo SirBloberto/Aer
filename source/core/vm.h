@@ -117,8 +117,8 @@ typedef enum {
        word — originally a placeholder callee_offset — becomes a global register index instead.
        This fits in exactly the same 2-word shape a plain OP_CALL already reserved, so no
        bytecode needs to shift and no other jump target needs re-patching.
-         Same runtime shape as OP_CALL_VALUE otherwise (arity check, receiver check,
-       default-filling, frame push) — just resolving `fv` from call_stack[0].registers[global_reg]
+         Same runtime shape as OP_CALL_VALUE otherwise (arity check, default-filling, frame push)
+       — just resolving `fv` from call_stack[0].registers[global_reg]
        (mirroring OP_LOAD_GLOBAL's own read) instead of a register in the CURRENT frame, so a
        later reassignment of the global (`greet = greet_v2`) is picked up immediately on the very
        next call through this same call site — it's read fresh every dispatch, never cached. */
@@ -202,11 +202,7 @@ typedef enum {
 
     /* `x as Point` where Point is a known STRUCT type (not integer/float/boolean/string,
        OP_CAST's own scope) — errors unless src_reg holds exactly that struct type, else passes
-       the value through unchanged (never converts). Also used, at compile time, by
-       parse_function/parse_call whenever a function has a struct-shape-checked first
-       ("receiver") parameter: see AerFunction.has_receiver/receiver_type's own check inside
-       lbl_call_value, which performs the equivalent test at call setup instead of via this
-       opcode (a receiver check happens once per call, not as a separate expression a user wrote). */
+       the value through unchanged (never converts). */
     OP_CHECK_SHAPE, /* operands: dest_reg, src_reg, type_name_pool_idx — errors unless
                            registers[src_reg] is an instance of that struct type, else
                            registers[dest_reg] = registers[src_reg] unchanged */
@@ -980,8 +976,6 @@ typedef struct {
                                      no-cleanup precedent, since a Chunk usually lives for the whole
                                      process anyway), freed only by chunk_free's own explicit
                                      teardown (aer_module_free_all) */
-    bool         has_receiver;
-    unsigned int receiver_type;  /* meaningful only when has_receiver */
     /* This function's real peak register need, captured at compile time (parser.c's
        max_register_used, patched in after the body finishes) — used at call time to bump
        vm->registers by exactly this much instead of always FRAME_REGISTERS. chunk_add_function
@@ -1165,8 +1159,7 @@ Shape*       chunk_find_shape(Chunk* c, const char* name);
 /* See ChunkFunction's own comment above. `defaults` is taken by ownership (never copied), matching
    how AerFunction.defaults and Shape.field_defaults are already handled. */
 void           chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offset,
-                                   unsigned int arity, unsigned int min_arity, AerVal* defaults,
-                                   bool has_receiver, unsigned int receiver_type);
+                                   unsigned int arity, unsigned int min_arity, AerVal* defaults);
 ChunkFunction* chunk_find_function(Chunk* c, const char* name);
 
 /* Parse-time variant — name_idx is a dedup'd pool index, so this is an int compare, no strcmp. */
@@ -1199,11 +1192,11 @@ void vm_gc_unsuppress(void);
 
 /* Call setup used only by aer_module_call (aer_module.c) for a cross-module call into another
    file's exported function — see ChunkFunction's own comment. Pushes a real CallFrame onto
-   target's own call stack (arity/receiver checks, default-filling, mirroring lbl_call_value
+   target's own call stack (arity check, default-filling, mirroring lbl_call_value
    exactly) with dest_reg fixed at 0, so the trampoline convention is: after vm_run(target) drains
    back to call depth 0 (hitting return_ip's OP_HALT), the result is sitting in
    target->call_stack[0].registers[0]. Full contract in setup_call's own comment in vm.c. */
-bool setup_call(VM* target, Chunk* fn_chunk, ChunkFunction* fn, int arg_count,
+bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
                     AerVal* args, unsigned int return_ip);
 
 /* Returns an uninitialized AerArray header from vm.c's internal slab pool, as if xmalloc'd directly (every in-file vm.c site still uses pool_alloc); exposed only because aer_stdlib.c's string.split() needs one and the pool isn't a raw global outside vm.c. */

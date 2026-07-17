@@ -1,6 +1,6 @@
 #!/usr/bin/env aer
-# AER test suite — structs: fixed-shape records, dot-access, struct-typed
-# receiver parameters, and shape-checking via `as`.
+# AER test suite — structs: fixed-shape records, dot-access, and
+# shape-checking via `as`.
 # Machine-checked via assert(): a clean run exits 0; any failure prints
 # "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
 #
@@ -50,24 +50,23 @@ assert(type(p1) == "Point", "struct instances report their declared type name")
 # print(p1[0])           # would error: use '.' not '[]'
 # append(p1, 1)          # would error: fixed shape
 
-# Struct-typed receiver parameters — only parameter 0 may carry `as Type`,
-# enforced at every call site (not just documentation).
+# Structs are heap references — mutation through a plain passed-in
+# parameter is visible to the caller, no special parameter form needed.
 struct Enemy:
     hp: integer = 100
 
-function heal(target as Point, amount):
+function heal(target, amount):
     target.x += amount
     return target
 
 heal(p1, 5.0)
-assert(p1.x == 15, "struct-typed receiver parameter, mutation through it via compound assignment")
+assert(p1.x == 15, "mutation through a passed-in struct reference via compound assignment")
 
 e = Enemy()
-# heal(e, 5.0)            # would error: heal() expects its first argument to be a Point
 
-# `as StructName` outside a function signature is a standalone runtime
-# shape check — it verifies, it never converts (there's no single
-# well-defined way to reshape one struct into another).
+# `as StructName` is a standalone runtime shape check — it verifies, it
+# never converts (there's no single well-defined way to reshape one
+# struct into another).
 checked = p1 as Point
 assert(checked.x == 15, "'as StructName' passes a matching instance through unchanged")
 # bad = e as Point        # would error: Expected a 'Point', got a 'Enemy'

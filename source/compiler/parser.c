@@ -781,7 +781,6 @@ static bool func_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offse
    correct final captured value in every other case. */
 static bool func_full_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offset, unsigned int* out_arity,
                                  unsigned int* out_min_arity, AerVal** out_defaults,
-                                 bool* out_has_receiver, unsigned int* out_receiver_type,
                                  unsigned int* out_max_registers) {
     ChunkFunction* f = chunk_find_function_by_name_idx(c, name_idx);
     if (!f) return false;
@@ -789,8 +788,6 @@ static bool func_full_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_
     *out_arity         = f->arity;
     *out_min_arity     = f->min_arity;
     *out_defaults      = f->defaults;
-    *out_has_receiver  = f->has_receiver;
-    *out_receiver_type = f->receiver_type;
     *out_max_registers = f->max_registers;
     return true;
 }
@@ -798,19 +795,14 @@ static bool func_full_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_
 /* Functions as values / default parameters. Builds a real runtime AerFunction, reusing the
    existing representation/constructor (vm_new_function/aer_function_val) rather than duplicating
    it. `defaults` is used AS-IS, not copied — it's already an independently xmalloc'd array
-   (func_register's own comment). has_receiver/receiver_type (`function f(target as Type, ...)`)
-   are checked once, at call setup (lbl_call_value, vm.c), not via a separate opcode a user's own
-   code would need to emit. */
+   (func_register's own comment). */
 static AerVal build_function_value(unsigned int func_offset, unsigned int arity, unsigned int min_arity,
-                                       AerVal* defaults, bool has_receiver, unsigned int receiver_type,
-                                       unsigned int max_registers) {
+                                       AerVal* defaults, unsigned int max_registers) {
     AerFunction* fn = vm_new_function();
     fn->code_offset   = func_offset;
     fn->arity         = (uint16_t)arity;
     fn->min_arity     = (uint16_t)min_arity;
     fn->defaults      = defaults;
-    fn->has_receiver  = has_receiver;
-    fn->receiver_type = receiver_type;
     fn->max_registers = max_registers;
     return aer_function_val(fn);
 }
@@ -856,9 +848,8 @@ static void pending_call_add(unsigned int name_idx, unsigned int patch_offset, c
    built (parse_function), or NULL if this function has no defaulted parameters; stored as-is,
    never copied, same as AerFunction.defaults itself never is. */
 static void func_register(Chunk* c, unsigned int name_idx, unsigned int offset, unsigned int arity,
-                              unsigned int min_arity, AerVal* defaults,
-                              bool has_receiver, unsigned int receiver_type) {
-    chunk_add_function(c, name_idx, offset, arity, min_arity, defaults, has_receiver, receiver_type);
+                              unsigned int min_arity, AerVal* defaults) {
+    chunk_add_function(c, name_idx, offset, arity, min_arity, defaults);
 
     /* Patch every earlier forward-referencing call to this name now that its real offset is
        known — swap-remove each match (order among pending entries never matters) so the list is
@@ -1293,13 +1284,12 @@ static int parse_primary_inner(Chunk* c) {
            reference as an ordinary pool constant — chunk_add_pool already dedups identical
            TYPE_FUNCTION values by code_offset+arity, so repeated references to the same function
            share one AerFunction, not one each. */
-        unsigned int func_offset, func_arity, func_min_arity, func_receiver_type, func_max_registers;
+        unsigned int func_offset, func_arity, func_min_arity, func_max_registers;
         AerVal* func_defaults;
-        bool func_has_receiver;
         if (func_full_lookup(c, name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
-                                 &func_has_receiver, &func_receiver_type, &func_max_registers)) {
+                                 &func_max_registers)) {
             AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
-                                                 func_has_receiver, func_receiver_type, func_max_registers);
+                                                 func_max_registers);
             return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
         }
 
@@ -3069,12 +3059,11 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     bool is_var = is_local_var || is_global_var;
 
     bool is_struct = !is_var && is_struct_name(name_idx);
-    unsigned int func_offset = 0, func_arity = 0, func_min_arity = 0, func_receiver_type = 0, func_max_registers = 0;
+    unsigned int func_offset = 0, func_arity = 0, func_min_arity = 0, func_max_registers = 0;
     AerVal* func_defaults = NULL;
-    bool func_has_receiver = false;
     bool is_func = !is_var && !is_struct &&
                    func_full_lookup(c, name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
-                                        &func_has_receiver, &func_receiver_type, &func_max_registers);
+                                        &func_max_registers);
     /* Forward references / mutual recursion. A name that isn't a variable, struct, known
        function, or builtin is not an immediate error: it's optimistically assumed to be a
        function defined LATER in this same parse() call (see pending_call_add's own comment). If
@@ -3107,20 +3096,14 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
             error_at("Function '%s' expects between %u and %u arguments, got %d", fname, func_min_arity, func_arity, arg_count);
         return 0;
     }
-    bool needs_padding = is_func && (unsigned int)arg_count < func_arity;
-    /* A receiver-checked function (`function f(target as Type, ...)`) must always route through
-       OP_CALL_VALUE, even at exact arity: the receiver check itself lives in lbl_call_value, since
-       that's the only call path with a real runtime AerFunction value to read
-       has_receiver/receiver_type from — OP_CALL's target is just a bare compile-time offset, with
-       no such value at all. */
-    bool needs_call_value = needs_padding || func_has_receiver;
+    bool needs_call_value = is_func && (unsigned int)arg_count < func_arity;
 
     /* The result reuses the first argument's register — matches Lua's own convention of reusing
        the base register for a call's result, same compact-register-use philosophy as
        compile_node's free-then-allocate discipline elsewhere. Determined BEFORE any callee_reg
        below is allocated (and before the compaction free at the very end), so a call needing an
        extra register just for its callee (a materialized global, or a freshly built function
-       value for the padding/receiver-checked case) always lands ABOVE dest/the args, never
+       value for the padding case) always lands ABOVE dest/the args, never
        aliasing one of them — seemingly harmless reordering that actually matters: reg_free() is
        a pure watermark rewind with no memory of what a register held, so allocating a new temp
        AFTER compacting (this function's own original, buggy order) could silently hand out the
@@ -3135,7 +3118,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         chunk_emit(c, PACK2(OP_LOAD_GLOBAL, callee_reg, var_reg));
     } else if (needs_call_value) {
         AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
-                                             func_has_receiver, func_receiver_type, func_max_registers);
+                                             func_max_registers);
         callee_reg = reg_alloc();
         chunk_emit(c, PACK1(OP_LOADK, callee_reg)); chunk_emit(c, (int)chunk_add_pool(c, fv));
     }
@@ -3149,7 +3132,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     } else if (is_func) {
         last_bare_call_start = c->count;
         if (needs_call_value) emit_call_value(c, dest, base, arg_count, callee_reg);
-        else                   emit_call(c, dest, func_offset, base, arg_count);   /* exact arity, no receiver check — no forward-ref patching needed, is_func means already resolved */
+        else                   emit_call(c, dest, func_offset, base, arg_count);   /* exact arity — no forward-ref patching needed, is_func means already resolved */
         last_bare_call_end = c->count;
     } else {
         last_bare_call_start = c->count;
@@ -3330,7 +3313,7 @@ static int parse_function_expr(Chunk* c) {
         for (unsigned int i = 0; i < default_count; i++) defaults[i] = param_defaults[(unsigned int)min_param_count + i];
     }
     AerVal fv = build_function_value(func_start, (unsigned int)param_count, (unsigned int)min_param_count,
-                                         defaults, false, 0, captured_max_registers);
+                                         defaults, captured_max_registers);
     return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
 }
 
@@ -3350,8 +3333,6 @@ static void parse_function(Chunk* c) {
     int param_count     = 0;
     int min_param_count = 0;
     bool seen_default   = false;
-    bool has_receiver          = false;
-    unsigned int receiver_type = 0;
     if (!equal(TOKEN_CLOSE_PARENTHESE)) {
         do {
             if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected parameter name"); return; }
@@ -3361,20 +3342,6 @@ static void parse_function(Chunk* c) {
             }
             param_names[param_count] = chunk_add_pool(c, token.value);
             lex();
-            /* `target as Type`, only meaningful on parameter 0 (the receiver), checked once at
-               call setup (lbl_call_value, vm.c) against the call's first argument. Always
-               consumes a stray 'as' here (not just when param_count==0) so a later annotation
-               gets one clear error instead of desyncing the parser. */
-            if (consume(TOKEN_AS)) {
-                if (param_count != 0) {
-                    error_at("A struct-type parameter ('as Type') is only allowed on the first parameter — it names that parameter as the method receiver, checked once against the call's first argument; there's no mechanism to check later parameters, so give them a plain name instead");
-                    return;
-                }
-                if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a struct type name after 'as'"); return; }
-                receiver_type = chunk_add_pool(c, token.value);
-                has_receiver  = true;
-                lex();
-            }
             if (consume(TOKEN_ASSIGN)) {
                 if (!parse_literal_default(c, &param_defaults[param_count])) {
                     error_at("Parameter defaults must be a literal value");
@@ -3434,8 +3401,7 @@ static void parse_function(Chunk* c) {
         defaults = xmalloc(sizeof(AerVal) * default_count);
         for (unsigned int i = 0; i < default_count; i++) defaults[i] = param_defaults[(unsigned int)min_param_count + i];
     }
-    func_register(c, name_idx, func_start, (unsigned int)param_count, (unsigned int)min_param_count, defaults,
-                      has_receiver, receiver_type);
+    func_register(c, name_idx, func_start, (unsigned int)param_count, (unsigned int)min_param_count, defaults);
     /* max_registers isn't known until the body below finishes compiling (patched in further down) —
        safe because nothing reads it until this function is actually CALLED at runtime, long after
        compilation ends; func_register/chunk_add_function must still run before the body so a

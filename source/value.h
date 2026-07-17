@@ -119,20 +119,18 @@ struct AerPackedArray {
 };
 _Static_assert(offsetof(struct AerPackedArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* gc_state first, same reasoning as AerArray above. Then pointer, then the two pool-index-sized
-   ints (code_offset/receiver_type can each exceed 65535 in a large program's constant pool, so
-   they stay full width), then the two fields bounded by a language-level cap (arity/min_arity <=
-   MAX_PARAMS == SCOPE_SLOT_MAX == 32, comfortably inside uint16_t), then the single bool — every
-   AerFunction is a plain function value now that closures (and their upvalues array) are gone. */
+/* gc_state first, same reasoning as AerArray above. Then pointer, then the pool-index-sized int
+   (code_offset can exceed 65535 in a large program's constant pool, so it stays full width), then
+   the two fields bounded by a language-level cap (arity/min_arity <= MAX_PARAMS ==
+   SCOPE_SLOT_MAX == 32, comfortably inside uint16_t) — every AerFunction is a plain function value
+   now that closures (and their upvalues array) are gone. */
 struct AerFunction {
     unsigned char gc_state;
     AerVal*      defaults;        /* NULL if min_arity == arity; else (arity - min_arity) compile-time-literal values */
     unsigned int code_offset;
-    unsigned int receiver_type;   /* pool index of Type's name, if has_receiver */
     unsigned int max_registers;   /* this function's real peak register need — see ChunkFunction's own comment, vm.h */
     uint16_t     arity;
     uint16_t     min_arity;       /* params [0, min_arity) are required; [min_arity, arity) use defaults[] below, in order */
-    bool         has_receiver;    /* true if param 0 was declared `p as Type` */
 };
 _Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
