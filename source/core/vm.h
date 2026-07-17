@@ -949,6 +949,12 @@ typedef struct {
    included, into ONE word instead of three. */
 /* ------------------------------------------------------------------ */
 
+/* One per-callsite field-cache entry — see Chunk.field_cache's own comment below. */
+typedef struct {
+    Shape* shape;
+    int    slot;
+} FieldCacheEntry;
+
 typedef struct {
     uint64_t* code;
     unsigned int count, capacity;
@@ -990,9 +996,11 @@ typedef struct {
        incorrect, only sometimes not-sped-up. Shape* is never reallocated once created (see struct
        Shape's own comment), so a cached pointer never goes stale; grown in lockstep with `code` by
        chunk_ensure_field_cache (vm.c), called once at the top of vm_run. NULL shape means "not
-       cached yet". */
-    Shape**      field_cache_shape;
-    int*         field_cache_slot;
+       cached yet". One array of {shape, slot} pairs, not two parallel arrays — every real access
+       reads/writes both fields together, so this halves the cache lines touched per lookup on the
+       two hottest opcodes (FIELD_GET/FIELD_SET) instead of scattering shape/slot across two
+       independently-strided allocations. */
+    FieldCacheEntry* field_cache;
     unsigned int field_cache_cap;
 
 #ifdef AER_DEBUG_TOOLS

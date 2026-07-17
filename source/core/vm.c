@@ -565,9 +565,8 @@ void chunk_free(Chunk* c) {
     free(c->functions);
     for (unsigned int i = 0; i < c->shape_count; i++) free(c->shapes[i]);
     free(c->shapes);
-    /* Not each entry — every populated slot is a Shape* owned by c->shapes, never separately owned. */
-    free(c->field_cache_shape);
-    free(c->field_cache_slot);
+    /* Not each entry's shape — every populated slot's Shape* is owned by c->shapes, never separately owned. */
+    free(c->field_cache);
 #ifdef AER_DEBUG_TOOLS
     free(c->debug_hits);
 #endif
@@ -1251,9 +1250,12 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
    itself jump to a vm_run-local label, but it doesn't need to: it just does the work and lets
    the caller DISPATCH() once it's back). `dest_reg`/`arg_reg_base`/`arg_count` are the caller's
    own operands; `is_tail_call` is whether the calling label's own opcode was its
-   OP_TAIL_CALL_* counterpart. */
+   OP_TAIL_CALL_* counterpart. `return_ip` is the caller's own local `ip` (the resume address,
+   already past this instruction's operands) — passed explicitly rather than read from vm->ip so
+   this function has no dependency on that field being kept in sync for anything but error
+   reporting. */
 static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int arg_count,
-                              bool is_tail_call) {
+                              bool is_tail_call, unsigned int return_ip) {
     if (aer_type(fv) != TYPE_FUNCTION) { error("Value is not callable"); return; }
     AerFunction* f = aer_as_function(fv);
     if (arg_count < (int)f->min_arity || arg_count > (int)f->arity) {
@@ -1288,7 +1290,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         callee->registers[i] = caller->registers[arg_reg_base + i];
     for (int i = arg_count; i < (int)f->arity; i++)
         callee->registers[i] = vm_default_value(f->defaults[i - f->min_arity]);
-    callee->return_ip   = vm->ip;
+    callee->return_ip   = return_ip;
     callee->dest_reg    = dest_reg;
     vm->call_depth++;   /* the defaults loop above wrote into callee->registers[] BEFORE this point, when mark_vm_roots's 0..call_depth scan didn't yet cover that frame — gc_maybe_collect() must run AFTER this increment, not before, or a collection could reclaim a fresh default array/dict as unreachable */
     gc_maybe_collect(vm);
@@ -1299,22 +1301,23 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
 }
 
 /* Resolves field_idx to a slot within shape, checking the per-callsite inline cache
-   (field_cache_shape/slot, keyed by `site` — this instruction's own bytecode offset) first. The
-   shape-only half of vm_resolve_field's lookup, split out so a caller that already has a Shape*
-   without going through a register/AerArray (OP_INDEX_FIELD_GET/SET's packed branch, keyed off
+   (field_cache, keyed by `site` — this instruction's own bytecode offset) first. The shape-only
+   half of vm_resolve_field's lookup, split out so a caller that already has a Shape* without
+   going through a register/AerArray (OP_INDEX_FIELD_GET/SET's packed branch, keyed off
    AerPackedArray.shape directly) can share the same cache — safe to share: the cache only ever
    stores (shape, slot) pairs, and a given field name's slot within a given Shape is identical
    whether that shape backs a boxed struct instance or a packed array. Returns false (error
    already reported) if shape has no such field. */
 static inline __attribute__((always_inline)) bool vm_resolve_field_by_shape(Chunk* c, unsigned int site, Shape* shape, int field_idx, int* out_slot) {
-    if (c->field_cache_shape[site] == shape) {
-        *out_slot = c->field_cache_slot[site];
+    FieldCacheEntry* entry = &c->field_cache[site];
+    if (entry->shape == shape) {
+        *out_slot = entry->slot;
         return true;
     }
     for (unsigned int i = 0; i < shape->field_count; i++) {
         if (shape->field_names[i] == (unsigned int)field_idx) {
-            c->field_cache_shape[site] = shape;
-            c->field_cache_slot[site]  = (int)i;
+            entry->shape = shape;
+            entry->slot  = (int)i;
             *out_slot = (int)i;
             return true;
         }
@@ -1643,8 +1646,8 @@ static void chunk_ensure_debug_hits(Chunk* c) {
 }
 #endif
 
-/* Grows Chunk.field_cache_shape/slot to cover every word currently in c->code, zero-filling the
-   new region (NULL shape = not cached) — same growth idiom as chunk_ensure_debug_hits above, but
+/* Grows Chunk.field_cache to cover every word currently in c->code, zero-filling the new region
+   (NULL shape = not cached) — same growth idiom as chunk_ensure_debug_hits above, but
    unconditional: this is a real always-on perf feature, not a debug tool. Called once at the top
    of vm_run; a no-op once field_cache_cap already covers c->count (REPL appends code across
    vm_run calls, same as debug_hits). */
@@ -1652,9 +1655,8 @@ static void chunk_ensure_field_cache(Chunk* c) {
     if (c->count <= c->field_cache_cap) return;
     unsigned int old_cap = c->field_cache_cap;
     c->field_cache_cap = c->count;
-    c->field_cache_shape = xrealloc(c->field_cache_shape, sizeof(Shape*) * c->field_cache_cap);
-    c->field_cache_slot  = xrealloc(c->field_cache_slot,  sizeof(int)    * c->field_cache_cap);
-    memset(c->field_cache_shape + old_cap, 0, sizeof(Shape*) * (c->field_cache_cap - old_cap));
+    c->field_cache = xrealloc(c->field_cache, sizeof(FieldCacheEntry) * c->field_cache_cap);
+    memset(c->field_cache + old_cap, 0, sizeof(FieldCacheEntry) * (c->field_cache_cap - old_cap));
 }
 
 bool vm_run(VM* vm) {
@@ -1674,8 +1676,16 @@ bool vm_run(VM* vm) {
     jmp_buf  catch_point;
     jmp_buf* saved_unwind_target = runtime_error_unwind_target;
     runtime_error_unwind_target  = &catch_point;
+    /* Was set on every single DISPATCH() before — this call's own VM never changes for the
+       whole run (a nested module/stdlib call either runs on a different VM's own vm_run(),
+       which does this same save/restore, or never touches active_vm_for_errors at all), so one
+       store here plus one restore at each of this call's two exits (below, and lbl_halt) is
+       exactly equivalent, at a fraction of the cost. */
+    VM* saved_active_vm  = active_vm_for_errors;
+    active_vm_for_errors = vm;
     if (setjmp(catch_point) != 0) {
         runtime_error_unwind_target = saved_unwind_target;
+        active_vm_for_errors        = saved_active_vm;
         return false;
     }
     Opcode cur_op;
@@ -1699,12 +1709,14 @@ bool vm_run(VM* vm) {
        field loop, trailing jump-target words) call READ() several times per dispatch, each paying
        a fresh load+store. Kept in sync with vm->ip at exactly two kinds of point: the end of every
        DISPATCH() (so active_vm_for_errors->ip stays correct for any error() call the next opcode's
-       body makes, identical to today's behavior) and immediately around the two vm_call_value()
-       calls below (the only place outside this function that reads or writes the SAME vm's ip —
-       module/stdlib calls operate on a different VM or never touch ip at all, confirmed by
-       inspection, so they need no such sync). Every other jump/call/return site in this function
-       only ever reads/writes ip using data already local to it, so using the hoisted local instead
-       of vm->ip directly is a pure substitution there — no additional sync needed. */
+       body makes, identical to today's behavior) and immediately around the vm_call_value() call
+       below (the only place outside this function that writes the SAME vm's ip — module/stdlib
+       calls operate on a different VM or never touch ip at all, confirmed by inspection, so they
+       need no such sync; vm_call_value's own return-address computation takes `ip` as an explicit
+       parameter now, not a read of vm->ip, so this reload is purely to pick up the new entry point
+       vm_call_value wrote on a successful call). Every other jump/call/return site in this
+       function only ever reads/writes ip using data already local to it, so using the hoisted
+       local instead of vm->ip directly is a pure substitution there — no additional sync needed. */
     unsigned int ip = vm->ip;
 #ifdef AER_DEBUG_TOOLS
     chunk_ensure_debug_hits(c);
@@ -2098,9 +2110,11 @@ lbl_call_value: {
     int callee_reg   = (int)UNPACK_REG4_D(op_word);
     /* vm_call_value writes a new vm->ip internally (function entry) or leaves it untouched (an
        error return) — either way, ip must be reloaded from it before the next READ(), since
-       DISPATCH() only writes vm->ip, it doesn't read it back. */
+       DISPATCH() only writes vm->ip, it doesn't read it back. OP_CALL_VALUE is a single packed
+       word with no trailing operand (PACK_REG4), so the local `ip` already holds the correct
+       resume address (past this instruction, nothing else to skip) to pass as return_ip. */
     vm_call_value(vm, vm->registers[callee_reg], dest_reg, arg_reg_base, arg_count,
-                      cur_op == OP_TAIL_CALL_VALUE);
+                      cur_op == OP_TAIL_CALL_VALUE, ip);
     ip = vm->ip;
     DISPATCH();
 }
@@ -3181,5 +3195,6 @@ lbl_raw_gte_real_boxed: {
 
 lbl_halt:
     runtime_error_unwind_target = saved_unwind_target;
+    active_vm_for_errors        = saved_active_vm;
     return true;
 }

@@ -119,6 +119,24 @@ make
 ```
 
 Output is written to `binary/aer` (`binary/aer.exe` on Windows — the Makefile handles the suffix).
+This is the dev build (debug symbols, no profile data) — use it for anything that might need gdb
+or a readable ASAN/fuzzer backtrace.
+
+For a release build, use profile-guided optimization instead:
+
+```sh
+make pgo
+```
+
+This is a two-pass build: pass 1 instruments a build and runs it against a representative workload
+plus the full test suite to record real execution-frequency data; pass 2 recompiles from that
+profile so the compiler lays out hot/cold code using actual behavior instead of static heuristics.
+Output is `binary/aer-pgo` (measured ~6-9% fewer instructions/cycles than the plain build on this
+project's own reference benchmark — re-run the comparison on your own workload before relying on
+that number, since PGO's benefit is workload-shaped by construction). Rebuild with `make pgo`
+whenever the source changes — the profile data is regenerated from the current binary each time,
+not cached.
+
 To clean:
 
 ```sh
