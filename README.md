@@ -1358,10 +1358,10 @@ matters in practice.
 
 ### Packed arrays at scale
 
-[`nbody.aer`](nbody.aer) (the classic n-body benchmark, N=5 bodies) is small enough that its whole
-working set stays resident in L1 cache regardless of memory layout — it doesn't exercise packed
-arrays' actual advantage. [`nbody_large_packed.aer`](nbody_large_packed.aer) and
-[`nbody_large_boxed.aer`](nbody_large_boxed.aer) run the identical physics and deterministic
+[`bench/nbody.aer`](bench/nbody.aer) (the classic n-body benchmark, N=5 bodies) is small enough
+that its whole working set stays resident in L1 cache regardless of memory layout — it doesn't
+exercise packed arrays' actual advantage. [`bench/nbody_large_packed.aer`](bench/nbody_large_packed.aer)
+and [`bench/nbody_large_boxed.aer`](bench/nbody_large_boxed.aer) run the identical physics and deterministic
 initial conditions at N=1024, differing only in one line: a packed `Body[1024]` versus an ordinary
 array of individually heap-allocated `Body()` instances. Measured on a Raspberry Pi (5-run-averaged
 `perf stat`, interleaved):
@@ -1387,6 +1387,9 @@ plus the test suite, not your specific program).
 ---
 
 ## Architecture
+
+This section is the summary; [`ARCHITECTURE.md`](ARCHITECTURE.md) is the full internals reference
+(value representation, allocator/GC, the register VM, the compiler, and the optimization history).
 
 AER uses a **single-pass compiler** — the parser emits bytecode directly as it recognises
 constructs. There is no intermediate AST. The pipeline is:
@@ -1788,12 +1791,13 @@ raises a normal AER runtime error instead of risking a stack overflow.
 | `source/utilities/pool.h/c` | Slab (bump/arena) allocator extended for the generational mark-sweep garbage collector — every pool-managed struct (`AerString`/`AerArray`/`AerDict`/`AerFunction`/`AerPackedArray`) carries its own one-byte GC state as its literal first field |
 | `source/utilities/error.h/c` | Error reporting with source location and column pointer; recoverable-error sink (callback or stderr), `aer_report_fatal` for genuinely unrecoverable conditions, `assert_failure_count` |
 | `include/aer.h` | Public embedding API: version constant, error callback/query functions, custom native-function registration (see [Embedding](#embedding)) |
-| `test.aer`, `tests/test_*.aer` | Runnable documentation and regression suites — `assert()`-based, exits nonzero on any failure. Run with `make test`. |
+| `tests/test_*.aer` | Runnable documentation and regression suites — `assert()`-based, exits nonzero on any failure. Run with `make test`. |
+| `ARCHITECTURE.md` | Internals-facing reference — value representation, allocator/GC, the register VM, the compiler, and the optimizations layered on top. The [Architecture](#architecture) section here is the summary; that document is the full story. |
 | `tests/embed_smoke_test.c` | Minimal standalone embedding host — proves a runtime error doesn't kill the process, demonstrates the VM-reuse-after-error contract, and registers/calls a custom host function. Build/run with `make test-embed`. |
 | `tests/smoke_test.c` | Register-VM unit test — hand-built bytecode plus real-source coverage below the level of a full `.aer` file. Build/run with `make test-smoke`. |
 | `tests/fuzz.py` | Mutation-based fuzzer against an ASAN build — reports crashes and hangs. Run with `make fuzz`. |
 | `tests/benchmark.sh` | Cross-language benchmark against Python/Lua (see [Benchmarking](#benchmarking)) |
-| `nbody.aer`, `nbody_large_packed.aer`, `nbody_large_boxed.aer` | Packed-array benchmarks at N=5 and N=1024 (see [Benchmarking](#benchmarking)) |
+| `bench/` | Standalone benchmark scripts — `nbody.aer`/`nbody_large_*.aer` (packed arrays, see [Benchmarking](#benchmarking)), `fib_bench.aer`, `sieve.aer`, micro-benches, plus the Python/Lua reference versions of nbody and sieve |
 | `.github/workflows/ci.yml` | CI: builds, runs `make test`, `make test-embed`, `make fuzz` (ASAN, fixed seed), and `make coverage` |
 
 ---

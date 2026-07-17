@@ -47,14 +47,6 @@ object/%.o: source/%.c
 	@mkdir -p $(dir $@)
 	gcc $(FLAGS) -c $< -o $@
 
-# No -g — smaller binary, no debug symbols. Use `all` (the default) for anything that
-# might need gdb or a readable ASAN/fuzzer backtrace; this is for a release artifact only.
-PERFORMANCE_FLAGS := -O2 -Wall -Wextra -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities
-
-performance: $(SOURCE)
-	@mkdir -p binary
-	gcc $(PERFORMANCE_FLAGS) -o binary/aer-performance$(EXE) $(SOURCE) -lm $(WINLIBS)
-
 # Disassembler + opcode/memory profiling (source/core/disasm.c, AER_DEBUG_TOOLS-gated code in
 # vm.c/vm.h) — entirely absent from every other target, including `all`. Run with AER_DISASSEMBLE
 # set (a path, or "-" for stderr) to dump a disassembly + hit-count summary + memory report after
@@ -117,7 +109,7 @@ fuzz: asan
 	python3 tests/fuzz.py --binary binary/aer-asan$(EXE) --iterations $(FUZZ_ITERATIONS) $(FUZZ_SEED)
 
 # Profile-guided optimization: a two-pass build, not a source change. Pass 1 instruments a build
-# with -fprofile-generate and runs it against nbody.aer (the actual workload this targets) plus the
+# with -fprofile-generate and runs it against bench/nbody.aer (the actual workload this targets) plus the
 # full test suite (broader code-path coverage), producing real execution-frequency data in
 # object-pgo/*.gcda; pass 2 recompiles with -fprofile-use so gcc lays out hot/cold code from that
 # real profile instead of static heuristics.
@@ -127,7 +119,7 @@ pgo: $(SOURCE)
 	@rm -rf $(PGO_DIR)
 	@mkdir -p binary $(PGO_DIR)
 	gcc $(FLAGS) -fprofile-generate=$(PGO_DIR) -o binary/aer-pgo-gen$(EXE) $(SOURCE) -lm $(WINLIBS)
-	./binary/aer-pgo-gen$(EXE) nbody.aer
+	./binary/aer-pgo-gen$(EXE) bench/nbody.aer
 	@for t in $(TESTS); do ./binary/aer-pgo-gen$(EXE) $$t >/dev/null 2>&1 || true; done
 	gcc $(FLAGS) -fprofile-use=$(PGO_DIR) -fprofile-correction -Wno-coverage-mismatch -Wno-missing-profile -o binary/aer-pgo$(EXE) $(SOURCE) -lm $(WINLIBS)
 

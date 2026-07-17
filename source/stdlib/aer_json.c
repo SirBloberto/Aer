@@ -4,67 +4,45 @@
 #include <string.h>
 #include "aer_stdlib.h"
 #include "error.h"
-
-/* Growable string buffer — vm.c's StrBuilder is `static` (private to vm.c), so this file needs its own copy, same as aer_io.c's make_pair/make_error. */
-typedef struct { char* buf; size_t len; size_t cap; } JsonBuf;
-
-static void jb_init(JsonBuf* b) {
-    b->cap = 64;
-    b->buf = xmalloc(b->cap);
-    b->len = 0;
-    b->buf[0] = '\0';
-}
-
-static void jb_append_n(JsonBuf* b, const char* s, size_t n) {
-    if (b->len + n + 1 > b->cap) {
-        while (b->len + n + 1 > b->cap) b->cap *= 2;
-        b->buf = xrealloc(b->buf, b->cap);
-    }
-    memcpy(b->buf + b->len, s, n);
-    b->len += n;
-    b->buf[b->len] = '\0';
-}
-
-static void jb_append(JsonBuf* b, const char* s)  { jb_append_n(b, s, strlen(s)); }
-static void jb_append_char(JsonBuf* b, char ch)   { jb_append_n(b, &ch, 1); }
+#include "strbuf.h"
 
 /* ------------------------------------------------------------------ */
 /* encode                                                              */
 /* ------------------------------------------------------------------ */
 
-static void json_encode_string(JsonBuf* b, const char* s, unsigned int len) {
-    jb_append_char(b, '"');
+static void json_encode_string(StrBuf* b, const char* s, unsigned int len) {
+    strbuf_append_char(b, '"');
     for (unsigned int i = 0; i < len; i++) {
         unsigned char ch = (unsigned char)s[i];
         switch (ch) {
-            case '"':  jb_append(b, "\\\""); break;
-            case '\\': jb_append(b, "\\\\"); break;
-            case '\n': jb_append(b, "\\n");  break;
-            case '\r': jb_append(b, "\\r");  break;
-            case '\t': jb_append(b, "\\t");  break;
-            case '\b': jb_append(b, "\\b");  break;
-            case '\f': jb_append(b, "\\f");  break;
+            case '"':  strbuf_append(b, "\\\""); break;
+            case '\\': strbuf_append(b, "\\\\"); break;
+            case '\n': strbuf_append(b, "\\n");  break;
+            case '\r': strbuf_append(b, "\\r");  break;
+            case '\t': strbuf_append(b, "\\t");  break;
+            case '\b': strbuf_append(b, "\\b");  break;
+            case '\f': strbuf_append(b, "\\f");  break;
             default:
                 if (ch < 0x20) {
                     char esc[8];
                     snprintf(esc, sizeof(esc), "\\u%04x", ch);
-                    jb_append(b, esc);
+                    strbuf_append(b, esc);
                 } else {
-                    jb_append_char(b, (char)ch);
+                    strbuf_append_char(b, (char)ch);
                 }
         }
     }
-    jb_append_char(b, '"');
+    strbuf_append_char(b, '"');
 }
 
 /* Returns false (error() already called) for a function or packed-array value — everything else succeeds. A struct instance (AerArray with a shape) encodes as a JSON object keyed by field names, so they survive a round trip via json.decode(). */
-static bool json_encode_value(Chunk* c, AerVal v, JsonBuf* b) {
+static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
     char tmp[64];
     switch (aer_type(v)) {
-        case TYPE_NULL:    jb_append(b, "null"); break;
-        case TYPE_BOOLEAN: jb_append(b, aer_as_bool(v) ? "true" : "false"); break;
-        case TYPE_INTEGER: snprintf(tmp, sizeof(tmp), "%lld", aer_as_int(v));  jb_append(b, tmp); break;
-        case TYPE_REAL:    snprintf(tmp, sizeof(tmp), "%g",   aer_as_real(v)); jb_append(b, tmp); break;
+        case TYPE_NULL:    strbuf_append(b, "null"); break;
+        case TYPE_BOOLEAN: strbuf_append(b, aer_as_bool(v) ? "true" : "false"); break;
+        case TYPE_INTEGER: snprintf(tmp, sizeof(tmp), "%lld", aer_as_int(v));  strbuf_append(b, tmp); break;
+        case TYPE_REAL:    snprintf(tmp, sizeof(tmp), "%g",   aer_as_real(v)); strbuf_append(b, tmp); break;
         case TYPE_STRING: {
             AerString* s = aer_as_string(v);
             json_encode_string(b, s->data, s->length);
@@ -77,39 +55,39 @@ static bool json_encode_value(Chunk* c, AerVal v, JsonBuf* b) {
             AerArray* a = aer_as_array(v);
             if (a->shape) {
                 Shape* shape = a->shape;
-                jb_append_char(b, '{');
+                strbuf_append_char(b, '{');
                 for (unsigned int i = 0; i < shape->field_count; i++) {
-                    if (i > 0) jb_append_char(b, ',');
+                    if (i > 0) strbuf_append_char(b, ',');
                     AerString* fname = aer_as_string(c->pool[shape->field_names[i]]);
                     json_encode_string(b, fname->data, fname->length);
-                    jb_append_char(b, ':');
+                    strbuf_append_char(b, ':');
                     if (!json_encode_value(c, a->items[i], b)) return false;
                 }
-                jb_append_char(b, '}');
+                strbuf_append_char(b, '}');
                 break;
             }
-            jb_append_char(b, '[');
+            strbuf_append_char(b, '[');
             for (unsigned int i = 0; i < a->count; i++) {
-                if (i > 0) jb_append_char(b, ',');
+                if (i > 0) strbuf_append_char(b, ',');
                 if (!json_encode_value(c, a->items[i], b)) return false;
             }
-            jb_append_char(b, ']');
+            strbuf_append_char(b, ']');
             break;
         }
         case TYPE_DICT: {
             AerDict* d = aer_as_dict(v);
-            jb_append_char(b, '{');
+            strbuf_append_char(b, '{');
             bool first = true;
             for (unsigned int i = 0; i < d->map.capacity; i++) {
                 HashTableEntry* e = &d->map.buckets[i];
                 if (!e->key) continue;
-                if (!first) jb_append_char(b, ',');
+                if (!first) strbuf_append_char(b, ',');
                 first = false;
                 json_encode_string(b, e->key, e->length);
-                jb_append_char(b, ':');
+                strbuf_append_char(b, ':');
                 if (!json_encode_value(c, e->payload, b)) return false;
             }
-            jb_append_char(b, '}');
+            strbuf_append_char(b, '}');
             break;
         }
         case TYPE_PACKED_ARRAY:
@@ -157,24 +135,24 @@ static AerVal json_parse_value(JsonParser* p);
 
 static AerVal json_parse_string_raw(JsonParser* p) {
     p->pos++;   /* opening quote */
-    JsonBuf b;
-    jb_init(&b);
+    StrBuf b;
+    strbuf_init(&b);
     while (p->pos < p->len && p->s[p->pos] != '"') {
         char ch = p->s[p->pos];
-        if (ch != '\\') { jb_append_char(&b, ch); p->pos++; continue; }
+        if (ch != '\\') { strbuf_append_char(&b, ch); p->pos++; continue; }
 
         p->pos++;
         if (p->pos >= p->len) { json_set_error(p, "Unterminated escape in JSON string"); free(b.buf); return aer_null(); }
         char esc = p->s[p->pos];
         switch (esc) {
-            case '"':  jb_append_char(&b, '"');  p->pos++; break;
-            case '\\': jb_append_char(&b, '\\'); p->pos++; break;
-            case '/':  jb_append_char(&b, '/');  p->pos++; break;
-            case 'n':  jb_append_char(&b, '\n'); p->pos++; break;
-            case 't':  jb_append_char(&b, '\t'); p->pos++; break;
-            case 'r':  jb_append_char(&b, '\r'); p->pos++; break;
-            case 'b':  jb_append_char(&b, '\b'); p->pos++; break;
-            case 'f':  jb_append_char(&b, '\f'); p->pos++; break;
+            case '"':  strbuf_append_char(&b, '"');  p->pos++; break;
+            case '\\': strbuf_append_char(&b, '\\'); p->pos++; break;
+            case '/':  strbuf_append_char(&b, '/');  p->pos++; break;
+            case 'n':  strbuf_append_char(&b, '\n'); p->pos++; break;
+            case 't':  strbuf_append_char(&b, '\t'); p->pos++; break;
+            case 'r':  strbuf_append_char(&b, '\r'); p->pos++; break;
+            case 'b':  strbuf_append_char(&b, '\b'); p->pos++; break;
+            case 'f':  strbuf_append_char(&b, '\f'); p->pos++; break;
             case 'u': {
                 if (p->pos + 4 >= p->len) { json_set_error(p, "Invalid \\u escape in JSON string"); free(b.buf); return aer_null(); }
                 char hex[5];
@@ -184,15 +162,15 @@ static AerVal json_parse_string_raw(JsonParser* p) {
                 p->pos += 5;
                 /* Encoded straight to UTF-8, basic-plane only — no surrogate pair reconstruction, since nothing here needs anything past the BMP. */
                 if (code < 0x80) {
-                    jb_append_char(&b, (char)code);
+                    strbuf_append_char(&b, (char)code);
                 } else if (code < 0x800) {
                     char buf2[2] = { (char)(0xC0 | (code >> 6)), (char)(0x80 | (code & 0x3F)) };
-                    jb_append_n(&b, buf2, 2);
+                    strbuf_append_n(&b, buf2, 2);
                 } else {
                     char buf3[3] = { (char)(0xE0 | (code >> 12)),
                                       (char)(0x80 | ((code >> 6) & 0x3F)),
                                       (char)(0x80 | (code & 0x3F)) };
-                    jb_append_n(&b, buf3, 3);
+                    strbuf_append_n(&b, buf3, 3);
                 }
                 break;
             }
@@ -336,8 +314,8 @@ static AerVal json_decode(AerString* input, char** err_out) {
 bool aer_json_call(VM* vm, Chunk* c, const char* name, int arg_count) {
     if (strcmp(name, "encode") == 0 && arg_count == 1) {
         AerVal v = vm_stack_pop(vm);
-        JsonBuf b;
-        jb_init(&b);
+        StrBuf b;
+        strbuf_init(&b);
         if (!json_encode_value(c, v, &b)) {
             free(b.buf);
             vm_stack_push(vm, aer_null());

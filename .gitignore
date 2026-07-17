@@ -23,3 +23,11 @@
 *.gcov
 *.gcda
 *.gcno
+
+#PGO build artifacts
+/object-pgo/*
+
+#Profiling/debugging leftovers — never fixtures to keep
+*.o
+perf.data*
+*.perf.data*

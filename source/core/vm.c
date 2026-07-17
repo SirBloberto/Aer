@@ -7,6 +7,7 @@
 #include "aer_stdlib.h"
 #include "error.h"
 #include "pool.h"
+#include "strbuf.h"
 #include "vm.h"
 
 /* Slab pools for heap types confirmed (via every free() site) to never be freed individually — alloc-speed only. Guarded since vm_init() reruns per VM/module import and would otherwise leak slabs. */
@@ -180,7 +181,7 @@ static void worklist_push(AerVal v) {
     gc_worklist.items[gc_worklist.count++] = v;
 }
 
-/* Shared by TYPE_FUNCTION marking and CallFrame root marking (a frame's executing function is a raw AerFunction*, not a wrapped Value). */
+/* Shared by TYPE_FUNCTION marking and CallFrame root marking (a frame's executing function is a raw AerFunction*, not a wrapped AerVal). */
 static void mark_function(AerFunction* f) {
     pool_mark(&function_pool, f);
 }
@@ -806,91 +807,70 @@ static const char* vm_type_name(Chunk* c, AerVal v) {
 /* Value formatting — shared by print() and vm_to_str() (interpolation, +, etc.) for one consistent recursive rendering, not a terse "<array[3]>" fallback. */
 /* ------------------------------------------------------------------ */
 
-typedef struct { char* buf; size_t len; size_t cap; } StrBuilder;
+static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb);
 
-static void sb_init(StrBuilder* sb) {
-    sb->cap = 64;
-    sb->buf = xmalloc(sb->cap);
-    sb->len = 0;
-    sb->buf[0] = '\0';
-}
-
-static void sb_append_n(StrBuilder* sb, const char* s, size_t n) {
-    if (sb->len + n + 1 > sb->cap) {
-        while (sb->len + n + 1 > sb->cap) sb->cap *= 2;
-        sb->buf = xrealloc(sb->buf, sb->cap);
-    }
-    memcpy(sb->buf + sb->len, s, n);
-    sb->len += n;
-    sb->buf[sb->len] = '\0';
-}
-
-static void sb_append(StrBuilder* sb, const char* s) { sb_append_n(sb, s, strlen(s)); }
-
-static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuilder* sb);
-
-static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuilder* sb) {
+static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
     char tmp[64];
     switch (aer_type(v)) {
-        case TYPE_NULL:     sb_append(sb, "null"); break;
-        case TYPE_INTEGER:  snprintf(tmp, sizeof(tmp), "%lld", aer_as_int(v));  sb_append(sb, tmp); break;
-        case TYPE_REAL:     snprintf(tmp, sizeof(tmp), "%g",   aer_as_real(v)); sb_append(sb, tmp); break;
-        case TYPE_BOOLEAN:  sb_append(sb, aer_as_bool(v) ? "true" : "false"); break;
-        case TYPE_FUNCTION: sb_append(sb, "<function>"); break;
+        case TYPE_NULL:     strbuf_append(sb, "null"); break;
+        case TYPE_INTEGER:  snprintf(tmp, sizeof(tmp), "%lld", aer_as_int(v));  strbuf_append(sb, tmp); break;
+        case TYPE_REAL:     snprintf(tmp, sizeof(tmp), "%g",   aer_as_real(v)); strbuf_append(sb, tmp); break;
+        case TYPE_BOOLEAN:  strbuf_append(sb, aer_as_bool(v) ? "true" : "false"); break;
+        case TYPE_FUNCTION: strbuf_append(sb, "<function>"); break;
         case TYPE_STRING: {
             AerString* s = aer_as_string(v);
-            if (in_collection) sb_append(sb, "\"");
-            sb_append_n(sb, s->data, s->length);
-            if (in_collection) sb_append(sb, "\"");
+            if (in_collection) strbuf_append(sb, "\"");
+            strbuf_append_n(sb, s->data, s->length);
+            if (in_collection) strbuf_append(sb, "\"");
             break;
         }
         case TYPE_ARRAY: {
             AerArray* a = aer_as_array(v);
             if (a->shape) {
                 Shape* shape = a->shape;
-                sb_append(sb, aer_as_string(c->pool[shape->name])->data);
-                sb_append(sb, "{");
+                strbuf_append(sb, aer_as_string(c->pool[shape->name])->data);
+                strbuf_append(sb, "{");
                 for (unsigned int i = 0; i < shape->field_count; i++) {
-                    if (i > 0) sb_append(sb, ", ");
-                    sb_append(sb, aer_as_string(c->pool[shape->field_names[i]])->data);
-                    sb_append(sb, ": ");
+                    if (i > 0) strbuf_append(sb, ", ");
+                    strbuf_append(sb, aer_as_string(c->pool[shape->field_names[i]])->data);
+                    strbuf_append(sb, ": ");
                     vm_format_value(c, a->items[i], true, sb);
                 }
-                sb_append(sb, "}");
+                strbuf_append(sb, "}");
                 break;
             }
-            sb_append(sb, "[");
+            strbuf_append(sb, "[");
             for (unsigned int i = 0; i < a->count; i++) {
-                if (i > 0) sb_append(sb, ", ");
+                if (i > 0) strbuf_append(sb, ", ");
                 vm_format_value(c, a->items[i], true, sb);
             }
-            sb_append(sb, "]");
+            strbuf_append(sb, "]");
             break;
         }
         case TYPE_PACKED_ARRAY: {
             AerPackedArray* pa = aer_as_packed_array(v);
-            sb_append(sb, aer_as_string(c->pool[pa->shape->name])->data);
-            sb_append(sb, "[");
+            strbuf_append(sb, aer_as_string(c->pool[pa->shape->name])->data);
+            strbuf_append(sb, "[");
             snprintf(tmp, sizeof(tmp), "%u", pa->count);
-            sb_append(sb, tmp);
-            sb_append(sb, "]");
+            strbuf_append(sb, tmp);
+            strbuf_append(sb, "]");
             break;
         }
         case TYPE_DICT: {
             AerDict* d = aer_as_dict(v);
-            sb_append(sb, "{");
+            strbuf_append(sb, "{");
             bool first = true;
             for (unsigned int i = 0; i < d->map.capacity; i++) {
                 HashTableEntry* e = &d->map.buckets[i];
                 if (!e->key) continue;
-                if (!first) sb_append(sb, ", ");
+                if (!first) strbuf_append(sb, ", ");
                 first = false;
-                sb_append(sb, "\"");
-                sb_append(sb, e->key);
-                sb_append(sb, "\": ");
+                strbuf_append(sb, "\"");
+                strbuf_append(sb, e->key);
+                strbuf_append(sb, "\": ");
                 vm_format_value(c, e->payload, true, sb);
             }
-            sb_append(sb, "}");
+            strbuf_append(sb, "}");
             break;
         }
         case TYPE_ANY: break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
@@ -898,8 +878,8 @@ static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuilder* 
 }
 
 static void vm_print_value(Chunk* c, AerVal v, bool in_collection) {
-    StrBuilder sb;
-    sb_init(&sb);
+    StrBuf sb;
+    strbuf_init(&sb);
     vm_format_value(c, v, in_collection, &sb);
     printf("%s", sb.buf);
     free(sb.buf);
@@ -1134,8 +1114,8 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
 
     if (aer_type(v) == TYPE_ARRAY || aer_type(v) == TYPE_DICT || aer_type(v) == TYPE_PACKED_ARRAY) {
         /* Unbounded recursive content doesn't fit the fixed buffer below, so reuse print()'s formatter; sb.buf is already a fresh allocation, handed to aer_make_string as-is. */
-        StrBuilder sb;
-        sb_init(&sb);
+        StrBuf sb;
+        strbuf_init(&sb);
         vm_format_value(vm->chunk, v, false, &sb);
         owned = sb.buf;
         len   = (unsigned int)sb.len;
