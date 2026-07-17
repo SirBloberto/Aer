@@ -1,0 +1,102 @@
+import math
+import time
+
+struct Body:
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+    vx: float = 0.0
+    vy: float = 0.0
+    vz: float = 0.0
+    mass: float = 0.0
+
+N = 1024
+STEPS = 20
+
+function offset_momentum(bodies, num_bodies):
+    px, py, pz = 0.0, 0.0, 0.0
+    for i in 0..num_bodies:
+        px += bodies[i].vx * bodies[i].mass
+        py += bodies[i].vy * bodies[i].mass
+        pz += bodies[i].vz * bodies[i].mass
+
+    bodies[0].vx = - px / bodies[0].mass
+    bodies[0].vy = - py / bodies[0].mass
+    bodies[0].vz = - pz / bodies[0].mass
+
+
+function energy(bodies):
+    e = 0.0
+    num_bodies = length(bodies)
+    for i in 0..num_bodies:
+        vx = bodies[i].vx
+        vy = bodies[i].vy
+        vz = bodies[i].vz
+        bim = bodies[i].mass
+        e += 0.5 * bim * (vx * vx + vy * vy + vz * vz)
+        for j in (i+1)..num_bodies:
+            dx = bodies[i].x - bodies[j].x
+            dy = bodies[i].y - bodies[j].y
+            dz = bodies[i].z - bodies[j].z
+            sq = dx * dx + dy * dy + dz * dz
+            e -= (bim * bodies[j].mass) / math.sqrt(sq)
+    return e
+
+function advance(bodies, dt):
+    num_bodies = length(bodies)
+    for i in 0..num_bodies:
+        bix = bodies[i].x
+        biy = bodies[i].y
+        biz = bodies[i].z
+        bimass = bodies[i].mass
+        bivx = bodies[i].vx
+        bivy = bodies[i].vy
+        bivz = bodies[i].vz
+        for j in (i+1)..num_bodies:
+            dx = bix - bodies[j].x
+            dy = biy - bodies[j].y
+            dz = biz - bodies[j].z
+            dpos_norm_sq = dx * dx + dy * dy + dz * dz
+            mag = dt / (dpos_norm_sq * math.sqrt(dpos_norm_sq))
+
+            mj = bodies[j].mass * mag
+            bivx -= dx * mj
+            bivy -= dy * mj
+            bivz -= dz * mj
+
+            mi = bimass * mag
+            bodies[j].vx += dx * mi
+            bodies[j].vy += dy * mi
+            bodies[j].vz += dz * mi
+        bodies[i].vx = bivx
+        bodies[i].vy = bivy
+        bodies[i].vz = bivz
+
+    for i in 0..num_bodies:
+        bodies[i].x += bodies[i].vx * dt
+        bodies[i].y += bodies[i].vy * dt
+        bodies[i].z += bodies[i].vz * dt
+
+# Same deterministic, formula-based init as nbody_large_packed.aer, bit-identical initial
+# conditions — the ONLY difference between the two benchmarks is this construction: an ordinary
+# array of individually heap-allocated Body() instances (scattered, pointer-chasing) instead of
+# one packed inline block.
+bodies = []
+for i in 0..N:
+    append(bodies, Body())
+    bodies[i].x = math.sin(i * 0.10) * 10.0
+    bodies[i].y = math.cos(i * 0.15) * 10.0
+    bodies[i].z = math.sin(i * 0.05) * 2.0
+    bodies[i].vx = math.cos(i * 0.20) * 0.01
+    bodies[i].vy = math.sin(i * 0.25) * 0.01
+    bodies[i].vz = math.cos(i * 0.10) * 0.001
+    bodies[i].mass = ((i % 10) + 1) * 1.0e-6
+
+start = time.now()
+offset_momentum(bodies, N)
+a = energy(bodies)
+for step in 0..STEPS:
+    advance(bodies, 0.01)
+a = energy(bodies)
+dur = time.now() - start
+print("Took: {dur}s")
