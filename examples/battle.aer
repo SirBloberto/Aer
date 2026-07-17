@@ -1,6 +1,6 @@
 # battle.aer — a small turn-based combat simulator, written to exercise a
-# broad slice of AER in one program: structs, closures, the pipe operator,
-# and the standard library (random, string).
+# broad slice of AER in one program: structs, the pipe operator, and the
+# standard library (random, string).
 #
 # Run it with:
 #   ./binary/aer examples/battle.aer
@@ -13,13 +13,10 @@ struct Character:
     hp: integer = 100
     attack: integer = 10
 
-# A closure factory — each character gets an independently-tuned special
-# attack, capturing its own `character` and `bonus`. Closures in AER
-# capture their directly-enclosing function's variables, which is exactly
-# what's needed here.
-function make_special_attack(character, bonus):
-    return function():
-        return character.attack + bonus
+# AER has no closures — a special attack's bonus is just an ordinary parameter,
+# not state captured from an enclosing call.
+function special_attack_damage(character, bonus):
+    return character.attack + bonus
 
 function deal_damage(target, amount):
     target.hp = target.hp - amount
@@ -76,8 +73,7 @@ villain = Character("Grothak", 100, 12)
 print(status_line(hero) |> string.upper())
 print(status_line(villain) |> string.upper())
 
-hero_special = make_special_attack(hero, 5)
-special_damage = hero_special()
+special_damage = special_attack_damage(hero, 5)
 hero_name = hero.name
 print("{hero_name}'s special attack would deal {special_damage} damage.")
 print("")

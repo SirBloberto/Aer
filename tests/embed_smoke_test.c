@@ -392,12 +392,17 @@ int main(void) {
        (vm.c) must abort BEFORE writing the LHS back whenever a fallible
        sub-step fails — the unfused 4-opcode form relied on the
        *intervening* DISPATCH() between opcodes to skip the final STORE on
-       an error partway through (e.g. an undefined RHS name), and a fused
+       an error partway through (e.g. a type-mismatched RHS), and a fused
        handler has no such intervening point unless it checks
        runtime_had_error explicitly after each sub-step. This can only be
        observed by inspecting VM state *after* an aborted statement, which
        needs the REPL-style statement-level abort this embedding harness
-       already exercises above — file mode (MODE_RUN) would just exit. */
+       already exercises above — file mode (MODE_RUN) would just exit.
+         The RHS must be an already-DEFINED name of the wrong type (not an
+       undefined one) to land in OP_COMPOUND_NAME_NAME specifically: an
+       undefined name is now a parse-time error (see parser.c's
+       report_if_shadowed_global/"is not defined" fallback), so it never
+       reaches this fused runtime opcode at all. */
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
@@ -406,10 +411,12 @@ int main(void) {
     aer_clear_error();
     shell("compound_x = 5\n");
     run_appended(&chunk, &vm);
-    shell("compound_x += undefined_thing\n");
+    shell("wrong_type = \"abc\"\n");
+    run_appended(&chunk, &vm);
+    shell("compound_x += wrong_type\n");
     ok = run_appended(&chunk, &vm);
 
-    check(!ok, "compound assignment with an undefined RHS name fails, just like the unfused form did");
+    check(!ok, "compound assignment with a type-mismatched RHS fails, just like the unfused form did");
 
     aer_clear_error();
     shell("assert(compound_x == 5, \"the fused handler did not write back after the RHS failed to resolve\")\n");

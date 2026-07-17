@@ -380,6 +380,21 @@ static unsigned int global_names[FRAME_REGISTERS];
 static int          global_regs[FRAME_REGISTERS];
 static int          global_count = 0;
 
+/* Shared by var_slot's shadow-ban check and parse_primary_inner's bare-reference read fallback:
+   true (after reporting the "not accessible inside a function" error) if name_idx is an existing
+   top-level variable and the caller is compiling inside a function body. */
+static bool report_if_shadowed_global(Chunk* c, unsigned int name_idx) {
+    if (function_depth == 0) return false;
+    for (int i = 0; i < global_count; i++) {
+        if (global_names[i] == name_idx) {
+            error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
+                     aer_as_string(c->pool[name_idx])->data);
+            return true;
+        }
+    }
+    return false;
+}
+
 /* A new variable's register is reserved_floor — NOT var_count, even though the two almost always
    hold the same value (both only ever move together, by exactly 1, right here). reserved_floor is
    what actually marks "everything below this is permanent, never handed out as a temp" — var_count
@@ -401,21 +416,12 @@ static int var_slot(Chunk* c, unsigned int name_idx) {
     for (int i = 0; i < var_count; i++)
         if (var_names[i] == name_idx) return var_regs[i];
     /* Shadowing a top-level variable's name is a compile error, not a silent fresh local — one
-       name means one variable everywhere. Catches all three ways this could happen: a bare
-       reference falling through to here (the name is read but doesn't resolve to a local),
-       declaring a fresh local with this name, and naming a parameter after it (parameters are
-       registered via this same function). function_depth == 0 (the name IS the top-level
-       definition itself) is exempt, and so is a name already local to the CURRENT function (the
-       var_names scan above already returned for that case). */
-    if (function_depth > 0) {
-        for (int i = 0; i < global_count; i++) {
-            if (global_names[i] == name_idx) {
-                error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
-                         aer_as_string(c->pool[name_idx])->data);
-                return -1;
-            }
-        }
-    }
+       name means one variable everywhere. Catches both ways this could happen here: declaring a
+       fresh local with this name, and naming a parameter after it (parameters are registered via
+       this same function). function_depth == 0 (the name IS the top-level definition itself) is
+       exempt, and so is a name already local to the CURRENT function (the var_names scan above
+       already returned for that case). */
+    if (report_if_shadowed_global(c, name_idx)) return -1;
     /* Checks reserved_floor — the register `reg` below is about to become — not var_count; the two
        can diverge (see this function's own comment above), and a for-loop's iteration-state
        promotion raises reserved_floor without touching var_count, so checking var_count here let a
@@ -1278,18 +1284,14 @@ static int parse_primary_inner(Chunk* c) {
            bare reference to it compose through further arithmetic (try_emit_binary_raw) without
            boxing; every consumer that can't handle that (materialize, arg_materialize, emit_binary,
            postfix-chain indexing/field-access, ...) already boxes it back via box_if_raw before
-           doing anything unsafe with it. A name not among the CURRENT function's own locals falls
-           through to var_slot below — if it's a top-level variable, var_slot's own shadow-ban
-           check reports the "not accessible inside a function" error; if it's genuinely new, the
-           existing prototype permissiveness creates a fresh local. */
+           doing anything unsafe with it. */
         int reg;
         if (var_lookup_rk(name_idx, &reg)) return reg;
 
         /* Functions as values (bare-name case): a name that isn't a variable/global but IS a
            known function, referenced here WITHOUT a following '(' (so this isn't a call at all —
            parse_call already claimed that case above), is a reference to the function itself as a
-           value: `f = square` needs `square` to actually evaluate to something, not fall through
-           to var_slot below and silently become a fresh, garbage-valued local. Built once per
+           value: `f = square` needs `square` to actually evaluate to something. Built once per
            reference as an ordinary pool constant — chunk_add_pool already dedups identical
            TYPE_FUNCTION values by code_offset+arity, so repeated references to the same function
            share one AerFunction, not one each. */
@@ -1302,10 +1304,20 @@ static int parse_primary_inner(Chunk* c) {
             return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
         }
 
-        reg = var_slot(c, name_idx);   /* not a known local, global, or function — existing
-                                           prototype permissiveness: silently creates a fresh local
-                                           (unchanged) */
-        return reg < 0 ? 0 : reg;      /* reg<0: error_at already called */
+        /* Not a known local, top-level variable, or function/struct — a genuine read of a name
+           that was never assigned anywhere reachable. This used to fall through to var_slot and
+           silently create a fresh, uninitialized local instead of erroring: nothing initializes
+           that register, and the bump-pointer register stack never zeroes a reused slot, so the
+           read could return whatever value an unrelated PRIOR call's frame last left sitting
+           there — a real, confirmed bug (a nested function expression reading an enclosing
+           function's long-since-popped parameter happened to "work" by exactly this accident,
+           until an intervening unrelated call clobbered the same physical register and it
+           silently returned garbage instead). report_if_shadowed_global still reports its own
+           more specific message first, so a name that IS a top-level variable names that reason
+           instead of a generic "not defined". */
+        if (report_if_shadowed_global(c, name_idx)) return 0;
+        error_at("'%s' is not defined", aer_as_string(c->pool[name_idx])->data);
+        return 0;
     }
     error_at("Expected an expression (only literals, variables, calls, array/dict literals, arithmetic/comparisons, and parentheses are supported)");
     return 0;
