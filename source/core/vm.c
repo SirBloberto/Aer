@@ -1669,9 +1669,9 @@ bool vm_run(VM* vm) {
        logic needed to change: runtime_had_error is still set by error() exactly as before, still
        read by those call sites exactly where they already read it; only the per-instruction
        DISPATCH() flag check is gone, replaced by jumping directly here the moment an error fires. */
-    jmp_buf  catch_point;
-    jmp_buf* saved_unwind_target = runtime_error_unwind_target;
-    runtime_error_unwind_target  = &catch_point;
+    AerJmpBuf  catch_point;
+    AerJmpBuf* saved_unwind_target = runtime_error_unwind_target;
+    runtime_error_unwind_target    = &catch_point;
     /* Was set on every single DISPATCH() before — this call's own VM never changes for the
        whole run (a nested module/stdlib call either runs on a different VM's own vm_run(),
        which does this same save/restore, or never touches active_vm_for_errors at all), so one
@@ -1679,7 +1679,7 @@ bool vm_run(VM* vm) {
        exactly equivalent, at a fraction of the cost. */
     VM* saved_active_vm  = active_vm_for_errors;
     active_vm_for_errors = vm;
-    if (setjmp(catch_point) != 0) {
+    if (AER_SETJMP(catch_point) != 0) {
         runtime_error_unwind_target = saved_unwind_target;
         active_vm_for_errors        = saved_active_vm;
         return false;

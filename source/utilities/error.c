@@ -10,7 +10,7 @@ bool         parse_had_error    = false;
 bool         runtime_had_error  = false;
 unsigned int assert_failure_count = 0;
 unsigned int (*runtime_line_lookup)(void) = NULL;
-jmp_buf*     runtime_error_unwind_target  = NULL;
+AerJmpBuf*   runtime_error_unwind_target  = NULL;
 
 #define ERROR_MSG_MAX 2048
 
@@ -117,7 +117,7 @@ void error(const char* format, ...) {
        (a parse-time error, or error()/error_at() called from parser.c) — falls through to the
        same "set flags, return normally" behavior this always had, letting the parser's own
        recursive-descent recovery run unchanged. */
-    if (runtime_error_unwind_target) longjmp(*runtime_error_unwind_target, 1);
+    if (runtime_error_unwind_target) AER_LONGJMP(*runtime_error_unwind_target, 1);
 }
 
 /* Print a message pinpointing the current token in the source. */
@@ -170,5 +170,5 @@ void error_at(const char* format, ...) {
        (a parse-time error, or error()/error_at() called from parser.c) — falls through to the
        same "set flags, return normally" behavior this always had, letting the parser's own
        recursive-descent recovery run unchanged. */
-    if (runtime_error_unwind_target) longjmp(*runtime_error_unwind_target, 1);
+    if (runtime_error_unwind_target) AER_LONGJMP(*runtime_error_unwind_target, 1);
 }
