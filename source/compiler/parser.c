@@ -156,19 +156,6 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
     chunk_emit(c, PACK_BINARY(op, dest, rk_lhs, rk_rhs));
 }
 
-unsigned int emit_cmp_jump_false(Chunk* c, int rk_a, Opcode cmp_op, int rk_b) {
-    rk_a = box_if_raw(c, rk_a);
-    rk_b = box_if_raw(c, rk_b);
-    if (!rk20_fits(rk_a) || !rk20_fits(rk_b)) {
-        error_at("Expression too large to compile (register/constant index exceeds the comparison-jump encoding's range)");
-        return 0;
-    }
-    chunk_emit(c, PACK_CMP_JUMP_FALSE(cmp_op, rk_a, rk_b));
-    unsigned int patch_offset = c->count;
-    chunk_emit(c, 0);   /* placeholder — patched by patch_jump once the target is known */
-    return patch_offset;
-}
-
 unsigned int emit_jump_if_false_reg(Chunk* c, int reg) {
     chunk_emit(c, PACK1(OP_JUMP_IF_FALSE_REG, reg));
     unsigned int patch_offset = c->count;
@@ -306,15 +293,8 @@ void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, 
 }
 
 /* ------------------------------------------------------------------ */
-/* M5 — real .aer source wiring, built up slice by slice (variables/arithmetic/if/for-while;
-   functions/calls incl. recursion; array/dict literals + indexing; `for x in y:` array
-   iteration — plain string literals landed alongside containers, needed to test dict keys).
-   An entirely separate recursive-descent compiler from parser.c, sharing only the real lexer's
-   token stream (lex()/token/consume()/equal()/require(), lexer.h) — not a shared/refactored
-   grammar, so this can't destabilize the production compiler while v3 remains unproven. See the
-   plan file for the full roadmap and what's still deferred (structs, compound assignment, unary
-   operators, and/or, string interpolation, dict-key/pair + range iteration, imports, defer,
-   modules — none of that is reachable from real source through this entry point yet). */
+/* Recursive-descent compiler — the full language grammar, from the lexer's token stream
+   (lex()/token/consume()/equal()/require(), lexer.h) straight to register bytecode. */
 /* ------------------------------------------------------------------ */
 
 static int  parse_primary_inner(Chunk* c);
@@ -783,55 +763,37 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     return true;
 }
 
-/* function name -> instruction offset, separate from var_names (a function needs a jump target,
-   not a register). func_arities/min_arities/defaults support functions as values and default
-   parameters: building a real runtime AerFunction (build_function_value, below), whether for a
-   bare-name value reference or a direct call that omits trailing arguments, needs a function's
-   full signature, not just its offset; calling by name with EVERY argument supplied still goes
-   through func_lookup/OP_CALL directly — see parse_call's own comment on when each path is used.
-   Grows on demand (xrealloc-doubling, matching chunk_pool_append). */
-static unsigned int* func_names          = NULL;
-static unsigned int* func_offsets        = NULL;
-static unsigned int* func_arities        = NULL;
-static unsigned int* func_min_arities    = NULL;
-static AerVal**       func_defaults      = NULL;   /* func_defaults[i]: xmalloc'd array of (arity-min_arity) values, or NULL if none */
-static bool*          func_has_receiver  = NULL;   /* `function f(target as Type, ...)`: see build_function_value's own comment */
-static unsigned int*  func_receiver_type = NULL;   /* meaningful only where func_has_receiver[i] is true */
-static int           func_count = 0;
-static int           func_cap   = 0;
-
-static bool func_lookup(unsigned int name_idx, unsigned int* out_offset) {
-    for (int i = 0; i < func_count; i++)
-        if (func_names[i] == name_idx) { *out_offset = func_offsets[i]; return true; }
-    return false;
+/* Function lookups read Chunk.functions directly (chunk_find_function_by_name_idx, vm.c) — the
+   registry chunk_add_function already maintains for cross-module calls is the single source of
+   truth; the parser keeps no parallel copy. A function needs a jump target, not a register, so
+   this is separate from var_names either way. */
+static bool func_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offset) {
+    ChunkFunction* f = chunk_find_function_by_name_idx(c, name_idx);
+    if (!f) return false;
+    *out_offset = f->code_offset;
+    return true;
 }
 
-/* functions as values / default parameters. Separate from func_lookup since most
-   call sites (a direct-by-name call supplying every argument) only ever need the offset; only a
-   function referenced as a VALUE, or a direct call omitting trailing (defaulted) arguments, needs
-   the rest of the signature to build a real AerFunction (build_function_value, below). */
-/* out_max_registers reads straight from c->functions[i] (not a separate parser-local array,
-   there's only one copy) — reflects chunk_add_function's safe FRAME_REGISTERS placeholder if this
-   name is being self-referenced as a value from within its own not-yet-finished body (the one case
-   where the real captured peak isn't patched in yet — see parse_function's own comment), or the
-   correct final captured value in every other case (this function's own body already fully
-   compiled by the time anything outside it, or after it, can reference it). */
+/* Functions as values / default parameters — a bare-name value reference, or a direct call that
+   omits trailing (defaulted) arguments, needs the full signature to build a real AerFunction
+   (build_function_value, below), not just the offset. max_registers reflects
+   chunk_add_function's safe FRAME_REGISTERS placeholder when a name is self-referenced as a
+   value from within its own not-yet-finished body (see parse_function's own comment), or the
+   correct final captured value in every other case. */
 static bool func_full_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offset, unsigned int* out_arity,
                                  unsigned int* out_min_arity, AerVal** out_defaults,
                                  bool* out_has_receiver, unsigned int* out_receiver_type,
                                  unsigned int* out_max_registers) {
-    for (int i = 0; i < func_count; i++) {
-        if (func_names[i] != name_idx) continue;
-        *out_offset        = func_offsets[i];
-        *out_arity         = func_arities[i];
-        *out_min_arity     = func_min_arities[i];
-        *out_defaults      = func_defaults[i];
-        *out_has_receiver  = func_has_receiver[i];
-        *out_receiver_type = func_receiver_type[i];
-        *out_max_registers = c->functions[i].max_registers;
-        return true;
-    }
-    return false;
+    ChunkFunction* f = chunk_find_function_by_name_idx(c, name_idx);
+    if (!f) return false;
+    *out_offset        = f->code_offset;
+    *out_arity         = f->arity;
+    *out_min_arity     = f->min_arity;
+    *out_defaults      = f->defaults;
+    *out_has_receiver  = f->has_receiver;
+    *out_receiver_type = f->receiver_type;
+    *out_max_registers = f->max_registers;
+    return true;
 }
 
 /* Functions as values / default parameters. Builds a real runtime AerFunction, reusing the
@@ -865,7 +827,7 @@ static AerVal build_function_value(unsigned int func_offset, unsigned int arity,
    COMPILE time, unlike the stack VM's runtime dynamic-scope lookup, so there's no sound way to
    leave a reference "maybe still resolvable" indefinitely across separate parse() calls the
    way the stack VM's names can. Grows on demand, same xrealloc-doubling convention as
-   func_names/struct_names above. */
+   struct_names below. */
 typedef struct {
     unsigned int name_idx;
     unsigned int patch_offset;
@@ -897,28 +859,6 @@ static void pending_call_add(unsigned int name_idx, unsigned int patch_offset, c
 static void func_register(Chunk* c, unsigned int name_idx, unsigned int offset, unsigned int arity,
                               unsigned int min_arity, AerVal* defaults,
                               bool has_receiver, unsigned int receiver_type) {
-    if (func_count >= func_cap) {
-        func_cap          = func_cap ? func_cap * 2 : 16;
-        func_names        = xrealloc(func_names,        sizeof(unsigned int) * (size_t)func_cap);
-        func_offsets      = xrealloc(func_offsets,      sizeof(unsigned int) * (size_t)func_cap);
-        func_arities      = xrealloc(func_arities,      sizeof(unsigned int) * (size_t)func_cap);
-        func_min_arities  = xrealloc(func_min_arities,  sizeof(unsigned int) * (size_t)func_cap);
-        func_defaults     = xrealloc(func_defaults,     sizeof(AerVal*) * (size_t)func_cap);
-        func_has_receiver = xrealloc(func_has_receiver, sizeof(bool) * (size_t)func_cap);
-        func_receiver_type= xrealloc(func_receiver_type,sizeof(unsigned int) * (size_t)func_cap);
-    }
-    func_names[func_count]        = name_idx;
-    func_offsets[func_count]      = offset;
-    func_arities[func_count]      = arity;
-    func_min_arities[func_count]  = min_arity;
-    func_defaults[func_count]     = defaults;
-    func_has_receiver[func_count] = has_receiver;
-    func_receiver_type[func_count]= receiver_type;
-    func_count++;
-
-    /* Also persists on the Chunk itself (not just this parser's own parse-time-only tables, which
-       get reset/reused the moment a later, separate parse() call starts) — see ChunkFunction's
-       own comment in vm.h for why a file-based `import`'s cross-module calls need this. */
     chunk_add_function(c, name_idx, offset, arity, min_arity, defaults, has_receiver, receiver_type);
 
     /* Patch every earlier forward-referencing call/defer to this name now that its real offset is
@@ -1006,9 +946,10 @@ static void loop_pop_and_patch_rotated(Chunk* c, unsigned int exit_target, unsig
     loop_depth--;
 }
 
-/* Struct type name registry, separate from func_names — a struct type isn't a callable offset,
-   it resolves at runtime via chunk_find_shape(); OP_STRUCT_NEW just needs to know at compile time
-   that `Name(...)` means "construct", not "call". */
+/* Struct type name registry — a struct type isn't a callable offset, it resolves at runtime via
+   chunk_find_shape(); OP_STRUCT_NEW just needs to know at compile time that `Name(...)` means
+   "construct", not "call". Parse-time-only (a Shape exists only once OP_DEFINE_STRUCT runs), so
+   unlike functions this can't live on the Chunk. */
 static unsigned int* struct_names = NULL;
 static int           struct_count = 0;
 static int           struct_cap   = 0;
@@ -1648,7 +1589,7 @@ static int compile_pipe(Chunk* c, int lhs) {
 
     bool is_struct = is_struct_name(name_idx);
     unsigned int func_offset = 0;
-    if (!is_struct && !func_lookup(name_idx, &func_offset)) {
+    if (!is_struct && !func_lookup(c, name_idx, &func_offset)) {
         error_at("Unknown function or struct type (must be defined before use)");
         return lhs;
     }
@@ -3254,7 +3195,7 @@ static void parse_defer(Chunk* c) {
     bool is_forward_ref = false;
     const char* call_site_cursor = NULL;
     if (!is_builtin) {
-        is_forward_ref = !func_lookup(name_idx, &func_offset);
+        is_forward_ref = !func_lookup(c, name_idx, &func_offset);
         call_site_cursor = is_forward_ref ? current_source_cursor() : NULL;
     }
 
@@ -3833,12 +3774,13 @@ void parser_reset(void) {
     reg_reset();
     var_count      = 0;
     global_count   = 0;
-    func_count     = 0;
     struct_count   = 0;
     pending_count  = 0;
     function_depth = 0;
     loop_depth     = 0;
     parse_had_error   = false;
+    /* Function registrations live on the Chunk (Chunk.functions), not in parser statics —
+       isolation between independent programs follows each program's own fresh Chunk. */
 }
 
 /* See ParserState's own comment in parser.h. Every field below is a direct mirror of one of
@@ -3857,14 +3799,6 @@ struct ParserState {
     unsigned int  global_names[FRAME_REGISTERS];
     int           global_regs[FRAME_REGISTERS];
     int           global_count;
-    unsigned int* func_names;
-    unsigned int* func_offsets;
-    unsigned int* func_arities;
-    unsigned int* func_min_arities;
-    AerVal**      func_defaults;
-    bool*         func_has_receiver;
-    unsigned int* func_receiver_type;
-    int           func_count, func_cap;
     PendingCall* pending_calls;
     int            pending_count, pending_cap;
     LoopContext  loop_stack[LOOP_MAX];
@@ -3904,16 +3838,6 @@ ParserState* parser_save_state(void) {
     memcpy(s->global_regs,  global_regs,  sizeof(global_regs));
     s->global_count = global_count;           global_count = 0;
 
-    s->func_names         = func_names;         func_names         = NULL;
-    s->func_offsets        = func_offsets;       func_offsets        = NULL;
-    s->func_arities        = func_arities;       func_arities        = NULL;
-    s->func_min_arities    = func_min_arities;   func_min_arities    = NULL;
-    s->func_defaults       = func_defaults;      func_defaults       = NULL;
-    s->func_has_receiver   = func_has_receiver;  func_has_receiver   = NULL;
-    s->func_receiver_type  = func_receiver_type; func_receiver_type  = NULL;
-    s->func_count = func_count;                func_count = 0;
-    s->func_cap   = func_cap;                  func_cap   = 0;
-
     s->pending_calls = pending_calls;          pending_calls = NULL;
     s->pending_count = pending_count;          pending_count = 0;
     s->pending_cap   = pending_cap;            pending_cap   = 0;
@@ -3937,13 +3861,6 @@ ParserState* parser_save_state(void) {
    a running program depends on, which was separately persisted onto the nested file's own Chunk
    (chunk_add_function/OP_DEFINE_STRUCT's handler) before this call, and outlives this free(). */
 void parser_restore_state(ParserState* s) {
-    free(func_names);
-    free(func_offsets);
-    free(func_arities);
-    free(func_min_arities);
-    free(func_defaults);
-    free(func_has_receiver);
-    free(func_receiver_type);
     free(pending_calls);
     free(struct_names);
 
@@ -3963,16 +3880,6 @@ void parser_restore_state(ParserState* s) {
     memcpy(global_names, s->global_names, sizeof(global_names));
     memcpy(global_regs,  s->global_regs,  sizeof(global_regs));
     global_count = s->global_count;
-
-    func_names         = s->func_names;
-    func_offsets       = s->func_offsets;
-    func_arities       = s->func_arities;
-    func_min_arities   = s->func_min_arities;
-    func_defaults      = s->func_defaults;
-    func_has_receiver  = s->func_has_receiver;
-    func_receiver_type = s->func_receiver_type;
-    func_count = s->func_count;
-    func_cap   = s->func_cap;
 
     pending_calls = s->pending_calls;
     pending_count = s->pending_count;

@@ -10,12 +10,11 @@ void pool_init(Pool* p, size_t elem_size, unsigned int elems_per_slab) {
     p->slab_count     = 0;
     p->slab_cap       = 0;
     p->elem_size      = elem_size;
-    /* Round elem_size up to the next power of two — see stride's own comment in pool.h. */
-    size_t stride = 1;
-    unsigned int shift = 0;
-    while (stride < elem_size) { stride <<= 1; shift++; }
+    /* 8-byte alignment keeps every cell's pointer/double members aligned; the 16-byte floor is
+       pool_free's free-list pointer at bytes [8,16). See stride's comment in pool.h. */
+    size_t stride = (elem_size + 7) & ~(size_t)7;
+    if (stride < 16) stride = 16;
     p->stride         = stride;
-    p->stride_shift   = shift;
     p->elems_per_slab = elems_per_slab;
     p->next_index     = elems_per_slab;   /* forces the first pool_alloc to grab a slab */
     p->free_list      = NULL;

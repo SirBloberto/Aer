@@ -733,6 +733,16 @@ ChunkFunction* chunk_find_function(Chunk* c, const char* name) {
     return NULL;
 }
 
+/* Parse-time lookup — name_idx is a dedup'd pool index (chunk_add_pool), so this is a plain int
+   compare, no strcmp. Newest-first, same convention as chunk_find_function. */
+ChunkFunction* chunk_find_function_by_name_idx(Chunk* c, unsigned int name_idx) {
+    for (unsigned int i = c->function_count; i > 0; i--) {
+        ChunkFunction* f = &c->functions[i - 1];
+        if (f->name == name_idx) return f;
+    }
+    return NULL;
+}
+
 bool chunk_is_imported(Chunk* c, const char* name, unsigned int len) {
     for (unsigned int i = 0; i < c->import_count; i++)
         if (strlen(c->imported_modules[i]) == len && strncmp(c->imported_modules[i], name, len) == 0)
@@ -1032,28 +1042,14 @@ static inline __attribute__((always_inline)) AerVal vm_binary_fast(AerVal a, Aer
 }
 
 /* Cold path for the per-operator OP_ADD/OP_SUB/.../OP_GTE labels in vm_run() (see PACK_BINARY's
-   own comment, vm.h) and for the OP_BINARY_FIELD/OP_FIELD_BINARY field-fusion opcodes and
-   OP_CMP_JUMP_FALSE (dead code) below — everything vm_binary_fast() (just above) doesn't handle:
-   AND/OR/IN (moved here verbatim from the old vm_binary(), which this function has fully replaced
-   now that every caller goes through vm_binary_fast() first), null, promoted-real, boolean, string,
-   array, dict, and the final type-mismatch error. Deliberately a real, non-inlined function rather
-   than always_inline like vm_binary_fast(): this path only runs for the rare case (anything that
-   isn't int-int or real-real arithmetic/comparison), so the ARM32 argument-passing cost that
-   motivates vm_binary_fast()'s own always_inline doesn't matter here — and NOT inlining it avoids
-   duplicating this whole body across every call site, the icache-bloat hazard this codebase already
-   measured as a real regression once (see vm_binary_icache_split notes). ta/tb are passed in rather
-   than recomputed since every caller already computed them for its own fast-path check. */
+   own comment, vm.h) and for the OP_BINARY_FIELD/OP_FIELD_BINARY field-fusion opcodes —
+   everything vm_binary_fast() (just above) doesn't handle: IN, null, promoted-real, boolean,
+   string, array, dict, and the final type-mismatch error. Deliberately a real, non-inlined
+   function rather than always_inline like vm_binary_fast(): this path only runs for the rare
+   case, and NOT inlining it avoids duplicating this whole body across every call site (a
+   measured icache-bloat regression once before). ta/tb are passed in rather than recomputed
+   since every caller already computed them for its own fast-path check. */
 static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
-    /* Logical ops work on any type via truthiness. Provably dead in practice today (parse_binary_ops
-       intercepts `and`/`or` before ever emitting a real binary opcode, see OP_AND/OP_OR's own comment
-       in vm.h) but kept, same as the old vm_binary() kept it: harmless, and cheap insurance if a
-       future caller (the field-fusion opcodes, an `in`-adjacent rewrite, ...) ever legitimately
-       reaches this with one of these ops. */
-    if (op == OP_AND || op == OP_OR) {
-        return aer_bool((op == OP_AND) ? (vm_truthy(a) && vm_truthy(b))
-                                        : (vm_truthy(a) || vm_truthy(b)));
-    }
-
     /* Checked before null-handling below so `null in arr` isn't intercepted by the "null op anything-else errors" rule, which is about direct comparison, not container search. */
     if (op == OP_IN) {
         if (aer_type(b) == TYPE_DICT) {
@@ -1821,7 +1817,6 @@ bool vm_run(VM* vm) {
         [OP_LOADK]       = &&lbl_loadk,
         [OP_MOVE]        = &&lbl_move,
         [OP_JUMP_IF_FALSE_REG] = &&lbl_jump_if_false_reg,
-        [OP_CMP_JUMP_FALSE]    = &&lbl_cmp_jump_false,
         [OP_CALL]              = &&lbl_call,
         [OP_CALL_VALUE]        = &&lbl_call_value,
         [OP_TAIL_CALL]         = &&lbl_call,
@@ -2085,20 +2080,6 @@ lbl_jump_if_false_reg: {
     int reg    = (int)UNPACK_A(op_word);
     int target = READ();
     if (!vm_truthy(vm->registers[reg])) ip = (unsigned int)target;
-    DISPATCH();
-}
-
-lbl_cmp_jump_false: {
-    Opcode cmp_op = (Opcode)UNPACK_CMP_JUMP_OP(op_word);
-    int target    = READ();
-    AerVal a = *vm_rk_ptr20(vm, const_pool, UNPACK_CMP_JUMP_RK_A(op_word));
-    AerVal b = *vm_rk_ptr20(vm, const_pool, UNPACK_CMP_JUMP_RK_B(op_word));
-    ValueType ta = aer_type(a), tb = aer_type(b);
-    bool handled;
-    AerVal cmp_result = vm_binary_fast(a, b, cmp_op, ta, tb, &handled);
-    if (!handled) cmp_result = vm_binary_cold(a, b, cmp_op, ta, tb);
-    if (!vm_truthy(cmp_result)) ip = (unsigned int)target;
-    gc_maybe_collect(vm);   /* emit_cmp_jump_false has no current caller (dead code) — kept for safety if it's ever wired up; cmp_result here is a transient, never stored, so nothing to root */
     DISPATCH();
 }
 
@@ -2388,9 +2369,7 @@ lbl_index_set: {
     DISPATCH();
 }
 
-/* Mirrors lbl_slice_get's own array/string branches (vm.c, above) exactly — same
-   vm_slice_bounds()/pool_alloc/copy logic, reading the collection and bounds from registers and
-   writing the result to one instead of stack pop/push. */
+/* `arr[a:b]` — vm_slice_bounds() resolves/clamps the bounds; a slice is always a fresh copy. */
 lbl_slice_get: {
     int dest_reg = (int)UNPACK_SLICE_GET_DEST(op_word);
     int arr_reg  = (int)UNPACK_SLICE_GET_ARR(op_word);
@@ -2427,9 +2406,8 @@ lbl_slice_get: {
     DISPATCH();
 }
 
-/* `x as Point` where Point is a known struct type. Mirrors lbl_check_shape (above)
-   exactly: errors unless src_reg holds exactly that struct type, else passes it through
-   unchanged — register-based instead of stack pop/push. */
+/* `x as Point` where Point is a known struct type: errors unless src_reg holds exactly that
+   struct type, else passes the value through unchanged (never converts). */
 lbl_check_shape: {
     int dest_reg = (int)UNPACK_CHECK_SHAPE_DEST(op_word);
     int src_reg  = (int)UNPACK_CHECK_SHAPE_LHS(op_word);
@@ -2444,9 +2422,8 @@ lbl_check_shape: {
     DISPATCH();
 }
 
-/* Mirrors lbl_dict_new (above) exactly — same pool_alloc/memset setup, same key-must-be-string
-   validation and owned-copy-of-the-key discipline — reading pairs from an already-in-order
-   register range instead of popping them off the stack in reverse. */
+/* Dict literal — keys must be strings; each key is stored as an owned copy (hashtable_key_dup),
+   never an alias into the source string. */
 lbl_dict_new: {
     int dest_reg      = (int)UNPACK_A(op_word);
     int pair_reg_base = (int)UNPACK_B(op_word);
@@ -2466,9 +2443,8 @@ lbl_dict_new: {
     DISPATCH();
 }
 
-/* Mirrors lbl_iter_next's TYPE_ARRAY branch (above) exactly — same bounds check/advance/fetch —
-   reading col/idx from registers instead of peeking the stack, and with no stack slots to pop on
-   exit (see this opcode's own comment in vm.h for why). */
+/* `for x in collection:` — arrays yield items, dicts yield keys, strings yield 1-char strings
+   (see OP_ITER_NEXT_ARRAY's comment, vm.h). */
 lbl_iter_next_array: {
     int col_reg       = (int)UNPACK_A(op_word);
     int idx_reg       = (int)UNPACK_B(op_word);
@@ -2641,9 +2617,8 @@ lbl_iter_range_loop: {
     DISPATCH();
 }
 
-/* Mirrors lbl_call's struct-instantiation fallback (above, around line 2137) almost verbatim —
-   same chunk_find_shape() lookup, same arity check, same single-allocation struct_pool layout —
-   reading args from a register range instead of popping them off the stack in reverse. */
+/* Struct instantiation — chunk_find_shape() by name, arity check, one struct_pool allocation
+   with items inline after the header, omitted trailing fields default-filled. */
 lbl_struct_new: {
     int dest_reg           = (int)UNPACK_STRUCT_NEW_DEST(op_word);
     int arg_reg_base       = (int)UNPACK_STRUCT_NEW_ARG_BASE(op_word);
@@ -2747,8 +2722,7 @@ lbl_field_binary: {
     DISPATCH();
 }
 
-/* register-based counterpart of lbl_print_repl (vm.c, above): same
-   print-unless-null-then-newline behavior, reading a register instead of popping the stack. */
+/* Shell mode auto-print: a bare statement's result is printed unless null. */
 lbl_print_repl: {
     int src_reg = (int)UNPACK_A(op_word);
     AerVal v = vm->registers[src_reg];

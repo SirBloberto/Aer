@@ -89,7 +89,7 @@ char* xstrdup(const char* s) {
     return p;
 }
 
-void error(char* format, ...) {
+void error(const char* format, ...) {
     char   buf[ERROR_MSG_MAX];
     size_t pos = 0;
     unsigned int line = runtime_line_lookup ? runtime_line_lookup() : 0;
@@ -121,7 +121,7 @@ void error(char* format, ...) {
 }
 
 /* Print a message pinpointing the current token in the source. */
-void error_at(char* format, ...) {
+void error_at(const char* format, ...) {
     const char* start  = current_source_start();
     const char* cursor = current_source_cursor();
 

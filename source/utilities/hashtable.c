@@ -33,9 +33,7 @@ static Pool key_pools[KEY_TIER_COUNT];
    own growth; 256 * HASHTABLE_HIGH% =~ 179 live entries before another rehash, covering small/
    medium dicts. Byte size per tier is capacity * sizeof(HashTableEntry), computed at pool_init
    time below (never hardcoded — sizeof(HashTableEntry) varies by target: 24 bytes on 32-bit ARM,
-   32 on a 64-bit dev box). pool_init itself rounds elem_size up to a power-of-two stride, so a
-   capacity-16 tier's nominal 384 bytes (Pi) becomes a 512-byte stride internally — memory overhead
-   only, not a correctness concern, not worth bypassing pool_init's own mechanism to avoid. */
+   32 on a 64-bit dev box). */
 #define BUCKET_TIER_COUNT 5
 static const unsigned int BUCKET_TIER_CAPACITY[BUCKET_TIER_COUNT]       = { 16, 32, 64, 128, 256 };
 static const unsigned int BUCKET_TIER_ELEMS_PER_SLAB[BUCKET_TIER_COUNT] = { 64, 32, 16, 8, 4 };

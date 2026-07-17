@@ -11,7 +11,7 @@ typedef enum {
     FLD_NAME,     /* pool index known to be a TYPE_STRING name — print just the string, no quotes */
     FLD_JUMP,     /* absolute code offset this instruction may jump to */
     FLD_COUNT,    /* a raw integer (arg count, item count, arity...) */
-    FLD_BINOP,    /* an Opcode value used as an operand (bin_op in a fused op, or CMP_JUMP_FALSE's comparison) */
+    FLD_BINOP,    /* an Opcode value used as an operand (bin_op in a fused op) */
     FLD_CAST,     /* CAST_INTEGER/CAST_FLOAT/CAST_BOOLEAN */
     FLD_REG,      /* a plain register index (packed or wide — a register number either way) */
     FLD_RK,       /* an RK-encoded operand: RK_CONST_FLAG set = a pool constant, else a register */
@@ -92,10 +92,6 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
        all — disassemble_one special-cases it rather than going through the generic field loop. */
     [OP_BINARY] = { "OP_BINARY", "reg = rk OP rk", {FLD_REG, FLD_BINOP}, false, 2 },
     [OP_JUMP_IF_FALSE_REG] = { "OP_JUMP_IF_FALSE_REG", "jump if !reg, no pop", {FLD_REG, FLD_JUMP}, false, 1 },
-    /* cmp_op/rk_a/rk_b all packed into one word (PACK_CMP_JUMP_FALSE, vm.h); the loop/if condition
-       target stays its own dedicated word regardless — same patchable-target rule as everywhere
-       else. Special-cased in disassemble_one. */
-    [OP_CMP_JUMP_FALSE]    = { "OP_CMP_JUMP_FALSE",    "fused: jump if !(rk <op> rk)", {FLD_BINOP, FLD_RK, FLD_RK, FLD_JUMP}, false, 3 },
     [OP_CALL]  = { "OP_CALL",  "call by compile-time-resolved offset", {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP}, false, 3 },
     /* OP_CALL_VALUE/OP_TAIL_CALL_VALUE pack all 4 fields into one word (PACK_REG4, vm.h) —
        callee_reg is always a plain register, never a patched target, unlike OP_CALL's
@@ -396,14 +392,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG,   (int)UNPACK_STRUCT_NEW_ARG_BASE(op_word));
         print_field(out, c, FLD_COUNT, (int)UNPACK_STRUCT_NEW_ARG_COUNT(op_word));
         print_field(out, c, FLD_NAME,  (int)UNPACK_STRUCT_NEW_NAME(op_word));
-    } else if (op == OP_CMP_JUMP_FALSE) {
-        /* cmp_op/rk_a/rk_b packed (PACK_CMP_JUMP_FALSE, vm.h); the branch target still trails as
-           its own word (patchable, never packed alongside anything else). */
-        print_field(out, c, FLD_BINOP, (int)UNPACK_CMP_JUMP_OP(op_word));
-        print_rk20(out, c, UNPACK_CMP_JUMP_RK_A(op_word));
-        print_rk20(out, c, UNPACK_CMP_JUMP_RK_B(op_word));
-        int target = (int)c->code[pos++];
-        print_field(out, c, FLD_JUMP, target);
     } else if (op == OP_INDEX_SET) {
         print_field(out, c, FLD_REG, (int)UNPACK_INDEX_SET_ARR(op_word));
         print_rk20(out, c, UNPACK_INDEX_SET_IDX(op_word));

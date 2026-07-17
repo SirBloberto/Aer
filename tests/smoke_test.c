@@ -194,11 +194,10 @@ int main(void) {
     }
 
     /* Test 4 (M2): a hand-driven while-loop — sum = 0; i = 0; while i < 5: sum += i; i += 1 —
-       proving OP_CMP_JUMP_FALSE (the fused register-operand comparison+branch) and the reused,
-       stack-neutral OP_JUMP work correctly together for real control flow, not just straight-line
-       arithmetic. sum/i are "locals" in reserved registers 0/1; the loop body writes directly into
-       them (a compound-assignment shape feeding an EXISTING register, not a fresh temp — same
-       distinction the real parser draws between OP_BINARY_* and OP_COMPOUND_*). Expected:
+       proving a comparison into a temp register + OP_JUMP_IF_FALSE_REG (the same shape the real
+       parser emits for a loop condition) and the reused, stack-neutral OP_JUMP work correctly
+       together for real control flow, not just straight-line arithmetic. sum/i are "locals" in
+       reserved registers 0/1; the loop body writes directly into them. Expected:
        sum == 0+1+2+3+4 == 10. */
     {
         Chunk c;
@@ -214,7 +213,8 @@ int main(void) {
         reg_reserve(2);   /* registers 0 (sum), 1 (i) are now "locals" */
 
         unsigned int loop_start = c.count;
-        unsigned int exit_patch = emit_cmp_jump_false(&c, /*rk_i=*/1, OP_LT, /*rk_5=*/(int)pool_five | RK_CONST_FLAG);
+        chunk_emit(&c, PACK_BINARY(OP_LT, 2, 1, (int)pool_five | RK_CONST_FLAG));   /* r2 = i < 5 */
+        unsigned int exit_patch = emit_jump_if_false_reg(&c, 2);
 
         /* sum = sum + i — writes directly into register 0, no new allocation. */
         chunk_emit(&c, PACK_BINARY(OP_ADD, 0, 0, 1));
@@ -309,8 +309,8 @@ int main(void) {
         unsigned int callee_offset = c.count;
 
         /* if !(n > 1) goto base_case: return 1 */
-        unsigned int base_case_patch = emit_cmp_jump_false(&c, /*rk_n=*/0, OP_GT,
-                                                                /*rk_1=*/(int)pool_1 | RK_CONST_FLAG);
+        chunk_emit(&c, PACK_BINARY(OP_GT, 1, 0, (int)pool_1 | RK_CONST_FLAG));   /* r1 = n > 1 */
+        unsigned int base_case_patch = emit_jump_if_false_reg(&c, 1);
 
         /* Recursive case (n > 1): reg1 = n - 1; reg2 = factorial(reg1); reg3 = n * reg2; return reg3 */
         chunk_emit(&c, PACK_BINARY(OP_SUB, 1, 0, (int)pool_1 | RK_CONST_FLAG));
@@ -413,8 +413,8 @@ int main(void) {
         reg_reserve(1);   /* reg 4: loop counter */
 
         unsigned int loop_start = c.count;
-        unsigned int exit_patch = emit_cmp_jump_false(&c, /*rk_i=*/4, OP_LT,
-                                                           /*rk_200=*/(int)pool_200 | RK_CONST_FLAG);
+        chunk_emit(&c, PACK_BINARY(OP_LT, 6, 4, (int)pool_200 | RK_CONST_FLAG));   /* r6 = i < 200 */
+        unsigned int exit_patch = emit_jump_if_false_reg(&c, 6);
 
         /* Throwaway array, rebuilt fresh into reg 5 every iteration — each pass's array_pool cell +
            xmalloc'd items buffer becomes garbage the instant the next iteration overwrites reg 5,

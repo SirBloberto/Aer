@@ -20,10 +20,9 @@ void reg_reserve(int count);
 int  reg_alloc(void);
 void reg_free(int count);
 
-/* Control flow for the register-operand opcodes. Each emits its instruction with a 0 placeholder
+/* Control flow for the register-operand opcodes. Emits its instruction with a 0 placeholder
    for `target` and returns the OFFSET of that placeholder word — pass it to patch_jump once the
    real target address (usually c->count at the jump-to point) is known. */
-unsigned int emit_cmp_jump_false(Chunk* c, int rk_a, Opcode cmp_op, int rk_b);
 unsigned int emit_jump_if_false_reg(Chunk* c, int reg);
 void patch_jump(Chunk* c, unsigned int patch_offset, unsigned int target);
 
@@ -62,7 +61,7 @@ void emit_slice_get(Chunk* c, int dest_reg, int arr_reg, int rk_start, int rk_en
 void emit_dict_new(Chunk* c, int dest_reg, int pair_reg_base, int pair_count);
 
 /* Array iteration (see OP_ITER_NEXT_ARRAY's comment in vm.h). Same emit-then-patch idiom as
-   emit_cmp_jump_false/emit_jump_if_false_reg: emits with a 0 placeholder for end_target and
+   emit_jump_if_false_reg: emits with a 0 placeholder for end_target and
    returns its offset for patch_jump once the loop-exit address (c->count right after the loop
    body + back-edge jump) is known. The caller must have already set idx_reg to 0 and col_reg to a
    live array before this instruction first executes, and should emit this instruction's own

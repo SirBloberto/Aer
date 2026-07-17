@@ -62,10 +62,6 @@ typedef enum {
        their condition is read directly out of a register (or an RK-encoded constant), never
        popped off any stack. */
     OP_JUMP_IF_FALSE_REG, /* operands: reg, target — jump to target if registers[reg] is falsy */
-    /* RK-encoded fused comparison + branch — a loop/if condition is virtually always a bare
-       comparison, so fusing it with the branch avoids a separate "compute bool, then branch on
-       it" step. */
-    OP_CMP_JUMP_FALSE,    /* operands: rk_a, cmp_op, rk_b, target */
 
     /* Function calls — real per-call register windowing (vm.h's CallFrame/VM.call_stack):
        every call gets its own isolated register bank, so nested/recursive calls can't clobber
@@ -824,24 +820,14 @@ typedef enum {
 #define UNPACK_PACKED_ARRAY_NEW_NAME(word)  (((word) >> 15) & 0x7FFFFFFFFULL)
 #define UNPACK_PACKED_ARRAY_NEW_COUNT(word) (((word) >> 50) & 0x1FFULL)
 
-/* Slice E — the last, tightest-budget batch: OP_CMP_JUMP_FALSE/OP_INDEX_SET/OP_SLICE_GET have no
-   patchable target issue (OP_CMP_JUMP_FALSE's target still gets its own dedicated word, same rule
-   as everywhere else) but need two RK20 operands in one word; OP_CALL_MODULE/OP_CALL_BUILTIN have
-   no patchable target at all (module/function/builtin names are always literal identifiers
-   resolved at parse time, never a forward-reference placeholder); OP_FIELD_BINARY/OP_BINARY_FIELD
-   are the tightest of all — dest+struct_reg+bin_op+one RK operand already use 42 bits, leaving
-   only 14 for field_idx (16384 slots) instead of the 29-42 bits every other opcode's name/field
-   index got. Still comfortably more than any real program's field-name count specifically (as
-   opposed to its total pool size, which these two don't need to address) — guarded the same way. */
-#define PACK_CMP_JUMP_FALSE(cmp_op, rk_a, rk_b) \
-    ( ((uint64_t)(OP_CMP_JUMP_FALSE) & 0xFF) \
-    | (((uint64_t)(cmp_op) & 0xFF) << 8) \
-    | ((PACK_RK20(rk_a) & 0xFFFFFULL) << 16) \
-    | ((PACK_RK20(rk_b) & 0xFFFFFULL) << 36) )
-#define UNPACK_CMP_JUMP_OP(word)   (((word) >> 8)  & 0xFF)
-#define UNPACK_CMP_JUMP_RK_A(word) (((word) >> 16) & 0xFFFFFULL)
-#define UNPACK_CMP_JUMP_RK_B(word) (((word) >> 36) & 0xFFFFFULL)
-
+/* Slice E — the last, tightest-budget batch: OP_INDEX_SET/OP_SLICE_GET need two RK20 operands in
+   one word; OP_CALL_MODULE/OP_CALL_BUILTIN have no patchable target at all (module/function/
+   builtin names are always literal identifiers resolved at parse time, never a forward-reference
+   placeholder); OP_FIELD_BINARY/OP_BINARY_FIELD are the tightest of all — dest+struct_reg+bin_op+
+   one RK operand already use 42 bits, leaving only 14 for field_idx (16384 slots) instead of the
+   29-42 bits every other opcode's name/field index got. Still comfortably more than any real
+   program's field-name count specifically (as opposed to its total pool size, which these two
+   don't need to address) — guarded the same way. */
 #define PACK_INDEX_SET(arr_reg, rk_idx, rk_val) \
     ( ((uint64_t)(OP_INDEX_SET) & 0xFF) \
     | (((uint64_t)(arr_reg) & 0x7F) << 8) \
@@ -1214,6 +1200,9 @@ void           chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int 
                                    unsigned int arity, unsigned int min_arity, AerVal* defaults,
                                    bool has_receiver, unsigned int receiver_type);
 ChunkFunction* chunk_find_function(Chunk* c, const char* name);
+
+/* Parse-time variant — name_idx is a dedup'd pool index, so this is an int compare, no strcmp. */
+ChunkFunction* chunk_find_function_by_name_idx(Chunk* c, unsigned int name_idx);
 
 /* `name` binds the module ("mid" for both `import mid` and `import sub.mid`); `path_name` is what
    resolves to a file, dots as directory separators ("sub.mid" -> "sub/mid.aer"), equal to name/len

@@ -51,18 +51,11 @@ typedef struct {
     unsigned int    slab_count, slab_cap;
     unsigned int    next_index;      /* next free cell within the current (last) slab */
     size_t          elem_size;
-    /* Cell-to-cell byte stride actually used for every address computation (pool_grow's slab
-       xmalloc, pool_alloc/pool_sweep's per-index addressing) — elem_size rounded up to the next
-       power of two, with stride_shift its log2, so a cell's index within a slab is
-       `offset >> stride_shift` instead of `offset / elem_size`. elem_size is a runtime Pool field,
-       not a compile-time constant, so the compiler can't strength-reduce that division into a
-       shift on its own; on a target with no hardware integer divide (e.g. 32-bit ARM), it would
-       instead call a software libgcc routine on every single GC write-barrier/mark check. stride
-       is always >= elem_size, so cells are slightly over-provisioned (real, bounded padding) in
-       exchange for the division never happening at all. Computed once in pool_init and never
-       changes after. */
+    /* Cell-to-cell byte stride for every address computation (all `index * stride` — no
+       pointer-to-index division exists anywhere): elem_size rounded up to 8-byte alignment,
+       16-byte floor for pool_free's free-list pointer at bytes [8,16). Computed once in
+       pool_init. */
     size_t          stride;
-    unsigned int    stride_shift;
     unsigned int    elems_per_slab;
     void*           free_list;       /* singly-linked through freed cells' bytes [sizeof(void*), 2*sizeof(void*)) — see the file comment above on why not [0, sizeof(void*)) */
 } Pool;
