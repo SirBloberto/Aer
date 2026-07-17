@@ -687,6 +687,8 @@ print(lo)    # 1
 print(hi)    # 9
 ```
 
+Under the hood, `return lo, hi` allocates a real array to carry the values across to the caller's destructuring assignment — there's no special multi-value calling convention. A single-value `return lo` allocates nothing extra. For a function called in a hot loop, prefer a single return value (or an explicitly passed-in struct/array to write into) over multiple return values if the allocation matters.
+
 ## Lists
 
 Arrays are mutable ordered sequences with reference semantics — assigning an array to a
@@ -755,17 +757,22 @@ not insertion order — don't rely on a dict preserving the order its keys were 
 
 Structs are AER's fixed-shape record type — the closest thing to a "class," minus methods (see
 [Method Calls and Pipes](#method-calls-and-pipes) for how behaviour attaches to them instead).
-Declared with a field list and optional literal defaults:
+Declared with a field list, each field mandatorily typed, and an optional literal default:
 
 ```
 struct Point:
-    x = 0.0
-    y = 0.0
+    x: float = 0.0
+    y: float = 0.0
 ```
 
-A bare field name with no `= value` defaults to `null`. Defaults must be literals — no arbitrary
-expressions — since the whole declaration compiles to a single instruction that registers the
-shape.
+**Every field must declare both a type and an explicit default** — `x = 0.0` with no type, and
+`x: float` with no default, are both compile errors. Eligible types are `integer`, `float`,
+`boolean`, `string`, `any`, or another struct's name; `any` opts out of type checking entirely for
+that field (and, along with `string` and a nested struct type, opts the whole struct out of
+packed-array eligibility — see [Packed Arrays](#packed-arrays) below). Defaults must be literals —
+no arbitrary expressions — since the whole declaration compiles to a single instruction that
+registers the shape. Assigning a value of the wrong type to a typed field is a runtime error, the
+same protection function parameters don't get.
 
 **Instantiation** reuses ordinary call syntax, positionally in declared field order. Omitted
 trailing arguments take their declared defaults; passing more arguments than fields is an error:
@@ -814,6 +821,47 @@ point_translate(p1, 1.0, 1.0)
 
 `x as Point` is a standalone runtime shape check, not part of a function signature — see
 [Casting and Shape-Checking](#casting-and-shape-checking--as).
+
+### Packed Arrays
+
+`Type[count]` constructs a fixed-size, mass-allocated array of `count` instances of struct `Type`,
+packed inline in one contiguous block instead of `count` separately heap-allocated instances
+linked through an ordinary array of references. This is AER's answer to data-oriented design: a
+tight loop over a large `Type[]` touches far fewer cache lines than the same loop over an ordinary
+array of struct instances (see [Benchmarking](#benchmarking) for a measured, at-scale comparison).
+
+```
+struct Body:
+    x: float = 0.0
+    y: float = 0.0
+    mass: float = 0.0
+
+bodies = Body[1024]
+bodies[0].x = 1.5
+print(bodies[0].x)      # 1.5
+print(length(bodies))   # 1024
+```
+
+**Eligibility is per-struct-type**, checked once at parse time: every field must be `integer`,
+`float`, or `boolean` — `any`, `string`, and nested-struct fields all disqualify a struct from
+`Type[count]` construction (they can't be packed at a uniform byte width), even though that same
+struct works fine as an ordinary, individually-constructed instance (`Type()`).
+
+**Field access only — no standalone per-element reference.** `arr[i].field` (get and set,
+including compound assignment) is the only supported form; a bare `arr[i]` alone is a compile
+error (`Cannot index type`), and so is `for x in arr:` — a packed array can't be iterated directly
+(index with an ordinary counting loop instead: `for i in 0..length(arr): ... arr[i].field ...`).
+This isn't an arbitrary restriction: a packed element has no standalone value to hand back — its
+"address" is pure arithmetic (`base + i * stride`), recomputed at each `.field` access, not a
+pointer to save or a value to box.
+
+**Not yet supported for a packed array specifically** (an ordinary struct array works fine with
+all of these): `json.encode()` (errors — "cannot serialize a packed array value"), and the
+embedding API's `Value`/`aer_val_to_public` boundary (a packed array can't yet cross into or out of
+host code through `AerNativeFn`).
+
+`type()` reports a distinct name (`"Point[]"`, not `"Point"`) so packed and ordinary instances of
+the same struct are still distinguishable at runtime.
 
 ## Method Calls and Pipes
 
@@ -1250,23 +1298,6 @@ game, a config parser) simply doesn't call it, and its scripts have none.
 | Pipe rejects nested calls in target args | `x \|> f(g(1))` is a parse error, at any depth | Assign the inner call to a variable first: `t = g(1); x \|> f(t)` |
 | Windows REPL doesn't support piped/redirected stdin | `aer.exe < commands.txt` fails — `_getch()` reads the console directly, bypassing redirection | Run `aer.exe script.aer` (file mode) instead — unaffected, since it never touches the raw-mode terminal code. A file-mode script can still read the piped data itself via `io.stdin()`/`io.read()` (see [Standard Library](#standard-library)) |
 
-### Known bugs
-
-- **Windows builds crash the whole process on any runtime error, instead of reporting it.**
-  `vm_run()`'s error path unwinds via `setjmp`/`longjmp` back to a catch point instead of
-  threading an error flag through every dispatch (a real, measured perf win — see the dispatch-
-  overhead work above). On Linux this is a plain, portable `longjmp`; on Windows, MinGW's
-  `longjmp` performs a full SEH-based stack unwind (`RtlUnwind`), which fails with
-  `STATUS_BAD_STACK` when called from inside `vm_run`'s computed-goto dispatch loop — confirmed
-  via GDB, independent of `-flto` (ruled out as the cause). Any script that hits a runtime error
-  (division by zero, an undefined variable, a malformed loop condition, `panic()`, ...) crashes
-  the process outright on Windows instead of printing the error and (for an embedding host)
-  returning `false` from `vm_run()`. Linux/Raspberry Pi builds are unaffected — confirmed via the
-  full embedding test suite (`make test-embed`), which passes cleanly there. Not yet fixed; the
-  likely fix is switching the Windows build to GCC's `__builtin_setjmp`/`__builtin_longjmp`
-  (bypasses SEH validation entirely — a known workaround for this class of MinGW issue), which
-  needs its own careful testing before landing.
-
 ### Hard limits
 
 | Limit | Default cap |
@@ -1325,6 +1356,34 @@ has no JIT and no type specialisation, so it won't out-loop a specializing inter
 advantage is startup time, simplicity of embedding, and being fast enough that the difference rarely
 matters in practice.
 
+### Packed arrays at scale
+
+[`nbody.aer`](nbody.aer) (the classic n-body benchmark, N=5 bodies) is small enough that its whole
+working set stays resident in L1 cache regardless of memory layout — it doesn't exercise packed
+arrays' actual advantage. [`nbody_large_packed.aer`](nbody_large_packed.aer) and
+[`nbody_large_boxed.aer`](nbody_large_boxed.aer) run the identical physics and deterministic
+initial conditions at N=1024, differing only in one line: a packed `Body[1024]` versus an ordinary
+array of individually heap-allocated `Body()` instances. Measured on a Raspberry Pi (5-run-averaged
+`perf stat`, interleaved):
+
+| Metric | Packed | Boxed | Difference |
+|--------|-------:|------:|:-----------|
+| Instructions | 25.86B | 32.33B | -20.0% |
+| Cycles | 14.38B | 18.72B | -23.2% |
+| Cache misses | 4.76M (0.048% of refs) | 42.0M (0.307% of refs) | ~8.8x fewer |
+| Wall clock | 8.16s | 10.03s | -18.6% |
+
+This is the honest, at-scale number for AER's stated data-oriented-design purpose — the cache-miss
+reduction specifically is packed arrays' actual value proposition, not the smaller (and less
+dramatic) instruction-count win alone.
+
+### Profile-guided optimization
+
+`make pgo` (see [Building](#building)) measured ~6-9% fewer instructions/cycles than the plain
+build on `nbody.aer` — re-run the comparison on your own workload before relying on that exact
+number, since PGO's benefit is workload-shaped by construction (it profiles against `nbody.aer`
+plus the test suite, not your specific program).
+
 ---
 
 ## Architecture
@@ -1365,18 +1424,21 @@ general expression) — without a chain of separate grammar rules.
 String interpolation is resolved at compile time: `"Hello {name}"` is lowered directly to a chain
 of `OP_LOAD` / `OP_TO_STR` / `OP_ADD` instructions with no runtime parsing.
 
-For-each loops compile to three stack-based iterator opcodes (`OP_ITER_NEXT`, `OP_ITER_NEXT_PAIR`,
-`OP_ITER_RANGE`) that keep their state directly on the value stack as a `[collection, index]` pair,
-avoiding any heap allocation per iteration.
+For-each loops compile to register-based iterator opcodes (`OP_ITER_NEXT_ARRAY`/`OP_ITER_NEXT_PAIR`
+for arrays/dicts/strings, `OP_ITER_RANGE_PREP`/`OP_ITER_RANGE_LOOP` for `a..b..step` ranges) whose
+state lives in a couple of registers the loop already owns — no heap allocation per iteration, and
+the range form is loop-rotated (PREP once before the loop, LOOP at the bottom) to match Lua's own
+FORLOOP shape rather than paying a separate top-of-loop check plus an unconditional back-edge jump.
 
-`break` and `continue` are compiled with scope-pop counts and iterator-stack-pop counts computed at
-compile time. A `LoopContext` struct tracks the entry scope depth and the number of iterator slots
-on the value stack, so both are unwound correctly on early exit.
+`break` and `continue` are compiled with jumps patched directly to the loop's own exit/continue
+targets, computed at compile time — there's no separate runtime scope or iterator stack to unwind,
+since a loop's iteration state is just ordinary registers.
 
-Struct declarations (`parse_struct`) resolve the struct's identity at **runtime**, not parse time —
-exactly like a function name, a struct isn't known to exist until the statement that declares it
-actually executes. The parser just emits the field list and defers name resolution to the VM's
-shape registry.
+Struct **names** are tracked in a parse-time table (`struct_names`) as soon as a `struct` statement
+is parsed, which is what lets `Type()`/`Type[count]` be recognized immediately after — but the
+struct's actual shape (field names, types, defaults) is only registered into the chunk's runtime
+shape registry when `OP_DEFINE_STRUCT` actually executes, exactly like a function name is knowable
+before its body has run.
 
 `import` is resolved entirely at parse time (see [Modularity](#modularity)) — a file-based import
 runs the imported file's code synchronously, in an isolated `Chunk`/`VM`, before the importing
@@ -1384,94 +1446,100 @@ file's own parse continues, which is why it's restricted to the top level of a f
 
 ### VM (`source/core/vm.c`)
 
-A stack-based virtual machine with a computed-goto dispatch loop (direct-threaded — each instruction
-jumps straight to the next handler instead of looping back through a `switch`). No recursion, no
-pointer chasing at runtime — just sequential integer array reads.
+A **register-based** virtual machine with a computed-goto dispatch loop (direct-threaded — each
+instruction jumps straight to the next handler instead of looping back through a `switch`). Every
+instruction word is fetched, masked down to its opcode, and dispatched via a jump table (`dt[]`) in
+one `DISPATCH()` macro shared by every handler. No recursion, no pointer chasing to fetch the next
+instruction — just sequential array reads.
 
-**Constant pool:** all literal values and variable names live in a single deduplicated `Value` pool
-inside the `Chunk`, referenced by index from the bytecode. String pool entries are deduplicated in
-O(1) via a name-to-index hashmap (`Chunk.name_index`); non-string literals use a linear scan.
+**Instruction encoding:** most opcodes pack their operands (destination register, RK-encoded
+operands, small tags) directly into the high bits of one 64-bit word alongside the opcode itself —
+`PACK_BINARY`, `PACK_REG4`, `PACK_CALL_MODULE` and friends, each documented at its own definition in
+`vm.h`. An operand that's "RK-encoded" (`vm_rk_ptr9`/`vm_rk_ptr20`) is either a register index or,
+with a flag bit set, an index into the chunk's constant pool — one opcode per operator instead of a
+family of opcodes per operand-kind combination. A handful of opcodes (`OP_LOADK`, `OP_DEFINE_STRUCT`,
+`OP_CALL_MODULE`) can't fit every operand in one word and read one or more trailing plain words
+instead, the same convention `source/core/disasm.c`'s decoder follows.
 
-**Scope:** a static array of small inline-slot scopes (spilling to a `HashMap` past 32 variables) in
-the VM struct. `scopes[0]` is the global scope; every function call pushes exactly one more
-(`OP_PUSH_SCOPE`/`OP_POP_SCOPE`, once per call, not once per `if`/`for` block — blocks don't scope
-at all anymore, see below) holding every local the function's *whole* body uses. Because assignment
-inside a function is always local (see [Scope inside a function](#scope-inside-a-function)), the
-parser resolves every name in a function body to a fixed slot at parse time — there is no runtime
-scope-chain walk for locals at all.
+**Registers, not a scope chain:** every function call gets its own contiguous window into one
+shared, bump-pointer `VM.register_stack` (`CallFrame.registers`/`frame_size`) — pushing a frame is
+just `callee->registers = caller->registers + caller->frame_size`, no heap allocation. The parser
+resolves every local (parameter or body variable) to a fixed register index at *parse* time
+(`var_slot`, `parser.c`), so there's no runtime name lookup for a function's own locals at all — the
+VM only ever reads/writes `registers[N]` directly. A top-level variable is a register in frame 0,
+which never moves for the life of the VM (see [Scope inside a function](#scope-inside-a-function)
+for why a function body can't reach it by name).
 
-**Every local gets a compile-time slot** — `OP_LOAD_LOCAL`/`OP_STORE_LOCAL`/`OP_DEFINE_LOCAL`, a
-direct index into the current call's own scope (`vm_scope_floor`), the same role CPython's
-`LOAD_FAST` plays relative to `LOAD_GLOBAL`. The parser assigns each distinct name in the function
-currently being compiled a slot the moment it first sees that name assigned or declared as a
-parameter (`current_locals`, `parser.c`) — a loop variable or plain body-local gets exactly the same
-fast path a parameter does; a name the parser doesn't recognize as a local of the current function
-is a true global instead, resolved by the name-based path below. `if`/`for` blocks don't introduce
-their own scope — a loop variable's slot is simply reused across iterations, matching Python's
-`LOAD_FAST`/`STORE_FAST` behavior (the value from the last iteration is still readable after the
-loop ends).
+**Tail calls:** `OP_TAIL_CALL`/`OP_TAIL_CALL_VALUE` — emitted instead of `OP_CALL`/`OP_CALL_VALUE`
+only when `return f(args)` is the *entire* return expression (see [Tail Calls](#tail-calls)) — share
+the exact same dispatch handler as their non-tail counterparts; the opcode value itself is patched
+in place once the call is confirmed to qualify. A qualifying tail call overwrites the *current*
+frame's own argument registers and jumps straight to the callee's code, reusing the frame instead of
+pushing a new one, which is what makes unbounded tail recursion run in constant stack space.
 
-**Call stack:** a static array of `CallFrame`s (return address, scope depth — doubling as the
-scope-lookup floor described above). `OP_CALL` saves a frame and jumps to the function's bytecode
-offset. `OP_RETURN` unwinds all scopes back to the saved depth, restores
-the instruction pointer, and pushes the return value. This call-setup logic (arity check, frame
-construction) is factored into a single shared helper, `vm_setup_call`, used both for an
-ordinary in-VM call and for invoking a file-module's function across the VM boundary (see below).
+**"Primitive pass" (raw locals):** a local the compiler can prove is always a plain `integer` or
+`float` (never reassigned to another type, never read across a branch that could disagree) gets
+unboxed storage in `CallFrame.raw_ints`/`raw_reals` instead of an ordinary tagged `AerVal` register,
+and a dedicated family of opcodes (`OP_RAW_ADD_INT`, `OP_RAW_LT_REAL`, ...) operates on it directly —
+no tag check, no allocation. `OP_BOX_INT`/`OP_BOX_REAL` bridge a raw value back to an ordinary
+register at the few places that need one (a call argument, a return value, a container element).
 
-**Inline caching for call targets and globals:** each `OP_CALL`/`OP_TAIL_CALL`/`OP_LOAD`/`OP_STORE`
-site carries a cache-slot operand indexing into `Chunk.addr_cache` — populated the first time that
-site's name resolves to an address inside the *global* scope's own inline slots (a fixed,
-never-reallocated location for the VM's whole lifetime), and dereferenced directly on every later
-visit, skipping the lookup entirely. This caches the *address* a name resolved to, not a snapshot of
-the value there, so reassigning the global is reflected immediately on the next access through that
-same site — no invalidation logic needed. `OP_LOAD`/`OP_STORE` always resolve a true global (the
-parser guarantees this, per the local-slot paragraph above), so their sites cache unconditionally.
-`OP_CALL`/`OP_TAIL_CALL` can still name a function value held in a local (`f = greet; f("World")`) —
-those only cache when the global is confirmed to be the *winning* resolution (not merely "a global
-with this name exists somewhere") — a local of the same name must keep winning on every visit
-through that site, not just the first one before the cache populated.
+**Field access is inline-cached per callsite:** `Chunk.field_cache` remembers, for each
+`.field`-access site in the bytecode, the last `(Shape*, slot)` pair that resolved there — a shape
+match on the next visit skips the by-name field scan entirely. Populated lazily and never
+invalidated (a struct's field layout never changes after `OP_DEFINE_STRUCT` registers it).
 
-`OP_TAIL_CALL` — emitted by `parse_return` instead of `OP_CALL` only when a `return name(args)`
-statement compiles to nothing but that one call (see [Functions](#functions)) — shares `OP_CALL`'s
-entire dispatch-table target and handler; the two diverge only once a callee is confirmed valid, at
-the point a frame would normally be pushed. It reuses the current frame's registers in place and
-jumps straight into the callee, instead of growing the call stack.
+**Packed arrays** (`Type[count]`, see [Packed Arrays](#packed-arrays)) are a separate value type,
+`AerPackedArray` — one raw byte block holding `count` instances of one struct type's fields at a
+fixed per-field 8-byte slot, addressed by pure arithmetic (`base + i * stride + field_offset`)
+instead of `count` individually heap-allocated, pointer-linked instances. Every field is a fixed
+primitive (never a heap reference), so a packed array is a leaf for the garbage collector — its own
+mark step never recurses into its contents.
 
-**Collections:** `AerArray` and `AerDict` are heap-allocated structs held by pointer inside a
-`Value`. Assignment copies the pointer — all aliases share the same data. Arrays grow with
-doubling reallocation; dicts use FNV-1a open addressing. A struct instance is an `AerArray` with a
-non-`NULL` `shape` pointer into the chunk's struct-type registry — same allocation and reference
-semantics as an ordinary array, with bracket/slice/append/delete rejected at the point of use.
+**Collections:** `AerArray` and `AerDict` are heap-allocated structs held by pointer inside an
+`AerVal`. Assignment copies the pointer — all aliases share the same data. Arrays grow with doubling
+reallocation; dicts use `source/utilities/hashtable.c`'s open-addressed hash table (FNV-1a, linear
+probing, size-classed slab pools for small key/bucket allocations — see below). A struct instance is
+an `AerArray` with a non-`NULL` `shape` pointer into the chunk's struct-type registry — same
+allocation and reference semantics as an ordinary array, with bracket/slice/append/delete rejected
+at the point of use.
 
-**Struct registry:** `Chunk.shapes` is an append-only array of individually heap-allocated `Shape`
-records (name, ordered field names, literal defaults), populated by `OP_DEFINE_STRUCT` and looked up
-by name (newest-first) via `chunk_find_shape`. Append-only so that redeclaring a struct — e.g.
-re-running a REPL block — never invalidates an instance still holding a pointer to the earlier
-`Shape`.
+**Garbage collection:** a generational mark-sweep collector. Every pool-managed object
+(`AerString`/`AerArray`/`AerDict`/`AerFunction`/`AerPackedArray`) carries its own one-byte GC state
+as its literal first field (mark bit, generation bit, free-list bit, remembered-set bit — see
+`source/utilities/pool.h`), so the collector never needs a side table to look up an object's state
+from its pointer. A write barrier records old-generation objects that come to hold a reference to a
+young one (the "remembered set") so a minor collection can trace from them without re-scanning every
+old object. `source/utilities/pool.c` is a slab (bump/arena) allocator underneath all of this,
+handing out a free-list cell if one exists or the next cell in the current slab otherwise.
 
-**REPL error handling:** a runtime error sets a flag checked at the top of every instruction
-dispatch. When set, `vm_run` returns immediately instead of fetching the next instruction — the
-rest of the current statement never executes, but the REPL's outer loop is unaffected and continues
-normally on the next line. File execution (`MODE_RUN`) is unaffected — it still exits immediately on
-any error, before this check is ever reached.
+**Error handling:** `error()`/`error_at()` (`source/utilities/error.c`) unwind directly back to the
+currently-executing `vm_run()` call's own catch point via `setjmp`/`longjmp` (GCC's
+`__builtin_setjmp`/`__builtin_longjmp` on MinGW specifically, to sidestep a Windows SEH incompatibility
+— see `error.h`'s `AER_JMP_BUF`/`AER_SETJMP`/`AER_LONGJMP`), instead of polling an error flag on every
+single dispatch. A nested `vm_run()` call (a cross-module call) installs and restores its own catch
+point, so an error inside an imported module's function unwinds only as far as that module's own
+call, not past it uncontrolled.
 
-**REPL persistence:** the `Chunk` and `VM` are long-lived across REPL calls. Each line resets only
-the bytecode counter; the pool, global scope, and struct registry persist so variables, functions,
-and struct types survive between lines.
+**REPL persistence:** the `Chunk` and `VM` are long-lived across REPL calls. Each line only extends
+the bytecode and constant pool; global variables, functions, and struct types all persist because
+their registers/registries are never reset between lines.
 
-**Native and file-based modules:** the hardcoded native modules (`math`, `random`, `string`, `time`)
-each dispatch by name from their own file in `source/stdlib/` (`aer_math.c` and friends).
-`source/core/aer_module.c` handles file-based
-imports — each imported file gets its own `Chunk` and `VM`, run to completion once at import time;
-calling one of its functions later uses a small trampoline that copies arguments across the VM
-boundary, sets up a call frame via the shared `vm_setup_call`, and runs the module's own VM just far
-enough to execute that one call before returning control to the caller.
+**Native and file-based modules:** the hardcoded native modules (`math`, `random`, `string`, `time`,
+`json`) each dispatch by name from their own file in `source/stdlib/` (`aer_math.c` and friends), all
+routed through `OP_CALL_MODULE`'s shared bridge in `vm.c`. `source/core/aer_module.c` handles
+file-based imports — each imported file gets its own `Chunk` and `VM`, run to completion once at
+import time; calling one of its functions later uses a small trampoline (`setup_call`) that copies
+arguments across the VM boundary and runs the module's own VM just far enough to execute that one
+call before returning control to the caller.
 
-### HashMap (`source/utilities/hashmap.c`)
+### Hash table (`source/utilities/hashtable.c`)
 
-FNV-1a hash with open addressing and linear probing. Grows at 70% load. One instance per live
-scope layer (past the inline-slot threshold) plus one per dict. Deletion uses the reinsert technique
-to preserve the probe-chain invariant without tombstones.
+FNV-1a hash with open addressing and linear probing, growing at 70% load; deletion uses the reinsert
+technique to preserve the probe-chain invariant without tombstones. Backs every `AerDict` and, less
+visibly, `Chunk.name_index` (the pool's own string-constant dedup table) — both consumers share the
+same size-classed slab pools for small key buffers and bucket arrays, falling back to plain
+malloc/xcalloc only past the largest size class.
 
 ---
 
@@ -1484,19 +1552,26 @@ Every non-obvious decision in AER was made deliberately. This section documents 
 The parser emits bytecode directly as it recognises tokens. There is no intermediate AST and no
 separate compilation phase. Each `parse_*` function simultaneously _is_ the grammar rule and the
 code generator. The payoff is simplicity: adding a new construct means writing one function, not
-touching three. Struct and function names are consequently resolved at **runtime**, not parse time
-— the same tradeoff that already applied to function calls, extended to structs.
+touching three. A struct or function's *name* is known as soon as its declaration is parsed (each
+kept in its own parse-time table), but its actual body/shape is only registered when that
+declaration's own bytecode runs — the same "name known early, definition resolved at its own point
+of execution" tradeoff applies to both.
 
-### Flat `int[]` bytecode
+### Packed instruction words, not a flat `int[]`
 
-Instructions and operands are plain integers in one array — not a struct-per-instruction with tagged
-unions. Instruction fetch is `c->code[vm->ip++]`: one array read, no pointer chasing. The constant
-pool (`c->pool`) is a separate `Value*` array indexed from bytecode.
+Bytecode is a `uint64_t[]`, not a plain `int[]` — most opcodes pack their destination register,
+RK-encoded operands, and small tags directly into one word alongside the opcode itself (see the VM
+section under [Architecture](#architecture)), so a single array read plus a handful of shifts/masks
+decodes an entire instruction with no pointer chasing. Only opcodes that can't fit everything in one word
+(`OP_LOADK`, `OP_DEFINE_STRUCT`, `OP_CALL_MODULE`, ...) read one or more trailing plain words after
+it. The constant pool (`c->pool`) is a separate `AerVal[]` indexed from bytecode.
 
 ### `TYPE_NULL` first in enum
 
-`(Value){0}` is zero-initialised and therefore always a valid null. Error paths, uninitialised slots,
-and missing dict keys are safe to produce without explicit construction. No sentinel magic needed.
+`(AerVal){0}` is zero-initialised and therefore always a valid null — `mark_vm_roots` (`vm.c`) can
+scan every register unconditionally, including one no instruction has written to yet, and get a
+harmless null back instead of an arbitrary tag. The same zero-value invariant holds for the public,
+embedding-facing `Value` struct. No sentinel magic needed either way.
 
 ### Backpatching
 
@@ -1511,12 +1586,15 @@ operator, add one row to the table — `in`, `|>`, and `as` all went in this way
 needing a small special-case branch in the climbing loop only because their right-hand side isn't a
 general expression.
 
-### Iterator state on the value stack
+### Iterator state lives in ordinary registers
 
-`for x in arr:` pushes `[collection, index]` onto the value stack before the loop, then
-`OP_ITER_NEXT` advances them in place. No heap allocation per iteration. `break` emits explicit
-`OP_POP` instructions at compile time to clean the iterator slots; `OP_ITER_NEXT` cleans up on
-natural exit.
+`for x in arr:` keeps its collection reference and index in two registers the loop already owns,
+advanced in place by `OP_ITER_NEXT_ARRAY`/`OP_ITER_NEXT_PAIR` each iteration — no heap allocation,
+and no separate iterator stack to unwind on `break`, since `break`/`continue` compile straight to a
+jump. The integer-range form (`a..b..step`) goes further: `OP_ITER_RANGE_PREP` computes a total
+iteration count once before the loop, and `OP_ITER_RANGE_LOOP` counts down at the *bottom* of the
+loop body, matching Lua's own FORLOOP shape — no unconditional back-edge jump instruction is ever
+emitted for this loop form at all.
 
 ### Short-circuit `&&`/`||` always produce boolean
 
@@ -1530,9 +1608,11 @@ Rather than returning the operand value (as JavaScript does), AER's `&&`/`||` al
 nested function's variable lookups would only work by accident, only while the enclosing call is
 still on the stack. Anonymous function expressions (`function(...): ...`) *can* be defined inside
 another function's body, but AER doesn't give them a capture mechanism: a nested function
-expression can only see its own parameters/locals and true globals, exactly like a top-level
-function — referencing the enclosing function's variable is a plain `'x' is not defined` error, not
-anything silently wrong.
+expression can only see its own parameters and locals, exactly like a top-level function (top-level
+variables are off-limits inside any function, nested or not — see
+[Scope inside a function](#scope-inside-a-function)) — referencing the enclosing function's
+variable is the same `'x' is not defined` (or, if the name happens to be a top-level variable, the
+"not accessible inside a function" error) either way, not anything silently wrong.
 
 This was a deliberate choice, not a missing feature: a closure is a function value carrying
 *implicit* bound state from wherever it happened to be created, invisible at every later call site —
@@ -1546,21 +1626,24 @@ behind the scenes.
 
 Assignment inside a function body is always local (see
 [Scope inside a function](#scope-inside-a-function)) — there is no walk-up-and-mutate-outer
-ambiguity to resolve, so every name a function body assigns or reads (other than a true global) is
-resolvable to a fixed slot at *parse* time, not a runtime lookup. This is what let `OP_LOAD_LOCAL`/
-`OP_STORE_LOCAL`/`OP_DEFINE_LOCAL` extend from parameters-only to every local a function has: an
-earlier "hybrid scopes" design (locals fast-pathed like parameters, everything else name-based) was
-tried and reverted before closures existed, specifically because the *old* semantics — a plain
-assignment walking up to mutate an existing outer/global binding — couldn't be resolved at parse
-time in the general case. Removing that walk-up rule in favor of always-local is what made the full
-flat-slot model possible.
+ambiguity to resolve, so every name a function body assigns or reads (other than a reference to
+another function/struct) is resolvable to a fixed register at *parse* time, not a runtime lookup.
+Every local — parameter or body variable alike — gets exactly the same fast path: a direct register
+index, read/written by whatever opcode the expression already needed (there's no separate
+load/store opcode for "a local" versus any other register, since a local's storage *is* just a
+register). An earlier "hybrid scopes" design (locals fast-pathed like parameters, everything else
+name-based) was tried and reverted before this rule existed, specifically because the *old*
+semantics — a plain assignment walking up to mutate an existing outer/global binding — couldn't be
+resolved at parse time in the general case. Removing that walk-up rule in favor of always-local is
+what made the full flat-register model possible.
 
-A lookup that isn't resolved to a local at parse time (a true global reference, or a call target
-that might be one) is bounded to the current call's own scope plus the global scope — since nested
-function definitions are rejected and there's no capture path, nothing else can ever be a
-legitimate target, so it never needs to walk caller frames. The payoff for recursion is unchanged:
-resolving a recursive function's own name from deep in a call chain still costs one hop, not one
-per stack frame.
+A lookup that isn't resolved to a local at parse time is either a compile error (the name is a
+top-level variable, off-limits from inside any function — see
+[Scope inside a function](#scope-inside-a-function)) or a reference to another function/struct
+name, resolved once at parse time exactly like a local would be — there is no runtime walk-up to
+any enclosing or caller scope at all, since nested function definitions are rejected and there's no
+capture path. The payoff for recursion is unchanged: resolving a recursive function's own name from
+deep in a call chain still costs one hop, not one per stack frame.
 
 ### Structs are arrays with a shape, not a new value type
 
@@ -1625,19 +1708,20 @@ imported file avoids this entirely, at the cost of needing a small cross-VM call
 
 ### Memory management
 
-AER runs a **generational mark-and-sweep collector** over four pooled heap types
-(`AerString`/`AerArray`/`AerDict`/`AerFunction` headers, `source/utilities/pool.c`). Every pool cell
-carries one byte of state: a mark bit (this collection cycle only), a generation bit (young/old —
-promoted the first time a cell survives any collection), and a free-list bit. Allocation is
-unchanged from the pooled/slab design (a free-list pop, or a bump into the current slab) —
-collection is what's new.
+AER runs a **generational mark-and-sweep collector** over six pooled heap types (`AerString`,
+`AerArray`, `AerDict`, `AerFunction`, struct instances in their own pool separate from ordinary
+arrays, and `AerPackedArray` — `source/utilities/pool.c`). Every pool cell carries one byte of
+state: a mark bit (this collection cycle only), a generation bit (young/old — promoted the first
+time a cell survives any collection), a free-list bit, and a remembered-set bit (see below).
+Allocation is unchanged from the pooled/slab design (a free-list pop, or a bump into the current
+slab) — collection is what's new.
 
 **Two collection modes, one shared heap.** A *minor* collection traces the normal roots (the VM
 stack and every live call frame's registers) plus a *remembered set* — old
 objects a write barrier caught being mutated to hold a young reference — and only sweeps young
 cells; old cells are presumed live and left untouched, which is what keeps minor collections cheap.
 A *major* collection (run periodically, after a fixed number of minor ones) traces the same roots
-with no remembered set needed and sweeps both generations. The four pools are process-global and
+with no remembered set needed and sweeps both generations. The six pools are process-global and
 shared by the main VM *and* every file-module's own VM (`import` still runs each file in a fully
 separate `Chunk`+`VM` — see [Modularity](#modularity)), so a collection triggered anywhere marks
 every loaded module's roots too, not just the VM that triggered it.
@@ -1662,7 +1746,7 @@ run, major collections run.
 
 **Two knobs, both optional.** `aer_gc_configure(minor_threshold, major_every_n_minor)` overrides the
 tuning constants above (2048 and 10 by default) — pass `0` for either argument to leave that one
-alone. `aer_gc_set_ceiling(max_live_cells)` caps total live cells across all five pools — a
+alone. `aer_gc_set_ceiling(max_live_cells)` caps total live cells across all six pools — a
 `-Xmx`-style limit, `0` (the default) meaning unlimited. Hitting the ceiling doesn't crash the host:
 the collector forces one extra major pass first (in case a cheap collection alone would've freed
 enough), and only if the script is *still* over the limit does it abort with a normal, recoverable
@@ -1689,10 +1773,10 @@ raises a normal AER runtime error instead of risking a stack overflow.
 |------|---------|
 | `source/main.c` | Entry point, REPL loop, file runner |
 | `source/terminal.h/c` | Raw-mode interactive REPL terminal |
-| `source/value.h` | `Value` type: null / boolean / integer / real / string / function / array / dict, and the `Shape` forward declaration |
+| `source/value.h` | `AerVal` (the internal tagged-union value) and `Value` (the public, embedding-boundary struct): null / boolean / integer / real / string / function / array / dict / packed array, and the `Shape` forward declaration |
 | `source/compiler/lexer.h/c` | Source text → token stream, indent/dedent tracking |
-| `source/compiler/parser.h/c` | Single-pass compiler: tokens → bytecode, escape processing |
-| `source/core/vm.h/c` | Bytecode chunk, VM, scope chain, struct-type registry, dispatch loop, built-ins |
+| `source/compiler/parser.h/c` | Single-pass compiler: tokens → register-based bytecode, escape processing |
+| `source/core/vm.h/c` | Bytecode chunk, register-based VM (`CallFrame`/bump-pointer register stack), struct-type registry, computed-goto dispatch loop, built-ins |
 | `source/stdlib/aer_stdlib.h` | Declares the entire native-module surface (math/random/string/time/json/io) — one header for a fixed, closed set |
 | `source/stdlib/aer_stdlib.c` | Native-module registry: `aer_stdlib_init()`, `aer_stdlib_is_native_module()` |
 | `source/stdlib/aer_math.c` / `aer_random.c` / `aer_string.c` / `aer_time.c` | One file per hardcoded native module, dispatched by `vm.c`'s `OP_CALL_MODULE` switch |
@@ -1700,12 +1784,16 @@ raises a normal AER runtime error instead of risking a stack overflow.
 | `source/stdlib/aer_io.c` | `io` module (file open/read/write/close) — opt-in per host via `aer_io_register()`, not hardcoded like the others |
 | `source/core/aer_module.h/c` | File-based `import` — resolution, isolated per-file `Chunk`/`VM`, cross-VM call trampoline |
 | `source/core/aer_host.h/c` | Host-registered native function registry (`aer_register_function`) — reached from AER the same way as `math`/`random`/`string` |
-| `source/utilities/hashtable.h/c` | FNV-1a open-addressing table (one per scope/dict), shared by `Chunk`'s name index and `AerDict` |
-| `source/utilities/pool.h/c` | Slab (bump/arena) allocator for heap types that are never individually freed — `AerString`/`AerArray`/`AerDict`/`AerFunction` headers |
+| `source/utilities/hashtable.h/c` | FNV-1a open-addressing hash table backing every `AerDict` and `Chunk`'s own string-constant dedup table, with size-classed slab pools for small key/bucket allocations |
+| `source/utilities/pool.h/c` | Slab (bump/arena) allocator extended for the generational mark-sweep garbage collector — every pool-managed struct (`AerString`/`AerArray`/`AerDict`/`AerFunction`/`AerPackedArray`) carries its own one-byte GC state as its literal first field |
 | `source/utilities/error.h/c` | Error reporting with source location and column pointer; recoverable-error sink (callback or stderr), `aer_report_fatal` for genuinely unrecoverable conditions, `assert_failure_count` |
 | `include/aer.h` | Public embedding API: version constant, error callback/query functions, custom native-function registration (see [Embedding](#embedding)) |
-| `tests/test.aer` | Runnable documentation and regression suite — `assert()`-based, exits nonzero on any failure |
+| `test.aer`, `tests/test_*.aer` | Runnable documentation and regression suites — `assert()`-based, exits nonzero on any failure. Run with `make test`. |
 | `tests/embed_smoke_test.c` | Minimal standalone embedding host — proves a runtime error doesn't kill the process, demonstrates the VM-reuse-after-error contract, and registers/calls a custom host function. Build/run with `make test-embed`. |
-| `.github/workflows/ci.yml` | CI: builds, runs `tests/test.aer`, runs `make test-embed` |
+| `tests/smoke_test.c` | Register-VM unit test — hand-built bytecode plus real-source coverage below the level of a full `.aer` file. Build/run with `make test-smoke`. |
+| `tests/fuzz.py` | Mutation-based fuzzer against an ASAN build — reports crashes and hangs. Run with `make fuzz`. |
+| `tests/benchmark.sh` | Cross-language benchmark against Python/Lua (see [Benchmarking](#benchmarking)) |
+| `nbody.aer`, `nbody_large_packed.aer`, `nbody_large_boxed.aer` | Packed-array benchmarks at N=5 and N=1024 (see [Benchmarking](#benchmarking)) |
+| `.github/workflows/ci.yml` | CI: builds, runs `make test`, `make test-embed`, `make fuzz` (ASAN, fixed seed), and `make coverage` |
 
 ---
