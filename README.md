@@ -239,9 +239,9 @@ matching Rust's `as` precedence convention. `in` sits at comparison precedence, 
 not).
 
 **Assignment** is a statement, not an expression, and isn't part of the precedence table at all:
-`=`, and the compound forms `+=  -=  *=  /=  %=  //=  <<=  >>=  &=  |=  ^=`. Compound assignment is
-**not** supported on an indexed or dot-field target — `arr[i] += 1` and `p.x += 1` are both parse
-errors; write `arr[i] = arr[i] + 1` / `p.x = p.x + 1` instead.
+`=`, and the compound forms `+=  -=  *=  /=  %=  //=  <<=  >>=  &=  |=  ^=`. Compound assignment
+works on plain names, indexed targets, and dot-field targets alike — `x += 1`, `arr[i] += 1`, and
+`p.x += 1` are all supported, at any chain depth (`bodies[i].pos[0].x += v`).
 
 `/` always performs true division and returns a real; `//` is floor division, rounding toward
 negative infinity (matching Python, not C):
