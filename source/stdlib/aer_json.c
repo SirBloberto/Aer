@@ -57,7 +57,7 @@ static void json_encode_string(JsonBuf* b, const char* s, unsigned int len) {
     jb_append_char(b, '"');
 }
 
-/* Returns false (error() already called) only for a function value — everything else succeeds. A struct instance (AerArray with a shape) encodes as a JSON object keyed by field names, so they survive a round trip via json.decode(). */
+/* Returns false (error() already called) for a function or packed-array value — everything else succeeds. A struct instance (AerArray with a shape) encodes as a JSON object keyed by field names, so they survive a round trip via json.decode(). */
 static bool json_encode_value(Chunk* c, AerVal v, JsonBuf* b) {
     char tmp[64];
     switch (aer_type(v)) {
@@ -112,6 +112,9 @@ static bool json_encode_value(Chunk* c, AerVal v, JsonBuf* b) {
             jb_append_char(b, '}');
             break;
         }
+        case TYPE_PACKED_ARRAY:
+            error("json.encode() cannot serialize a packed array value");
+            return false;
         case TYPE_ANY: break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
     }
     return true;

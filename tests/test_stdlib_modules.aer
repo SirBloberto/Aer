@@ -197,8 +197,8 @@ assert(dict_err == null && decoded_dict["a"] == 1, "json.encode()/decode() round
 # struct is structurally a dict on the wire, so it decodes back as one
 # (AER has no way to know which struct type a plain JSON object came from).
 struct JsonPoint:
-    x
-    y
+    x: integer = 0
+    y: integer = 0
 
 point = JsonPoint(3, 4)
 point_json = json.encode(point)

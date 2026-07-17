@@ -24,6 +24,18 @@ FLAGS := -O2 -g -flto -Wall -Wextra -I include -I source -I source/compiler -I s
 SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/stdlib/*.c source/utilities/*.c)
 OBJECT := $(patsubst source/%.c,object/%.o,$(SOURCE))
 
+# object/%.o only depends on its own .c file (below), not on any header it includes — editing a
+# shared header (e.g. vm.h) leaves every OTHER .o that includes it stale, and they still link in
+# without error, just with mismatched struct layouts against whatever .o *did* get rebuilt.
+# Confirmed as a real, reproducible bug this way, not theoretical: a CallFrame layout change built
+# via plain `make` (no clean) linked cleanly and then produced silently wrong runtime results. A
+# `-MMD -MP` + generated-.d-file fix was tried and reverted — GNU Make under MSYS2/Windows didn't
+# reliably pick up the generated dependencies (confirmed via `make -n` still showing only the
+# directly-touched .c file needing a rebuild even after regenerating .d files), so it wasn't a real
+# fix, just untested-looking safety. Until this is solved properly: run `make clean` before
+# rebuilding whenever a header's struct layout changed, not just `make`.
+
+
 # Everything except main.c — conflicts with test-embed's/test-smoke's own main() below.
 LIBOBJECT := $(filter-out object/main.o,$(OBJECT))
 
@@ -62,7 +74,8 @@ TESTS := tests/test_core.aer \
          tests/test_perf_fusion.aer \
          tests/test_primitive_pass.aer \
          tests/test_dict_pool_stress.aer \
-         tests/test_io_mode_enforcement.aer
+         tests/test_io_mode_enforcement.aer \
+         tests/test_packed_arrays.aer
 
 test: all
 	@for t in $(TESTS); do \

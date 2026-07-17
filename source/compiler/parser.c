@@ -11,6 +11,17 @@
 static int next_temp_register = 0;
 static int reserved_floor     = 0;
 
+/* Highest next_temp_register/reserved_floor has reached since the last reset — NOT the same as
+   either counter's own final value, since both shrink back down as temporaries free (reg_free)
+   while the function keeps running. This is the number that actually matters for a function's
+   real register need: how many were ever simultaneously live, not how many are live at the
+   moment compilation finishes. Reset alongside next_temp_register/reserved_floor everywhere they
+   are (reg_reset, and the save/restore blocks around a function body's compilation), and read
+   back after that body finishes compiling but before its own restore runs — see parse_function/
+   parse_function_expr. */
+static int max_register_used = 0;
+static void track_peak(int v) { if (v > max_register_used) max_register_used = v; }
+
 /* Raw-slot allocators for CallFrame.raw_ints/raw_reals ("primitive pass"), mirroring reg_alloc/
    reg_free/reg_reserve's exact shape for boxed registers above — EXCEPT overflow: reg_reserve
    refuses to compile past FRAME_REGISTERS (a real ceiling with no fallback), but running out of
@@ -60,15 +71,16 @@ static int raw_real_reserve_one(void) {
 void reg_reset(void) {
     next_temp_register = 0;
     reserved_floor     = 0;
+    max_register_used  = 0;
     raw_int_next_temp = 0;  raw_int_reserved_floor = 0;
     raw_real_next_temp = 0; raw_real_reserved_floor = 0;
 }
 
-/* Must refuse to hand out/reserve a register >= FRAME_REGISTERS, the literal size of
-   CallFrame.registers[] — an unchecked overflow here is an out-of-bounds write into CallFrame's
-   neighboring fields (return_ip, dest_reg, defers, defer_count), surfacing much later as a GC-time
-   segfault. Returns an in-bounds sentinel after erroring so the rest of this statement's
-   compilation can't cause a second OOB access before parse_had_error is checked. */
+/* Must refuse to hand out/reserve a register >= FRAME_REGISTERS — every frame's bump-pointer bank
+   (vm->register_stack) is sized assuming no single frame ever needs more than this, so an
+   unchecked overflow here would silently corrupt whatever the NEXT frame bumped past it is using.
+   Returns an in-bounds sentinel after erroring so the rest of this statement's compilation can't
+   cause a second OOB access before parse_had_error is checked. */
 void reg_reserve(int count) {
     if (reserved_floor + count > FRAME_REGISTERS) {
         error_at("Too many live variables/temporaries (max %d registers per call)", FRAME_REGISTERS);
@@ -76,6 +88,7 @@ void reg_reserve(int count) {
     }
     reserved_floor     += count;
     next_temp_register += count;
+    track_peak(next_temp_register);
 }
 
 int reg_alloc(void) {
@@ -83,7 +96,9 @@ int reg_alloc(void) {
         error_at("Too many live variables/temporaries (max %d registers per call)", FRAME_REGISTERS);
         return FRAME_REGISTERS - 1;
     }
-    return next_temp_register++;
+    int reg = next_temp_register++;
+    track_peak(next_temp_register);
+    return reg;
 }
 
 void reg_free(int count) {
@@ -252,18 +267,29 @@ unsigned int emit_iter_next_pair(Chunk* c, int col_reg, int idx_reg, int key_des
     return patch_offset;
 }
 
-unsigned int emit_iter_range(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg) {
-    /* All 4 registers packed into one word (PACK_REG4, vm.h) — end_target stays in its own
-       dedicated word regardless (hard rule: a patchable jump target is never packed alongside
-       anything else, so patch_jump's blind overwrite stays correct). 2 words total, down from 3. */
-    chunk_emit(c, PACK_REG4(OP_ITER_RANGE, cur_reg, end_reg, step_reg, item_dest_reg));
+/* Loop-rotated range-for pair (see OP_ITER_RANGE_PREP/OP_ITER_RANGE_LOOP's own comments, vm.h) —
+   used only by parse_for_in's plain `for i in a..b..step:` form. */
+unsigned int emit_iter_range_prep(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg) {
+    chunk_emit(c, PACK_REG4(OP_ITER_RANGE_PREP, cur_reg, end_reg, step_reg, item_dest_reg));
     unsigned int patch_offset = c->count;
-    chunk_emit(c, 0);   /* placeholder — patched by patch_jump once the loop-exit target is known */
+    chunk_emit(c, 0);   /* placeholder — patched once the loop's overall exit address is known */
     return patch_offset;
+}
+
+/* body_target is always already resolved (the loop body's own start, captured before parse_block
+   ran) — unlike every other jump this file emits into a loop, this one is never a patch_jump
+   placeholder. */
+void emit_iter_range_loop(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg, unsigned int body_target) {
+    chunk_emit(c, PACK_REG4(OP_ITER_RANGE_LOOP, cur_reg, end_reg, step_reg, item_dest_reg));
+    chunk_emit(c, (int)body_target);
 }
 
 void emit_struct_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int arg_reg_base, int arg_count) {
     chunk_emit(c, PACK_STRUCT_NEW(dest_reg, arg_reg_base, arg_count, type_name_pool_idx));
+}
+
+void emit_packed_array_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int rk_count) {
+    chunk_emit(c, PACK_PACKED_ARRAY_NEW(dest_reg, type_name_pool_idx, rk_count));
 }
 
 void emit_field_get(Chunk* c, int dest_reg, int struct_reg, unsigned int field_name_pool_idx) {
@@ -313,6 +339,7 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond);
 static void parse_assignment(Chunk* c, unsigned int name_idx);
 static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_is_index);
 static int  parse_call(Chunk* c, unsigned int name_idx);
+static int  parse_packed_array_new(Chunk* c, unsigned int name_idx);
 static void parse_function(Chunk* c);
 static bool parse_literal_default(Chunk* c, AerVal* out);
 static void parse_return(Chunk* c);
@@ -420,6 +447,7 @@ static int var_slot(unsigned int name_idx) {
     var_count++;
     reserved_floor++;                        /* permanently protects this register from the temp allocator */
     next_temp_register = reserved_floor;   /* resync — see this function's own comment for why that's always safe */
+    track_peak(reserved_floor);
     if (function_depth == 0) {
         global_names[global_count] = name_idx;
         global_regs[global_count]  = reg;
@@ -600,6 +628,82 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
     }
 }
 
+/* One side an EXISTING raw slot (never a bare raw-composable literal — see below), the other a
+   genuine runtime register — the comparison sibling of OP_RAW_ADD_INT_BOXED's "raw meets boxed"
+   pattern (vm.h), covering ONLY the 4 ordering comparisons. Found necessary via a real per-opcode
+   profile of sieve.aer: a raw-tracked loop counter (parser.c's primitive pass) almost always gets
+   compared against a bound that ISN'T raw — a function parameter, since parameters are never
+   raw-tracked — so without this, `for i <= limit:` had to box the raw side (OP_BOX_INT) just to
+   run an ordinary boxed OP_LTE. OP_BOX_INT turned out to be the single most-executed opcode on
+   that benchmark (~16% of all dispatches), almost entirely from exactly this shape.
+     Deliberately requires the raw side to ALREADY be a raw slot (RK_RAW_INT_FLAG/RK_RAW_REAL_FLAG
+   set), not merely raw-composable (rk_raw_kind also accepts a bare int/real LITERAL) — a real
+   regression found via benchmark.sh's counting-loop workload (`for i < 1000000:` at script scope,
+   where `i` stays boxed — top-level locals are never raw-tracked — but the literal `1000000` IS
+   raw-composable): raw_materialize is a free no-op for an already-raw slot, but for a bare literal
+   it EMITS a real OP_RAW_LOAD_INT/_POOL instruction — and unlike a genuine raw variable (already
+   resident, materialized once), an expression's own literal gets re-materialized fresh every time
+   that expression runs. In a hot loop CONDITION, that means paying a whole extra dispatch every
+   single iteration to load a constant the old boxed path could already reference directly via RK
+   addressing for free. Returns false (falls back to box_if_raw + the ordinary boxed comparison,
+   which is what a boxed-variable-vs-literal comparison should keep using) for a non-comparison
+   operator, a boxed side that isn't a plain register, or a "raw" side that's actually just a
+   literal. */
+static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind_lhs,
+                                       int rk_rhs, RawKind kind_rhs, int* out_rk) {
+    bool lhs_raw   = (kind_lhs != RAWK_NONE);
+    int  raw_rk    = lhs_raw ? rk_lhs : rk_rhs;
+    RawKind kind   = lhs_raw ? kind_lhs : kind_rhs;
+    int  boxed_rk  = lhs_raw ? rk_rhs : rk_lhs;
+
+    if (!(raw_rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) return false;
+    if (boxed_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
+
+    /* `boxed OP raw` is `raw (flip) OP boxed` — LT/GT and LTE/GTE swap. */
+    Opcode effective_op = op;
+    if (!lhs_raw) {
+        switch (op) {
+            case OP_LT:  effective_op = OP_GT;  break;
+            case OP_GT:  effective_op = OP_LT;  break;
+            case OP_LTE: effective_op = OP_GTE; break;
+            case OP_GTE: effective_op = OP_LTE; break;
+            default: return false;
+        }
+    }
+
+    bool int_kind = (kind == RAWK_INT);
+    Opcode raw_op;
+    if (int_kind) {
+        switch (effective_op) {
+            case OP_LT:  raw_op = OP_RAW_LT_INT_BOXED;  break;
+            case OP_GT:  raw_op = OP_RAW_GT_INT_BOXED;  break;
+            case OP_LTE: raw_op = OP_RAW_LTE_INT_BOXED; break;
+            case OP_GTE: raw_op = OP_RAW_GTE_INT_BOXED; break;
+            default: return false;
+        }
+    } else {
+        switch (effective_op) {
+            case OP_LT:  raw_op = OP_RAW_LT_REAL_BOXED;  break;
+            case OP_GT:  raw_op = OP_RAW_GT_REAL_BOXED;  break;
+            case OP_LTE: raw_op = OP_RAW_LTE_REAL_BOXED; break;
+            case OP_GTE: raw_op = OP_RAW_GTE_REAL_BOXED; break;
+            default: return false;
+        }
+    }
+
+    int slot = raw_materialize(c, raw_rk, kind);
+    if (slot < 0) return false;   /* raw-slot budget exhausted: fall back to boxed */
+
+    int floor_now = int_kind ? raw_int_reserved_floor : raw_real_reserved_floor;
+    if (slot >= floor_now) { if (int_kind) raw_int_free(1); else raw_real_free(1); }
+    if (is_temp(boxed_rk)) reg_free(1);
+
+    int dest = reg_alloc();
+    chunk_emit(c, PACK_RAW_CMP_BOXED(raw_op, dest, slot, boxed_rk));
+    *out_rk = dest;
+    return true;
+}
+
 /* Tries to emit a native raw-storage op for `op` when both rk_lhs/rk_rhs are the same raw-composable
    kind (rk_raw_kind) — returns false (emitting nothing) if the operator has no raw-native form or
    the operand kinds don't match, in which case the caller falls back to the ordinary boxed
@@ -610,6 +714,8 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
 static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int* out_rk) {
     RawKind kind_lhs = rk_raw_kind(c, rk_lhs);
     RawKind kind_rhs = rk_raw_kind(c, rk_rhs);
+    if ((kind_lhs == RAWK_NONE) != (kind_rhs == RAWK_NONE))
+        return try_emit_cmp_raw_boxed(c, op, rk_lhs, kind_lhs, rk_rhs, kind_rhs, out_rk);
     if (kind_lhs == RAWK_NONE || kind_rhs == RAWK_NONE || kind_lhs != kind_rhs) return false;
     bool int_kind = (kind_lhs == RAWK_INT);
 
@@ -704,9 +810,16 @@ static bool func_lookup(unsigned int name_idx, unsigned int* out_offset) {
    call sites (a direct-by-name call supplying every argument) only ever need the offset; only a
    function referenced as a VALUE, or a direct call omitting trailing (defaulted) arguments, needs
    the rest of the signature to build a real AerFunction (build_function_value, below). */
-static bool func_full_lookup(unsigned int name_idx, unsigned int* out_offset, unsigned int* out_arity,
+/* out_max_registers reads straight from c->functions[i] (not a separate parser-local array,
+   there's only one copy) — reflects chunk_add_function's safe FRAME_REGISTERS placeholder if this
+   name is being self-referenced as a value from within its own not-yet-finished body (the one case
+   where the real captured peak isn't patched in yet — see parse_function's own comment), or the
+   correct final captured value in every other case (this function's own body already fully
+   compiled by the time anything outside it, or after it, can reference it). */
+static bool func_full_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offset, unsigned int* out_arity,
                                  unsigned int* out_min_arity, AerVal** out_defaults,
-                                 bool* out_has_receiver, unsigned int* out_receiver_type) {
+                                 bool* out_has_receiver, unsigned int* out_receiver_type,
+                                 unsigned int* out_max_registers) {
     for (int i = 0; i < func_count; i++) {
         if (func_names[i] != name_idx) continue;
         *out_offset        = func_offsets[i];
@@ -715,6 +828,7 @@ static bool func_full_lookup(unsigned int name_idx, unsigned int* out_offset, un
         *out_defaults      = func_defaults[i];
         *out_has_receiver  = func_has_receiver[i];
         *out_receiver_type = func_receiver_type[i];
+        *out_max_registers = c->functions[i].max_registers;
         return true;
     }
     return false;
@@ -727,7 +841,8 @@ static bool func_full_lookup(unsigned int name_idx, unsigned int* out_offset, un
    are checked once, at call setup (lbl_call_value, vm.c), not via a separate opcode a user's own
    code would need to emit. */
 static AerVal build_function_value(unsigned int func_offset, unsigned int arity, unsigned int min_arity,
-                                       AerVal* defaults, bool has_receiver, unsigned int receiver_type) {
+                                       AerVal* defaults, bool has_receiver, unsigned int receiver_type,
+                                       unsigned int max_registers) {
     AerFunction* fn = vm_new_function();
     fn->code_offset   = func_offset;
     fn->arity         = (uint16_t)arity;
@@ -735,6 +850,7 @@ static AerVal build_function_value(unsigned int func_offset, unsigned int arity,
     fn->defaults      = defaults;
     fn->has_receiver  = has_receiver;
     fn->receiver_type = receiver_type;
+    fn->max_registers = max_registers;
     return aer_function_val(fn);
 }
 
@@ -825,9 +941,19 @@ static void func_register(Chunk* c, unsigned int name_idx, unsigned int offset, 
 #define LOOP_MAX  16
 #define BREAK_MAX 32
 typedef struct {
-    unsigned int top;                     /* continue's target — same value passed to parse_for_body/for_in */
+    unsigned int top;                     /* continue's target — same value passed to parse_for_body/for_in — meaningless when rotated (see below) */
     unsigned int patches[BREAK_MAX];   /* break's OP_JUMP operand offsets, patched once the loop ends */
     int          patch_count;
+    /* Rotated range-for loops (parse_for_in's `..` form) only — see OP_ITER_RANGE_LOOP's own
+       comment, vm.h. A rotated loop's bottom check+advance doesn't exist yet when `continue`
+       appears in the body (it's only emitted after the body finishes compiling), so unlike every
+       other loop form, `continue` can't resolve its jump target immediately — it has to defer,
+       exactly the way `break` already does. Every OTHER loop form leaves rotated false and
+       continue_patch_count at 0 forever, so parse_continue's existing immediate-jump behavior is
+       completely unchanged for them. */
+    bool         rotated;
+    unsigned int continue_patches[BREAK_MAX];
+    int          continue_patch_count;
 } LoopContext;
 static LoopContext loop_stack[LOOP_MAX];
 static int           loop_depth = 0;
@@ -839,6 +965,21 @@ static bool loop_push(unsigned int top) {
     }
     loop_stack[loop_depth].top         = top;
     loop_stack[loop_depth].patch_count = 0;
+    loop_stack[loop_depth].rotated      = false;
+    loop_depth++;
+    return true;
+}
+
+/* Rotated range-for only (parse_for_in's `..` form) — `top` is never read for a rotated loop
+   (parse_continue defers instead), so it's left meaningless rather than given a fake value. */
+static bool loop_push_rotated(void) {
+    if (loop_depth >= LOOP_MAX) {
+        error_at("Too many nested loops (max %d)", LOOP_MAX);
+        return false;
+    }
+    loop_stack[loop_depth].patch_count          = 0;
+    loop_stack[loop_depth].rotated              = true;
+    loop_stack[loop_depth].continue_patch_count = 0;
     loop_depth++;
     return true;
 }
@@ -850,6 +991,18 @@ static void loop_pop_and_patch(Chunk* c, unsigned int exit_target) {
     LoopContext* ctx = &loop_stack[loop_depth - 1];
     for (int i = 0; i < ctx->patch_count; i++)
         patch_jump(c, ctx->patches[i], exit_target);
+    loop_depth--;
+}
+
+/* Rotated range-for only — same as loop_pop_and_patch, plus patches every deferred `continue` to
+   land at continue_target (OP_ITER_RANGE_LOOP's own position, not the loop body's start — continue
+   still needs to run the advance-and-check, not just re-enter the body from the top). */
+static void loop_pop_and_patch_rotated(Chunk* c, unsigned int exit_target, unsigned int continue_target) {
+    LoopContext* ctx = &loop_stack[loop_depth - 1];
+    for (int i = 0; i < ctx->patch_count; i++)
+        patch_jump(c, ctx->patches[i], exit_target);
+    for (int i = 0; i < ctx->continue_patch_count; i++)
+        patch_jump(c, ctx->continue_patches[i], continue_target);
     loop_depth--;
 }
 
@@ -1157,6 +1310,20 @@ static int parse_primary_inner(Chunk* c) {
         lex();
         if (consume(TOKEN_OPEN_PARENTHESE)) return parse_call(c, name_idx);
 
+        /* `Type[count]` — packed array construction, same is_struct_name-and-not-shadowed
+           precedence parse_call's own is_struct check uses for `Type(...)`. Checked as a peek
+           (equal, not consume) so a plain `someVar[i]` — the overwhelmingly common case — falls
+           through to the ordinary postfix-chain indexing below untouched when this doesn't match. */
+        if (equal(TOKEN_OPEN_BRACKET)) {
+            int dummy_reg;
+            bool shadowed = var_lookup(name_idx, &dummy_reg) ||
+                             (function_depth > 0 && global_lookup(name_idx, &dummy_reg));
+            if (!shadowed && is_struct_name(name_idx)) {
+                lex();   /* consume '[' */
+                return parse_packed_array_new(c, name_idx);
+            }
+        }
+
         /* A name not among the CURRENT function's own locals may still be a top-level variable,
            readable via OP_LOAD_GLOBAL (see global_names's own comment). Checked only when
            var_lookup_rk (non-creating) misses, so a local always shadows a global of the same
@@ -1186,13 +1353,13 @@ static int parse_primary_inner(Chunk* c) {
            reference as an ordinary pool constant — chunk_add_pool already dedups identical
            TYPE_FUNCTION values by code_offset+arity, so repeated references to the same function
            share one AerFunction, not one each. */
-        unsigned int func_offset, func_arity, func_min_arity, func_receiver_type;
+        unsigned int func_offset, func_arity, func_min_arity, func_receiver_type, func_max_registers;
         AerVal* func_defaults;
         bool func_has_receiver;
-        if (func_full_lookup(name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
-                                 &func_has_receiver, &func_receiver_type)) {
+        if (func_full_lookup(c, name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
+                                 &func_has_receiver, &func_receiver_type, &func_max_registers)) {
             AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
-                                                 func_has_receiver, func_receiver_type);
+                                                 func_has_receiver, func_receiver_type, func_max_registers);
             return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
         }
 
@@ -1245,6 +1412,33 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                 if (parse_had_error) return rk;
 
                 int arr_reg = materialize(c, rk);
+
+                /* `expr[index].field` — fused into one opcode (OP_INDEX_FIELD_GET) rather than
+                   index-then-field, since a packed array (Type[count]) has no standalone value
+                   `expr[index]` alone could produce — see the opcode's own comment, vm.h. Dispatches
+                   at runtime on whether the object turns out to be packed or an ordinary struct
+                   array, so this is emitted for EVERY `[index].field` read, not just packed ones;
+                   behaviorally identical to the old two-step sequence for anything that isn't
+                   packed. Only intercepted for exactly this pattern — a bare `expr[index]` with no
+                   immediate `.field` still uses plain OP_INDEX_GET below. */
+                if (equal(TOKEN_DOT)) {
+                    lex();
+                    if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected field name after '.'"); return rk; }
+                    unsigned int field_idx = chunk_add_pool(c, token.value);
+                    lex();
+
+                    if (is_temp(rk_start)) reg_free(1);
+                    if (is_temp(arr_reg))  reg_free(1);
+
+                    if (!rk20_fits(rk_start) || !pool_idx_fits(field_idx, FUSED_FIELD_NAME_MAX)) {
+                        error_at("Expression too large to compile (register/constant/field index exceeds the fused index-field-op encoding's range)");
+                        return rk;
+                    }
+                    int dest = reg_alloc();
+                    chunk_emit(c, PACK_INDEX_FIELD_GET(dest, arr_reg, field_idx, rk_start));
+                    rk = dest;
+                    continue;
+                }
 
                 /* Free-then-allocate, matching parse_binary_ops's own discipline. */
                 if (is_temp(rk_start)) reg_free(1);
@@ -2095,6 +2289,82 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
     }
     if (parse_had_error) return;
 
+    /* `name[index].field = / OP= value` — the single-hop case fuses into OP_INDEX_FIELD_GET/SET
+       (see their own comment, vm.h) instead of index-then-field, for the same reason
+       parse_postfix_chain's read side fuses it: a packed array has no standalone value a bare
+       `name[index]` could produce. Checked here, before the general multi-hop loop below, since
+       it's the only shape that can compile to fewer opcodes than the general path — anything with
+       further chaining after '.field' (`name[index].field.sub = v`, `name[index].field[0] = v`)
+       or no '.field' immediately after the index at all falls through to that unchanged general
+       machinery, just having already consumed '.field' along the way (exactly what the loop's own
+       first iteration would have consumed anyway). */
+    if (first_is_index && equal(TOKEN_DOT)) {
+        lex();
+        if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected field name after '.'"); return; }
+        unsigned int fused_field_idx = chunk_add_pool(c, token.value);
+        lex();
+
+        bool no_more_chaining = !equal(TOKEN_OPEN_BRACKET) && !equal(TOKEN_DOT);
+        bool is_plain_assign  = equal(TOKEN_ASSIGN);
+        int compound_i = -1;
+        if (!is_plain_assign) {
+            for (int ci = 0; ci < COMPOUND_ASSIGN_OP_COUNT; ci++) {
+                if (equal(compound_assign_ops[ci].tok)) { compound_i = ci; break; }
+            }
+        }
+
+        if (no_more_chaining && (is_plain_assign || compound_i >= 0)) {
+            if (!rk9_fits(pending_rk_idx) || !pool_idx_fits(fused_field_idx, FUSED_FIELD_NAME_MAX)) {
+                error_at("Expression too large to compile (register/constant/field index exceeds the fused index-field-op encoding's range)");
+                return;
+            }
+            if (is_plain_assign) {
+                lex();
+                int rk_val = parse_binary(c, 0);
+                if (parse_had_error) return;
+                rk_val = box_if_raw(c, rk_val);
+                if (!rk9_fits(rk_val)) {
+                    error_at("Expression too large to compile (value exceeds the fused index-field-set encoding's range)");
+                    return;
+                }
+                chunk_emit(c, PACK_INDEX_FIELD_SET(obj_reg, fused_field_idx, pending_rk_idx, rk_val));
+                if (is_temp(rk_val)) reg_free(1);
+            } else {
+                lex();
+                int field_reg = reg_alloc();
+                chunk_emit(c, PACK_INDEX_FIELD_GET(field_reg, obj_reg, fused_field_idx, pending_rk_idx));
+                int rk_rhs = parse_binary(c, 0);
+                if (parse_had_error) return;
+                emit_binary(c, field_reg, compound_assign_ops[compound_i].op, field_reg, rk_rhs);
+                if (is_temp(rk_rhs)) reg_free(1);
+                chunk_emit(c, PACK_INDEX_FIELD_SET(obj_reg, fused_field_idx, pending_rk_idx, field_reg));
+                reg_free(1);   /* field_reg */
+            }
+            if (is_temp(pending_rk_idx)) reg_free(1);
+            if (!obj_is_base) reg_free(1);
+            return;
+        }
+
+        /* Not the fused case — replicate exactly what the while loop's own first iteration would
+           do for a pending INDEX step immediately followed by '.field' (already consumed above),
+           then fall through to the same general multi-hop loop/assignment logic below for
+           whatever follows. */
+        bool reuse_pending_idx_reg = is_temp(pending_rk_idx);
+        int dest_reg;
+        if (!obj_is_base)               dest_reg = obj_reg;
+        else if (reuse_pending_idx_reg) dest_reg = pending_rk_idx;
+        else                             dest_reg = reg_alloc();
+
+        emit_index_get(c, dest_reg, obj_reg, pending_rk_idx);
+
+        if (reuse_pending_idx_reg && dest_reg != pending_rk_idx) reg_free(1);
+
+        obj_reg = dest_reg;
+        obj_is_base = false;
+        pending_is_field  = true;
+        pending_field_idx = fused_field_idx;
+    }
+
     while (equal(TOKEN_OPEN_BRACKET) || equal(TOKEN_DOT)) {
         bool reuse_pending_idx_reg = !pending_is_field && is_temp(pending_rk_idx);
         int dest_reg;
@@ -2443,8 +2713,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
     int rk_start = parse_binary(c, 0);   /* the range's start, or the whole collection if no '..' follows */
 
     /* `a..b` or `a..b..step`: step defaults to a constant 1 when omitted, direction is inferred at
-       runtime from cur vs end (OP_ITER_RANGE), not from step's sign. `..` is for-loop-specific
-       syntax here, not a general binary operator. */
+       runtime from cur vs end (OP_ITER_RANGE_PREP/OP_ITER_RANGE_LOOP), not from step's sign. `..`
+       is for-loop-specific syntax here, not a general binary operator. */
     if (consume(TOKEN_DOT_DOT)) {
         int rk_end = parse_binary(c, 0);
         int rk_step;
@@ -2454,13 +2724,22 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         require(TOKEN_COLON, "expected ':' after for-in clause");
         if (parse_had_error) return;
 
-        /* cur_reg MUST be a genuinely fresh register (arg_materialize, not materialize) since
-           OP_ITER_RANGE mutates it every iteration — aliasing an existing variable's register
-           here would make the loop silently corrupt that variable. end_reg/step_reg are read-only,
-           so materialize's cheaper "reuse if already a plain register" is safe for them. */
+        /* cur/end/step are all snapshotted ONCE here via arg_materialize (a genuine fresh copy,
+           never a live alias to an existing named variable's register) — matching Lua/Python's own
+           range-for semantics exactly: the bounds are evaluated once, before the loop starts, and
+           later mutating whatever variable they came from has no effect on an already-running
+           loop. This used to be `materialize()` for end/step (its cheaper "reuse if already a
+           plain register" behavior), which meant a range like `for i in 0..n:` silently kept
+           re-reading `n` on every iteration if `n` was an ordinary boxed variable — a real,
+           previously-shipped but undocumented and untested quirk, not an intentional feature (no
+           test relied on it), and the direct reason OP_ITER_RANGE_LOOP needed to re-validate
+           cur/end/step's types on every single dispatch: they were never actually guaranteed
+           constant for the loop's duration before now. Snapshotting them here instead makes that
+           guarantee always hold, so OP_ITER_RANGE_LOOP can always skip the per-iteration
+           re-validation entirely — see its own comment, vm.h. */
         int cur_reg  = arg_materialize(c, rk_start);
-        int end_reg  = materialize(c, rk_end);
-        int step_reg = materialize(c, rk_step);
+        int end_reg  = arg_materialize(c, rk_end);
+        int step_reg = arg_materialize(c, rk_step);
 
         /* Promotes whatever of the above are genuine temps to protected/permanent status for
            exactly the loop's duration, by raising reserved_floor to match the watermark right
@@ -2474,10 +2753,34 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         int saved_reserved_floor = reserved_floor;
         reserved_floor = next_temp_register;
 
-        unsigned int loop_top = c->count;
-        unsigned int patch_exit = emit_iter_range(c, cur_reg, end_reg, step_reg, item_reg);
+        /* Loop-rotated: PREP once, before the loop; LOOP (the advance+check+branch-back) at the
+           BOTTOM of the body instead of a top-of-loop check-and-advance opcode plus a separate
+           unconditional OP_JUMP back-edge (the shape parse_loop_body still uses for every OTHER
+           loop form) — see OP_ITER_RANGE_PREP/OP_ITER_RANGE_LOOP's own comments, vm.h, and
+           parse_continue's own comment for why this is the one loop form whose `continue` has to
+           defer-patch instead of jumping to an already-known target. */
+        unsigned int patch_empty = emit_iter_range_prep(c, cur_reg, end_reg, step_reg, item_reg);
 
-        parse_loop_body(c, loop_top, patch_exit);
+        if (!loop_push_rotated()) {
+            reserved_floor     = saved_reserved_floor;
+            next_temp_register = saved_reserved_floor;
+            return;
+        }
+        unsigned int body_start = c->count;
+        parse_block(c);
+        if (parse_had_error) {
+            loop_depth--;
+            reserved_floor     = saved_reserved_floor;
+            next_temp_register = saved_reserved_floor;
+            return;
+        }
+
+        unsigned int loop_bottom = c->count;
+        emit_iter_range_loop(c, cur_reg, end_reg, step_reg, item_reg, body_start);
+
+        unsigned int exit_pos = c->count;
+        patch_jump(c, patch_empty, exit_pos);
+        loop_pop_and_patch_rotated(c, exit_pos, loop_bottom);
 
         reserved_floor     = saved_reserved_floor;
         next_temp_register = saved_reserved_floor;
@@ -2786,6 +3089,30 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
 static unsigned int last_bare_call_end   = (unsigned int)-1;
 static unsigned int last_bare_call_start = (unsigned int)-1;
 
+/* `Type[count]` — a packed/flat array of Type's instances (see TYPE_PACKED_ARRAY, value.h). Reuses
+   the existing indexing-bracket grammar rather than inventing a call-with-a-type-as-value form,
+   consistent with `Type(...)` meaning "construct one" (struct instantiation, parse_call above).
+   `[` is already consumed by the caller (parse_primary_inner), which only reaches here once it's
+   confirmed name_idx is a struct type name and not shadowed by a variable of the same name — the
+   exact same precedence parse_call's own is_struct check already establishes. Eligibility (every
+   field is a fixed primitive) can't be checked here — a Shape is only fully known once its
+   OP_DEFINE_STRUCT has actually run, not at parse time — so it's deferred to OP_PACKED_ARRAY_NEW's
+   own runtime check, same reasoning as OP_STRUCT_NEW's positional-arg type check. */
+static int parse_packed_array_new(Chunk* c, unsigned int name_idx) {
+    int rk_count = parse_binary(c, 0);
+    require(TOKEN_CLOSE_BRACKET, "expected ']' after packed array count");
+    if (parse_had_error) return 0;
+    rk_count = box_if_raw(c, rk_count);   /* no raw-native form of this opcode exists */
+    if (!rk9_fits(rk_count)) {
+        error_at("Expression too large to compile (register/constant exceeds the packed-array-count encoding's range)");
+        return 0;
+    }
+    if (is_temp(rk_count)) reg_free(1);
+    int dest = reg_alloc();
+    emit_packed_array_new(c, dest, name_idx, rk_count);
+    return dest;
+}
+
 static int parse_call(Chunk* c, unsigned int name_idx) {
     /* Functions as values: if `name_idx` is already a known variable (holding whatever value it
        was assigned — possibly a function value), this is a call THROUGH that variable, not a call
@@ -2802,12 +3129,12 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     bool is_var = is_local_var || is_global_var;
 
     bool is_struct = !is_var && is_struct_name(name_idx);
-    unsigned int func_offset = 0, func_arity = 0, func_min_arity = 0, func_receiver_type = 0;
+    unsigned int func_offset = 0, func_arity = 0, func_min_arity = 0, func_receiver_type = 0, func_max_registers = 0;
     AerVal* func_defaults = NULL;
     bool func_has_receiver = false;
     bool is_func = !is_var && !is_struct &&
-                   func_full_lookup(name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
-                                        &func_has_receiver, &func_receiver_type);
+                   func_full_lookup(c, name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
+                                        &func_has_receiver, &func_receiver_type, &func_max_registers);
     /* Forward references / mutual recursion. A name that isn't a variable, struct, known
        function, or builtin is not an immediate error: it's optimistically assumed to be a
        function defined LATER in this same parse() call (see pending_call_add's own comment). If
@@ -2868,7 +3195,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         chunk_emit(c, PACK2(OP_LOAD_GLOBAL, callee_reg, var_reg));
     } else if (needs_call_value) {
         AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
-                                             func_has_receiver, func_receiver_type);
+                                             func_has_receiver, func_receiver_type, func_max_registers);
         callee_reg = reg_alloc();
         chunk_emit(c, PACK1(OP_LOADK, callee_reg)); chunk_emit(c, (int)chunk_add_pool(c, fv));
     }
@@ -3087,6 +3414,7 @@ static int parse_function_expr(Chunk* c) {
     int saved_var_count      = var_count;
     int saved_next_temp      = next_temp_register;
     int saved_reserved_floor = reserved_floor;
+    int saved_max_register_used = max_register_used;
     int saved_raw_int_next_temp      = raw_int_next_temp;
     int saved_raw_int_reserved_floor = raw_int_reserved_floor;
     int saved_raw_real_next_temp      = raw_real_next_temp;
@@ -3097,6 +3425,7 @@ static int parse_function_expr(Chunk* c) {
     var_count          = 0;
     next_temp_register = 0;
     reserved_floor     = 0;
+    max_register_used  = 0;
     raw_int_next_temp = 0;  raw_int_reserved_floor = 0;
     raw_real_next_temp = 0; raw_real_reserved_floor = 0;
 
@@ -3112,12 +3441,15 @@ static int parse_function_expr(Chunk* c) {
         emit_return(c, reg_null);
     }
 
+    unsigned int captured_max_registers = (unsigned int)max_register_used;
+
     var_count = saved_var_count;
     memcpy(var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
     memcpy(var_regs,  saved_var_regs,  sizeof(int) * (size_t)saved_var_count);
     memcpy(var_kind,  saved_var_kind,  sizeof(VarKind) * (size_t)saved_var_count);
     next_temp_register = saved_next_temp;
     reserved_floor     = saved_reserved_floor;
+    max_register_used  = saved_max_register_used;
     raw_int_next_temp = saved_raw_int_next_temp;   raw_int_reserved_floor = saved_raw_int_reserved_floor;
     raw_real_next_temp = saved_raw_real_next_temp; raw_real_reserved_floor = saved_raw_real_reserved_floor;
 
@@ -3130,7 +3462,7 @@ static int parse_function_expr(Chunk* c) {
         for (unsigned int i = 0; i < default_count; i++) defaults[i] = param_defaults[(unsigned int)min_param_count + i];
     }
     AerVal fv = build_function_value(func_start, (unsigned int)param_count, (unsigned int)min_param_count,
-                                         defaults, false, 0);
+                                         defaults, false, 0, captured_max_registers);
     return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
 }
 
@@ -3208,6 +3540,7 @@ static void parse_function(Chunk* c) {
     int saved_var_count      = var_count;
     int saved_next_temp      = next_temp_register;
     int saved_reserved_floor = reserved_floor;
+    int saved_max_register_used = max_register_used;
     int saved_raw_int_next_temp      = raw_int_next_temp;
     int saved_raw_int_reserved_floor = raw_int_reserved_floor;
     int saved_raw_real_next_temp      = raw_real_next_temp;
@@ -3218,6 +3551,7 @@ static void parse_function(Chunk* c) {
     var_count          = 0;
     next_temp_register = 0;
     reserved_floor     = 0;
+    max_register_used  = 0;
     raw_int_next_temp = 0;  raw_int_reserved_floor = 0;
     raw_real_next_temp = 0; raw_real_reserved_floor = 0;
 
@@ -3234,6 +3568,13 @@ static void parse_function(Chunk* c) {
     }
     func_register(c, name_idx, func_start, (unsigned int)param_count, (unsigned int)min_param_count, defaults,
                       has_receiver, receiver_type);
+    /* max_registers isn't known until the body below finishes compiling (patched in further down) —
+       safe because nothing reads it until this function is actually CALLED at runtime, long after
+       compilation ends; func_register/chunk_add_function must still run before the body so a
+       self-recursive call inside it resolves. Safe to capture the index here since named functions
+       can't nest (this function's own comment above) — no other chunk_add_function call can land
+       between this point and the patch-in below. */
+    unsigned int this_func_idx = c->function_count - 1;
 
     /* Incremented BEFORE registering parameters (not after, as a first draft of the global-read
        feature had it) — var_slot only skips recording a top-level global when
@@ -3252,12 +3593,15 @@ static void parse_function(Chunk* c) {
         emit_return(c, reg_null);
     }
 
+    c->functions[this_func_idx].max_registers = (unsigned int)max_register_used;
+
     var_count = saved_var_count;
     memcpy(var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
     memcpy(var_regs,  saved_var_regs,  sizeof(int) * (size_t)saved_var_count);
     memcpy(var_kind,  saved_var_kind,  sizeof(VarKind) * (size_t)saved_var_count);
     next_temp_register = saved_next_temp;
     reserved_floor     = saved_reserved_floor;
+    max_register_used  = saved_max_register_used;
     raw_int_next_temp = saved_raw_int_next_temp;   raw_int_reserved_floor = saved_raw_int_reserved_floor;
     raw_real_next_temp = saved_raw_real_next_temp; raw_real_reserved_floor = saved_raw_real_reserved_floor;
 
@@ -3319,14 +3663,17 @@ static bool parse_literal_default(Chunk* c, AerVal* out) {
    registers the type name so a later `Name(args)` call site resolves to construction
    (parse_call). Field defaults share the same literal set (including `[]`/`{}`) via
    parse_literal_default above. */
-/* Maps the four primitive type keywords `as` already recognizes (README's cast section) to a
-   ValueType, for an optional `field: type` struct-field annotation. Returns false (and reports no
-   error itself — the caller knows the context) if name/len don't match any of them. */
+/* Maps the four primitive type keywords `as` already recognizes (README's cast section), plus
+   `any` (an explicit, visible "no constraint" choice — never an implicit default from omitting
+   the annotation), to a ValueType for a mandatory `field: type` struct-field annotation. Returns
+   false (and reports no error itself — the caller knows the context) if name/len don't match any
+   of them. */
 static bool parse_field_type_name(const char* name, unsigned int len, ValueType* out) {
     if      (len == 7 && strncmp(name, "integer", 7) == 0) *out = TYPE_INTEGER;
     else if (len == 5 && strncmp(name, "float",   5) == 0) *out = TYPE_REAL;
     else if (len == 6 && strncmp(name, "string",  6) == 0) *out = TYPE_STRING;
     else if (len == 7 && strncmp(name, "boolean", 7) == 0) *out = TYPE_BOOLEAN;
+    else if (len == 3 && strncmp(name, "any",     3) == 0) *out = TYPE_ANY;
     else return false;
     return true;
 }
@@ -3353,43 +3700,38 @@ static void parse_struct(Chunk* c) {
         unsigned int fname = chunk_add_pool(c, token.value);
         lex();
 
-        /* Optional `: type` — reuses the same four primitive-type keywords `as` recognizes.
-           Declaring a type requires an explicit, matching default: a typed field with no default
-           would otherwise fall back to null (every bare field's usual default), which would
-           silently violate the very "this field is always this type" invariant the fused
-           field-arithmetic opcodes below rely on to skip a runtime check. */
-        ValueType ftype = TYPE_ANY;
-        bool has_type = consume(TOKEN_COLON);
-        if (has_type) {
-            if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a type name after ':'"); return; }
-            const char* type_name = aer_as_string(token.value)->data;
-            unsigned int type_len = aer_as_string(token.value)->length;
-            if (!parse_field_type_name(type_name, type_len, &ftype)) {
-                error_at("Unknown type '%.*s' in struct field declaration (must be integer/float/string/boolean)",
-                         (int)type_len, type_name);
-                return;
-            }
-            lex();
+        /* Mandatory `: type` — every field must declare one of the four primitive types or `any`
+           (an explicit choice, not a fallback from omitting the annotation — see
+           parse_field_type_name's own comment). Every typed field, `any` included, must have an
+           explicit default: a field with no default would otherwise fall back to null (every bare
+           field's usual default), which would silently violate the "this field is always this
+           type" invariant the fused field-arithmetic opcodes below rely on to skip a runtime check. */
+        require(TOKEN_COLON, "Struct field must declare a type (e.g. 'x: float' or 'x: any')");
+        if (parse_had_error) return;
+        if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a type name after ':'"); return; }
+        ValueType ftype;
+        const char* type_name = aer_as_string(token.value)->data;
+        unsigned int type_len = aer_as_string(token.value)->length;
+        if (!parse_field_type_name(type_name, type_len, &ftype)) {
+            error_at("Unknown type '%.*s' in struct field declaration (must be integer/float/string/boolean/any)",
+                     (int)type_len, type_name);
+            return;
         }
+        lex();
 
-        AerVal dflt = aer_null();
-        bool has_default = consume(TOKEN_ASSIGN);
-        if (has_default) {
-            if (!parse_literal_default(c, &dflt)) {
-                error_at("Struct field defaults must be a literal value");
-                return;
-            }
+        if (!consume(TOKEN_ASSIGN)) {
+            error_at("Struct field '%.*s' must have an explicit default value",
+                     (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
+            return;
         }
-        if (has_type) {
-            if (!has_default) {
-                error_at("A typed struct field ('%.*s: ...') must have an explicit default value",
-                         (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
-                return;
-            }
-            if (aer_type(dflt) != ftype) {
-                error_at("Struct field default's type doesn't match its declared type");
-                return;
-            }
+        AerVal dflt;
+        if (!parse_literal_default(c, &dflt)) {
+            error_at("Struct field defaults must be a literal value");
+            return;
+        }
+        if (ftype != TYPE_ANY && aer_type(dflt) != ftype) {
+            error_at("Struct field default's type doesn't match its declared type");
+            return;
         }
         field_names[field_count]    = fname;
         field_defaults[field_count] = dflt;
@@ -3428,8 +3770,15 @@ static void parse_break(Chunk* c) {
 
 static void parse_continue(Chunk* c) {
     if (loop_depth == 0) { error_at("'continue' outside loop"); return; }
+    LoopContext* ctx = &loop_stack[loop_depth - 1];
     chunk_emit(c, OP_JUMP);
-    chunk_emit(c, (int)loop_stack[loop_depth - 1].top);   /* known at compile time — no patch needed */
+    if (ctx->rotated) {
+        if (ctx->continue_patch_count >= BREAK_MAX) { error_at("Too many continues in one loop (max %d)", BREAK_MAX); return; }
+        ctx->continue_patches[ctx->continue_patch_count++] = c->count;
+        chunk_emit(c, 0);   /* placeholder — patched by loop_pop_and_patch_rotated once OP_ITER_RANGE_LOOP's own position is known */
+    } else {
+        chunk_emit(c, (int)ctx->top);   /* known at compile time — no patch needed */
+    }
 }
 
 /* A bare call/module-call used as a STATEMENT (its result isn't assigned to anything):

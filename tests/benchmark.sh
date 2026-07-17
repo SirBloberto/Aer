@@ -101,11 +101,9 @@ echo "Workload 2 — counting loop (1 000 000 iterations)"
 divider
 
 cat > "$TMP/loop.aer" << 'AER'
-i = 0
 total = 0
-for i < 1000000:
+for i in 0..1000000:
     total += i
-    i += 1
 print(total)
 AER
 

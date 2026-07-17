@@ -755,8 +755,8 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm,
             "struct Point:\n"
-            "    x\n"
-            "    y\n"
+            "    x: integer = 0\n"
+            "    y: integer = 0\n"
             "p = Point(3, 4)\n"
             "total = p.x + p.y\n");
 
@@ -773,8 +773,8 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm,
             "struct Point:\n"
-            "    x\n"
-            "    y\n"
+            "    x: integer = 0\n"
+            "    y: integer = 0\n"
             "p = Point(1, 2)\n"
             "p.x = 99\n"
             "total = p.x\n");
@@ -793,8 +793,8 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm,
             "struct Pair:\n"
-            "    a\n"
-            "    b = 10\n"
+            "    a: integer = 0\n"
+            "    b: integer = 10\n"
             "q = Pair(5)\n"
             "total = q.b\n");
 
@@ -813,8 +813,8 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm,
             "struct Pair:\n"
-            "    a\n"
-            "    b = 10\n"
+            "    a: integer = 0\n"
+            "    b: integer = 10\n"
             "q = Pair(1, 2, 3)\n");
 
         check(!ok, "instantiating a struct with more arguments than fields reports a clean runtime error, not a crash");
@@ -1408,7 +1408,7 @@ int main(void) {
         chunk_init(&c);
         VM vm;
         bool ok = run_source(&c, &vm,
-            "struct Point:\n    x\n    y\n"
+            "struct Point:\n    x: integer = 0\n    y: integer = 0\n"
             "p = Point(1, 2)\np.x += 5\np.y *= 3\nrx = p.x\nry = p.y\n");
         check(ok, "real source 'p.x += 5' / 'p.y *= 3' ran without error");
         check(aer_as_int(register_get(&vm, 1)) == 6, "rx == 6 — 1 + 5");
@@ -1523,7 +1523,7 @@ int main(void) {
         chunk_init(&c);
         VM vm;
         bool ok = run_source(&c, &vm,
-            "struct Point:\n    x\n    y\n\n"
+            "struct Point:\n    x: integer = 0\n    y: integer = 0\n\n"
             "p = Point(10, 20)\n"
             "a = 3\n"
             "b = a - p.x\n"
@@ -1552,8 +1552,8 @@ int main(void) {
         chunk_init(&c);
         VM vm;
         bool ok = run_source(&c, &vm,
-            "struct Inner:\n    c\n\n"
-            "struct Outer:\n    b\n\n"
+            "struct Inner:\n    c: integer = 0\n\n"
+            "struct Outer:\n    b: any = null\n\n"
             "arr = [Inner(1), Inner(2)]\n"
             "o = Outer(arr)\n"
             "o.b[0].c = 99\n"
@@ -1564,9 +1564,9 @@ int main(void) {
             "mat = [[1, 2], [3, 4]]\n"
             "mat[0][1] = 42\n"
             "z = mat[0][1]\n"
-            "struct L3:\n    v\n\n"
-            "struct L2:\n    inner\n\n"
-            "struct L1:\n    mid\n\n"
+            "struct L3:\n    v: integer = 0\n\n"
+            "struct L2:\n    inner: any = null\n\n"
+            "struct L1:\n    mid: any = null\n\n"
             "l3 = L3(1)\n"
             "l2 = L2(l3)\n"
             "l1 = L1(l2)\n"

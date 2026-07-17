@@ -13,13 +13,16 @@
 # 23. Structs                                                          #
 # ------------------------------------------------------------------ #
 
-# Fixed layout, declared with field defaults. Defaults are optional
+# Fixed layout — every field must declare a type (one of
+# integer/float/string/boolean/any) and an explicit default. Defaults are
 # literals only (no arbitrary expressions), plus the two special-cased
-# empty-collection forms '[]'/'{}' (see section 38); a bare field name
-# defaults to null.
+# empty-collection forms '[]'/'{}' (see section 38) for 'any'-typed fields.
 struct Point:
-    x = 0.0
-    y = 0.0
+    x: float = 0.0
+    y: float = 0.0
+
+# struct BadPoint:      # would error: Struct field must declare a type
+#     x = 0.0
 
 # Instantiation reuses call syntax — positional, in declared field order.
 # Omitted trailing arguments take their declared defaults.
@@ -50,7 +53,7 @@ assert(type(p1) == "Point", "struct instances report their declared type name")
 # Struct-typed receiver parameters — only parameter 0 may carry `as Type`,
 # enforced at every call site (not just documentation).
 struct Enemy:
-    hp = 100
+    hp: integer = 100
 
 function heal(target as Point, amount):
     target.x += amount
@@ -84,9 +87,9 @@ assert(ca_p.y == 1, "struct field -= a constant")
 # Chained field access (a.b.c) — only the LAST step is the compound
 # target; the earlier ones (ca_outer -> .inner) are plain FIELD_GETs.
 struct Inner:
-    v = 0
+    v: integer = 0
 struct Outer:
-    inner = null
+    inner: any = null
 ca_outer = Outer(Inner(10))
 ca_outer.inner.v += 5
 assert(ca_outer.inner.v == 15, "compound assignment through a chained struct field (a.b.c += n)")
@@ -122,8 +125,8 @@ assert(ca_call_count == 1, "...and f() was called exactly once, not once per rea
 # ------------------------------------------------------------------ #
 
 struct Bucket:
-    items = []
-    tags = {}
+    items: any = []
+    tags: any = {}
 
 nd_a = Bucket()
 nd_b = Bucket()
@@ -150,5 +153,28 @@ fd_r1 = collect(1)
 fd_r2 = collect(2)
 assert(length(fd_r1) == 1 && fd_r1[0] == 1, "first call's omitted-argument default starts fresh")
 assert(length(fd_r2) == 1 && fd_r2[0] == 2, "a second call's own omitted-argument default is independent, not the first call's mutated array")
+
+# ------------------------------------------------------------------ #
+# 39. Mandatory struct field typing — every field must declare        #
+#     integer/float/string/boolean/any explicitly; 'any' is a visible #
+#     escape hatch, never an implicit default from omitting a type.   #
+# ------------------------------------------------------------------ #
+
+struct Tagged:
+    label: string = "untitled"
+    active: boolean = true
+    note: any = null
+
+t1 = Tagged()
+assert(t1.label == "untitled" && t1.active == true && t1.note == null, "any-typed field's literal default (null) applies like any other")
+
+t2 = Tagged("x", false, 42)
+assert(t2.note == 42, "an any-typed field accepts any argument type at construction — no enforcement, by design")
+t2.note = "now a string"
+assert(t2.note == "now a string", "an any-typed field also accepts any type on later assignment")
+
+# print(t2.label = 5)   # would error: 'label' is declared 'string', assigning an integer fails
+# struct Bad:           # would error: Struct field must declare a type (e.g. 'x: float' or 'x: any')
+#     size = 1
 
 print("test_structs.aer: all assertions passed.")

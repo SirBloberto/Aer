@@ -145,7 +145,7 @@ assert(es[3] == 42, "raw local written into a dict value boxes correctly")
 assert(es[4] == "value is 42", "raw local interpolated into a string boxes correctly")
 
 struct Holder:
-    value = 0
+    value: integer = 0
 function escape_to_struct():
     n = 7
     h = Holder(n)          # struct construction argument
@@ -162,7 +162,7 @@ assert(escape_to_struct() == 14, "raw local used in struct construction and fiel
 # ------------------------------------------------------------------ #
 
 struct Vec:
-    x = 0.0
+    x: float = 0.0
 function field_derived_not_raw():
     v = Vec(3.0)
     result = v.x + 1        # v.x is a field read — result computed correctly either way

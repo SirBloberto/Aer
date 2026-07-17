@@ -6,10 +6,11 @@
 #include <stdint.h>
 
 /* Forward declarations — mutual references between Value and collection types */
-typedef struct AerArray    AerArray;
-typedef struct AerDict     AerDict;
-typedef struct AerFunction AerFunction;
-typedef struct AerString   AerString;
+typedef struct AerArray       AerArray;
+typedef struct AerDict        AerDict;
+typedef struct AerFunction    AerFunction;
+typedef struct AerString      AerString;
+typedef struct AerPackedArray AerPackedArray;
 typedef struct Shape       Shape;   /* full definition in vm.h — needs pool-index arrays */
 typedef struct Value       Value;   /* the STABLE PUBLIC boxed type — used only at the
                                         AerNativeFn host-embedding boundary from here on
@@ -27,6 +28,15 @@ typedef enum ValueType {
     TYPE_FUNCTION,
     TYPE_ARRAY,
     TYPE_DICT,
+    /* A fixed-size, mass-allocated array of one struct type's instances, packed inline (no
+       per-element heap allocation, no pointer indirection) — see AerPackedArray below. Only
+       constructible for a struct whose every field is a fixed-primitive type (integer/float/
+       boolean; enforced at construction, vm.c) — never any/string/nested-struct, since those can't
+       be packed at a uniform byte width. Deliberately has no standalone per-element reference
+       value: `arr[i]` alone is not legal, only `arr[i].field` (get/set) is — see OP_INDEX_FIELD_GET/
+       SET's own comment, vm.h, for why (packed indexing is pure arithmetic, so there's nothing a
+       standalone reference would save over recomputing it at each access). */
+    TYPE_PACKED_ARRAY,
     /* Not a real value tag — never written into an AerVal.tag, only into Shape.field_types[] (see
        Shape's own comment, vm.h) to mean "this struct field has no declared type." Appended last
        so it can't disturb TYPE_NULL's load-bearing == 0 invariant or any existing tag value. */
@@ -93,6 +103,22 @@ struct AerArray {
 };
 _Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
+/* One struct type's instances, packed inline in one raw byte block instead of AerArray's per-
+   element AerVal pointers-to-scattered-instances — see TYPE_PACKED_ARRAY's own comment above.
+   Every field packs at a fixed 8-byte slot (matching AerVal's numeric payload width — no bit-width
+   type support), in the struct's declared field order, so element i's field j lives at
+   `data + i * (shape->field_count * 8) + j * 8`. A LEAF for the GC — every field is a fixed
+   primitive (integer/float/boolean), never a heap reference, so unlike AerArray this never needs a
+   write barrier and its mark step never recurses into contents (see mark_value's TYPE_PACKED_ARRAY
+   case, vm.c). gc_state first, same reasoning as AerArray above. */
+struct AerPackedArray {
+    unsigned char gc_state;
+    unsigned char* data;
+    unsigned int  count;
+    Shape*        shape;
+};
+_Static_assert(offsetof(struct AerPackedArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
+
 /* gc_state first, same reasoning as AerArray above. Then pointer, then the two pool-index-sized
    ints (code_offset/receiver_type can each exceed 65535 in a large program's constant pool, so
    they stay full width), then the two fields bounded by a language-level cap (arity/min_arity <=
@@ -103,6 +129,7 @@ struct AerFunction {
     AerVal*      defaults;        /* NULL if min_arity == arity; else (arity - min_arity) compile-time-literal values */
     unsigned int code_offset;
     unsigned int receiver_type;   /* pool index of Type's name, if has_receiver */
+    unsigned int max_registers;   /* this function's real peak register need — see ChunkFunction's own comment, vm.h */
     uint16_t     arity;
     uint16_t     min_arity;       /* params [0, min_arity) are required; [min_arity, arity) use defaults[] below, in order */
     bool         has_receiver;    /* true if param 0 was declared `p as Type` */
@@ -145,7 +172,10 @@ static inline AerVal aer_null(void) {
 }
 
 static inline AerVal aer_bool(bool b) {
-    AerVal v; v.tag = TYPE_BOOLEAN; v.as.b = b; return v;
+    /* as.i = 0 first: as.b only occupies byte 0, and vm_packed_slot_write (vm.c) memcpy's the
+       whole 8-byte union into packed-array storage — without this, its other 7 bytes would be
+       whatever garbage was already on the caller's stack. */
+    AerVal v; v.tag = TYPE_BOOLEAN; v.as.i = 0; v.as.b = b; return v;
 }
 
 static inline AerVal aer_real(double d) {
@@ -168,6 +198,7 @@ static inline AerVal aer_string_val(AerString* s)     { return aer_box_ptr(TYPE_
 static inline AerVal aer_function_val(AerFunction* f)  { return aer_box_ptr(TYPE_FUNCTION, f); }
 static inline AerVal aer_array_val(AerArray* a)        { return aer_box_ptr(TYPE_ARRAY, a); }
 static inline AerVal aer_dict_val(AerDict* d)          { return aer_box_ptr(TYPE_DICT, d); }
+static inline AerVal aer_packed_array_val(AerPackedArray* a) { return aer_box_ptr(TYPE_PACKED_ARRAY, a); }
 
 static inline bool      aer_as_bool(AerVal v) { return v.as.b; }
 static inline double    aer_as_real(AerVal v) { return v.as.d; }
@@ -177,6 +208,7 @@ static inline AerString*   aer_as_string(AerVal v)   { return (AerString*)v.as.p
 static inline AerFunction* aer_as_function(AerVal v) { return (AerFunction*)v.as.ptr; }
 static inline AerArray*    aer_as_array(AerVal v)     { return (AerArray*)v.as.ptr; }
 static inline AerDict*     aer_as_dict(AerVal v)      { return (AerDict*)v.as.ptr; }
+static inline AerPackedArray* aer_as_packed_array(AerVal v) { return (AerPackedArray*)v.as.ptr; }
 
 /* Integer and real are both "a number" as far as most native-module math/time functions are
    concerned — coerces either into a plain double, false for any other type. */
@@ -203,6 +235,7 @@ static inline Value aer_val_to_public(AerVal v) {
         case TYPE_FUNCTION: out.data.function = aer_as_function(v); break;
         case TYPE_ARRAY:    out.data.array    = aer_as_array(v);    break;
         case TYPE_DICT:     out.data.dict     = aer_as_dict(v);     break;
+        case TYPE_PACKED_ARRAY: break;   /* not part of the public embedding surface yet */
         case TYPE_ANY:      break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
     }
     return out;
@@ -222,6 +255,7 @@ static inline AerVal aer_val_from_public(Value v) {
         case TYPE_FUNCTION: return aer_function_val(v.data.function);
         case TYPE_ARRAY:    return aer_array_val(v.data.array);
         case TYPE_DICT:     return aer_dict_val(v.data.dict);
+        case TYPE_PACKED_ARRAY: break;   /* not part of the public embedding surface yet */
         case TYPE_ANY:      break;   /* never a real Value's type — only Shape.field_types[] uses it */
     }
     return aer_null();

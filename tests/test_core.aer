@@ -231,8 +231,8 @@ assert(i == 5, "while-form for loop")
 # while condition" pointing at the '.'. Common in linked-list-style
 # traversal: `for cur != null: ... cur = cur.next`.
 struct LoopLinkNode:
-    value
-    next
+    value: integer = 0
+    next: any = null
 lln3 = LoopLinkNode(3, null)
 lln2 = LoopLinkNode(2, lln3)
 lln1 = LoopLinkNode(1, lln2)

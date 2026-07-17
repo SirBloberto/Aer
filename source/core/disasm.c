@@ -117,7 +117,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_STORE_GLOBAL] = { "OP_STORE_GLOBAL", "top-level frame's reg = rk", {FLD_REG, FLD_RK}, false, 2 },
     [OP_DEFER_PUSH]   = { "OP_DEFER_PUSH",   "snapshot args; run at this frame's OP_RETURN", {FLD_REG, FLD_COUNT, FLD_JUMP}, false, 2 },
     [OP_ARRAY_NEW] = { "OP_ARRAY_NEW", "reg = new array from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT}, false, 3 },
-    /* OP_INDEX_GET/OP_ITER_NEXT_PAIR/OP_ITER_RANGE/OP_FIELD_GET/OP_FIELD_SET are the Slice A
+    /* OP_INDEX_GET/OP_ITER_NEXT_PAIR/OP_ITER_RANGE_PREP/OP_ITER_RANGE_LOOP/OP_FIELD_GET/
+       OP_FIELD_SET are the Slice A
        extension of OP_BINARY's single-word treatment (PACK_INDEX_GET/PACK_REG4/PACK_FIELD_GET/
        PACK_FIELD_SET, vm.h) — disassemble_one special-cases all of them below the same way it
        does OP_BINARY, since their RK/name fields no longer live in separate trailing words. Their
@@ -131,10 +132,14 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_DICT_NEW]  = { "OP_DICT_NEW",  "reg = new dict from contiguous key/value reg pairs", {FLD_REG, FLD_REG, FLD_COUNT}, false, 3 },
     [OP_ITER_NEXT_ARRAY] = { "OP_ITER_NEXT_ARRAY", "for-each step, array or dict-keys", {FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 3 },
     [OP_ITER_NEXT_PAIR]  = { "OP_ITER_NEXT_PAIR",  "for-each step, dict key+value pairs", {FLD_REG, FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 4 },
-    [OP_ITER_RANGE]      = { "OP_ITER_RANGE",      "for-each step, numeric a..b[..step] range", {FLD_REG, FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 4 },
+    [OP_ITER_RANGE_PREP] = { "OP_ITER_RANGE_PREP", "rotated range-for: once-before-loop check", {FLD_REG, FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 4 },
+    [OP_ITER_RANGE_LOOP] = { "OP_ITER_RANGE_LOOP", "rotated range-for: bottom-of-loop advance+check+branch-back (bounds snapshotted once, never re-validated)", {FLD_REG, FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 4 },
     [OP_STRUCT_NEW] = { "OP_STRUCT_NEW", "reg = new struct instance from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME}, false, 4 },
     [OP_FIELD_GET]  = { "OP_FIELD_GET",  "reg = struct.field", {FLD_REG, FLD_REG, FLD_NAME}, false, 3 },
     [OP_FIELD_SET]  = { "OP_FIELD_SET",  "struct.field = rk", {FLD_REG, FLD_NAME, FLD_RK}, false, 3 },
+    [OP_PACKED_ARRAY_NEW] = { "OP_PACKED_ARRAY_NEW", "reg = new packed array of Type, rk count", {FLD_REG, FLD_NAME, FLD_RK}, false, 3 },
+    [OP_INDEX_FIELD_GET]  = { "OP_INDEX_FIELD_GET",  "fused: reg = reg[rk].field (packed or struct array)", {FLD_REG, FLD_REG, FLD_NAME, FLD_RK}, false, 4 },
+    [OP_INDEX_FIELD_SET]  = { "OP_INDEX_FIELD_SET",  "fused: reg[rk].field = rk (packed or struct array)", {FLD_REG, FLD_NAME, FLD_RK, FLD_RK}, false, 4 },
     [OP_UNARY] = { "OP_UNARY", "reg = unary_op(rk)", {FLD_REG, FLD_BINOP, FLD_RK}, false, 3 },
     [OP_CAST]  = { "OP_CAST",  "reg = cast(rk)", {FLD_REG, FLD_CAST, FLD_RK}, false, 3 },
     [OP_BINARY_FIELD] = { "OP_BINARY_FIELD", "fused: reg = rk OP struct.field (field on the right)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_RK, FLD_NAME}, false, 5 },
@@ -176,6 +181,14 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_RAW_SUB_REAL_BOXED] = { "OP_RAW_SUB_REAL_BOXED", "rawr -= reg (tag-checked)", {FLD_REG}, false, 1 },
     [OP_RAW_MUL_REAL_BOXED] = { "OP_RAW_MUL_REAL_BOXED", "rawr *= reg (tag-checked)", {FLD_REG}, false, 1 },
     [OP_RAW_LOAD_INT_POOL]  = { "OP_RAW_LOAD_INT_POOL",  "rawi = pool constant", {FLD_REG}, false, 1 },
+    [OP_RAW_LT_INT_BOXED]   = { "OP_RAW_LT_INT_BOXED",   "reg = rawi < reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_GT_INT_BOXED]   = { "OP_RAW_GT_INT_BOXED",   "reg = rawi > reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_LTE_INT_BOXED]  = { "OP_RAW_LTE_INT_BOXED",  "reg = rawi <= reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_GTE_INT_BOXED]  = { "OP_RAW_GTE_INT_BOXED",  "reg = rawi >= reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_LT_REAL_BOXED]  = { "OP_RAW_LT_REAL_BOXED",  "reg = rawr < reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_GT_REAL_BOXED]  = { "OP_RAW_GT_REAL_BOXED",  "reg = rawr > reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_LTE_REAL_BOXED] = { "OP_RAW_LTE_REAL_BOXED", "reg = rawr <= reg (tag-checked)", {FLD_REG}, false, 1 },
+    [OP_RAW_GTE_REAL_BOXED] = { "OP_RAW_GTE_REAL_BOXED", "reg = rawr >= reg (tag-checked)", {FLD_REG}, false, 1 },
 };
 
 static const char* cast_name(int k) {
@@ -329,7 +342,22 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG,  (int)UNPACK_FIELD_SET_STRUCT(op_word));
         print_field(out, c, FLD_NAME, (int)UNPACK_FIELD_SET_FIELD(op_word));
         print_rk9(out, c, UNPACK_FIELD_SET_RK(op_word));
-    } else if (op == OP_ITER_RANGE || op == OP_ITER_NEXT_PAIR) {
+    } else if (op == OP_PACKED_ARRAY_NEW) {
+        print_field(out, c, FLD_REG,  (int)UNPACK_PACKED_ARRAY_NEW_DEST(op_word));
+        print_field(out, c, FLD_NAME, (int)UNPACK_PACKED_ARRAY_NEW_NAME(op_word));
+        print_rk9(out, c, UNPACK_PACKED_ARRAY_NEW_COUNT(op_word));
+    } else if (op == OP_INDEX_FIELD_GET) {
+        print_field(out, c, FLD_REG,  (int)UNPACK_INDEX_FIELD_GET_DEST(op_word));
+        print_field(out, c, FLD_REG,  (int)UNPACK_INDEX_FIELD_GET_OBJ(op_word));
+        print_field(out, c, FLD_NAME, (int)UNPACK_INDEX_FIELD_GET_FIELD(op_word));
+        print_rk20(out, c, UNPACK_INDEX_FIELD_GET_RK(op_word));
+    } else if (op == OP_INDEX_FIELD_SET) {
+        print_field(out, c, FLD_REG,  (int)UNPACK_INDEX_FIELD_SET_OBJ(op_word));
+        print_field(out, c, FLD_NAME, (int)UNPACK_INDEX_FIELD_SET_FIELD(op_word));
+        print_rk9(out, c, UNPACK_INDEX_FIELD_SET_IDX(op_word));
+        print_rk9(out, c, UNPACK_INDEX_FIELD_SET_VAL(op_word));
+    } else if (op == OP_ITER_NEXT_PAIR ||
+               op == OP_ITER_RANGE_PREP || op == OP_ITER_RANGE_LOOP) {
         /* 4 registers packed via PACK_REG4 (vm.h); the loop-exit target still gets its own
            trailing word regardless — a patchable jump target is never packed alongside anything
            else (see PACK_REG4's own comment), so pos must still advance past it here. */
@@ -470,6 +498,16 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rawi(out, (int)UNPACK_RAW_LOAD_INT_POOL_DEST(op_word));
         fprintf(out, "  val=");
         print_pool_value(out, c->pool[UNPACK_RAW_LOAD_INT_POOL_POOL(op_word)]);
+    } else if (op == OP_RAW_LT_INT_BOXED || op == OP_RAW_GT_INT_BOXED ||
+               op == OP_RAW_LTE_INT_BOXED || op == OP_RAW_GTE_INT_BOXED) {
+        print_field(out, c, FLD_REG, (int)UNPACK_RAW_CMP_BOXED_DEST(op_word));
+        print_rawi(out, (int)UNPACK_RAW_CMP_BOXED_SLOT(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_RAW_CMP_BOXED_REG(op_word));
+    } else if (op == OP_RAW_LT_REAL_BOXED || op == OP_RAW_GT_REAL_BOXED ||
+               op == OP_RAW_LTE_REAL_BOXED || op == OP_RAW_GTE_REAL_BOXED) {
+        print_field(out, c, FLD_REG, (int)UNPACK_RAW_CMP_BOXED_DEST(op_word));
+        print_rawr(out, (int)UNPACK_RAW_CMP_BOXED_SLOT(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_RAW_CMP_BOXED_REG(op_word));
     } else {
         int i = 0;
         for (; i < info->packed; i++) {

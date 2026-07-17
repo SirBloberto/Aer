@@ -1,0 +1,84 @@
+function literal_bounds():
+    total = 0
+    for i in 0..1000000:
+        total += i
+    return total
+assert(literal_bounds() == 499999500000, "literal bounds (fast path) basic sum")
+
+function literal_step():
+    values = []
+    for i in 0..10..2:
+        append(values, i)
+    return values
+s = literal_step()
+assert(length(s) == 5, "literal step (fast path) length")
+assert(s[4] == 8, "literal step (fast path) last value")
+
+function raw_var_end_mutated_midloop():
+    n = 10
+    total = 0
+    for i in 0..n:
+        total += i
+        if i == 3:
+            n = 3
+    return total
+assert(raw_var_end_mutated_midloop() == 45, "raw-tracked end snapshotted at materialize time, mid-loop mutation has no effect: sum 0..9=45")
+
+function boxed_var_end_mutated_midloop():
+    if true:
+        n = 10
+    total = 0
+    for i in 0..n:
+        total += i
+        if i == 3:
+            n = 3
+    return total
+assert(boxed_var_end_mutated_midloop() == 45, "bounds are always snapshotted once now, matching Lua/Python — mid-loop mutation of n has no effect even when n is boxed: sum 0..9=45")
+
+function variable_step():
+    step = 3
+    values = []
+    for i in 0..10..step:
+        append(values, i)
+    return values
+vs = variable_step()
+assert(length(vs) == 4, "variable step (slow path) length")
+assert(vs[3] == 9, "variable step (slow path) last value")
+
+function mixed_literal_end_variable_step():
+    step = 2
+    values = []
+    for i in 0..10..step:
+        append(values, i)
+    return values
+ms = mixed_literal_end_variable_step()
+assert(length(ms) == 5, "literal end + variable step (slow path) length")
+
+function uneven_step_ascending():
+    values = []
+    for i in 0..10..3:
+        append(values, i)
+    return values
+ue = uneven_step_ascending()
+assert(length(ue) == 4, "step doesn't evenly divide range (ascending): 0,3,6,9 = 4 iterations")
+assert(ue[3] == 9, "uneven step ascending last value")
+
+function uneven_step_descending():
+    values = []
+    for i in 10..0..3:
+        append(values, i)
+    return values
+ud = uneven_step_descending()
+assert(length(ud) == 4, "step doesn't evenly divide range (descending): 10,7,4,1 = 4 iterations")
+assert(ud[3] == 1, "uneven step descending last value")
+
+function exact_multiple_step():
+    values = []
+    for i in 0..9..3:
+        append(values, i)
+    return values
+em = exact_multiple_step()
+assert(length(em) == 3, "step evenly divides range exactly: 0,3,6 = 3 iterations (9 excluded)")
+assert(em[2] == 6, "exact multiple step last value")
+
+print("all fast-range-path edge-case assertions passed")

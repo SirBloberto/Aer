@@ -1,0 +1,143 @@
+#!/usr/bin/env aer
+# AER test suite — packed struct arrays (`Type[count]`): fixed-size, mass-allocated,
+# inline-packed arrays of one struct type's instances. Machine-checked via assert():
+# a clean run exits 0; any failure prints "ASSERT FAILED: ..." and the process exits
+# nonzero (see main.c/error.c).
+
+# ------------------------------------------------------------------ #
+# 40. Construction, defaults, and get/set across all three eligible   #
+#     field types (integer/float/boolean).                           #
+# ------------------------------------------------------------------ #
+
+struct Point:
+    x: integer = 0
+    y: float = 0.0
+    flag: boolean = false
+
+pa1 = Point[5]
+assert(length(pa1) == 5, "packed array reports its declared count via length()")
+assert(pa1[0].x == 0 && pa1[0].y == 0.0 && pa1[0].flag == false, "every element starts at the struct's own declared defaults")
+assert(pa1[4].x == 0, "the last element is default-initialized too, not just the first")
+
+pa1[2].x = 42
+pa1[2].y = 3.5
+pa1[2].flag = true
+assert(pa1[2].x == 42 && pa1[2].y == 3.5 && pa1[2].flag == true, "field set/get round-trips for all three eligible types")
+
+# ------------------------------------------------------------------ #
+# 41. Elements are independent — writing one never touches another   #
+#     (the whole point of packed storage: no aliasing between slots).#
+# ------------------------------------------------------------------ #
+
+assert(pa1[0].x == 0 && pa1[1].x == 0 && pa1[3].x == 0, "writing element 2 left every other element at its own default")
+
+# ------------------------------------------------------------------ #
+# 42. Compound assignment on a packed field.                          #
+# ------------------------------------------------------------------ #
+
+pa1[0].x += 10
+assert(pa1[0].x == 10, "compound assignment (+=) on a packed field")
+pa1[0].y -= 1.5
+assert(pa1[0].y == -1.5, "compound assignment (-=) on a packed float field")
+
+# ------------------------------------------------------------------ #
+# 43. Variable index (not just literal), including loop-driven access.#
+# ------------------------------------------------------------------ #
+
+n = 3
+pa1[n].x = 99
+assert(pa1[3].x == 99, "a variable used as the index resolves correctly")
+
+for i in 0..5:
+    pa1[i].x = i * 100
+total = 0
+for i in 0..5:
+    total += pa1[i].x
+assert(total == 0 + 100 + 200 + 300 + 400, "a loop writing then reading every element by index sees its own writes")
+
+# ------------------------------------------------------------------ #
+# 44. Two independent packed arrays of the same struct type don't     #
+#     share storage.                                                  #
+# ------------------------------------------------------------------ #
+
+pa2 = Point[3]
+pa2[0].x = 7
+assert(pa1[0].x != pa2[0].x, "two separate Point[] arrays are independently allocated, not aliased")
+
+# ------------------------------------------------------------------ #
+# 45. type()/print() report a distinct name from a plain instance.    #
+# ------------------------------------------------------------------ #
+
+assert(type(pa1) == "Point[]", "a packed array's type() name is distinct from a plain instance's own type name")
+p_single = Point()
+assert(type(p_single) == "Point", "a plain (unpacked) struct instance's type name is unaffected by this feature")
+
+# ------------------------------------------------------------------ #
+# 46. length()/type() on a zero-count packed array — the empty-block  #
+#     edge case (malloc(0) is implementation-defined, must not be     #
+#     misreported as out-of-memory or crash).                         #
+# ------------------------------------------------------------------ #
+
+pa_empty = Point[0]
+assert(length(pa_empty) == 0, "a zero-count packed array constructs cleanly and reports length 0")
+
+# ------------------------------------------------------------------ #
+# 47. Eligibility is per-struct-type, not global — a struct with only #
+#     fixed-primitive fields can be packed even if OTHER structs in   #
+#     the same program have any/string fields (which just can't be    #
+#     packed themselves — see the commented "would error" cases       #
+#     below).                                                         #
+# ------------------------------------------------------------------ #
+
+struct Dynamic:
+    tag: any = null
+    label: string = "x"
+
+d = Dynamic()
+assert(d.tag == null && d.label == "x", "a struct with any/string fields still works fine as a plain (unpacked) instance")
+
+# pd = Dynamic[3]   # would error: 'Dynamic' cannot be packed into an array: field 'tag' must be integer/float/boolean, not any
+
+# ------------------------------------------------------------------ #
+# 48. GC correctness — allocate many packed arrays under real         #
+#     allocation pressure, force collections, verify data survives.   #
+#     (Packed arrays are GC leaves — every field is a fixed primitive,#
+#     never a heap reference — so this also exercises that a leaf     #
+#     object's own mark/sweep/free lifecycle is correct on its own,   #
+#     not just as a side effect of tracing something else's contents.)#
+# ------------------------------------------------------------------ #
+
+struct GcPoint:
+    v: integer = 0
+
+survivor = GcPoint[10]
+survivor[3].v = 12345
+
+gc_churn = []
+for i in 0..5000:
+    append(gc_churn, GcPoint[4])
+    append(gc_churn, [i, i * 2, "u" + (i as string)])
+
+assert(survivor[3].v == 12345, "a packed array held in a still-live variable survives GC pressure from unrelated allocations")
+assert(length(gc_churn) == 10000, "all the churn allocations (including throwaway packed arrays) completed without corrupting anything")
+
+# ------------------------------------------------------------------ #
+# 49. Out-of-bounds and type-mismatch errors (documented, not run —   #
+#     same convention as every other error-path example in this      #
+#     suite: a real runtime error aborts the whole script, so these   #
+#     can't be exercised inline in a script that must exit 0).        #
+# ------------------------------------------------------------------ #
+
+# bad = pa1[100].x           # would error: Array index 100 out of bounds (len 5)
+# pa1[0].x = "not an int"    # would error: Field 'x' is declared as a fixed type and cannot be assigned a different type
+# print(pa1[0])              # would error: Cannot index type (bare packed-array indexing isn't legal — only arr[i].field is)
+
+# ------------------------------------------------------------------ #
+# 50. A struct definition missing a type on one field is a compile    #
+#     error (mandatory struct typing, landed alongside this feature). #
+# ------------------------------------------------------------------ #
+
+# struct Bad:                # would error: Struct field must declare a type (e.g. 'x: float' or 'x: any')
+#     size = 1
+
+print("test_packed_arrays.aer: all assertions passed.")

@@ -74,12 +74,15 @@ unsigned int emit_iter_next_array(Chunk* c, int col_reg, int idx_reg, int item_d
    instruction's own offset as the loop's back-edge target. */
 unsigned int emit_iter_next_pair(Chunk* c, int col_reg, int idx_reg, int key_dest_reg, int val_dest_reg);
 
-/* The integer-range for-loop form (see OP_ITER_NEXT_ARRAY's own comment). Same emit-then-patch
-   idiom: cur_reg MUST already be a register the loop owns exclusively (mutated every iteration —
-   never an aliased existing variable's register), end_reg/step_reg may safely alias an existing
-   variable's register (read-only). Caller emits this instruction's own offset as the loop's
-   back-edge target, same convention as emit_iter_next_array. */
-unsigned int emit_iter_range(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg);
+/* The integer-range for-loop form (see OP_ITER_NEXT_ARRAY's own comment), loop-rotated — see
+   OP_ITER_RANGE_PREP/OP_ITER_RANGE_LOOP's own comments, vm.h. cur/end/step MUST all already be
+   registers the loop owns exclusively (snapshotted once via arg_materialize, never an alias to an
+   existing variable's register — see parse_for_in). emit_iter_range_prep returns a patch offset
+   (the empty-range exit, resolved once the loop's overall exit address is known);
+   emit_iter_range_loop's body_target is always already resolved (the loop body's own start), so it
+   needs no patching and returns nothing. */
+unsigned int emit_iter_range_prep(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg);
+void emit_iter_range_loop(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg, unsigned int body_target);
 
 /* Structs. type_name_pool_idx/field_name_pool_idx are plain pool indices (not RK-encoded — a
    type/field name is always a compile-time-known constant, never a register). rk_val
@@ -87,6 +90,10 @@ unsigned int emit_iter_range(Chunk* c, int cur_reg, int end_reg, int step_reg, i
 void emit_struct_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int arg_reg_base, int arg_count);
 void emit_field_get(Chunk* c, int dest_reg, int struct_reg, unsigned int field_name_pool_idx);
 void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, int rk_val);
+
+/* `Type[count]` — a packed array of Type's instances (value.h's TYPE_PACKED_ARRAY). rk_count is
+   RK-encoded like any other value operand. */
+void emit_packed_array_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int rk_count);
 
 /* Resets every persistent compile-time table (register allocator, variable/global/function/
    struct-type tables, function/loop depth) to empty — call this ONCE before compiling a fresh,

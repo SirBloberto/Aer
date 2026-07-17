@@ -11,9 +11,9 @@ import random
 import string
 
 struct Character:
-    name = "Unnamed"
-    hp = 100
-    attack = 10
+    name: string = "Unnamed"
+    hp: integer = 100
+    attack: integer = 10
 
 # A closure factory — each character gets an independently-tuned special
 # attack, capturing its own `character` and `bonus`. Closures in AER

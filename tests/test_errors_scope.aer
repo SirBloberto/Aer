@@ -50,7 +50,7 @@ assert(outer == 10, "...and the outer/global binding is left untouched")
 # given a reference to (a struct/array/dict), not a bare name — see the Scope section
 # of the README.
 struct Counter:
-    value
+    value: integer = 0
 
 function bump(c):
     c.value += 1

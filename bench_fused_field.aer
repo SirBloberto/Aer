@@ -1,5 +1,5 @@
 struct P:
-    x
+    x: integer = 0
 
 p = P(5)
 a = 3

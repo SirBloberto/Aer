@@ -263,16 +263,63 @@ typedef enum {
                               bucket's value, registers[idx_reg] = the bucket index past it,
                               fall through */
 
-    /* Integer-range iteration (`for i in a..b..step:`) — direction inferred from cur vs end, not
-       step's sign; step must be positive; >=/<= exit check so a step that doesn't evenly divide
-       the range still stops cleanly. cur_reg MUST be a register the loop owns exclusively (never
-       an aliased existing variable's register — see parse_for_in's use of arg_materialize,
-       not materialize, to guarantee this), since this opcode mutates it every iteration;
-       end_reg/step_reg are read-only and may safely alias an existing variable's register. */
-    OP_ITER_RANGE, /* operands: cur_reg, end_reg, step_reg, item_dest_reg, end_target — if the
-                          range is exhausted: jump to end_target (item_dest_reg untouched); else
-                          registers[item_dest_reg] = registers[cur_reg], registers[cur_reg]
-                          advances by +-step, fall through */
+    /* Integer-range iteration (`for i in a..b..step:`), loop-rotated: PREP runs ONCE before the
+       loop, LOOP runs at the BOTTOM of the loop body — unlike every other loop form (which checks
+       at the top and needs a separate unconditional OP_JUMP back-edge, see parse_loop_body's own
+       comment), this pair's own bottom-of-loop branch-backward-on-continue IS the back-edge, so no
+       OP_JUMP is ever emitted for this loop form. Found via a real cross-VM benchmark showing AER
+       paying one extra dispatch per iteration that Lua's own FORLOOP (which uses this exact same
+       bottom-of-loop shape) doesn't.
+         PREP precomputes a total iteration COUNT once (ceiling division so a step that doesn't
+       evenly divide the range still stops at the right point) instead of LOOP re-deriving "still in
+       range" from a direction-dependent comparison against the original limit on every single
+       dispatch — matching Lua's own FORLOOP algorithm exactly (its FORPREP does the equivalent
+       countdown setup), found by comparing AER's real per-iteration cost against what Lua actually
+       does internally, not just its opcode name. end_reg/step_reg are REPURPOSED by PREP into a
+       countdown and a direction-adjusted (already signed) step — LOOP reads them under this new
+       meaning, never the original bound/step values. This is safe only because cur/end/step are
+       all snapshotted ONCE by parse_for_in via arg_materialize before the loop starts — matching
+       Lua/Python's own range-for semantics (their bounds are evaluated once, never re-read from
+       whatever variable they came from) — so end_reg/step_reg are fresh, loop-owned registers
+       nothing else in the program ever reads, safe to overwrite with derived bookkeeping instead of
+       their original values. This also means LOOP never needs to re-validate cur/end/step's types
+       per iteration (PREP already checked once, and — per the same snapshot guarantee — it can't
+       have changed since), unlike a first attempt at this design that allowed end/step to alias an
+       existing variable and had to pay a full type/step check on every single dispatch to stay safe
+       (see [[project_aer_iter_range_loop_fast]] for that finding and why it was superseded by
+       simply not allowing the alias in the first place). Reused only by the plain
+       `for i in a..b..step:` form, not for-in over arrays/dicts (OP_ITER_NEXT_ARRAY/PAIR), which
+       keep the ordinary top-of-loop-plus-JUMP shape unchanged — extending the same rotation to
+       those would need their own PREP/LOOP pair, not attempted here. */
+    OP_ITER_RANGE_PREP, /* operands: cur_reg, end_reg, step_reg, item_dest_reg, empty_target —
+                               validates cur/end/step are integers and step > 0 (the ONLY place this
+                               is ever checked). Computes direction (ascending iff cur < end) and a
+                               total iteration count via ceiling division; if that count is 0 (empty
+                               range): jump to empty_target (item_dest_reg untouched, loop body
+                               never runs, end_reg/step_reg untouched too — no repurposing happens on
+                               the empty-range path). Otherwise: registers[end_reg] = count - 1 (the
+                               countdown OP_ITER_RANGE_LOOP will read as "iterations remaining after
+                               this one"), registers[step_reg] = the direction-adjusted signed step,
+                               registers[item_dest_reg] = registers[cur_reg] (the first iteration's
+                               value), fall through into the loop body. Never advances cur_reg —
+                               that's OP_ITER_RANGE_LOOP's job, below. */
+    OP_ITER_RANGE_LOOP, /* operands: cur_reg, remaining_reg (was end_reg — see OP_ITER_RANGE_PREP's
+                               own comment), signed_step_reg (was step_reg), item_dest_reg,
+                               body_target — body_target is a PLAIN already-resolved address (the
+                               loop body's own start), never a placeholder needing patch_jump —
+                               unlike every other loop form's back-edge, this is the only jump target
+                               this whole construct needs to know before it's emitted. Runs once per
+                               iteration, at the BOTTOM of the loop body. If remaining_reg's countdown
+                               is already 0: exhausted, cur_reg/item_dest_reg left untouched, control
+                               simply falls through to whatever comes right after this instruction
+                               (the loop's exit code), so the loop variable's final value is always
+                               whatever the last successful iteration wrote — same as a non-rotated
+                               check-at-top loop would leave it. Otherwise: registers[cur_reg] =
+                               registers[item_dest_reg] = registers[cur_reg] + signed_step_reg's
+                               already-direction-adjusted value (no ascending/descending branch
+                               needed here at all — PREP baked the sign in once), decrements the
+                               countdown, then jumps BACKWARD to body_target — that branch, taken on
+                               every ordinary iteration, IS the back-edge. */
 
     /* Structs. OP_DEFINE_STRUCT itself (above) is reused unmodified for struct *definitions*;
        these three ARE their own opcodes because instantiation, field get, and field set all need
@@ -287,6 +334,35 @@ typedef enum {
                           field-name scan (vm.c), registers[dest_reg] = the matching field */
     OP_FIELD_SET,  /* operands: struct_reg, field_name_pool_idx, rk_val — includes the
                           gc_barrier_array call */
+
+    /* Packed struct arrays: `Type[count]` (a fixed-size, mass-allocated, inline-packed array of
+       one struct type's instances — see TYPE_PACKED_ARRAY, value.h). Only constructible for a
+       struct whose every field is a fixed-primitive type (checked at runtime here, same as
+       OP_STRUCT_NEW's own positional-arg type check, since a Shape is only fully known once
+       OP_DEFINE_STRUCT has run). Every element is default-initialized from the struct's own field
+       defaults, same as an omitted-argument OP_STRUCT_NEW. */
+    OP_PACKED_ARRAY_NEW, /* operands: dest_reg, type_name_pool_idx, rk_count — chunk_find_shape()
+                                by name, eligibility check (every field_types[i] is integer/float/
+                                boolean), one packed_array_pool allocation + one xmalloc'd data
+                                block sized count * (field_count * 8 bytes), every element
+                                default-filled */
+
+    /* The fused `obj[index].field` read/write pair — see TYPE_PACKED_ARRAY's own comment (value.h)
+       for why packed arrays have no standalone reference value: computing a packed element's
+       address is pure arithmetic (base + index * element_size), so there's nothing a standalone
+       reference would save over recomputing it, unlike today's pointer-chasing struct arrays where
+       aliasing a reference into a local genuinely saves a dereference. Because there's no
+       standalone reference, `obj[index]` alone can't represent a packed access — the parser only
+       ever emits these two opcodes for the exact syntactic pattern `expr[index].field`, immediately
+       fused (parse_postfix_chain/parse_chain_assignment, parser.c), never split into a separate
+       index step. Dispatches on aer_type(obj) at runtime: TYPE_PACKED_ARRAY takes the packed byte-
+       offset path; TYPE_ARRAY (any other array, including a struct instance produced by an outer
+       index) falls back to exactly what index-then-field already did (vm_index_get_compute() then
+       vm_resolve_field()/field-set) — so this replaces the old two-opcode compilation for this
+       specific pattern for EVERY array, not just packed ones, but is behaviorally identical to the
+       old two-step sequence for anything that isn't a packed array. */
+    OP_INDEX_FIELD_GET, /* operands: dest_reg, obj_reg, field_name_pool_idx, rk_idx */
+    OP_INDEX_FIELD_SET, /* operands: obj_reg, field_name_pool_idx, rk_idx, rk_val */
 
     /* Expression-grammar completions. unary_op reuses OP_NEGATE/OP_NOT/OP_BITWISE_NOT as its
        operand tag, same convention OP_BINARY already uses for bin_op — one opcode per operator
@@ -356,6 +432,21 @@ typedef enum {
        the existing raw-raw compound-assign family's own scope (DIV/MOD/FLOOR_DIV always shadow). */
     OP_RAW_ADD_INT_BOXED, OP_RAW_SUB_INT_BOXED, OP_RAW_MUL_INT_BOXED,
     OP_RAW_ADD_REAL_BOXED, OP_RAW_SUB_REAL_BOXED, OP_RAW_MUL_REAL_BOXED,
+    /* Ordering comparison between a raw slot and an ORDINARY BOXED value, producing a normal boxed
+       boolean — the comparison sibling of OP_RAW_ADD_INT_BOXED above, for exactly the same reason:
+       a loop counter that's raw-tracked (parser.c's primitive pass) almost always gets compared
+       against a bound that ISN'T raw (a function parameter, an array length, ...), since parameters
+       are never raw-tracked. Without this, that comparison had to box the raw side first
+       (OP_BOX_INT) just to run an ordinary boxed OP_LTE — found via a real per-opcode profile of
+       sieve.aer, where OP_BOX_INT was the single most-executed opcode (~16% of all dispatches),
+       almost entirely from `for i <= limit:`-shaped loop conditions. A runtime tag check on the
+       boxed operand decides: matching type -> compare directly against the raw slot; mismatched
+       type -> the same "Type mismatch in binary expression" error the boxed VM already gives.
+       Unlike the ADD/SUB/MUL family above, this is NOT in-place (a comparison never mutates its
+       raw operand) and is used from ordinary binary expressions (try_emit_cmp_raw_boxed, parser.c),
+       not compound-assignment. */
+    OP_RAW_LT_INT_BOXED, OP_RAW_GT_INT_BOXED, OP_RAW_LTE_INT_BOXED, OP_RAW_GTE_INT_BOXED,
+    OP_RAW_LT_REAL_BOXED, OP_RAW_GT_REAL_BOXED, OP_RAW_LTE_REAL_BOXED, OP_RAW_GTE_REAL_BOXED,
     /* OP_RAW_LOAD_INT's immediate is a signed 20-bit field (-524288..524287) — a literal outside
        that range must NOT be silently truncated (a real bug found exactly this way: `i < 20000000`
        packed 20000000 into 20 bits, silently becoming 77056, running a supposedly-20M-iteration
@@ -492,8 +583,8 @@ typedef enum {
      Patchable jump targets are deliberately EXCLUDED from every packing here, same rule OP_JUMP's
    family already followed before this change (see PACK3's own comment above): patch_jump does a
    blind word overwrite at the target's own offset, so any field sharing that word would be
-   clobbered. OP_ITER_RANGE/OP_ITER_NEXT_PAIR's target word is untouched by PACK_REG4 — only their
-   OTHER (non-target) fields get packed together. */
+   clobbered. OP_ITER_RANGE_PREP/OP_ITER_RANGE_LOOP/OP_ITER_NEXT_PAIR's target word is untouched by
+   PACK_REG4 — only their OTHER (non-target) fields get packed together. */
 #define PACK_REG4(op, a, b, cc, d) \
     ( ((uint64_t)(op) & 0xFF) \
     | (((uint64_t)(a)  & 0x7F) << 8) \
@@ -681,6 +772,19 @@ typedef enum {
 #define UNPACK_RAW_ARITH_BOXED_SLOT(word)  ((((uint32_t)(word)) >> 7)  & 0x1FU)
 #define UNPACK_RAW_ARITH_BOXED_REG(word)   ((((uint32_t)(word)) >> 12) & 0x7FU)
 
+/* Comparison between a raw slot and a boxed value (OP_RAW_*_INT_BOXED/OP_RAW_*_REAL_BOXED, see
+   their own Opcode-enum comment) — unlike PACK_RAW_ARITH_BOXED above, this isn't in-place, so it
+   needs its own normal registers[] dest for the resulting boxed boolean. dest(7) + slot(5) +
+   boxed_reg(7) = 19 bits. */
+#define PACK_RAW_CMP_BOXED(op, dest, slot, boxed_reg) \
+    ( ((uint64_t)(op)        & 0x7F) \
+    | (((uint64_t)(dest)     & 0x7F) << 7) \
+    | (((uint64_t)(slot)     & 0x1F) << 14) \
+    | (((uint64_t)(boxed_reg) & 0x7F) << 19) )
+#define UNPACK_RAW_CMP_BOXED_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
+#define UNPACK_RAW_CMP_BOXED_SLOT(word) ((((uint32_t)(word)) >> 14) & 0x1FU)
+#define UNPACK_RAW_CMP_BOXED_REG(word)  ((((uint32_t)(word)) >> 19) & 0x7FU)
+
 /* dest/lhs_reg (7 bits each) + type_name_idx — a bare pool index, not RK (always a compile-time
    struct type name, never a register) — gets the remaining 42 bits, same reasoning as
    OP_FIELD_GET's field_idx. */
@@ -706,6 +810,19 @@ typedef enum {
 #define UNPACK_STRUCT_NEW_ARG_BASE(word) (((word) >> 15) & 0x7F)
 #define UNPACK_STRUCT_NEW_ARG_COUNT(word) (((word) >> 22) & 0x7F)
 #define UNPACK_STRUCT_NEW_NAME(word)     (((word) >> 29) & 0x7FFFFFFFFULL)
+
+/* dest(7) + type_name_idx (35 bits, same bare-pool-index convention as OP_STRUCT_NEW above — the
+   struct type is always a compile-time name, never a register) + rk_count (RK9 — a count is
+   usually a register, rarely a large literal, so RK9's smaller constant-pool budget costs
+   nothing in practice; same choice OP_FIELD_SET/OP_INDEX_GET already made for their own operands). */
+#define PACK_PACKED_ARRAY_NEW(dest, type_name_idx, rk_count) \
+    ( ((uint64_t)(OP_PACKED_ARRAY_NEW) & 0xFF) \
+    | (((uint64_t)(dest)          & 0x7F) << 8) \
+    | (((uint64_t)(type_name_idx) & 0x7FFFFFFFFULL) << 15) \
+    | ((PACK_RK9(rk_count) & 0x1FFULL) << 50) )
+#define UNPACK_PACKED_ARRAY_NEW_DEST(word)  (((word) >> 8)  & 0x7F)
+#define UNPACK_PACKED_ARRAY_NEW_NAME(word)  (((word) >> 15) & 0x7FFFFFFFFULL)
+#define UNPACK_PACKED_ARRAY_NEW_COUNT(word) (((word) >> 50) & 0x1FFULL)
 
 /* Slice E — the last, tightest-budget batch: OP_CMP_JUMP_FALSE/OP_INDEX_SET/OP_SLICE_GET have no
    patchable target issue (OP_CMP_JUMP_FALSE's target still gets its own dedicated word, same rule
@@ -799,6 +916,36 @@ typedef enum {
 #define UNPACK_BINARY_FIELD_RK(word)     (((word) >> 30) & 0xFFFFFULL)
 #define UNPACK_BINARY_FIELD_NAME(word)   (((word) >> 50) & FUSED_FIELD_NAME_MASK)
 
+/* dest(7) + obj_reg(7) + field_idx (FUSED_FIELD_NAME_MASK, same 14-bit budget as the two fusions
+   just above) + rk_idx (RK20 — plenty of room left in the word, so no need to narrow this one to
+   RK9 the way OP_INDEX_FIELD_SET below has to). See OP_INDEX_FIELD_GET's own comment (above, near
+   OP_FIELD_SET) for why this replaces plain index-then-field for every array, not just packed
+   ones. */
+#define PACK_INDEX_FIELD_GET(dest, obj_reg, field_idx, rk_idx) \
+    ( ((uint64_t)(OP_INDEX_FIELD_GET) & 0xFF) \
+    | (((uint64_t)(dest)    & 0x7F) << 8) \
+    | (((uint64_t)(obj_reg) & 0x7F) << 15) \
+    | (((uint64_t)(field_idx) & FUSED_FIELD_NAME_MASK) << 22) \
+    | ((PACK_RK20(rk_idx) & 0xFFFFFULL) << 36) )
+#define UNPACK_INDEX_FIELD_GET_DEST(word)  (((word) >> 8)  & 0x7F)
+#define UNPACK_INDEX_FIELD_GET_OBJ(word)   (((word) >> 15) & 0x7F)
+#define UNPACK_INDEX_FIELD_GET_FIELD(word) (((word) >> 22) & FUSED_FIELD_NAME_MASK)
+#define UNPACK_INDEX_FIELD_GET_RK(word)    (((word) >> 36) & 0xFFFFFULL)
+
+/* obj_reg(7) + field_idx (FUSED_FIELD_NAME_MASK, 14 bits) + rk_idx + rk_val — two operands beyond
+   OP_INDEX_FIELD_GET's one, so both RK operands narrow to RK9 (same budget-vs-headroom trade
+   OP_FIELD_SET/OP_INDEX_GET already made) to fit in one word rather than needing a second. */
+#define PACK_INDEX_FIELD_SET(obj_reg, field_idx, rk_idx, rk_val) \
+    ( ((uint64_t)(OP_INDEX_FIELD_SET) & 0xFF) \
+    | (((uint64_t)(obj_reg)   & 0x7F) << 8) \
+    | (((uint64_t)(field_idx) & FUSED_FIELD_NAME_MASK) << 15) \
+    | ((PACK_RK9(rk_idx) & 0x1FFULL) << 29) \
+    | ((PACK_RK9(rk_val) & 0x1FFULL) << 38) )
+#define UNPACK_INDEX_FIELD_SET_OBJ(word)   (((word) >> 8)  & 0x7F)
+#define UNPACK_INDEX_FIELD_SET_FIELD(word) (((word) >> 15) & FUSED_FIELD_NAME_MASK)
+#define UNPACK_INDEX_FIELD_SET_IDX(word)   (((word) >> 29) & 0x1FFULL)
+#define UNPACK_INDEX_FIELD_SET_VAL(word)   (((word) >> 38) & 0x1FFULL)
+
 /* OP_CAST operand values — target type for `x as T` (T=string compiles to OP_TO_STR instead, since that conversion already existed). */
 #define CAST_INTEGER 0
 #define CAST_FLOAT   1
@@ -863,6 +1010,14 @@ typedef struct {
                                      teardown (aer_module_free_all) */
     bool         has_receiver;
     unsigned int receiver_type;  /* meaningful only when has_receiver */
+    /* This function's real peak register need, captured at compile time (parser.c's
+       max_register_used, patched in after the body finishes) — used at call time to bump
+       vm->registers by exactly this much instead of always FRAME_REGISTERS. chunk_add_function
+       sets this to FRAME_REGISTERS as a safe placeholder before the body compiles (self-reference
+       to this same function's own value from within its own not-yet-finished body is the one case
+       that reads it before the real peak is patched in — see parse_function's own comment) — never
+       an under-allocation, just misses the cache-locality win for that one rare pattern. */
+    unsigned int max_registers;
 } ChunkFunction;
 
 /* ------------------------------------------------------------------ */
@@ -955,7 +1110,19 @@ typedef struct {
    own isolated call chain instead of sharing — and thereby corrupting — the calling VM's own
    in-progress one. */
 typedef struct {
-    AerVal       registers[FRAME_REGISTERS];
+    /* A bump-pointer base into vm->register_stack — NOT owned/freed storage, just "where this
+       frame's registers currently live," computed once at push time as
+       (caller's registers) + (caller's frame_size), matching Lua/V8's own call-cost model: a call
+       is a pointer add, never an allocation. registers[0..frame_size) is this frame's own bank;
+       nothing else in vm->register_stack is touched until a later push reuses that same range. */
+    AerVal*      registers;
+    /* How many registers THIS frame actually reserved — a callee's ChunkFunction.max_registers/
+       AerFunction.max_registers (that specific function's real compile-time-captured peak, not a
+       flat FRAME_REGISTERS for every function regardless of need), or FRAME_REGISTERS for frame 0
+       (the top level/REPL's own usage is open-ended across statements, never "sealed" the way a
+       function body's is — see parser.c's own comment). Read at the NEXT push through this frame,
+       to know how far to bump past it. */
+    unsigned int frame_size;
 
     /* Raw (unboxed) scratch for the "primitive pass" — locals the compiler proved are always the
        same primitive type across their whole life (parser.c's var_kind/RK_RAW_*_FLAG) get a bare
@@ -1000,6 +1167,17 @@ typedef struct {
     int64_t*     raw_ints;
     double*      raw_reals;
     int          call_depth;
+
+    /* One shared, contiguous, fixed-size register bank for the WHOLE call chain — a call never
+       allocates, it just bumps a base pointer forward by the callee's own frame_size, and a return
+       bumps it back to whatever the caller's own (already-known) base was. Sized to the same worst
+       case the original design always paid unconditionally (VM_CALL_MAX frames, each up to
+       FRAME_REGISTERS) — no new overflow class versus today, since no single frame_size can ever
+       exceed FRAME_REGISTERS (parser.c's ceiling) and there can never be more than VM_CALL_MAX
+       frames deep. The real win isn't a smaller reservation, it's that most real functions use far
+       fewer than FRAME_REGISTERS, so the ACTUAL bytes touched during a deep call chain are a much
+       smaller, more cache-friendly working set than a flat 128-per-frame design ever had. */
+    AerVal       register_stack[VM_CALL_MAX * FRAME_REGISTERS];
 } VM;
 
 /* Bounds-checked push/pop against vm->stack (see the stack field's own comment above) for use
