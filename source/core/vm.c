@@ -1924,10 +1924,9 @@ lbl_move: {
    from ANY instantiation of this macro (add/sub/mul/div/floor_div/eq/neq/lt/gt/lte/gte) is OP_ADD's
    string-concatenation case (an xmalloc + aer_make_string). Every int/int and real/real fast-path
    result (aer_int()/aer_real()) is a plain tagged-union construction, never heap allocation, so it
-   never needs a GC checkpoint — found via a real per-opcode profile (perf annotate) showing this
-   call's own two comparisons (gc_suppress_depth/pool_total_alloc_count) costing ~14% of ALL
-   instructions on a tight counting-loop benchmark, paid on literally every dispatch of the single
-   most common opcode family regardless of operator or operand type, when 10 of these 11 operators
+   never needs a GC checkpoint — this call's own two comparisons (gc_suppress_depth/
+   pool_total_alloc_count) would otherwise run on literally every dispatch of the single most
+   common opcode family regardless of operator or operand type, when 10 of these 11 operators
    (everything except OP_ADD) could never possibly need it in any branch at all. */
 #define BINARY_OP_INT_REAL(NAME, OPENUM, INT_STMT, REAL_STMT) \
 lbl_##NAME: { \
@@ -2422,19 +2421,16 @@ lbl_iter_range_prep: {
     /* Precomputes a total iteration count ONCE, instead of re-deriving "still in range" from a
        direction-dependent comparison against the original limit on every single dispatch of
        OP_ITER_RANGE_LOOP — matching Lua's own FORLOOP design (its FORPREP does the equivalent
-       count computation), found by comparing AER's real per-iteration cost against Lua's actual
-       algorithm, not just its opcode name. Ceiling division so a step that doesn't evenly divide
-       the range still gets the correct final count (e.g. 0..10..3 must stop after 0,3,6,9 — 4
-       iterations, not 3 or 4.33). count==0 means an empty range, same exit as before. */
+       count computation). Ceiling division so a step that doesn't evenly divide the range still
+       gets the correct final count (e.g. 0..10..3 must stop after 0,3,6,9 — 4 iterations, not 3
+       or 4.33). count==0 means an empty range, same exit as before. */
     bool ascending = cur < rng_end;
     int64_t diff  = ascending ? (rng_end - cur) : (cur - rng_end);
     /* step == 1 (the overwhelmingly common case — no explicit `..step` in the source) skips the
-       division entirely: count is just diff. Division has no fast hardware path on this target
-       (confirmed by a real regression: nbody.aer's many short, frequently-re-entered range-for
-       loops got measurably slower under the unconditional-division version of this computation,
-       even though a long-running loop like a pure counting benchmark improved — the division's
-       one-time cost in PREP outweighed the per-iteration savings in LOOP when PREP runs relatively
-       often compared to LOOP). */
+       division entirely: count is just diff. This target has no fast hardware integer divide, and
+       short, frequently-re-entered range-for loops (nbody.aer's inner loops, not a long-running
+       counting loop) pay PREP's one-time division cost often enough that skipping it here is a
+       real win, not just a theoretical one. */
     int64_t count = (step == 1) ? diff : (diff + step - 1) / step;
     if (count == 0) {
         ip = (unsigned int)empty_target;

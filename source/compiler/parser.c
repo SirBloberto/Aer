@@ -629,24 +629,22 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
 
 /* One side an EXISTING raw slot (never a bare raw-composable literal — see below), the other a
    genuine runtime register — the comparison sibling of OP_RAW_ADD_INT_BOXED's "raw meets boxed"
-   pattern (vm.h), covering ONLY the 4 ordering comparisons. Found necessary via a real per-opcode
-   profile of sieve.aer: a raw-tracked loop counter (parser.c's primitive pass) almost always gets
-   compared against a bound that ISN'T raw — a function parameter, since parameters are never
-   raw-tracked — so without this, `for i <= limit:` had to box the raw side (OP_BOX_INT) just to
-   run an ordinary boxed OP_LTE. OP_BOX_INT turned out to be the single most-executed opcode on
-   that benchmark (~16% of all dispatches), almost entirely from exactly this shape.
+   pattern (vm.h), covering ONLY the 4 ordering comparisons. A raw-tracked loop counter (parser.c's
+   primitive pass) almost always gets compared against a bound that ISN'T raw — a function
+   parameter, since parameters are never raw-tracked — so without this, `for i <= limit:` had to
+   box the raw side (OP_BOX_INT) just to run an ordinary boxed OP_LTE.
      Deliberately requires the raw side to ALREADY be a raw slot (RK_RAW_INT_FLAG/RK_RAW_REAL_FLAG
-   set), not merely raw-composable (rk_raw_kind also accepts a bare int/real LITERAL) — a real
-   regression found via benchmark.sh's counting-loop workload (`for i < 1000000:` at script scope,
-   where `i` stays boxed — top-level locals are never raw-tracked — but the literal `1000000` IS
-   raw-composable): raw_materialize is a free no-op for an already-raw slot, but for a bare literal
-   it EMITS a real OP_RAW_LOAD_INT/_POOL instruction — and unlike a genuine raw variable (already
-   resident, materialized once), an expression's own literal gets re-materialized fresh every time
-   that expression runs. In a hot loop CONDITION, that means paying a whole extra dispatch every
-   single iteration to load a constant the old boxed path could already reference directly via RK
-   addressing for free. Returns false (falls back to box_if_raw + the ordinary boxed comparison,
-   which is what a boxed-variable-vs-literal comparison should keep using) for a non-comparison
-   operator, a boxed side that isn't a plain register, or a "raw" side that's actually just a
+   set), not merely raw-composable (rk_raw_kind also accepts a bare int/real LITERAL): for a script-
+   scope loop like `for i < 1000000:` (`i` stays boxed — top-level locals are never raw-tracked —
+   but the literal `1000000` IS raw-composable), raw_materialize is a free no-op for an already-raw
+   slot, but for a bare literal it EMITS a real OP_RAW_LOAD_INT/_POOL instruction — and unlike a
+   genuine raw variable (already resident, materialized once), an expression's own literal gets
+   re-materialized fresh every time that expression runs. In a hot loop CONDITION, that means
+   paying a whole extra dispatch every single iteration to load a constant the old boxed path could
+   already reference directly via RK addressing for free. Returns false (falls back to
+   box_if_raw + the ordinary boxed comparison, which is what a boxed-variable-vs-literal comparison
+   should keep using) for a non-comparison operator, a boxed side that isn't a plain register, or a
+   "raw" side that's actually just a
    literal. */
 static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind_lhs,
                                        int rk_rhs, RawKind kind_rhs, int* out_rk) {

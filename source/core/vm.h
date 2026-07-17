@@ -211,30 +211,26 @@ typedef enum {
        loop, LOOP runs at the BOTTOM of the loop body — unlike every other loop form (which checks
        at the top and needs a separate unconditional OP_JUMP back-edge, see parse_loop_body's own
        comment), this pair's own bottom-of-loop branch-backward-on-continue IS the back-edge, so no
-       OP_JUMP is ever emitted for this loop form. Found via a real cross-VM benchmark showing AER
-       paying one extra dispatch per iteration that Lua's own FORLOOP (which uses this exact same
-       bottom-of-loop shape) doesn't.
+       OP_JUMP is ever emitted for this loop form, matching Lua's own FORLOOP shape.
          PREP precomputes a total iteration COUNT once (ceiling division so a step that doesn't
        evenly divide the range still stops at the right point) instead of LOOP re-deriving "still in
        range" from a direction-dependent comparison against the original limit on every single
        dispatch — matching Lua's own FORLOOP algorithm exactly (its FORPREP does the equivalent
-       countdown setup), found by comparing AER's real per-iteration cost against what Lua actually
-       does internally, not just its opcode name. end_reg/step_reg are REPURPOSED by PREP into a
-       countdown and a direction-adjusted (already signed) step — LOOP reads them under this new
-       meaning, never the original bound/step values. This is safe only because cur/end/step are
-       all snapshotted ONCE by parse_for_in via arg_materialize before the loop starts — matching
-       Lua/Python's own range-for semantics (their bounds are evaluated once, never re-read from
-       whatever variable they came from) — so end_reg/step_reg are fresh, loop-owned registers
-       nothing else in the program ever reads, safe to overwrite with derived bookkeeping instead of
-       their original values. This also means LOOP never needs to re-validate cur/end/step's types
-       per iteration (PREP already checked once, and — per the same snapshot guarantee — it can't
-       have changed since), unlike a first attempt at this design that allowed end/step to alias an
-       existing variable and had to pay a full type/step check on every single dispatch to stay safe
-       (see [[project_aer_iter_range_loop_fast]] for that finding and why it was superseded by
-       simply not allowing the alias in the first place). Reused only by the plain
-       `for i in a..b..step:` form, not for-in over arrays/dicts (OP_ITER_NEXT_ARRAY/PAIR), which
-       keep the ordinary top-of-loop-plus-JUMP shape unchanged — extending the same rotation to
-       those would need their own PREP/LOOP pair, not attempted here. */
+       countdown setup). end_reg/step_reg are REPURPOSED by PREP into a countdown and a
+       direction-adjusted (already signed) step — LOOP reads them under this new meaning, never the
+       original bound/step values. This is safe only because cur/end/step are all snapshotted ONCE
+       by parse_for_in via arg_materialize before the loop starts — matching Lua/Python's own
+       range-for semantics (their bounds are evaluated once, never re-read from whatever variable
+       they came from) — so end_reg/step_reg are fresh, loop-owned registers nothing else in the
+       program ever reads, safe to overwrite with derived bookkeeping instead of their original
+       values. This also means LOOP never needs to re-validate cur/end/step's types per iteration
+       (PREP already checked once, and — per the same snapshot guarantee — it can't have changed
+       since): an earlier design that allowed end/step to alias an existing variable had to pay a
+       full type/step check on every single dispatch to stay safe, which is why aliasing is
+       disallowed instead. Reused only by the plain `for i in a..b..step:` form, not for-in over
+       arrays/dicts (OP_ITER_NEXT_ARRAY/PAIR), which keep the ordinary top-of-loop-plus-JUMP shape
+       unchanged — extending the same rotation to those would need their own PREP/LOOP pair, not
+       attempted here. */
     OP_ITER_RANGE_PREP, /* operands: cur_reg, end_reg, step_reg, item_dest_reg, empty_target —
                                validates cur/end/step are integers and step > 0 (the ONLY place this
                                is ever checked). Computes direction (ascending iff cur < end) and a
@@ -325,12 +321,11 @@ typedef enum {
     OP_CAST, /* operands: dest_reg, cast_type, rk_operand — registers[dest_reg] =
                    vm_cast(rk_operand, cast_type) */
 
-    /* Fusion, found via a real per-opcode dispatch audit on nbody.aer: `x OP y.field` (e.g. this
-       exact benchmark's `dx = bix - bj.x`) always compiled as OP_FIELD_GET (into a fresh temp)
-       immediately followed by OP_BINARY reading that temp — two dispatches for something that's
-       structurally one operation. Recognized at emit time in parse_binary_ops (parser.c) by
-       truncating the just-emitted OP_FIELD_GET and re-encoding it as this opcode's last two
-       operands. */
+    /* Fusion: `x OP y.field` (e.g. nbody.aer's `dx = bix - bj.x`) always compiled as OP_FIELD_GET
+       (into a fresh temp) immediately followed by OP_BINARY reading that temp — two dispatches for
+       something that's structurally one operation. Recognized at emit time in parse_binary_ops
+       (parser.c) by truncating the just-emitted OP_FIELD_GET and re-encoding it as this opcode's
+       last two operands. */
     OP_BINARY_FIELD, /* operands: dest_reg, rk_lhs, bin_op, struct_reg, field_name_pool_idx —
                             registers[dest_reg] = rk_lhs OP struct_reg.field */
 
@@ -367,10 +362,10 @@ typedef enum {
     OP_RAW_MOVE_INT, OP_RAW_MOVE_REAL,
     /* Compound-assignment accumulation of an ORDINARY BOXED value straight into a raw slot, in
        place — no shadow at all, since the slot's identity never changes. Exists for exactly the
-       "accumulate a boxed arithmetic result into a raw accumulator" pattern (found via nbody.aer's
-       own `energy()`: `e += 0.5 * bim * (...)` where bim/vx/vy/vz are struct-field reads, so the
-       RHS is an ordinary boxed register — never provably raw at compile time — even though it's
-       always real at runtime). A runtime tag check on the boxed operand decides: matching type ->
+       "accumulate a boxed arithmetic result into a raw accumulator" pattern (e.g. nbody.aer's own
+       `energy()`: `e += 0.5 * bim * (...)` where bim/vx/vy/vz are struct-field reads, so the RHS is
+       an ordinary boxed register — never provably raw at compile time — even though it's always
+       real at runtime). A runtime tag check on the boxed operand decides: matching type ->
        accumulate directly into the raw slot; mismatched type -> the same "Type mismatch in binary
        expression" runtime error the boxed VM already gives for this. Only ADD/SUB/MUL — matching
        the existing raw-raw compound-assign family's own scope (DIV/MOD/FLOOR_DIV always shadow). */
@@ -381,10 +376,10 @@ typedef enum {
        a loop counter that's raw-tracked (parser.c's primitive pass) almost always gets compared
        against a bound that ISN'T raw (a function parameter, an array length, ...), since parameters
        are never raw-tracked. Without this, that comparison had to box the raw side first
-       (OP_BOX_INT) just to run an ordinary boxed OP_LTE — found via a real per-opcode profile of
-       sieve.aer, where OP_BOX_INT was the single most-executed opcode (~16% of all dispatches),
-       almost entirely from `for i <= limit:`-shaped loop conditions. A runtime tag check on the
-       boxed operand decides: matching type -> compare directly against the raw slot; mismatched
+       (OP_BOX_INT) just to run an ordinary boxed OP_LTE — on sieve.aer, OP_BOX_INT was the single
+       most-executed opcode, almost entirely from `for i <= limit:`-shaped loop conditions. A
+       runtime tag check on the boxed operand decides: matching type -> compare directly against
+       the raw slot; mismatched
        type -> the same "Type mismatch in binary expression" error the boxed VM already gives.
        Unlike the ADD/SUB/MUL family above, this is NOT in-place (a comparison never mutates its
        raw operand) and is used from ordinary binary expressions (try_emit_cmp_raw_boxed, parser.c),
