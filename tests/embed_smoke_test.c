@@ -52,14 +52,12 @@ static void check(bool cond, const char* what) {
 }
 
 /* A minimal host-registered function — everything a real one needs:
-   read args, compute, return a Value. Registered below as "game.add". */
-static Value host_add(VM* vm, int arg_count, Value* args, void* userdata) {
+   read args, compute, return an AerVal. Registered below as "game.add". */
+static AerVal host_add(VM* vm, int arg_count, AerVal* args, void* userdata) {
     (void)vm; (void)userdata;
-    Value r = {0};
-    r.type = TYPE_INTEGER;
-    if (arg_count == 2 && args[0].type == TYPE_INTEGER && args[1].type == TYPE_INTEGER)
-        r.data.integer = args[0].data.integer + args[1].data.integer;
-    return r;
+    if (arg_count == 2 && aer_type(args[0]) == TYPE_INTEGER && aer_type(args[1]) == TYPE_INTEGER)
+        return aer_int(aer_as_int(args[0]) + aer_as_int(args[1]));
+    return aer_int(0);
 }
 
 /* Mirrors main.c's run() — parse+run whatever text shell() was just

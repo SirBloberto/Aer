@@ -5,22 +5,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Forward declarations — mutual references between Value and collection types */
+/* Forward declarations — mutual references between AerVal and collection types */
 typedef struct AerArray       AerArray;
 typedef struct AerDict        AerDict;
 typedef struct AerFunction    AerFunction;
 typedef struct AerString      AerString;
 typedef struct AerPackedArray AerPackedArray;
 typedef struct Shape       Shape;   /* full definition in vm.h — needs pool-index arrays */
-typedef struct Value       Value;   /* the STABLE PUBLIC boxed type — used only at the
-                                        AerNativeFn host-embedding boundary from here on
-                                        (see aer_host.c's aer_host_call and include/aer.h).
-                                        Every internal storage location (the VM stack,
-                                        scopes, arrays, dicts, chunk pool, ...) uses AerVal
-                                        below instead. */
 
 typedef enum ValueType {
-    TYPE_NULL,      /* zero-value; (Value){0} is null */
+    TYPE_NULL,      /* zero-value; (AerVal){0} is null */
     TYPE_BOOLEAN,
     TYPE_INTEGER,
     TYPE_REAL,
@@ -43,14 +37,13 @@ typedef enum ValueType {
     TYPE_ANY,
 } ValueType;
 
-/* AerVal: the internal runtime value, as an explicit tagged union — every VM stack slot, scope
-   variable, array element, dict entry, and struct field is one of these, not a Value. See the
-   accessor functions further down this file.
+/* AerVal: the one runtime value type, everywhere — every VM stack slot, register, array element,
+   dict entry, struct field, and host-embedding argument/result (AerNativeFn, include/aer.h) is one
+   of these. See the accessor functions further down this file.
    The tag MUST default to TYPE_NULL (0) on zero-init — mark_vm_roots (vm.c) scans every
    register unconditionally, relying on a never-yet-written register decoding as a harmless leaf
    value. TYPE_NULL is declared first in ValueType above specifically so this holds automatically
-   for any zero-initialized AerVal, the same invariant this file already documents for the public
-   Value struct above ("zero-value; (Value){0} is null"). */
+   for any zero-initialized AerVal. */
 typedef struct AerVal {
     ValueType tag;
     union {
@@ -60,26 +53,6 @@ typedef struct AerVal {
         void*     ptr;
     } as;
 } AerVal;
-
-typedef union ValueData {
-    char   boolean;
-    int64_t integer;
-    double real;
-    /* string/function are heap-allocated, not inline structs, so this union
-       stays sized to a pointer instead of bloating every Value to fit their
-       rarely-used fields. */
-    AerString*   string;
-    AerFunction* function;
-    AerArray* array;
-    AerDict*  dict;
-} ValueData;
-
-/* Value itself was already forward-declared above (needed by ValueData) —
-   this completes it, matching the AerArray/AerDict/Shape pattern below. */
-struct Value {
-    ValueType type;
-    ValueData data;
-};
 
 /* Defined after AerVal so items[] can use the complete internal value type.
    gc_state must be first — pool.c treats every pool-managed struct's leading byte as its GC
@@ -201,47 +174,6 @@ static inline bool aer_as_double(AerVal v, double* out) {
     if (aer_type(v) == TYPE_INTEGER) { *out = (double)aer_as_int(v); return true; }
     if (aer_type(v) == TYPE_REAL)    { *out = aer_as_real(v);        return true; }
     return false;
-}
-
-/* The seam between AER's internal AerVal and the public boxed Value struct used by AerNativeFn's
-   signature (README's Embedding section); used by aer_host.c's aer_host_call and by aer_io.c,
-   which builds Value results from AerVal-returning helpers like aer_make_string. Value was
-   already a plain tagged struct (never NaN-boxed), so this seam needed no changes when AerVal's
-   own representation changed underneath it. */
-static inline Value aer_val_to_public(AerVal v) {
-    Value out = {0};
-    out.type = aer_type(v);
-    switch (out.type) {
-        case TYPE_NULL:     break;
-        case TYPE_BOOLEAN:  out.data.boolean  = aer_as_bool(v);     break;
-        case TYPE_INTEGER:  out.data.integer  = aer_as_int(v);      break;
-        case TYPE_REAL:     out.data.real     = aer_as_real(v);     break;
-        case TYPE_STRING:   out.data.string   = aer_as_string(v);   break;
-        case TYPE_FUNCTION: out.data.function = aer_as_function(v); break;
-        case TYPE_ARRAY:    out.data.array    = aer_as_array(v);    break;
-        case TYPE_DICT:     out.data.dict     = aer_as_dict(v);     break;
-        case TYPE_PACKED_ARRAY: break;   /* not part of the public embedding surface yet */
-        case TYPE_ANY:      break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
-    }
-    return out;
-}
-
-/* The inverse. TYPE_REAL goes through aer_real() so a host constructing a value directly still
-   goes through the same factory as everything else. */
-static inline AerVal aer_val_from_public(Value v) {
-    switch (v.type) {
-        case TYPE_NULL:     return aer_null();
-        case TYPE_BOOLEAN:  return aer_bool(v.data.boolean);
-        case TYPE_INTEGER:  return aer_int(v.data.integer);
-        case TYPE_REAL:     return aer_real(v.data.real);
-        case TYPE_STRING:   return aer_string_val(v.data.string);
-        case TYPE_FUNCTION: return aer_function_val(v.data.function);
-        case TYPE_ARRAY:    return aer_array_val(v.data.array);
-        case TYPE_DICT:     return aer_dict_val(v.data.dict);
-        case TYPE_PACKED_ARRAY: break;   /* not part of the public embedding surface yet */
-        case TYPE_ANY:      break;   /* never a real Value's type — only Shape.field_types[] uses it */
-    }
-    return aer_null();
 }
 
 #endif
