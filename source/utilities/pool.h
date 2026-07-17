@@ -10,25 +10,14 @@
    struct — AerString/AerArray/AerDict/AerFunction — declares `unsigned char gc_state;` first, and
    each has a _Static_assert pinning it to offset 0): bit 0 is the mark bit (this collection cycle
    only); bit 1 is the generation bit (0 = young, 1 = old, set once a cell survives a collection);
-   bit 2 marks a cell on the free-list — this is what stops pool_sweep from re-discovering an
-   already-free cell (nothing marks it) and re-pushing it, corrupting the list; bit 3 marks a cell
-   already in the GC's remembered set (gc_remember, vm.c), checked before scanning the remembered
-   set so re-remembering costs one lookup instead of a full scan, and is never cleared once set
-   (matches the remembered set's own add-only design — see vm.c). Byte-per-cell, not bit-packed,
+   bit 2 marks a cell on the free-list, so pool_sweep never re-discovers and re-pushes an
+   already-free cell; bit 3 marks a cell already in the GC's remembered set (gc_remember, vm.c),
+   never cleared once set (the remembered set itself is add-only). Byte-per-cell, not bit-packed,
    per this project's readability-over-micro-opt precedent.
 
-   State lives IN the object, not in a side array, specifically to avoid a reverse lookup (pointer
-   -> which slab -> which index) on every single check — that used to be a real cost (~12.6% of
-   total instructions on a real benchmark, see project memory) since it ran on every array/dict
-   write via the GC write barrier. The trade-off: every pool-managed struct pays some alignment
-   padding for the leading byte (see each struct's own comment, value.h/vm.h) — a real, measured
-   memory-for-speed trade, not a free win.
-
-   Offset is a universal compile-time constant (0), not a per-pool stored value — a variant with
-   gc_state placed last (a per-type, per-pool offset, saving real padding on AerFunction/AerString)
-   was tried and measured a real ~7% slower wall-clock on sieve.aer: every pool_is_young/pool_mark/
-   etc. call had to load the offset out of Pool and add it, instead of touching the cell directly.
-   That cost more than the memory it saved, so it was reverted — see project memory.
+   State lives IN the object, not a side array keyed by pointer, to avoid a pointer -> slab ->
+   index reverse lookup on every write-barrier check. Offset 0 is a compile-time constant, never a
+   per-pool stored value, so pool_is_young/pool_mark/etc. touch the cell directly with no extra load.
 
    pool_free's free-list "next" pointer is written starting at cell offset sizeof(void*), NOT
    offset 0 — writing at offset 0 would clobber the leading gc_state byte the instant a cell is
@@ -36,11 +25,9 @@
    stale pointer to an already-freed cell and must be able to detect that). Every pool-managed
    struct is comfortably larger than 2*sizeof(void*) once padded, so this is always safe space.
 
-   Aging is per-cell, not slab-position-based: a slab-boundary scheme breaks
-   the moment a freed OLD cell is reused for a young allocation, silently
-   inheriting the wrong generation. Per-cell tagging is correct regardless of
-   which physical cell is reused — pool_alloc always clears the generation
-   bit on every allocation. */
+   Aging is per-cell, not slab-position-based: a slab-boundary scheme breaks the moment a freed OLD
+   cell is reused for a young allocation, silently inheriting the wrong generation. pool_alloc
+   always clears the generation bit on every allocation. */
 #define POOL_MARKED     0x1
 #define POOL_OLD        0x2
 #define POOL_FREE       0x4

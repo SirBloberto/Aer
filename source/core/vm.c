@@ -56,14 +56,12 @@ static inline AerVal* vm_rk_ptr20(VM* vm, AerVal* const_pool, uint64_t rk) {
    arithmetic/comparison/bitwise/OP_IN family's own narrower RK scheme, sized so the whole packed
    word fits in the low 32 bits (see PACK_BINARY's own comment in vm.h for why that matters on this
    32-bit ARM target). Same pointer-return shape as vm_rk_ptr20 above, same reasoning.
-     A branch-free variant of this (flag_bit = rk>>8; idx = rk-(flag_bit<<7), reading a per-frame
-   copy of the constant pool instead of const_pool directly) was built, measured, and reverted —
-   real ~18%-of-instructions win on nbody.aer, but it required giving every call frame its own
-   pool-allocated window, which reintroduced real per-call allocation cost that regressed
-   call-heavy code substantially (~54% more cycles on a non-tail-recursive fib(30) benchmark). Lua/
-   V8 don't try to eliminate this branch either — they accept it and instead make calls themselves
-   free (a bump-pointer register stack, see VM.register_stack), which is the direction this
-   codebase went instead. See project memory for the full measurement writeup. */
+     A branch-free variant of this (reading a per-frame copy of the constant pool instead of
+   const_pool directly, so the flag bit could fold into arithmetic) was tried and reverted: it
+   required giving every call frame its own pool-allocated window, which made calls themselves
+   slower. Lua/V8 don't try to eliminate this branch either — they accept it and instead make calls
+   themselves free (a bump-pointer register stack, see VM.register_stack), which is the direction
+   this codebase went instead. */
 static inline AerVal* vm_rk_ptr9(VM* vm, AerVal* const_pool, uint32_t rk) {
     if (rk & RK9_CONST_FLAG) return &const_pool[rk & RK9_INDEX_MASK];
     return &vm->registers[rk & RK9_INDEX_MASK];
@@ -764,12 +762,11 @@ void vm_init(VM* vm, Chunk* chunk) {
     aer_stdlib_init();
     vm_pools_init_once();
     runtime_line_lookup = lookup_runtime_line;
-    /* Resets this VM's own v3 call stack for a fresh run — a chunk that ended mid-call (a bug, or
+    /* Resets this VM's own call stack for a fresh run — a chunk that ended mid-call (a bug, or
        a deliberately unbalanced test) must not leak into this VM's next run. Frame 0's registers
        base never moves again after this — the top level's own usage is open-ended (globals persist
        and can grow across REPL statements), so unlike a real function call it always gets a flat
-       FRAME_REGISTERS reservation, exactly as every frame used to get before this session's
-       bump-pointer work. */
+       FRAME_REGISTERS reservation. */
     vm->call_depth = 0;
     vm->call_stack[0].registers  = &vm->register_stack[0];
     vm->call_stack[0].frame_size = FRAME_REGISTERS;
@@ -957,9 +954,8 @@ static bool values_equal(AerVal a, AerVal b) {
 /* Int/int and real/real only — the two type-pairs common enough in arithmetic-heavy code to be
    worth an inlined fast path at a call site, and small enough (no string/array/dict/bool/null/
    AND-OR-IN handling) that always_inline-ing this at its two call sites (the OP_BINARY_FIELD/
-   OP_FIELD_BINARY field-fusion opcodes below) doesn't reproduce the icache-bloat regression this
-   codebase already measured once from inlining the old, much bigger vm_binary() at every call site
-   (see vm_binary_icache_split notes). Everything else falls through to vm_binary_cold() (a real,
+   OP_FIELD_BINARY field-fusion opcodes below) doesn't bloat the icache the way inlining a full
+   binary-op dispatch would. Everything else falls through to vm_binary_cold() (a real,
    non-inlined function, just below) — *handled is set false and the caller must call that instead.
    ta/tb are passed in rather than recomputed since every caller already computed them for its own
    dispatch. */
@@ -1027,9 +1023,9 @@ static inline __attribute__((always_inline)) AerVal vm_binary_fast(AerVal a, Aer
    everything vm_binary_fast() (just above) doesn't handle: IN, null, promoted-real, boolean,
    string, array, dict, and the final type-mismatch error. Deliberately a real, non-inlined
    function rather than always_inline like vm_binary_fast(): this path only runs for the rare
-   case, and NOT inlining it avoids duplicating this whole body across every call site (a
-   measured icache-bloat regression once before). ta/tb are passed in rather than recomputed
-   since every caller already computed them for its own fast-path check. */
+   case, and NOT inlining it avoids duplicating this whole body across every call site. ta/tb are
+   passed in rather than recomputed since every caller already computed them for its own
+   fast-path check. */
 static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
     /* Checked before null-handling below so `null in arr` isn't intercepted by the "null op anything-else errors" rule, which is about direct comparison, not container search. */
     if (op == OP_IN) {
@@ -1349,9 +1345,9 @@ static inline __attribute__((always_inline)) bool vm_resolve_field(VM* vm, Chunk
      No switch on ftype: AerVal.as is exactly 8 bytes, and for TYPE_INTEGER/TYPE_REAL the packed
    slot's raw bytes already ARE that union's bit pattern. TYPE_BOOLEAN's slot holds an 8-byte 0/1
    (see vm_packed_slot_write) whose low byte is a little-endian machine's first byte — the same
-   byte .as.b reads — so one branchless memcpy is correct for all three eligible field types.
-   Measured real cost on the Pi (ARMv7, weaker branch prediction than x86): removing this
-   3-way switch fixed a regression where packed arrays were slower than plain struct arrays. */
+   byte .as.b reads — so one branchless memcpy is correct for all three eligible field types. A
+   3-way switch here regresses packed arrays slower than plain struct arrays on ARM (weaker branch
+   prediction than x86) — keep this branchless. */
 static inline AerVal vm_packed_slot_read(unsigned char* slot, ValueType ftype) {
     AerVal v;
     v.tag = ftype;
@@ -1726,7 +1722,6 @@ bool vm_run(VM* vm) {
 #define READ()     (c->code[ip++])
 #define PUSH(v)    do { if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return false; } vm->stack[vm->stack_top++] = (v); } while(0)
 #define POP()      (vm->stack_top > 0 ? vm->stack[--vm->stack_top] : (error("Stack underflow"), aer_null()))
-/* active_vm_for_errors = vm is just a pointer store; the line-lookup binary search only runs inside error() when a fault fires, not per-opcode as an earlier version did. */
 #ifdef AER_DEBUG_TOOLS
 /* gc_maybe_collect() is no longer called from here — see each allocating label's own call,
    placed by hand right after its result is stored into a VM-visible root (a register, or for
@@ -1742,7 +1737,7 @@ bool vm_run(VM* vm) {
    this macro after the GC-check relocation (see gc_maybe_collect's own comment, DISPATCH()'s
    longtime neighbor) — this closes the other half of the gap explained to the user against Lua's
    longjmp-based error propagation. */
-#define DISPATCH() do { active_vm_for_errors = vm; unsigned int op_ip = ip; op_word = READ(); vm->ip = ip; cur_op = (Opcode)(op_word & 0x7F); c->debug_hits[op_ip]++; goto *dt[cur_op]; } while(0)
+#define DISPATCH() do { unsigned int op_ip = ip; op_word = READ(); vm->ip = ip; cur_op = (Opcode)(op_word & 0x7F); c->debug_hits[op_ip]++; goto *dt[cur_op]; } while(0)
 #else
 /* Masked to 7 bits (0x7F), not 8 — 62 Opcode values fit with 66 to spare (room for future opcodes,
    e.g. concurrency primitives, without a second redesign). Every existing packed format (PACK3,
@@ -1750,7 +1745,7 @@ bool vm_run(VM* vm) {
    them; narrowing the mask changes nothing for those. It exists so newly designed compact formats
    (PACK_BINARY, see vm.h) can start their own next field at bit 7 instead of being forced to
    reserve all of bit 7 for no reason. */
-#define DISPATCH() do { active_vm_for_errors = vm; op_word = READ(); vm->ip = ip; cur_op = (Opcode)(op_word & 0x7F); goto *dt[cur_op]; } while(0)
+#define DISPATCH() do { op_word = READ(); vm->ip = ip; cur_op = (Opcode)(op_word & 0x7F); goto *dt[cur_op]; } while(0)
 #endif
 
     static const void* const dt[] = {

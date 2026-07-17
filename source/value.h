@@ -44,14 +44,9 @@ typedef enum ValueType {
 } ValueType;
 
 /* AerVal: the internal runtime value, as an explicit tagged union — every VM stack slot, scope
-   variable, array element, dict entry, and struct field is one of these, not a Value. Replaced a
-   NaN-boxed 8-byte encoding (a genuine double unless it matched a reserved bit pattern, which was
-   then reinterpreted as a 3-bit tag + packed payload) after measuring, via direct machine-code
-   disassembly against Lua's equivalent value representation, that NaN-boxing's decode cost
-   (masking and shifting a word to test and extract that tag on every single touch) was the
-   dominant remaining cost gap in the whole interpreter — a plain tag field is one aligned load,
-   no decode at all. See the accessor functions further down this file.
-     The tag MUST default to TYPE_NULL (0) on zero-init — mark_vm_roots (vm.c) scans every
+   variable, array element, dict entry, and struct field is one of these, not a Value. See the
+   accessor functions further down this file.
+   The tag MUST default to TYPE_NULL (0) on zero-init — mark_vm_roots (vm.c) scans every
    register unconditionally, relying on a never-yet-written register decoding as a harmless leaf
    value. TYPE_NULL is declared first in ValueType above specifically so this holds automatically
    for any zero-initialized AerVal, the same invariant this file already documents for the public
@@ -88,12 +83,7 @@ struct Value {
 
 /* Defined after AerVal so items[] can use the complete internal value type.
    gc_state must be first — pool.c treats every pool-managed struct's leading byte as its GC
-   state, generically, without knowing the rest of the layout (see pool.h). Costs real alignment
-   padding (items needs pointer alignment) in exchange for pool.c never needing to load a per-pool
-   offset before touching it — a variable-offset version was tried and measured a real ~7% slower
-   wall-clock on sieve.aer (the added `Pool*` load + add on every write-barrier check outweighed
-   the memory saved), so it was reverted in favor of this simpler, faster, universal-offset-0
-   design — see pool.h's file comment and project memory for the measured trade-off. */
+   state, generically, without knowing the rest of the layout (see pool.h). */
 struct AerArray {
     unsigned char gc_state;
     AerVal*      items;
@@ -180,10 +170,7 @@ static inline AerVal aer_real(double d) {
     AerVal v; v.tag = TYPE_REAL; v.as.d = d; return v;
 }
 
-/* No boxed-integer path exists under this representation — a plain `int64_t` fits the value
-   union at any magnitude, no heap fallback needed (the old NaN-boxed encoding could only fit an
-   inline 47-bit integer and needed a heap-boxed `long_pool` cell for the rare overflow case;
-   that whole mechanism — long_pool, aer_int_boxed, aer_int_is_boxed/aer_int_box_ptr — is gone). */
+/* A plain `int64_t` fits the value union at any magnitude — no heap-boxed overflow path needed. */
 static inline AerVal aer_int(int64_t n) {
     AerVal v; v.tag = TYPE_INTEGER; v.as.i = n; return v;
 }
@@ -240,9 +227,7 @@ static inline Value aer_val_to_public(AerVal v) {
 }
 
 /* The inverse. TYPE_REAL goes through aer_real() so a host constructing a value directly still
-   goes through the same factory as everything else (no canonicalization needed anymore — that
-   was purely a NaN-boxing concern, since a genuine NaN could collide with the boxed-tag bit
-   pattern; an explicit tag field has no such collision to guard against). */
+   goes through the same factory as everything else. */
 static inline AerVal aer_val_from_public(Value v) {
     switch (v.type) {
         case TYPE_NULL:     return aer_null();
