@@ -261,7 +261,6 @@ static bool lex_keyword(unsigned int length) {
         { "continue", sizeof("continue") - 1, TOKEN_CONTINUE },
         { "null",     sizeof("null")     - 1, TOKEN_NULL     },
         { "import",   sizeof("import")   - 1, TOKEN_IMPORT   },
-        { "defer",    sizeof("defer")    - 1, TOKEN_DEFER    },
     };
     static const int keyword_count = sizeof(keywords) / sizeof(*keywords);
 

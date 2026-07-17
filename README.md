@@ -187,7 +187,6 @@ in the language is reserved:
 | `break` / `continue` | loop control |
 | `null` | the absence-of-a-value literal |
 | `import` | bring a native or file-based module into scope |
-| `defer` | schedule a call to run when the current function returns |
 | `true` / `false` | boolean literals |
 
 **Everything else is an ordinary identifier**, including `print`, `length`, `append`, `delete`,
@@ -282,7 +281,7 @@ x = 5  # inline comment
 ```
 
 A statement is one of: an assignment, a bare function/pipe call (result discarded), or one of the
-keyword-led forms (`if`, `for`, `return`, `break`, `continue`, `import`, `defer`, `struct`,
+keyword-led forms (`if`, `for`, `return`, `break`, `continue`, `import`, `struct`,
 `function`). There is no statement terminator — a newline ends a statement.
 
 ## Values
@@ -590,10 +589,7 @@ function count_down(n, acc):
 print(count_down(100000, 0))    # 5000050000, no "Call stack overflow"
 ```
 
-Mutual recursion between two functions gets the same treatment. The one thing that disables it: if
-the function has a `defer` call still pending, the frame can't be discarded yet — that specific call
-falls back to a normal, stack-growing call instead, so `defer` still always fires correctly, just
-without the stack-depth benefit for that call.
+Mutual recursion between two functions gets the same treatment.
 
 ### Scope inside a function
 
@@ -919,42 +915,6 @@ Running a file with one or more failed assertions still exits the process with a
 checked independently of runtime errors. An embedding host reads the count via
 `aer_assert_failure_count()` (see [Embedding](#embedding)).
 
-### Defer
-
-`defer name(args)` schedules a call to run when the *current function* returns — LIFO, so the
-last `defer` registered is the first one to actually run:
-
-```
-function process():
-    defer print("third")
-    defer print("second")
-    defer print("first")
-    print("processing")
-# prints: processing / first / second / third
-```
-
-Arguments are evaluated **at the `defer` statement itself**, not when the deferred call actually
-runs — the same rule Go's `defer` uses:
-
-```
-x = 1
-defer print(x)   # captures 1 right now
-x = 2
-# whatever runs later still prints 1, not 2
-```
-
-Only a bare `name(args)` call is a valid `defer` target — not a module call (`math.sqrt(...)`),
-not an arbitrary expression. `defer` outside a function body is a parse-time error, the same
-treatment `return` already gets.
-
-**Two disclosed limitations:**
-
-- **Defer does not run during a runtime error or `panic()`** — those still abort immediately with
-  zero cleanup.
-- **The deferred function is resolved by name when it actually runs, not snapshotted when `defer`
-  executes** — if the variable holding it is reassigned before the function returns, the deferred
-  call uses the latest value.
-
 ## Modularity
 
 AER draws a hard line between **core builtins** ([Built-in Functions](#built-in-functions) —
@@ -1139,15 +1099,15 @@ f, err = io.open("log.txt", "a")   # mode is "r", "w", or "a"
 if err != null:
     print("could not open: " + err)
 else:
-    defer io.close(f)
     write_err, err2 = io.write(f, "a line\n")
+    io.close(f)
 ```
 
 ```
 io.open(path, mode)   # returns (handle, err) — handle is a plain integer, opaque outside io.*
 io.read(handle)       # reads all remaining data as a string, returns (contents, err)
 io.write(handle, s)   # returns (null, err) — only err is ever meaningful
-io.close(handle)      # returns (null, err) — pairs naturally with `defer`
+io.close(handle)      # returns (null, err)
 io.stdin()            # returns the stdin handle (always succeeds) — usable with io.read() like any other handle
 ```
 
@@ -1465,9 +1425,8 @@ through that site, not just the first one before the cache populated.
 `OP_TAIL_CALL` — emitted by `parse_return` instead of `OP_CALL` only when a `return name(args)`
 statement compiles to nothing but that one call (see [Functions](#functions)) — shares `OP_CALL`'s
 entire dispatch-table target and handler; the two diverge only once a callee is confirmed valid, at
-the point a frame would normally be pushed. With no pending `defer` calls on the current frame, it
-unwinds that frame's own scopes and jumps straight into the callee, reusing the frame in place
-instead of growing the call stack.
+the point a frame would normally be pushed. It reuses the current frame's registers in place and
+jumps straight into the callee, instead of growing the call stack.
 
 **Collections:** `AerArray` and `AerDict` are heap-allocated structs held by pointer inside a
 `Value`. Assignment copies the pointer — all aliases share the same data. Arrays grow with
@@ -1665,7 +1624,7 @@ unchanged from the pooled/slab design (a free-list pop, or a bump into the curre
 collection is what's new.
 
 **Two collection modes, one shared heap.** A *minor* collection traces the normal roots (the VM
-stack, every scope, every call frame's function and pending defers) plus a *remembered set* — old
+stack and every live call frame's registers) plus a *remembered set* — old
 objects a write barrier caught being mutated to hold a young reference — and only sweeps young
 cells; old cells are presumed live and left untouched, which is what keeps minor collections cheap.
 A *major* collection (run periodically, after a fixed number of minor ones) traces the same roots

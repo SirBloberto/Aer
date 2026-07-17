@@ -24,7 +24,7 @@ static bool pools_initialized = false;
 /* Test-only accessor (tests/smoke_test.c is the only intended caller) — reads back a register's
    final value after a chunk has run to OP_HALT. Reads whichever frame is currently active, which
    is frame 0 (the top level) once a chunk has run to completion with every call balanced by a
-   return. See CallFrame/DeferredCall's own comments in vm.h for the call_stack/registers/
+   return. See CallFrame's own comment in vm.h for the call_stack/registers/
    call_depth fields this reads — per-VM-instance so a nested file-module VM (aer_module.c) gets
    its own isolated call chain instead of sharing/corrupting the calling VM's in-progress one. */
 AerVal register_get(VM* vm, int slot) {
@@ -237,28 +237,17 @@ static void mark_vm_roots(VM* vm) {
     /* Registers can hold heap references (arrays/dicts/strings/functions). Scanned
        unconditionally, not tracked for liveness: an idle register is zero-init, which decodes as
        TYPE_NULL (value.h — the tag field defaults to 0 on zero-init) and is a harmless no-op leaf
-       in mark_value's default case. Scanned per-frame, bounded to the live call chain (0..call_depth) rather than
-       all VM_CALL_MAX frames regardless of depth — a blanket scan over every frame was a real,
-       measured cache-miss hotspot, since even shallow recursion was walking every frame's worth of
-       cold, mostly-zeroed memory on every GC pass. Frames beyond call_depth are dead (already
-       returned, defers already drained by lbl_return before unwind), so bounding the scan to the
-       live call chain can't under-collect. */
-    /* frame_size, not FRAME_REGISTERS — frames pack contiguously in vm->register_stack, so
-       scanning a flat 128 per frame would re-visit deeper frames' overlapping windows and mark
-       stale values left by already-returned calls. */
+       in mark_value's default case. Scanned per-frame, bounded to the live call chain
+       (0..call_depth) rather than all VM_CALL_MAX frames regardless of depth — a blanket scan
+       over every frame was a real, measured cache-miss hotspot, since even shallow recursion was
+       walking every frame's worth of cold, mostly-zeroed memory on every GC pass. Frames beyond
+       call_depth are dead (already returned), so bounding the scan to the live call chain can't
+       under-collect. frame_size, not FRAME_REGISTERS — frames pack contiguously in
+       vm->register_stack, so scanning a flat 128 per frame would re-visit deeper frames'
+       overlapping windows and mark stale values left by already-returned calls. */
     for (int f = 0; f <= vm->call_depth; f++)
         for (unsigned int i = 0; i < vm->call_stack[f].frame_size; i++)
             worklist_push(vm->call_stack[f].registers[i]);
-
-    /* A deferred call's snapshotted args live outside registers[], in each frame's own
-       defers[] side array, so they need their own scan; bounded to the live call chain for the
-       same reason as the registers loop just above. */
-    for (int f = 0; f <= vm->call_depth; f++) {
-        CallFrame* frame = &vm->call_stack[f];
-        for (int d = 0; d < frame->defer_count; d++)
-            for (int a = 0; a < frame->defers[d].arg_count; a++)
-                worklist_push(frame->defers[d].args[a]);
-    }
 }
 
 /* Chunk.pool and every Shape's field_defaults are permanent roots, walked fresh every cycle since mark bits are cleared each sweep. */
@@ -791,14 +780,10 @@ void vm_init(VM* vm, Chunk* chunk) {
     vm->registers  = vm->call_stack[0].registers;
     vm->raw_ints   = vm->call_stack[0].raw_ints;
     vm->raw_reals  = vm->call_stack[0].raw_reals;
-    vm->call_stack[0].defer_count = 0;
 }
 
 void vm_free(VM* vm) {
-    /* Every call_stack slot, not just up to call_depth — a slot's lazily allocated defers array
-       persists across reuse, so any slot ever used may still hold one. */
-    for (int i = 0; i < VM_CALL_MAX; i++)
-        free(vm->call_stack[i].defers);
+    (void)vm;   /* nothing to free — every allocation a VM makes lives in the shared pools */
 }
 
 /* ------------------------------------------------------------------ */
@@ -1264,7 +1249,6 @@ bool setup_call(VM* target, Chunk* fn_chunk, ChunkFunction* fn, int arg_count,
         callee->registers[i] = vm_default_value(fn->defaults[i - fn->min_arity]);
     callee->return_ip   = return_ip;
     callee->dest_reg    = 0;
-    callee->defer_count = 0;
     target->call_depth++;   /* same rooting rule as vm_call_value's non-tail branch (above) — the defaults loop wrote into callee->registers[] before this point */
     gc_maybe_collect(target);
     target->registers = target->call_stack[target->call_depth].registers;
@@ -1311,7 +1295,7 @@ static void vm_call_value(VM* vm, Chunk* c, AerVal fv, int dest_reg, int arg_reg
        loops below are the same always-safe-forward-shift copy lbl_call's own comment explains,
        done in this order (args, then defaults) specifically so every SOURCE register the arg-copy
        loop reads is read before the defaults-fill loop can possibly overwrite it. */
-    if (is_tail_call && vm->call_stack[vm->call_depth].defer_count == 0) {
+    if (is_tail_call) {
         for (int i = 0; i < arg_count; i++)
             vm->registers[i] = vm->registers[arg_reg_base + i];
         for (int i = arg_count; i < (int)f->arity; i++)
@@ -1331,7 +1315,6 @@ static void vm_call_value(VM* vm, Chunk* c, AerVal fv, int dest_reg, int arg_reg
         callee->registers[i] = vm_default_value(f->defaults[i - f->min_arity]);
     callee->return_ip   = vm->ip;
     callee->dest_reg    = dest_reg;
-    callee->defer_count = 0;
     vm->call_depth++;   /* the defaults loop above wrote into callee->registers[] BEFORE this point, when mark_vm_roots's 0..call_depth scan didn't yet cover that frame — gc_maybe_collect() must run AFTER this increment, not before, or a collection could reclaim a fresh default array/dict as unreachable */
     gc_maybe_collect(vm);
     vm->registers = vm->call_stack[vm->call_depth].registers;
@@ -1827,7 +1810,6 @@ bool vm_run(VM* vm) {
         [OP_CALL_BUILTIN]      = &&lbl_call_builtin,
         [OP_LOAD_GLOBAL]       = &&lbl_load_global,
         [OP_STORE_GLOBAL]      = &&lbl_store_global,
-        [OP_DEFER_PUSH]        = &&lbl_defer_push,
         [OP_RETURN]            = &&lbl_return,
         [OP_ARRAY_NEW]         = &&lbl_array_new,
         [OP_INDEX_GET]         = &&lbl_index_get,
@@ -2103,7 +2085,7 @@ lbl_call: {
        destination). So this needs no special-casing for overlap, whether or not it aliases the
        CALLEE's own parameter registers (which may have nothing to do with the CALLER's own
        reserved_floor — a genuinely different function's arity). */
-    if (cur_op == OP_TAIL_CALL && vm->call_stack[vm->call_depth].defer_count == 0) {
+    if (cur_op == OP_TAIL_CALL) {
         for (int i = 0; i < arg_count; i++)
             vm->registers[i] = vm->registers[arg_reg_base + i];
         ip = (unsigned int)callee_offset;
@@ -2127,7 +2109,6 @@ lbl_call: {
         callee->registers[i] = caller->registers[arg_reg_base + i];
     callee->return_ip   = ip;   /* already past this instruction's operands — the correct resume point */
     callee->dest_reg    = dest_reg;
-    callee->defer_count = 0;   /* reused call_stack slots must never inherit a previous occupant's pending defers */
     vm->call_depth++;
     vm->registers = vm->call_stack[vm->call_depth].registers;
     vm->raw_ints  = vm->call_stack[vm->call_depth].raw_ints;
@@ -2170,39 +2151,10 @@ lbl_call_global_value: {
 
 /* src_reg is a plain 0-based index into the CALLEE's own frame. return_ip/dest_reg live in the
    callee's own frame (not a single shared global), which is exactly what makes nested/recursive
-   calls safe: an outer call's return info can't be clobbered by an inner one.
-     Before actually returning, drains this frame's pending defers LIFO, one per visit: each is
-   set up as an inline call into a fresh, deeper vm->call_stack slot whose return_ip points back at
-   THIS SAME OP_RETURN instruction (reenter_addr), so the deferred call's own eventual OP_RETURN
-   re-dispatches here and rechecks defer_count. Since every call already owns an isolated register
-   bank, this frame's `result` (once finally read, after defer_count reaches 0) can't be clobbered
-   by a deferred call's own return value — no separate pending-return-value tracking needed. */
+   calls safe: an outer call's return info can't be clobbered by an inner one. */
 lbl_return: {
     int src_reg = (int)UNPACK_A(op_word);
-    unsigned int reenter_addr = ip - 1;   /* this OP_RETURN's own address: now one packed word (opcode + src_reg together) instead of two */
     CallFrame* callee = &vm->call_stack[vm->call_depth];
-
-    if (callee->defer_count > 0) {
-        if (vm->call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); DISPATCH(); }
-        DeferredCall dc = callee->defers[--callee->defer_count];
-        CallFrame* next = &vm->call_stack[vm->call_depth + 1];
-        /* FRAME_REGISTERS — same deliberate simplification as lbl_call's own comment: a deferred
-           call's callee_offset is a raw code offset too (DeferredCall, vm.h), not a stable
-           function reference, so the real per-function max_registers isn't available here without
-           the same bytecode-encoding work that's out of scope for this pass. */
-        next->registers  = callee->registers + callee->frame_size;
-        next->frame_size  = FRAME_REGISTERS;
-        for (int i = 0; i < dc.arg_count; i++) next->registers[i] = dc.args[i];
-        next->return_ip   = reenter_addr;
-        next->dest_reg    = -1;   /* sentinel: a deferred call's own return value is always discarded, never written anywhere (register 0 may be a live variable in the frame it would otherwise land in) */
-        next->defer_count = 0;
-        vm->call_depth++;
-        vm->registers = vm->call_stack[vm->call_depth].registers;
-        vm->raw_ints  = vm->call_stack[vm->call_depth].raw_ints;
-        vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
-        ip = dc.callee_offset;
-        DISPATCH();
-    }
 
     AerVal result = callee->registers[src_reg];
     unsigned int return_ip = callee->return_ip;
@@ -2211,7 +2163,7 @@ lbl_return: {
     vm->registers = vm->call_stack[vm->call_depth].registers;
     vm->raw_ints  = vm->call_stack[vm->call_depth].raw_ints;
     vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
-    if (dest_reg >= 0) vm->registers[dest_reg] = result;   /* dest_reg == -1: a deferred call's discarded result */
+    vm->registers[dest_reg] = result;
     ip = return_ip;
     DISPATCH();
 }
@@ -2293,32 +2245,6 @@ lbl_load_global: {
 lbl_store_global: {
     int global_reg = (int)UNPACK_STORE_GLOBAL_REG(op_word);
     vm->call_stack[0].registers[global_reg] = *vm_rk_ptr9(vm, const_pool, UNPACK_STORE_GLOBAL_RK(op_word));
-    DISPATCH();
-}
-
-/* See DeferredCall's comment (above) and OP_DEFER_PUSH's (vm.h) — snapshots arg_count
-   register values into the CURRENT frame's own deferred-call list now; lbl_return drains this
-   list LIFO before the frame actually returns. Overflow checks mirror the stack VM's
-   lbl_defer_push exactly (arg_count is already rejected at parse time by parse_defer, this is
-   just a defensive backstop). */
-lbl_defer_push: {
-    int arg_reg_base  = (int)UNPACK_A(op_word);
-    int arg_count     = (int)UNPACK_B(op_word);
-    int callee_offset = READ();
-    CallFrame* frame = &vm->call_stack[vm->call_depth];
-    if (arg_count > MAX_DEFER_ARGS) {
-        error("Too many arguments to a deferred call (max %d)", MAX_DEFER_ARGS);
-        DISPATCH();
-    }
-    if (frame->defer_count >= MAX_DEFERS_PER_CALL) {
-        error("Too many deferred calls in one function (max %d)", MAX_DEFERS_PER_CALL);
-        DISPATCH();
-    }
-    if (!frame->defers) frame->defers = xmalloc(sizeof(DeferredCall) * MAX_DEFERS_PER_CALL);
-    DeferredCall* dc = &frame->defers[frame->defer_count++];
-    dc->callee_offset = (unsigned int)callee_offset;
-    dc->arg_count      = arg_count;
-    for (int i = 0; i < arg_count; i++) dc->args[i] = vm->registers[arg_reg_base + i];
     DISPATCH();
 }
 

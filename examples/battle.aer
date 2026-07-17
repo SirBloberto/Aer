@@ -1,8 +1,6 @@
 # battle.aer — a small turn-based combat simulator, written to exercise a
 # broad slice of AER in one program: structs, closures, the pipe operator,
-# defer (with the "arguments evaluated early, but references still see
-# later mutations" nuance demonstrated deliberately), and the standard
-# library (random, string).
+# and the standard library (random, string).
 #
 # Run it with:
 #   ./binary/aer examples/battle.aer
@@ -52,13 +50,7 @@ function print_summary(result):
     print("--- battle over after {r} rounds — {w} wins ---")
 
 function run_battle(hero, villain):
-    # A dict, not two plain variables — defer evaluates its arguments
-    # immediately, so a plain integer/string captured here would freeze at
-    # its value right now. A dict is a reference: defer captures the
-    # reference immediately, but print_summary still sees every mutation
-    # made to it right up until the moment this function actually returns.
     result = {"rounds": 0, "winner": "nobody"}
-    defer print_summary(result)
 
     for round_num in 1..30:
         villain = battle_round(hero, villain, round_num)
@@ -73,6 +65,7 @@ function run_battle(hero, villain):
             result["winner"] = villain.name
             break
 
+    print_summary(result)
     return result["winner"]
 
 random.seed(42)   # drop this line for a different battle every run

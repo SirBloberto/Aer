@@ -1,6 +1,6 @@
 #!/usr/bin/env aer
 # AER test suite — errors-as-values vs. runtime errors, scope semantics,
-# and defer/panic.
+# and panic().
 # Machine-checked via assert(): a clean run exits 0; any failure prints
 # "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
 
@@ -75,63 +75,8 @@ for i in 0..3:
 #     return helper()
 
 # ------------------------------------------------------------------ #
-# 27. defer and panic()                                               #
+# 27. panic()                                                          #
 # ------------------------------------------------------------------ #
-
-defer_log = []
-function record(tag):
-    append(defer_log, tag)
-
-function lifo_test():
-    defer record("first")
-    defer record("second")
-    defer record("third")
-
-lifo_test()
-assert(length(defer_log) == 3 && defer_log[0] == "third" && defer_log[1] == "second" && defer_log[2] == "first",
-       "defer runs LIFO — last deferred, first executed")
-
-capture_log = []
-function record_value(v):
-    append(capture_log, v)
-
-function arg_capture_test():
-    x = 1
-    defer record_value(x)
-    x = 2
-
-arg_capture_test()
-assert(length(capture_log) == 1 && capture_log[0] == 1,
-       "defer evaluates its arguments immediately, at the defer statement — not when the call actually runs")
-
-explicit_log = []
-function explicit_return_test():
-    defer append(explicit_log, "ran")
-    return 42
-
-explicit_result = explicit_return_test()
-assert(explicit_result == 42 && length(explicit_log) == 1 && explicit_log[0] == "ran",
-       "defer runs before an explicit return, and the real return value is preserved")
-
-implicit_log = []
-function implicit_return_test():
-    defer append(implicit_log, "ran")
-
-implicit_return_test()
-assert(length(implicit_log) == 1 && implicit_log[0] == "ran",
-       "defer also runs on an implicit (fall-off-the-end) return")
-
-nested_log = []
-function inner():
-    append(nested_log, "inner")
-
-function outer2():
-    defer inner()
-    defer append(nested_log, "outer-own")
-
-outer2()
-assert(length(nested_log) == 2 && nested_log[0] == "outer-own" && nested_log[1] == "inner",
-       "a deferred call to a real user-defined function runs correctly, LIFO alongside deferred builtins")
 
 # panic()'s abort behavior can't be exercised from inside this file — a
 # runtime error (which panic() triggers, same as any other) aborts the

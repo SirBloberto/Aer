@@ -81,9 +81,9 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* Register-VM opcodes. `packed` narrow fields (register indices, bin_op/unary_op/cast_type
        tags) come from the instruction's own descriptor word — see disassemble_one's own comment;
        everything after them in fields[] is a WIDE word exactly like OP_JUMP/OP_DEFINE_STRUCT/
-       OP_HALT above. FLD_JUMP is reused for callee_offset (OP_CALL/OP_DEFER_PUSH) too — a
-       function entry point is exactly as absolute-code-address-shaped as a jump target for
-       disassembly purposes. */
+       OP_HALT above. FLD_JUMP is reused for callee_offset (OP_CALL) too — a function entry
+       point is exactly as absolute-code-address-shaped as a jump target for disassembly
+       purposes. */
     [OP_LOADK] = { "OP_LOADK", "reg = pool constant", {FLD_REG, FLD_POOL}, false, 1 },
     [OP_MOVE]  = { "OP_MOVE",  "reg = reg", {FLD_REG, FLD_REG}, false, 2 },
     /* OP_BINARY is the sole exception to the "packed fields come from A/B/C, everything else is a
@@ -101,7 +101,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_TAIL_CALL_VALUE] = { "OP_TAIL_CALL_VALUE", "tail call through a register value, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 4 },
     [OP_CALL_GLOBAL_VALUE]      = { "OP_CALL_GLOBAL_VALUE",      "call a runtime function value held in the top-level frame's reg", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
     [OP_TAIL_CALL_GLOBAL_VALUE] = { "OP_TAIL_CALL_GLOBAL_VALUE", "tail call through the top-level frame's reg, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 3 },
-    [OP_RETURN] = { "OP_RETURN", "return reg to caller, drain pending defers first", {FLD_REG}, false, 1 },
+    [OP_RETURN] = { "OP_RETURN", "return reg to caller", {FLD_REG}, false, 1 },
     /* No patchable target at all — module/function/builtin names are always literal identifiers
        resolved at parse time — so everything packs into one word (PACK_CALL_MODULE/
        PACK_CALL_BUILTIN, vm.h). Special-cased in disassemble_one. */
@@ -111,7 +111,6 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_CALL_BUILTIN] = { "OP_CALL_BUILTIN", "global builtin (length/append/etc.) by name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_COUNT}, false, 4 },
     [OP_LOAD_GLOBAL]  = { "OP_LOAD_GLOBAL",  "reg = top-level frame's reg (read-only)", {FLD_REG, FLD_REG}, false, 2 },
     [OP_STORE_GLOBAL] = { "OP_STORE_GLOBAL", "top-level frame's reg = rk", {FLD_REG, FLD_RK}, false, 2 },
-    [OP_DEFER_PUSH]   = { "OP_DEFER_PUSH",   "snapshot args; run at this frame's OP_RETURN", {FLD_REG, FLD_COUNT, FLD_JUMP}, false, 2 },
     [OP_ARRAY_NEW] = { "OP_ARRAY_NEW", "reg = new array from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT}, false, 3 },
     /* OP_INDEX_GET/OP_ITER_NEXT_PAIR/OP_ITER_RANGE_PREP/OP_ITER_RANGE_LOOP/OP_FIELD_GET/
        OP_FIELD_SET are the Slice A

@@ -328,7 +328,6 @@ static bool at_module_name(Chunk* c);
 static int  module_call_id(AerString* name);
 static int  parse_module_call(Chunk* c);
 static void parse_import(Chunk* c);
-static void parse_defer(Chunk* c);
 static bool is_builtin_name(Chunk* c, unsigned int name_idx);
 static int  parse_builtin_call(Chunk* c, unsigned int name_idx);
 static int  parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base);
@@ -816,7 +815,7 @@ static AerVal build_function_value(unsigned int func_offset, unsigned int arity,
     return aer_function_val(fn);
 }
 
-/* forward references / mutual recursion. A call/defer site whose target isn't
+/* forward references / mutual recursion. A call site whose target isn't
    registered YET is optimistically assumed to be a function defined LATER in this same parse()
    call — recorded here (with a placeholder callee_offset already emitted at patch_offset, and the
    call site's own source cursor for a useful error message later) instead of failing immediately.
@@ -861,7 +860,7 @@ static void func_register(Chunk* c, unsigned int name_idx, unsigned int offset, 
                               bool has_receiver, unsigned int receiver_type) {
     chunk_add_function(c, name_idx, offset, arity, min_arity, defaults, has_receiver, receiver_type);
 
-    /* Patch every earlier forward-referencing call/defer to this name now that its real offset is
+    /* Patch every earlier forward-referencing call to this name now that its real offset is
        known — swap-remove each match (order among pending entries never matters) so the list is
        left holding only genuinely still-unresolved entries. */
     for (int i = 0; i < pending_count; ) {
@@ -3170,78 +3169,6 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     return dest;
 }
 
-/* `defer name(args)`. Resolves the target at compile time via func_lookup, consistent with every
-   other call target being resolved at compile time. Only a plain function is a valid target: no
-   module calls and no struct construction ("deferred construction" has no clear meaning) —
-   is_struct_name is deliberately not checked here, so a defer targeting a struct type still
-   ultimately fails, just via the same "never defined anywhere in this call" path a genuine typo
-   would, rather than a dedicated message. Arguments are evaluated now, via the same
-   contiguous-register materialization every other call site uses, then copied out immediately by
-   OP_DEFER_PUSH — snapshotted at the defer statement, not re-evaluated at replay time. */
-static void parse_defer(Chunk* c) {
-    if (function_depth == 0) { error_at("'defer' outside function"); return; }
-    if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a function name after 'defer'"); return; }
-    unsigned int name_idx = chunk_add_pool(c, token.value);
-    lex();
-
-    /* Deferring a builtin (`defer append(log, "ran")`). Checked before the forward-reference
-       assumption below: a builtin is always "already defined", never a forward reference. */
-    bool is_builtin = is_builtin_name(c, name_idx);
-
-    /* Same forward-reference assumption as parse_call: an unresolved name might still be a
-       function defined later in this same parse() call. Cursor captured NOW, before the arg list
-       below consumes past it. */
-    unsigned int func_offset = 0;
-    bool is_forward_ref = false;
-    const char* call_site_cursor = NULL;
-    if (!is_builtin) {
-        is_forward_ref = !func_lookup(c, name_idx, &func_offset);
-        call_site_cursor = is_forward_ref ? current_source_cursor() : NULL;
-    }
-
-    require(TOKEN_OPEN_PARENTHESE, "expected '(' after deferred function name");
-    if (parse_had_error) return;
-
-    int arg_reg_base;
-    int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
-    require(TOKEN_CLOSE_PARENTHESE, "expected ')' after deferred call arguments");
-    if (parse_had_error) return;
-
-    if (arg_count > MAX_DEFER_ARGS) {
-        error_at("Too many arguments to a deferred call (max %d)", MAX_DEFER_ARGS);
-        return;
-    }
-
-    /* Builtins have no bytecode offset of their own (OP_CALL_BUILTIN calls straight into C), so the
-       deferred-call replay mechanism (lbl_return, vm.c — jumps to a stored offset and runs it
-       exactly like an ordinary call re-entry) has nothing to jump TO for one. Fixed with a tiny
-       synthetic trampoline, emitted once right here (jumped over so it never runs inline): call
-       the builtin with whatever args land in registers[0..arg_count), then return —
-       indistinguishable from a real function to the replay mechanism. */
-    unsigned int callee_offset;
-    if (is_builtin) {
-        chunk_emit(c, OP_JUMP);
-        unsigned int patch = c->count;
-        chunk_emit(c, 0);
-        callee_offset = c->count;
-        chunk_emit(c, PACK_CALL_BUILTIN(0, 0, arg_count, name_idx));
-        chunk_emit(c, (uint64_t)builtin_call_id(aer_as_string(c->pool[name_idx])));
-        chunk_emit(c, PACK1(OP_RETURN, 0));
-        patch_jump(c, patch, c->count);
-    } else {
-        callee_offset = func_offset;
-    }
-
-    chunk_emit(c, PACK2(OP_DEFER_PUSH, arg_count > 0 ? arg_reg_base : 0, arg_count));
-    unsigned int patch_offset = c->count;
-    chunk_emit(c, (int)callee_offset);
-    if (!is_builtin && is_forward_ref) pending_call_add(name_idx, patch_offset, call_site_cursor);
-
-    /* Args are copied out of these registers immediately by the opcode above — unlike a plain
-       call, there's no result register to reuse one of them for, so all of them free. */
-    if (arg_count > 0) reg_free(arg_count);
-}
-
 /* `return expr` or bare `return` (implicit null). `return a, b, ...` packs into an array
    (OP_ARRAY_NEW): the destructuring-assignment side (parse_assignment's single-RHS-expression
    case, already built for `a, b = some_array_expr`) already treats a call's result as "the array
@@ -3746,7 +3673,6 @@ static void parse_statement(Chunk* c) {
     if (consume(TOKEN_BREAK))    { parse_break(c);     return; }
     if (consume(TOKEN_CONTINUE)) { parse_continue(c);  return; }
     if (consume(TOKEN_IMPORT))   { parse_import(c);    return; }
-    if (consume(TOKEN_DEFER))    { parse_defer(c);     return; }
     if (at_module_name(c))    { discard_statement_result(c, parse_module_call(c)); return; }
     if (equal(TOKEN_IDENTIFIER)) {
         unsigned int name_idx = chunk_add_pool(c, token.value);
@@ -3908,8 +3834,8 @@ void parser_restore_state(ParserState* s) {
      Once every statement in this call has compiled, anything still left in the forward-reference
    pending list (pending_call_add) never got defined anywhere in this call. A forward reference's
    failure can only be discovered here, at the very end — by then the statement that made the call
-   already compiled "successfully" and was never rolled back, so a still-live OP_CALL/OP_DEFER_PUSH
-   with a bogus target needs to be dealt with directly rather than via the per-statement rollback
+   already compiled "successfully" and was never rolled back, so a still-live OP_CALL with a bogus
+   target needs to be dealt with directly rather than via the per-statement rollback
    above. Each is reported at its own original call site via a saved/restored cursor override
    (lexer_set_cursor), then either: retargeted to OP_CALL_GLOBAL_VALUE/OP_TAIL_CALL_GLOBAL_VALUE if
    the name turned out to be an ordinary top-level variable holding a function value rather than a

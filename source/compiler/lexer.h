@@ -78,7 +78,6 @@ typedef enum TokenType {
     TOKEN_CONTINUE,
     TOKEN_NULL,
     TOKEN_IMPORT,
-    TOKEN_DEFER,
     TOKEN_COMMA,
 
     TOKEN_INDENT,

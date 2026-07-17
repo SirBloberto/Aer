@@ -44,21 +44,6 @@ function is_odd(n):
 assert(is_even(100000) == true, "mutual tail recursion between two functions, 100,000 levels deep")
 assert(is_odd(100001) == true, "mutual tail recursion — the other parity")
 
-# A tail-recursive function that also defers on every call: defer_count > 0
-# at each tail position disables the optimization for that call (falls back
-# to a normal, stack-growing call instead), but every deferred call must
-# still run, in the correct order, at a depth well under the 64-frame limit.
-tail_defer_log = []
-function tail_defer_test(n):
-    defer append(tail_defer_log, n)
-    if n <= 0:
-        return 0
-    return tail_defer_test(n - 1)
-
-tail_defer_test(10)
-assert(length(tail_defer_log) == 11 && tail_defer_log[0] == 0 && tail_defer_log[10] == 10,
-       "defer still fires correctly, in order, for a tail-recursive function whose own pending defers disable the optimization each call")
-
 # A call wrapped in anything else (here, `+ 0`) is NOT a tail call — proof
 # the detection doesn't over-apply. Kept shallow (well under 64) since this
 # path is deliberately not optimized.

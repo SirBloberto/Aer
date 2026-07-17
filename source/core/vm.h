@@ -93,17 +93,13 @@ typedef enum {
        PACK's encoding keeps A/B/C in separate bits, so this is a blind byte-level OR/mask, no
        re-encoding needed).
          Handled by literally the SAME dispatch label as OP_CALL (see the dispatch table, vm.c)
-       — cur_op distinguishes them once the callee is confirmed valid: with the CURRENT frame's
-       own defer_count == 0 (a pending defer must run before this frame's storage is reused for
-       someone else's locals, and there's no return value yet to hand back mid-call), the current
+       — cur_op distinguishes them once the callee is confirmed valid: the current
        call_stack[call_depth]'s OWN registers[0..arg_count) are overwritten with the new args
        (always safe: a call's argument registers are always temps, hence numerically above every
        permanent parameter/local register a would-be overlapping destination slot could be) and
        vm->ip jumps straight to callee_offset — call_depth, dest_reg, and return_ip are left
        completely untouched, so whatever the ORIGINAL (pre-recursion) caller expected back still
-       arrives in the right place once the chain of tail calls finally returns. If defer_count > 0
-       (or this is a genuine, non-tail OP_CALL), falls through to the ordinary push-a-new-frame
-       path unchanged. */
+       arrives in the right place once the chain of tail calls finally returns. */
     OP_TAIL_CALL,        /* same operands as OP_CALL; dest_reg is unused (ignored) here */
     OP_TAIL_CALL_VALUE,  /* same operands as OP_CALL_VALUE; dest_reg is unused (ignored) here */
 
@@ -181,12 +177,6 @@ typedef enum {
        parser.c). */
     OP_STORE_GLOBAL, /* operands: global_reg, rk_val — call_stack[0].registers[global_reg] =
                             vm_rk_value(rk_val) */
-
-    /* `defer name(args)`. callee_offset is resolved at COMPILE time, consistent with every call
-       target being resolved at compile time. Snapshots arg_count values out of the CURRENT
-       frame's registers into that frame's own deferred-call list (CallFrame.defers, vm.c)
-       immediately; lbl_return drains this list LIFO before the frame actually unwinds. */
-    OP_DEFER_PUSH, /* operands: callee_offset, arg_reg_base, arg_count */
 
     /* Registers can hold heap-allocated values (arrays/dicts/strings/functions), which is why
        mark_vm_roots (vm.c) scans all of registers[] for every live frame. */
@@ -631,10 +621,8 @@ typedef enum {
 #define UNPACK_INDEX_GET_RK(word)   ((((uint32_t)(word)) >> 21) & 0x1FFU)
 
 /* Slice C: OP_STORE_GLOBAL/OP_UNARY/OP_CAST/OP_CHECK_SHAPE/OP_STRUCT_NEW — none of these have a
-   patchable target (unlike OP_JUMP_IF_FALSE_REG/OP_DEFER_PUSH, which stay 2 words: see
-   emit_jump_if_false_reg/emit_defer_push's own comments — a `defer` callee_offset can be a
-   forward-reference placeholder exactly like OP_CALL's, so it needs the same dedicated word), so
-   all their fields safely fold into one word. */
+   patchable target (unlike OP_JUMP_IF_FALSE_REG, which stays 2 words — see
+   emit_jump_if_false_reg's own comment), so all their fields safely fold into one word. */
 /* Tier 1 — op(7) + global_reg(7) + rk_val (RK9:9) = 23 bits, entirely in the low word. */
 #define PACK_STORE_GLOBAL(global_reg, rk_val) \
     ( ((uint64_t)(OP_STORE_GLOBAL) & 0x7F) \
@@ -959,8 +947,6 @@ typedef enum {
 #define CALL_BUILTIN_PANIC  6
 
 #define MAX_STRUCT_FIELDS 16
-#define MAX_DEFERS_PER_CALL 8  /* max pending `defer` statements per function call */
-#define MAX_DEFER_ARGS      8  /* max arguments to a single deferred call */
 
 /* A struct type's blueprint (field names in order + default literals); individually heap-allocated and never moved/realloc'd, so AerArray.shape pointers stay valid as the shape table grows. */
 struct Shape {
@@ -1079,16 +1065,6 @@ typedef struct {
 #define VM_CALL_MAX     64
 #define VM_KEY_MAX      4096   /* max dict key length for stack-buffered lookups */
 
-/* A `defer name(args)` statement. Unlike a plain call, the target is resolved at COMPILE time via
-   func_lookup — consistent with every other call site's target being resolved at compile time.
-   `args` are snapshotted at the defer statement — a deferred call's arguments are evaluated once,
-   now, not re-evaluated at replay time. */
-typedef struct {
-    unsigned int callee_offset;
-    AerVal       args[MAX_DEFER_ARGS];
-    int          arg_count;
-} DeferredCall;
-
 /* Per-call register frame — every active call gets its own isolated FRAME_REGISTERS-sized
    bank, mirroring how a stack-based VM would give every call its own call-frame; nested/recursive
    calls can't clobber each other. Lives inside the VM struct (not a file-scope static) so a
@@ -1123,14 +1099,6 @@ typedef struct {
 
     unsigned int return_ip;   /* where to resume in the CALLER */
     int          dest_reg;    /* which of the CALLER's registers gets the return value */
-
-    /* Pending `defer` calls, drained LIFO by lbl_return before the frame unwinds. Each call gets
-       its own isolated register bank, so a frame's real return value just sits in its own src_reg
-       untouched while nested deferred calls run in deeper, separate frames — there is no shared
-       mutable slot for a deferred call's own result to collide with, so no separate "draining"
-       flag is needed. */
-    DeferredCall* defers;
-    int             defer_count;
 } CallFrame;
 
 typedef struct {
