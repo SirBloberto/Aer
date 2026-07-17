@@ -243,8 +243,11 @@ static void mark_vm_roots(VM* vm) {
        cold, mostly-zeroed memory on every GC pass. Frames beyond call_depth are dead (already
        returned, defers already drained by lbl_return before unwind), so bounding the scan to the
        live call chain can't under-collect. */
+    /* frame_size, not FRAME_REGISTERS — frames pack contiguously in vm->register_stack, so
+       scanning a flat 128 per frame would re-visit deeper frames' overlapping windows and mark
+       stale values left by already-returned calls. */
     for (int f = 0; f <= vm->call_depth; f++)
-        for (int i = 0; i < FRAME_REGISTERS; i++)
+        for (unsigned int i = 0; i < vm->call_stack[f].frame_size; i++)
             worklist_push(vm->call_stack[f].registers[i]);
 
     /* A deferred call's snapshotted args live outside registers[], in each frame's own
@@ -371,8 +374,9 @@ static void gc_reset_alloc_counts(void) {
 /* Shared by aer_gc_stats and gc_maybe_collect's ceiling check — one place walking all pools' cell state, not two. */
 static unsigned int gc_count_live_cells(void) {
     unsigned int total = 0;
-    Pool* pools[] = { &string_pool, &array_pool, &dict_pool, &function_pool, &struct_pool };
-    for (unsigned int p = 0; p < 5; p++) {
+    Pool* pools[] = { &string_pool, &array_pool, &dict_pool, &function_pool, &struct_pool,
+                      &packed_array_pool };
+    for (unsigned int p = 0; p < sizeof(pools) / sizeof(pools[0]); p++) {
         Pool* pool = pools[p];
         for (unsigned int i = 0; i < pool->slab_count; i++) {
             unsigned int count = (i == pool->slab_count - 1) ? pool->next_index : pool->elems_per_slab;
@@ -2279,16 +2283,17 @@ lbl_call_builtin: {
     int arg_count    = (int)UNPACK_CALL_BUILTIN_ARG_COUNT(op_word);
     int name_idx     = (int)UNPACK_CALL_BUILTIN_NAME(op_word);
     int builtin_id   = (int)READ();
-    const char* name = aer_as_string(c->pool[name_idx])->data;
+    /* name is only resolved on the error paths — the happy path never needs it. */
     if (arg_count > 4) {
-        error("Too many arguments to '%s'", name);
+        error("Too many arguments to '%s'", aer_as_string(c->pool[name_idx])->data);
         vm->registers[dest_reg] = aer_null();
         DISPATCH();
     }
     AerVal args[4];
     for (int i = 0; i < arg_count; i++) args[i] = vm->registers[arg_reg_base + i];
     bool handled = vm_call_builtin(c, builtin_id, args, arg_count, &vm->registers[dest_reg]);
-    if (!handled) error("'%s' is not defined, or was called with the wrong number of arguments", name);
+    if (!handled) error("'%s' is not defined, or was called with the wrong number of arguments",
+                        aer_as_string(c->pool[name_idx])->data);
     gc_maybe_collect(vm);   /* vm_call_builtin: struct_pool site + aer_make_string (type()) */
     DISPATCH();
 }

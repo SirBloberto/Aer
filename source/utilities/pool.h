@@ -67,7 +67,7 @@ typedef struct {
     void*           free_list;       /* singly-linked through freed cells' bytes [sizeof(void*), 2*sizeof(void*)) — see the file comment above on why not [0, sizeof(void*)) */
 } Pool;
 
-/* Cells allocated across all 5 pools since last reset — gc_maybe_collect (vm.c) checks this every opcode dispatch; one shared counter beats summing 5 per-pool fields (5 cache lines) that often. */
+/* Cells allocated across all GC-managed pools since last reset — gc_maybe_collect (vm.c) checks this on allocating opcodes; one shared counter beats summing per-pool fields that often. */
 extern unsigned int pool_total_alloc_count;
 
 void  pool_init(Pool* p, size_t elem_size, unsigned int elems_per_slab);

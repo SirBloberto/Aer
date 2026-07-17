@@ -4,6 +4,11 @@
 #include "aer_stdlib.h"
 
 void aer_stdlib_init(void) {
+    /* Once-guarded — vm_init calls this per VM (every module import), and re-seeding would
+       reset the random sequence mid-program. */
+    static bool initialized = false;
+    if (initialized) return;
+    initialized = true;
     srand((unsigned int)time(NULL));
 }
 
