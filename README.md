@@ -1288,11 +1288,11 @@ game, a config parser) simply doesn't call it, and its scripts have none.
 | `/` always returns real | `1 / 1` → `1.0` | Use `//` for integer floor division |
 | Arrays and dicts are references | `b = a; b[0] = 99` modifies `a` too | No built-in copy; iterate to clone |
 | `&&`/`||` return boolean, not operand | `x = x \|\| "default"` doesn't work | `x = if x: x else: "default"` |
-| Undefined variable is a runtime error | `print(x)` before assignment crashes | Check with `x = null` first |
+| Referencing a name that was never assigned is a compile error | `print(x)` with no prior `x = ...` anywhere fails to compile | Assign it first (`x = null` if there's genuinely nothing better) |
 | Missing dict key returns `null` | No error, silent | Use `key in dict` before access |
 | `append()`/`delete()` mutate arrays in place and also return them | `arr = append(arr, v)` works but is redundant — the mutation already happened | Call `append(arr, v)` / `delete(arr, i)` as a statement |
 | String interpolation: identifiers only | `"{x + 1}"` is a syntax error | `tmp = x + 1; print("{tmp}")` |
-| Compound assign not valid on indexed/field targets | `arr[i] += 1` and `p.x += 1` are parse errors | `arr[i] = arr[i] + 1` / `p.x = p.x + 1` |
+| Repeated `s += x` in a loop is quadratic | Strings are immutable — every `+=` allocates a fresh buffer and copies the whole thing so far, not just the addition | Build a list with `append()` and join once: `parts = []; for ...: append(parts, x); s = string.join(parts, "")` |
 | `as Type` never converts | `some_dict as Point` errors rather than reshaping the dict into a Point | Build the struct explicitly: `Point(some_dict["x"], ...)` |
 | Struct instances are still `AerArray` under the hood | `length(p)` works and returns the field count (not blocked) | Harmless but not the intended API — use dot access |
 | Pipe rejects nested calls in target args | `x \|> f(g(1))` is a parse error, at any depth | Assign the inner call to a variable first: `t = g(1); x \|> f(t)` |
