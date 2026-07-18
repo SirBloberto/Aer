@@ -1707,26 +1707,6 @@ int main(void) {
         chunk_free(&c);
     }
 
-    /* Test 71 (feature completeness — Step 4, if-expressions): `x = if cond: a else: b` and the
-       no-else-means-null form — previously a hard parse error ("Expected an expression"), now the
-       most pervasive single gap the roadmap plan's own test-suite audit found (dozens of
-       occurrences). Covers a false condition taking the else branch, a comparison condition taking
-       the then branch, and the implicit-null no-else form. */
-    {
-        Chunk c;
-        chunk_init(&c);
-        VM vm;
-        bool ok = run_source(&c, &vm,
-            "abs_x = if -5 >= 0: -5 else: 5\n"
-            "label_is_even = if 4 % 2 == 0: true else: false\n"
-            "maybe = if false: \"yes\"\n");
-        check(ok, "real source if-expressions (both branches, and the implicit-null no-else form) ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 5,     "abs_x == 5 — false condition takes the else branch");
-        check(aer_as_bool(register_get(&vm, 1)) == true, "label_is_even == true — a comparison condition takes the then branch");
-        check(aer_type(register_get(&vm, 2)) == TYPE_NULL, "maybe == null — no else means null, same as parser.c's own if-expression");
-        chunk_free(&c);
-    }
-
     /* Test 72 (feature completeness — Step 4, slice syntax): `arr[a:b]`/`arr[a:]`/`arr[:b]`/`arr[:]`
        for both arrays and strings — previously a hard parse error ("expected ']' after index"),
        the second-most pervasive gap the roadmap plan's own test-suite audit found. Assertions are

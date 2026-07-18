@@ -253,7 +253,7 @@ negative infinity (matching Python, not C):
 ```
 
 `&&` and `||` **always produce a boolean**, never one of the operand values — `x = x || "default"`
-does not work the way it does in JavaScript; write `x = if x: x else: "default"` instead. Both
+does not work the way it does in JavaScript; write it as a statement-form `if`/`else` instead. Both
 short-circuit: the right-hand side is only evaluated if the left side doesn't already determine the
 result.
 
@@ -287,9 +287,7 @@ if x > 0:
 
 `if`, `else`, `for`, and `function` bodies are **always** the indented block form — there is no
 same-line single-statement shortcut. This is a deliberate one-way-to-do-it choice: a same-line form
-would be a second, purely visual spelling of the identical thing. (The inline *if-expression*, see
-[Control Flow](#control-flow), looks similar but returns a value — a genuinely different capability,
-not a layout variant.)
+would be a second, purely visual spelling of the identical thing.
 
 Comments run from `#` to end of line:
 
@@ -470,12 +468,13 @@ else:
     print(0)
 ```
 
-The **inline if-expression** returns a value, unlike the statement form above:
+There is no inline conditional expression — assign inside each branch instead:
 
 ```
-abs_x = if x >= 0: x else: -x
-print(if n % 2 == 0: "even" else: "odd")
-label = if admin: "Admin"    # no else branch evaluates to null
+if x >= 0:
+    abs_x = x
+else:
+    abs_x = -x
 ```
 
 ### For Loop
@@ -1287,7 +1286,7 @@ game, a config parser) simply doesn't call it, and its scripts have none.
 |-----------|-------------|------------|
 | `/` always returns real | `1 / 1` → `1.0` | Use `//` for integer floor division |
 | Arrays and dicts are references | `b = a; b[0] = 99` modifies `a` too | No built-in copy; iterate to clone |
-| `&&`/`||` return boolean, not operand | `x = x \|\| "default"` doesn't work | `x = if x: x else: "default"` |
+| `&&`/`||` return boolean, not operand | `x = x \|\| "default"` doesn't work | `if x:` ... `else: x = "default"` |
 | Referencing a name that was never assigned is a compile error | `print(x)` with no prior `x = ...` anywhere fails to compile | Assign it first (`x = null` if there's genuinely nothing better) |
 | Missing dict key returns `null` | No error, silent | Use `key in dict` before access |
 | `append()`/`delete()` mutate arrays in place and also return them | `arr = append(arr, v)` works but is redundant — the mutation already happened | Call `append(arr, v)` / `delete(arr, i)` as a statement |
@@ -1603,7 +1602,7 @@ emitted for this loop form at all.
 
 Rather than returning the operand value (as JavaScript does), AER's `&&`/`||` always produce
 `true` or `false`. `x = x || "default"` does not work the way it does in JavaScript.
-`x = if x: x else: "default"` is the idiomatic replacement.
+A statement-form `if`/`else` assigning `x` in each branch is the idiomatic replacement.
 
 ### Named functions can't nest; no closures at all
 

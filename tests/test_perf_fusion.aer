@@ -339,22 +339,49 @@ assert(is_order_arr[0] == 999 && is_order_arr[1] == 200,
        "arr[i] = f() writes to the index i had BEFORE f() ran, not after — proof the value-must-be-CONST restriction correctly forces this through the unfused, correctly-ordered path")
 
 # ------------------------------------------------------------------ #
-# 40. Compare-and-branch fusion (OP_CMP_JUMP_FALSE) — one test per     #
-#     comparison operator, through if/while/if-expr, plus the          #
-#     non-fusing cases (and/or, a bare boolean, a non-comparison        #
-#     expression) that must keep working via plain OP_JUMP_IF_FALSE.   #
+# 40. Compare-and-branch fusion — one test per comparison operator,     #
+#     through if/while, plus the non-fusing cases (and/or, a bare      #
+#     boolean, a non-comparison expression) that must keep working     #
+#     via plain OP_JUMP_IF_FALSE.                                      #
 # ------------------------------------------------------------------ #
 
-# Each of these routes the comparison through an actual `if` CONDITION (via the inline
-# if-expression form, itself one of the three emit_jump_if_false call sites) — not through a
-# plain boolean-valued function argument, which would never touch emit_jump_if_false at all.
-assert((if 1 == 1: true else: false) == true,  "if (a == b) fuses to OP_CMP_JUMP_FALSE, true branch")
-assert((if 1 == 2: true else: false) == false, "if (a == b) fuses to OP_CMP_JUMP_FALSE, false branch")
-assert((if 1 != 2: true else: false) == true,  "if (a != b) fuses")
-assert((if 1 <  2: true else: false) == true,  "if (a < b) fuses")
-assert((if 2 >  1: true else: false) == true,  "if (a > b) fuses")
-assert((if 1 <= 1: true else: false) == true,  "if (a <= b) fuses")
-assert((if 1 >= 1: true else: false) == true,  "if (a >= b) fuses")
+# Each of these routes the comparison through an actual `if` CONDITION (emit_jump_if_false_reg) —
+# not through a plain boolean-valued function argument, which would never touch it at all.
+if 1 == 1:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == true,  "if (a == b) fuses, true branch")
+if 1 == 2:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == false, "if (a == b) fuses, false branch")
+if 1 != 2:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == true,  "if (a != b) fuses")
+if 1 <  2:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == true,  "if (a < b) fuses")
+if 2 >  1:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == true,  "if (a > b) fuses")
+if 1 <= 1:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == true,  "if (a <= b) fuses")
+if 1 >= 1:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == true,  "if (a >= b) fuses")
 
 # Block-form if/else — the same call site (parse_if), different grammar production.
 cb_result = false
@@ -374,21 +401,41 @@ assert(cb_wsum == 10, "a while-style for-loop condition (i < 5) fuses and still 
 
 # Non-fusing: and/or conditions (short-circuit jumps, not a bare comparison — the outermost
 # operator here is && / ||, so parse_binary_ops's last_cmp correctly comes back -1).
-assert((if 1 < 2 && 3 < 4: true else: false) == true, "a && condition does not fuse (last operator is &&, not a bare comparison) but still works")
-assert((if 1 > 2 || 3 < 4: true else: false) == true, "a || condition does not fuse but still works")
+if 1 < 2 && 3 < 4:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == true, "a && condition does not fuse (last operator is &&, not a bare comparison) but still works")
+if 1 > 2 || 3 < 4:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == true, "a || condition does not fuse but still works")
 
 # Non-fusing: a bare boolean variable/expression, no comparison at all.
 cb_flag = true
-assert((if cb_flag: true else: false) == true, "a bare boolean variable condition does not fuse (nothing to fuse) but still works")
+if cb_flag:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == true, "a bare boolean variable condition does not fuse (nothing to fuse) but still works")
 
 # Non-fusing: arithmetic result used directly as a truthy condition (no comparison).
-assert((if 1 + 1: true else: false) == true, "a non-comparison, non-boolean truthy condition does not fuse but still works")
+if 1 + 1:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == true, "a non-comparison, non-boolean truthy condition does not fuse but still works")
 
 # The comparison's operands may themselves be arbitrary (non-simple) expressions —
 # fusion only cares that the OUTERMOST operator is a comparison, not what's inside it.
 function cb_double(n):
     return n * 2
-assert((if cb_double(3) == 6: true else: false) == true, "a comparison whose operands are complex sub-expressions (calls) still fuses and evaluates them correctly")
+if cb_double(3) == 6:
+    cb_r = true
+else:
+    cb_r = false
+assert(cb_r == true, "a comparison whose operands are complex sub-expressions (calls) still fuses and evaluates them correctly")
 
 # Sieve-shaped nested loop conditions (p * p <= limit, i <= limit) — the exact
 # pattern that motivated this fusion — still produce the right prime count.

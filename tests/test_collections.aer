@@ -43,7 +43,12 @@ b[0] = 99
 assert(a[0] == 99, "arrays are references — mutating b also mutates a")
 
 # Truthiness: empty array is falsy, non-empty is truthy
-assert((if []: "empty" else: "not empty") == "not empty", "non-empty array is truthy")
+non_empty_arr_label = "unset"
+if [1]:
+    non_empty_arr_label = "not empty"
+else:
+    non_empty_arr_label = "empty"
+assert(non_empty_arr_label == "not empty", "non-empty array is truthy")
 
 empty_arr = []
 empty_arr_label = "unset"

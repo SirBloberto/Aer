@@ -203,18 +203,6 @@ else:
     size_label = "small"
 assert(size_label == "big", "if/else block form")
 
-# The inline if-EXPRESSION is a different capability (it produces a value,
-# which the statement form can't) and is unaffected by that rule:
-abs_x = if x >= 0: x else: -x
-assert(abs_x == 7, "inline if-expression")
-
-label = if x % 2 == 0: "even" else: "odd"
-assert(label == "odd", "inline if-expression, else branch")
-
-# Inline with no else branch — evaluates to null
-maybe = if false: "yes"
-assert(maybe == null, "inline if-expression with no else evaluates to null")
-
 # ------------------------------------------------------------------ #
 # 8. For — while form                                                  #
 # ------------------------------------------------------------------ #
@@ -325,7 +313,10 @@ assert(length(kept) == 4 && kept[0] == 1 && kept[1] == 3 && kept[2] == 5 && kept
 # Truthy: everything else
 
 function truthy(v):
-    return if v: "truthy" else: "falsy"
+    if v:
+        return "truthy"
+    else:
+        return "falsy"
 
 assert(truthy(null) == "falsy", "null is falsy")
 assert(truthy(false) == "falsy", "false is falsy")
