@@ -33,5 +33,8 @@
 perf.data*
 *.perf.data*
 
-#Working conventions for AI-assisted development — kept locally, not shipped in the public tree
+#Working conventions and local state for AI-assisted development — kept locally, not shipped
+#in the public tree. Listed explicitly rather than relying on Windows' case-insensitive match
+#of /CLAUDE.md against .claude/, which wouldn't hold on a case-sensitive filesystem.
 /CLAUDE.md
+/.claude/
