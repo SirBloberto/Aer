@@ -42,7 +42,7 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
         case TYPE_NULL:    strbuf_append(b, "null"); break;
         case TYPE_BOOLEAN: strbuf_append(b, aer_as_bool(v) ? "true" : "false"); break;
         case TYPE_INTEGER: snprintf(tmp, sizeof(tmp), "%lld", aer_as_int(v));  strbuf_append(b, tmp); break;
-        case TYPE_REAL:    snprintf(tmp, sizeof(tmp), "%g",   aer_as_real(v)); strbuf_append(b, tmp); break;
+        case TYPE_REAL:    aer_format_real(aer_as_real(v), tmp, sizeof(tmp)); strbuf_append(b, tmp); break;
         case TYPE_STRING: {
             AerString* s = aer_as_string(v);
             json_encode_string(b, s->data, s->length);
@@ -92,6 +92,9 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
         }
         case TYPE_PACKED_ARRAY:
             error("json.encode() cannot serialize a packed array value");
+            return false;
+        case TYPE_RESULT:
+            error("json.encode() cannot serialize a Result value");
             return false;
         case TYPE_ANY: break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
     }
@@ -335,20 +338,8 @@ bool aer_json_call(VM* vm, Chunk* c, int fn_id, int arg_count) {
         char* err_msg = NULL;
         AerVal value = json_decode(aer_as_string(s_v), &err_msg);
 
-        /* Go-style (value, err) pair — a TYPE_ARRAY under the hood, same as string.split()/aer_io.c's make_pair (see OP_UNPACK). */
-        AerArray* r = vm_new_array();
-        r->count    = 2;
-        r->capacity = 2;
-        r->items    = xmalloc(sizeof(AerVal) * 2);
-        r->shape    = NULL;
-        if (err_msg) {
-            r->items[0] = aer_null();
-            r->items[1] = aer_make_string(err_msg, (unsigned int)strlen(err_msg));
-        } else {
-            r->items[0] = value;
-            r->items[1] = aer_null();
-        }
-        vm_stack_push(vm, aer_array_val(r));
+        AerVal err = err_msg ? aer_make_string(err_msg, (unsigned int)strlen(err_msg)) : aer_null();
+        vm_stack_push(vm, aer_make_result(err_msg ? aer_null() : value, err));
         return true;
     }
 

@@ -126,4 +126,8 @@ typedef struct LexerState LexerState;
 LexerState* lexer_save_state(void);
 void        lexer_restore_state(LexerState* state);
 
+/* Begins lexing a fresh, independent text span (e.g. a string interpolation's `{expr}` body) —
+   see this function's own comment in lexer.c for the save/restore contract callers must follow. */
+void lexer_begin_span(const char* text, unsigned int len);
+
 #endif

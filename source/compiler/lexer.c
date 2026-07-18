@@ -139,6 +139,42 @@ void shell(char* line) {
     indent_reset();
 }
 
+/* Begins lexing a fresh, independent text span — not a file, a page of shell input — used for
+   string interpolation's `{expr}` sub-expression (parser.c's parse_string_literal). Caller must
+   have already called lexer_save_state() to preserve whatever the lexer was doing before (almost
+   certainly mid-way through a STRING token's own raw byte scan, nowhere near a normal token
+   boundary), and must call lexer_restore_state() once the sub-expression has been fully consumed.
+   A fresh heap File (not a shared static slot, unlike shell()'s) — an interpolated expression can
+   itself contain a nested string literal with its own interpolation, and each nesting level needs
+   its own independent buffer alive at the same time, not one shared slot stomped by the next call.
+   text need not be NUL-terminated by the caller — copied here, into an owned, NUL-terminated
+   buffer lex_string()/friends can scan past the end of safely. */
+void lexer_begin_span(const char* text, unsigned int len) {
+    char* buf = xmalloc((size_t)len + 1);
+    memcpy(buf, text, len);
+    buf[len] = '\0';
+
+    if (file_index >= file_capacity) {
+        file_capacity = file_capacity ? file_capacity * 2 : 8;
+        files_storage = xrealloc(files_storage, sizeof(File*) * file_capacity);
+    }
+    File* file    = xmalloc(sizeof(File));
+    file->name    = "<interpolation>";
+    file->start   = buf;
+    file->buffer  = buf;
+    files_storage[file_index++] = file;
+    current = file;
+    indent_reset();
+    /* A span is always a single inline expression, never a multi-line block — a plain string
+       literal can't even contain a raw newline (lex_string() stops at '\n'), so indentation
+       tracking is not just unnecessary here but actively wrong: at_line_start's default true
+       would measure any leading whitespace before the span's first real token as an indent level
+       relative to a freshly-reset stack, spuriously emitting TOKEN_INDENT instead of that token
+       (caught by `"{ expr }"` — the entirely ordinary, readable style of leaving space around an
+       interpolated expression — failing where `"{expr}"` with no leading space did not). */
+    at_line_start = false;
+}
+
 /* ------------------------------------------------------------------ */
 /* Token helpers                                                        */
 /* ------------------------------------------------------------------ */

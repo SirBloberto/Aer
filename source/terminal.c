@@ -289,13 +289,23 @@ char* handle_terminal() {
             return buffer;
 
         } else if (key == END_OF_TEXT) {   /* Ctrl-C */
-            /* Cancels the current line only, like Python's REPL — it does
-               NOT exit the shell, which surprises people used to a
-               terminal where Ctrl-C kills the process. Ctrl-D (EOF) is
-               the actual exit; say so every time, since there's no other
-               way to discover it (no exit()/quit() builtin exists). */
+            /* Cancels the current INPUT, like Python's REPL — not just the one physical line
+               being edited, but a whole in-progress multi-line block (a `function`/`if`/`for`
+               body still being typed, prompt showing "..."). It does NOT exit the shell, which
+               surprises people used to a terminal where Ctrl-C kills the process. Ctrl-D (EOF)
+               is the actual exit; say so every time, since there's no other way to discover it
+               (no exit()/quit() builtin exists).
+                 Returning NULL here (rather than clearing the line and looping back to read
+               more of it, as this used to) is what makes this actually abandon a multi-line
+               block: main.c's run_shell() owns the block-accumulation state (in_block/
+               block_buf), not this file, so only handing control all the way back up lets it
+               reset that state instead of silently continuing to append to the old buffer. */
+            if (screen_rows > screen_row)
+                printf("\x1b[%dB", screen_rows - screen_row);
             printf("\nKeyboardInterrupt (press Ctrl-D to exit)\n");
             clear();
+            screen_row = 0;
+            return NULL;
 
         } else if (key == END_OF_TRANS) {  /* Ctrl-D */
             printf("\n");

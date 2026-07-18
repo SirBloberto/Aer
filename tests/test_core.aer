@@ -39,6 +39,13 @@ assert(10 % 3 == 1, "modulo")
 assert(2 + 2 == 4, "addition")
 assert(1 + 2.5 == 3.5, "integer promoted to real when mixed")
 
+# A whole-number real must still display its decimal point -- plain "%g" formatting used to print
+# 42.0 as bare "42", indistinguishable from an integer once round-tripped through print()/
+# interpolation/json.encode() (see test_stdlib_modules.aer for the json.encode/decode round-trip
+# side of this same fix).
+assert("{42 as float}" == "42.0", "a whole-number float shows its decimal point when interpolated")
+assert("{3.5}" == "3.5", "a fractional real is untouched by the same formatting fix")
+
 # ------------------------------------------------------------------ #
 # 3. Strings — interpolation, escapes, indexing, slicing               #
 # ------------------------------------------------------------------ #
@@ -68,10 +75,46 @@ assert("arr is {interp_arr}" == "arr is [1, 2, \"three\"]", "interpolating an ar
 interp_dict = {"a": 1}
 assert("dict is {interp_dict}" == "dict is \{\"a\": 1}", "interpolating a dict shows its contents, not a placeholder")
 
+# {expr} interpolates any expression (calls, arithmetic, indexing, field access, ...), not just a
+# bare name -- sub-parsed via its own independent lexer span (parser.c's parse_interpolated_expr),
+# not a raw text-to-variable lookup.
+function interp_add(interp_x, interp_y):
+    return interp_x + interp_y
+
+assert("{interp_add(1, 2)}" == "3", "a function call inside \{}")
+assert("{age * 2 + 1}" == "61", "an arithmetic expression inside \{}")
+assert("{ age * 2 + 1 }" == "61", "leading/trailing whitespace inside \{} doesn't get misread as indentation")
+
+struct InterpPoint:
+    x: integer = 0
+    y: integer = 0
+ipoint = InterpPoint(3, 4)
+assert("{ipoint.x}" == "3", "field access inside \{}")
+
+interp_list = [10, 20, 30]
+assert("{interp_list[1]}" == "20", "indexing inside \{}")
+
+assert("{interp_add(1,2)} and {age} and {interp_list[0]}" == "3 and 30 and 10",
+       "multiple \{} interpolations in one string, mixing calls/names/indexing")
+
+# A nested string literal inside an interpolated expression needs its own quotes escaped, same as
+# any other embedded quote -- the OUTER string's own lexing doesn't know about {}/nesting at all,
+# it just scans for the next unescaped '"'.
+function interp_shout(interp_s):
+    return interp_s + "!"
+assert("{interp_shout(\"hi\")}" == "hi!", "a nested string literal argument inside \{}, quotes escaped")
+
+# A dict literal (its own '{'/'}') inside an interpolated expression -- depth-aware scanning must
+# not mistake the dict literal's own braces for the interpolation's closing brace.
+assert("{ {\"z\": 9}[\"z\"] }" == "9", "a dict literal (nested braces) inside \{}")
+
 # String comparison
 assert("abc" == "abc", "string equality")
 assert(!("abc" == "xyz"), "string inequality via ==")
 assert("abc" != "xyz", "string inequality via !=")
+
+# String ordering and `in`-on-strings are exercised in test_functions.aer instead (this file's
+# constant pool is near the 9-bit RK9 encoding's per-file ceiling; see that file's own comment).
 
 # Strings are indexable — a single character is just a length-1 string
 word = "hello"

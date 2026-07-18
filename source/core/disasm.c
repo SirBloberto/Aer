@@ -86,6 +86,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
        purposes. */
     [OP_LOADK] = { "OP_LOADK", "reg = pool constant", {FLD_REG, FLD_POOL}, false, 1 },
     [OP_MOVE]  = { "OP_MOVE",  "reg = reg", {FLD_REG, FLD_REG}, false, 2 },
+    [OP_IS_RESULT] = { "OP_IS_RESULT", "reg = is-result(reg)", {FLD_REG, FLD_REG}, false, 2 },
     /* OP_BINARY is the sole exception to the "packed fields come from A/B/C, everything else is a
        separate wide word" rule described above: its whole instruction (dest, bin_op, AND both RK
        operands) is packed into ONE word (PACK_BINARY, vm.h), so it has no trailing wide fields at
@@ -200,7 +201,12 @@ static void print_pool_value(FILE* out, AerVal v) {
         case TYPE_NULL:     fprintf(out, "null"); break;
         case TYPE_BOOLEAN:  fprintf(out, "%s", aer_as_bool(v) ? "true" : "false"); break;
         case TYPE_INTEGER:  fprintf(out, "%lld", aer_as_int(v)); break;
-        case TYPE_REAL:     fprintf(out, "%g", aer_as_real(v)); break;
+        case TYPE_REAL: {
+            char buf[64];
+            aer_format_real(aer_as_real(v), buf, sizeof(buf));
+            fprintf(out, "%s", buf);
+            break;
+        }
         case TYPE_STRING:   fprintf(out, "\"%.*s\"", (int)aer_as_string(v)->length, aer_as_string(v)->data); break;
         case TYPE_FUNCTION: fprintf(out, "<function@%u>", aer_as_function(v)->code_offset); break;
         default:            fprintf(out, "<value>"); break;

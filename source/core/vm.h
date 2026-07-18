@@ -53,6 +53,10 @@ typedef enum {
        PACK3's own comment below explains the packed-instruction encoding these use. */
     OP_LOADK,  /* operands: dest_reg, pool_idx — registers[dest_reg] = chunk pool constant */
     OP_MOVE,   /* operands: dest_reg, src_reg — registers[dest_reg] = registers[src_reg] */
+    /* operands: dest_reg, src_reg — registers[dest_reg] = (registers[src_reg] is a TYPE_RESULT),
+       as a boolean. Used only by `|>`'s codegen (compile_pipe) to gate its short-circuit check —
+       an ordinary value must never take that path, only a genuine Result. */
+    OP_IS_RESULT,
     /* RK-encoded operand: a register index, or (with bit 30 set) a constant-pool index — see
        vm_rk_value (vm.c). One opcode per operator's runtime `bin_op`, not a family of opcodes
        per operand-kind combination — that's the entire point of RK encoding. */
@@ -935,6 +939,10 @@ typedef enum {
 #define CALL_BUILTIN_TYPE   4
 #define CALL_BUILTIN_ASSERT 5
 #define CALL_BUILTIN_PANIC  6
+/* Builds a real Result from a (value, err) pair — the only way AER source itself can construct
+   one (native stdlib code has aer_make_result() directly). Lets a user-written fallible function
+   participate in `|>`'s short-circuit check the same way io.read()/json.decode() do. */
+#define CALL_BUILTIN_RESULT 7
 
 #define MAX_STRUCT_FIELDS 16
 
@@ -1154,6 +1162,15 @@ void         chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line);
 
 /* The source line whose statement contains `offset` (the largest recorded mark at or before it), or 0 if the chunk has no marks yet. */
 unsigned int chunk_line_for_offset(Chunk* c, unsigned int offset);
+
+/* Formats a real number for display, guaranteeing a decimal point/exponent/nan-inf marker
+   survives — plain "%g" prints a whole-valued float (e.g. 42.0) as "42", indistinguishable from
+   an integer once it round-trips through print() or json.encode() (json.decode()'s own number
+   parser, aer_json.c, only treats a token as real if it contains '.' or 'e' — without this, a
+   real that happens to be a whole number silently becomes an integer on the way back in). Shared
+   by vm.c (print/interpolation, `as string`), aer_json.c (json.encode), and disasm.c (debug-tools
+   pool dump) — the one place this decision is made, not reimplemented per caller. */
+void aer_format_real(double d, char* buf, size_t bufsize);
 
 unsigned int chunk_add_pool(Chunk* c, AerVal v);
 Shape*       chunk_find_shape(Chunk* c, const char* name);

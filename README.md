@@ -259,7 +259,7 @@ result.
 
 ## Built-in Functions
 
-Seven **core builtins** are always available, with no `import` — ordinary identifiers dispatched
+Eight **core builtins** are always available, with no `import` — ordinary identifiers dispatched
 directly by the VM, not syntax:
 
 | Function | Signature | Behaviour |
@@ -271,6 +271,7 @@ directly by the VM, not syntax:
 | `delete(x, key)` | 2 args | removes index `key` from an array or key `key` from a dict, mutating in place; returns `x` |
 | `assert(cond, msg)` | 2 args | prints `ASSERT FAILED: msg` on a false `cond` and keeps running — see [Error Handling](#error-handling) |
 | `panic(msg)` | 1 arg | aborts like any runtime error, with your own message — see [Error Handling](#error-handling) |
+| `Result(value, err)` | 2 args | builds a genuine `Result` — exactly one argument must be null — capitalized like a struct constructor, not a plain builtin (see [Error Handling](#error-handling)) |
 
 Everything past this — `math`, `random`, `string`, `time`, `io` — requires an explicit `import` and
 is covered in [Standard Library](#standard-library).
@@ -384,20 +385,41 @@ for ch in word:
     print(ch)            # h e l l o
 ```
 
+Strings support the same comparison operators numbers do — `<`/`>`/`<=`/`>=` compare
+lexicographically (byte-wise, then by length if one is a prefix of the other; the same order
+`math.sort()` already uses for an array of strings), and `in` tests substring membership:
+
+```
+print("apple" < "banana")   # true
+print("ell" in "hello")     # true — same question string.contains() answers
+```
+
 Strings are immutable — `word[0] = "H"` is a runtime error.
 
-**Interpolation**: any `{identifier}` inside a string is replaced with that variable's string form,
-no prefix required:
+**Interpolation**: any `{expr}` inside a string is replaced with that expression's string form, no
+prefix required — a bare identifier is just the simplest case; calls, arithmetic, indexing, and
+field access all work too:
 
 ```
 name = "Robert"
 age  = 30
 print("Hello {name}, you are {age} years old")
 # Hello Robert, you are 30 years old
+
+function double(n):
+    return n * 2
+print("{name} is {double(age)} in dog years")
+# Robert is 60 in dog years
 ```
 
-Interpolation only accepts a bare identifier, not a general expression — `"{x + 1}"` is a syntax
-error; assign to a temporary first. To include a literal `{`, escape it: `"\{name}"` prints `{name}`.
+`{expr}` is parsed as a genuine sub-expression (its own independent lex/parse pass, saved and
+restored around the outer string), not a text-to-variable lookup — so it accepts anything
+`parse_binary` does, including a nested `{}` (a dict literal). The one thing it *doesn't* handle is
+a nested string literal's own quotes: the outer string's own lexing decides where the whole string
+token ends before interpolation ever runs, and it has no idea `{}` exists — so a literal `"` inside
+an interpolated expression still needs the same `\"` escaping any other embedded quote would:
+`"{greet(\"world\")}"`. To include a literal `{` (not an interpolation), escape it: `"\{name}"`
+prints `{name}`.
 
 ### Casting and Shape-Checking — `as`
 
@@ -419,6 +441,10 @@ p = Point(1.0, 2.0)
 checked = p as Point       # passes through unchanged
 # e as Point                # errors if e isn't exactly a Point
 ```
+
+`"abc" as integer`/`as float` is a runtime error, not a silent `0` — the whole string (leading/
+trailing whitespace aside) must be a valid number, or it's rejected rather than fabricating a
+plausible-looking wrong value.
 
 `as` is also used to declare a struct-typed function parameter — see [Structs](#structs).
 
@@ -877,8 +903,8 @@ print(string.upper("hello"))   # HELLO
 ```
 
 **The pipe operator, `|>`** — `x |> f(args)` desugars to `f(x, args)`: `x` becomes argument zero.
-It's a plain rewrite, not type-based dispatch — `f` is always resolved through AER's ordinary flat
-function scope, exactly as if you'd written `f(x, args)` yourself. This is what gives AER a
+`f` is always resolved through AER's ordinary flat function scope, exactly as if you'd written
+`f(x, args)` yourself — the target itself is never dispatched by type. This is what gives AER a
 method-chain *feel* without a real method table:
 
 ```
@@ -896,6 +922,26 @@ The target can be a module-qualified function too, exactly like calling it direc
 
 ```
 print("hello" |> string.upper())   # HELLO
+```
+
+**One exception:** `|>` checks whether `x` itself — the value on its left — is a `Result` (see
+[Error Handling](#error-handling)). If it is, the call becomes conditional: a failed `Result`
+(non-null `err`) skips the call entirely and the whole expression is just that same failed
+`Result`, unchanged; a successful one is unwrapped to its `.value` before `f` is called. An
+ordinary value is completely unaffected by this — the check only ever fires for a genuine
+`Result`, so `5 |> increment(3)` above costs nothing extra and behaves exactly as shown. This is
+what lets a chain of fallible native calls read like a single pipeline instead of a staircase of
+`if err == null` guards:
+
+```
+# every stage after a failure is skipped, not just the one that failed --
+# a missing file means json.decode() never runs at all, and err carries
+# io.read()'s own message straight through.
+value, err = io.read("config.json") |> json.decode()
+if err != null:
+    print(err)
+else:
+    print(value)
 ```
 
 A pipe chain also works as a bare statement, its result discarded — useful when the target mutates
@@ -936,6 +982,47 @@ function safe_div(a, b):
 result, err = safe_div(10, 0)
 if err != null:
     print("Error: {err}")
+```
+
+A function you write this way (`return a, b`) returns a plain 2-element array — `a, b = ...`
+destructures it the same way it destructures any array. Every fallible *native* stdlib function
+(`io.read`, `json.decode`, etc.) returns something slightly stricter instead: a real `Result` type,
+distinct from an ordinary array (`type(x)` reports `"Result"`, not `"array"`). Destructuring
+looks identical either way — `value, err = io.read(path)` works whether `io.read` is yours or the
+stdlib's — the difference only shows up if you try to misuse one: indexing anything but `0`/`1` on
+a `Result` is a clear error rather than quietly doing whatever an out-of-bounds array access does,
+and a `Result` can't be silently handed to something expecting a plain array. A bare `Result` is
+also truthy exactly when it succeeded, so `if io.read(path): ...` reads as "if that worked" without
+destructuring first. `==`/`!=` on a `Result` is reference equality, same as arrays/dicts — two
+separately-built Results with identical contents are not `==` to each other, only a `Result`
+compared against itself (or a variable holding the same one) is.
+
+**`Result(value, err)`** builds a genuine `Result` from AER source itself — the only way to, since
+`io`/`json` build theirs from native code directly. Capitalized like a struct constructor
+(`Basket(...)`, not `print(...)`) rather than a plain builtin — deliberately, since a lowercase
+`result` is exactly the kind of name a script would otherwise pick for an ordinary local variable,
+and this way it can't be silently shadowed by one. Exactly one of the two arguments must be null;
+passing both (or neither) is a runtime error. Use it so your own fallible functions return the same
+shape `io.read`/`json.decode` do, letting them participate in `|>`'s short-circuit below:
+
+```
+function parse_positive(n):
+    if n <= 0:
+        return Result(null, "must be positive")
+    return Result(n, null)
+```
+
+**`return value, error(err)`** (and `return error(err)` alone) is sugar for exactly the same thing,
+spelled to match a plain `return value, err`'s shape. `error(x)` is recognized only as the first
+token of a return statement's own value — the identifier `error` immediately followed by `(` — and
+only as the last value in a 1- or 2-value return; everywhere else, including a plain variable
+literally named `error`, it's a completely ordinary identifier:
+
+```
+function parse_positive(n):
+    if n <= 0:
+        return error("must be positive")   # same as return Result(null, "must be positive")
+    return n, error(null)                  # same as return Result(n, null)
 ```
 
 **Runtime errors** are a VM-level thing and are not values at all — out-of-bounds access, wrong
@@ -1078,8 +1165,8 @@ There are currently five native modules — `math`, `random`, `string`, `time`, 
 opt-in host capability, `io`. See [Modularity](#modularity) for how `import` resolves these.
 
 ```
-math.sqrt(x)          # square root, always returns a real
-math.pow(x, y)        # x to the power of y, always returns a real
+math.sqrt(x)          # square root, always returns a real; x must be non-negative
+math.pow(x, y)        # x to the power of y, always returns a real; a negative x requires a whole-number y
 math.floor(x)         # round toward negative infinity, returns an integer
 math.ceil(x)          # round toward positive infinity, returns an integer
 math.abs(x)           # absolute value, preserves integer/real
@@ -1152,32 +1239,31 @@ doesn't call `aer_io_register()`, and scripts running under it have no file acce
 no sandbox layer, the capability just isn't there unless a host explicitly grants it.
 
 ```
-f, err = io.open("log.txt", "a")   # mode is "r", "w", or "a"
+write_err, err = io.append("log.txt", "a line\n")
 if err != null:
-    print("could not open: " + err)
-else:
-    write_err, err2 = io.write(f, "a line\n")
-    io.close(f)
+    print("could not write: " + err)
 ```
 
 ```
-io.open(path, mode)   # returns (handle, err) — handle is a plain integer, opaque outside io.*
-io.read(handle)       # reads all remaining data as a string, returns (contents, err)
-io.write(handle, s)   # returns (null, err) — only err is ever meaningful
-io.close(handle)      # returns (null, err)
-io.stdin()            # returns the stdin handle (always succeeds) — usable with io.read() like any other handle
+io.read(path)     # opens, reads the whole file, and closes it in one call — returns (contents, err)
+io.write(path, s) # opens (truncating), writes s, and closes it — returns (null, err)
+io.append(path, s) # same as io.write(), but opens in append mode instead of truncating
+io.stdin()        # returns a handle for piped input (always succeeds) — pass it to io.read() instead of a path
 ```
 
-Every `io` function follows the multi-return convention `safe_div` already establishes at the user
-level (see [Error Handling](#error-handling)) — `(value, err)`, `err` non-null on failure. A wrong
-argument *type* (not a string path, not an integer handle) is a VM-level runtime error like any
-other stdlib type mismatch; a bad handle or a file that can't be opened is the fallible case and
-comes back as `err` instead. There's no path sandboxing within `io` itself — same trust model as
-any language's file API — the boundary is entirely "does this host expose `io` at all."
+Every `io` function follows the `(value, err)` convention `safe_div` establishes at the user level
+(see [Error Handling](#error-handling)) — except the value it returns on both sides is a real
+`Result`, not a plain array (more on that distinction there). A wrong argument *type* (not a string
+path, not `io.stdin()`'s handle) is a VM-level runtime error like any other stdlib type mismatch; a
+missing file or a write that fails partway is the fallible case and comes back as `err` instead.
+There's no path sandboxing within `io` itself — same trust model as any language's file API — the
+boundary is entirely "does this host expose `io` at all."
 
-`io.read()` works the same way whether the handle is a regular file or `io.stdin()` — a piped,
-non-seekable stream falls back to reading until EOF instead of the seek-and-presize approach a
-regular file uses, but the call site is identical either way.
+`io.read()` takes either a path (opens, reads the whole file, closes it) or `io.stdin()`'s handle —
+piped, non-seekable input falls back to reading until EOF instead of the seek-and-presize approach
+a regular file uses, but the call site is identical either way. There's no `io.open`/`io.close`:
+every file operation here is one-shot, so there's no handle for user code to leak or use with the
+wrong mode.
 
 ---
 
@@ -1290,7 +1376,6 @@ game, a config parser) simply doesn't call it, and its scripts have none.
 | Referencing a name that was never assigned is a compile error | `print(x)` with no prior `x = ...` anywhere fails to compile | Assign it first (`x = null` if there's genuinely nothing better) |
 | Missing dict key returns `null` | No error, silent | Use `key in dict` before access |
 | `append()`/`delete()` mutate arrays in place and also return them | `arr = append(arr, v)` works but is redundant — the mutation already happened | Call `append(arr, v)` / `delete(arr, i)` as a statement |
-| String interpolation: identifiers only | `"{x + 1}"` is a syntax error | `tmp = x + 1; print("{tmp}")` |
 | Repeated `s += x` in a loop is quadratic | Strings are immutable — every `+=` allocates a fresh buffer and copies the whole thing so far, not just the addition | Build a list with `append()` and join once: `parts = []; for ...: append(parts, x); s = string.join(parts, "")` |
 | `as Type` never converts | `some_dict as Point` errors rather than reshaping the dict into a Point | Build the struct explicitly: `Point(some_dict["x"], ...)` |
 | Struct instances are still `AerArray` under the hood | `length(p)` works and returns the field count (not blocked) | Harmless but not the intended API — use dot access |
@@ -1423,8 +1508,10 @@ Binary expressions use **precedence climbing**: one function with a table (see
 the cast/shape-check operator `as` (both of which special-case their RHS parsing since it isn't a
 general expression) — without a chain of separate grammar rules.
 
-String interpolation is resolved at compile time: `"Hello {name}"` is lowered directly to a chain
-of `OP_LOAD` / `OP_TO_STR` / `OP_ADD` instructions with no runtime parsing.
+String interpolation is resolved at compile time: each `{expr}` is sub-parsed via its own
+independent lexer span (saved/restored around the outer string's own raw byte scan) into ordinary
+expression bytecode, then lowered into a chain of `OP_TO_STR` / `OP_ADD` instructions alongside the
+literal segments — no runtime parsing, and no different from typing that expression anywhere else.
 
 For-each loops compile to register-based iterator opcodes (`OP_ITER_NEXT_ARRAY`/`OP_ITER_NEXT_PAIR`
 for arrays/dicts/strings, `OP_ITER_RANGE_PREP`/`OP_ITER_RANGE_LOOP` for `a..b..step` ranges) whose

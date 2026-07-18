@@ -1031,6 +1031,37 @@ static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base) 
     return count;
 }
 
+/* Decodes backslash escapes (`\n \t \\ \" \{`) into `out` (caller-provided, at least `len` bytes —
+   decoding a 2-source-char escape into at most 2 output bytes never grows the input) and returns
+   the decoded length. Shared by pool_escaped_string (a literal string segment) and
+   parse_interpolated_expr (an interpolated expression's own raw text — the outer lex_string()
+   already left it with the SAME escapes intact, e.g. `\"` for a quote that must not end the outer
+   string early, so it needs the identical decode before it can be handed to a sub-lexer as
+   genuine AER source, where a nested string literal's quote must be bare, not backslash-escaped). */
+static unsigned int decode_string_escapes(const char* s, unsigned int len, char* out) {
+    unsigned int o = 0;
+    for (unsigned int i = 0; i < len; i++) {
+        if (s[i] == '\\' && i + 1 < len) {
+            i++;
+            switch (s[i]) {
+                case 'n':  out[o++] = '\n'; break;
+                case 't':  out[o++] = '\t'; break;
+                case '\\': out[o++] = '\\'; break;
+                case '"':  out[o++] = '"';  break;
+                /* `\{` suppresses interpolation (the pre-scan above already treats it as escaped,
+                   never as an interpolation start), so it must unescape to a bare '{' the same
+                   way `\"` unescapes to a bare '"' — without this case it fell through to
+                   `default`, leaving a literal backslash in the output alongside the brace. */
+                case '{':  out[o++] = '{';  break;
+                default:   out[o++] = '\\'; out[o++] = s[i]; break;
+            }
+        } else {
+            out[o++] = s[i];
+        }
+    }
+    return o;
+}
+
 /* Plain string literals only (see parse_string_literal for `"...{name}..."` interpolation). Needed
    because dict literals' keys must be strings. */
 static unsigned int pool_escaped_string(Chunk* c, const char* s, unsigned int len) {
@@ -1039,26 +1070,7 @@ static unsigned int pool_escaped_string(Chunk* c, const char* s, unsigned int le
         error_at("String literal too long (max %u bytes)", (unsigned int)sizeof(buf) - 1);
         len = 0;
     }
-    unsigned int out = 0;
-    for (unsigned int i = 0; i < len; i++) {
-        if (s[i] == '\\' && i + 1 < len) {
-            i++;
-            switch (s[i]) {
-                case 'n':  buf[out++] = '\n'; break;
-                case 't':  buf[out++] = '\t'; break;
-                case '\\': buf[out++] = '\\'; break;
-                case '"':  buf[out++] = '"';  break;
-                /* `\{` suppresses interpolation (the pre-scan above already treats it as escaped,
-                   never as an interpolation start), so it must unescape to a bare '{' the same
-                   way `\"` unescapes to a bare '"' — without this case it fell through to
-                   `default`, leaving a literal backslash in the output alongside the brace. */
-                case '{':  buf[out++] = '{';  break;
-                default:   buf[out++] = '\\'; buf[out++] = s[i]; break;
-            }
-        } else {
-            buf[out++] = s[i];
-        }
-    }
+    unsigned int out = decode_string_escapes(s, len, buf);
     char* owned = xmalloc((size_t)out + 1);
     memcpy(owned, buf, out);
     owned[out] = '\0';
@@ -1098,11 +1110,31 @@ static bool binary_op_info(TokenType t, unsigned int* prec, Opcode* op) {
     }
 }
 
-/* String literals with `{name}` interpolation: literal segments and interpolated values
-   concatenate via OP_BINARY(OP_ADD) into registers, and a `{name}`'s value-to-string step goes
-   through OP_UNARY's folded-in OP_TO_STR case. Interpolated names must already be a defined
-   variable (var_lookup, non-creating) — there's no runtime scope-chain fallback to resolve
-   against. */
+/* Sub-parses `{expr}`'s bracketed text as a genuine expression — calls, arithmetic, indexing,
+   field access, anything parse_binary already handles, not just a bare variable name. Runs in its
+   own independent lexer span (lexer_begin_span) so it can be called from the middle of the OUTER
+   string literal's own raw byte scan below, which never touches the lexer/token machinery itself
+   until parse_string_literal's own final lex() call — save/restore leaves that scan exactly where
+   it found it. The whole span must be consumed by exactly one expression; anything left over
+   (e.g. `{1 2}`) is a parse error. */
+static int parse_interpolated_expr(Chunk* c, const char* text, unsigned int len) {
+    char* decoded = xmalloc((size_t)len + 1);
+    unsigned int decoded_len = decode_string_escapes(text, len, decoded);
+
+    LexerState* saved = lexer_save_state();
+    lexer_begin_span(decoded, decoded_len);
+    free(decoded);   /* lexer_begin_span copies it into its own owned buffer */
+    lex();
+    int rk = parse_binary(c, 0);
+    if (!parse_had_error && !equal(TOKEN_END_OF_FILE))
+        error_at("Unexpected token in string interpolation");
+    lexer_restore_state(saved);
+    return rk;
+}
+
+/* String literals with `{expr}` interpolation: literal segments and interpolated values
+   concatenate via OP_BINARY(OP_ADD) into registers, and an interpolated expression's value-to-
+   string step goes through OP_UNARY's folded-in OP_TO_STR case. */
 static int parse_string_literal(Chunk* c) {
     AerString* ts    = aer_as_string(token.value);
     char*        s   = ts->data;
@@ -1143,35 +1175,37 @@ static int parse_string_literal(Chunk* c) {
         }
         if (i >= len) break;
 
-        /* Interpolation: {name} */
+        /* Interpolation: {expr} — depth-aware so a nested '{'/'}' (e.g. a dict literal) doesn't
+           end the scan early. A nested STRING literal's own quote characters are NOT specially
+           handled here (the outer lex_string() already decided where the whole string token ends
+           before this function ever runs), so a quote inside an interpolated expression still
+           needs the same \" escaping any other string content would. */
         i++;   /* skip '{' */
-        unsigned int var_start = i;
-        while (i < len && s[i] != '}') i++;
-        if (i >= len) { error_at("Unclosed '{' in string"); break; }
-        if (i == var_start) { error_at("Empty '{}' in string"); i++; continue; }
-
-        unsigned int name_len = i - var_start;
-        char* name_buf = xmalloc((size_t)name_len + 1);
-        memcpy(name_buf, s + var_start, name_len);
-        name_buf[name_len] = '\0';
-        unsigned int name_pool_idx = chunk_add_pool(c, aer_make_string(name_buf, name_len));
-
-        int var_reg;
-        if (!var_lookup_rk(name_pool_idx, &var_reg)) {
-            error_at("'%.*s' is not defined (an interpolated name must already have a value)",
-                     (int)name_len, s + var_start);
+        unsigned int expr_start = i;
+        int depth = 1;
+        while (i < len && depth > 0) {
+            if (s[i] == '\\' && i + 1 < len) { i += 2; continue; }
+            if (s[i] == '{') { depth++; i++; continue; }
+            if (s[i] == '}') { depth--; if (depth == 0) break; i++; continue; }
             i++;
-            continue;
         }
-        /* var_lookup_rk, not raw var_lookup — a raw-tracked name must be boxed before feeding it
-           to OP_TO_STR (bypasses materialize/emit_binary entirely, so this needs its own explicit
-           box_if_raw call; found as a real gap in review — left as var_lookup's plain result, this
-           would silently print whatever unrelated boxed value happens to sit at that register
-           number instead of the interpolated variable's actual value). */
-        var_reg = box_if_raw(c, var_reg);
+        if (depth != 0) { error_at("Unclosed '{' in string"); break; }
+        if (i == expr_start) { error_at("Empty '{}' in string"); i++; continue; }
 
-        int str_dest = reg_alloc();
-        chunk_emit(c, PACK_UNARY(str_dest, OP_TO_STR, var_reg));
+        unsigned int expr_len = i - expr_start;
+        int rk_expr = parse_interpolated_expr(c, s + expr_start, expr_len);
+        if (parse_had_error) { i++; continue; }
+        int expr_reg = materialize(c, rk_expr);
+
+        /* Reuse expr_reg itself as the OP_TO_STR destination when it's already a temp (a call
+           result, an arithmetic expression, ...) instead of allocating a fresh str_dest on top of
+           it — allocating a separate one here would leave expr_reg stranded as a dead temp for
+           the rest of this string literal (reg_free is a LIFO stack: an older temp can never be
+           freed while a newer one, str_dest, is still live on top of it). A non-temp expr_reg (a
+           bare variable's own permanent register) must never be written into, so that case still
+           gets a fresh destination exactly as the old bare-name path always did. */
+        int str_dest = is_temp(expr_reg) ? expr_reg : reg_alloc();
+        chunk_emit(c, PACK_UNARY(str_dest, OP_TO_STR, expr_reg));
 
         if (result < 0) {
             result = str_dest;
@@ -1539,11 +1573,54 @@ static int compile_or(Chunk* c, int lhs, unsigned int prec) {
     return dest;
 }
 
+/* `x |> f(args)` calls f(x, args) unconditionally for an ordinary value — but if x is a Result
+   (io.read()/json.decode()/etc.), the call is conditional: skipped entirely, propagating the same
+   failed Result unchanged, when x's err is non-null; reduced to just x's value (unwrapped in
+   place) when it isn't. Emitted right after `dest` is materialized with `lhs`, before any further
+   pipe-call argument is parsed. Must be paired with compile_pipe_guard_end once the call itself
+   has been emitted. Dispatches on dest's actual runtime type (via the new OP_IS_RESULT), not on
+   anything visible at the call site — an ordinary value takes the "not a Result" branch and is
+   never touched, so `x |> f(args)` for a plain value costs one extra type check over what it cost
+   before Result existed. */
+static unsigned int compile_pipe_guard_begin(Chunk* c, int dest) {
+    int check = reg_alloc();
+    chunk_emit(c, PACK2(OP_IS_RESULT, check, dest));
+    unsigned int patch_not_result = emit_jump_if_false_reg(c, check);
+
+    unsigned int err_idx = chunk_add_pool(c, aer_int(1));
+    emit_index_get(c, check, dest, (int)err_idx | RK_CONST_FLAG);
+    unsigned int null_idx = chunk_add_pool(c, aer_null());
+    emit_binary(c, check, OP_EQ, check, (int)null_idx | RK_CONST_FLAG);
+    unsigned int patch_skip_call = emit_jump_if_false_reg(c, check);
+
+    unsigned int val_idx = chunk_add_pool(c, aer_int(0));
+    emit_index_get(c, dest, dest, (int)val_idx | RK_CONST_FLAG);
+
+    patch_jump(c, patch_not_result, c->count);
+    reg_free(1);   /* `check` — freed before any further pipe-call argument is parsed, restoring
+                       next_temp_register to right after `dest`, exactly where arg_materialize
+                       would put the next argument regardless of whether this guard ran at all */
+    return patch_skip_call;
+}
+
+/* Pairs with compile_pipe_guard_begin: emitted right after the call, jumps the "call happened"
+   path past the (empty) skip block, and patches the skip jump to land at the same spot — dest
+   already holds the original failed Result at that point, so there's nothing left to do there. */
+static void compile_pipe_guard_end(Chunk* c, unsigned int patch_skip_call) {
+    chunk_emit(c, OP_JUMP);
+    unsigned int patch_over_skip = c->count;
+    chunk_emit(c, 0);
+    unsigned int end = c->count;
+    patch_jump(c, patch_skip_call, end);
+    patch_jump(c, patch_over_skip, end);
+}
+
 /* `x |> f(args)` desugars to f(x, args): the piped value becomes argument zero, ahead of
    whatever's inside the parentheses. Reuses parse_call's own function/struct resolution and
    arg_materialize's contiguous-register discipline directly rather than duplicating it — the
    only new part is materializing `lhs` into the argument-zero slot before parsing the rest of
-   the list. */
+   the list. See compile_pipe_guard_begin/_end above for the Result short-circuit wrapped around
+   the actual call in both branches below. */
 static int compile_pipe(Chunk* c, int lhs) {
     if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a function name after '|>'"); return lhs; }
 
@@ -1567,6 +1644,9 @@ static int compile_pipe(Chunk* c, int lhs) {
 
         if (is_temp(lhs)) reg_free(1);
         int arg_reg_base = arg_materialize(c, lhs);
+        int dest = arg_reg_base;
+        unsigned int patch_skip_call = compile_pipe_guard_begin(c, dest);
+
         int arg_count = 1;
         if (!equal(TOKEN_CLOSE_PARENTHESE)) {
             do {
@@ -1578,7 +1658,6 @@ static int compile_pipe(Chunk* c, int lhs) {
         require(TOKEN_CLOSE_PARENTHESE, "expected ')' after pipe call arguments");
         if (parse_had_error) return lhs;
 
-        int dest = arg_reg_base;
         if (arg_count > 1) reg_free(arg_count - 1);
         if (!pool_idx_fits(module_idx, CALL_MODULE_NAME_MAX) || !pool_idx_fits(fn_idx, CALL_MODULE_NAME_MAX)) {
             error_at("Expression too large to compile (module/function name index exceeds the module-call encoding's range)");
@@ -1587,6 +1666,7 @@ static int compile_pipe(Chunk* c, int lhs) {
         chunk_emit(c, PACK_CALL_MODULE(dest, arg_reg_base, arg_count, module_idx, fn_idx));
         chunk_emit(c, module_id);
         chunk_emit(c, fn_id);
+        compile_pipe_guard_end(c, patch_skip_call);
         return dest;
     }
 
@@ -1610,6 +1690,12 @@ static int compile_pipe(Chunk* c, int lhs) {
 
     if (is_temp(lhs)) reg_free(1);
     int arg_reg_base = arg_materialize(c, lhs);
+    int dest = arg_reg_base;
+    /* A struct constructor can never be handed a Result — there's no reasonable meaning for
+       "short-circuit a struct construction" — so the guard is only worth its cost for a real
+       function call. */
+    unsigned int patch_skip_call = is_struct ? 0 : compile_pipe_guard_begin(c, dest);
+
     int arg_count = 1;
     if (!equal(TOKEN_CLOSE_PARENTHESE)) {
         do {
@@ -1621,10 +1707,13 @@ static int compile_pipe(Chunk* c, int lhs) {
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after pipe call arguments");
     if (parse_had_error) return lhs;
 
-    int dest = arg_reg_base;
     if (arg_count > 1) reg_free(arg_count - 1);
-    if (is_struct) emit_struct_new(c, dest, name_idx, arg_reg_base, arg_count);
-    else           emit_call(c, dest, func_offset, arg_reg_base, arg_count);
+    if (is_struct) {
+        emit_struct_new(c, dest, name_idx, arg_reg_base, arg_count);
+    } else {
+        emit_call(c, dest, func_offset, arg_reg_base, arg_count);
+        compile_pipe_guard_end(c, patch_skip_call);
+    }
     return dest;
 }
 
@@ -2966,7 +3055,7 @@ static void parse_import(Chunk* c) {
    is_struct_name, checked before this ever runs. */
 static bool is_builtin_name(Chunk* c, unsigned int name_idx) {
     AerString* s = aer_as_string(c->pool[name_idx]);
-    static const char* const names[] = { "length", "delete", "append", "print", "type", "assert", "panic" };
+    static const char* const names[] = { "length", "delete", "append", "print", "type", "assert", "panic", "Result" };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         size_t len = strlen(names[i]);
         if (s->length == len && strncmp(s->data, names[i], len) == 0) return true;
@@ -2982,6 +3071,7 @@ static int builtin_call_id(AerString* name) {
     if (name->length == 5 && strncmp(name->data, "print", 5) == 0) return CALL_BUILTIN_PRINT;
     if (name->length == 4 && strncmp(name->data, "type", 4) == 0) return CALL_BUILTIN_TYPE;
     if (name->length == 6 && strncmp(name->data, "assert", 6) == 0) return CALL_BUILTIN_ASSERT;
+    if (name->length == 6 && strncmp(name->data, "Result", 6) == 0) return CALL_BUILTIN_RESULT;
     return CALL_BUILTIN_PANIC;
 }
 
@@ -3159,6 +3249,47 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     return dest;
 }
 
+/* Parses one element of a `return` value list. `error(x)` — the identifier `error` immediately
+   followed by `(` — is recognized here as a marker for Result's err slot, sugar for
+   `Result(value, err)` at the return-statement level; anything else, including a plain variable
+   literally named `error`, falls through to an ordinary expression. This makes `error` a reserved
+   word only in this one exact position (the start of a return value, immediately followed by an
+   open paren) — everywhere else, including elsewhere inside a return's own value list, it's a
+   completely ordinary identifier. */
+static int parse_return_value(Chunk* c, bool* is_error_marker) {
+    *is_error_marker = false;
+    if (equal(TOKEN_IDENTIFIER)) {
+        AerString* s = aer_as_string(token.value);
+        if (s->length == 5 && strncmp(s->data, "error", 5) == 0) {
+            lex();
+            if (consume(TOKEN_OPEN_PARENTHESE)) {
+                int rk = parse_binary(c, 0);
+                if (parse_had_error) return rk;
+                require(TOKEN_CLOSE_PARENTHESE, "expected ')' after error(...)'s argument");
+                if (parse_had_error) return rk;
+                *is_error_marker = true;
+                return rk;
+            }
+            error_at("'error' must be called as error(...) in a return statement (e.g. 'return value, error(err)')");
+            return 0;
+        }
+    }
+    return parse_binary(c, 0);
+}
+
+/* reg_base/reg_base+1 already hold (value, err), contiguous — emits exactly the bytecode
+   `Result(value, err)` itself would (see CALL_BUILTIN_RESULT, vm.c), reusing its "exactly one
+   must be null" validation rather than duplicating it, then returns the built Result. */
+static void emit_result_call_and_return(Chunk* c, int reg_base) {
+    reg_free(1);   /* the err register — only dest (== reg_base) stays live past the call, same convention parse_builtin_call's own arg_count>1 case follows */
+    char* name_buf = xmalloc(7);
+    memcpy(name_buf, "Result", 7);
+    unsigned int name_idx = chunk_add_pool(c, aer_make_string(name_buf, 6));
+    chunk_emit(c, PACK_CALL_BUILTIN(reg_base, reg_base, 2, name_idx));
+    chunk_emit(c, (uint64_t)CALL_BUILTIN_RESULT);
+    emit_return(c, reg_base);
+}
+
 /* `return expr` or bare `return` (implicit null). `return a, b, ...` packs into an array
    (OP_ARRAY_NEW): the destructuring-assignment side (parse_assignment's single-RHS-expression
    case, already built for `a, b = some_array_expr`) already treats a call's result as "the array
@@ -3175,21 +3306,62 @@ static void parse_return(Chunk* c) {
     if (function_depth == 0) { error_at("'return' outside function"); return; }
 
     if (!equal(TOKEN_NEW_LINE) && !equal(TOKEN_END_OF_FILE) && !equal(TOKEN_DEDENT)) {
-        int rk_first = parse_binary(c, 0);
+        bool is_error0;
+        int rk_first = parse_return_value(c, &is_error0);
         if (parse_had_error) return;
 
         if (equal(TOKEN_COMMA)) {
+            if (is_error0) { error_at("error(...) must be the last value in a return statement"); return; }
+
             int reg_base = arg_materialize(c, rk_first);
             unsigned int count = 1;
+            /* Deliberately NOT materialized immediately when it's the error slot — see below,
+               where it's the very next thing materialized once the loop confirms it really was
+               last, keeping it contiguous with reg_base with nothing else in between. */
+            bool have_error_slot = false;
+            int  error_rk = 0;
             while (consume(TOKEN_COMMA)) {
-                int rk_next = parse_binary(c, 0);
+                bool is_error_n;
+                int rk_next = parse_return_value(c, &is_error_n);
                 if (parse_had_error) return;
-                arg_materialize(c, rk_next);
+
+                if (have_error_slot) {
+                    /* A value (marker or not) appeared after the error slot — it wasn't last. */
+                    error_at("error(...) must be the last value in a return statement");
+                    return;
+                }
+                if (is_error_n) {
+                    if (count > 1) {
+                        error_at("error(...) may only appear in a 1- or 2-value return (Result has exactly two slots)");
+                        return;
+                    }
+                    have_error_slot = true;
+                    error_rk = rk_next;
+                } else {
+                    arg_materialize(c, rk_next);
+                }
                 count++;
             }
+
+            if (have_error_slot) {
+                arg_materialize(c, error_rk);
+                emit_result_call_and_return(c, reg_base);
+                return;
+            }
+
             reg_free((int)count - 1);
             emit_array_new(c, reg_base, reg_base, (int)count);
             emit_return(c, reg_base);
+            return;
+        }
+
+        if (is_error0) {
+            /* `return error(err)` alone: Result(null, err) — value defaults to null, matching
+               the (value, err) convention's own "exactly one is meaningful" shape. */
+            unsigned int null_idx = chunk_add_pool(c, aer_null());
+            int reg_base = arg_materialize(c, (int)null_idx | RK_CONST_FLAG);
+            arg_materialize(c, rk_first);
+            emit_result_call_and_return(c, reg_base);
             return;
         }
 
@@ -3646,11 +3818,31 @@ static void parse_statement(Chunk* c) {
     if (consume(TOKEN_BREAK))    { parse_break(c);     return; }
     if (consume(TOKEN_CONTINUE)) { parse_continue(c);  return; }
     if (consume(TOKEN_IMPORT))   { parse_import(c);    return; }
-    if (at_module_name(c))    { discard_statement_result(c, parse_module_call(c)); return; }
+    /* A call used as a bare statement may itself be the start of a pipe chain (e.g.
+       `io.read(path) |> json.decode()` with the result discarded) — checked here, right after
+       the call, rather than only recognizing a pipe chain that starts from a bare name
+       (parse_assignment's own TOKEN_PIPE branch) or a field chain (parse_chain_assignment's). */
+    if (at_module_name(c)) {
+        int lhs = parse_module_call(c);
+        if (equal(TOKEN_PIPE)) {
+            unsigned int lhs_start = c->count;
+            lhs = parse_binary_ops(c, 0, lhs, lhs_start);
+        }
+        discard_statement_result(c, lhs);
+        return;
+    }
     if (equal(TOKEN_IDENTIFIER)) {
         unsigned int name_idx = chunk_add_pool(c, token.value);
         lex();
-        if (consume(TOKEN_OPEN_PARENTHESE)) { discard_statement_result(c, parse_call(c, name_idx)); return; }
+        if (consume(TOKEN_OPEN_PARENTHESE)) {
+            int lhs = parse_call(c, name_idx);
+            if (equal(TOKEN_PIPE)) {
+                unsigned int lhs_start = c->count;
+                lhs = parse_binary_ops(c, 0, lhs, lhs_start);
+            }
+            discard_statement_result(c, lhs);
+            return;
+        }
         if (consume(TOKEN_OPEN_BRACKET))    { parse_chain_assignment(c, name_idx, true);  return; }
         if (consume(TOKEN_DOT))             { parse_chain_assignment(c, name_idx, false); return; }
         parse_assignment(c, name_idx);

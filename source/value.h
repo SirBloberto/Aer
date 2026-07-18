@@ -11,6 +11,7 @@ typedef struct AerDict        AerDict;
 typedef struct AerFunction    AerFunction;
 typedef struct AerString      AerString;
 typedef struct AerPackedArray AerPackedArray;
+typedef struct AerResult      AerResult;
 typedef struct Shape       Shape;   /* full definition in vm.h — needs pool-index arrays */
 
 typedef enum ValueType {
@@ -31,6 +32,11 @@ typedef enum ValueType {
        SET's own comment, vm.h, for why (packed indexing is pure arithmetic, so there's nothing a
        standalone reference would save over recomputing it at each access). */
     TYPE_PACKED_ARRAY,
+    /* A tagged (value, err) pair — the stdlib's fallible-function convention (`io.read`,
+       `json.decode`, etc.). Exactly one of the two fields is ever non-null. A real type (not a
+       2-element AerArray) specifically so indexing/truthiness/dispatch can tell a Result apart
+       from an ordinary array on sight, instead of guessing from shape. */
+    TYPE_RESULT,
     /* Not a real value tag — never written into an AerVal.tag, only into Shape.field_types[] (see
        Shape's own comment, vm.h) to mean "this struct field has no declared type." Appended last
        so it can't disturb TYPE_NULL's load-bearing == 0 invariant or any existing tag value. */
@@ -112,6 +118,16 @@ struct AerString {
 };
 _Static_assert(offsetof(struct AerString, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
+/* See TYPE_RESULT's own comment above. Fields are set once at construction (aer_make_result) and
+   never mutated afterward — there's no language-level `result[0] = ...` — so unlike AerArray/
+   AerDict this never needs a write barrier. gc_state first, same reasoning as AerArray above. */
+struct AerResult {
+    unsigned char gc_state;
+    AerVal value;
+    AerVal err;
+};
+_Static_assert(offsetof(struct AerResult, gc_state) == 0, "pool.c assumes gc_state is byte 0");
+
 /* AerDict is defined in vm.h (needs HashTable which is in hashtable.h) */
 
 /* Wraps an existing (data, length) pair in a fresh heap-allocated AerString
@@ -122,6 +138,11 @@ _Static_assert(offsetof(struct AerString, gc_state) == 0, "pool.c assumes gc_sta
    use it too, not just the VM itself. Internal-only (not part of the public
    embedding surface) — see include/aer.h for what host code actually uses. */
 AerVal aer_make_string(char* data, unsigned int length);
+
+/* Builds a Result from a native module's (value, err) pair — exactly one of the two should be
+   null. Defined in vm.c (needs pool_alloc); declared here so stdlib modules (aer_io.c,
+   aer_json.c) can use it without reaching into vm.c internals. */
+AerVal aer_make_result(AerVal value, AerVal err);
 
 /* Accessors for AerVal above — every read/write of its payload goes through one of these, never a
    direct `.as.x` elsewhere, so the representation can change again without touching call sites. */
@@ -157,6 +178,7 @@ static inline AerVal aer_function_val(AerFunction* f)  { return aer_box_ptr(TYPE
 static inline AerVal aer_array_val(AerArray* a)        { return aer_box_ptr(TYPE_ARRAY, a); }
 static inline AerVal aer_dict_val(AerDict* d)          { return aer_box_ptr(TYPE_DICT, d); }
 static inline AerVal aer_packed_array_val(AerPackedArray* a) { return aer_box_ptr(TYPE_PACKED_ARRAY, a); }
+static inline AerVal aer_result_val(AerResult* r)       { return aer_box_ptr(TYPE_RESULT, r); }
 
 static inline bool      aer_as_bool(AerVal v) { return v.as.b; }
 static inline double    aer_as_real(AerVal v) { return v.as.d; }
@@ -167,6 +189,7 @@ static inline AerFunction* aer_as_function(AerVal v) { return (AerFunction*)v.as
 static inline AerArray*    aer_as_array(AerVal v)     { return (AerArray*)v.as.ptr; }
 static inline AerDict*     aer_as_dict(AerVal v)      { return (AerDict*)v.as.ptr; }
 static inline AerPackedArray* aer_as_packed_array(AerVal v) { return (AerPackedArray*)v.as.ptr; }
+static inline AerResult*      aer_as_result(AerVal v)        { return (AerResult*)v.as.ptr; }
 
 /* Integer and real are both "a number" as far as most native-module math/time functions are
    concerned — coerces either into a plain double, false for any other type. */

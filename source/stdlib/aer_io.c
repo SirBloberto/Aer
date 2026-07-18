@@ -7,22 +7,11 @@
 
 /* io is a host-registered module, not hardcoded like math/random/string — see aer_stdlib.h; registered once by main.c, and embed_smoke_test.c deliberately never registers it, proving file access is opt-in. */
 
-#define MAX_OPEN_FILES 16
-
-static FILE* open_files[MAX_OPEN_FILES];
-static char  open_modes[MAX_OPEN_FILES];
-
-/* Builds a Go-style (ok, err) pair the same way string.split does — a "multi-return" is just a TYPE_ARRAY value (see parse_return/OP_UNPACK), so that's all `value, err = io.open(...)` needs. */
-static AerVal make_pair(AerVal ok, AerVal err) {
-    AerArray* r = vm_new_array();
-    r->count    = 2;
-    r->capacity = 2;
-    r->items    = xmalloc(sizeof(AerVal) * 2);
-    r->items[0] = ok;
-    r->items[1] = err;
-    r->shape    = NULL;
-    return aer_array_val(r);
-}
+/* io.stdin()'s handle — the only "handle" concept left in this API. Every other operation is
+   one-shot and path-based (open, do the thing, close, all inside the native call), so there's no
+   persistent file table to manage anymore. */
+#define STDIN_HANDLE 0
+static FILE* stdin_file = NULL;
 
 static AerVal make_error(const char* msg) {
     size_t n   = strlen(msg);
@@ -31,46 +20,7 @@ static AerVal make_error(const char* msg) {
     return aer_make_string(buf, (unsigned int)n);
 }
 
-static AerVal io_open(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)userdata;
-    if (arg_count != 2 || aer_type(args[0]) != TYPE_STRING || aer_type(args[1]) != TYPE_STRING) {
-        error("io.open() requires a path and a mode string");
-        return aer_null();
-    }
-    const char* path = aer_as_string(args[0])->data;
-    const char* mode = aer_as_string(args[1])->data;
-    if (strcmp(mode, "r") != 0 && strcmp(mode, "w") != 0 && strcmp(mode, "a") != 0) {
-        error("io.open() mode must be \"r\", \"w\", or \"a\"");
-        return aer_null();
-    }
-
-    int slot = -1;
-    for (int i = 0; i < MAX_OPEN_FILES; i++) {
-        if (!open_files[i]) { slot = i; break; }
-    }
-    if (slot < 0) return make_pair(aer_null(), make_error("Too many open files"));
-
-    FILE* fp = fopen(path, mode);
-    if (!fp) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "%s: %s", path, strerror(errno));
-        return make_pair(aer_null(), make_error(buf));
-    }
-    open_files[slot] = fp;
-    open_modes[slot] = mode[0];
-
-    return make_pair(aer_int(slot), aer_null());
-}
-
-/* Shared by io_read/io_write/io_close — a handle is a bounds-checked index into open_files; anything else is a wrong-type arg (caller's job to reject) or a stale/closed handle (this function's job). */
-static FILE* handle_file(AerVal h) {
-    if (aer_type(h) != TYPE_INTEGER) return NULL;
-    int64_t i = aer_as_int(h);
-    if (i < 0 || i >= MAX_OPEN_FILES) return NULL;
-    return open_files[i];
-}
-
-/* stdin (or any non-seekable stream) can't be pre-sized via fseek/ftell, so read until EOF into a growing buffer — the same io.read(handle) call site the caller can't tell apart from a normal file. */
+/* stdin (or any non-seekable stream) can't be pre-sized via fseek/ftell, so read until EOF into a growing buffer. */
 static AerVal io_read_until_eof(FILE* fp) {
     size_t cap = 4096, len = 0;
     char*  buf = xmalloc(cap);
@@ -82,81 +32,101 @@ static AerVal io_read_until_eof(FILE* fp) {
     }
     buf = xrealloc(buf, len + 1);
     buf[len] = '\0';
-    return make_pair(aer_make_string(buf, (unsigned int)len), aer_null());
+    return aer_make_result(aer_make_string(buf, (unsigned int)len), aer_null());
 }
 
-static AerVal io_read(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)userdata;
-    if (arg_count != 1 || aer_type(args[0]) != TYPE_INTEGER) {
-        error("io.read() requires a handle");
-        return aer_null();
-    }
-    FILE* fp = handle_file(args[0]);
-    if (!fp) return make_pair(aer_null(), make_error("Invalid or closed file handle"));
-    if (open_modes[aer_as_int(args[0])] != 'r')
-        return make_pair(aer_null(), make_error("File handle is not open for reading"));
-
+/* Shared by the path-open and stdin branches of io_read — tries the fast seek-and-presize path
+   first, falling back to io_read_until_eof for a non-seekable stream (fseek fails on a pipe). */
+static AerVal io_read_fp(FILE* fp) {
     if (fseek(fp, 0, SEEK_END) != 0) return io_read_until_eof(fp);
     long size = ftell(fp);
-    if (size < 0) return make_pair(aer_null(), make_error(strerror(errno)));
+    if (size < 0) return aer_make_result(aer_null(), make_error(strerror(errno)));
     fseek(fp, 0, SEEK_SET);
 
     char*  buf   = xmalloc((size_t)size + 1);
     size_t nread = fread(buf, 1, (size_t)size, fp);
     buf[nread] = '\0';
+    return aer_make_result(aer_make_string(buf, (unsigned int)nread), aer_null());
+}
 
-    return make_pair(aer_make_string(buf, (unsigned int)nread), aer_null());
+/* io.read(path) opens, reads the whole file, and closes it in one call; io.read(io.stdin())
+   reads the already-open stdin stream instead — the only handle-shaped value this API still
+   produces, since there's no path for piped input. */
+static AerVal io_read(VM* vm, int arg_count, AerVal* args, void* userdata) {
+    (void)vm; (void)userdata;
+    if (arg_count != 1) {
+        error("io.read() requires a path string or io.stdin()'s handle");
+        return aer_null();
+    }
+
+    if (aer_type(args[0]) == TYPE_STRING) {
+        const char* path = aer_as_string(args[0])->data;
+        FILE* fp = fopen(path, "r");
+        if (!fp) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s: %s", path, strerror(errno));
+            return aer_make_result(aer_null(), make_error(buf));
+        }
+        AerVal result = io_read_fp(fp);
+        fclose(fp);
+        return result;
+    }
+    if (aer_type(args[0]) == TYPE_INTEGER && aer_as_int(args[0]) == STDIN_HANDLE) {
+        return io_read_fp(stdin_file);
+    }
+    error("io.read() requires a path string or io.stdin()'s handle");
+    return aer_null();
+}
+
+/* Shared by io_write/io_append — opens `path` in `mode`, writes the whole string, closes it. */
+static AerVal io_write_mode(AerVal path_v, AerVal data_v, const char* mode) {
+    const char* path = aer_as_string(path_v)->data;
+    FILE* fp = fopen(path, mode);
+    if (!fp) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s: %s", path, strerror(errno));
+        return aer_make_result(aer_null(), make_error(buf));
+    }
+    AerString* s = aer_as_string(data_v);
+    size_t written = fwrite(s->data, 1, s->length, fp);
+    fclose(fp);
+    if (written != s->length) return aer_make_result(aer_null(), make_error(strerror(errno)));
+    return aer_make_result(aer_null(), aer_null());
 }
 
 static AerVal io_write(VM* vm, int arg_count, AerVal* args, void* userdata) {
     (void)vm; (void)userdata;
-    if (arg_count != 2 || aer_type(args[0]) != TYPE_INTEGER || aer_type(args[1]) != TYPE_STRING) {
-        error("io.write() requires a handle and a string");
+    if (arg_count != 2 || aer_type(args[0]) != TYPE_STRING || aer_type(args[1]) != TYPE_STRING) {
+        error("io.write() requires a path and a string");
         return aer_null();
     }
-    FILE* fp = handle_file(args[0]);
-    if (!fp) return make_pair(aer_null(), make_error("Invalid or closed file handle"));
-    if (open_modes[aer_as_int(args[0])] == 'r')
-        return make_pair(aer_null(), make_error("File handle is not open for writing"));
-
-    AerString*   s       = aer_as_string(args[1]);
-    unsigned int n       = s->length;
-    size_t       written = fwrite(s->data, 1, n, fp);
-    if (written != n) return make_pair(aer_null(), make_error(strerror(errno)));
-
-    return make_pair(aer_null(), aer_null());
+    return io_write_mode(args[0], args[1], "w");
 }
 
-static AerVal io_close(VM* vm, int arg_count, AerVal* args, void* userdata) {
+static AerVal io_append(VM* vm, int arg_count, AerVal* args, void* userdata) {
     (void)vm; (void)userdata;
-    if (arg_count != 1 || aer_type(args[0]) != TYPE_INTEGER) {
-        error("io.close() requires a handle");
+    if (arg_count != 2 || aer_type(args[0]) != TYPE_STRING || aer_type(args[1]) != TYPE_STRING) {
+        error("io.append() requires a path and a string");
         return aer_null();
     }
-    FILE* fp = handle_file(args[0]);
-    if (!fp) return make_pair(aer_null(), make_error("Invalid or already-closed file handle"));
-
-    fclose(fp);
-    open_files[aer_as_int(args[0])] = NULL;
-    return make_pair(aer_null(), aer_null());
+    return io_write_mode(args[0], args[1], "a");
 }
 
-/* Always handle 0 — reserved in aer_io_register() before any io.open() call could claim it (io_open scans from index 0); a call like every other io function since there's no module-constant mechanism, and closing stdin's handle works like any other. */
+/* Always handle 0 — the one reserved handle. Same call site as every other io function; kept
+   since there's no module-constant mechanism, and it's the only way to reach piped stdin data. */
 static AerVal io_stdin(VM* vm, int arg_count, AerVal* args, void* userdata) {
     (void)vm; (void)args; (void)userdata;
     if (arg_count != 0) {
         error("io.stdin() takes no arguments");
         return aer_null();
     }
-    return aer_int(0);
+    return aer_int(STDIN_HANDLE);
 }
 
 void aer_io_register(void) {
-    open_files[0] = stdin;
-    open_modes[0] = 'r';
-    aer_register_function("io", "open",  io_open,  NULL);
-    aer_register_function("io", "read",  io_read,  NULL);
-    aer_register_function("io", "write", io_write, NULL);
-    aer_register_function("io", "close", io_close, NULL);
-    aer_register_function("io", "stdin", io_stdin, NULL);
+    stdin_file = stdin;
+    aer_register_function("io", "read",   io_read,   NULL);
+    aer_register_function("io", "write",  io_write,  NULL);
+    aer_register_function("io", "append", io_append, NULL);
+    aer_register_function("io", "stdin",  io_stdin,  NULL);
 }

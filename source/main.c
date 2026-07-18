@@ -23,6 +23,13 @@ static void run_shell();
 static bool run_file(char* path);
 static void help();
 
+#ifdef AER_DEBUG_TOOLS
+/* Set by main()'s own argv scan below, read by run_file()'s dump block. Only meaningful in this
+   debug-tools build (aer-debug) — the regular aer binary has none of debug_hits/aer_disassemble's
+   supporting Chunk fields at all (see vm.h), so there's nothing for this flag to control there. */
+static const char* debug_dump_path = NULL;
+#endif
+
 int main(int argc, char** argv) {
     chunk_init(&chunk);
     vm_init(&vm, &chunk);
@@ -33,6 +40,25 @@ int main(int argc, char** argv) {
        process's life; resetting it here and never again is what lets a REPL session's later lines
        see an earlier line's variables/functions. See parser_reset's own comment (parser.c). */
     parser_reset();
+
+#ifdef AER_DEBUG_TOOLS
+    /* `--debug-path=<path>` is filtered out of argv here, before help/version/run_file ever see
+       it, so it can appear alongside a script path in any position without disturbing the
+       existing argc==1/help/version/file dispatch below. */
+    int    real_argc = 1;
+    char** real_argv = xmalloc(sizeof(char*) * (size_t)argc);
+    real_argv[0] = argv[0];
+    for (int i = 1; i < argc; i++) {
+        static const char prefix[] = "--debug-path=";
+        if (strncmp(argv[i], prefix, sizeof(prefix) - 1) == 0) {
+            debug_dump_path = argv[i] + sizeof(prefix) - 1;
+        } else {
+            real_argv[real_argc++] = argv[i];
+        }
+    }
+    argc = real_argc;
+    argv = real_argv;
+#endif
 
     int status = 0;
     if (argc == 1) {
@@ -83,7 +109,18 @@ static void run_shell() {
 
     while (1) {
         char* line = handle_terminal();
-        if (!line) continue;
+        if (!line) {
+            /* Ctrl-C (handle_terminal's own NULL return) — abandon whatever multi-line block
+               was in progress, exactly like Python's REPL, rather than leaving in_block/
+               block_buf pointing at a now-stale, partially-typed statement the next line would
+               otherwise silently keep appending to. */
+            free(block_buf);
+            block_buf  = NULL;
+            block_size = 0;
+            in_block   = false;
+            set_terminal_prompt(">>> ");
+            continue;
+        }
 
         size_t len = strlen(line);
 
@@ -137,13 +174,13 @@ static bool run_file(char* path) {
     read_file(path);
     run();
 #ifdef AER_DEBUG_TOOLS
-    /* AER_DISASSEMBLE unset: skip entirely, zero cost. Set to a path: write there. Set to "-" (or
-       anything else, e.g. empty): stderr. Checked after run() so both the static bytecode and the
-       full run's dispatch/hit counts are available together in one dump. */
-    const char* dump_path = getenv("AER_DISASSEMBLE");
+    /* --debug-path=<path> unset: skip entirely, zero cost. Set to a path: write there. Set to "-"
+       (or anything else, e.g. empty): stderr. Checked after run() so both the static bytecode and
+       the full run's dispatch/hit counts are available together in one dump. */
+    const char* dump_path = debug_dump_path;
     if (dump_path) {
         FILE* dump_out = strcmp(dump_path, "-") == 0 ? stderr : fopen(dump_path, "w");
-        if (!dump_out) { fprintf(stderr, "AER_DISASSEMBLE: could not open '%s' for writing\n", dump_path); dump_out = stderr; }
+        if (!dump_out) { fprintf(stderr, "--debug-path: could not open '%s' for writing\n", dump_path); dump_out = stderr; }
         aer_disassemble(&chunk, dump_out);
         aer_debug_memory_report(dump_out);
         if (dump_out != stderr) fclose(dump_out);
@@ -159,4 +196,8 @@ static void help() {
     printf("  version   Show Aer version\n");
     printf("  <file>    Execute an Aer source file\n");
     printf("  (no args) Start interactive shell\n");
+#ifdef AER_DEBUG_TOOLS
+    printf("  --debug-path=<path>  Write a disassembly + hit-count/memory dump here after running\n");
+    printf("                       <file> (\"-\" for stderr)\n");
+#endif
 }

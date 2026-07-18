@@ -4,6 +4,10 @@
 # Machine-checked via assert(): a clean run exits 0; any failure prints
 # "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
 
+import io
+import json
+import string
+
 # ------------------------------------------------------------------ #
 # 16. Functions                                                        #
 # ------------------------------------------------------------------ #
@@ -49,8 +53,8 @@ assert(dispatch["add"](10, 20) == 30, "function stored in a dict, called via key
 function no_return():
     x = 1
 
-result = no_return()
-assert(result == null, "falling off the end of a function returns null")
+fallthrough_result = no_return()
+assert(fallthrough_result == null, "falling off the end of a function returns null")
 
 # ------------------------------------------------------------------ #
 # 17. Anonymous function expressions                                   #
@@ -129,6 +133,100 @@ basket.items |> pipe_stmt_append("added")
 assert(length(basket.items) == 3 && basket.items[2] == "added",
        "a field-chain pipe (a.b |> f(...)) works as a statement too")
 
+# `x |> f(args)` short-circuits when x is a Result (io.read()/json.decode()/etc.): a failed
+# Result skips the call entirely and propagates unchanged; a successful one unwraps to its
+# value before the call runs. An ordinary (non-Result) value is completely unaffected — see
+# pipe_scratch above for proof it still always calls.
+pipe_json_path = "tests/pipe_scratch.json"
+write_ok, write_err = io.write(pipe_json_path, "\{\"name\": \"pipe test\", \"n\": 41}")
+assert(write_err == null, "fixture write for the pipe/Result tests succeeded")
+
+data, decode_err = io.read(pipe_json_path) |> json.decode()
+assert(decode_err == null && data["name"] == "pipe test" && data["n"] == 41,
+       "io.read(path) |> json.decode() unwraps a successful Result before calling the next stage")
+
+missing_data, missing_decode_err = io.read("tests/pipe_scratch_missing.json") |> json.decode()
+assert(missing_data == null && missing_decode_err != null,
+       "a failed io.read() short-circuits the chain -- json.decode() never runs")
+assert(string.contains(missing_decode_err, "No such file"),
+       "the propagated error is io.read()'s own file error, not a JSON parse error -- proves json.decode() was actually skipped, not just erroring on a null input")
+
+function bump(n, amount):
+    return n + amount
+
+bump_data, bump_err = io.read(pipe_json_path) |> json.decode()
+bumped = bump_data["n"] |> bump(1)
+assert(bump_err == null && bumped == 42,
+       "a chain can keep going after an unwrap -- the pipe operator's own short-circuit check only ever fires for a genuine Result, never for an ordinary value like the unwrapped int here")
+
+# A pipe chain starting from a CALL (not a bare name) used as a bare statement, its result
+# discarded -- e.g. `io.read(path) |> json.decode()` on its own line. This is a distinct code
+# path from the bare-name pipe-as-statement case above: a statement beginning with a module
+# call (or any other call) used to be parsed and returned from immediately, with no check for
+# a trailing pipe at all, so `io.read(path) |> json.decode()` as a standalone statement was a
+# parse error even though the identical expression worked fine on an assignment's right-hand
+# side.
+increment(1, 1) |> square2()               # a plain (non-module) call leading a pipe statement
+io.read(pipe_json_path) |> json.decode()   # a module call leading a pipe statement
+
+# Result() -- the only way AER source itself can construct a genuine Result, so a
+# user-written fallible function can participate in `|>`'s short-circuit the same way
+# io.read()/json.decode() do.
+function parse_positive(n):
+    if n <= 0:
+        return Result(null, "must be positive")
+    return Result(n, null)
+
+r_ok = parse_positive(5)
+assert(type(r_ok) == "Result", "Result() builds a genuine Result, not a plain array")
+assert(r_ok, "a successful Result is truthy")
+
+# == on a Result -- reference equality, same as arrays/dicts, rather than falling through to a
+# generic "Type mismatch in binary expression" error.
+r_ok_same_ref = r_ok
+r_ok_other = parse_positive(5)
+assert(r_ok == r_ok_same_ref, "== is true for the same Result reference")
+assert(!(r_ok == r_ok_other), "== is false for two separately-built, equal-looking Results (reference equality, not structural)")
+assert(r_ok != r_ok_other, "!= is the inverse of ==")
+
+function double_it(n):
+    return Result(n * 2, null)
+
+doubled, double_err = parse_positive(5) |> double_it()
+assert(double_err == null && doubled == 10,
+       "a user function built with Result() composes with |>'s short-circuit exactly like a native stdlib call")
+
+skipped, skip_err = parse_positive(-5) |> double_it()
+assert(skipped == null && skip_err == "must be positive",
+       "a failing user-constructed Result short-circuits the chain too -- double_it() never runs")
+
+# `return value, error(err)` / `return error(err)` -- sugar over Result(value, err) recognized
+# only in a return statement's own value list (the identifier `error` immediately followed by
+# `(`); everywhere else, including a plain variable literally named `error`, it's an ordinary
+# identifier.
+function parse_positive_v2(n):
+    if n <= 0:
+        return error("must be positive")
+    return n, error(null)
+
+ok_val, ok_err = parse_positive_v2(5)
+assert(ok_err == null && ok_val == 5, "return value, error(null) builds a successful Result")
+assert(type(Result(1, null)) == type(parse_positive_v2(5)),
+       "return value, error(err) produces the exact same Result type as Result(value, err) directly")
+
+bad_val, bad_err = parse_positive_v2(-1)
+assert(bad_val == null && bad_err == "must be positive",
+       "return error(err) alone defaults the value to null")
+
+doubled_v2, double_err_v2 = parse_positive_v2(5) |> double_it()
+assert(double_err_v2 == null && doubled_v2 == 10,
+       "a return-error(...)-built Result composes with |>'s short-circuit exactly like Result() does")
+
+# `error` remains an ordinary identifier everywhere else, including elsewhere in the same
+# return's value list -- only "error(" right at the start of a return value is special.
+error = "not a keyword"
+assert(error == "not a keyword", "error is an ordinary variable name outside a return statement")
+
 # Calling a function value reached through indexing/field access, as a bare
 # statement (not assigned to anything) — functions stored in an array/dict
 # and dispatched dynamically is a common pattern once functions are
@@ -194,5 +292,27 @@ assert(add3(1, 2, 3) == 6, "two trailing defaults, both supplied — no default 
 
 f = greet
 assert(f("Value") == "Hello, Value!", "a default still applies through a function-value call (OP_CALL_VALUE), not just a named call")
+
+# ------------------------------------------------------------------ #
+# 22. String ordering and `in` (kept here, not test_core.aer -- that   #
+#     file's constant pool is near the 9-bit RK9 encoding's per-file   #
+#     ceiling; adding more unique string literals there started        #
+#     failing with "Expression too large to compile")                 #
+# ------------------------------------------------------------------ #
+
+# The same lexicographic order math.sort() already assumes for strings (aer_math.c's sort_cmp),
+# exposed as ordinary comparison operators instead of only being reachable through sort().
+assert("apple" < "banana", "string < is lexicographic")
+assert(!("banana" < "apple"), "string < is false the other way around")
+assert("apple" <= "apple", "string <= includes equal strings")
+assert("b" > "a", "string >")
+assert("ab" < "abc", "a proper prefix sorts before the longer string")
+
+# Substring membership via `in` -- strings are otherwise full collection citizens (indexable,
+# sliceable, iterable, length()-able); `in` used to reject them entirely, forcing
+# string.contains() to exist as the only way to ask this question.
+assert("ell" in "hello", "in finds a substring")
+assert(!("xyz" in "hello"), "in correctly reports a non-substring as absent")
+assert("" in "hello", "an empty needle is trivially in any string")
 
 print("test_functions.aer: all assertions passed.")

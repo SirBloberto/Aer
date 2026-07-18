@@ -151,23 +151,22 @@ import io
 
 scratch_path = "tests/io_scratch.txt"
 
-f, open_err = io.open(scratch_path, "w")
-assert(open_err == null, "io.open() in write mode succeeds and returns no error")
-write_result, write_err = io.write(f, "hello from AER\nsecond line")
+write_result, write_err = io.write(scratch_path, "hello from AER\nsecond line")
 assert(write_err == null, "io.write() succeeds and returns no error")
-close_result, close_err = io.close(f)
-assert(close_err == null, "io.close() succeeds and returns no error")
 
-f2, open_err2 = io.open(scratch_path, "r")
-assert(open_err2 == null, "io.open() in read mode succeeds on a file just written")
-contents, read_err = io.read(f2)
+contents, read_err = io.read(scratch_path)
 assert(read_err == null && contents == "hello from AER\nsecond line",
        "io.read() returns exactly what was written")
-io.close(f2)
 
-missing_handle, missing_err = io.open("tests/definitely_does_not_exist.txt", "r")
-assert(missing_handle == null && missing_err != null,
-       "io.open() on a nonexistent file returns a null handle and a non-null error")
+missing_contents, missing_err = io.read("tests/definitely_does_not_exist.txt")
+assert(missing_contents == null && missing_err != null,
+       "io.read() on a nonexistent file returns a null value and a non-null error")
+
+append_result, append_err = io.append(scratch_path, "\nthird line")
+assert(append_err == null, "io.append() succeeds and returns no error")
+appended_contents, appended_read_err = io.read(scratch_path)
+assert(appended_read_err == null && appended_contents == "hello from AER\nsecond line\nthird line",
+       "io.append() adds to the end of an existing file rather than truncating it")
 
 # ------------------------------------------------------------------ #
 # json — encode/decode (a native module, same dispatch as math/string) #
@@ -179,6 +178,17 @@ assert(json.encode(null) == "null", "json.encode(null)")
 assert(json.encode(true) == "true", "json.encode(true)")
 assert(json.encode(42) == "42", "json.encode() on an integer")
 assert(json.encode("hi") == "\"hi\"", "json.encode() on a plain string")
+
+# A whole-number real must round-trip as a real, not silently become an integer -- json.encode()
+# used to emit a bare "5" for 5.0 (plain "%g" formatting drops the decimal point), and
+# json.decode()'s own number parser only recognizes a token as real if it contains '.'/'e', so
+# the type flipped on the way back in. Fixed by guaranteeing the encoded text always shows a
+# decimal point (see aer_format_real, vm.c).
+assert(json.encode(5.0) == "5.0", "json.encode() on a whole-number real keeps its decimal point")
+whole_float_json = json.encode({"price": 5.0})
+decoded_price, price_err = json.decode(whole_float_json)
+assert(price_err == null && type(decoded_price["price"]) == "real" && decoded_price["price"] == 5.0,
+       "json.encode()/decode() round-trips a whole-number real as a real, not an integer")
 
 arr_json = json.encode([1, 2, "three", true, null])
 assert(arr_json == "[1,2,\"three\",true,null]", "json.encode() on a mixed array")

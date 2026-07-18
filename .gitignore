@@ -11,7 +11,7 @@
 
 #Scratch files written/overwritten by tests' own io round-trip tests
 /tests/io_scratch.txt
-/tests/io_mode_scratch.txt
+/tests/pipe_scratch.json
 
 #REPL history, written to the cwd by start_terminal()
 /.aer_history

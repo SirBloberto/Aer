@@ -24,7 +24,7 @@ bool aer_time_call(VM* vm, int fn_id, int arg_count);
 /* Native module, dispatched like math/random/string/time (OP_CALL_MODULE, vm.c) — not host-registered like io, since JSON encode/decode needs no host capability. Still takes Chunk* c (unlike the others above): json_encode_value needs it to resolve struct field names when encoding a struct instance. */
 bool aer_json_call(VM* vm, Chunk* c, int fn_id, int arg_count);
 
-/* Registers the "io" module (open/read/write/close) via aer_register_function — deliberately not wired into the OP_CALL_MODULE switch; file access is opt-in per host (main.c calls this after vm_init(); embed_smoke_test.c doesn't, so its scripts get none). See aer_io.c. */
+/* Registers the "io" module (read/write/append/stdin) via aer_register_function — deliberately not wired into the OP_CALL_MODULE switch; file access is opt-in per host (main.c calls this after vm_init(); embed_smoke_test.c doesn't, so its scripts get none). See aer_io.c. */
 void aer_io_register(void);
 
 #endif

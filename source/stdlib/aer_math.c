@@ -37,12 +37,17 @@ bool aer_math_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_MATH_SQRT && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "sqrt", &x)) return true;
+        if (x < 0) { error("sqrt() requires a non-negative number"); vm_stack_push(vm, aer_null()); return true; }
         vm_stack_push(vm, aer_real(sqrt(x))); return true;
     }
     if (fn_id == FN_MATH_POW && arg_count == 2) {
         AerVal ey = vm_stack_pop(vm); AerVal ex = vm_stack_pop(vm);
         double x, y;
         if (!aer_as_double(ex, &x) || !aer_as_double(ey, &y)) { error("pow() requires two numbers"); vm_stack_push(vm, aer_null()); return true; }
+        /* A negative base with a non-whole exponent has no real result (it's only defined over
+           complex numbers) — same domain-guard shape as sqrt()/log()/log2()/log10() just above,
+           rejecting the case that would otherwise silently produce nan instead of erroring. */
+        if (x < 0 && floor(y) != y) { error("pow() with a negative base requires a whole-number exponent"); vm_stack_push(vm, aer_null()); return true; }
         vm_stack_push(vm, aer_real(pow(x, y))); return true;
     }
     if (fn_id == FN_MATH_FLOOR && arg_count == 1) {

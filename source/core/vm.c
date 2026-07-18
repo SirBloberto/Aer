@@ -11,7 +11,7 @@
 #include "vm.h"
 
 /* Slab pools for heap types confirmed (via every free() site) to never be freed individually — alloc-speed only. Guarded since vm_init() reruns per VM/module import and would otherwise leak slabs. */
-static Pool string_pool, array_pool, dict_pool, function_pool, struct_pool, packed_array_pool;
+static Pool string_pool, array_pool, dict_pool, function_pool, struct_pool, packed_array_pool, result_pool;
 static bool pools_initialized = false;
 
 /* struct_pool holds struct instances (AerArray with shape != NULL) as ONE allocation instead of
@@ -76,6 +76,7 @@ static void vm_pools_init_once(void) {
     pool_init(&function_pool, sizeof(AerFunction),  64);
     pool_init(&struct_pool,   sizeof(AerArray) + MAX_STRUCT_FIELDS * sizeof(AerVal), 64);
     pool_init(&packed_array_pool, sizeof(AerPackedArray), 64);
+    pool_init(&result_pool,   sizeof(AerResult),   64);
     hashtable_pools_init_once();
     pools_initialized = true;
 }
@@ -92,6 +93,7 @@ static bool value_is_young(AerVal v) {
         case TYPE_DICT:     return pool_is_young(&dict_pool,     aer_as_dict(v));
         case TYPE_FUNCTION: return pool_is_young(&function_pool, aer_as_function(v));
         case TYPE_PACKED_ARRAY: return pool_is_young(&packed_array_pool, aer_as_packed_array(v));
+        case TYPE_RESULT:   return pool_is_young(&result_pool,   aer_as_result(v));
         default:            return false;   /* null/boolean/integer/real have no heap cell — integers are never boxed under the tagged representation */
     }
 }
@@ -218,6 +220,14 @@ static void mark_value(AerVal v) {
                the worklist. */
             pool_mark(&packed_array_pool, aer_as_packed_array(v));
             break;
+        case TYPE_RESULT: {
+            AerResult* r = aer_as_result(v);
+            if (!pool_mark(&result_pool, r)) {
+                worklist_push(r->value);
+                worklist_push(r->err);
+            }
+            break;
+        }
         default:
             break;   /* null/boolean/integer/real reference no heap cell — integers are never boxed under the tagged representation */
     }
@@ -270,6 +280,7 @@ static void free_dict(void* cell)     { hashtable_free(&((AerDict*)cell)->map); 
 static void free_function(void* cell) { (void)cell; }   /* nothing to free — no closure upvalues array anymore */
 static void free_struct(void* cell)   { (void)cell; }   /* items lives inline in this same cell — nothing separate to free */
 static void free_packed_array(void* cell) { free(((AerPackedArray*)cell)->data); }
+static void free_result(void* cell)   { (void)cell; }   /* both fields are plain AerVals — nothing separately owned */
 
 /* ------------------------------------------------------------------ */
 /* Generational GC — collection                                        */
@@ -283,6 +294,7 @@ static void gc_collect(VM* vm, bool minor) {
     pool_clear_marks(&function_pool);
     pool_clear_marks(&struct_pool);
     pool_clear_marks(&packed_array_pool);
+    pool_clear_marks(&result_pool);
 
     mark_vm_roots(vm);
     mark_chunk_roots(vm->chunk);
@@ -338,6 +350,7 @@ static void gc_collect(VM* vm, bool minor) {
     pool_sweep(&function_pool, minor, free_function);
     pool_sweep(&struct_pool,   minor, free_struct);
     pool_sweep(&packed_array_pool, minor, free_packed_array);
+    pool_sweep(&result_pool,   minor, free_result);
 }
 
 /* ------------------------------------------------------------------ */
@@ -800,7 +813,18 @@ static const char* vm_type_name(Chunk* c, AerVal v) {
         snprintf(buf, sizeof(buf), "%s[]", aer_as_string(c->pool[pa->shape->name])->data);
         return buf;
     }
+    if (aer_type(v) == TYPE_RESULT) return "Result";
     return type_names[aer_type(v)];
+}
+
+void aer_format_real(double d, char* buf, size_t bufsize) {
+    snprintf(buf, bufsize, "%g", d);
+    /* '.'/'e'/'E' already mark an ordinary real; 'n'/'N'/'i'/'I' cover every case spelling of
+       "nan"/"inf"/"-inf" — none of those need (or should get) a trailing ".0" appended. */
+    if (!strpbrk(buf, ".eEnNiI")) {
+        size_t len = strlen(buf);
+        if (len + 3 <= bufsize) { buf[len] = '.'; buf[len + 1] = '0'; buf[len + 2] = '\0'; }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -814,7 +838,7 @@ static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) 
     switch (aer_type(v)) {
         case TYPE_NULL:     strbuf_append(sb, "null"); break;
         case TYPE_INTEGER:  snprintf(tmp, sizeof(tmp), "%lld", aer_as_int(v));  strbuf_append(sb, tmp); break;
-        case TYPE_REAL:     snprintf(tmp, sizeof(tmp), "%g",   aer_as_real(v)); strbuf_append(sb, tmp); break;
+        case TYPE_REAL:     aer_format_real(aer_as_real(v), tmp, sizeof(tmp)); strbuf_append(sb, tmp); break;
         case TYPE_BOOLEAN:  strbuf_append(sb, aer_as_bool(v) ? "true" : "false"); break;
         case TYPE_FUNCTION: strbuf_append(sb, "<function>"); break;
         case TYPE_STRING: {
@@ -873,6 +897,15 @@ static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) 
             strbuf_append(sb, "}");
             break;
         }
+        case TYPE_RESULT: {
+            AerResult* r = aer_as_result(v);
+            strbuf_append(sb, "Result(");
+            vm_format_value(c, r->value, true, sb);
+            strbuf_append(sb, ", ");
+            vm_format_value(c, r->err, true, sb);
+            strbuf_append(sb, ")");
+            break;
+        }
         case TYPE_ANY: break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
     }
 }
@@ -898,6 +931,9 @@ static inline __attribute__((always_inline)) bool vm_truthy(AerVal v) {
         case TYPE_ARRAY:    return aer_as_array(v)->count > 0;
         case TYPE_DICT:     return aer_as_dict(v)->map.count > 0;
         case TYPE_PACKED_ARRAY: return aer_as_packed_array(v)->count > 0;
+        /* "Did this succeed" — `if result { ... }` reads the same way `if err == null` does, just
+           inverted, without needing to destructure first. */
+        case TYPE_RESULT:   return aer_type(aer_as_result(v)->err) == TYPE_NULL;
         case TYPE_ANY:      break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
     }
     return false;
@@ -926,6 +962,7 @@ static bool values_equal(AerVal a, AerVal b) {
         case TYPE_ARRAY:    return aer_as_array(a) == aer_as_array(b);
         case TYPE_DICT:     return aer_as_dict(a) == aer_as_dict(b);
         case TYPE_PACKED_ARRAY: return aer_as_packed_array(a) == aer_as_packed_array(b);
+        case TYPE_RESULT:   return aer_as_result(a) == aer_as_result(b);
         case TYPE_ANY:      break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
     }
     return false;
@@ -1026,7 +1063,19 @@ static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueT
             }
             return aer_bool(false);
         }
-        error("Right side of 'in' must be a dict or array");
+        if (aer_type(b) == TYPE_STRING) {
+            /* Substring search — mirrors string.contains() (aer_string.c) exactly; kept as its
+               own small loop rather than shared, since the two live in different modules with
+               different (stack-based vs. binary-op) calling conventions. */
+            if (aer_type(a) != TYPE_STRING) { error("Left side of 'in' must be a string when testing string membership"); return aer_bool(false); }
+            AerString* needle = aer_as_string(a);
+            AerString* hay    = aer_as_string(b);
+            bool found = needle->length == 0;
+            for (unsigned int i = 0; !found && i + needle->length <= hay->length; i++)
+                if (memcmp(hay->data + i, needle->data, needle->length) == 0) found = true;
+            return aer_bool(found);
+        }
+        error("Right side of 'in' must be a dict, array, or string");
         return aer_bool(false);
     }
 
@@ -1087,6 +1136,20 @@ static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueT
             /* aer_make_string takes ownership of buf directly; no pool interning needed since this string is used once, right here (see vm_to_str's comment). */
             return aer_make_string(buf, len);
         }
+        if (op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE) {
+            /* Same total order math.sort() already assumes and implements for strings
+               (aer_math.c's sort_cmp) — exposed here as the ordinary comparison operators
+               instead of only being reachable indirectly through sort(). */
+            unsigned int n = as->length < bs->length ? as->length : bs->length;
+            int cmp = n > 0 ? memcmp(as->data, bs->data, n) : 0;
+            if (cmp == 0) cmp = (int)as->length - (int)bs->length;
+            switch (op) {
+                case OP_LT:  return aer_bool(cmp < 0);
+                case OP_GT:  return aer_bool(cmp > 0);
+                case OP_LTE: return aer_bool(cmp <= 0);
+                default:     return aer_bool(cmp >= 0);   /* OP_GTE */
+            }
+        }
         error("Operator not valid for strings"); return aer_bool(false);
     }
 
@@ -1102,6 +1165,12 @@ static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueT
         error("Operator not valid for dicts"); return aer_bool(false);
     }
 
+    if (aer_type(a) == TYPE_RESULT && aer_type(b) == TYPE_RESULT) {
+        if (op == OP_EQ)  return aer_bool(aer_as_result(a) == aer_as_result(b));
+        if (op == OP_NEQ) return aer_bool(aer_as_result(a) != aer_as_result(b));
+        error("Operator not valid for Results"); return aer_bool(false);
+    }
+
     error("Type mismatch in binary expression");
     return aer_bool(false);
 }
@@ -1112,7 +1181,7 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
     char*        owned;
     unsigned int len;
 
-    if (aer_type(v) == TYPE_ARRAY || aer_type(v) == TYPE_DICT || aer_type(v) == TYPE_PACKED_ARRAY) {
+    if (aer_type(v) == TYPE_ARRAY || aer_type(v) == TYPE_DICT || aer_type(v) == TYPE_PACKED_ARRAY || aer_type(v) == TYPE_RESULT) {
         /* Unbounded recursive content doesn't fit the fixed buffer below, so reuse print()'s formatter; sb.buf is already a fresh allocation, handed to aer_make_string as-is. */
         StrBuf sb;
         strbuf_init(&sb);
@@ -1125,10 +1194,10 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
         switch (aer_type(v)) {
             case TYPE_NULL:     snprintf(buf, sizeof(buf), "null");                              break;
             case TYPE_INTEGER:  snprintf(buf, sizeof(buf), "%lld", aer_as_int(v));               break;
-            case TYPE_REAL:     snprintf(buf, sizeof(buf), "%g",   aer_as_real(v));               break;
+            case TYPE_REAL:     aer_format_real(aer_as_real(v), buf, sizeof(buf));                 break;
             case TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s",   aer_as_bool(v) ? "true" : "false"); break;
             case TYPE_FUNCTION: snprintf(buf, sizeof(buf), "<function>");                        break;
-            case TYPE_ARRAY: case TYPE_DICT: case TYPE_STRING: case TYPE_PACKED_ARRAY: break;   /* handled above */
+            case TYPE_ARRAY: case TYPE_DICT: case TYPE_STRING: case TYPE_PACKED_ARRAY: case TYPE_RESULT: break;   /* handled above */
             case TYPE_ANY: break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
         }
         len   = (unsigned int)strlen(buf);
@@ -1366,6 +1435,13 @@ AerDict* vm_new_dict(void) {
     return pool_alloc(&dict_pool);
 }
 
+AerVal aer_make_result(AerVal value, AerVal err) {
+    AerResult* r = pool_alloc(&result_pool);
+    r->value = value;
+    r->err   = err;
+    return aer_result_val(r);
+}
+
 AerFunction* vm_new_function(void) {
     return pool_alloc(&function_pool);
 }
@@ -1466,6 +1542,17 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
             error("panic: %.*s", (int)ms->length, ms->data);
             return true;
         }
+        case CALL_BUILTIN_RESULT: {
+            if (arg_count != 2) return false;
+            bool value_is_null = aer_type(args[0]) == TYPE_NULL;
+            bool err_is_null   = aer_type(args[1]) == TYPE_NULL;
+            if (value_is_null == err_is_null) {
+                error("Result() requires exactly one of its two arguments to be null (the value on success, the err on failure)");
+                return true;
+            }
+            *out = aer_make_result(args[0], args[1]);
+            return true;
+        }
     }
     return false;
 }
@@ -1516,6 +1603,17 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         ch_buf[0] = os->data[i];
         ch_buf[1] = '\0';
         *out = aer_make_string(ch_buf, 1); return;   /* no chunk_add_pool interning — see vm_to_str's comment */
+    } else if (aer_type(obj) == TYPE_RESULT) {
+        /* `result[0]` is the value, `result[1]` is the err — the same (value, err) order every
+           stdlib fallible function returns, so destructuring (`a, b = io.read(path)`, which
+           desugars to exactly this indexing) reads them out in the expected order. */
+        if (aer_type(idx) != TYPE_INTEGER) { error("Result index must be an integer"); *out = aer_null(); return; }
+        int64_t i = aer_as_int(idx);
+        AerResult* r = aer_as_result(obj);
+        if (i == 0) { *out = r->value; return; }
+        if (i == 1) { *out = r->err;   return; }
+        error("Result index %lld out of bounds (a Result only has indices 0 and 1)", aer_as_int(idx));
+        *out = aer_null();
     } else {
         error("Cannot index type");
         *out = aer_null();
@@ -1577,7 +1675,20 @@ static AerVal vm_cast(AerVal v, int cast_type) {
                                           ? vs->length : sizeof(buf) - 1;
                     memcpy(buf, vs->data, n);
                     buf[n] = '\0';
-                    r = aer_int(atoll(buf)); break;
+                    /* strtoll, not atoll — atoll returns 0 for a non-numeric string with no way
+                       to tell "parsed as zero" apart from "wasn't a number at all"; checking end
+                       against the buffer's own end (after skipping the same leading whitespace/
+                       sign atoll would) catches that case as a real error instead of fabricating
+                       a plausible-looking wrong number. */
+                    char* end;
+                    long long parsed = strtoll(buf, &end, 10);
+                    while (*end == ' ' || *end == '\t') end++;   /* tolerate trailing whitespace, same as leading */
+                    if (end == buf || *end != '\0') {
+                        error("'%.*s' as integer: not a valid integer", (int)n, buf);
+                        r = aer_int(0);
+                        break;
+                    }
+                    r = aer_int(parsed); break;
                 }
                 default: error("Cannot convert this type to integer"); r = aer_int(0);
             }
@@ -1593,7 +1704,17 @@ static AerVal vm_cast(AerVal v, int cast_type) {
                                           ? vs->length : sizeof(buf) - 1;
                     memcpy(buf, vs->data, n);
                     buf[n] = '\0';
-                    r = aer_real(atof(buf)); break;
+                    /* strtod, not atof — same "distinguish a real 0 from not-a-number-at-all"
+                       reasoning as CAST_INTEGER above. */
+                    char* end;
+                    double parsed = strtod(buf, &end);
+                    while (*end == ' ' || *end == '\t') end++;
+                    if (end == buf || *end != '\0') {
+                        error("'%.*s' as float: not a valid number", (int)n, buf);
+                        r = aer_real(0.0);
+                        break;
+                    }
+                    r = aer_real(parsed); break;
                 }
                 default: error("Cannot convert this type to float"); r = aer_real(0.0);
             }
@@ -1761,6 +1882,7 @@ bool vm_run(VM* vm) {
         [OP_HALT]           = &&lbl_halt,
         [OP_LOADK]       = &&lbl_loadk,
         [OP_MOVE]        = &&lbl_move,
+        [OP_IS_RESULT]   = &&lbl_is_result,
         [OP_JUMP_IF_FALSE_REG] = &&lbl_jump_if_false_reg,
         [OP_CALL]              = &&lbl_call,
         [OP_CALL_VALUE]        = &&lbl_call_value,
@@ -1874,6 +1996,13 @@ lbl_move: {
     int dest = (int)UNPACK_A(op_word);
     int src  = (int)UNPACK_B(op_word);
     vm->registers[dest] = vm->registers[src];
+    DISPATCH();
+}
+
+lbl_is_result: {
+    int dest = (int)UNPACK_A(op_word);
+    int src  = (int)UNPACK_B(op_word);
+    vm->registers[dest] = aer_bool(aer_type(vm->registers[src]) == TYPE_RESULT);
     DISPATCH();
 }
 
@@ -2005,8 +2134,21 @@ lbl_in: {
             if (values_equal(a, arr->items[i])) { found = true; break; }
         }
         *result = aer_bool(found);
+    } else if (aer_type(b) == TYPE_STRING) {
+        /* Substring search — same as vm_binary_cold's own OP_IN case and string.contains() (aer_string.c). */
+        if (aer_type(a) != TYPE_STRING) {
+            error("Left side of 'in' must be a string when testing string membership");
+            *result = aer_bool(false);
+        } else {
+            AerString* needle = aer_as_string(a);
+            AerString* hay    = aer_as_string(b);
+            bool found = needle->length == 0;
+            for (unsigned int i = 0; !found && i + needle->length <= hay->length; i++)
+                if (memcmp(hay->data + i, needle->data, needle->length) == 0) found = true;
+            *result = aer_bool(found);
+        }
     } else {
-        error("Right side of 'in' must be a dict or array");
+        error("Right side of 'in' must be a dict, array, or string");
         *result = aer_bool(false);
     }
     DISPATCH();
