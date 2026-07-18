@@ -9,8 +9,9 @@
 
 /.vscode
 
-#Scratch file written/overwritten by tests/test.aer's io round-trip test
+#Scratch files written/overwritten by tests' own io round-trip tests
 /tests/io_scratch.txt
+/tests/io_mode_scratch.txt
 
 #REPL history, written to the cwd by start_terminal()
 /.aer_history
@@ -31,3 +32,6 @@
 *.o
 perf.data*
 *.perf.data*
+
+#Working conventions for AI-assisted development — kept locally, not shipped in the public tree
+/CLAUDE.md
