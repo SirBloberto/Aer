@@ -1,3 +1,0 @@
-for i in 0..20000000:
-    x = 1
-print("done: {x}")

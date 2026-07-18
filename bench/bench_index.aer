@@ -1,4 +1,0 @@
-arr = [1, 2, 3, 4, 5]
-for i in 0..20000000:
-    x = arr[0]
-print("done: {x}")

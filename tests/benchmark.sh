@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Benchmark AER against Python and Lua across four workloads.
+# Benchmark AER against Python and Lua across seven workloads.
 # Usage: ./benchmark.sh
 # Requirements: python3 (required), lua (optional)
 #
@@ -234,10 +234,10 @@ divider
 
 cat > "$TMP/struct.aer" << 'AER'
 struct Point:
-    x = 0.0
-    y = 0.0
+    x: float = 0.0
+    y: float = 0.0
 
-function translate(p as Point, dx, dy):
+function translate(p, dx, dy):
     return Point(p.x + dx, p.y + dy)
 
 p = Point(0.0, 0.0)
@@ -265,8 +265,8 @@ print(p.x)
 PY
 
 # No direct struct/record equivalent kept for Python/Lua here — this workload
-# exercises AER's receiver-enforcement + dot-access path specifically, not a
-# cross-language comparison. Timed for regression tracking only.
+# exercises AER's struct-field access path specifically, not a cross-language
+# comparison. Timed for regression tracking only.
 time_run "AER" "$AER" "$TMP/struct.aer"
 time_run "Python" "$PYTHON" "$TMP/struct.py"
 
@@ -356,67 +356,6 @@ time_run "AER"    "$AER" "$TMP/call.aer"
 time_run "Python" "$PYTHON" "$TMP/call.py"
 if [ $LUA_AVAILABLE -eq 1 ]; then
     time_run "Lua" "$LUA" "$TMP/call.lua"
-fi
-
-# ── Workload 8: closures (10 000 created + invoked) ──────────────────────────
-# Stresses AER's box-on-capture closure mechanism specifically (allocation
-# from closure_box_pool per capture, plus the indirection every read/write
-# through a captured variable pays) — none of the other workloads create or
-# invoke a closure at all.
-
-divider
-echo "Workload 8 — closures (10 000 created + invoked)"
-divider
-
-cat > "$TMP/closure.aer" << 'AER'
-function make_adder(x):
-    return function(y):
-        return x + y
-
-adders = []
-i = 0
-for i < 10000:
-    append(adders, make_adder(i))
-    i += 1
-
-total = 0
-i = 0
-for i < 10000:
-    total += adders[i](1)
-    i += 1
-print(total)
-AER
-
-cat > "$TMP/closure.py" << 'PY'
-def make_adder(x):
-    return lambda y: x + y
-
-adders = [make_adder(i) for i in range(10000)]
-total = 0
-for a in adders:
-    total += a(1)
-print(total)
-PY
-
-cat > "$TMP/closure.lua" << 'LUA'
-local function make_adder(x)
-    return function(y) return x + y end
-end
-local adders = {}
-for i = 0, 9999 do
-    adders[i + 1] = make_adder(i)
-end
-local total = 0
-for i = 1, 10000 do
-    total = total + adders[i](1)
-end
-print(total)
-LUA
-
-time_run "AER"    "$AER" "$TMP/closure.aer"
-time_run "Python" "$PYTHON" "$TMP/closure.py"
-if [ $LUA_AVAILABLE -eq 1 ]; then
-    time_run "Lua" "$LUA" "$TMP/closure.lua"
 fi
 
 divider

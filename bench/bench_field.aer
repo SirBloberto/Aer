@@ -1,9 +1,0 @@
-struct P:
-    x: integer = 0
-
-p = P(1)
-for i in 0..20000000:
-    y = p.x
-    p.x = y + 1
-final = p.x
-print("done: {final}")
