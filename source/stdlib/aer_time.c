@@ -3,17 +3,15 @@
 #include "aer_stdlib.h"
 #include "error.h"
 
-bool aer_time_call(VM* vm, Chunk* c, const char* name, int arg_count) {
-    (void)c;
-
-    if (strcmp(name, "now") == 0 && arg_count == 0) {
+bool aer_time_call(VM* vm, int fn_id, int arg_count) {
+    if (fn_id == FN_TIME_NOW && arg_count == 0) {
         /* Sub-second epoch time via clock_gettime(CLOCK_REALTIME), not time()'s whole seconds, so scripts can measure short durations; used since C11's timespec_get() isn't available on this project's MinGW-w64 target. */
         struct timespec ts = {0};
         clock_gettime(CLOCK_REALTIME, &ts);
         vm_stack_push(vm, aer_real((double)ts.tv_sec + (double)ts.tv_nsec / 1e9)); return true;
     }
 
-    if (strcmp(name, "strftime") == 0 && arg_count == 2) {
+    if (fn_id == FN_TIME_STRFTIME && arg_count == 2) {
         AerVal fmt_v = vm_stack_pop(vm); AerVal ts_v = vm_stack_pop(vm);
         if (aer_type(fmt_v) != TYPE_STRING) { error("time.strftime() requires a format string"); vm_stack_push(vm, aer_null()); return true; }
         double ts_num;

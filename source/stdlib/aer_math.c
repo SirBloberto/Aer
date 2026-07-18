@@ -33,31 +33,29 @@ static int sort_cmp(const void* pa, const void* pb) {
     return da < db ? -1 : (da > db ? 1 : 0);
 }
 
-bool aer_math_call(VM* vm, Chunk* c, const char* name, int arg_count) {
-    (void)c;   /* not needed yet — kept for parity with core builtins and in case a future stdlib function needs it */
-
-    if (strcmp(name, "sqrt") == 0 && arg_count == 1) {
+bool aer_math_call(VM* vm, int fn_id, int arg_count) {
+    if (fn_id == FN_MATH_SQRT && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "sqrt", &x)) return true;
         vm_stack_push(vm, aer_real(sqrt(x))); return true;
     }
-    if (strcmp(name, "pow") == 0 && arg_count == 2) {
+    if (fn_id == FN_MATH_POW && arg_count == 2) {
         AerVal ey = vm_stack_pop(vm); AerVal ex = vm_stack_pop(vm);
         double x, y;
         if (!aer_as_double(ex, &x) || !aer_as_double(ey, &y)) { error("pow() requires two numbers"); vm_stack_push(vm, aer_null()); return true; }
         vm_stack_push(vm, aer_real(pow(x, y))); return true;
     }
-    if (strcmp(name, "floor") == 0 && arg_count == 1) {
+    if (fn_id == FN_MATH_FLOOR && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "floor", &x)) return true;
         vm_stack_push(vm, aer_int((int64_t)floor(x))); return true;
     }
-    if (strcmp(name, "ceil") == 0 && arg_count == 1) {
+    if (fn_id == FN_MATH_CEIL && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "ceil", &x)) return true;
         vm_stack_push(vm, aer_int((int64_t)ceil(x))); return true;
     }
-    if (strcmp(name, "abs") == 0 && arg_count == 1) {
+    if (fn_id == FN_MATH_ABS && arg_count == 1) {
         AerVal a = vm_stack_pop(vm);
         if (aer_type(a) == TYPE_INTEGER) {
             int64_t n = aer_as_int(a);
@@ -69,51 +67,51 @@ bool aer_math_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         }
         error("abs() requires a number"); vm_stack_push(vm, aer_null()); return true;
     }
-    if (strcmp(name, "min") == 0 && arg_count == 2) {
+    if (fn_id == FN_MATH_MIN && arg_count == 2) {
         AerVal b = vm_stack_pop(vm); AerVal a = vm_stack_pop(vm);
         double da, db;
         if (!aer_as_double(a, &da) || !aer_as_double(b, &db)) { error("min() requires two numbers"); vm_stack_push(vm, aer_null()); return true; }
         vm_stack_push(vm, da <= db ? a : b); return true;
     }
-    if (strcmp(name, "max") == 0 && arg_count == 2) {
+    if (fn_id == FN_MATH_MAX && arg_count == 2) {
         AerVal b = vm_stack_pop(vm); AerVal a = vm_stack_pop(vm);
         double da, db;
         if (!aer_as_double(a, &da) || !aer_as_double(b, &db)) { error("max() requires two numbers"); vm_stack_push(vm, aer_null()); return true; }
         vm_stack_push(vm, da >= db ? a : b); return true;
     }
-    if (strcmp(name, "sin") == 0 && arg_count == 1) {
+    if (fn_id == FN_MATH_SIN && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "sin", &x)) return true;
         vm_stack_push(vm, aer_real(sin(x))); return true;
     }
-    if (strcmp(name, "cos") == 0 && arg_count == 1) {
+    if (fn_id == FN_MATH_COS && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "cos", &x)) return true;
         vm_stack_push(vm, aer_real(cos(x))); return true;
     }
-    if (strcmp(name, "log") == 0 && arg_count == 1) {
+    if (fn_id == FN_MATH_LOG && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "log", &x)) return true;
         if (x <= 0) { error("log() requires a positive number"); vm_stack_push(vm, aer_null()); return true; }
         vm_stack_push(vm, aer_real(log(x))); return true;
     }
-    if (strcmp(name, "log2") == 0 && arg_count == 1) {
+    if (fn_id == FN_MATH_LOG2 && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "log2", &x)) return true;
         if (x <= 0) { error("log2() requires a positive number"); vm_stack_push(vm, aer_null()); return true; }
         vm_stack_push(vm, aer_real(log2(x))); return true;
     }
-    if (strcmp(name, "log10") == 0 && arg_count == 1) {
+    if (fn_id == FN_MATH_LOG10 && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "log10", &x)) return true;
         if (x <= 0) { error("log10() requires a positive number"); vm_stack_push(vm, aer_null()); return true; }
         vm_stack_push(vm, aer_real(log10(x))); return true;
     }
-    if (strcmp(name, "pi") == 0 && arg_count == 0) {
+    if (fn_id == FN_MATH_PI && arg_count == 0) {
         /* A function, not a bare module value, for consistency with every other native module (none expose non-function bindings yet); literal digits rather than M_PI, which isn't guaranteed defined on every target toolchain. */
         vm_stack_push(vm, aer_real(3.14159265358979323846)); return true;
     }
-    if (strcmp(name, "sort") == 0 && arg_count == 1) {
+    if (fn_id == FN_MATH_SORT && arg_count == 1) {
         AerVal arr = vm_stack_pop(vm);
         if (aer_type(arr) != TYPE_ARRAY) { error("sort() requires an array"); vm_stack_push(vm, aer_null()); return true; }
         AerArray* a = aer_as_array(arr);

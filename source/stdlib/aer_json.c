@@ -311,8 +311,8 @@ static AerVal json_decode(AerString* input, char** err_out) {
 /* dispatch                                                            */
 /* ------------------------------------------------------------------ */
 
-bool aer_json_call(VM* vm, Chunk* c, const char* name, int arg_count) {
-    if (strcmp(name, "encode") == 0 && arg_count == 1) {
+bool aer_json_call(VM* vm, Chunk* c, int fn_id, int arg_count) {
+    if (fn_id == FN_JSON_ENCODE && arg_count == 1) {
         AerVal v = vm_stack_pop(vm);
         StrBuf b;
         strbuf_init(&b);
@@ -324,7 +324,7 @@ bool aer_json_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         vm_stack_push(vm, aer_make_string(b.buf, (unsigned int)b.len));
         return true;
     }
-    if (strcmp(name, "decode") == 0 && arg_count == 1) {
+    if (fn_id == FN_JSON_DECODE && arg_count == 1) {
         AerVal s_v = vm_stack_pop(vm);
         if (aer_type(s_v) != TYPE_STRING) {
             error("json.decode() requires a string");

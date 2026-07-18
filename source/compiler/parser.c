@@ -313,7 +313,6 @@ static int  compile_pipe(Chunk* c, int lhs);
 static void parse_statement(Chunk* c);
 static void parse_block(Chunk* c);
 static void parse_if(Chunk* c);
-static int  parse_if_expr(Chunk* c);
 static void parse_for_while(Chunk* c);
 static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond);
 static void parse_assignment(Chunk* c, unsigned int name_idx);
@@ -326,6 +325,7 @@ static void parse_return(Chunk* c);
 static void parse_struct(Chunk* c);
 static bool at_module_name(Chunk* c);
 static int  module_call_id(AerString* name);
+static int  module_fn_id(int module_id, AerString* name);
 static int  parse_module_call(Chunk* c);
 static void parse_import(Chunk* c);
 static bool is_builtin_name(Chunk* c, unsigned int name_idx);
@@ -357,8 +357,8 @@ static VarKind var_kind[FRAME_REGISTERS];
 
 /* Nonzero while compiling an if/else branch body — see var_kind's own comment above for why this
    disqualifies raw storage. Mirrors function_depth's own "a plain counter is enough" reasoning
-   (parse_if/parse_if_expr bodies can nest, so this does need to be a real counter, not a 0/1 flag,
-   unlike function_depth). */
+   (parse_if bodies can nest, so this does need to be a real counter, not a 0/1 flag, unlike
+   function_depth). */
 static int branch_depth = 0;
 
 /* Nonzero while compiling a function body — lets parse_return reject a top-level `return`. No
@@ -1201,7 +1201,6 @@ static int parse_string_literal(Chunk* c) {
    (`-x`/`!x`/`~x`) sit ABOVE this in the precedence chain — see parse_unary — matching the real
    grammar's parse_binary -> parse_unary -> parse_primary structure. */
 static int parse_primary_inner(Chunk* c) {
-    if (consume(TOKEN_IF)) return parse_if_expr(c);
     if (consume(TOKEN_FUNCTION)) return parse_function_expr(c);
     if (consume(TOKEN_OPEN_PARENTHESE)) {
         int rk = parse_binary(c, 0);
@@ -1560,6 +1559,7 @@ static int compile_pipe(Chunk* c, int lhs) {
         require(TOKEN_DOT, "expected '.' after module name");
         if (parse_had_error) return lhs;
         if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a function name after '.'"); return lhs; }
+        int fn_id = module_fn_id(module_id, aer_as_string(token.value));
         unsigned int fn_idx = chunk_add_pool(c, token.value);
         lex();
         require(TOKEN_OPEN_PARENTHESE, "expected '(' after piped module function name");
@@ -1586,6 +1586,7 @@ static int compile_pipe(Chunk* c, int lhs) {
         }
         chunk_emit(c, PACK_CALL_MODULE(dest, arg_reg_base, arg_count, module_idx, fn_idx));
         chunk_emit(c, module_id);
+        chunk_emit(c, fn_id);
         return dest;
     }
 
@@ -2538,67 +2539,6 @@ static void parse_if(Chunk* c) {
     }
 }
 
-/* Inline if-expression: `if cond: then_val else: else_val` (no newline after ':', unlike the
-   statement form parse_if above — this is an EXPRESSION, reached only from parse_primary_inner).
-   "No else means null". Both branches must converge on ONE result register, so result_reg is
-   allocated BEFORE either branch is compiled, then each branch either LOADKs a constant into it
-   or MOVEs a mismatched register into it (skipping the MOVE when it's already the right
-   register). */
-static int parse_if_expr(Chunk* c) {
-    int rk_cond = parse_binary(c, 0);
-    require(TOKEN_COLON, "expected ':' after if condition");
-    if (parse_had_error) return 0;
-
-    int reg_cond = materialize(c, rk_cond);
-    unsigned int patch_jif = emit_jump_if_false_reg(c, reg_cond);
-    if (is_temp(reg_cond)) reg_free(1);
-
-    int result_reg = reg_alloc();
-
-    /* branch_depth: see parse_if's own comment — expressions can't currently contain assignments,
-       so this can't matter yet, but costs nothing and guards against a future grammar change
-       silently reintroducing the phi/merge problem this counter exists to avoid. */
-    branch_depth++;
-    int rk_then = parse_binary(c, 0);
-    branch_depth--;
-    if (parse_had_error) return result_reg;
-    rk_then = box_if_raw(c, rk_then);   /* a bare raw variable reference (not an assignment) can
-                                            legitimately be this branch's value — box before MOVE */
-    if (rk_then & RK_CONST_FLAG) {
-        chunk_emit(c, PACK1(OP_LOADK, result_reg)); chunk_emit(c, rk_then & ~RK_CONST_FLAG);
-    } else if (rk_then != result_reg) {
-        chunk_emit(c, PACK2(OP_MOVE, result_reg, rk_then));
-        if (is_temp(rk_then)) reg_free(1);
-    }
-
-    chunk_emit(c, OP_JUMP);
-    unsigned int patch_jmp = c->count;
-    chunk_emit(c, 0);
-    patch_jump(c, patch_jif, c->count);
-
-    if (consume(TOKEN_ELSE)) {
-        require(TOKEN_COLON, "expected ':' after else");
-        if (parse_had_error) return result_reg;
-        branch_depth++;
-        int rk_else = parse_binary(c, 0);
-        branch_depth--;
-        if (parse_had_error) return result_reg;
-        rk_else = box_if_raw(c, rk_else);
-        if (rk_else & RK_CONST_FLAG) {
-            chunk_emit(c, PACK1(OP_LOADK, result_reg)); chunk_emit(c, rk_else & ~RK_CONST_FLAG);
-        } else if (rk_else != result_reg) {
-            chunk_emit(c, PACK2(OP_MOVE, result_reg, rk_else));
-            if (is_temp(rk_else)) reg_free(1);
-        }
-    } else {
-        unsigned int null_idx = chunk_add_pool(c, aer_null());
-        chunk_emit(c, PACK1(OP_LOADK, result_reg)); chunk_emit(c, (int)null_idx);
-    }
-
-    patch_jump(c, patch_jmp, c->count);
-    return result_reg;
-}
-
 /* Shared while/for-while tail: require ':', branch-if-false, body, back-edge to loop_top. */
 /* Shared "compile a for-loop's body and back-edge" tail, used by every for/while/for-in form
    below: loop_top is the back-edge jump target (the position of the loop's own condition/iterate
@@ -2859,6 +2799,62 @@ static int module_call_id(AerString* name) {
     return CALL_MODULE_DYNAMIC;
 }
 
+#define NAME_IS(lit) (name->length == sizeof(lit) - 1 && strncmp(name->data, lit, sizeof(lit) - 1) == 0)
+
+/* One level down from module_call_id: which function within a fixed module this is. Same
+   deal — a literal identifier in `module.fn(...)`, never ambiguous, so resolvable once here
+   instead of every call at runtime. FN_ID_UNKNOWN (vm.h) for anything not one of that
+   module's known functions; the runtime still reports the "has no function" error by name. */
+static int module_fn_id(int module_id, AerString* name) {
+    switch (module_id) {
+        case CALL_MODULE_MATH:
+            if (NAME_IS("sqrt"))    return FN_MATH_SQRT;
+            if (NAME_IS("pow"))     return FN_MATH_POW;
+            if (NAME_IS("floor"))   return FN_MATH_FLOOR;
+            if (NAME_IS("ceil"))    return FN_MATH_CEIL;
+            if (NAME_IS("abs"))     return FN_MATH_ABS;
+            if (NAME_IS("min"))     return FN_MATH_MIN;
+            if (NAME_IS("max"))     return FN_MATH_MAX;
+            if (NAME_IS("sin"))     return FN_MATH_SIN;
+            if (NAME_IS("cos"))     return FN_MATH_COS;
+            if (NAME_IS("log"))     return FN_MATH_LOG;
+            if (NAME_IS("log2"))    return FN_MATH_LOG2;
+            if (NAME_IS("log10"))   return FN_MATH_LOG10;
+            if (NAME_IS("pi"))      return FN_MATH_PI;
+            if (NAME_IS("sort"))    return FN_MATH_SORT;
+            return FN_ID_UNKNOWN;
+        case CALL_MODULE_RANDOM:
+            if (NAME_IS("random"))  return FN_RANDOM_RANDOM;
+            if (NAME_IS("randint")) return FN_RANDOM_RANDINT;
+            if (NAME_IS("seed"))    return FN_RANDOM_SEED;
+            return FN_ID_UNKNOWN;
+        case CALL_MODULE_STRING:
+            if (NAME_IS("upper"))       return FN_STRING_UPPER;
+            if (NAME_IS("lower"))       return FN_STRING_LOWER;
+            if (NAME_IS("trim"))        return FN_STRING_TRIM;
+            if (NAME_IS("contains"))    return FN_STRING_CONTAINS;
+            if (NAME_IS("split"))       return FN_STRING_SPLIT;
+            if (NAME_IS("starts_with")) return FN_STRING_STARTS_WITH;
+            if (NAME_IS("ends_with"))   return FN_STRING_ENDS_WITH;
+            if (NAME_IS("repeat"))      return FN_STRING_REPEAT;
+            if (NAME_IS("replace"))     return FN_STRING_REPLACE;
+            if (NAME_IS("join"))        return FN_STRING_JOIN;
+            return FN_ID_UNKNOWN;
+        case CALL_MODULE_TIME:
+            if (NAME_IS("now"))      return FN_TIME_NOW;
+            if (NAME_IS("strftime")) return FN_TIME_STRFTIME;
+            return FN_ID_UNKNOWN;
+        case CALL_MODULE_JSON:
+            if (NAME_IS("encode")) return FN_JSON_ENCODE;
+            if (NAME_IS("decode")) return FN_JSON_DECODE;
+            return FN_ID_UNKNOWN;
+        default:
+            return FN_ID_UNKNOWN;
+    }
+}
+
+#undef NAME_IS
+
 static int parse_module_call(Chunk* c) {
     int module_id = module_call_id(aer_as_string(token.value));
     unsigned int module_idx = chunk_add_pool(c, token.value);
@@ -2868,6 +2864,7 @@ static int parse_module_call(Chunk* c) {
         return 0;
     }
     if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a function name after '.'"); return 0; }
+    int fn_id = module_fn_id(module_id, aer_as_string(token.value));
     unsigned int fn_idx = chunk_add_pool(c, token.value);
     lex();
     require(TOKEN_OPEN_PARENTHESE, "expected '(' after module function name");
@@ -2887,6 +2884,7 @@ static int parse_module_call(Chunk* c) {
     }
     chunk_emit(c, PACK_CALL_MODULE(dest, base, arg_count, module_idx, fn_idx));
     chunk_emit(c, module_id);
+    chunk_emit(c, fn_id);
     return dest;
 }
 

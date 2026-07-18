@@ -2122,30 +2122,34 @@ lbl_call_module: {
     int module_idx   = (int)UNPACK_CALL_MODULE_MODULE(op_word);
     int fn_idx       = (int)UNPACK_CALL_MODULE_FN(op_word);
     int module_id    = READ();
-    const char* module = aer_as_string(c->pool[module_idx])->data;
-    const char* fn     = aer_as_string(c->pool[fn_idx])->data;
+    int fn_id        = READ();
     for (int i = 0; i < arg_count; i++) PUSH(vm->registers[arg_reg_base + i]);
     bool handled = false;
-    /* module_id was resolved once, at parse time (module_call_id, parser.c) — a switch on a small
-       int instead of a strcmp chain against every known built-in's name on every single call. Only
-       CALL_MODULE_DYNAMIC (a host-registered module or a user file import — never a fixed core
-       built-in) still needs the original by-name resolution, since those are genuinely only
-       knowable at runtime. */
+    /* module_id/fn_id were resolved once, at parse time (module_call_id/module_fn_id, parser.c)
+       — a switch on two small ints instead of a strcmp chain against every known built-in
+       module's name, then another against every one of that module's function names, on every
+       single call. Only CALL_MODULE_DYNAMIC (a host-registered module or a user file import —
+       never a fixed core built-in) still needs the original by-name resolution, since those are
+       genuinely only knowable at runtime; module/fn names are resolved below only on that path
+       and on the error path — the happy path here never touches the constant pool. */
     switch (module_id) {
-        case CALL_MODULE_MATH:   handled = aer_math_call(vm, c, fn, arg_count);   break;
-        case CALL_MODULE_RANDOM: handled = aer_random_call(vm, c, fn, arg_count); break;
-        case CALL_MODULE_STRING: handled = aer_string_call(vm, c, fn, arg_count); break;
-        case CALL_MODULE_TIME:   handled = aer_time_call(vm, c, fn, arg_count);   break;
-        case CALL_MODULE_JSON:   handled = aer_json_call(vm, c, fn, arg_count);   break;
-        default:
+        case CALL_MODULE_MATH:   handled = aer_math_call(vm, fn_id, arg_count);   break;
+        case CALL_MODULE_RANDOM: handled = aer_random_call(vm, fn_id, arg_count); break;
+        case CALL_MODULE_STRING: handled = aer_string_call(vm, fn_id, arg_count); break;
+        case CALL_MODULE_TIME:   handled = aer_time_call(vm, fn_id, arg_count);   break;
+        case CALL_MODULE_JSON:   handled = aer_json_call(vm, c, fn_id, arg_count);   break;
+        default: {
+            const char* module = aer_as_string(c->pool[module_idx])->data;
+            const char* fn     = aer_as_string(c->pool[fn_idx])->data;
             if (aer_host_is_module(module, (unsigned int)strlen(module)))
                 handled = aer_host_call(vm, module, fn, arg_count);
             else
                 handled = aer_module_call(vm, module, fn, arg_count);
             break;
+        }
     }
     if (handled) { vm->registers[dest_reg] = POP(); gc_maybe_collect(vm); DISPATCH(); }   /* stdlib/module functions routinely allocate (new strings/arrays/etc.) */
-    error("'%s' has no function '%s'", module, fn);
+    error("'%s' has no function '%s'", aer_as_string(c->pool[module_idx])->data, aer_as_string(c->pool[fn_idx])->data);
     for (int i = 0; i < arg_count; i++) POP();
     vm->registers[dest_reg] = aer_null();
     DISPATCH();

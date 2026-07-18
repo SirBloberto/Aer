@@ -112,16 +112,15 @@ typedef enum {
        chain (VM.call_stack), not this one. Stack-neutral from the caller's perspective —
        vm->stack_top ends exactly where it started. */
     /* operands: dest_reg, module_pool_idx, fn_pool_idx, arg_reg_base, arg_count (all packed into
-       one word, PACK_CALL_MODULE), plus one trailing plain word: module_id (CALL_MODULE_MATH etc.,
-       below) — resolved at parse time (the module name in `module.fn(...)` is always a literal
-       identifier, never ambiguous), so the VM can switch on a small int instead of running a
-       strcmp chain against every known built-in module's name on every single call. Perf finding:
-       aer_math_call + its own strcmp + the outer module-name strcmp were ~2.8-3% of nbody.aer's
-       cycles, almost entirely the OUTER module-name check (the inner per-function strcmp inside
-       aer_math_call etc. is untouched by this — see its own dispatch, vm.c). CALL_MODULE_DYNAMIC
-       means "not a known core built-in" (a host-registered module or a user file import) — those
-       are genuinely only resolvable by name at runtime, so that path still runs the original
-       strcmp/aer_host_is_module logic unchanged. Couldn't fit this as a packed bit-field instead:
+       one word, PACK_CALL_MODULE), plus two trailing plain words: module_id (CALL_MODULE_MATH
+       etc., below) and fn_id (FN_MATH_SQRT etc., below) — both resolved at parse time (the
+       module and function names in `module.fn(...)` are always literal identifiers, never
+       ambiguous), so the VM can switch on two small ints instead of running a strcmp chain
+       against every known built-in module's name, then another against every one of that
+       module's function names, on every single call. CALL_MODULE_DYNAMIC means "not a known
+       core built-in" (a host-registered module or a user file import) — those are genuinely
+       only resolvable by name at runtime, so that path still runs the original
+       strcmp/aer_host_is_module logic unchanged, and never resolves an fn_id. Couldn't fit this as a packed bit-field instead:
        PACK_CALL_MODULE already uses 63 of the word's 64 bits, and shrinking module_idx/fn_idx's
        17-bit pool-index fields to make room would risk breaking large programs with many string
        constants (unlike FIELD_NAME's narrower 14-bit budget, a pool index here isn't scoped to
@@ -880,6 +879,52 @@ typedef enum {
 #define CALL_MODULE_TIME     3
 #define CALL_MODULE_JSON     4
 #define CALL_MODULE_DYNAMIC  5
+
+/* OP_CALL_MODULE's second trailing word: fn_id, the same parse-time-resolved-int trick as
+   module_id above, one level down — which specific function within a fixed module this is.
+   -1 (FN_ID_UNKNOWN) means the name didn't match any function of that module; the runtime
+   still reports "'%s' has no function '%s'" by string name in that case (vm.c), so an unknown
+   name is never silently misrouted to id 0. Each fixed module owns its own flat id space
+   (aer_math_call only ever sees FN_MATH_*, etc.) since dispatch is already split by module_id
+   first. CALL_MODULE_DYNAMIC calls never resolve or use an fn_id — genuinely only resolvable
+   by name at runtime, same as their module_id. */
+#define FN_ID_UNKNOWN   (-1)
+
+#define FN_MATH_SQRT    0
+#define FN_MATH_POW     1
+#define FN_MATH_FLOOR   2
+#define FN_MATH_CEIL    3
+#define FN_MATH_ABS     4
+#define FN_MATH_MIN     5
+#define FN_MATH_MAX     6
+#define FN_MATH_SIN     7
+#define FN_MATH_COS     8
+#define FN_MATH_LOG     9
+#define FN_MATH_LOG2    10
+#define FN_MATH_LOG10   11
+#define FN_MATH_PI      12
+#define FN_MATH_SORT    13
+
+#define FN_RANDOM_RANDOM  0
+#define FN_RANDOM_RANDINT 1
+#define FN_RANDOM_SEED    2
+
+#define FN_STRING_UPPER       0
+#define FN_STRING_LOWER       1
+#define FN_STRING_TRIM        2
+#define FN_STRING_CONTAINS    3
+#define FN_STRING_SPLIT       4
+#define FN_STRING_STARTS_WITH 5
+#define FN_STRING_ENDS_WITH   6
+#define FN_STRING_REPEAT      7
+#define FN_STRING_REPLACE     8
+#define FN_STRING_JOIN        9
+
+#define FN_TIME_NOW      0
+#define FN_TIME_STRFTIME 1
+
+#define FN_JSON_ENCODE 0
+#define FN_JSON_DECODE 1
 
 /* OP_CALL_BUILTIN's trailing builtin_id word — no DYNAMIC case, unlike CALL_MODULE_*: every call
    site is already gated behind is_builtin_name, so builtin_call_id always matches. */

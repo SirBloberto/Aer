@@ -105,7 +105,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
        PACK_CALL_BUILTIN, vm.h). Special-cased in disassemble_one. */
     /* Trailing FLD_COUNT past `packed`: word-count only, for aer_disassemble's summary walk — the
        real trailing word is decoded/printed specially in disassemble_one below. */
-    [OP_CALL_MODULE]  = { "OP_CALL_MODULE",  "call a native or file-module function by (module, function) name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_NAME, FLD_COUNT}, false, 5 },
+    [OP_CALL_MODULE]  = { "OP_CALL_MODULE",  "call a native or file-module function by (module, function) name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_NAME}, false, 5 },
     [OP_CALL_BUILTIN] = { "OP_CALL_BUILTIN", "global builtin (length/append/etc.) by name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_COUNT}, false, 4 },
     [OP_ARRAY_NEW] = { "OP_ARRAY_NEW", "reg = new array from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT}, false, 3 },
     /* OP_INDEX_GET/OP_ITER_NEXT_PAIR/OP_ITER_RANGE_PREP/OP_ITER_RANGE_LOOP/OP_FIELD_GET/
@@ -401,10 +401,12 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_COUNT, (int)UNPACK_CALL_MODULE_ARG_COUNT(op_word));
         print_field(out, c, FLD_NAME,  (int)UNPACK_CALL_MODULE_MODULE(op_word));
         print_field(out, c, FLD_NAME,  (int)UNPACK_CALL_MODULE_FN(op_word));
-        /* Trailing word (see OP_CALL_MODULE's own comment, vm.h): module_id, resolved once at
-           parse time so the VM can switch on it instead of running a strcmp chain per call. */
+        /* Two trailing words (see OP_CALL_MODULE's own comment, vm.h): module_id and fn_id, both
+           resolved once at parse time so the VM can switch on small ints instead of running a
+           strcmp chain (module name, then function name) per call. */
         int module_id = (int)c->code[pos++];
-        fprintf(out, "  id=%s", call_module_id_names[module_id]);
+        int fn_id      = (int)c->code[pos++];
+        fprintf(out, "  id=%s fn_id=%d", call_module_id_names[module_id], fn_id);
     } else if (op == OP_CALL_BUILTIN) {
         static const char* const call_builtin_id_names[] = {
             "length", "delete", "append", "print", "type", "assert", "panic"

@@ -3,10 +3,8 @@
 #include "aer_stdlib.h"
 #include "error.h"
 
-bool aer_string_call(VM* vm, Chunk* c, const char* name, int arg_count) {
-    (void)c;
-
-    if (strcmp(name, "upper") == 0 && arg_count == 1) {
+bool aer_string_call(VM* vm, int fn_id, int arg_count) {
+    if (fn_id == FN_STRING_UPPER && arg_count == 1) {
         AerVal a = vm_stack_pop(vm);
         if (aer_type(a) != TYPE_STRING) { error("string.upper() requires a string"); vm_stack_push(vm, aer_null()); return true; }
         AerString* as = aer_as_string(a);
@@ -16,7 +14,7 @@ bool aer_string_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         buf[len] = '\0';
         vm_stack_push(vm, aer_make_string(buf, len)); return true;
     }
-    if (strcmp(name, "lower") == 0 && arg_count == 1) {
+    if (fn_id == FN_STRING_LOWER && arg_count == 1) {
         AerVal a = vm_stack_pop(vm);
         if (aer_type(a) != TYPE_STRING) { error("string.lower() requires a string"); vm_stack_push(vm, aer_null()); return true; }
         AerString* as = aer_as_string(a);
@@ -26,7 +24,7 @@ bool aer_string_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         buf[len] = '\0';
         vm_stack_push(vm, aer_make_string(buf, len)); return true;
     }
-    if (strcmp(name, "trim") == 0 && arg_count == 1) {
+    if (fn_id == FN_STRING_TRIM && arg_count == 1) {
         AerVal a = vm_stack_pop(vm);
         if (aer_type(a) != TYPE_STRING) { error("string.trim() requires a string"); vm_stack_push(vm, aer_null()); return true; }
         AerString* as = aer_as_string(a);
@@ -40,7 +38,7 @@ bool aer_string_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         buf[n] = '\0';
         vm_stack_push(vm, aer_make_string(buf, n)); return true;
     }
-    if (strcmp(name, "contains") == 0 && arg_count == 2) {
+    if (fn_id == FN_STRING_CONTAINS && arg_count == 2) {
         AerVal needle = vm_stack_pop(vm); AerVal hay = vm_stack_pop(vm);
         if (aer_type(hay) != TYPE_STRING || aer_type(needle) != TYPE_STRING) { error("string.contains() requires two strings"); vm_stack_push(vm, aer_null()); return true; }
         AerString* hs = aer_as_string(hay);
@@ -51,7 +49,7 @@ bool aer_string_call(VM* vm, Chunk* c, const char* name, int arg_count) {
             if (memcmp(hs->data + i, ns->data, nlen) == 0) found = true;
         vm_stack_push(vm, aer_bool(found)); return true;
     }
-    if (strcmp(name, "split") == 0 && arg_count == 2) {
+    if (fn_id == FN_STRING_SPLIT && arg_count == 2) {
         AerVal sep_v = vm_stack_pop(vm); AerVal s_v = vm_stack_pop(vm);
         if (aer_type(s_v) != TYPE_STRING || aer_type(sep_v) != TYPE_STRING) { error("string.split() requires two strings"); vm_stack_push(vm, aer_null()); return true; }
         AerString* ss = aer_as_string(s_v);
@@ -89,7 +87,7 @@ bool aer_string_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         }
         vm_stack_push(vm, aer_array_val(r)); return true;
     }
-    if (strcmp(name, "starts_with") == 0 && arg_count == 2) {
+    if (fn_id == FN_STRING_STARTS_WITH && arg_count == 2) {
         AerVal prefix_v = vm_stack_pop(vm); AerVal s_v = vm_stack_pop(vm);
         if (aer_type(s_v) != TYPE_STRING || aer_type(prefix_v) != TYPE_STRING) { error("string.starts_with() requires two strings"); vm_stack_push(vm, aer_null()); return true; }
         AerString* ss = aer_as_string(s_v);
@@ -97,7 +95,7 @@ bool aer_string_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         bool matches = ps->length <= ss->length && memcmp(ss->data, ps->data, ps->length) == 0;
         vm_stack_push(vm, aer_bool(matches)); return true;
     }
-    if (strcmp(name, "ends_with") == 0 && arg_count == 2) {
+    if (fn_id == FN_STRING_ENDS_WITH && arg_count == 2) {
         AerVal suffix_v = vm_stack_pop(vm); AerVal s_v = vm_stack_pop(vm);
         if (aer_type(s_v) != TYPE_STRING || aer_type(suffix_v) != TYPE_STRING) { error("string.ends_with() requires two strings"); vm_stack_push(vm, aer_null()); return true; }
         AerString* ss = aer_as_string(s_v);
@@ -105,7 +103,7 @@ bool aer_string_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         bool matches = fs->length <= ss->length && memcmp(ss->data + (ss->length - fs->length), fs->data, fs->length) == 0;
         vm_stack_push(vm, aer_bool(matches)); return true;
     }
-    if (strcmp(name, "repeat") == 0 && arg_count == 2) {
+    if (fn_id == FN_STRING_REPEAT && arg_count == 2) {
         AerVal n_v = vm_stack_pop(vm); AerVal s_v = vm_stack_pop(vm);
         if (aer_type(s_v) != TYPE_STRING) { error("string.repeat() requires a string"); vm_stack_push(vm, aer_null()); return true; }
         if (aer_type(n_v) != TYPE_INTEGER) { error("string.repeat() count must be an integer"); vm_stack_push(vm, aer_null()); return true; }
@@ -118,7 +116,7 @@ bool aer_string_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         buf[total] = '\0';
         vm_stack_push(vm, aer_make_string(buf, total)); return true;
     }
-    if (strcmp(name, "replace") == 0 && arg_count == 3) {
+    if (fn_id == FN_STRING_REPLACE && arg_count == 3) {
         AerVal new_v = vm_stack_pop(vm); AerVal old_v = vm_stack_pop(vm); AerVal s_v = vm_stack_pop(vm);
         if (aer_type(s_v) != TYPE_STRING || aer_type(old_v) != TYPE_STRING || aer_type(new_v) != TYPE_STRING) {
             error("string.replace() requires three strings"); vm_stack_push(vm, aer_null()); return true;
@@ -149,7 +147,7 @@ bool aer_string_call(VM* vm, Chunk* c, const char* name, int arg_count) {
         buf[total] = '\0';
         vm_stack_push(vm, aer_make_string(buf, total)); return true;
     }
-    if (strcmp(name, "join") == 0 && arg_count == 2) {
+    if (fn_id == FN_STRING_JOIN && arg_count == 2) {
         AerVal sep_v = vm_stack_pop(vm); AerVal arr_v = vm_stack_pop(vm);
         if (aer_type(arr_v) != TYPE_ARRAY) { error("string.join() requires an array"); vm_stack_push(vm, aer_null()); return true; }
         if (aer_type(sep_v) != TYPE_STRING) { error("string.join() separator must be a string"); vm_stack_push(vm, aer_null()); return true; }
