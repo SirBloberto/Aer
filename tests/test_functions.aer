@@ -127,7 +127,7 @@ assert(length(numbers_list) == 4 && numbers_list[3] == "touched",
        "a bare-name pipe chain works as a statement, not just an expression")
 
 struct Basket:
-    items: any = []
+    items = []
 
 basket = Basket([1, 2])
 basket.items |> pipe_stmt_append("added")

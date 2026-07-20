@@ -87,8 +87,8 @@ assert("{age * 2 + 1}" == "61", "an arithmetic expression inside \{}")
 assert("{ age * 2 + 1 }" == "61", "leading/trailing whitespace inside \{} doesn't get misread as indentation")
 
 struct InterpPoint:
-    x: integer = 0
-    y: integer = 0
+    x = 0
+    y = 0
 ipoint = InterpPoint(3, 4)
 assert("{ipoint.x}" == "3", "field access inside \{}")
 
@@ -175,6 +175,19 @@ if true || boom(boom_log):
     short_circuited = true
 assert(short_circuited && length(boom_log) == 0, "|| short-circuits, boom() never called")
 
+# && and || return the winning OPERAND, not a coerced boolean (Python/Lua semantics) — the
+# common "x = x || default" idiom this enables is the whole point of the change.
+assert((0 || "default") == "default", "|| falls through to the rhs operand when the lhs is falsy")
+assert(("set" || "default") == "set", "|| returns the lhs operand itself when it's truthy, unchanged")
+assert((null || "fallback") == "fallback", "|| treats null as falsy, same as an if condition would")
+assert((5 && "b") == "b", "&& returns the rhs operand when the lhs is truthy")
+assert((0 && "b") == 0, "&& returns the lhs operand itself when it's falsy, unchanged")
+default_val = 3 || 99
+assert(default_val == 3, "x = x || default: a truthy existing value wins, unmodified")
+missing_val = null
+resolved = missing_val || "computed"
+assert(resolved == "computed", "x = x || default: a null value falls through to the default")
+
 # in — membership test for arrays and dicts
 nums = [1, 2, 3]
 assert(2 in nums, "value membership in an array")
@@ -253,8 +266,8 @@ assert(i == 5, "while-form for loop")
 # while condition" pointing at the '.'. Common in linked-list-style
 # traversal: `for cur != null: ... cur = cur.next`.
 struct LoopLinkNode:
-    value: integer = 0
-    next: any = null
+    value = 0
+    next = null
 lln3 = LoopLinkNode(3, null)
 lln2 = LoopLinkNode(2, lln3)
 lln1 = LoopLinkNode(1, lln2)

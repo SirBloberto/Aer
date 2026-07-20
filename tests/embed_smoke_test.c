@@ -212,26 +212,22 @@ int main(void) {
     check(aer_assert_failure_count() == 0,
           "the AER_PATH-resolved module's function returned the correct value");
 
-    /* io is a host-registered module (source/stdlib/aer_io.h), not a hardcoded
-       native one — see aer_io_register(). This test binary deliberately
-       never calls it (unlike source/main.c, which does), proving file
-       access really is opt-in per embedding host: `import io` here falls
-       through to the generic file-import path, which fails to find an
-       "io.aer" file on disk, exactly as if "io" were any other unknown
-       name. import itself emits no bytecode either way, so vm_run() alone
-       can't observe this — the failure only shows up as a parse-time error
-       (aer_had_error()), not a false `ok`. */
+    /* io is registered by vm_init() itself now (source/core/vm.c's ensure_io_registered), the
+       same always-on status as every other stdlib module — this test binary never calls
+       aer_io_register() itself (unlike source/main.c, which used to be the only thing that did),
+       and io.exists() still works, proving io is no longer a host opt-in. */
     vm.stack_top     = 0;
     vm.call_depth = 0;
     vm.registers  = vm.call_stack[0].registers;
     vm.raw_ints   = vm.call_stack[0].raw_ints;
     vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("import io\n");
-    run_appended(&chunk, &vm);
+    shell("import io\nassert(io.exists(\"tests\") == true, \"io.exists() finds the real tests/ directory\")\n");
+    ok = run_appended(&chunk, &vm);
 
-    check(aer_had_error(),
-          "import io fails in a host that never called aer_io_register() — file access is opt-in per host, not ambient");
+    check(ok && !aer_had_error(),
+          "import io succeeds with no host action at all — io is unconditionally available, same as every other stdlib module");
+    check(aer_assert_failure_count() == 0, "io.exists() actually works through this unconditional registration, not just a successful import");
 
     /* aer_module_call's mv (a file-module's own reused VM) didn't reset call_depth/stack_top after
        a runtime error inside a module function — the error unwinds via longjmp straight past

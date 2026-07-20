@@ -11,9 +11,9 @@ import collection
 # ------------------------------------------------------------------ #
 
 struct Point:
-    x: integer = 0
-    y: float = 0.0
-    flag: boolean = false
+    x = 0
+    y = 0.0
+    flag = false
 
 pa1 = Point[5]
 assert(length(pa1) == 5, "packed array reports its declared count via length()")
@@ -85,19 +85,19 @@ assert(length(pa_empty) == 0, "a zero-count packed array constructs cleanly and 
 # ------------------------------------------------------------------ #
 # 47. Eligibility is per-struct-type, not global — a struct with only #
 #     fixed-primitive fields can be packed even if OTHER structs in   #
-#     the same program have any/string fields (which just can't be    #
-#     packed themselves — see the commented "would error" cases       #
-#     below).                                                         #
+#     the same program have untyped/string/array/dict fields (which   #
+#     just can't be packed themselves — see the commented "would      #
+#     error" case below).                                             #
 # ------------------------------------------------------------------ #
 
 struct Dynamic:
-    tag: any = null
-    label: string = "x"
+    tag = null
+    label = "x"
 
 d = Dynamic()
-assert(d.tag == null && d.label == "x", "a struct with any/string fields still works fine as a plain (unpacked) instance")
+assert(d.tag == null && d.label == "x", "a struct with an untyped/string field still works fine as a plain (unpacked) instance")
 
-# pd = Dynamic[3]   # would error: 'Dynamic' cannot be packed into an array: field 'tag' must be integer/float/boolean, not any
+# pd = Dynamic[3]   # would error: 'Dynamic' cannot be packed into an array: field 'tag' must be integer/float/boolean, not untyped (no annotation)
 
 # ------------------------------------------------------------------ #
 # 48. GC correctness — allocate many packed arrays under real         #
@@ -109,7 +109,7 @@ assert(d.tag == null && d.label == "x", "a struct with any/string fields still w
 # ------------------------------------------------------------------ #
 
 struct GcPoint:
-    v: integer = 0
+    v = 0
 
 survivor = GcPoint[10]
 survivor[3].v = 12345
@@ -134,11 +134,12 @@ assert(length(gc_churn) == 10000, "all the churn allocations (including throwawa
 # print(pa1[0])              # would error: Cannot index type (bare packed-array indexing isn't legal — only arr[i].field is)
 
 # ------------------------------------------------------------------ #
-# 50. A struct definition missing a type on one field is a compile    #
-#     error (mandatory struct typing, landed alongside this feature). #
+# 50. A struct field with no default at all is a compile error --     #
+#     the type is inferred FROM the default, so there's no fallback   #
+#     when one is missing.                                            #
 # ------------------------------------------------------------------ #
 
-# struct Bad:                # would error: Struct field must declare a type (e.g. 'x: float' or 'x: any')
-#     size = 1
+# struct Bad:
+#     size          # would error: Struct field 'size' must have an explicit default value
 
 print("test_packed_arrays.aer: all assertions passed.")

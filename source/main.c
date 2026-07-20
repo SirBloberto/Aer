@@ -29,9 +29,7 @@ static const char* debug_dump_path = NULL;
 
 int main(int argc, char** argv) {
     chunk_init(&chunk);
-    vm_init(&vm, &chunk);
-    /* io is an opt-in host capability — a sandboxing host simply doesn't call this */
-    aer_io_register();
+    vm_init(&vm, &chunk);   /* registers io, same as every other stdlib module */
     /* Once per process — parser state persists across parse() calls, which is what makes REPL
        variable/function persistence work */
     parser_reset();
@@ -89,6 +87,11 @@ static void run() {
     parse(&chunk);
     chunk_emit(&chunk, OP_HALT);
     runtime_had_error = false;
+    /* A rolled-back statement compiles to a no-op, which is harmless for one bad REPL line but not
+       for a file: a corrupted loop body (e.g. an increment that failed to compile) silently becomes
+       an infinite loop instead of the syntax error it actually is. File mode refuses to run at all
+       once parse() has flagged any statement as invalid; the REPL still runs the rest of the line. */
+    if (mode == MODE_RUN && parse_had_error) return;
     vm_run(&vm);
 }
 
@@ -164,7 +167,9 @@ static void run_shell() {
 static bool run_file(char* path) {
     mode = MODE_RUN;
     read_file(path);
-    run();
+    /* read_file() can fail (missing file, unreadable, embedded NUL) without ever setting up the
+       lexer's current file — calling run() anyway would lex/parse a null or stale File*. */
+    if (!aer_had_error()) run();
 #ifdef AER_DEBUG_TOOLS
     /* After run() so the dump has both the bytecode and the run's hit counts; "-" means stderr */
     const char* dump_path = debug_dump_path;

@@ -133,6 +133,74 @@ static void push_null_result(VM* vm) {
     if (vm->stack_top < VM_STACK_MAX) vm->stack[vm->stack_top++] = aer_null();
 }
 
+/* Shared by aer_module_load below and aer_actor_spawn (aer_actor.c) -- both need "make a
+   brand-new, independent VM+Chunk, load+compile+run its top-level code exactly once, without
+   corrupting whatever compile is already in progress on the caller's side (a nested import, or
+   an actor spawned mid-script)" and nothing else; each caller layers its own specific concerns
+   (circular-import detection, module-name registration, contextual error wording) on top. */
+InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** out_chunk, unsigned int* out_halt_addr) {
+    /* Save the caller's lexer position and lookahead token so parsing can resume exactly where it
+       left off once this nested read+lex+parse+run cycle (which reuses the same global
+       lexer/parser state) completes. */
+    LexerState* saved       = lexer_save_state();
+    Token       saved_token = token;
+    /* Save the parser's file-scope tables too, or compiling this corrupts the caller's own
+       still-in-progress compile. */
+    ParserState* saved_parser = parser_save_state();
+
+    Chunk* mchunk = xmalloc(sizeof(Chunk));
+    VM*    mvm    = xmalloc(sizeof(VM));
+    chunk_init(mchunk);
+    vm_init(mvm, mchunk);
+
+    read_file(path);
+    bool ok = !parse_had_error;
+    if (ok) {
+        lex();
+        parse(mchunk);
+        ok = !parse_had_error;
+    }
+    InstantiateResult result = ok ? INSTANTIATE_OK : INSTANTIATE_PARSE_FAILED;
+    unsigned int halt_addr = mchunk->count;
+    chunk_emit(mchunk, OP_HALT);
+
+    if (ok) {
+        runtime_had_error = false;
+        mvm->ip = 0;
+        /* The caller's own chunk/VM isn't registered as a GC root yet (that happens once this
+           function returns and the caller registers it), so a collection triggered by this
+           nested run could sweep something the caller still needs — see vm_gc_suppress's comment
+           in vm.h. */
+        vm_gc_suppress();
+        vm_run(mvm);
+        vm_gc_unsuppress();
+        if (runtime_had_error) {
+            ok = false;
+            result = INSTANTIATE_RUNTIME_FAILED;
+        }
+    }
+    /* Whatever happened during this nested run must not leak into the caller's own later
+       execution — it hasn't even finished parsing yet, let alone started running. */
+    runtime_had_error = false;
+
+    lexer_restore_state(saved);
+    token = saved_token;
+    parser_restore_state(saved_parser);
+
+    if (!ok) {
+        /* Never handed back to the caller, so nothing else can reach these — free here. */
+        vm_free(mvm);
+        chunk_free(mchunk);
+        free(mvm);
+        free(mchunk);
+        return result;
+    }
+    *out_vm        = mvm;
+    *out_chunk     = mchunk;
+    *out_halt_addr = halt_addr;
+    return INSTANTIATE_OK;
+}
+
 bool aer_module_load(const char* name, unsigned int len,
                       const char* path_name, unsigned int path_len) {
     if (find_module(name, len)) return true;   /* already loaded, not an error */
@@ -152,54 +220,12 @@ bool aer_module_load(const char* name, unsigned int len,
     }
     loading_stack[loading_depth++] = path;
 
-    /* Save the importing file's lexer position and lookahead token so parsing can resume exactly where it left off once this nested read+lex+parse+run cycle (which reuses the same global lexer/parser state) completes. */
-    LexerState* saved       = lexer_save_state();
-    Token       saved_token = token;
-    /* Save the parser's file-scope tables too, or compiling the import corrupts the importing
-       file's still-in-progress compile. */
-    ParserState* saved_parser = parser_save_state();
-
-    Chunk* mchunk = xmalloc(sizeof(Chunk));
-    VM*    mvm    = xmalloc(sizeof(VM));
-    chunk_init(mchunk);
-    vm_init(mvm, mchunk);
-
-    read_file(path);
-    bool ok = !parse_had_error;
-    if (ok) {
-        lex();
-        parse(mchunk);
-        ok = !parse_had_error;
-    }
-    unsigned int halt_addr = mchunk->count;
-    chunk_emit(mchunk, OP_HALT);
-
-    if (ok) {
-        runtime_had_error = false;
-        mvm->ip = 0;
-        /* The outer (importing) chunk/VM isn't registered as a GC root yet (that happens once this function returns and the FileModule entry is added), so a collection triggered by this nested run could sweep something the outer file still needs — see vm_gc_suppress's comment in vm.h. */
-        vm_gc_suppress();
-        vm_run(mvm);
-        vm_gc_unsuppress();
-        if (runtime_had_error) {
-            error_at("Error while loading module '%.*s'", (int)len, name);
-            ok = false;
-        }
-    }
-    /* Whatever happened inside the imported file must not leak into the importing program's own later execution — it hasn't even finished parsing yet, let alone started running. */
-    runtime_had_error = false;
-
-    lexer_restore_state(saved);
-    token = saved_token;
-    parser_restore_state(saved_parser);
+    VM* mvm = NULL; Chunk* mchunk = NULL; unsigned int halt_addr = 0;
+    InstantiateResult r = aer_vm_instantiate_from_file(path, &mvm, &mchunk, &halt_addr);
     loading_depth--;
 
-    if (!ok) {
-        /* Never registered into modules[], so aer_module_free_all can't reach them — free here. */
-        vm_free(mvm);
-        chunk_free(mchunk);
-        free(mvm);
-        free(mchunk);
+    if (r != INSTANTIATE_OK) {
+        if (r == INSTANTIATE_RUNTIME_FAILED) error_at("Error while loading module '%.*s'", (int)len, name);
         free(path);
         return false;
     }

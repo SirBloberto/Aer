@@ -520,7 +520,9 @@ typedef enum {
 #define CALL_MODULE_TIME       3
 #define CALL_MODULE_JSON       4
 #define CALL_MODULE_COLLECTION 5
-#define CALL_MODULE_DYNAMIC    6
+#define CALL_MODULE_NET        6
+#define CALL_MODULE_REGEX      7
+#define CALL_MODULE_DYNAMIC    8
 
 /* Second trailing word: fn_id within the module (each module owns a flat id space);
    FN_ID_UNKNOWN still errors by name, never misroutes to id 0. */
@@ -564,6 +566,7 @@ typedef enum {
 #define FN_TIME_NOW      0
 #define FN_TIME_STRFTIME 1
 #define FN_TIME_SLEEP    2
+#define FN_TIME_PARSE    3
 
 #define FN_JSON_ENCODE 0
 #define FN_JSON_DECODE 1
@@ -575,6 +578,15 @@ typedef enum {
 #define FN_COLLECTION_INDEX_OF 4
 #define FN_COLLECTION_KEYS     5
 #define FN_COLLECTION_SORT     6
+
+#define FN_NET_CONNECT 0
+#define FN_NET_SEND    1
+#define FN_NET_RECV    2
+#define FN_NET_CLOSE   3
+
+#define FN_REGEX_MATCH   0
+#define FN_REGEX_FIND    1
+#define FN_REGEX_REPLACE 2
 
 /* OP_CALL_BUILTIN's trailing builtin_id — no DYNAMIC case; is_builtin_name gates every site. */
 #define CALL_BUILTIN_LENGTH 0

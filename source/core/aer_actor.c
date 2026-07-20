@@ -1,0 +1,127 @@
+#include <stdlib.h>
+#include <string.h>
+#include "aer_actor.h"
+#include "aer_module.h"
+#include "error.h"
+
+typedef struct Mailbox {
+    char* data;
+    unsigned int len;
+    struct Mailbox* next;
+} Mailbox;
+
+struct Actor {
+    VM*          vm;
+    Chunk*       chunk;
+    unsigned int halt_addr;
+    Mailbox*     mailbox_head;
+    Mailbox*     mailbox_tail;
+    struct Actor* next;   /* process-wide registry, for GC root enumeration and free_all */
+};
+
+static Actor* actors = NULL;
+
+Actor* aer_actor_spawn(const char* path) {
+    /* read_file() (called inside aer_vm_instantiate_from_file) only ever reads through this
+       pointer via fopen() -- never mutated, so the cast is safe in practice, matching every
+       other path string in this codebase's own imprecise-but-harmless char* convention. */
+    VM* vm = NULL; Chunk* chunk = NULL; unsigned int halt_addr = 0;
+    if (aer_vm_instantiate_from_file((char*)path, &vm, &chunk, &halt_addr) != INSTANTIATE_OK) return NULL;
+
+    Actor* a = xmalloc(sizeof(Actor));
+    a->vm           = vm;
+    a->chunk        = chunk;
+    a->halt_addr    = halt_addr;
+    a->mailbox_head = NULL;
+    a->mailbox_tail = NULL;
+    a->next         = actors;
+    actors = a;
+    return a;
+}
+
+bool aer_actor_call(Actor* actor, const char* fn, int arg_count, AerVal* args, AerVal* out_result) {
+    ChunkFunction* fnreg = chunk_find_function(actor->chunk, fn);
+    if (!fnreg) return false;
+
+    VM* mv = actor->vm;
+    /* A prior call's error can leave call_depth/stack_top stuck above 0 (same reset
+       aer_module_call needs and for the same reason — see its own comment). */
+    mv->call_depth = 0;
+    mv->stack_top  = 0;
+    mv->registers  = mv->call_stack[0].registers;
+    mv->raw_ints   = mv->call_stack[0].raw_ints;
+    mv->raw_reals  = mv->call_stack[0].raw_reals;
+
+    if (!setup_call(mv, fnreg, arg_count, args, actor->halt_addr)) return false;
+
+    /* Called directly by host (C) code, never from inside another VM's bytecode dispatch, so
+       there's no enclosing vm_run() to longjmp back into on failure the way aer_module_call
+       needs — a plain false return is enough. */
+    vm_gc_suppress();
+    vm_run(mv);
+    vm_gc_unsuppress();
+    bool ok = !runtime_had_error;
+    runtime_had_error = false;   /* this actor's own failure must not leak into the caller's other work */
+    if (!ok) return false;
+
+    *out_result = mv->call_stack[0].registers[0];
+    return true;
+}
+
+bool aer_actor_send(Actor* actor, const char* message, unsigned int len) {
+    Mailbox* m = xmalloc(sizeof(Mailbox));
+    m->data = xmalloc(len);
+    memcpy(m->data, message, len);
+    m->len  = len;
+    m->next = NULL;
+    if (actor->mailbox_tail) actor->mailbox_tail->next = m;
+    else                     actor->mailbox_head = m;
+    actor->mailbox_tail = m;
+    return true;
+}
+
+bool aer_actor_try_receive(Actor* actor, char** out_message, unsigned int* out_len) {
+    Mailbox* m = actor->mailbox_head;
+    if (!m) return false;
+    actor->mailbox_head = m->next;
+    if (!actor->mailbox_head) actor->mailbox_tail = NULL;
+    *out_message = m->data;
+    *out_len     = m->len;
+    free(m);
+    return true;
+}
+
+static void free_mailbox(Actor* a) {
+    Mailbox* m = a->mailbox_head;
+    while (m) {
+        Mailbox* next = m->next;
+        free(m->data);
+        free(m);
+        m = next;
+    }
+}
+
+void aer_actor_free(Actor* actor) {
+    Actor** link = &actors;
+    while (*link && *link != actor) link = &(*link)->next;
+    if (*link) *link = actor->next;
+
+    vm_free(actor->vm);
+    chunk_free(actor->chunk);
+    free(actor->vm);
+    free(actor->chunk);
+    free_mailbox(actor);
+    free(actor);
+}
+
+void aer_actor_free_all(void) {
+    while (actors) aer_actor_free(actors);
+}
+
+bool aer_actor_get(unsigned int index, VM** out_vm, Chunk** out_chunk) {
+    Actor* a = actors;
+    for (unsigned int i = 0; a; i++, a = a->next) {
+        if (i == index) { *out_vm = a->vm; *out_chunk = a->chunk; return true; }
+    }
+    return false;
+}

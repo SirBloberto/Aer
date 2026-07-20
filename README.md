@@ -34,7 +34,6 @@ principled design can go with very little code.
 - [Standard Library](#standard-library)
 - [Embedding](#embedding)
 - [Pitfalls and Limitations](#pitfalls-and-limitations)
-- [Benchmarking](#benchmarking)
 - [Architecture](#architecture)
 - [Design Decisions](#design-decisions)
 - [Memory and Security](#memory-and-security)
@@ -121,8 +120,8 @@ make
 Output is written to `binary/aer` (`binary/aer.exe` on Windows — the Makefile handles the suffix).
 One build for everything — it carries debug symbols and is the same binary the test suite runs.
 (A PGO build variant used to exist and measured ~6-9% faster; it was dropped to keep the makefile
-small. If you ever need it back: `-fprofile-generate`, run `bench/nbody.aer`, rebuild with
-`-fprofile-use`.)
+small. If you ever need it back: `-fprofile-generate`, run the binary against any representative
+`.aer` workload, rebuild with `-fprofile-use`.)
 
 To clean:
 
@@ -196,7 +195,7 @@ in the language is reserved:
 
 **Everything else is an ordinary identifier**, including `print`, `length`, `type`, `assert`, and
 `panic` (see [Built-in Functions](#built-in-functions)) and every stdlib name
-(`math`, `random`, `string`, `time`, `collection`). None of these are keywords — they can be shadowed by a local
+(`math`, `random`, `string`, `time`, `collection`, `net`, `regex`, `json`, `io`). None of these are keywords — they can be shadowed by a local
 variable or parameter of the same name, and they compose with everything else a function value can
 (passed around, stored in a variable, piped through `|>`).
 
@@ -241,10 +240,15 @@ negative infinity (matching Python, not C):
 -7 // 2         # -4   — floors toward negative infinity, not toward zero
 ```
 
-`&&` and `||` **always produce a boolean**, never one of the operand values — `x = x || "default"`
-does not work the way it does in JavaScript; write it as a statement-form `if`/`else` instead. Both
-short-circuit: the right-hand side is only evaluated if the left side doesn't already determine the
-result.
+`&&` and `||` **return the deciding operand itself**, not a coerced boolean (Python/Lua semantics,
+not C/JS's strict-boolean `&&`/`||`): `a || b` is `a` if `a` is truthy, else `b`; `a && b` is `a` if
+`a` is falsy, else `b`. Both short-circuit — the right-hand side is only evaluated if the left side
+doesn't already determine the result. This is what makes `x = x || "default"` work as a default-value
+idiom:
+
+```
+name = user_input || "Anonymous"    # "Anonymous" if user_input is falsy (null, "", 0, ...)
+```
 
 ## Built-in Functions
 
@@ -651,7 +655,7 @@ by bare name:
 
 ```
 struct Counter:
-    value: integer = 0
+    value = 0
 
 function bump(c):
     c.value += 1     # mutates the struct's own field, passed in explicitly
@@ -774,22 +778,32 @@ not insertion order — don't rely on a dict preserving the order its keys were 
 
 Structs are AER's fixed-shape record type — the closest thing to a "class," minus methods (see
 [Method Calls and Pipes](#method-calls-and-pipes) for how behaviour attaches to them instead).
-Declared with a field list, each field mandatorily typed, and an optional literal default:
+Declared with a field list, each field given a literal default:
 
 ```
 struct Point:
-    x: float = 0.0
-    y: float = 0.0
+    x = 0.0
+    y = 0.0
 ```
 
-**Every field must declare both a type and an explicit default** — `x = 0.0` with no type, and
-`x: float` with no default, are both compile errors. Eligible types are `integer`, `float`,
-`boolean`, `string`, `any`, or another struct's name; `any` opts out of type checking entirely for
-that field (and, along with `string` and a nested struct type, opts the whole struct out of
-packed-array eligibility — see [Packed Arrays](#packed-arrays) below). Defaults must be literals —
-no arbitrary expressions — since the whole declaration compiles to a single instruction that
-registers the shape. Assigning a value of the wrong type to a typed field is a runtime error, the
-same protection function parameters don't get.
+**Every field must have an explicit default — there's no separate type annotation at all.** A
+field's type is always exactly its default's type: `0.0` makes `x` a `float` field, `0` would make
+it `integer`, `""` a `string`, `[]` an `array`, `{}` a `dict`. `null` is the one default with no
+matching type — it leaves that field genuinely unconstrained, since there's no dedicated "accepts
+anything" keyword (a nested struct instance, which can't be written as a literal default, is the
+main reason to reach for this — see `Outer`/`Inner` below). Defaults must be literals — no
+arbitrary expressions — since the whole declaration compiles to a single instruction that registers
+the shape. Assigning a value of the wrong type to a typed field is a runtime error, the same
+protection function parameters don't get; a `null`-defaulted field has no such protection, by
+design.
+
+```
+struct Inner:
+    v = 0
+struct Outer:
+    inner = null    # unconstrained -- a nested struct's own type isn't a valid literal default
+o = Outer(Inner(5))
+```
 
 **Instantiation** reuses ordinary call syntax, positionally in declared field order. Omitted
 trailing arguments take their declared defaults; passing more arguments than fields is an error:
@@ -845,13 +859,16 @@ point_translate(p1, 1.0, 1.0)
 packed inline in one contiguous block instead of `count` separately heap-allocated instances
 linked through an ordinary array of references. This is AER's answer to data-oriented design: a
 tight loop over a large `Type[]` touches far fewer cache lines than the same loop over an ordinary
-array of struct instances (see [Benchmarking](#benchmarking) for a measured, at-scale comparison).
+array of struct instances. Measured at scale (N=1024, Raspberry Pi, 5-run-averaged `perf stat`): a
+packed `Body[1024]` versus an ordinary array of heap-allocated instances is -20% instructions, -23%
+cycles, ~8.8x fewer cache misses, -18.6% wall clock — the cache-miss reduction is packed arrays'
+actual value proposition, not visible at small N where everything fits in L1.
 
 ```
 struct Body:
-    x: float = 0.0
-    y: float = 0.0
-    mass: float = 0.0
+    x = 0.0
+    y = 0.0
+    mass = 0.0
 
 bodies = Body[1024]
 bodies[0].x = 1.5
@@ -859,8 +876,9 @@ print(bodies[0].x)      # 1.5
 print(length(bodies))   # 1024
 ```
 
-**Eligibility is per-struct-type**, checked once at parse time: every field must be `integer`,
-`float`, or `boolean` — `any`, `string`, and nested-struct fields all disqualify a struct from
+**Eligibility is per-struct-type**, checked at construction (the first `Type[count]`, a VM runtime
+check, not a parse-time one): every field must be `integer`, `float`, or `boolean` — a `string`,
+`array`, `dict`, or unconstrained (`null`-defaulted) field all disqualify a struct from
 `Type[count]` construction (they can't be packed at a uniform byte width), even though that same
 struct works fine as an ordinary, individually-constructed instance (`Type()`).
 
@@ -1067,12 +1085,14 @@ print(math.sqrt(16.0))     # 4
 print(random.randint(1, 6))
 ```
 
-There are six native modules — `math`, `random`, `string`, `time`, `json`, `collection` — not files on disk, but a
-hardcoded set the parser recognizes (see [Standard Library](#standard-library) for the full
-function list). `import math` itself emits no bytecode; it just records "math" as a known module
-name for the rest of the file (or REPL session), consulted entirely at parse time. There's no
-`TYPE_MODULE` value, and a module name is never a real scope variable, so `x = math` (assigning the
-module itself, rather than calling something on it) is a parse error.
+There are eight native modules — `math`, `random`, `string`, `time`, `json`, `collection`, `net`,
+`regex` — not files on disk, but a hardcoded set the parser recognizes (see [Standard
+Library](#standard-library) for the full function list; `io` is a ninth stdlib module, described
+there too, wired in slightly differently — see that section). `import math` itself emits no
+bytecode; it just records "math" as a known module name for the rest of the file (or REPL
+session), consulted entirely at parse time. There's no `TYPE_MODULE` value, and a module name is
+never a real scope variable, so `x = math` (assigning the module itself, rather than calling
+something on it) is a parse error.
 
 ### File-based imports
 
@@ -1141,21 +1161,41 @@ An embedding host can add its own modules the same way — see [Embedding](#embe
 
 ## Concurrency
 
-**Not supported.** AER has no threads, coroutines, `async`/`await`, or event loop of any kind — the
-VM is a single, synchronous dispatch loop, and a script runs start-to-finish on the thread that
-calls into it. This is a deliberate scope limit for a "light" embedded scripting language, not an
-oversight: an embedding host that needs concurrent script execution runs multiple independent
-`Chunk`/`VM` pairs (see [Embedding](#embedding)) on its own threads — AER itself never has to know
-about them, the same way file-based `import` already gets isolation from a genuinely separate VM
-rather than any in-language concurrency primitive.
+**Not supported at the language level.** AER has no threads, coroutines, `async`/`await`, or event
+loop of any kind — the VM is a single, synchronous dispatch loop, and a script runs start-to-finish
+on the thread that calls into it. This is a deliberate scope limit for a "light" embedded scripting
+language, not an oversight.
+
+**Multiple independent `VM`+`Chunk` pairs can coexist in one process** (file-based `import` already
+relies on this — each imported file gets its own), but **they are not safe to run simultaneously on
+separate OS threads**: a `VM`'s registers/call-stack are per-instance, but the underlying
+GC-managed heap (`string_pool`/`array_pool`/`dict_pool`/etc., `source/core/vm.c`) is a single set of
+pools shared by the whole process, not one per `VM`. Two VMs executing at the same instant on
+different threads would race on the allocator and the collector. Safe concurrent use of multiple
+VMs today means one thread driving them cooperatively (never two running literally simultaneously),
+not true parallelism.
+
+**Actor-model groundwork exists** (`source/core/aer_actor.h/c`) — spawning an independent, long-lived
+VM (reusing the same instantiation `import` uses internally) plus a plain host-side mailbox of byte
+strings (message content, e.g. JSON, is entirely up to each side's own `json.encode()`/`decode()`
+calls; the mailbox itself only ever moves bytes, never a live value, so it works regardless of the
+shared-pool constraint above). This is **not** an AER language feature yet — there's no `import
+actor`, and no scheduler (suspending a `vm_run()` mid-execution to switch to a different actor and
+resume it later is real, novel work, comparable in size to this project's value-representation
+migration or its generational GC). What exists today is driven entirely by host (C) code spawning
+actors and calling named functions on them; a real scheduler is the natural next step if this is
+pursued further, and would most likely stay cooperative (one thread, one actor running at a time)
+rather than reaching for true parallelism, since that's what the shared-pool constraint above allows
+without a much larger refactor.
 
 ---
 
 ## Standard Library
 
-There are currently six native modules — `math`, `random`, `string`, `time`, `json`, and
-`collection` — plus one opt-in host capability, `io`. See [Modularity](#modularity) for how
-`import` resolves these.
+There are currently eight native modules — `math`, `random`, `string`, `time`, `json`,
+`collection`, `net`, and `regex` — plus `io`, wired in slightly differently under the hood but
+just as unconditionally available (see [File I/O](#file-io--io) below). See
+[Modularity](#modularity) for how `import` resolves these.
 
 ```
 math.sqrt(x)          # square root, always returns a real; x must be non-negative
@@ -1190,6 +1230,9 @@ time.now()            # current epoch time as a real, with sub-second precision
 time.sleep(s)         # pauses for s seconds (integer or real, e.g. 0.25)
 time.strftime(t, fmt) # formats an epoch time (e.g. from time.now()) using C strftime format codes,
                       # in local time — time.strftime(time.now(), "%Y-%m-%d %H:%M:%S")
+time.parse(s, fmt)    # the strptime side of strftime — %Y %m %d %H %M %S %% only, hand-rolled
+                      # (strptime itself isn't reliably present on the MinGW target); returns an
+                      # epoch time as a real, or a runtime error if s doesn't match fmt exactly
 json.encode(value)    # returns a JSON string
 json.decode(s)        # returns (value, err) — err non-null on malformed input
 ```
@@ -1249,14 +1292,59 @@ always produces a plain dict back, never the original struct. Encoding a functio
 runtime error — there's nothing to serialize. `json.decode` follows the same `(value, err)`
 convention as the rest of the fallible stdlib rather than aborting the script on malformed input.
 
-### File I/O — `io`, an opt-in host capability, not a native module
+### Networking — `net`
 
-Unlike the six native modules above, `io` is **not** hardcoded into the parser's native-module
-table — it's registered like any other host function, via `aer_register_function` (see
-[Embedding](#embedding)). `source/main.c` (the reference CLI) registers it, so `./binary/aer
-script.aer` has file access; an embedding host that links AER into a game or a config parser simply
-doesn't call `aer_io_register()`, and scripts running under it have no file access at all — no flag,
-no sandbox layer, the capability just isn't there unless a host explicitly grants it.
+Blocking TCP only — connect/send/recv/close, the common "talk to a server" case. No HTTP/TLS
+layer and no listen/accept (there's no way to *be* a server yet); deliberately scoped small rather
+than half-implementing a much bigger surface.
+
+```
+import net
+
+handle, err = net.connect(host, port)   # a connection handle, or an error string (10-second timeout --
+                                         # a bare connect() has none, and can hang far longer than a
+                                         # normal refused connection against certain unreachable addresses)
+if err == null:
+    sent, err2 = net.send(handle, "hello\n")
+    reply, err3 = net.recv(handle, 4096)  # up to 4096 bytes; "" means the peer closed the connection
+    net.close(handle)
+```
+
+Every call is blocking, matching AER's single-threaded execution model — no async I/O, no event
+loop.
+
+### Regular Expressions — `regex`
+
+A small backtracking engine covering the practical common subset: literals, `.`, character classes
+(`[abc]`, `[^a-z]`, `\d \w \s \D \W \S`), `*`/`+`/`?` quantifiers (on single atoms and on groups),
+`^`/`$` anchors, `|` alternation, and `(...)` grouping (non-capturing — none of the three functions
+below need to extract a sub-match, only the overall match). No backreferences, no named groups, no
+lazy quantifiers. Rolled in-house rather than depending on a system library — POSIX `<regex.h>`
+isn't reliably available on the MinGW target, and this matches the project's existing precedent
+(its own PRNG instead of libc `rand()`, its own GC).
+
+```
+import regex
+
+regex.match(s, pattern)          # true/false — does pattern occur anywhere in s
+regex.find(s, pattern)           # the first matching substring, or null
+regex.replace(s, pattern, repl)  # every non-overlapping match replaced with repl (a literal string, no backreferences)
+```
+
+Nested unbounded quantifiers (`(a*)*b` against a long non-matching run of `a`s — the textbook
+catastrophic-backtracking shape) are exponential in any naive backtracker, this one included. A
+step budget bounds worst-case time instead of letting a pathological pattern hang a script: past
+it, a match attempt just reports failure early rather than exhaustively searching every partition.
+
+### File I/O — `io`
+
+`io` is registered slightly differently under the hood than the other native modules above — it
+goes through the same generic host-function mechanism a real embedding host would use for its own
+custom functions (`aer_register_function`, see [Embedding](#embedding)) rather than a fixed
+dispatch-table entry — but `vm_init()` calls `aer_io_register()` itself now, once per process, so
+every host gets it automatically with no action of its own. It's just as unconditionally available
+as `math`/`collection`/`net`/everything else; the only thing left genuinely host-specific is a
+host's own *custom* functions (a game's `spawn_enemy()`, say) via that same mechanism.
 
 ```
 write_err, err = io.append("log.txt", "a line\n")
@@ -1279,8 +1367,10 @@ Every `io` function follows the `(value, err)` convention `safe_div` establishes
 `Result`, not a plain array (more on that distinction there). A wrong argument *type* (not a string
 path, not `io.stdin()`'s handle) is a VM-level runtime error like any other stdlib type mismatch; a
 missing file or a write that fails partway is the fallible case and comes back as `err` instead.
-There's no path sandboxing within `io` itself — same trust model as any language's file API — the
-boundary is entirely "does this host expose `io` at all."
+There's no path sandboxing within `io` at all — same trust model as any language's file API. Since
+`io` is unconditionally available now (not a host opt-in), running untrusted AER source is not a
+safe sandbox on its own — that would need a real permission system, a different feature from
+anything described here.
 
 `io.read()` takes either a path (opens, reads the whole file, closes it) or `io.stdin()`'s handle —
 piped, non-seekable input falls back to reading until EOF instead of the seek-and-presize approach
@@ -1380,10 +1470,9 @@ Build and run the embedding smoke test (a minimal, complete example of everythin
 including the deliberate-error and VM-reuse cases) with `make test-embed`.
 
 **`aer_io_register()`** (`source/stdlib/aer_io.h`) is the same registration mechanism applied to an
-AER-provided (not host-defined) capability — see [File I/O](#file-io--io-an-opt-in-host-capability-not-a-native-module).
-It's not called automatically by `vm_init()` — `source/main.c` calls it explicitly, once, right
-after `vm_init()`, so the reference CLI's scripts get file access. A different embedding host (a
-game, a config parser) simply doesn't call it, and its scripts have none.
+AER-provided (not host-defined) capability — see [File I/O](#file-io--io). Unlike a host's own
+custom functions, `vm_init()` calls this one itself, once per process, so every host's scripts get
+file access automatically — there's nothing for an embedding host to opt into or out of here.
 
 ---
 
@@ -1395,7 +1484,6 @@ game, a config parser) simply doesn't call it, and its scripts have none.
 |-----------|-------------|------------|
 | `/` always returns real | `1 / 1` → `1.0` | Use `//` for integer floor division |
 | Arrays and dicts are references | `b = a; b[0] = 99` modifies `a` too | `b = collection.copy(a)` when you really want a distinct container (shallow — one level) |
-| `&&`/`||` return boolean, not operand | `x = x \|\| "default"` doesn't work | `if x:` ... `else: x = "default"` |
 | Referencing a name that was never assigned is a compile error | `print(x)` with no prior `x = ...` anywhere fails to compile | Assign it first (`x = null` if there's genuinely nothing better) |
 | Missing dict key returns `null` | No error, silent | Use `key in dict` before access |
 | `collection.append()`/`delete()`/`sort()`/`shuffle()` mutate in place and also return the container | `arr = collection.append(arr, v)` works but is redundant — the mutation already happened | Call them as statements |
@@ -1403,7 +1491,6 @@ game, a config parser) simply doesn't call it, and its scripts have none.
 | `as Type` never converts | `some_dict as Point` errors rather than reshaping the dict into a Point | Build the struct explicitly: `Point(some_dict["x"], ...)` |
 | Struct instances are still `AerArray` under the hood | `length(p)` works and returns the field count (not blocked) | Harmless but not the intended API — use dot access |
 | Pipe rejects nested calls in target args | `x \|> f(g(1))` is a parse error, at any depth | Assign the inner call to a variable first: `t = g(1); x \|> f(t)` |
-| Windows REPL doesn't support piped/redirected stdin | `aer.exe < commands.txt` fails — `_getch()` reads the console directly, bypassing redirection | Run `aer.exe script.aer` (file mode) instead — unaffected, since it never touches the raw-mode terminal code. A file-mode script can still read the piped data itself via `io.stdin()`/`io.read()` (see [Standard Library](#standard-library)) |
 
 ### Hard limits
 
@@ -1426,9 +1513,9 @@ game, a config parser) simply doesn't call it, and its scripts have none.
   function/struct persistence work. The file-module registry grows the same way during normal
   execution, but an embedding host can explicitly reclaim it via `aer_module_free_all()` (see
   [Embedding](#embedding)) when tearing the process down.
-- No networking, regex, or date/time parsing — `time` covers `now()`/`sleep()`/`strftime()` only. File I/O
-  exists but is a host-registered opt-in ([Standard Library](#standard-library)), not always
-  available.
+- `net` is a minimal blocking TCP client only — no listen/accept (no way to *be* a server), no
+  HTTP/TLS layer. `regex` covers a practical common subset (see [Regular
+  Expressions](#regular-expressions--regex)), not the full PCRE feature set.
 - No try/catch **at the AER language level** — runtime errors are still not catchable AER
   values; user-level fallibility still uses the multi-return `(value, null)` / `(null, message)`
   convention only. A *host* embedding AER can recover from a script's runtime error via
@@ -1443,28 +1530,6 @@ game, a config parser) simply doesn't call it, and its scripts have none.
   position (see [Structs](#structs)).
 - No struct methods namespaced by type — see [Structs](#structs).
 - No concurrency of any kind — see [Concurrency](#concurrency).
-
----
-
-## Benchmarking
-
-Two canonical workloads live in [`bench/`](bench/): [`nbody.aer`](bench/nbody.aer) (float-heavy
-struct arithmetic — the workload every performance decision in this project was measured against)
-and [`sieve.aer`](bench/sieve.aer) (integer/array-heavy iteration). Time them with your shell's
-`time` (or `perf stat` on Linux) against equivalent Python/Lua if you want a comparison — the
-cross-language harness and reference implementations that used to live in the repo were dropped as
-clutter; the workloads themselves are trivial to port.
-
-**Where AER lands:** faster than CPython across these workloads, and within striking distance of
-Lua everywhere except raw tight-loop iteration (a specializing interpreter is hard to beat there
-without a JIT). AER's advantage is startup time, simplicity of embedding, and being fast enough
-that the difference rarely matters.
-
-**Packed arrays at scale** (recorded result — the N=1024 variant files were dropped from the repo,
-the numbers stand): `nbody` at N=1024 with a packed `Body[1024]` versus an ordinary array of
-heap-allocated instances, on a Raspberry Pi (5-run-averaged `perf stat`): -20% instructions, -23%
-cycles, ~8.8x fewer cache misses, -18.6% wall clock. The cache-miss reduction is packed arrays'
-actual value proposition; `bench/nbody.aer` at N=5 fits in L1 and cannot show it.
 
 ---
 
@@ -1845,8 +1910,9 @@ runtime error (`aer_last_error()`) — the same non-fatal path every other runti
 |-------|------|--------|
 | Out-of-memory is still fatal | `aer_report_fatal()` calls `exit(1)` — the one remaining unconditional process exit | By design for this phase; a configurable memory ceiling (rejecting an allocation, or forcing a collection first) is a natural next step now that the collector exists, but isn't built |
 | No arithmetic overflow checks | `arr[9999999999999]` on a 32-bit platform behaves unexpectedly | Array bounds are checked; index arithmetic is not |
-| File I/O is host-registered opt-in, not ambient | `io` (see [Standard Library](#standard-library)) gives the reference CLI real file access; an embedding host simply doesn't get it unless it calls `aer_io_register()` itself | The sandboxing boundary is "does this host register `io`," not any restriction within `io` once granted — same trust model as any language's file API |
+| `io` is unconditionally available, with no path restriction | Every AER script gets real file access (see [File I/O](#file-io--io)) — there's no host opt-out and no sandboxing within `io` itself | Same trust model as any language's file API; running untrusted AER source is not safe on its own — that would need a real permission system, not present here |
 | File-based `import` reads arbitrary files by name | `import` resolves and executes `<name>.aer` (or a file found via `AER_PATH`) from disk with no sandboxing | Same-directory/`AER_PATH` resolution limits the blast radius somewhat; a real permissions model would be needed before embedding AER in a context where the script source isn't trusted |
+| `net` makes outbound TCP connections with no restriction | Any script can `net.connect()` to any host/port reachable from the process | Same "no sandbox" trust model as `io`/`import` above — this is not a safe way to run untrusted scripts |
 
 Dict key lookups (`in`, `delete`, index get/set) build a null-terminated copy of the key into a
 fixed `VM_KEY_MAX` (4096 byte) stack buffer rather than a length-sized VLA, so an oversized key
@@ -1864,12 +1930,13 @@ raises a normal AER runtime error instead of risking a stack overflow.
 | `source/compiler/lexer.h/c` | Source text → token stream, indent/dedent tracking |
 | `source/compiler/parser.h/c` | Single-pass compiler: tokens → register-based bytecode, escape processing |
 | `source/core/vm.h/c` | Bytecode chunk, register-based VM (`CallFrame`/bump-pointer register stack), struct-type registry, computed-goto dispatch loop, built-ins |
-| `source/stdlib/aer_stdlib.h` | Declares the entire native-module surface (math/random/string/time/json/io) — one header for a fixed, closed set |
-| `source/stdlib/aer_stdlib.c` | Native-module registry: `aer_stdlib_init()`, `aer_stdlib_is_native_module()` |
-| `source/stdlib/aer_math.c` / `aer_random.c` / `aer_string.c` / `aer_time.c` | One file per hardcoded native module, dispatched by `vm.c`'s `OP_CALL_MODULE` switch |
-| `source/stdlib/aer_json.c` | `json` module — encode/decode, dispatched the same way as the four above |
-| `source/stdlib/aer_io.c` | `io` module (file open/read/write/close) — opt-in per host via `aer_io_register()`, not hardcoded like the others |
-| `source/core/aer_module.h/c` | File-based `import` — resolution, isolated per-file `Chunk`/`VM`, cross-VM call trampoline |
+| `source/stdlib/aer_stdlib.h` | Declares the entire native-module surface (math/random/string/time/json/collection/net/regex/io) — one header for a fixed, closed set |
+| `source/stdlib/aer_stdlib.c` | `aer_stdlib_is_native_module()` — the hardcoded module names `import` accepts |
+| `source/stdlib/aer_math.c` / `aer_random.c` / `aer_string.c` / `aer_time.c` / `aer_collection.c` / `aer_net.c` / `aer_regex.c` | One file per hardcoded native module, dispatched by `vm.c`'s `OP_CALL_MODULE` switch |
+| `source/stdlib/aer_json.c` | `json` module — encode/decode, dispatched the same way as the modules above |
+| `source/stdlib/aer_io.c` | `io` module (file open/read/write/close) — registered via the generic host-function mechanism (`aer_register_function`), but called by `vm_init()` itself, so it's just as unconditionally available as the hardcoded modules above |
+| `source/core/aer_module.h/c` | File-based `import` — resolution, isolated per-file `Chunk`/`VM`, cross-VM call trampoline; `aer_vm_instantiate_from_file()` is the shared "spin up an independent VM+Chunk and run its top-level code once" primitive this and `aer_actor.c` both use |
+| `source/core/aer_actor.h/c` | Actor-model groundwork — spawning an independent long-lived VM plus a host-side byte-string mailbox; not yet wired up to the AER language (no scheduler, no `import actor`) — see [Concurrency](#concurrency) |
 | `source/core/aer_host.h/c` | Host-registered native function registry (`aer_register_function`) — reached from AER the same way as `math`/`random`/`string` |
 | `source/utilities/hashtable.h/c` | FNV-1a open-addressing hash table backing every `AerDict` and `Chunk`'s own string-constant dedup table, with size-classed slab pools for small key/bucket allocations |
 | `source/utilities/pool.h/c` | Slab (bump/arena) allocator extended for the generational mark-sweep garbage collector — every pool-managed struct (`AerString`/`AerArray`/`AerDict`/`AerFunction`/`AerPackedArray`) carries its own one-byte GC state as its literal first field |
@@ -1880,7 +1947,6 @@ raises a normal AER runtime error instead of risking a stack overflow.
 | `tests/embed_smoke_test.c` | Minimal standalone embedding host — proves a runtime error doesn't kill the process, demonstrates the VM-reuse-after-error contract, and registers/calls a custom host function. Build/run with `make test-embed`. |
 | `tests/smoke_test.c` | Register-VM unit test — hand-built bytecode plus real-source coverage below the level of a full `.aer` file. Build/run with `make test-smoke`. |
 | `tests/fuzz.py` | Mutation-based fuzzer against an ASAN build — reports crashes and hangs. Run with `make fuzz`. |
-| `bench/` | The two canonical benchmark workloads — `nbody.aer` and `sieve.aer` (see [Benchmarking](#benchmarking)) |
 | `.github/workflows/ci.yml` | CI: Ubuntu (`make test`, `make test-embed`, `make fuzz`) and Windows/MSYS2 (`make test`, `make test-embed`, `make test-smoke`) |
 
 ---

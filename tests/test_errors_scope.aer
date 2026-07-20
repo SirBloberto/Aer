@@ -52,7 +52,7 @@ assert(read_it(outer) == 10, "the value has to be passed in explicitly; a functi
 # given a reference to (a struct/array/dict), not a bare name — see the Scope section
 # of the README.
 struct Counter:
-    value: integer = 0
+    value = 0
 
 function bump(c):
     c.value += 1

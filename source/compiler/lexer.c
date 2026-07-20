@@ -101,6 +101,17 @@ void read_file(char* filename) {
     fclose(fp);
     buf[nread] = '\0';
 
+    /* An embedded NUL would make every '\0'-terminated scan below (indentation, the \r-strip
+       pass, lex_string, ...) treat it as the end of the file, silently truncating everything
+       after it instead of reporting an error -- found via tests/fuzz.py's byte-flip mutator
+       turning a mid-file space into a NUL, which truncated a loop body and made it infinite. */
+    if (strlen(buf) != nread) {
+        unsigned long at = (unsigned long)strlen(buf);
+        free(buf);
+        error("Source file '%s' contains an embedded NUL byte at offset %lu -- not a valid AER source file", filename, at);
+        return;
+    }
+
     /* Normalize Windows line endings: strip \r in-place */
     char* dst = buf; char* src = buf;
     while (*src) { if (*src != '\r') *dst++ = *src; src++; }

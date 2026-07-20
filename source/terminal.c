@@ -61,6 +61,10 @@ static unsigned long history_length;
 #else
     static struct termios original;
 #endif
+/* True when stdin isn't a real console (redirected from a file/pipe) -- raw-mode editing and
+   history are meaningless without a terminal to render them on, so handle_terminal() falls back
+   to plain line reads instead (see handle_terminal_piped). */
+static bool piped_stdin = false;
 static unsigned short screen_row;
 static unsigned short screen_position;
 static unsigned short screen_rows;
@@ -106,7 +110,22 @@ void start_terminal(char* name) {
 #ifdef _WIN32
     hStdin  = GetStdHandle(STD_INPUT_HANDLE);
     hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (!GetConsoleMode(hStdin, &original_in_mode))   die("GetConsoleMode (stdin)");
+    /* A redirected/piped stdin is a valid handle but not a console, so GetConsoleMode fails --
+       that used to hit die() unconditionally, crashing on `aer.exe < script.txt`. Same fallback
+       applied on POSIX (isatty) below in case the equivalent gap exists there too, just
+       unexercised. Raw mode, history, and screen-size queries are all meaningless without a real
+       console to render them on, so the piped path skips straight to allocating the line buffer
+       handle_terminal_piped() needs and returns. */
+    piped_stdin = !GetConsoleMode(hStdin, &original_in_mode);
+#else
+    piped_stdin = !isatty(STDIN_FILENO);
+#endif
+    if (piped_stdin) {
+        buffer = xcalloc(buffer_length, sizeof(char));
+        return;
+    }
+
+#ifdef _WIN32
     if (!GetConsoleMode(hStdout, &original_out_mode)) die("GetConsoleMode (stdout)");
     atexit(end_terminal);
 
@@ -163,7 +182,33 @@ void start_terminal(char* name) {
     history_position = history_length;
 }
 
+/* Plain line reads, no raw-mode editing/history -- used when stdin is redirected from a file or
+   pipe (see start_terminal). Mirrors the interactive loop's own EOF contract (end_terminal() +
+   exit(0)) rather than returning NULL, so run_shell()'s existing NULL-means-Ctrl-C handling in
+   main.c needs no changes for this path. A final line with no trailing newline is still handed
+   over as one real line; only a completely empty read at EOF exits. */
+static char* handle_terminal_piped(void) {
+    length = 0;
+    for (;;) {
+        int ch = getchar();
+        if (ch == EOF) {
+            if (length == 0) { end_terminal(); exit(0); }
+            break;
+        }
+        if (length + 2 > buffer_length) {
+            buffer_length *= 2;
+            buffer = xrealloc(buffer, buffer_length);
+        }
+        buffer[length++] = (char)ch;
+        if (ch == '\n') break;
+    }
+    buffer[length] = '\0';
+    return buffer;
+}
+
 char* handle_terminal() {
+    if (piped_stdin) return handle_terminal_piped();
+
     clear();
     refresh();
 
@@ -308,6 +353,7 @@ void end_terminal() {
         fclose(history);
         history = NULL;
     }
+    if (piped_stdin) return;   /* raw mode was never entered -- nothing to restore */
 #ifdef _WIN32
     SetConsoleMode(hStdin, original_in_mode);
     SetConsoleMode(hStdout, original_out_mode);

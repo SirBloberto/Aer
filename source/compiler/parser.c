@@ -1244,60 +1244,52 @@ static int parse_unary(Chunk* c) {
 
 /* Both the lhs-false and rhs-false paths land on the same "result = false" code. `dest`
    is allocated once, after both operands free. */
+/* `a && b` = a if falsy(a), else b -- the operand itself, not a coerced boolean (matches
+   Python/Lua). dest is lhs's own temp register when it has one, else a fresh copy (never an
+   existing variable's permanent register, which this must not clobber). */
 static int compile_and(Chunk* c, int lhs, unsigned int prec) {
     int reg_lhs = materialize(c, lhs);
-    unsigned int patch_false_a = emit_jump_if_false_reg(c, reg_lhs);
-    if (is_temp(reg_lhs)) reg_free(1);
+    int dest;
+    if (is_temp(reg_lhs)) {
+        dest = reg_lhs;
+    } else {
+        dest = reg_alloc();
+        chunk_emit(c, PACK2(OP_MOVE, dest, reg_lhs));
+    }
+    unsigned int patch_skip = emit_jump_if_false_reg(c, dest);   /* lhs falsy -- dest already holds it */
 
     int rk_rhs = parse_binary(c, prec);
     int reg_rhs = materialize(c, rk_rhs);
-    unsigned int patch_false_b = emit_jump_if_false_reg(c, reg_rhs);
+    if (reg_rhs != dest) chunk_emit(c, PACK2(OP_MOVE, dest, reg_rhs));
     if (is_temp(reg_rhs)) reg_free(1);
 
-    int dest = reg_alloc();
-    unsigned int pool_true = chunk_add_pool(c, aer_bool(true));
-    chunk_emit(c, PACK1(OP_LOADK, dest)); chunk_emit(c, (int)pool_true);
-    chunk_emit(c, OP_JUMP);
-    unsigned int patch_end = c->count; chunk_emit(c, 0);
-
-    patch_jump(c, patch_false_a, c->count);
-    patch_jump(c, patch_false_b, c->count);
-    unsigned int pool_false = chunk_add_pool(c, aer_bool(false));
-    chunk_emit(c, PACK1(OP_LOADK, dest)); chunk_emit(c, (int)pool_false);
-
-    patch_jump(c, patch_end, c->count);
+    patch_jump(c, patch_skip, c->count);
     return dest;
 }
 
-/* No jump-if-true opcode exists, so this restructures to jump-if-false only -- lhs-false
-   jumps into a "check rhs" block. */
+/* `a || b` = a if truthy(a), else b. No jump-if-true opcode exists, so this restructures to
+   jump-if-false only -- lhs-false jumps into a "use rhs" block; lhs-true jumps past it, keeping
+   dest's already-in-place value. */
 static int compile_or(Chunk* c, int lhs, unsigned int prec) {
     int reg_lhs = materialize(c, lhs);
-    unsigned int patch_check_rhs = emit_jump_if_false_reg(c, reg_lhs);
-    if (is_temp(reg_lhs)) reg_free(1);
-
-    int dest = reg_alloc();
-    unsigned int pool_true = chunk_add_pool(c, aer_bool(true));
-    chunk_emit(c, PACK1(OP_LOADK, dest)); chunk_emit(c, (int)pool_true);
+    int dest;
+    if (is_temp(reg_lhs)) {
+        dest = reg_lhs;
+    } else {
+        dest = reg_alloc();
+        chunk_emit(c, PACK2(OP_MOVE, dest, reg_lhs));
+    }
+    unsigned int patch_use_rhs = emit_jump_if_false_reg(c, dest);
     chunk_emit(c, OP_JUMP);
-    unsigned int patch_end_a = c->count; chunk_emit(c, 0);
+    unsigned int patch_end = c->count; chunk_emit(c, 0);
 
-    patch_jump(c, patch_check_rhs, c->count);
+    patch_jump(c, patch_use_rhs, c->count);
     int rk_rhs = parse_binary(c, prec);
     int reg_rhs = materialize(c, rk_rhs);
-    unsigned int patch_result_false = emit_jump_if_false_reg(c, reg_rhs);
+    if (reg_rhs != dest) chunk_emit(c, PACK2(OP_MOVE, dest, reg_rhs));
     if (is_temp(reg_rhs)) reg_free(1);
 
-    chunk_emit(c, PACK1(OP_LOADK, dest)); chunk_emit(c, (int)pool_true);
-    chunk_emit(c, OP_JUMP);
-    unsigned int patch_end_b = c->count; chunk_emit(c, 0);
-
-    patch_jump(c, patch_result_false, c->count);
-    unsigned int pool_false = chunk_add_pool(c, aer_bool(false));
-    chunk_emit(c, PACK1(OP_LOADK, dest)); chunk_emit(c, (int)pool_false);
-
-    patch_jump(c, patch_end_a, c->count);
-    patch_jump(c, patch_end_b, c->count);
+    patch_jump(c, patch_end, c->count);
     return dest;
 }
 
@@ -2383,6 +2375,8 @@ static int module_call_id(AerString* name) {
     if (name->length == 4 && strncmp(name->data, "time", 4) == 0)   return CALL_MODULE_TIME;
     if (name->length == 4 && strncmp(name->data, "json", 4) == 0)   return CALL_MODULE_JSON;
     if (name->length == 10 && strncmp(name->data, "collection", 10) == 0) return CALL_MODULE_COLLECTION;
+    if (name->length == 3 && strncmp(name->data, "net", 3) == 0)     return CALL_MODULE_NET;
+    if (name->length == 5 && strncmp(name->data, "regex", 5) == 0)   return CALL_MODULE_REGEX;
     return CALL_MODULE_DYNAMIC;
 }
 
@@ -2434,6 +2428,7 @@ static int module_fn_id(int module_id, AerString* name) {
             if (NAME_IS("now"))      return FN_TIME_NOW;
             if (NAME_IS("strftime")) return FN_TIME_STRFTIME;
             if (NAME_IS("sleep"))    return FN_TIME_SLEEP;
+            if (NAME_IS("parse"))    return FN_TIME_PARSE;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_JSON:
             if (NAME_IS("encode")) return FN_JSON_ENCODE;
@@ -2447,6 +2442,17 @@ static int module_fn_id(int module_id, AerString* name) {
             if (NAME_IS("index_of")) return FN_COLLECTION_INDEX_OF;
             if (NAME_IS("keys"))     return FN_COLLECTION_KEYS;
             if (NAME_IS("sort"))     return FN_COLLECTION_SORT;
+            return FN_ID_UNKNOWN;
+        case CALL_MODULE_NET:
+            if (NAME_IS("connect")) return FN_NET_CONNECT;
+            if (NAME_IS("send"))    return FN_NET_SEND;
+            if (NAME_IS("recv"))    return FN_NET_RECV;
+            if (NAME_IS("close"))   return FN_NET_CLOSE;
+            return FN_ID_UNKNOWN;
+        case CALL_MODULE_REGEX:
+            if (NAME_IS("match"))   return FN_REGEX_MATCH;
+            if (NAME_IS("find"))    return FN_REGEX_FIND;
+            if (NAME_IS("replace")) return FN_REGEX_REPLACE;
             return FN_ID_UNKNOWN;
         default:
             return FN_ID_UNKNOWN;
@@ -3100,18 +3106,6 @@ static bool parse_literal_default(Chunk* c, AerVal* out) {
 
 /* Emits OP_DEFINE_STRUCT directly, then registers the type name so `Name(args)` resolves to
    construction. Field defaults share parse_literal_default with function parameters. */
-/* Maps the four `as` primitive keywords plus `any` (an explicit, visible no-constraint choice)
-   to a ValueType for a mandatory struct-field annotation. Returns false silently if no match. */
-static bool parse_field_type_name(const char* name, unsigned int len, ValueType* out) {
-    if      (len == 7 && strncmp(name, "integer", 7) == 0) *out = TYPE_INTEGER;
-    else if (len == 5 && strncmp(name, "float",   5) == 0) *out = TYPE_REAL;
-    else if (len == 6 && strncmp(name, "string",  6) == 0) *out = TYPE_STRING;
-    else if (len == 7 && strncmp(name, "boolean", 7) == 0) *out = TYPE_BOOLEAN;
-    else if (len == 3 && strncmp(name, "any",     3) == 0) *out = TYPE_ANY;
-    else return false;
-    return true;
-}
-
 static void parse_struct(Chunk* c) {
     if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected struct name"); return; }
     unsigned int name_idx = chunk_add_pool(c, token.value);
@@ -3134,22 +3128,11 @@ static void parse_struct(Chunk* c) {
         unsigned int fname = chunk_add_pool(c, token.value);
         lex();
 
-        /* Every typed field must have an explicit default -- one with none would fall back to null,
-           silently violating the "always this type" invariant the fused field-arithmetic opcodes
-           rely on to skip a runtime check. */
-        require(TOKEN_COLON, "Struct field must declare a type (e.g. 'x: float' or 'x: any')");
-        if (parse_had_error) return;
-        if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a type name after ':'"); return; }
-        ValueType ftype;
-        const char* type_name = aer_as_string(token.value)->data;
-        unsigned int type_len = aer_as_string(token.value)->length;
-        if (!parse_field_type_name(type_name, type_len, &ftype)) {
-            error_at("Unknown type '%.*s' in struct field declaration (must be integer/float/string/boolean/any)",
-                     (int)type_len, type_name);
-            return;
-        }
-        lex();
-
+        /* No type annotation -- a field's type is always exactly its default's type. Every field
+           already needs an explicit default (below), and that default was always required to match
+           its own declared type anyway, so a separate ': type' never carried information the
+           default didn't already have. 'null' is the one default with no matching ValueType, and
+           is what TYPE_ANY (unconstrained) means here -- never a spelled-out keyword. */
         if (!consume(TOKEN_ASSIGN)) {
             error_at("Struct field '%.*s' must have an explicit default value",
                      (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
@@ -3160,13 +3143,9 @@ static void parse_struct(Chunk* c) {
             error_at("Struct field defaults must be a literal value");
             return;
         }
-        if (ftype != TYPE_ANY && aer_type(dflt) != ftype) {
-            error_at("Struct field default's type doesn't match its declared type");
-            return;
-        }
         field_names[field_count]    = fname;
         field_defaults[field_count] = dflt;
-        field_types[field_count]    = ftype;
+        field_types[field_count]    = aer_type(dflt) == TYPE_NULL ? TYPE_ANY : aer_type(dflt);
         field_count++;
 
         if (!equal(TOKEN_DEDENT) && !equal(TOKEN_END_OF_FILE))

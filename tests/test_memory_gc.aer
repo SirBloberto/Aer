@@ -86,8 +86,8 @@ assert(gc_old_dict["fresh_key"]["nested"] == "written after promotion",
 # a separate file/process would remove the preceding allocation pressure
 # entirely and risk reintroducing the exact flakiness this ordering avoids.
 struct InterpPoint:
-    x: integer = 0
-    y: integer = 0
+    x = 0
+    y = 0
 interp_pt = InterpPoint(1, 2)
 assert("pt is {interp_pt}" == "pt is InterpPoint\{x: 1, y: 2}", "interpolating a struct shows its fields, not a placeholder")
 
@@ -142,8 +142,8 @@ assert(many_params(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
 # into one on every field access. 100 comfortably crosses the 64-per-slab
 # boundary.
 struct SlabPoint:
-    x: integer = 0
-    y: integer = 0
+    x = 0
+    y = 0
 
 slab_structs = []
 for i in 0..100:
@@ -161,7 +161,7 @@ assert(slab_structs[99].x == 99 && slab_structs[99].y == 198, "the last struct i
 # into an already-old struct instance could be swept as unreachable by a
 # later minor collection, which never re-traces old cells on its own.
 struct OldStruct:
-    payload: any = null
+    payload = null
 
 gc_old_struct = OldStruct(null)
 
@@ -181,8 +181,8 @@ assert(gc_old_struct.payload == "written after promotion",
 # Struct field mutation through all three write paths, confirming the new
 # inline-items layout is correct for each.
 struct MutPoint:
-    x: integer = 0
-    y: integer = 0
+    x = 0
+    y = 0
 
 mp = MutPoint(1, 2)
 mp.x = 10                    # plain assignment

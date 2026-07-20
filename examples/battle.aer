@@ -9,9 +9,9 @@ import random
 import string
 
 struct Character:
-    name: string = "Unnamed"
-    hp: integer = 100
-    attack: integer = 10
+    name = "Unnamed"
+    hp = 100
+    attack = 10
 
 # AER has no closures — a special attack's bonus is just an ordinary parameter,
 # not state captured from an enclosing call.

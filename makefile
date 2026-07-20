@@ -2,7 +2,7 @@
 # without -static the exe silently depends on MSYS2 DLLs and won't launch outside its build shell.
 ifneq (,$(findstring _NT,$(shell uname -s 2>/dev/null)))
     EXE     := .exe
-    WINLIBS := -lkernel32 -static
+    WINLIBS := -lkernel32 -lws2_32 -static
 else
     EXE     :=
     WINLIBS :=
@@ -45,7 +45,9 @@ TESTS := tests/test_core.aer \
          tests/test_perf_fusion.aer \
          tests/test_primitive_pass.aer \
          tests/test_dict_pool_stress.aer \
-         tests/test_packed_arrays.aer
+         tests/test_packed_arrays.aer \
+         tests/test_net.aer \
+         tests/test_regex.aer
 
 test: all
 	@for t in $(TESTS); do \

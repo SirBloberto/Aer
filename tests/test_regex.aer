@@ -1,0 +1,97 @@
+#!/usr/bin/env aer
+import regex
+# AER test suite — regex module: a compact hand-rolled backtracking engine covering literals,
+# '.', character classes, '*'/'+'/'?' quantifiers (on atoms and groups), '^'/'$' anchors, '|'
+# alternation, and '(...)' grouping (non-capturing). Machine-checked via assert(): a clean run
+# exits 0; any failure prints "ASSERT FAILED: ..." and the process exits nonzero.
+
+# ------------------------------------------------------------------ #
+# regex.match — literals, '.', classes, quantifiers                    #
+# ------------------------------------------------------------------ #
+
+assert(regex.match("hello world", "world") == true, "a literal substring matches anywhere in the subject")
+assert(regex.match("hello world", "xyz") == false, "a literal that doesn't occur doesn't match")
+assert(regex.match("abc", "a.c") == true, "'.' matches any single character")
+assert(regex.match("aXXXb", "aX*b") == true, "'*' matches greedily across multiple repetitions")
+assert(regex.match("ab", "aX*b") == true, "'*' also matches zero repetitions")
+assert(regex.match("a123", "a[0-9]+") == true, "'+' requires at least one repetition, matched here")
+assert(regex.match("a", "a[0-9]+") == false, "'+' fails with zero repetitions available")
+assert(regex.match("a", "a[0-9]*") == true, "'*' succeeds with zero repetitions where '+' wouldn't")
+
+# ------------------------------------------------------------------ #
+# Anchors                                                              #
+# ------------------------------------------------------------------ #
+
+assert(regex.match("hello", "^hello$") == true, "^...$ anchors match the whole subject exactly")
+assert(regex.match("hello!", "^hello$") == false, "^...$ rejects trailing extra characters")
+assert(regex.find("say hello world", "^hello") == null, "^ only matches at the true start of the subject, not anywhere a search cursor lands")
+assert(regex.find("hello world", "^hello") == "hello", "^ succeeds when the match really is at the start")
+
+# ------------------------------------------------------------------ #
+# Alternation and groups                                               #
+# ------------------------------------------------------------------ #
+
+assert(regex.match("cat", "cat|dog") == true, "alternation matches its first branch")
+assert(regex.match("dog", "cat|dog") == true, "alternation matches its second branch")
+assert(regex.match("fish", "cat|dog") == false, "alternation rejects anything matching neither branch")
+assert(regex.match("abab", "(ab)+") == true, "a group can itself be quantified with '+'")
+assert(regex.match("ababab", "(ab)*c?") == true, "a quantified group followed by an optional atom")
+
+# A zero-width repetition ('(a?)*' can trivially match nothing each iteration) must still
+# terminate instead of looping forever — this is the actual bug class a naive port of this
+# technique risks; both cases below must complete, not hang.
+assert(regex.match("", "(a?)*") == true, "a zero-width-capable group quantifier terminates on empty input")
+assert(regex.match("bbb", "(a?)*") == true, "a zero-width-capable group quantifier terminates when it never matches")
+
+# Escaped metacharacters and nested groups.
+assert(regex.match("a.b", "a\\.b") == true, "an escaped '.' matches only a literal dot")
+assert(regex.match("axb", "a\\.b") == false, "an escaped '.' does not match an arbitrary character")
+assert(regex.match("abcabc", "(abc)(abc)") == true, "two adjacent groups in sequence")
+assert(regex.match("xy", "(a(b|c)?d)?xy") == true, "an entire optional (possibly nested) group can be skipped")
+
+# ------------------------------------------------------------------ #
+# Character classes, negation, and \d \w \s shorthand                  #
+# ------------------------------------------------------------------ #
+
+assert(regex.match("xyz", "[^0-9]+") == true, "a negated class matches characters outside the set")
+assert(regex.match("123", "[^0-9]+") == false, "a negated class rejects characters inside the set")
+assert(regex.match("foo_bar123", "^\\w+$") == true, "\\w covers letters, digits, and underscore")
+assert(regex.match("foo bar", "^\\w+$") == false, "\\w does not cover a space")
+assert(regex.match("   ", "^\\s+$") == true, "\\s covers whitespace")
+
+# ------------------------------------------------------------------ #
+# regex.find — returns the matched substring, or null                  #
+# ------------------------------------------------------------------ #
+
+assert(regex.find("price: 42 dollars", "[0-9]+") == "42", "find() returns the matched substring")
+assert(regex.find("no digits here", "[0-9]+") == null, "find() returns null when nothing matches")
+
+# ------------------------------------------------------------------ #
+# regex.replace — all non-overlapping matches, replacement is literal  #
+# ------------------------------------------------------------------ #
+
+assert(regex.replace("2024-01-15", "-", "/") == "2024/01/15", "replace() substitutes every match")
+assert(regex.replace("aaa", "a", "b") == "bbb", "replace() handles adjacent matches correctly")
+assert(regex.replace("hello world", "o", "0") == "hell0 w0rld", "replace() substitutes a repeated single character")
+
+# A zero-width pattern ('x*' against text with no 'x's) matches at every position — replace()
+# must still advance past a real character each time or it would never terminate.
+assert(regex.replace("abc", "x*", "-") == "-a-b-c-", "replace() with a zero-width pattern still terminates and interleaves correctly")
+
+# ------------------------------------------------------------------ #
+# Catastrophic-backtracking safety net                                 #
+# ------------------------------------------------------------------ #
+
+# '(a*)*b' against a long run of 'a's with no trailing 'b' is the textbook catastrophic-
+# backtracking shape — exponential in any naive backtracker, this one included. A step budget
+# (aer_regex.c) bounds worst-case time instead of letting it hang; this must complete quickly and
+# report no match (the correct answer, just reached via an early cutoff instead of an exhaustive
+# search of every possible partition).
+long_a = ""
+i = 0
+for i < 40:
+    long_a += "a"
+    i += 1
+assert(regex.match(long_a, "(a*)*b") == false, "a pathological nested-quantifier pattern completes quickly instead of hanging")
+
+print("test_regex.aer: all assertions passed.")

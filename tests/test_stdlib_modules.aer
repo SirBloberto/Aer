@@ -131,6 +131,16 @@ time.sleep(0.05)
 sleep_after = time.now()
 assert(sleep_after - sleep_before >= 0.04, "time.sleep() really waits at least (about) the requested interval")
 
+# parse — the strptime side of strftime. Round-tripping through parse() then strftime() with the
+# same format is timezone-independent by construction: parse()'s mktime() interprets the fields as
+# local time, and strftime()'s localtime() decodes the resulting epoch back the same way, so
+# whatever the test machine's timezone is, the round trip reproduces the original string exactly.
+round_trip = time.strftime(time.parse("2024-01-15 13:45:30", "%Y-%m-%d %H:%M:%S"), "%Y-%m-%d %H:%M:%S")
+assert(round_trip == "2024-01-15 13:45:30", "time.parse() followed by time.strftime() with the same format round-trips exactly")
+
+date_only = time.strftime(time.parse("2024-01-15", "%Y-%m-%d"), "%Y-%m-%d")
+assert(date_only == "2024-01-15", "time.parse() with a date-only format round-trips exactly")
+
 # ------------------------------------------------------------------ #
 # 26. File-based imports                                              #
 # ------------------------------------------------------------------ #
@@ -256,8 +266,8 @@ assert(dict_err == null && decoded_dict["a"] == 1, "json.encode()/decode() round
 # struct is structurally a dict on the wire, so it decodes back as one
 # (AER has no way to know which struct type a plain JSON object came from).
 struct JsonPoint:
-    x: integer = 0
-    y: integer = 0
+    x = 0
+    y = 0
 
 point = JsonPoint(3, 4)
 point_json = json.encode(point)

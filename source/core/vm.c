@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "aer_host.h"
+#include "aer_actor.h"
 #include "aer_module.h"
 #include "aer_stdlib.h"
 #include "error.h"
@@ -264,6 +265,15 @@ static void gc_collect(VM* vm, bool minor) {
         if (!aer_module_get(i, &mvm, &mchunk)) break;
         mark_vm_roots(mvm);
         mark_chunk_roots(mchunk);
+    }
+    /* Every actor is a permanent root set for as long as it's alive, not just while its own
+       vm_run() is on the stack (see aer_actor.h's own comment) — same reasoning as file-modules
+       above, just a separate registry since an actor isn't imported/name-keyed. */
+    for (unsigned int i = 0; ; i++) {
+        VM* avm; Chunk* achunk;
+        if (!aer_actor_get(i, &avm, &achunk)) break;
+        mark_vm_roots(avm);
+        mark_chunk_roots(achunk);
     }
 
     if (minor) {
@@ -706,10 +716,25 @@ bool chunk_add_import(Chunk* c, const char* name, unsigned int len,
 /* VM lifecycle                                                         */
 /* ------------------------------------------------------------------ */
 
+/* io used to be opt-in (a host had to call aer_io_register() itself, so the exact same script
+   could see a different standard library depending on who ran it) -- every other stdlib module is
+   wired directly into the VM's fixed dispatch table with no host action needed at all, and this
+   was the one asymmetry. Registering it here, once per process regardless of how many VMs get
+   created (module loading spins up a fresh one per import), makes it exactly as always-on as
+   collection/math/string/etc. aer_register_function() has no dedup check of its own, so calling
+   aer_io_register() more than once would silently grow host_functions[] on every import. */
+static bool io_registered = false;
+static void ensure_io_registered(void) {
+    if (io_registered) return;
+    aer_io_register();
+    io_registered = true;
+}
+
 void vm_init(VM* vm, Chunk* chunk) {
     memset(vm, 0, sizeof(*vm));
     vm->chunk = chunk;
     vm_pools_init_once();
+    ensure_io_registered();
     runtime_line_lookup = lookup_runtime_line;
     /* Resets this VM's call stack -- a chunk that ended mid-call must not leak into the next run.
        Frame 0 always gets a flat FRAME_REGISTERS reservation (top-level usage is open-ended). */
@@ -1933,6 +1958,8 @@ lbl_call_module: {
         case CALL_MODULE_TIME:   handled = aer_time_call(vm, fn_id, arg_count);   break;
         case CALL_MODULE_JSON:   handled = aer_json_call(vm, c, fn_id, arg_count);   break;
         case CALL_MODULE_COLLECTION: handled = aer_collection_call(vm, fn_id, arg_count); break;
+        case CALL_MODULE_NET:    handled = aer_net_call(vm, fn_id, arg_count);   break;
+        case CALL_MODULE_REGEX:  handled = aer_regex_call(vm, fn_id, arg_count); break;
         default: {
             const char* module = aer_as_string(c->pool[module_idx])->data;
             const char* fn     = aer_as_string(c->pool[fn_idx])->data;
@@ -2366,9 +2393,11 @@ lbl_packed_array_new: {
     for (unsigned int i = 0; i < shape->field_count; i++) {
         ValueType ft = shape->field_types[i];
         if (ft != TYPE_INTEGER && ft != TYPE_REAL && ft != TYPE_BOOLEAN) {
+            const char* got = ft == TYPE_ANY ? "untyped (no annotation)"
+                            : ft == TYPE_ARRAY ? "array"
+                            : ft == TYPE_DICT ? "dict" : "string";
             error("'%s' cannot be packed into an array: field '%s' must be integer/float/boolean, not %s",
-                  name, aer_as_string(c->pool[shape->field_names[i]])->data,
-                  ft == TYPE_ANY ? "any" : "string");
+                  name, aer_as_string(c->pool[shape->field_names[i]])->data, got);
             DISPATCH();
         }
     }

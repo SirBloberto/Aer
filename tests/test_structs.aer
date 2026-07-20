@@ -14,16 +14,15 @@ import collection
 # 23. Structs                                                          #
 # ------------------------------------------------------------------ #
 
-# Fixed layout — every field must declare a type (one of
-# integer/float/string/boolean/any) and an explicit default. Defaults are
-# literals only (no arbitrary expressions), plus the two special-cased
-# empty-collection forms '[]'/'{}' (see section 38) for 'any'-typed fields.
+# Fixed layout — every field must have an explicit default, and its type is
+# inferred from that default (no type keyword, ever): 0.0 is a float field,
+# [] is an array field, null is unconstrained. Defaults are literals only
+# (no arbitrary expressions), plus the two special-cased empty-collection
+# forms '[]'/'{}' (see section 38). See section 39 for the "no default"
+# error case.
 struct Point:
-    x: float = 0.0
-    y: float = 0.0
-
-# struct BadPoint:      # would error: Struct field must declare a type
-#     x = 0.0
+    x = 0.0
+    y = 0.0
 
 # Instantiation reuses call syntax — positional, in declared field order.
 # Omitted trailing arguments take their declared defaults.
@@ -54,7 +53,7 @@ assert(type(p1) == "Point", "struct instances report their declared type name")
 # Structs are heap references — mutation through a plain passed-in
 # parameter is visible to the caller, no special parameter form needed.
 struct Enemy:
-    hp: integer = 100
+    hp = 100
 
 function heal(target, amount):
     target.x += amount
@@ -87,9 +86,9 @@ assert(ca_p.y == 1, "struct field -= a constant")
 # Chained field access (a.b.c) — only the LAST step is the compound
 # target; the earlier ones (ca_outer -> .inner) are plain FIELD_GETs.
 struct Inner:
-    v: integer = 0
+    v = 0
 struct Outer:
-    inner: any = null
+    inner = null   # untyped -- a nested struct's own type isn't a valid field annotation
 ca_outer = Outer(Inner(10))
 ca_outer.inner.v += 5
 assert(ca_outer.inner.v == 15, "compound assignment through a chained struct field (a.b.c += n)")
@@ -125,8 +124,8 @@ assert(ca_call_count[0] == 1, "...and f() was called exactly once, not once per 
 # ------------------------------------------------------------------ #
 
 struct Bucket:
-    items: any = []
-    tags: any = {}
+    items = []
+    tags = {}
 
 nd_a = Bucket()
 nd_b = Bucket()
@@ -144,6 +143,11 @@ assert(length(nd_b.tags) == 0, "...untouched on a different instance")
 nd_c = Bucket([9, 9, 9])
 assert(length(nd_c.items) == 3, "an explicitly passed array argument is used as-is, not replaced by a fresh empty one")
 
+# array/dict are enforced exactly like integer/float/string/boolean — 'items'
+# and 'tags' above are real types now, not an escape hatch.
+# nd_a.items = {}   # would error: 'items' is declared 'array', assigning a dict fails
+# nd_a.tags = []    # would error: 'tags' is declared 'dict', assigning an array fails
+
 # Function parameter defaults get the identical per-CALL freshness — the
 # same underlying vm_default_value fix in vm.c applies to both call sites.
 function collect(x, seen = []):
@@ -155,26 +159,27 @@ assert(length(fd_r1) == 1 && fd_r1[0] == 1, "first call's omitted-argument defau
 assert(length(fd_r2) == 1 && fd_r2[0] == 2, "a second call's own omitted-argument default is independent, not the first call's mutated array")
 
 # ------------------------------------------------------------------ #
-# 39. Mandatory struct field typing — every field must declare        #
-#     integer/float/string/boolean/any explicitly; 'any' is a visible #
-#     escape hatch, never an implicit default from omitting a type.   #
+# 39. Field types are inferred from the default, never declared —     #
+#     every field must have an explicit default, and that default's   #
+#     own type IS the field's type. 'null' is the one default with    #
+#     no matching type, and means unconstrained (no 'any' keyword).   #
 # ------------------------------------------------------------------ #
 
 struct Tagged:
-    label: string = "untitled"
-    active: boolean = true
-    note: any = null
+    label = "untitled"
+    active = true
+    note = null   # untyped -- accepts any value, at construction or later
 
 t1 = Tagged()
-assert(t1.label == "untitled" && t1.active == true && t1.note == null, "any-typed field's literal default (null) applies like any other")
+assert(t1.label == "untitled" && t1.active == true && t1.note == null, "an untyped field's literal default (null) applies like any other")
 
 t2 = Tagged("x", false, 42)
-assert(t2.note == 42, "an any-typed field accepts any argument type at construction — no enforcement, by design")
+assert(t2.note == 42, "an untyped field accepts any argument type at construction — no enforcement, by design")
 t2.note = "now a string"
-assert(t2.note == "now a string", "an any-typed field also accepts any type on later assignment")
+assert(t2.note == "now a string", "an untyped field also accepts any type on later assignment")
 
 # print(t2.label = 5)   # would error: 'label' is declared 'string', assigning an integer fails
-# struct Bad:           # would error: Struct field must declare a type (e.g. 'x: float' or 'x: any')
-#     size = 1
+# struct Bad:
+#     size          # would error: Struct field 'size' must have an explicit default value
 
 print("test_structs.aer: all assertions passed.")

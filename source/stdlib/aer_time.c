@@ -6,6 +6,51 @@
 #include "aer_stdlib.h"
 #include "error.h"
 
+/* Hand-rolled rather than strptime(): unlike strftime(), it isn't reliably present on the MinGW
+   target (confirmed absent -- implicit-declaration error at compile time), so a minimal parser
+   for the common format codes stands in, same pattern as time.sleep()'s own platform split. */
+static bool parse_digits(const char** s, int max_digits, int* out) {
+    int n = 0, count = 0;
+    while (count < max_digits && **s >= '0' && **s <= '9') {
+        n = n * 10 + (**s - '0');
+        (*s)++;
+        count++;
+    }
+    if (count == 0) return false;
+    *out = n;
+    return true;
+}
+
+/* %Y %m %d %H %M %S %% only; every other format char must match the input literally. Requires
+   the whole input to be consumed -- a trailing mismatch is a parse failure, not a partial match. */
+static bool time_parse_impl(const char* input, const char* fmt, struct tm* tm) {
+    memset(tm, 0, sizeof(*tm));
+    tm->tm_mday = 1;
+    const char* s = input;
+    const char* f = fmt;
+    while (*f) {
+        if (*f == '%') {
+            f++;
+            int val;
+            switch (*f) {
+                case 'Y': if (!parse_digits(&s, 4, &val)) return false; tm->tm_year = val - 1900; break;
+                case 'm': if (!parse_digits(&s, 2, &val)) return false; tm->tm_mon  = val - 1;    break;
+                case 'd': if (!parse_digits(&s, 2, &val)) return false; tm->tm_mday = val;         break;
+                case 'H': if (!parse_digits(&s, 2, &val)) return false; tm->tm_hour = val;         break;
+                case 'M': if (!parse_digits(&s, 2, &val)) return false; tm->tm_min  = val;         break;
+                case 'S': if (!parse_digits(&s, 2, &val)) return false; tm->tm_sec  = val;         break;
+                case '%': if (*s != '%') return false; s++; break;
+                default: return false;   /* unsupported format code */
+            }
+            f++;
+        } else {
+            if (*s != *f) return false;
+            s++; f++;
+        }
+    }
+    return *s == '\0';
+}
+
 bool aer_time_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_TIME_NOW && arg_count == 0) {
         /* Sub-second epoch time via clock_gettime(CLOCK_REALTIME), not time()'s whole seconds, so scripts can measure short durations; used since C11's timespec_get() isn't available on this project's MinGW-w64 target. */
@@ -48,6 +93,26 @@ bool aer_time_call(VM* vm, int fn_id, int arg_count) {
         char* buf = xmalloc(n + 1);
         memcpy(buf, out, n + 1);
         vm_stack_push(vm, aer_make_string(buf, (unsigned int)n)); return true;
+    }
+
+    if (fn_id == FN_TIME_PARSE && arg_count == 2) {
+        AerVal fmt_v = vm_stack_pop(vm); AerVal str_v = vm_stack_pop(vm);
+        if (aer_type(str_v) != TYPE_STRING || aer_type(fmt_v) != TYPE_STRING) {
+            error("time.parse() requires a date string and a format string");
+            vm_stack_push(vm, aer_null()); return true;
+        }
+        struct tm tm;
+        if (!time_parse_impl(aer_as_string(str_v)->data, aer_as_string(fmt_v)->data, &tm)) {
+            error("time.parse(): '%s' does not match format '%s'", aer_as_string(str_v)->data, aer_as_string(fmt_v)->data);
+            vm_stack_push(vm, aer_null()); return true;
+        }
+        tm.tm_isdst = -1;   /* let mktime figure out DST */
+        time_t t = mktime(&tm);
+        if (t == (time_t)-1) {
+            error("time.parse(): the parsed date/time is not representable");
+            vm_stack_push(vm, aer_null()); return true;
+        }
+        vm_stack_push(vm, aer_real((double)t)); return true;
     }
 
     return false;

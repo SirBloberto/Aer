@@ -8,8 +8,10 @@ underneath it.
 Source map: `source/compiler/{lexer,parser}.c` (front end), `source/core/vm.{c,h}` (bytecode
 format + the VM itself), `source/value.h` (value representation and its accessors),
 `source/utilities/pool.{c,h}` (allocator), `source/stdlib/aer_*.c` (built-in library modules:
-math/random/string/time/json/collection/io), `source/core/aer_module.c`/`aer_host.c` (import and
-host-embedding mechanisms), `source/core/disasm.c` (debug-only disassembler/profiler).
+math/random/string/time/json/collection/net/regex/io), `source/core/aer_module.c`/`aer_host.c`
+(import and host-embedding mechanisms), `source/core/aer_actor.c` (actor-model groundwork —
+independent VM spawning and a host-side mailbox, not yet a language feature),
+`source/core/disasm.c` (debug-only disassembler/profiler).
 
 ---
 
@@ -503,13 +505,6 @@ after the split: -1.6–1.7% instructions relative to the pre-split baseline.
 
 ## 6. Known architectural limitations (current, unresolved)
 
-- **Windows-only: any runtime error crashes the process.** `vm_run`'s `longjmp`-based error unwind
-  (§5.1) works correctly on Linux (a plain, portable `longjmp`), but on Windows, MinGW's `longjmp`
-  performs a full SEH-based stack unwind (`RtlUnwind`) that fails (`STATUS_BAD_STACK`) when called
-  from inside `vm_run`'s computed-goto dispatch loop — confirmed via GDB, independent of `-flto`.
-  Linux/Raspberry Pi builds are fully unaffected (verified via the complete embedding test suite).
-  Not yet fixed; the likely fix is switching the Windows build to GCC's
-  `__builtin_setjmp`/`__builtin_longjmp` (bypasses SEH validation entirely), not yet attempted.
 - **`x as integer`/`x as float` silently return 0 for an unparseable string.** `vm_cast` uses
   `atoll`/`atof`, neither of which reports a conversion failure — `"abc" as integer` quietly
   becomes `0` rather than raising the same runtime error every *other* unconvertible case in the
@@ -525,10 +520,19 @@ after the split: -1.6–1.7% instructions relative to the pre-split baseline.
   not built) could enable contiguous typed storage and bounds-check elision, but real vectorization
   would need the interpreter to recognize vectorizable access patterns at compile time — a
   substantially larger undertaking than anything landed so far.
-- **No concurrency of any kind.** The VM's global state (registers, call frames, the constant pool)
-  assumes single-threaded reentrance throughout; the GC is not thread-safe. A real concurrency
-  feature (discussed: `spawn`/`await`) would need either a much narrower cooperative/green-thread
-  scoping than a full actor model, or a substantial rearchitecture of GC and VM state ownership.
+- **No concurrency at the language level.** A `VM`'s registers/call-stack are per-instance (proven
+  by file-based `import`, which already runs each imported file in its own), but the GC-managed
+  heap (`string_pool`/`array_pool`/etc., `vm.c`) is one set of pools shared by the whole process —
+  two VMs executing simultaneously on separate OS threads would race on the allocator and
+  collector. Actor-model groundwork exists (`source/core/aer_actor.h/c`: spawn an independent VM,
+  plus a host-side byte-string mailbox — reused via `aer_vm_instantiate_from_file`, the same
+  primitive `aer_module_load` uses), verified end-to-end with a hand-written round-robin host
+  driver. What's still missing, and is the substantially harder remaining piece: a scheduler
+  capable of suspending a `vm_run()` mid-execution and resuming it later, comparable in size to the
+  value-representation migration (§1) or the generational GC (§2). Cooperative (one thread, one
+  actor running at a time) is the natural fit given the shared-pool constraint above — true
+  parallelism would additionally require moving the pools from process-global statics into
+  per-`VM` fields, a real but separable refactor.
 
 ---
 
