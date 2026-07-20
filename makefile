@@ -47,7 +47,9 @@ TESTS := tests/test_core.aer \
          tests/test_dict_pool_stress.aer \
          tests/test_packed_arrays.aer \
          tests/test_net.aer \
-         tests/test_regex.aer
+         tests/test_regex.aer \
+         tests/test_actor.aer \
+         tests/test_scheduler.aer
 
 test: all
 	@for t in $(TESTS); do \
@@ -70,6 +72,39 @@ test-smoke: $(LIBOBJECT)
 	gcc $(FLAGS) -c tests/smoke_test.c -o object/smoke_test.o
 	gcc $(FLAGS) -o binary/smoke_test$(EXE) $(LIBOBJECT) object/smoke_test.o -lm $(WINLIBS)
 	./binary/smoke_test$(EXE)
+
+# The short, readable embedding example (examples/embedding_example.c) -- see tests/embed_smoke_test.c
+# for the exhaustive version this project's own test suite actually relies on.
+example-embed: $(LIBOBJECT)
+	@mkdir -p binary object
+	gcc $(FLAGS) -c examples/embedding_example.c -o object/embedding_example.o
+	gcc $(FLAGS) -o binary/embedding_example$(EXE) $(LIBOBJECT) object/embedding_example.o -lm $(WINLIBS)
+	./binary/embedding_example$(EXE)
+
+# Standalone source formatter -- its own tokenizer (source/tools/aer_fmt.c), not linked against the
+# real compiler at all (see that file's own comment for why).
+fmt-tool:
+	@mkdir -p binary object/tools
+	gcc $(FLAGS) -c source/tools/aer_fmt.c -o object/tools/aer_fmt.o
+	gcc $(FLAGS) -o binary/aer-fmt$(EXE) object/tools/aer_fmt.o
+
+# Language server -- links the real compiler directly (LIBOBJECT, same everything-except-main.c
+# set test-embed/example-embed already use), unlike aer-fmt: diagnostics are the real parser's own
+# errors, not a reimplementation.
+lsp-tool: $(LIBOBJECT)
+	@mkdir -p binary object/tools
+	gcc $(FLAGS) -c source/tools/aer_lsp.c -o object/tools/aer_lsp.o
+	gcc $(FLAGS) -o binary/aer-lsp$(EXE) $(LIBOBJECT) object/tools/aer_lsp.o -lm $(WINLIBS)
+
+# tests/fmt_input.aer (deliberately messy) must format to exactly tests/fmt_expected.aer, and that
+# expected output must be a fixed point (formatting it again changes nothing) -- idempotency is
+# the formatter's actual correctness bar, not "looks right".
+test-fmt: fmt-tool
+	./binary/aer-fmt$(EXE) tests/fmt_input.aer > object/fmt_test_out.aer
+	diff tests/fmt_expected.aer object/fmt_test_out.aer
+	./binary/aer-fmt$(EXE) object/fmt_test_out.aer > object/fmt_test_out2.aer
+	diff object/fmt_test_out.aer object/fmt_test_out2.aer
+	@echo "test-fmt: input formats to the expected canonical output, which is a fixed point"
 
 # ASAN build for tests/fuzz.py; may not link on a bare MinGW install (needs libasan).
 asan: $(SOURCE)

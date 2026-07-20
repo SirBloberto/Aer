@@ -17,6 +17,13 @@ AerJmpBuf*   runtime_error_unwind_target  = NULL;
 static char             last_error_msg[ERROR_MSG_MAX] = "";
 static AerErrorCallback error_callback                = NULL;
 static void*            error_callback_userdata       = NULL;
+static AerDiagnosticCallback diagnostic_callback          = NULL;
+static void*                 diagnostic_callback_userdata = NULL;
+
+void aer_set_diagnostic_callback(AerDiagnosticCallback callback, void* userdata) {
+    diagnostic_callback          = callback;
+    diagnostic_callback_userdata = userdata;
+}
 
 static void append_fmt(char* buf, size_t bufsize, size_t* pos, const char* fmt, ...) {
     if (*pos >= bufsize) return;
@@ -94,17 +101,16 @@ void error(const char* format, ...) {
     if (line > 0) append_fmt(buf, sizeof(buf), &pos, "Line %u: ", line);
     append_fmt(buf, sizeof(buf), &pos, "Error: ");
 
+    char msg_only[ERROR_MSG_MAX];
     va_list args;
     va_start(args, format);
-    if (pos < sizeof(buf)) {
-        int n = vsnprintf(buf + pos, sizeof(buf) - pos, format, args);
-        if (n > 0) pos += (size_t)n;
-        if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
-    }
+    vsnprintf(msg_only, sizeof(msg_only), format, args);
     va_end(args);
+    append_fmt(buf, sizeof(buf), &pos, "%s", msg_only);
 
     append_fmt(buf, sizeof(buf), &pos, "\n");
     emit_error(buf);
+    if (diagnostic_callback) diagnostic_callback(line, 0, msg_only, diagnostic_callback_userdata);
 
     parse_had_error   = true;
     runtime_had_error = true;
@@ -127,7 +133,6 @@ void error_at(const char* format, ...) {
         }
     }
 
-    /* Find end of the current line */
     const char* line_end = cursor;
     while (*line_end != '\n' && *line_end != '\0')
         line_end++;
@@ -141,17 +146,18 @@ void error_at(const char* format, ...) {
     for (unsigned int i = 0; i < col && pos < sizeof(buf) - 1; i++) buf[pos++] = ' ';
     append_fmt(buf, sizeof(buf), &pos, "^\nError: ");
 
+    char msg_only[ERROR_MSG_MAX];
     va_list args;
     va_start(args, format);
-    if (pos < sizeof(buf)) {
-        int n = vsnprintf(buf + pos, sizeof(buf) - pos, format, args);
-        if (n > 0) pos += (size_t)n;
-        if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
-    }
+    vsnprintf(msg_only, sizeof(msg_only), format, args);
     va_end(args);
+    append_fmt(buf, sizeof(buf), &pos, "%s", msg_only);
 
     append_fmt(buf, sizeof(buf), &pos, "\n");
     emit_error(buf);
+    /* col is 0-based here (measured from line_start); diagnostic consumers get 1-based like
+       line_number, so callers don't need to know this function's own internal convention. */
+    if (diagnostic_callback) diagnostic_callback(line_number, col + 1, msg_only, diagnostic_callback_userdata);
 
     parse_had_error   = true;
     runtime_had_error = true;

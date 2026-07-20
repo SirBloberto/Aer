@@ -60,6 +60,8 @@ assert(path == "C:\\Users\\Robert", "backslash escape plus interpolation")
 
 assert("col1\tcol2" == "col1" + "\t" + "col2", "tab escape")
 assert("line1\nline2" == "line1" + "\n" + "line2", "newline escape")
+assert("a\rb" == "a" + "\r" + "b", "carriage return escape")
+assert(length("\r") == 1, "\\r decodes to one real byte, not a literal backslash-r")
 assert("say \"hi\"" == "say " + "\"" + "hi" + "\"", "escaped double quote")
 assert("use \{name} to interpolate" == "use " + "\{" + "name}" + " to interpolate", "escaped brace suppresses interpolation")
 

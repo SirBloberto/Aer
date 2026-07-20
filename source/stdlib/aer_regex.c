@@ -298,10 +298,13 @@ static bool regex_match_at(Group* g, const char* text, const char** end) {
     return false;
 }
 
-/* Scans for the first position with a match. *match_len is set to the matched span's length. */
-static const char* regex_search(Group* g, const char* subject, int* match_len) {
-    subject_start = subject;
-    for (const char* s = subject; ; s++) {
+/* Scans for the first position with a match, starting from scan_from. subject_true_start is the
+   real beginning of the whole subject -- kept separate from scan_from so '^' stays anchored to it
+   even when a caller (replace()'s loop) scans repeatedly from an advancing cursor. *match_len is
+   set to the matched span's length. */
+static const char* regex_search(Group* g, const char* subject_true_start, const char* scan_from, int* match_len) {
+    subject_start = subject_true_start;
+    for (const char* s = scan_from; ; s++) {
         const char* end;
         if (regex_match_at(g, s, &end)) { *match_len = (int)(end - s); return s; }
         if (*s == '\0') return NULL;
@@ -324,7 +327,8 @@ bool aer_regex_call(VM* vm, int fn_id, int arg_count) {
         Group* g = regex_compile(aer_as_string(pat_v)->data);
         if (!g) { error("regex.match(): invalid pattern '%s'", aer_as_string(pat_v)->data); vm_stack_push(vm, aer_null()); return true; }
         int len;
-        bool found = regex_search(g, aer_as_string(str_v)->data, &len) != NULL;
+        const char* subject = aer_as_string(str_v)->data;
+        bool found = regex_search(g, subject, subject, &len) != NULL;
         free_group(g);
         vm_stack_push(vm, aer_bool(found));
         return true;
@@ -341,7 +345,8 @@ bool aer_regex_call(VM* vm, int fn_id, int arg_count) {
         Group* g = regex_compile(aer_as_string(pat_v)->data);
         if (!g) { error("regex.find(): invalid pattern '%s'", aer_as_string(pat_v)->data); vm_stack_push(vm, aer_null()); return true; }
         int len;
-        const char* at = regex_search(g, aer_as_string(str_v)->data, &len);
+        const char* subject = aer_as_string(str_v)->data;
+        const char* at = regex_search(g, subject, subject, &len);
         free_group(g);
         if (!at) { vm_stack_push(vm, aer_null()); return true; }
         char* buf = xmalloc((size_t)len + 1);
@@ -370,7 +375,7 @@ bool aer_regex_call(VM* vm, int fn_id, int arg_count) {
         const char* cursor = subject->data;
         for (;;) {
             int mlen;
-            const char* at = regex_search(g, cursor, &mlen);
+            const char* at = regex_search(g, subject->data, cursor, &mlen);
             size_t chunk = at ? (size_t)(at - cursor) : strlen(cursor);
             if (len + chunk + repl->length + 1 > cap) {
                 while (len + chunk + repl->length + 1 > cap) cap *= 2;

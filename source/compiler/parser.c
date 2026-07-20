@@ -852,6 +852,7 @@ static unsigned int decode_string_escapes(const char* s, unsigned int len, char*
             switch (s[i]) {
                 case 'n':  out[o++] = '\n'; break;
                 case 't':  out[o++] = '\t'; break;
+                case 'r':  out[o++] = '\r'; break;
                 case '\\': out[o++] = '\\'; break;
                 case '"':  out[o++] = '"';  break;
                 /* `\{` unescapes to a bare `{`, same as `\"` unescapes to a bare quote. */
@@ -1701,8 +1702,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                old raw value was already emitted before this shadow decision, and re-runs every
                iteration reading a slot nothing writes to anymore (real bug found this way). */
             if (loop_depth > 0) {
-                error_at("This assignment would change '%s' from a fixed numeric type to a different type, but it's inside a loop — not supported (restructure so the type change happens outside any loop)",
-                         aer_as_string(c->pool[name_idx])->data);
+                error_at("This assignment would change '%s' from a fixed numeric type to a different type, but it's inside a loop — not supported. If you're accumulating with +, -, or *, use the compound form ('%s += ...' etc.) instead — it doesn't have this restriction. Otherwise, restructure so the type change happens outside any loop.",
+                         aer_as_string(c->pool[name_idx])->data, aer_as_string(c->pool[name_idx])->data);
                 return;
             }
             rk_val = box_if_raw(c, rk_val);
@@ -2377,6 +2378,8 @@ static int module_call_id(AerString* name) {
     if (name->length == 10 && strncmp(name->data, "collection", 10) == 0) return CALL_MODULE_COLLECTION;
     if (name->length == 3 && strncmp(name->data, "net", 3) == 0)     return CALL_MODULE_NET;
     if (name->length == 5 && strncmp(name->data, "regex", 5) == 0)   return CALL_MODULE_REGEX;
+    if (name->length == 5 && strncmp(name->data, "actor", 5) == 0)   return CALL_MODULE_ACTOR;
+    if (name->length == 9 && strncmp(name->data, "scheduler", 9) == 0) return CALL_MODULE_SCHEDULER;
     return CALL_MODULE_DYNAMIC;
 }
 
@@ -2453,6 +2456,16 @@ static int module_fn_id(int module_id, AerString* name) {
             if (NAME_IS("match"))   return FN_REGEX_MATCH;
             if (NAME_IS("find"))    return FN_REGEX_FIND;
             if (NAME_IS("replace")) return FN_REGEX_REPLACE;
+            return FN_ID_UNKNOWN;
+        case CALL_MODULE_ACTOR:
+            if (NAME_IS("spawn"))   return FN_ACTOR_SPAWN;
+            if (NAME_IS("send"))    return FN_ACTOR_SEND;
+            if (NAME_IS("receive")) return FN_ACTOR_RECEIVE;
+            if (NAME_IS("call"))    return FN_ACTOR_CALL;
+            return FN_ID_UNKNOWN;
+        case CALL_MODULE_SCHEDULER:
+            if (NAME_IS("add")) return FN_SCHEDULER_ADD;
+            if (NAME_IS("run")) return FN_SCHEDULER_RUN;
             return FN_ID_UNKNOWN;
         default:
             return FN_ID_UNKNOWN;

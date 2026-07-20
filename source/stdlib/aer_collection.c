@@ -48,7 +48,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             if (aer_type(key) != TYPE_INTEGER) { error("Array delete() index must be an integer"); vm_stack_push(vm, aer_null()); return true; }
             int64_t i = aer_as_int(key);
             if (i < 0) i += (int64_t)a->count;
-            if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(key), a->count); vm_stack_push(vm, aer_null()); return true; }
+            if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(key), a->count); vm_stack_push(vm, aer_null()); return true; }
             memmove(&a->items[i], &a->items[i + 1], (size_t)(a->count - (uint64_t)i - 1) * sizeof(AerVal));
             a->count--;
             vm_stack_push(vm, obj); return true;
@@ -92,7 +92,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         int64_t i = aer_as_int(idx);
         if (i < 0) i += (int64_t)a->count;
         /* i == count is valid: insert at the end, same as append(). */
-        if (i < 0 || (uint64_t)i > a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(idx), a->count); vm_stack_push(vm, aer_null()); return true; }
+        if (i < 0 || (uint64_t)i > a->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count); vm_stack_push(vm, aer_null()); return true; }
         if (a->count >= a->capacity) {
             a->capacity = a->capacity ? a->capacity * 2 : 4;
             a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);

@@ -1,0 +1,30 @@
+#comment with no space after hash
+import math
+
+struct Point:
+    x = 0
+    y = 0
+
+function add(a, b):
+    return a + b
+
+function negate(n):
+    return -n
+
+function check(flag):
+    if !flag:
+        return 0
+    return 1
+
+total = 0
+for i in 0..5:
+    total += i
+values = [1, 2, 3]
+lookup = {"a": 1, "b": 2}
+mask = 0xFF
+print(add(1, 2))  # trailing comment
+print(negate(5))
+print(values[0])
+print(lookup["a"])
+
+print("done")

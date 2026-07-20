@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "aer.h"
 #include "aer_module.h"
 #include "error.h"
 #include "lexer.h"
@@ -266,12 +267,8 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
 
     /* A prior call's error longjmp can leave mv->call_depth stuck above 0 — left unreset, this
        call's result would land in the wrong frame's registers (and enough failures overflow the
-       call stack). Reset both; the stack is dead space between calls. */
-    mv->call_depth = 0;
-    mv->stack_top  = 0;
-    mv->registers  = mv->call_stack[0].registers;
-    mv->raw_ints   = mv->call_stack[0].raw_ints;
-    mv->raw_reals  = mv->call_stack[0].raw_reals;
+       call stack). The stack is dead space between calls. */
+    aer_vm_reset_for_reuse(mv);
 
     /* Trampoline: the frame's return address is this module's top-level HALT, so vm_run executes
        exactly one call and the result lands in call_stack[0].registers[0]. */

@@ -103,6 +103,10 @@ AerVal aer_make_string(char* data, unsigned int length);
 /* Builds a Result from a (value, err) pair — exactly one of the two should be null. */
 AerVal aer_make_result(AerVal value, AerVal err);
 
+/* Copies msg into an owned buffer and boxes it as a TYPE_STRING -- the common shape of building a
+   Result's error side from a C string literal or a static message. */
+AerVal aer_make_error(const char* msg);
+
 /* Every payload read/write goes through these accessors, never a direct `.as.x` elsewhere. */
 
 static inline ValueType aer_type(AerVal v) { return v.tag; }

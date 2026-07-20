@@ -78,6 +78,10 @@ assert(regex.replace("hello world", "o", "0") == "hell0 w0rld", "replace() subst
 # must still advance past a real character each time or it would never terminate.
 assert(regex.replace("abc", "x*", "-") == "-a-b-c-", "replace() with a zero-width pattern still terminates and interleaves correctly")
 
+# '^' must stay anchored to the true start of the subject across every match replace() makes, not
+# get re-anchored to wherever its internal search cursor currently sits.
+assert(regex.replace("aaa", "^a", "X") == "Xaa", "^ in replace() only matches the true start of the subject, not every cursor position")
+
 # ------------------------------------------------------------------ #
 # Catastrophic-backtracking safety net                                 #
 # ------------------------------------------------------------------ #

@@ -15,13 +15,6 @@
 static int    io_argc = 0;
 static char** io_argv = NULL;
 
-static AerVal make_error(const char* msg) {
-    size_t n   = strlen(msg);
-    char*  buf = xmalloc(n + 1);
-    memcpy(buf, msg, n + 1);
-    return aer_make_string(buf, (unsigned int)n);
-}
-
 /* stdin (or any non-seekable stream) can't be pre-sized via fseek/ftell, so read until EOF into a growing buffer. */
 static AerVal io_read_until_eof(FILE* fp) {
     size_t cap = 4096, len = 0;
@@ -41,7 +34,7 @@ static AerVal io_read_until_eof(FILE* fp) {
 static AerVal io_read_fp(FILE* fp) {
     if (fseek(fp, 0, SEEK_END) != 0) return io_read_until_eof(fp);
     long size = ftell(fp);
-    if (size < 0) return aer_make_result(aer_null(), make_error(strerror(errno)));
+    if (size < 0) return aer_make_result(aer_null(), aer_make_error(strerror(errno)));
     fseek(fp, 0, SEEK_SET);
 
     char*  buf   = xmalloc((size_t)size + 1);
@@ -63,7 +56,7 @@ static AerVal io_read(VM* vm, int arg_count, AerVal* args, void* userdata) {
         if (!fp) {
             char buf[256];
             snprintf(buf, sizeof(buf), "%s: %s", path, strerror(errno));
-            return aer_make_result(aer_null(), make_error(buf));
+            return aer_make_result(aer_null(), aer_make_error(buf));
         }
         AerVal result = io_read_fp(fp);
         fclose(fp);
@@ -82,12 +75,12 @@ static AerVal io_write_mode(AerVal path_v, AerVal data_v, const char* mode) {
     if (!fp) {
         char buf[256];
         snprintf(buf, sizeof(buf), "%s: %s", path, strerror(errno));
-        return aer_make_result(aer_null(), make_error(buf));
+        return aer_make_result(aer_null(), aer_make_error(buf));
     }
     AerString* s = aer_as_string(data_v);
     size_t written = fwrite(s->data, 1, s->length, fp);
     fclose(fp);
-    if (written != s->length) return aer_make_result(aer_null(), make_error(strerror(errno)));
+    if (written != s->length) return aer_make_result(aer_null(), aer_make_error(strerror(errno)));
     return aer_make_result(aer_null(), aer_null());
 }
 
@@ -130,7 +123,7 @@ static AerVal io_remove(VM* vm, int arg_count, AerVal* args, void* userdata) {
     if (remove(path) != 0) {
         char buf[256];
         snprintf(buf, sizeof(buf), "%s: %s", path, strerror(errno));
-        return aer_make_result(aer_null(), make_error(buf));
+        return aer_make_result(aer_null(), aer_make_error(buf));
     }
     return aer_make_result(aer_null(), aer_null());
 }

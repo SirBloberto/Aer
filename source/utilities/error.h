@@ -40,6 +40,14 @@ extern unsigned int (*runtime_line_lookup)(void);
 void error(const char* format, ...) __attribute__((cold));
 void error_at(const char* format, ...) __attribute__((cold));
 
+/* Structured alongside the plain-text sink above (aer_set_error_callback, include/aer.h) -- for a
+   tool that wants (line, column, message) fields directly instead of scraping them back out of a
+   formatted "N | source line\n    ^\nError: msg" string. line/col are 1-based; col 0 means
+   "unknown position" (the plain error() path, which has no source cursor to measure from unless
+   runtime_line_lookup is active). */
+typedef void (*AerDiagnosticCallback)(unsigned int line, unsigned int col, const char* message, void* userdata);
+void aer_set_diagnostic_callback(AerDiagnosticCallback callback, void* userdata);
+
 /* Terminates the process for a condition error recovery doesn't apply to (OOM) — routes through the same sink as error()/error_at() first; the only thing here still allowed to call exit(). */
 void aer_report_fatal(const char* msg);
 

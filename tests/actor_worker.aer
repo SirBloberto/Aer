@@ -1,0 +1,5 @@
+function add(a, b):
+    return a + b
+
+function crash():
+    return 1 / 0

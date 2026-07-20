@@ -1,0 +1,43 @@
+#!/usr/bin/env aer
+import actor
+import scheduler
+import collection
+# AER test suite — scheduler module: cooperative round-robin scheduling of actor tasks.
+# The load-bearing claim this test proves: a long-running task does not starve a short one under
+# scheduler.run() — both actually interleave, not "task 1 fully to completion, then task 2."
+
+sink, sink_err       = actor.spawn("tests/actor_sink.aer")
+looper, looper_err   = actor.spawn("tests/actor_looper.aer")
+messenger, msg_err   = actor.spawn("tests/actor_messenger.aer")
+assert(sink_err == null && looper_err == null && msg_err == null, "all three actors spawn successfully")
+
+added1 = scheduler.add(looper, "count_and_report", sink, 2000000)
+added2 = scheduler.add(messenger, "report_and_finish", sink)
+
+scheduler.run()
+
+# Drain the sink's mailbox in delivery order.
+messages = []
+for i in 0..1000:
+    m = actor.receive(sink)
+    if m == null:
+        break
+    collection.append(messages, m)
+
+done_index = collection.index_of(messages, "messenger-done")
+assert(done_index >= 0, "the messenger's task ran and delivered its message")
+assert(done_index < length(messages) - 1, "the messenger finished while the looper was still ticking, not only after the looper had already completed — proof the scheduler actually interleaves rather than running one task to completion before starting the next")
+
+# Correctness on top of interleaving: the looper's own multi-round result (its loop bound is far
+# larger than one scheduler slice, so a correct final total also proves resuming a yielded task
+# across many scheduler rounds reproduces exactly what one uninterrupted run would give).
+expected_total = 0
+for i in 0..2000000:
+    expected_total = expected_total + i
+assert(messages[length(messages) - 1] == "total:{expected_total}", "the looper's sliced, multi-round execution produced the exact same result an uninterrupted run would")
+
+# The actor is still usable after being driven by the scheduler, not left in a broken state.
+result, call_err = actor.call(looper, "count_and_report", sink, 0)
+assert(call_err == null && result == 0, "the actor is still callable normally after being driven by the scheduler")
+
+print("test_scheduler.aer: all assertions passed.")

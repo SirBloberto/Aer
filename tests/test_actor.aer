@@ -1,0 +1,51 @@
+#!/usr/bin/env aer
+import actor
+# AER test suite — actor module: spawn/send/receive/call over an independent, long-lived VM.
+# This is script-facing plumbing only, not concurrency: every call below runs the target actor's
+# code to completion before the next line here executes, exactly like aer_actor_call already does
+# from host C code (source/core/aer_actor.c). A cooperative scheduler that actually interleaves
+# actors is a separate, later piece (tests/test_scheduler.aer).
+
+# ------------------------------------------------------------------ #
+# actor.spawn                                                          #
+# ------------------------------------------------------------------ #
+
+handle, err = actor.spawn("tests/actor_worker.aer")
+assert(err == null, "spawn() of a valid script succeeds")
+assert(type(handle) == "integer", "spawn() returns an integer handle")
+
+# ------------------------------------------------------------------ #
+# actor.call — runs a function already defined in the actor's script   #
+# ------------------------------------------------------------------ #
+
+result, call_err = actor.call(handle, "add", 3, 4)
+assert(call_err == null && result == 7, "call() runs the actor's function and returns its result")
+
+crash_result, crash_err = actor.call(handle, "crash")
+assert(crash_result == null && crash_err != null, "call() reports a Result error when the actor's own code errors, isolated to that actor")
+
+# The actor is still usable after one of its calls errored — isolation, not a dead VM.
+still_alive, still_err = actor.call(handle, "add", 10, 20)
+assert(still_err == null && still_alive == 30, "an actor keeps working after a previous call of its own errored")
+
+# ------------------------------------------------------------------ #
+# actor.send / actor.receive — a plain host-side mailbox               #
+# ------------------------------------------------------------------ #
+
+empty = actor.receive(handle)
+assert(empty == null, "receive() on an empty mailbox returns null, not an error")
+
+sent = actor.send(handle, "hello")
+msg = actor.receive(handle)
+assert(msg == "hello", "send() then receive() delivers the message back out")
+
+again = actor.receive(handle)
+assert(again == null, "receive() returns null once the mailbox is drained")
+
+# FIFO ordering across multiple queued messages
+actor.send(handle, "first")
+actor.send(handle, "second")
+assert(actor.receive(handle) == "first", "messages are delivered in the order they were sent")
+assert(actor.receive(handle) == "second", "...second message follows the first")
+
+print("test_actor.aer: all assertions passed.")

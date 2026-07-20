@@ -522,7 +522,9 @@ typedef enum {
 #define CALL_MODULE_COLLECTION 5
 #define CALL_MODULE_NET        6
 #define CALL_MODULE_REGEX      7
-#define CALL_MODULE_DYNAMIC    8
+#define CALL_MODULE_ACTOR      8
+#define CALL_MODULE_SCHEDULER  9
+#define CALL_MODULE_DYNAMIC    10
 
 /* Second trailing word: fn_id within the module (each module owns a flat id space);
    FN_ID_UNKNOWN still errors by name, never misroutes to id 0. */
@@ -587,6 +589,14 @@ typedef enum {
 #define FN_REGEX_MATCH   0
 #define FN_REGEX_FIND    1
 #define FN_REGEX_REPLACE 2
+
+#define FN_ACTOR_SPAWN   0
+#define FN_ACTOR_SEND    1
+#define FN_ACTOR_RECEIVE 2
+#define FN_ACTOR_CALL    3
+
+#define FN_SCHEDULER_ADD 0
+#define FN_SCHEDULER_RUN 1
 
 /* OP_CALL_BUILTIN's trailing builtin_id — no DYNAMIC case; is_builtin_name gates every site. */
 #define CALL_BUILTIN_LENGTH 0
@@ -764,12 +774,38 @@ bool chunk_add_import(Chunk* c, const char* name, unsigned int len,
                        const char* path_name, unsigned int path_len);
 bool chunk_is_imported(Chunk* c, const char* name, unsigned int len);
 
+/* Coarse, process-wide capability toggles -- default true (every prior release's always-on
+   behavior, unchanged unless a host/CLI flag opts out). Plain globals, not per-VM fields, matching
+   this codebase's existing style for exactly this kind of runtime policy flag (parse_had_error,
+   runtime_had_error, mode, error.h) -- there's no current scenario needing different VMs in the
+   same process to see different capabilities, and import_enabled specifically is checked at parse
+   time (chunk_add_import), before any particular VM is even necessarily in the picture. Set via
+   aer_set_io_enabled()/aer_set_net_enabled()/aer_set_import_enabled() (include/aer.h), not
+   directly. This is a blast-radius limiter, not a real permission system -- see the README's
+   Sandboxing note. */
+extern bool aer_io_enabled;
+extern bool aer_net_enabled;
+extern bool aer_import_enabled;
+
 void vm_init(VM* vm, Chunk* chunk);
 void vm_free(VM* vm);
 
 /* Runs from vm->ip to OP_HALT or runtime error (returns false). A host reusing the VM after
    a false return must reset stack_top/call_depth first — see main.c's run(). */
 bool vm_run(VM* vm);
+
+typedef enum {
+    VM_SLICE_DONE,      /* reached OP_HALT */
+    VM_SLICE_YIELDED,   /* max_instructions reached at a loop back-edge or call; vm->ip is a valid resume point */
+    VM_SLICE_ERROR,     /* runtime error, same as vm_run's false */
+} VmSliceResult;
+
+/* vm_run(vm) is exactly vm_run_slice(vm, 0) -- 0 means unlimited, the only budget every caller but
+   the scheduler (aer_scheduler.c) ever passes. A nonzero budget bounds how many loop-back-edges and
+   calls this call executes before returning VM_SLICE_YIELDED with vm->ip left at a valid resume
+   point; calling vm_run_slice again on the same VM continues exactly where it left off, the same
+   way vm_run already resumes from wherever vm->ip points (main.c's REPL already relies on this). */
+VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions);
 
 /* A counter, not a flag — imports nest, and during a nested import's run the outer chunk
    isn't in any root set yet. */

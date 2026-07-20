@@ -2,11 +2,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "aer.h"
 #include "aer_host.h"
 #include "aer_actor.h"
 #include "aer_module.h"
+#include "aer_scheduler.h"
 #include "aer_stdlib.h"
 #include "error.h"
+#include "lexer.h"
+#include "parser.h"
 #include "pool.h"
 #include "strbuf.h"
 #include "vm.h"
@@ -695,9 +699,17 @@ bool chunk_is_imported(Chunk* c, const char* name, unsigned int len) {
 
 bool chunk_add_import(Chunk* c, const char* name, unsigned int len,
                        const char* path_name, unsigned int path_len) {
+    bool is_native_or_host = aer_stdlib_is_native_module(name, len) || aer_host_is_module(name, len);
+    /* --no-import/aer_set_import_enabled(false) only blocks file-based import (arbitrary path
+       reads) -- math/net/regex/etc. are fixed dispatch, not a file read, and stay available;
+       io/net have their own separate toggles for that. Checked at parse time, same as every other
+       import failure (aer_module_load reports its own errors the same way, error_at() below). */
+    if (!is_native_or_host && !aer_import_enabled) {
+        error_at("File-based import is disabled for this run (--no-import)");
+        return false;
+    }
     /* Anything not a native/host module is attempted as a file-based import; aer_module_load() reports its own errors for that path. */
-    if (!aer_stdlib_is_native_module(name, len) && !aer_host_is_module(name, len) &&
-        !aer_module_load(name, len, path_name, path_len)) {
+    if (!is_native_or_host && !aer_module_load(name, len, path_name, path_len)) {
         return false;
     }
     if (chunk_is_imported(c, name, len)) return true;   /* re-importing is harmless, not an error */
@@ -716,12 +728,9 @@ bool chunk_add_import(Chunk* c, const char* name, unsigned int len,
 /* VM lifecycle                                                         */
 /* ------------------------------------------------------------------ */
 
-/* io used to be opt-in (a host had to call aer_io_register() itself, so the exact same script
-   could see a different standard library depending on who ran it) -- every other stdlib module is
-   wired directly into the VM's fixed dispatch table with no host action needed at all, and this
-   was the one asymmetry. Registering it here, once per process regardless of how many VMs get
-   created (module loading spins up a fresh one per import), makes it exactly as always-on as
-   collection/math/string/etc. aer_register_function() has no dedup check of its own, so calling
+/* Registered here, once per process regardless of how many VMs get created (module loading spins
+   up a fresh one per import), so io is exactly as always-on as collection/math/string/etc. with no
+   host action needed. aer_register_function() has no dedup check of its own, so calling
    aer_io_register() more than once would silently grow host_functions[] on every import. */
 static bool io_registered = false;
 static void ensure_io_registered(void) {
@@ -730,24 +739,49 @@ static void ensure_io_registered(void) {
     io_registered = true;
 }
 
+bool aer_io_enabled     = true;
+bool aer_net_enabled    = true;
+bool aer_import_enabled = true;
+
+void aer_set_io_enabled(bool enabled)     { aer_io_enabled     = enabled; }
+void aer_set_net_enabled(bool enabled)    { aer_net_enabled    = enabled; }
+void aer_set_import_enabled(bool enabled) { aer_import_enabled = enabled; }
+
 void vm_init(VM* vm, Chunk* chunk) {
     memset(vm, 0, sizeof(*vm));
     vm->chunk = chunk;
     vm_pools_init_once();
     ensure_io_registered();
     runtime_line_lookup = lookup_runtime_line;
-    /* Resets this VM's call stack -- a chunk that ended mid-call must not leak into the next run.
-       Frame 0 always gets a flat FRAME_REGISTERS reservation (top-level usage is open-ended). */
-    vm->call_depth = 0;
+    /* Frame 0's register window only ever needs linking once, for the life of the VM (top-level
+       usage is open-ended, so it always gets a flat FRAME_REGISTERS reservation) -- everything
+       else a fresh run needs is exactly what aer_vm_reset_for_reuse() already does. */
     vm->call_stack[0].registers  = &vm->register_stack[0];
     vm->call_stack[0].frame_size = FRAME_REGISTERS;
+    aer_vm_reset_for_reuse(vm);
+}
+
+void vm_free(VM* vm) {
+    (void)vm;   /* nothing to free — every allocation a VM makes lives in the shared pools */
+}
+
+void aer_vm_reset_for_reuse(VM* vm) {
+    vm->stack_top  = 0;
+    vm->call_depth = 0;
     vm->registers  = vm->call_stack[0].registers;
     vm->raw_ints   = vm->call_stack[0].raw_ints;
     vm->raw_reals  = vm->call_stack[0].raw_reals;
 }
 
-void vm_free(VM* vm) {
-    (void)vm;   /* nothing to free — every allocation a VM makes lives in the shared pools */
+bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
+    aer_vm_reset_for_reuse(vm);
+    vm->ip = chunk->count;
+    shell((char*)source);   /* shell() strdup()s its own copy — never mutates through this pointer */
+    lex();
+    parse(chunk);
+    chunk_emit(chunk, OP_HALT);
+    runtime_had_error = false;
+    return vm_run(vm);
 }
 
 /* ------------------------------------------------------------------ */
@@ -791,7 +825,7 @@ static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) 
     char tmp[64];
     switch (aer_type(v)) {
         case TYPE_NULL:     strbuf_append(sb, "null"); break;
-        case TYPE_INTEGER:  snprintf(tmp, sizeof(tmp), "%lld", aer_as_int(v));  strbuf_append(sb, tmp); break;
+        case TYPE_INTEGER:  snprintf(tmp, sizeof(tmp), "%lld", (long long)aer_as_int(v));  strbuf_append(sb, tmp); break;
         case TYPE_REAL:     aer_format_real(aer_as_real(v), tmp, sizeof(tmp)); strbuf_append(sb, tmp); break;
         case TYPE_BOOLEAN:  strbuf_append(sb, aer_as_bool(v) ? "true" : "false"); break;
         case TYPE_FUNCTION: strbuf_append(sb, "<function>"); break;
@@ -1128,7 +1162,7 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
         char buf[64];
         switch (aer_type(v)) {
             case TYPE_NULL:     snprintf(buf, sizeof(buf), "null");                              break;
-            case TYPE_INTEGER:  snprintf(buf, sizeof(buf), "%lld", aer_as_int(v));               break;
+            case TYPE_INTEGER:  snprintf(buf, sizeof(buf), "%lld", (long long)aer_as_int(v));               break;
             case TYPE_REAL:     aer_format_real(aer_as_real(v), buf, sizeof(buf));                 break;
             case TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s",   aer_as_bool(v) ? "true" : "false"); break;
             case TYPE_FUNCTION: snprintf(buf, sizeof(buf), "<function>");                        break;
@@ -1339,6 +1373,13 @@ AerVal aer_make_result(AerVal value, AerVal err) {
     return aer_result_val(r);
 }
 
+AerVal aer_make_error(const char* msg) {
+    size_t n   = strlen(msg);
+    char*  buf = xmalloc(n + 1);
+    memcpy(buf, msg, n + 1);
+    return aer_make_string(buf, (unsigned int)n);
+}
+
 AerFunction* vm_new_function(void) {
     return pool_alloc(&function_pool);
 }
@@ -1419,7 +1460,7 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         if (aer_type(idx) != TYPE_INTEGER) { error("Array index must be an integer"); *out = aer_null(); return; }
         int64_t i = aer_as_int(idx);
         if (i < 0) i += (int64_t)a->count;
-        if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(idx), a->count); *out = aer_null(); return; }
+        if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count); *out = aer_null(); return; }
         *out = a->items[i]; return;
     } else if (aer_type(obj) == TYPE_DICT) {
         if (aer_type(idx) != TYPE_STRING) { error("Dict key must be a string"); *out = aer_null(); return; }
@@ -1438,7 +1479,7 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         int64_t i = aer_as_int(idx);
         int64_t len = (int64_t)os->length;
         if (i < 0) i += len;
-        if (i < 0 || i >= len) { error("String index %lld out of bounds (len %lld)", aer_as_int(idx), len); *out = aer_null(); return; }
+        if (i < 0 || i >= len) { error("String index %lld out of bounds (len %lld)", (long long)aer_as_int(idx), (long long)len); *out = aer_null(); return; }
         /* A single character is a length-1 string (AER has no char type); copies the byte since AerString must always own its data, even after obj is later collected. */
         char* ch_buf = xmalloc(2);
         ch_buf[0] = os->data[i];
@@ -1452,7 +1493,7 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         AerResult* r = aer_as_result(obj);
         if (i == 0) { *out = r->value; return; }
         if (i == 1) { *out = r->err;   return; }
-        error("Result index %lld out of bounds (a Result only has indices 0 and 1)", aer_as_int(idx));
+        error("Result index %lld out of bounds (a Result only has indices 0 and 1)", (long long)aer_as_int(idx));
         *out = aer_null();
     } else {
         error("Cannot index type");
@@ -1469,7 +1510,7 @@ static inline void vm_index_set_compute(AerVal obj, AerVal idx, AerVal val) {
         if (aer_type(idx) != TYPE_INTEGER) { error("Array index must be an integer"); return; }
         int64_t i = aer_as_int(idx);
         if (i < 0) i += (int64_t)a->count;
-        if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(idx), a->count); return; }
+        if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count); return; }
         gc_barrier_array(a, val);
         a->items[i] = val;
     } else if (aer_type(obj) == TYPE_DICT) {
@@ -1583,7 +1624,12 @@ static void chunk_ensure_field_cache(Chunk* c) {
     memset(c->field_cache + old_cap, 0, sizeof(FieldCacheEntry) * (c->field_cache_cap - old_cap));
 }
 
-bool vm_run(VM* vm) {
+/* max_instructions == 0 means unlimited (every existing caller via the vm_run() wrapper below) --
+   the budget decrement only happens at loop-back-edge and call opcodes (the only places a script
+   can spend unbounded time), not on every DISPATCH(), so the check costs nothing on the common
+   unlimited path and stays cheap even when a budget is active. See aer_scheduler.c for the caller
+   that actually uses a nonzero budget. */
+VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     Chunk* c = vm->chunk;
     /* Hoisted once -- c->pool is only mutated at parse time, stable for the whole call. */
     AerVal* const_pool = c->pool;
@@ -1599,7 +1645,7 @@ bool vm_run(VM* vm) {
     if (AER_SETJMP(catch_point) != 0) {
         runtime_error_unwind_target = saved_unwind_target;
         active_vm_for_errors        = saved_active_vm;
-        return false;
+        return VM_SLICE_ERROR;
     }
     Opcode cur_op;
     /* Full 64-bit instruction word (opcode + packed operands) -- must survive past DISPATCH()'s
@@ -1610,20 +1656,23 @@ bool vm_run(VM* vm) {
        touch. Synced at the end of every DISPATCH() and around vm_call_value (the only other
        write to this VM's ip). */
     unsigned int ip = vm->ip;
+    /* Only ever read/decremented at the handful of yield-checkpoints below; never touched when
+       max_instructions is 0. */
+    unsigned int slice_budget = max_instructions;
 #ifdef AER_DEBUG_TOOLS
     chunk_ensure_debug_hits(c);
 #endif
     chunk_ensure_field_cache(c);
 
 #define READ()     (c->code[ip++])
-#define PUSH(v)    do { if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return false; } vm->stack[vm->stack_top++] = (v); } while(0)
+#define PUSH(v)    do { if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return VM_SLICE_ERROR; } vm->stack[vm->stack_top++] = (v); } while(0)
 #define POP()      (vm->stack_top > 0 ? vm->stack[--vm->stack_top] : (error("Stack underflow"), aer_null()))
 #ifdef AER_DEBUG_TOOLS
 /* Not called from DISPATCH() -- each allocating label calls it right after storing its result
    into a VM-visible root. Labels that can never allocate (confirmed by inspection) have no call
    at all, a real zero-cost dispatch for the common case. */
 /* No error check here -- error()/error_at() longjmp straight to this call's catch_point on
-   fault, replacing the last unconditional per-instruction cost this macro used to pay. */
+   fault, so DISPATCH() itself never needs to poll anything. */
 #define DISPATCH() do { unsigned int op_ip = ip; op_word = READ(); vm->ip = ip; cur_op = (Opcode)(op_word & 0x7F); c->debug_hits[op_ip]++; goto *dt[cur_op]; } while(0)
 #else
 /* 7-bit mask, not 8 -- 62 Opcode values fit with 66 to spare, and every existing packed format
@@ -1736,6 +1785,10 @@ bool vm_run(VM* vm) {
 lbl_jump: {
     int target = READ();
     ip = (unsigned int)target;
+    /* Every loop's back-edge (while/for/plain jump alike) goes through here -- the one checkpoint
+       that bounds an AER-level loop's slice length. ip already points at a complete instruction
+       (this jump's own operand is fully consumed), so yielding here is always resumable. */
+    if (max_instructions && --slice_budget == 0) { vm->ip = ip; return VM_SLICE_YIELDED; }
     DISPATCH();
 }
 
@@ -1883,6 +1936,10 @@ lbl_call: {
         for (int i = 0; i < arg_count; i++)
             vm->registers[i] = vm->registers[arg_reg_base + i];
         ip = (unsigned int)callee_offset;
+        /* Every call (tail or not) is the other place a script can spend unbounded time
+           (recursion instead of a loop) -- checked once ip already points at the callee's real
+           entry point, so a yield here always resumes at a valid instruction boundary. */
+        if (max_instructions && --slice_budget == 0) { vm->ip = ip; return VM_SLICE_YIELDED; }
         DISPATCH();
     }
     if (vm->call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); DISPATCH(); }
@@ -1902,6 +1959,7 @@ lbl_call: {
     vm->raw_ints  = vm->call_stack[vm->call_depth].raw_ints;
     vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
     ip = (unsigned int)callee_offset;
+    if (max_instructions && --slice_budget == 0) { vm->ip = ip; return VM_SLICE_YIELDED; }
     DISPATCH();
 }
 
@@ -1960,9 +2018,22 @@ lbl_call_module: {
         case CALL_MODULE_COLLECTION: handled = aer_collection_call(vm, fn_id, arg_count); break;
         case CALL_MODULE_NET:    handled = aer_net_call(vm, fn_id, arg_count);   break;
         case CALL_MODULE_REGEX:  handled = aer_regex_call(vm, fn_id, arg_count); break;
+        case CALL_MODULE_ACTOR:     handled = aer_actor_module_call(vm, fn_id, arg_count);     break;
+        case CALL_MODULE_SCHEDULER: handled = aer_scheduler_module_call(vm, fn_id, arg_count); break;
         default: {
             const char* module = aer_as_string(c->pool[module_idx])->data;
             const char* fn     = aer_as_string(c->pool[fn_idx])->data;
+            /* io is the one module still reached through the generic host-call path
+               (aer_host_call) rather than a fixed CALL_MODULE_* case -- gated here by name
+               specifically so --no-io never touches a real embedding host's own custom modules,
+               which go through this exact same path. */
+            if (!aer_io_enabled && strcmp(module, "io") == 0) {
+                for (int i = 0; i < arg_count; i++) POP();
+                error("io is disabled for this run (--no-io)");
+                PUSH(aer_null());
+                handled = true;
+                break;
+            }
             if (aer_host_is_module(module, (unsigned int)strlen(module)))
                 handled = aer_host_call(vm, module, fn, arg_count);
             else
@@ -2251,6 +2322,9 @@ lbl_iter_range_loop: {
     vm->registers[item_dest_reg] = new_cur_v;
     vm->registers[remaining_reg] = aer_int(remaining - 1);
     ip = (unsigned int)body_target;
+    /* range-for's own dedicated back-edge -- lbl_jump's check doesn't cover this loop shape since
+       it never goes through a plain OP_JUMP. */
+    if (max_instructions && --slice_budget == 0) { vm->ip = ip; return VM_SLICE_YIELDED; }
     DISPATCH();
 }
 
@@ -2437,7 +2511,7 @@ lbl_index_field_get: {
         int64_t i = aer_as_int(*idx);
         if (i < 0) i += (int64_t)pa->count;
         if (i < 0 || (uint64_t)i >= pa->count) {
-            error("Array index %lld out of bounds (len %u)", aer_as_int(*idx), pa->count);
+            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
             DISPATCH();
         }
         int slot;
@@ -2475,7 +2549,7 @@ lbl_index_field_set: {
         int64_t i = aer_as_int(*idx);
         if (i < 0) i += (int64_t)pa->count;
         if (i < 0 || (uint64_t)i >= pa->count) {
-            error("Array index %lld out of bounds (len %u)", aer_as_int(*idx), pa->count);
+            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
             DISPATCH();
         }
         int slot;
@@ -2911,5 +2985,9 @@ lbl_raw_gte_real_boxed: {
 lbl_halt:
     runtime_error_unwind_target = saved_unwind_target;
     active_vm_for_errors        = saved_active_vm;
-    return true;
+    return VM_SLICE_DONE;
+}
+
+bool vm_run(VM* vm) {
+    return vm_run_slice(vm, 0) == VM_SLICE_DONE;
 }

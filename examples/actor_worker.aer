@@ -1,0 +1,12 @@
+# actor_worker.aer — the actor script examples/actors_demo.aer spawns. Not meant to be run
+# directly; it only defines functions for another actor to call/schedule.
+
+function add(a, b):
+    return a + b
+
+function slow_count(label, n):
+    total = 0
+    for i in 0..n:
+        total += i
+    print("{label} finished counting to {n}: total = {total}")
+    return total

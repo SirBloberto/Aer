@@ -1,0 +1,54 @@
+# fetch_page.aer — a minimal HTTP GET client, built directly on AER's raw `net` module.
+#
+# net is a blocking TCP client only (connect/send/recv/close) — there's deliberately no HTTP
+# layer, so this example builds the request by hand and reads the raw response back. It's a good
+# illustration of what net actually gives you: every call is blocking and can fail with a Result,
+# and a single recv() is never guaranteed to return the whole response — a real TCP peer can (and
+# does) split it across several reads, so you keep calling recv() until it closes the connection
+# (an empty string, matching io.read()'s own "EOF is just an empty read" convention).
+#
+# The request below uses plain "\n" line endings, not "\r\n" — AER's string escapes have no `\r`
+# (see the README's Pitfalls table), so a literal "\r\n" actually sends a backslash and an r
+# followed by a real newline, not a real CRLF, which most real HTTP servers reject outright. HTTP
+# is technically supposed to require CRLF, but is universally lenient about bare LF in practice —
+# confirmed against a real server while writing this example, not assumed.
+#
+# Run it with:
+#   ./binary/aer examples/fetch_page.aer
+
+import net
+import collection
+import string
+
+host = "example.com"
+port = 80
+
+# panic() aborts the whole script with a clean, reported error and a nonzero exit code (a normal
+# runtime error, not a crash — see the README's Embedding section) — guard clauses instead of
+# nested if/else, and unlike print()-then-fall-through, the process actually reports failure.
+handle, err = net.connect(host, port)
+if err != null:
+    panic("connect failed: {err}")
+
+request = "GET / HTTP/1.0\nHost: {host}\nConnection: close\n\n"
+sent, send_err = net.send(handle, request)
+if send_err != null:
+    panic("send failed: {send_err}")
+
+# Collected into a list and joined once at the end, not "response += chunk" in the loop —
+# repeated string += is quadratic (see the README's Pitfalls table), and a real response here can
+# easily be dozens of chunks.
+chunks = []
+for i in 0..1000:
+    chunk, recv_err = net.recv(handle, 4096)
+    if recv_err != null:
+        panic("recv failed: {recv_err}")
+    if chunk == "":
+        break
+    collection.append(chunks, chunk)
+
+net.close(handle)
+response = string.join(chunks, "")
+
+print("Received {length(response)} bytes:")
+print(response)

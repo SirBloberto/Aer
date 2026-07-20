@@ -6,11 +6,13 @@ top of all of it. README.md documents the *language*; this document explains the
 underneath it.
 
 Source map: `source/compiler/{lexer,parser}.c` (front end), `source/core/vm.{c,h}` (bytecode
-format + the VM itself), `source/value.h` (value representation and its accessors),
+format + the VM itself, including `vm_run_slice()`, the bounded-instruction-count entry point the
+scheduler below drives), `source/value.h` (value representation and its accessors),
 `source/utilities/pool.{c,h}` (allocator), `source/stdlib/aer_*.c` (built-in library modules:
-math/random/string/time/json/collection/net/regex/io), `source/core/aer_module.c`/`aer_host.c`
-(import and host-embedding mechanisms), `source/core/aer_actor.c` (actor-model groundwork —
-independent VM spawning and a host-side mailbox, not yet a language feature),
+math/random/string/time/json/collection/net/regex/actor/scheduler/io), `source/core/aer_module.c`/
+`aer_host.c` (import and host-embedding mechanisms), `source/core/aer_actor.c` (independent VM
+spawning and a host-side mailbox, reachable from AER scripts via the `actor` module),
+`source/core/aer_scheduler.c` (cooperative round-robin scheduler over spawned actors),
 `source/core/disasm.c` (debug-only disassembler/profiler).
 
 ---
@@ -48,21 +50,11 @@ Integers are never boxed under this representation either: the old encoding coul
 `value.h` also holds the accessor functions (`aer_int`, `aer_as_string`, `aer_type`, ...) right
 alongside `AerVal`'s own definition — every read/write of an `AerVal`'s payload goes through one of
 these, never a direct `.as.x` anywhere else, so the representation itself can be swapped again
-without touching call sites. (These lived in a separate `value_box.h` for a while; merged back into
-`value.h` since nothing depended on keeping type definitions and their accessors in different
-files — every consumer needed both together anyway.)
+without touching call sites.
 
-A second, *public* type exists for the embedding boundary: `Value` (`value.h`), a plain
-non-tagged-union struct (`{ ValueType type; ValueData data; }`) used only in `AerNativeFn`'s
-signature (host-registered functions, `include/aer.h`). `aer_val_to_public`/`aer_val_from_public`
-are the seam between the two — `Value` was never NaN-boxed, so this seam needed no changes when
-`AerVal`'s own internal representation changed underneath it. This is currently **not** the same
-type as `AerVal`: `AerVal`'s internal shape has already changed once (NaN-boxing → tagged union)
-and survived without forcing every embedding host to recompile against a different public struct
-layout. Merging them now would trade that proven ABI insulation for eliminating a small,
-mechanical conversion function. **Deferred, not rejected**: revisit once `AerVal`'s own
-representation is no longer expected to change — merging while it's still actively iterating would
-give up real insulation for a marginal simplification.
+`AerVal` is the one value type, used identically in `AerNativeFn`'s signature (host-registered
+functions, `include/aer.h`) as everywhere else internally — a host reads/writes it through the same
+`aer_int`/`aer_as_string`/`aer_type`/etc. accessors as the interpreter itself, never a raw field.
 
 ---
 
@@ -70,10 +62,10 @@ give up real insulation for a marginal simplification.
 
 ### 2.1 Slab pools, not malloc-per-object
 
-Every heap type — `AerString`, `AerArray`, `AerDict`, `AerFunction`, and struct instances — is
-allocated from one of five fixed-size **slab (arena) pools** (`pool.c`), not individual `malloc`
-calls. `pool_init(pool, elem_size, elems_per_slab)` sets one up; `pool_alloc(pool)` hands back
-memory sized for exactly one cell:
+Every heap type — `AerString`, `AerArray`, `AerDict`, `AerFunction`, struct instances,
+`AerPackedArray`, and `AerResult` — is allocated from one of seven fixed-size **slab (arena)
+pools** (`pool.c`), not individual `malloc` calls. `pool_init(pool, elem_size, elems_per_slab)`
+sets one up; `pool_alloc(pool)` hands back memory sized for exactly one cell:
 
 - **Free-list first**: if a previous cell was freed, `pool_alloc` reuses it (an intrusive
   singly-linked list threaded through the first `sizeof(void*)` bytes of each freed cell).
@@ -82,7 +74,7 @@ memory sized for exactly one cell:
   allocation per object.
 - Returned memory is **uninitialized**, like `malloc` — the caller fills it in.
 
-Five pools exist (`vm_pools_init_once`, `vm.c`):
+Seven pools exist (`vm_pools_init_once`, `vm.c`):
 
 | Pool | Cell size | Elems/slab |
 |---|---|---|
@@ -91,6 +83,8 @@ Five pools exist (`vm_pools_init_once`, `vm.c`):
 | `dict_pool` | `sizeof(AerDict)` | 64 |
 | `function_pool` | `sizeof(AerFunction)` | 64 |
 | `struct_pool` | `sizeof(AerArray) + MAX_STRUCT_FIELDS * sizeof(AerVal)` | 64 |
+| `packed_array_pool` | `sizeof(AerPackedArray)` | 64 |
+| `result_pool` | `sizeof(AerResult)` | 64 |
 
 `struct_pool` is the one deliberate exception to "header separate from payload": a struct
 instance's field count never changes after construction (unlike a plain array's `items[]`, which
@@ -159,9 +153,10 @@ reference-counted, not incremental.
   defaults — permanent roots, since a bytecode constant or a struct's declared default must never
   be collected out from under a later reference to it.
 - If file-based `import`s are active, every imported module's *own* VM/Chunk gets its roots walked
-  too (`aer_module_get` iterates the whole file-module registry) — the five pools are one shared
-  heap fed by N independent root sets (the main VM plus one per imported file), not N separate
-  collectors.
+  too (`aer_module_get` iterates the whole file-module registry); every spawned actor's VM/Chunk
+  likewise (`aer_actor_get`, `vm.c`'s `gc_collect`, mirroring `aer_module_get`'s own enumeration) —
+  the seven pools are one shared heap fed by N independent root sets (the main VM plus one per
+  imported file plus one per live actor), not N separate collectors.
 
 **Mark phase**: an explicit growable worklist (`MarkWorklist`), not C call-stack recursion — user
 data structures (deeply nested arrays/dicts) have no depth limit, so recursion would risk a native
@@ -191,7 +186,7 @@ payload, e.g. `AerString.data`) and pushed onto the free-list.
 **Trigger** (`gc_maybe_collect`, `vm.c`): checked from inside individual allocating opcode
 handlers, **not** from `DISPATCH()` on every single instruction (see §5.1 for why this placement
 itself was a real, measured win). A minor collection runs once `pool_total_alloc_count` (a single
-shared counter across all 5 pools) crosses `minor_gc_threshold` (default 2048, `aer_gc_configure`);
+shared counter across all 7 pools) crosses `minor_gc_threshold` (default 2048, `aer_gc_configure`);
 a major collection runs after every `major_gc_every_n_minor` (default 10) minor ones. An optional
 live-cell **ceiling** (`aer_gc_set_ceiling`, 0 = unlimited) is checked once per opcode after the
 normal rhythm — if exceeded, an extra major collection is forced before the process gives up and
@@ -270,9 +265,8 @@ opcode values fit with 66 to spare, deliberate headroom for e.g. future concurre
 without a second encoding redesign.
 
 `DISPATCH()` itself (the per-opcode macro) does the absolute minimum: read the next word, split
-out the opcode, jump. Two costs that used to live here were found and removed:
-- **Per-instruction GC-flag check** — see §5.1.
-- **Per-instruction error-flag check** — see §5.1.
+out the opcode, jump — no per-instruction GC check and no per-instruction error-flag check (see
+§5.1 for how both stay off this path entirely).
 
 **`CallFrame`** (`vm.h`) is the unit of call isolation: `registers[FRAME_REGISTERS]` (128 slots),
 plus (for the primitive pass, §4.3) `raw_ints[32]`/`raw_reals[32]`, plus `return_ip`/`dest_reg` and
@@ -415,91 +409,65 @@ parser tables have been reset for whatever compiles next.
 
 ---
 
-## 5. Cross-cutting optimizations, and what each one actually bought
+## 5. Cross-cutting optimizations: current design and why
 
-Roughly chronological; each was landed after a real, reproducible measurement, not a theoretical
-argument alone (see the project's own stated readability-over-micro-optimization value — a
-change that couldn't show a real number was set aside, not applied speculatively).
+Full "what was tried, measured, and reverted" narrative lives in a local, unshipped file
+(`OPTIMIZATION_HISTORY.md`) — this section states the current design and the headline number only.
 
-### 5.1 Dispatch-loop overhead: two flags removed from every single instruction
+### 5.1 Dispatch-loop overhead
 
-Two "check something on every dispatch, even though it's almost always negative" costs were
-found and relocated:
+`DISPATCH()` carries no per-instruction GC check and no per-instruction error-flag check. GC checks
+are hand-placed at the handful of opcodes that can actually allocate (`gc_maybe_collect`, right
+after `OP_ARRAY_NEW`/`OP_STRUCT_NEW`/`append`/string concatenation/...) — an opcode that can never
+reach `pool_alloc` has zero GC-related cost, not a skipped check. Errors propagate via
+`setjmp`/`longjmp`: `vm_run` sets a catch point once at the top of its own call, `error()` jumps
+straight back to it the instant a fault fires, with no flag to poll anywhere. A blanket per-opcode
+check of either kind was tried and measured worse; not revisited. Combined measured effect: -2.2%
+instructions.
 
-- **GC check**: originally `DISPATCH()` itself checked "should we collect?" on every opcode. Two
-  earlier attempts (an unsafe relocation, then a gate that was a net loss) were tried and reverted
-  before landing the real fix: **hand-placed, per-allocating-label** checks (`gc_maybe_collect`
-  called individually, right after each of the handful of opcodes that can actually allocate —
-  `OP_ARRAY_NEW`, `OP_STRUCT_NEW`, `append`, string concatenation, ...). An opcode that can *never*
-  reach `pool_alloc` (`OP_MOVE`, `OP_JUMP`, field get/set, global load/store, `OP_CALL`/
-  `OP_TAIL_CALL`, ...) now has **zero** GC-related cost, not a skipped check — a genuinely
-  Lua-style zero-cost dispatch for the common case. Measured: **-2.2% instructions**.
-- **Error check**: `error()`/`error_at()` used to set a flag `DISPATCH()` polled every instruction.
-  Replaced with `setjmp`/`longjmp`: `vm_run` sets a catch point once at the top of its own call;
-  `error()` jumps straight back to it the instant a fault fires. This closed the other half of the
-  Lua comparison (Lua's own C implementation uses `longjmp` for errors too) — but see §6 for a real,
-  currently-unresolved platform-specific consequence of this change.
-
-### 5.2 Value representation: NaN-boxing → tagged union
+### 5.2 Value representation: tagged union
 
 Covered in full in §1 — the single largest win measured this whole project (-11.2% instructions on
 `nbody.aer`, -62.5% on isolated arithmetic).
 
 ### 5.3 Instruction encoding narrowing (Tier 1)
 
-Covered in §3.2. Narrowing `OP_BINARY` specifically had a genuinely surprising result: instructions
-went up slightly (+0.1–0.13%) despite the fix working exactly as designed (confirmed via
-disassembly — the cross-register reconstruction really was eliminated), while wall-clock/IPC were
-consistently *better* (~5–8%). The mechanism for the discrepancy was never fully pinned down; the
-wall-clock win was trusted over the instruction-count regression as the real signal.
+Covered in §3.2. Narrowing `OP_BINARY` specifically: instructions went up slightly (+0.1–0.13%)
+while wall-clock/IPC were consistently better (~5–8%) — the wall-clock win is trusted as the real
+signal; the discrepancy's exact mechanism was never fully pinned down.
 
 ### 5.4 The direct-destination-write pattern
 
-Found via `perf annotate`: the single hottest instruction in `nbody.aer`'s whole profile (~3.6% of
-cycles) was a 16-byte `AerVal` stack round-trip inside the binary-op handler macros — build a local
-`result`, then copy it into `vm->registers[dest]` afterward. Rewritten to write through a
-destination *pointer* directly (`*result = ...`) instead. ~5–6% wall-clock win (IPC 1.73–1.76 →
-1.82–1.86); the same fix applied to array-index writes for a further ~0.75% instruction reduction.
+Binary-op handlers write their result through a destination pointer directly (`*result = ...`)
+rather than building a local `AerVal` and copying it into `vm->registers[dest]` afterward — a
+16-byte stack round-trip that profiling found was the single hottest instruction in `nbody.aer`'s
+whole profile (~3.6% of cycles). Array-index writes use the same pattern. ~5–6% wall-clock win
+(IPC 1.73–1.76 → 1.82–1.86) plus ~0.75% further instruction reduction from the index-write case.
 
-### 5.5 Module/builtin call dispatch: numeric ID instead of `strcmp`
+### 5.5 Module/builtin call dispatch: numeric ID, not `strcmp`
 
-`module.function(...)` used to resolve the module name via a `strcmp` chain against every known
-built-in module's name, on *every single call* — `aer_math_call` + its own inner per-function
-`strcmp` + this outer module-name check were ~2.8–3% of `nbody.aer`'s cycles, almost entirely the
-outer check. Since a module name in `module.fn(...)` is always a literal identifier (never
-ambiguous), it's resolved once at *parse* time to a small integer ID (`CALL_MODULE_MATH` etc.),
-and the VM switches on that int instead. `CALL_MODULE_DYNAMIC` (a host-registered module or a file
-import — genuinely only resolvable by name at runtime) is the sole remaining `strcmp` path.
-`OP_CALL_BUILTIN`'s own dispatch (`length`/`print`/`type`/...) got the identical treatment:
-`builtin_call_id` (parser.c) resolves the literal name to a `CALL_BUILTIN_LENGTH`-etc. int once at
-parse time, emitted as a trailing word exactly like `OP_CALL_MODULE`'s `module_id`, and
-`vm_call_builtin` switches on it instead of running a 7-entry `strcmp` chain per call. No
-`DYNAMIC` case needed here — unlike a module name, a builtin call site is only ever emitted after
-`is_builtin_name` already confirmed the name is one of the seven, so the id always resolves. Fixing
-this also surfaced (and removed) a second piece of confirmed dead code: `vm_call_builtin`'s
-struct-construction fallback branch (via `chunk_find_shape`) could never actually be reached, since
-struct construction is resolved at compile time before this opcode is ever emitted — the code's own
-comment already said as much, it just hadn't been acted on.
+A module name in `module.fn(...)` is always a literal identifier (never ambiguous), so it's
+resolved once at parse time to a small integer ID (`CALL_MODULE_MATH` etc.), and the VM switches on
+that int instead of running a `strcmp` chain per call. `CALL_MODULE_DYNAMIC` (a host-registered
+module or a file import — genuinely only resolvable by name at runtime) is the sole remaining
+`strcmp` path. `OP_CALL_BUILTIN`'s dispatch (`length`/`print`/`type`/...) works identically via
+`builtin_call_id` (parser.c). Measured ~2.8–3% of `nbody.aer`'s cycles recovered.
 
 ### 5.6 `vm_binary` fast/cold split
 
-An `always_inline` shared arithmetic helper (`vm_binary`) turned out to be the dominant source of
-icache bloat in `vm_run` (161KB → 108KB removing it, a genuine -75% cache-miss reduction) — but
-naively removing the inlining was a **net 5% slowdown** on its own, since some callers were
-genuinely hot enough to need the inlined version. The real fix: split into `vm_binary_fast` (small,
-kept `always_inline`) and `vm_binary_cold` (everything else, a real out-of-line call). Net result
-after the split: -1.6–1.7% instructions relative to the pre-split baseline.
+The shared arithmetic helper is split into `vm_binary_fast` (small, `always_inline`) and
+`vm_binary_cold` (everything else, out-of-line) — inlining the whole thing bloats `vm_run`'s icache
+footprint (161KB vs 108KB, a -75% cache-miss difference with the split); never inlining it costs
+~5% on the callers hot enough to need it. Net: -1.6–1.7% instructions.
 
 ### 5.7 Build-level wins: LTO and PGO
 
-- **`-flto`**: `pool.c`'s hot, tiny functions (`pool_cell_state`, `pool_is_young`,
-  `gc_barrier_array`) are called from `vm.c` — a different translation unit — so without LTO every
-  call pays full cross-TU call/return overhead no matter how trivial the callee's body is. Added to
-  the shared build flags: ~4.4% fewer instructions, ~5–7% faster wall clock.
-- **PGO** (a two-stage `-fprofile-generate`/`-fprofile-use` build): a real 7–9% wall-clock win on
-  `nbody.aer` with **zero source changes**, compounding automatically with LTO. The dedicated
-  makefile target was dropped in a cleanup pass (it doubled build time and needed workload
-  training); the measured result stands, and the recipe is two flags if it's ever wanted again.
+`-flto` is load-bearing, not optional — `pool.c`'s hot, tiny functions (`pool_cell_state`,
+`pool_is_young`, `gc_barrier_array`) are called from `vm.c`, a different translation unit, and pay
+full cross-TU call/return overhead without it (~4.4% fewer instructions, ~5–7% faster wall clock
+with it on). PGO (`-fprofile-generate`/`-fprofile-use`, see the README's Building section) measures
+a further 7–9% wall-clock win with zero source changes, compounding with LTO — not wired into the
+default build, to keep the makefile small.
 
 ---
 
@@ -520,19 +488,25 @@ after the split: -1.6–1.7% instructions relative to the pre-split baseline.
   not built) could enable contiguous typed storage and bounds-check elision, but real vectorization
   would need the interpreter to recognize vectorizable access patterns at compile time — a
   substantially larger undertaking than anything landed so far.
-- **No concurrency at the language level.** A `VM`'s registers/call-stack are per-instance (proven
-  by file-based `import`, which already runs each imported file in its own), but the GC-managed
-  heap (`string_pool`/`array_pool`/etc., `vm.c`) is one set of pools shared by the whole process —
-  two VMs executing simultaneously on separate OS threads would race on the allocator and
-  collector. Actor-model groundwork exists (`source/core/aer_actor.h/c`: spawn an independent VM,
-  plus a host-side byte-string mailbox — reused via `aer_vm_instantiate_from_file`, the same
-  primitive `aer_module_load` uses), verified end-to-end with a hand-written round-robin host
-  driver. What's still missing, and is the substantially harder remaining piece: a scheduler
-  capable of suspending a `vm_run()` mid-execution and resuming it later, comparable in size to the
-  value-representation migration (§1) or the generational GC (§2). Cooperative (one thread, one
-  actor running at a time) is the natural fit given the shared-pool constraint above — true
-  parallelism would additionally require moving the pools from process-global statics into
-  per-`VM` fields, a real but separable refactor.
+- **No OS-thread parallelism at the language level, by design.** A `VM`'s registers/call-stack are
+  per-instance (proven by file-based `import`, which already runs each imported file in its own),
+  but the GC-managed heap (`string_pool`/`array_pool`/etc., `vm.c`) is one set of pools shared by
+  the whole process — two VMs executing simultaneously on separate OS threads would race on the
+  allocator and collector. Cooperative, single-threaded concurrency exists instead
+  (`source/core/aer_actor.h/c` + `aer_scheduler.h/c`, reachable from AER scripts via the `actor`/
+  `scheduler` modules): actors are independent VMs (spawned via `aer_vm_instantiate_from_file`, the
+  same primitive `aer_module_load` uses) driven by `vm_run_slice()` — the `vm_run()` dispatch loop,
+  refactored to take a bounded instruction count and return `VM_SLICE_YIELDED` instead of running
+  to completion, with the budget checked only at the three sites a script can spend unbounded time
+  (`lbl_jump`, `lbl_call`, `lbl_iter_range_loop`'s back-edge — never a blanket per-`DISPATCH()`
+  check). This works with no fiber/`ucontext`/stack-copying machinery because AER calls never
+  recurse in C — every call pushes a `CallFrame` onto a plain array and jumps, so a "suspended"
+  script's entire state already lives on the `VM` struct, not the C stack; `vm_run()` already
+  resumed from wherever `vm->ip` pointed as its normal contract before this existed (the REPL's own
+  statement-by-statement execution relies on the same fact). The scheduler round-robins queued
+  tasks through this in small slices until each finishes or errors. True OS-thread parallelism
+  would additionally require moving the pools from process-global statics into per-`VM` fields, a
+  real but separable, larger refactor — not attempted.
 
 ---
 
@@ -543,7 +517,7 @@ Two entirely separate allocation lifetimes exist in this codebase. Don't conflat
 - **Compile-time / permanent** — grows a `Chunk`'s own bookkeeping arrays. Lives for the process's
   life (or the importing module's life), never GC-tracked, freed only by `chunk_free` (or, for
   `shapes`/`functions`, not even then — see below).
-- **Runtime / GC-tracked** — a pool cell (one of the 5 pools, §2.1) plus, for variable-length types,
+- **Runtime / GC-tracked** — a pool cell (one of the 7 pools, §2.1) plus, for variable-length types,
   a separate `xmalloc`'d payload. Reclaimed only by the collector (§2.4), never by an explicit
   `free()` call from ordinary VM code.
 

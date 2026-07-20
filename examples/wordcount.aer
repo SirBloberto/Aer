@@ -1,0 +1,35 @@
+# wordcount.aer — a small command-line utility in the style of Unix `wc`: counts lines and words
+# in a file. Demonstrates io.args() (extra CLI arguments reach the script this way) and io.read()
+# (a Result — a missing/unreadable file is a clean error, not a crash).
+#
+# Run it with:
+#   ./binary/aer examples/wordcount.aer <path-to-a-text-file>
+
+import io
+import string
+
+# panic() aborts the whole script with a nonzero exit code (a normal, recoverable-by-the-host
+# runtime error, not a crash -- see the README's Embedding section) -- guard clauses instead of
+# nested if/else.
+args = io.args()
+if length(args) == 0:
+    panic("usage: aer wordcount.aer <file>")
+
+path = args[0]
+contents, err = io.read(path)
+if err != null:
+    panic("could not read {path}: {err}")
+
+lines = string.split(contents, "\n")
+line_count = length(lines)
+
+word_count = 0
+for line in lines:
+    words = string.split(line, " ")
+    for word in words:
+        trimmed = string.trim(word)
+        if length(trimmed) > 0:
+            word_count += 1
+
+char_count = length(contents)
+print("{path}: {line_count} lines, {word_count} words, {char_count} characters")

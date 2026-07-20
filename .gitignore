@@ -38,3 +38,4 @@ perf.data*
 #of /CLAUDE.md against .claude/, which wouldn't hold on a case-sensitive filesystem.
 /CLAUDE.md
 /.claude/
+/OPTIMIZATION_HISTORY.md

@@ -1,0 +1,11 @@
+import actor
+
+function count_and_report(sink, n):
+    total = 0
+    i = 0
+    for i in 0..n:
+        total += i
+        if i % 100000 == 0:
+            actor.send(sink, "tick")
+    actor.send(sink, "total:{total}")
+    return total

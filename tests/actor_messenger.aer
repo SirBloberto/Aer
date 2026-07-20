@@ -1,0 +1,5 @@
+import actor
+
+function report_and_finish(sink):
+    actor.send(sink, "messenger-done")
+    return "pong"

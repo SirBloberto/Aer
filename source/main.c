@@ -27,6 +27,22 @@ static void help();
 static const char* debug_dump_path = NULL;
 #endif
 
+/* Interprets a K/M/G suffix as a cell-count multiplier (1,000 / 1,000,000 / 1,000,000,000) --
+   aer_gc_set_ceiling() counts live *cells*, not bytes, and cell sizes differ per pool (a string
+   cell isn't the size of a dict cell), so there is no accurate bytes-to-cells conversion available
+   without a much bigger per-allocation byte-accounting subsystem this project doesn't have. This
+   is a cell-count ceiling with a familiar-looking suffix, not a byte-accurate memory limit --
+   documented as such in help() below and the README, not silently implied. */
+static unsigned int parse_memory_size(const char* s) {
+    char* end;
+    double n = strtod(s, &end);
+    unsigned int multiplier = 1;
+    if (*end == 'K' || *end == 'k')      multiplier = 1000u;
+    else if (*end == 'M' || *end == 'm') multiplier = 1000000u;
+    else if (*end == 'G' || *end == 'g') multiplier = 1000000000u;
+    return (unsigned int)(n * multiplier);
+}
+
 int main(int argc, char** argv) {
     chunk_init(&chunk);
     vm_init(&vm, &chunk);   /* registers io, same as every other stdlib module */
@@ -34,22 +50,37 @@ int main(int argc, char** argv) {
        variable/function persistence work */
     parser_reset();
 
-#ifdef AER_DEBUG_TOOLS
-    /* Filter --debug-path=<path> out of argv before the help/version/file dispatch sees it */
+    /* Filter recognized global flags out of argv before the help/version/file dispatch sees them
+       — everything after the script path still reaches the script untouched, via io.args(). */
     int    real_argc = 1;
     char** real_argv = xmalloc(sizeof(char*) * (size_t)argc);
     real_argv[0] = argv[0];
     for (int i = 1; i < argc; i++) {
-        static const char prefix[] = "--debug-path=";
-        if (strncmp(argv[i], prefix, sizeof(prefix) - 1) == 0) {
-            debug_dump_path = argv[i] + sizeof(prefix) - 1;
+        static const char no_io[]      = "--no-io";
+        static const char no_net[]     = "--no-net";
+        static const char no_import[]  = "--no-import";
+        static const char mem_size[]   = "--memory-size=";
+#ifdef AER_DEBUG_TOOLS
+        static const char debug_path[] = "--debug-path=";
+#endif
+        if (strcmp(argv[i], no_io) == 0) {
+            aer_set_io_enabled(false);
+        } else if (strcmp(argv[i], no_net) == 0) {
+            aer_set_net_enabled(false);
+        } else if (strcmp(argv[i], no_import) == 0) {
+            aer_set_import_enabled(false);
+        } else if (strncmp(argv[i], mem_size, sizeof(mem_size) - 1) == 0) {
+            aer_gc_set_ceiling(parse_memory_size(argv[i] + sizeof(mem_size) - 1));
+#ifdef AER_DEBUG_TOOLS
+        } else if (strncmp(argv[i], debug_path, sizeof(debug_path) - 1) == 0) {
+            debug_dump_path = argv[i] + sizeof(debug_path) - 1;
+#endif
         } else {
             real_argv[real_argc++] = argv[i];
         }
     }
     argc = real_argc;
     argv = real_argv;
-#endif
 
     int status = 0;
     if (argc == 1) {
@@ -73,13 +104,8 @@ int main(int argc, char** argv) {
 
 static void run() {
     /* Append new code after any previous bytecode — preserves function bodies compiled in earlier REPL calls. */
-    unsigned int start = chunk.count;
-    vm.ip            = start;
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
+    aer_vm_reset_for_reuse(&vm);
+    vm.ip = chunk.count;
     lex();
     /* parse() never resets its own tables (parser_reset, called once in main() above, already did
        that) and has its own per-statement rollback/recovery, so it's safe to call repeatedly —
@@ -149,16 +175,15 @@ static void run_shell() {
             if (!blank) continue;
 
             set_terminal_prompt(">>> ");
-            shell(block_buf);
+            aer_run_source(&vm, &chunk, block_buf);
             free(block_buf);
             block_buf  = NULL;
             block_size = 0;
             in_block   = false;
-        } else {
-            shell(line);
+            continue;
         }
 
-        run();
+        aer_run_source(&vm, &chunk, line);
     }
 }
 
@@ -181,7 +206,7 @@ static bool run_file(char* path) {
         if (dump_out != stderr) fclose(dump_out);
     }
 #endif
-    /* A runtime error no longer terminates the process (see error.c) — the CLI decides to exit nonzero here; a failed assert() doesn't set aer_had_error() on purpose (see error.h), so it's checked separately. */
+    /* A runtime error doesn't terminate the process (see error.c) — the CLI decides to exit nonzero here; a failed assert() doesn't set aer_had_error() on purpose (see error.h), so it's checked separately. */
     return !aer_had_error() && aer_assert_failure_count() == 0;
 }
 
@@ -191,6 +216,10 @@ static void help() {
     printf("  version   Show Aer version\n");
     printf("  <file> [args...]   Execute an Aer source file; extra arguments reach the script via io.args()\n");
     printf("  (no args) Start interactive shell\n");
+    printf("  --no-io              Disable the io module for this run\n");
+    printf("  --no-net             Disable the net module for this run\n");
+    printf("  --no-import          Disable file-based import for this run (fixed stdlib modules still work)\n");
+    printf("  --memory-size=<N>[K|M|G]  Cap live GC cells (not bytes) at N; suffix multiplies by 1e3/1e6/1e9\n");
 #ifdef AER_DEBUG_TOOLS
     printf("  --debug-path=<path>  Write a disassembly + hit-count/memory dump here after running\n");
     printf("                       <file> (\"-\" for stderr)\n");

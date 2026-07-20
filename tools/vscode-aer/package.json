@@ -1,0 +1,43 @@
+{
+  "name": "vscode-aer",
+  "displayName": "AER",
+  "description": "Syntax highlighting and language server support for the AER programming language",
+  "version": "0.2.0",
+  "publisher": "aer-lang",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": ["Programming Languages"],
+  "main": "./src/extension.js",
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "aer",
+        "aliases": ["AER", "aer"],
+        "extensions": [".aer"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "aer",
+        "scopeName": "source.aer",
+        "path": "./syntaxes/aer.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "AER",
+      "properties": {
+        "aer.languageServerPath": {
+          "type": "string",
+          "default": "aer-lsp",
+          "description": "Path to the aer-lsp binary (built with 'make lsp-tool' from the AER repo). Defaults to expecting it on PATH."
+        }
+      }
+    }
+  }
+}

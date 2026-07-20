@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #include <winsock2.h>
@@ -45,13 +46,6 @@ static void sock_close(sock_t s) { close(s); }
 static const char* sock_errmsg(void) { return strerror(errno); }
 #endif
 
-static AerVal make_error(const char* msg) {
-    size_t n   = strlen(msg);
-    char*  buf = xmalloc(n + 1);
-    memcpy(buf, msg, n + 1);
-    return aer_make_string(buf, (unsigned int)n);
-}
-
 #ifdef _WIN32
 static bool set_nonblocking(sock_t s, bool nonblocking) {
     u_long mode = nonblocking ? 1 : 0;
@@ -66,7 +60,10 @@ static bool set_nonblocking(sock_t s, bool nonblocking) {
 }
 #endif
 
-#define NET_CONNECT_TIMEOUT_SECONDS 10
+/* Shared bound for every blocking net operation -- connect/send/recv all found (or could find) the
+   same class of indefinite hang, so they all get the same bound rather than each picking its own
+   number. */
+#define NET_TIMEOUT_SECONDS 10
 
 /* connect() has no built-in timeout and can hang far longer than a normal refused connection on
    some host/network combinations -- found via tests/fuzz.py mutating a test's loopback address
@@ -86,7 +83,7 @@ static bool connect_with_timeout(sock_t s, const struct sockaddr* addr, socklen_
     FD_ZERO(&write_set);
     FD_SET(s, &write_set);
     struct timeval tv;
-    tv.tv_sec  = NET_CONNECT_TIMEOUT_SECONDS;
+    tv.tv_sec  = NET_TIMEOUT_SECONDS;
     tv.tv_usec = 0;
     if (select((int)s + 1, NULL, &write_set, NULL, &tv) <= 0) {
         set_nonblocking(s, false);
@@ -99,7 +96,70 @@ static bool connect_with_timeout(sock_t s, const struct sockaddr* addr, socklen_
     return so_error == 0;
 }
 
+/* send()/recv() are plain blocking calls with no bound of their own -- a connection that's open
+   but silent (peer never sends, or never drains its receive buffer) hangs exactly like the
+   pre-fix connect() did. Rather than switching the socket to non-blocking I/O (unnecessary here --
+   there's no partial-progress case to retry), just gate the existing blocking call behind a bounded
+   wait: the socket never leaves blocking mode, only how long we wait for it to become ready is bounded. */
+static bool wait_ready(sock_t s, bool for_write, int timeout_sec) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(s, &fds);
+    struct timeval tv;
+    tv.tv_sec  = timeout_sec;
+    tv.tv_usec = 0;
+    int ready = for_write ? select((int)s + 1, NULL, &fds, NULL, &tv)
+                          : select((int)s + 1, &fds, NULL, NULL, &tv);
+    return ready > 0;
+}
+
+/* Handles given to scripts are opaque integer ids resolved through this registry, never a raw
+   socket cast through an int -- a script passing a wrong or stale integer (a typo'd variable, a
+   handle reused after close) must get a clean error, not silently operate on whatever OS handle
+   that integer happens to collide with (e.g. net.close(0) closing real stdin on POSIX). Mirrors
+   aer_actor.c's aer_actor_resolve(). Entries are removed on close() specifically so a reused id can
+   never resolve to a socket the OS has since recycled for something unrelated. */
+typedef struct SocketEntry {
+    unsigned int id;
+    sock_t sock;
+    struct SocketEntry* next;
+} SocketEntry;
+
+static SocketEntry* sockets        = NULL;
+static unsigned int  next_socket_id = 1;   /* 0 reserved as "no such handle" */
+
+static unsigned int register_socket(sock_t s) {
+    SocketEntry* e = xmalloc(sizeof(SocketEntry));
+    e->id   = next_socket_id++;
+    e->sock = s;
+    e->next = sockets;
+    sockets = e;
+    return e->id;
+}
+
+/* *out_sock untouched on failure. */
+static bool resolve_socket(AerVal handle_v, sock_t* out_sock) {
+    if (aer_type(handle_v) != TYPE_INTEGER) return false;
+    unsigned int id = (unsigned int)aer_as_int(handle_v);
+    for (SocketEntry* e = sockets; e; e = e->next) {
+        if (e->id == id) { *out_sock = e->sock; return true; }
+    }
+    return false;
+}
+
+static void unregister_socket(unsigned int id) {
+    SocketEntry** link = &sockets;
+    while (*link && (*link)->id != id) link = &(*link)->next;
+    if (*link) { SocketEntry* dead = *link; *link = dead->next; free(dead); }
+}
+
 bool aer_net_call(VM* vm, int fn_id, int arg_count) {
+    if (!aer_net_enabled) {
+        for (int i = 0; i < arg_count; i++) vm_stack_pop(vm);
+        error("net is disabled for this run (--no-net)");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
     if (fn_id == FN_NET_CONNECT && arg_count == 2) {
         AerVal port_v = vm_stack_pop(vm);
         AerVal host_v = vm_stack_pop(vm);
@@ -120,7 +180,7 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
         struct addrinfo* res = NULL;
         int gai = getaddrinfo(aer_as_string(host_v)->data, port_str, &hints, &res);
         if (gai != 0) {
-            vm_stack_push(vm, aer_make_result(aer_null(), make_error(gai_strerror(gai))));
+            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(gai_strerror(gai))));
             return true;
         }
 
@@ -134,10 +194,10 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
         }
         freeaddrinfo(res);
         if (s == SOCK_INVALID) {
-            vm_stack_push(vm, aer_make_result(aer_null(), make_error(sock_errmsg())));
+            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
             return true;
         }
-        vm_stack_push(vm, aer_make_result(aer_int((int64_t)(intptr_t)s), aer_null()));
+        vm_stack_push(vm, aer_make_result(aer_int((int64_t)register_socket(s)), aer_null()));
         return true;
     }
 
@@ -149,11 +209,22 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
             vm_stack_push(vm, aer_null());
             return true;
         }
-        sock_t    s   = (sock_t)(intptr_t)aer_as_int(handle_v);
+        sock_t s;
+        if (!resolve_socket(handle_v, &s)) {
+            error("net.send(): no such connection handle");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
         AerString* str = aer_as_string(data_v);
+        if (!wait_ready(s, true, NET_TIMEOUT_SECONDS)) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "net.send() timed out after %ds", NET_TIMEOUT_SECONDS);
+            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
+            return true;
+        }
         long sent = send(s, str->data, (int)str->length, 0);
         if (sent < 0) {
-            vm_stack_push(vm, aer_make_result(aer_null(), make_error(sock_errmsg())));
+            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
             return true;
         }
         vm_stack_push(vm, aer_make_result(aer_int((int64_t)sent), aer_null()));
@@ -168,13 +239,24 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
             vm_stack_push(vm, aer_null());
             return true;
         }
-        sock_t  s         = (sock_t)(intptr_t)aer_as_int(handle_v);
+        sock_t s;
+        if (!resolve_socket(handle_v, &s)) {
+            error("net.recv(): no such connection handle");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
         int64_t max_bytes = aer_as_int(max_v);
+        if (!wait_ready(s, false, NET_TIMEOUT_SECONDS)) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "net.recv() timed out after %ds", NET_TIMEOUT_SECONDS);
+            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
+            return true;
+        }
         char*   buf       = xmalloc((size_t)max_bytes);
         long    got       = recv(s, buf, (int)max_bytes, 0);
         if (got < 0) {
             free(buf);
-            vm_stack_push(vm, aer_make_result(aer_null(), make_error(sock_errmsg())));
+            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
             return true;
         }
         /* got == 0 means the peer closed the connection -- an empty string, not an error,
@@ -187,12 +269,14 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
 
     if (fn_id == FN_NET_CLOSE && arg_count == 1) {
         AerVal handle_v = vm_stack_pop(vm);
-        if (aer_type(handle_v) != TYPE_INTEGER) {
-            error("net.close() requires a connection handle");
+        sock_t s;
+        if (!resolve_socket(handle_v, &s)) {
+            error("net.close(): no such connection handle");
             vm_stack_push(vm, aer_null());
             return true;
         }
-        sock_close((sock_t)(intptr_t)aer_as_int(handle_v));
+        sock_close(s);
+        unregister_socket((unsigned int)aer_as_int(handle_v));
         vm_stack_push(vm, aer_null());
         return true;
     }

@@ -3,8 +3,9 @@
 
 #include "vm.h"
 
-/* The entire native-module surface (math/random/string/time/json/collection/net/regex/io), all
-   dispatched from vm.c's OP_CALL_MODULE switch. */
+/* The entire native-module surface
+   (math/random/string/time/json/collection/net/regex/actor/scheduler/io), all dispatched from
+   vm.c's OP_CALL_MODULE switch. */
 
 /* The hardcoded module names `import` accepts; `name` need not be NUL-terminated. */
 bool aer_stdlib_is_native_module(const char* name, unsigned int len);
@@ -18,6 +19,8 @@ bool aer_time_call(VM* vm, int fn_id, int arg_count);
 bool aer_collection_call(VM* vm, int fn_id, int arg_count);
 bool aer_net_call(VM* vm, int fn_id, int arg_count);
 bool aer_regex_call(VM* vm, int fn_id, int arg_count);
+bool aer_actor_module_call(VM* vm, int fn_id, int arg_count);
+bool aer_scheduler_module_call(VM* vm, int fn_id, int arg_count);
 
 /* Takes Chunk* unlike the others — encoding a struct instance needs its field names. */
 bool aer_json_call(VM* vm, Chunk* c, int fn_id, int arg_count);

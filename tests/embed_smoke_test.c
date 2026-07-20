@@ -1,8 +1,6 @@
-/* Embedding smoke test — proves the thing this phase exists to prove: a
-   runtime error no longer terminates the process. Links directly against
-   the AER library sources (everything except source/main.c, which has
-   its own conflicting main()) — this program IS a minimal embedding
-   host, not a wrapper around the CLI.
+/* Embedding smoke test — proves a runtime error no longer terminates the process. Links directly
+   against the AER library sources (everything except source/main.c, which has its own conflicting
+   main()) — this program IS a minimal embedding host, not a wrapper around the CLI.
 
    Build and run: make test-embed
 */
@@ -60,26 +58,6 @@ static AerVal host_add(VM* vm, int arg_count, AerVal* args, void* userdata) {
     return aer_int(0);
 }
 
-/* Mirrors main.c's run() — parse+run whatever text shell() was just
-   handed, appended after any existing bytecode. Not calling into main.c
-   itself; this is what a host's own equivalent of run() looks like.
-     error_at()/error() (error.c) set runtime_had_error alongside parse_had_error
-   unconditionally — even a compile error that parse()'s own per-statement recovery
-   fully recovers from leaves runtime_had_error stuck true, and DISPATCH() (vm.c) aborts
-   vm_run() before its first instruction whenever that flag is set. main.c's run() resets
-   it right before vm_run() for exactly this reason; without the same reset here, a
-   recovered parse error in one shell() segment silently no-ops every later run_appended()
-   call's execution too, not just the segment that actually errored. */
-static bool run_appended(Chunk* chunk, VM* vm) {
-    unsigned int start = chunk->count;
-    vm->ip = start;
-    lex();
-    parse(chunk);
-    chunk_emit(chunk, OP_HALT);
-    runtime_had_error = false;
-    return vm_run(vm);
-}
-
 int main(void) {
     aer_set_error_callback(on_error, NULL);
 
@@ -88,13 +66,10 @@ int main(void) {
     chunk_init(&chunk);
     vm_init(&vm, &chunk);
     parser_reset();
-    mode = MODE_RUN;   /* the mode that used to exit(1) on any runtime error */
+    mode = MODE_RUN;
 
-    /* A script that deliberately errors at runtime. Before this phase,
-       reaching this line at all in MODE_RUN was impossible — the process
-       would already be dead. */
-    shell("print(1 / 0)\n");
-    bool ok = run_appended(&chunk, &vm);
+    /* A script that deliberately errors at runtime; MODE_RUN survives it without terminating. */
+    bool ok = aer_run_source(&vm, &chunk, "print(1 / 0)\n");
 
     check(!ok, "vm_run() returns false on a runtime error");
     check(aer_had_error(), "aer_had_error() is true after the error");
@@ -104,19 +79,12 @@ int main(void) {
     check(strcmp(aer_last_error(), last_callback_msg) == 0,
           "aer_last_error() matches what the callback received");
 
-    /* The embedding contract documented on vm_run() in vm.h: a host
-       reusing the same VM* after an error must reset stack/call/scope
-       state itself, applied here by hand, exactly like main.c's run()
-       does between REPL statements. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
+    /* aer_run_source() resets the VM for reuse itself (aer_vm_reset_for_reuse) — a host driving
+       vm_run()/vm_run_slice() directly on its own VM would need to call that itself between calls,
+       same contract vm_run() has always documented. */
     aer_clear_error();
 
-    shell("print(2 + 2)\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk, "print(2 + 2)\n");
 
     check(ok, "the same VM runs a second, valid script successfully after the reset");
     check(!aer_had_error(), "no error state remains after a clean run");
@@ -130,14 +98,8 @@ int main(void) {
        plus two blank lines plus "bad = x.y" — chunk_line_for_offset() and
        current_runtime_line (source/core/vm.c, source/utilities/error.c)
        are what make this work. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("x = 1\n\n\nbad = x.y\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk, "x = 1\n\n\nbad = x.y\n");
 
     check(!ok, "field access on a non-struct still fails");
     check(strstr(aer_last_error(), "Line 4:") != NULL,
@@ -150,8 +112,7 @@ int main(void) {
        correctly through the C call, not just that the script ran. */
     aer_clear_error();
     aer_register_function("game", "add", host_add, NULL);
-    shell("import game\nassert(game.add(3, 4) == 7, \"game.add returns the sum\")\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk, "import game\nassert(game.add(3, 4) == 7, \"game.add returns the sum\")\n");
 
     check(ok, "a script calling a host-registered function runs without error");
     check(aer_assert_failure_count() == 0,
@@ -162,8 +123,7 @@ int main(void) {
        itself (it would abort that whole file, same as any other runtime
        error) — here, a host can inspect vm_run()'s return value directly. */
     aer_clear_error();
-    shell("panic(\"something went wrong\")\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk, "panic(\"something went wrong\")\n");
 
     check(!ok, "panic() aborts the call, just like any other runtime error");
     check(aer_had_error(), "aer_had_error() is true after panic()");
@@ -178,35 +138,25 @@ int main(void) {
        over-apply; tests/test.aer proves the true-tail-call case reuses
        the frame (completes far past 64 levels) — this is the negative
        case that can't run there, since it deliberately aborts the file. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("function not_tail(n):\n    if n <= 0:\n        return 0\n    return not_tail(n - 1) + 0\n\nnot_tail(1000)\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk,
+        "function not_tail(n):\n    if n <= 0:\n        return 0\n    return not_tail(n - 1) + 0\n\nnot_tail(1000)\n");
 
     check(!ok, "deep non-tail recursion still overflows the call stack — tail-call detection did not over-apply");
     check(strstr(aer_last_error(), "overflow") != NULL,
           "the failure is specifically a call stack overflow, not some other error");
 
     /* AER_PATH search paths — resolve_path() (aer_module.c) only reaches its
-       AER_PATH fallback once the same-directory candidate misses. shell()
-       names its source "shell" (no directory component), so the
+       AER_PATH fallback once the same-directory candidate misses. aer_run_source()'s
+       internal shell() call names its source "shell" (no directory component), so the
        same-directory candidate resolves relative to this process's cwd —
        the repo root when run via `make test-embed` — where
        searchpath_helper.aer does not exist; it only exists under tests/.
        Setting AER_PATH=tests here is what makes the import succeed at all. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     set_aer_path("tests");
-    shell("import searchpath_helper\nassert(searchpath_helper.quadruple(5) == 20, \"quadruple via AER_PATH-resolved import\")\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk,
+        "import searchpath_helper\nassert(searchpath_helper.quadruple(5) == 20, \"quadruple via AER_PATH-resolved import\")\n");
 
     check(ok, "a module found only via an AER_PATH directory still imports and runs successfully");
     check(aer_assert_failure_count() == 0,
@@ -216,14 +166,8 @@ int main(void) {
        same always-on status as every other stdlib module — this test binary never calls
        aer_io_register() itself (unlike source/main.c, which used to be the only thing that did),
        and io.exists() still works, proving io is no longer a host opt-in. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("import io\nassert(io.exists(\"tests\") == true, \"io.exists() finds the real tests/ directory\")\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk, "import io\nassert(io.exists(\"tests\") == true, \"io.exists() finds the real tests/ directory\")\n");
 
     check(ok && !aer_had_error(),
           "import io succeeds with no host action at all — io is unconditionally available, same as every other stdlib module");
@@ -236,33 +180,16 @@ int main(void) {
        mv->call_stack[0].registers[0] where aer_module_call always reads the result from. Not just
        an eventual "Call stack overflow" after enough failures — the very next call after a single
        failure silently returns whatever stale value already sat there, no error at all. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("import module_call_helper\n");
-    run_appended(&chunk, &vm);
+    aer_run_source(&vm, &chunk, "import module_call_helper\n");
 
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("module_call_helper.boom()\n");
-    run_appended(&chunk, &vm);
+    aer_run_source(&vm, &chunk, "module_call_helper.boom()\n");
     check(aer_had_error(), "a runtime error inside a module function is reported, not silently swallowed");
 
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("assert(module_call_helper.good(5) == 50, \"a call after a prior failed call still returns the correct value, not a stale one from the wrong call frame\")\n");
-    bool ok_after_module_error = run_appended(&chunk, &vm);
+    bool ok_after_module_error = aer_run_source(&vm, &chunk,
+        "assert(module_call_helper.good(5) == 50, \"a call after a prior failed call still returns the correct value, not a stale one from the wrong call frame\")\n");
     check(ok_after_module_error, "the call after a prior module-function failure runs without error");
     check(aer_assert_failure_count() == 0,
           "good(5) returns 50, not null or any other stale value left over from boom()'s failed call");
@@ -274,14 +201,8 @@ int main(void) {
        Asserting a collection actually ran and that the live-cell count
        stayed far below the iteration count is the only real proof
        reclamation happened, not just that nothing crashed. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("for i in 0..5000:\n    temp = [i, i * 2, i * 3]\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk, "for i in 0..5000:\n    temp = [i, i * 2, i * 3]\n");
 
     unsigned int live_cells, minor_collections, major_collections;
     aer_gc_stats(&live_cells, &minor_collections, &major_collections);
@@ -300,17 +221,11 @@ int main(void) {
        more collections than the default for the same workload. Restored
        to the defaults immediately after, so it doesn't affect the ceiling
        tests below. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     aer_gc_configure(20, 0);   /* tiny minor threshold; 0 leaves the major cadence alone */
     unsigned int minors_before;
     aer_gc_stats(NULL, &minors_before, NULL);
-    shell("for i in 0..2000:\n    temp = [i, i * 2, i * 3]\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk, "for i in 0..2000:\n    temp = [i, i * 2, i * 3]\n");
     unsigned int minors_after;
     aer_gc_stats(NULL, &minors_after, NULL);
     aer_gc_configure(2048, 10);   /* restore defaults before the ceiling tests below */
@@ -323,15 +238,9 @@ int main(void) {
        keeps genuinely-live memory growing (not throwaway garbage) to
        abort with a normal, recoverable runtime error instead of growing
        forever. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     aer_gc_set_ceiling(50);
-    shell("import collection\npermanent = []\nfor i in 0..5000:\n    collection.append(permanent, [i, i * 2, i * 3])\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk, "import collection\npermanent = []\nfor i in 0..5000:\n    collection.append(permanent, [i, i * 2, i * 3])\n");
 
     check(!ok, "a script whose live memory keeps growing hits the ceiling and aborts");
     check(aer_had_error(), "aer_had_error() is true after the ceiling is exceeded");
@@ -341,15 +250,9 @@ int main(void) {
     /* Disabling the ceiling (0) lets the same shape of script succeed —
        proves it doesn't wrongly reject once unset, not just that a tiny
        one rejects. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     aer_gc_set_ceiling(0);
-    shell("permanent2 = []\nfor i in 0..5000:\n    collection.append(permanent2, [i, i * 2, i * 3])\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk, "permanent2 = []\nfor i in 0..5000:\n    collection.append(permanent2, [i, i * 2, i * 3])\n");
 
     check(ok, "the same shape of script succeeds once the ceiling is disabled (0)");
 
@@ -364,19 +267,14 @@ int main(void) {
        got compiled at all, and a later reference to n1 failed with a
        confusing, seemingly unrelated "'n1' is not defined" — see
        recovered_at_boundary in parser.c. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     /* x.y += 1 used to be this test's broken statement, back when compound
        field/index assignment (parser.c's parse_assignment) wasn't supported
        at all — now that it is, `x.` with no field name after the dot is the
        still-genuinely-invalid construct, unrelated to that feature. */
-    shell("function f(x):\n    x. += 1\n\n"
-          "n1 = 42\nassert(n1 == 42, \"a statement after a broken function body still compiles and runs\")\n");
-    ok = run_appended(&chunk, &vm);
+    ok = aer_run_source(&vm, &chunk,
+        "function f(x):\n    x. += 1\n\n"
+        "n1 = 42\nassert(n1 == 42, \"a statement after a broken function body still compiles and runs\")\n");
 
     check(aer_had_error(), "the malformed field access inside f() still reports its own error");
     check(aer_assert_failure_count() == 0,
@@ -397,24 +295,15 @@ int main(void) {
        undefined name is now a parse-time error (see parser.c's
        report_if_shadowed_global/"is not defined" fallback), so it never
        reaches this fused runtime opcode at all. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("compound_x = 5\n");
-    run_appended(&chunk, &vm);
-    shell("wrong_type = \"abc\"\n");
-    run_appended(&chunk, &vm);
-    shell("compound_x += wrong_type\n");
-    ok = run_appended(&chunk, &vm);
+    aer_run_source(&vm, &chunk, "compound_x = 5\n");
+    aer_run_source(&vm, &chunk, "wrong_type = \"abc\"\n");
+    ok = aer_run_source(&vm, &chunk, "compound_x += wrong_type\n");
 
     check(!ok, "compound assignment with a type-mismatched RHS fails, just like the unfused form did");
 
     aer_clear_error();
-    shell("assert(compound_x == 5, \"the fused handler did not write back after the RHS failed to resolve\")\n");
-    run_appended(&chunk, &vm);
+    aer_run_source(&vm, &chunk, "assert(compound_x == 5, \"the fused handler did not write back after the RHS failed to resolve\")\n");
     check(aer_assert_failure_count() == 0,
           "a failed OP_COMPOUND_NAME_NAME left its LHS completely unchanged, matching the unfused form");
 
@@ -424,43 +313,30 @@ int main(void) {
        checked from tests/test.aer (MODE_RUN exits on the first runtime
        error, so there's no way to observe "this expression errored, then
        execution continued" from inside that file). */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("ig_smoke_arr = [1, 2, 3]\n");
-    run_appended(&chunk, &vm);
-    shell("ig_smoke_oob = ig_smoke_arr[99]\n");
-    ok = run_appended(&chunk, &vm);
+    aer_run_source(&vm, &chunk, "ig_smoke_arr = [1, 2, 3]\n");
+    ok = aer_run_source(&vm, &chunk, "ig_smoke_oob = ig_smoke_arr[99]\n");
 
     check(!ok, "an out-of-bounds index through a fused OP_INDEX_GET_NAME_CONST path fails, just like the unfused form did");
     check(aer_had_error(), "the out-of-bounds fused index read reports its own error");
 
     aer_clear_error();
-    shell("assert(ig_smoke_arr[0] == 1, \"the array itself is untouched after the failed fused index read\")\n");
-    run_appended(&chunk, &vm);
+    aer_run_source(&vm, &chunk, "assert(ig_smoke_arr[0] == 1, \"the array itself is untouched after the failed fused index read\")\n");
     check(aer_assert_failure_count() == 0,
           "a failed fused index-get did not corrupt the array or leave the VM in a bad state");
 
     /* A malformed `for` while-condition (found by tests/fuzz.py) used to still compile into
        a real, infinite back-edge loop despite the reported error. Can't be tested from a
        normal .aer file (the hang IS the bug) — here we just confirm the call returns. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("malformed_for_x = 1\nfor malformed_for_x !  print(\"body\")\n    malformed_for_x = 2\nmalformed_for_after = \"reached\"\n");
-    run_appended(&chunk, &vm);
+    aer_run_source(&vm, &chunk,
+        "malformed_for_x = 1\nfor malformed_for_x !  print(\"body\")\n    malformed_for_x = 2\nmalformed_for_after = \"reached\"\n");
 
     check(aer_had_error(), "a malformed while-condition (missing ':') reports a parse error");
 
     aer_clear_error();
-    shell("assert(malformed_for_after == \"reached\", \"the statement after a malformed for-loop still compiles and runs — recovery, not a stuck loop\")\n");
-    run_appended(&chunk, &vm);
+    aer_run_source(&vm, &chunk,
+        "assert(malformed_for_after == \"reached\", \"the statement after a malformed for-loop still compiles and runs — recovery, not a stuck loop\")\n");
     check(aer_assert_failure_count() == 0,
           "execution continued past the malformed for-loop instead of looping forever");
 
@@ -472,14 +348,9 @@ int main(void) {
        whatever the boxed register had accumulated. Can't be tested from a normal .aer file the
        same way the malformed-for-loop case above can't — the compile error would abort the
        whole script before any assert() runs. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("function loop_shadow_div():\n    p_raw = 4\n    for k in 0..3:\n        if k == 1:\n            p_raw /= 2\n    return p_raw\n");
-    run_appended(&chunk, &vm);
+    aer_run_source(&vm, &chunk,
+        "function loop_shadow_div():\n    p_raw = 4\n    for k in 0..3:\n        if k == 1:\n            p_raw /= 2\n    return p_raw\n");
     check(aer_had_error(),
           "compound-assigning a raw-tracked local to a different type inside a loop is a compile error, not silent corruption");
 
@@ -490,16 +361,58 @@ int main(void) {
        re-executes every loop iteration, always seeing the same frozen pre-loop value instead of
        accumulating. Same fix, same reasoning as the compound case above: a compile error, not a
        silent wrong answer. */
-    vm.stack_top     = 0;
-    vm.call_depth = 0;
-    vm.registers  = vm.call_stack[0].registers;
-    vm.raw_ints   = vm.call_stack[0].raw_ints;
-    vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
-    shell("function loop_shadow_plain():\n    total_raw = 0\n    k = 0\n    for k < 3:\n        x = length(\"ab\")\n        total_raw = total_raw + x\n        k = k + 1\n    return total_raw\n");
-    run_appended(&chunk, &vm);
+    aer_run_source(&vm, &chunk,
+        "function loop_shadow_plain():\n    total_raw = 0\n    k = 0\n    for k < 3:\n        x = length(\"ab\")\n        total_raw = total_raw + x\n        k = k + 1\n    return total_raw\n");
     check(aer_had_error(),
           "plain-assigning a raw-tracked local to a boxed value inside a loop is a compile error, not silent corruption");
+
+    /* net handles are resolved through a registry (aer_net.c), never a raw socket cast through an
+       int — a bad or stale handle must be a clean, reported error, not silently operate on
+       whatever OS handle that integer happens to collide with (net.close(0) used to mean "close
+       real stdin" before this fix). Can't be checked from tests/test_net.aer: MODE_RUN aborts the
+       whole file on this class of error, same reason wrong-argument-type checks live here too. */
+    aer_clear_error();
+    ok = aer_run_source(&vm, &chunk, "import net\nnet.close(999999)\n");
+    check(!ok && strstr(aer_last_error(), "no such connection handle") != NULL,
+          "net.close() on a handle that was never connected fails cleanly, not silently or on a real fd");
+
+    /* Coarse capability toggles (aer_set_io_enabled/net_enabled/import_enabled, --no-io/--no-net/
+       --no-import at the CLI). Each is a process-wide flag, not something a running .aer script
+       can flip on itself — this embedding-level check is the natural place for coverage, the same
+       reason aer_gc_set_ceiling() is tested here rather than from tests/test_*.aer. Every check
+       restores the default (true) immediately after, so no later test in this file is affected. */
+    aer_clear_error();
+    aer_set_net_enabled(false);
+    ok = aer_run_source(&vm, &chunk, "import net\nnet.connect(\"127.0.0.1\", 1)\n");
+    aer_set_net_enabled(true);
+    check(!ok && strstr(aer_last_error(), "--no-net") != NULL,
+          "net.connect() reports a clean, specific error when net is disabled, not a crash or a silent no-op");
+
+    aer_clear_error();
+    aer_set_io_enabled(false);
+    ok = aer_run_source(&vm, &chunk, "io.exists(\"tests\")\n");
+    aer_set_io_enabled(true);
+    check(!ok && strstr(aer_last_error(), "--no-io") != NULL,
+          "io.exists() reports a clean, specific error when io is disabled");
+
+    aer_clear_error();
+    aer_set_import_enabled(false);
+    /* The import failure is a parse-time error (chunk_add_import/error_at()), not a runtime one —
+       aer_run_source()'s own return value only reflects vm_run()'s outcome, and a single failed
+       import statement rolls back to a no-op that vm_run() then trivially succeeds on. Check
+       aer_had_error() (which error_at() does set), not aer_run_source()'s return value, to observe
+       a pure parse-time failure correctly — the same distinction "field access on a non-struct"
+       above draws between parse and runtime errors. */
+    aer_run_source(&vm, &chunk, "import searchpath_helper\n");
+    aer_set_import_enabled(true);
+    check(aer_had_error() && strstr(aer_last_error(), "--no-import") != NULL,
+          "file-based import reports a clean, specific error when import is disabled");
+
+    aer_clear_error();
+    ok = aer_run_source(&vm, &chunk, "import math\nassert(math.sqrt(4.0) == 2.0, \"math still works\")\n");
+    check(ok && aer_assert_failure_count() == 0,
+          "fixed-dispatch modules like math are unaffected by --no-import — only file-based import is gated");
 
     /* aer_module_free_all — searchpath_helper (loaded earlier via AER_PATH) proves there's
        something in the registry to tear down; aer_module_get(0, ...) going from true to

@@ -160,7 +160,7 @@ static void print_pool_value(FILE* out, AerVal v) {
     switch (aer_type(v)) {
         case TYPE_NULL:     fprintf(out, "null"); break;
         case TYPE_BOOLEAN:  fprintf(out, "%s", aer_as_bool(v) ? "true" : "false"); break;
-        case TYPE_INTEGER:  fprintf(out, "%lld", aer_as_int(v)); break;
+        case TYPE_INTEGER:  fprintf(out, "%lld", (long long)aer_as_int(v)); break;
         case TYPE_REAL: {
             char buf[64];
             aer_format_real(aer_as_real(v), buf, sizeof(buf));

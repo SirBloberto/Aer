@@ -1,0 +1,40 @@
+# log_redact.aer — classify log lines by severity and redact anything that looks like sensitive
+# data (an email address, an IPv4 address), using only regex.match()/find()/replace(). AER's regex
+# groups are non-capturing (see the README) — there's no way to extract a sub-piece of a match, so
+# this sticks to whole-match operations (classify, replace) rather than trying to pull fields out.
+#
+# Run it with:
+#   ./binary/aer examples/log_redact.aer
+
+import regex
+
+lines = [
+    "2026-07-20 09:14:02 INFO  user alice@example.com logged in from 192.168.1.42",
+    "2026-07-20 09:15:47 ERROR connection refused from 10.0.0.7",
+    "2026-07-20 09:16:03 WARN  retrying request for bob@example.com",
+    "2026-07-20 09:17:55 ERROR database timeout, contact ops@example.com"
+]
+
+error_count = 0
+warn_count  = 0
+info_count  = 0
+
+for line in lines:
+    if regex.match(line, "ERROR"):
+        error_count += 1
+    else:
+        if regex.match(line, "WARN"):
+            warn_count += 1
+        else:
+            if regex.match(line, "INFO"):
+                info_count += 1
+
+    # replace() swaps every match on the line, not just the first — both patterns below could
+    # legitimately appear more than once in a real log line.
+    redacted = line
+    redacted = regex.replace(redacted, "\w+@\w+\.\w+", "[EMAIL REDACTED]")
+    redacted = regex.replace(redacted, "\d+\.\d+\.\d+\.\d+", "[IP REDACTED]")
+    print(redacted)
+
+print("")
+print("{error_count} error(s), {warn_count} warning(s), {info_count} info line(s)")

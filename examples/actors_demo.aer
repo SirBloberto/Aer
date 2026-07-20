@@ -1,0 +1,37 @@
+# actors_demo.aer — the actor and scheduler modules in one file: an independent, long-lived VM
+# you can call synchronously, message through a mailbox, or hand to the cooperative scheduler.
+#
+# Run it with:
+#   ./binary/aer examples/actors_demo.aer
+
+import actor
+import scheduler
+
+# panic() aborts the whole script with a clean, reported error and a nonzero exit code (a normal
+# runtime error, not a crash — see the README's Embedding section) — a guard clause instead of a
+# nested if/else, and unlike print()-then-fall-through, the process actually reports failure.
+worker, err = actor.spawn("examples/actor_worker.aer")
+if err != null:
+    panic("spawn failed: {err}")
+
+# actor.call() — synchronous, runs to completion right away, like calling a function that happens
+# to live in a different VM. Good for a one-off request/response.
+sum_result, call_err = actor.call(worker, "add", 3, 4)
+print("actor.call(worker, \"add\", 3, 4) = {sum_result}")
+
+# actor.send()/actor.receive() — a plain host-side mailbox, independent of any function call.
+# Message content is just a string; a real program would typically json.encode()/decode() it.
+actor.send(worker, "hello from the main script")
+msg = actor.receive(worker)
+print("worker's mailbox delivered: {msg}")
+
+# scheduler.add()/scheduler.run() — queue tasks on one or more actors and let them interleave in
+# small slices instead of running one fully to completion before the next starts. Spawning a
+# second worker means there are genuinely two things in flight under one scheduler.run().
+worker2, err2 = actor.spawn("examples/actor_worker.aer")
+if err2 != null:
+    panic("spawn failed: {err2}")
+scheduler.add(worker, "slow_count", "worker 1", 500000)
+scheduler.add(worker2, "slow_count", "worker 2", 500000)
+scheduler.run()
+print("scheduler.run() returned — both workers finished")
