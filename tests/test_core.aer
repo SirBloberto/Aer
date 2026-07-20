@@ -1,4 +1,5 @@
 #!/usr/bin/env aer
+import collection
 # AER test suite — core language mechanics: types, arithmetic, strings,
 # comparisons/logic, bitwise, casting, control flow, all `for` forms,
 # break/continue, and truthiness rules.
@@ -130,7 +131,7 @@ assert(word[:] == "hello", "string slice [:] copies the whole string")
 # Strings are iterable
 chars = []
 for ch in "abc":
-    append(chars, ch)
+    collection.append(chars, ch)
 assert(length(chars) == 3 && chars[0] == "a" && chars[1] == "b" && chars[2] == "c", "string iteration yields one character at a time, in order")
 
 # Strings are immutable
@@ -167,7 +168,7 @@ assert(short_circuit_result == "safe", "&& short-circuits before a null index/co
 # || short-circuit: second side skipped when first is true
 boom_log = []
 function boom(log):
-    append(log, true)
+    collection.append(log, true)
     return false
 short_circuited = false
 if true || boom(boom_log):
@@ -196,26 +197,16 @@ assert(~0 == -1, "bitwise not")
 assert((1 << 4) == 16, "left shift")
 assert((16 >> 2) == 4, "right shift")
 
-# Bitwise compound assigns
+# No bitwise compound assigns — `&=`/`|=`/`^=`/`<<=`/`>>=` were dropped as redundant spellings;
+# write bw = bw & 0x0F etc.
 bw = 0xFF
-bw &= 0x0F
-assert(bw == 15, "&= compound assign")
-
-bw = 0
-bw |= 3
-assert(bw == 3, "|= compound assign")
-
-bw = 7
-bw ^= 2
-assert(bw == 5, "^= compound assign")
-
-bw = 1
-bw <<= 3
-assert(bw == 8, "<<= compound assign")
-
-bw = 16
-bw >>= 2
-assert(bw == 4, ">>= compound assign")
+bw = bw & 0x0F
+assert(bw == 15, "bitwise and-with-assign spelled out")
+bw = bw | 16
+bw = bw ^ 1
+bw = bw << 2
+bw = bw >> 1
+assert(bw == 60, "bitwise update chain spelled out")
 
 # ------------------------------------------------------------------ #
 # 6. `as` — type casting                                               #
@@ -270,7 +261,7 @@ lln1 = LoopLinkNode(1, lln2)
 llcur = lln1
 llwalked = []
 for llcur != null:
-    append(llwalked, llcur.value)
+    collection.append(llwalked, llcur.value)
     llcur = llcur.next
 assert(length(llwalked) == 3 && llwalked[0] == 1 && llwalked[1] == 2 && llwalked[2] == 3,
        "while-form for loop whose condition is a field/postfix chain (linked-list traversal)")
@@ -299,12 +290,12 @@ assert(i == 1, "%= compound assign")
 
 ascending = []
 for i in 0..5:
-    append(ascending, i)
+    collection.append(ascending, i)
 assert(length(ascending) == 5 && ascending[0] == 0 && ascending[4] == 4, "range 0..5 yields 0,1,2,3,4 in order")
 
 descending = []
 for i in 5..0:
-    append(descending, i)
+    collection.append(descending, i)
 assert(length(descending) == 5 && descending[0] == 5 && descending[4] == 1, "range auto-reverses when start > end")
 
 # ------------------------------------------------------------------ #
@@ -314,7 +305,7 @@ assert(length(descending) == 5 && descending[0] == 5 && descending[4] == 1, "ran
 fruits = ["apple", "banana", "cherry"]
 visited_fruits = []
 for fruit in fruits:
-    append(visited_fruits, fruit)
+    collection.append(visited_fruits, fruit)
 assert(length(visited_fruits) == 3 && visited_fruits[0] == "apple" && visited_fruits[1] == "banana" && visited_fruits[2] == "cherry", "array iteration visits every element in order")
 
 # ------------------------------------------------------------------ #
@@ -345,7 +336,7 @@ for i in 0..10:
         continue
     if i > 7:
         break
-    append(kept, i)
+    collection.append(kept, i)
 assert(length(kept) == 4 && kept[0] == 1 && kept[1] == 3 && kept[2] == 5 && kept[3] == 7, "continue skips even numbers, break stops once i > 7")
 
 # ------------------------------------------------------------------ #

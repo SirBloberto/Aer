@@ -36,8 +36,7 @@ static FileModule* find_module(const char* name, unsigned int len) {
     return NULL;
 }
 
-/* True if `name` already ends in ".aer" — quoted import paths may spell the extension out
-   explicitly (`import "../utils.aer"`), dotted-identifier imports never do. */
+/* Quoted import paths may spell out the .aer extension; dotted imports never do. */
 static bool has_aer_ext(const char* name, unsigned int len) {
     return len >= 4 && strncmp(name + len - 4, ".aer", 4) == 0;
 }
@@ -59,9 +58,7 @@ static bool file_exists(const char* path) {
     return true;
 }
 
-/* True for a path that's already fully qualified and shouldn't be joined against the importing
-   file's directory or searched for on AER_PATH: a leading '/' or '\' (Unix-style, and also how
-   Windows accepts a rooted path on the current drive), or a drive letter like "C:/" / "C:\". */
+/* Fully qualified (leading '/', '', or drive letter) — never dir-joined or AER_PATH-searched. */
 static bool is_absolute_path(const char* p, unsigned int len) {
     if (len == 0) return false;
     if (p[0] == '/' || p[0] == '\\') return true;
@@ -69,18 +66,9 @@ static bool is_absolute_path(const char* p, unsigned int len) {
     return false;
 }
 
-/* Resolves an import path to a real file on disk. `path_name` is used exactly as written —
-   dotted-identifier imports (`import a.b`) arrive here with dots already turned into '/' by the
-   parser; quoted-path imports (`import "../a/b"`) arrive with whatever separators/relative
-   components the user wrote, untouched (so a literal ".." is never mistaken for the dotted-name
-   convention and mangled into extra separators).
-
-   An absolute path (leading '/' or a drive letter) is used as-is, with no directory-joining or
-   AER_PATH search — the caller already said exactly where to look. Otherwise this resolves
-   relative to the currently-lexed file's directory; if missing there, falls back to AER_PATH, a
-   PATH_LIST_SEP-separated list searched in order (like PYTHONPATH); if still not found, returns
-   the same-directory candidate anyway so aer_module_load's read_file() produces the usual "Cannot
-   open file" error. */
+/* Resolves an import path to a real file: absolute paths as-is; otherwise relative to the
+   importing file's directory, then each AER_PATH entry. Dots in dotted imports were already
+   turned into '/' by the parser; quoted paths arrive untouched. */
 static char* resolve_path(const char* path_name, unsigned int len) {
     if (is_absolute_path(path_name, len)) return join_path("", 0, path_name, len);
 
@@ -167,11 +155,8 @@ bool aer_module_load(const char* name, unsigned int len,
     /* Save the importing file's lexer position and lookahead token so parsing can resume exactly where it left off once this nested read+lex+parse+run cycle (which reuses the same global lexer/parser state) completes. */
     LexerState* saved       = lexer_save_state();
     Token       saved_token = token;
-    /* Same idea for the parser's own compile-time tables (function/variable/struct registries, the
-       pending-forward-reference list, etc.) — all file-scope statics in parser.c shared by
-       whichever parse() call is innermost. Without this, compiling the imported file here would
-       corrupt the importing file's own still-in-progress compile the moment this call returns. See
-       parser_save_state's own comment in parser.c/.h. */
+    /* Save the parser's file-scope tables too, or compiling the import corrupts the importing
+       file's still-in-progress compile. */
     ParserState* saved_parser = parser_save_state();
 
     Chunk* mchunk = xmalloc(sizeof(Chunk));
@@ -210,10 +195,7 @@ bool aer_module_load(const char* name, unsigned int len,
     loading_depth--;
 
     if (!ok) {
-        /* mchunk/mvm were already fully allocated and initialized above (chunk_init/vm_init, plus
-           whatever the failed parse/run itself emitted) — never registered into modules[], so
-           aer_module_free_all() has no way to ever reach them; free everything here instead,
-           mirroring aer_module_free_all's own per-module cleanup. */
+        /* Never registered into modules[], so aer_module_free_all can't reach them — free here. */
         vm_free(mvm);
         chunk_free(mchunk);
         free(mvm);
@@ -237,9 +219,7 @@ bool aer_module_load(const char* name, unsigned int len,
     return true;
 }
 
-/* Finds a compiled TYPE_FUNCTION registration named `fn` among the module's exported functions
-   — see ChunkFunction's own comment (vm.h) for why this is a Chunk-level registry rather than a
-   runtime scope-by-name scan: the register VM never writes named bindings into any scope at all. */
+/* Chunk-level function registry — the register VM never writes named bindings into any scope. */
 static ChunkFunction* find_module_function(FileModule* m, const char* fn) {
     return chunk_find_function(m->chunk, fn);
 }
@@ -253,34 +233,22 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
 
     VM* mv = m->vm;
 
-    /* Args are already sitting in the CALLING vm's own stack (lbl_call_module pushed them there
-       before calling here) — no need to copy them anywhere first, setup_call reads straight out
-       of this pointer and copies each one into the callee's own register bank immediately, with no
-       allocation in between. */
+    /* Args are already on the calling vm's stack; setup_call copies them straight into the
+       callee's registers. */
     AerVal* args = &vm->stack[vm->stack_top - arg_count];
     vm->stack_top -= arg_count;
 
-    /* mv is reused across every future call into this module for the process's whole life — a
-       PRIOR call's runtime error unwinds via longjmp straight past OP_RETURN's normal
-       call_depth-- (vm.c), so a failed call can leave mv->call_depth stuck above 0. setup_call
-       always pushes its new frame at mv->call_depth+1 and hardcodes the callee's dest_reg to 0,
-       meaning the result of THIS call would land in mv->call_stack[mv->call_depth].registers[0] —
-       not mv->call_stack[0].registers[0], which is what the read below always assumes. Left
-       unreset, this isn't just an eventual "Call stack overflow" after enough failures (bounded by
-       VM_CALL_MAX) — the very next call after any single failed one silently reads whatever stale
-       value already sits in frame 0's register 0, returning a wrong result with no error at all.
-       Mirrors main.c's run()'s own defensive reset before every top-level statement — unconditional,
-       not just after a detected failure, since a successful call already restores call_depth to 0
-       itself (OP_RETURN), so resetting here is always safe and costs nothing extra. */
+    /* A prior call's error longjmp can leave mv->call_depth stuck above 0 — left unreset, this
+       call's result would land in the wrong frame's registers (and enough failures overflow the
+       call stack). Reset both; the stack is dead space between calls. */
     mv->call_depth = 0;
     mv->stack_top  = 0;
     mv->registers  = mv->call_stack[0].registers;
     mv->raw_ints   = mv->call_stack[0].raw_ints;
     mv->raw_reals  = mv->call_stack[0].raw_reals;
 
-    /* Trampoline: setup_call pushes a real call frame whose return address is this module's
-       own top-level HALT, so vm_run(mv) executes exactly one call and stops — see its own comment
-       (vm.c) for why the result always lands in mv->call_stack[0].registers[0]. */
+    /* Trampoline: the frame's return address is this module's top-level HALT, so vm_run executes
+       exactly one call and the result lands in call_stack[0].registers[0]. */
     if (!setup_call(mv, fnreg, arg_count, args, m->halt_addr)) {
         push_null_result(vm);
         return true;

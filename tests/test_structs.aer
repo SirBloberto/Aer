@@ -1,4 +1,5 @@
 #!/usr/bin/env aer
+import collection
 # AER test suite — structs: fixed-shape records, dot-access, and
 # shape-checking via `as`.
 # Machine-checked via assert(): a clean run exits 0; any failure prints
@@ -48,7 +49,7 @@ assert(type(p1) == "Point", "struct instances report their declared type name")
 # (bracket indexing, slicing, append, delete) are all rejected on a struct
 # instance — a struct's shape is fixed, a collection's is not.
 # print(p1[0])           # would error: use '.' not '[]'
-# append(p1, 1)          # would error: fixed shape
+# collection.append(p1, 1)          # would error: fixed shape
 
 # Structs are heap references — mutation through a plain passed-in
 # parameter is visible to the caller, no special parameter form needed.
@@ -129,8 +130,8 @@ struct Bucket:
 
 nd_a = Bucket()
 nd_b = Bucket()
-append(nd_a.items, 1)
-append(nd_a.items, 2)
+collection.append(nd_a.items, 1)
+collection.append(nd_a.items, 2)
 nd_a.tags["x"] = 1
 
 assert(length(nd_a.items) == 2, "appending to one instance's default-array field grows it normally")
@@ -146,7 +147,7 @@ assert(length(nd_c.items) == 3, "an explicitly passed array argument is used as-
 # Function parameter defaults get the identical per-CALL freshness — the
 # same underlying vm_default_value fix in vm.c applies to both call sites.
 function collect(x, seen = []):
-    append(seen, x)
+    collection.append(seen, x)
     return seen
 fd_r1 = collect(1)
 fd_r2 = collect(2)

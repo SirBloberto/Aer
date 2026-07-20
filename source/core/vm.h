@@ -20,11 +20,7 @@ typedef enum {
     OP_EQ, OP_NEQ, OP_LT, OP_GT, OP_LTE, OP_GTE,
     OP_IN,              /* key in dict → key existence; value in array → element scan */
 
-    /* Binary logical — never actually dispatched (parse_binary_ops intercepts `and`/`or`
-       before emitting a real OP_BINARY, routing them to short-circuiting jumps instead, since
-       they can't evaluate both sides unconditionally the way every other binary op does); kept as
-       enum values purely because parser.c's operator-token lookup table still tags `and`/`or`
-       tokens with these, and vm_binary_cold() itself still has a (dead but harmless) branch for them. */
+    /* Never dispatched — parser tags for `&&`/`||`, which compile to short-circuit jumps. */
     OP_AND, OP_OR,
     OP_PIPE,            /* never dispatched either — `x |> f(args)` desugars to a call at parse time; kept as a lookup-table tag only, same reason as OP_AND/OP_OR */
 
@@ -34,323 +30,123 @@ typedef enum {
     /* Unary */
     OP_NEGATE, OP_NOT, OP_BITWISE_NOT,
 
-    /* Control flow. Genuinely dispatched, unlike the family above — OP_JUMP's handler (lbl_jump)
-       only ever touches vm->ip, so every register-based opcode below reuses it as-is for
-       unconditional jumps instead of having its own register-specific version. */
+    /* OP_JUMP's handler only touches vm->ip, so register opcodes reuse it for unconditional jumps. */
     OP_JUMP,            /* operand: absolute code index */
 
-    /* Structs — instances are TYPE_ARRAY with a non-NULL AerArray.shape. OP_DEFINE_STRUCT's own
-       handler (lbl_define_struct) only ever reads operands and writes to chunk->shapes[], never
-       any register/GC-sensitive state, so it's reused as-is for struct *definitions*
-       (instantiation/field access are separate, register-based opcodes below). */
+    /* Struct definitions only — instantiation/field access are register opcodes below. */
     OP_DEFINE_STRUCT,    /* operands: name pool idx, field count, then that many (field-name, default-value) pool-idx pairs — registers a Shape in the chunk's shape table */
 
     /* Misc */
     OP_TO_STR,  /* used as OP_UNARY's unary_op tag (string interpolation's value-to-string step) — see vm_to_str() */
     OP_HALT,
 
-    /* ---- register-VM opcodes. See the register-based bytecode plan for the full design;
-       PACK3's own comment below explains the packed-instruction encoding these use. */
+    /* ---- register-VM opcodes (packed encoding: see PACK3/PACK_BINARY below). */
     OP_LOADK,  /* operands: dest_reg, pool_idx — registers[dest_reg] = chunk pool constant */
     OP_MOVE,   /* operands: dest_reg, src_reg — registers[dest_reg] = registers[src_reg] */
-    /* operands: dest_reg, src_reg — registers[dest_reg] = (registers[src_reg] is a TYPE_RESULT),
-       as a boolean. Used only by `|>`'s codegen (compile_pipe) to gate its short-circuit check —
-       an ordinary value must never take that path, only a genuine Result. */
+    /* dest_reg, src_reg — dest = (src is a Result); gates |>'s short-circuit (compile_pipe). */
     OP_IS_RESULT,
-    /* RK-encoded operand: a register index, or (with bit 30 set) a constant-pool index — see
-       vm_rk_value (vm.c). One opcode per operator's runtime `bin_op`, not a family of opcodes
-       per operand-kind combination — that's the entire point of RK encoding. */
+    /* RK-encoded operand: register index, or (bit 30 set) constant-pool index — see vm_rk_value. */
     OP_BINARY, /* operands: dest_reg, rk_b, bin_op, rk_c — registers[dest_reg] = rk_b OP rk_c */
 
-    /* Control flow. These two ARE their own opcodes (rather than reusing something else) because
-       their condition is read directly out of a register (or an RK-encoded constant), never
-       popped off any stack. */
+    /* Condition is read straight from a register/RK constant, never popped. */
     OP_JUMP_IF_FALSE_REG, /* operands: reg, target — jump to target if registers[reg] is falsy */
 
-    /* Function calls — real per-call register windowing (vm.h's CallFrame/VM.call_stack):
-       every call gets its own isolated register bank, so nested/recursive calls can't clobber
-       each other. */
-    OP_CALL,   /* operands: dest_reg, callee_offset, arg_reg_base, arg_count — bulk-copies
-                     registers[arg_reg_base..+arg_count) (caller's frame) into the new callee
-                     frame's own registers starting at 0, in one dispatch, saves the return
-                     address + dest_reg in the callee's frame, jumps to callee_offset */
-    OP_RETURN, /* operand: src_reg (0-based, in the callee's own frame) — writes
-                     registers[src_reg] to the caller's saved dest_reg, pops the callee's frame,
-                     jumps back */
+    /* Calls — per-call register windowing (CallFrame): each call gets an isolated bank. */
+    OP_CALL,   /* dest_reg, callee_offset, arg_reg_base, arg_count — copies args into the
+                     callee frame, saves return address + dest, jumps */
+    OP_RETURN, /* src_reg (callee frame) — result to caller's dest_reg, pops the frame, jumps back */
 
-    /* Functions as values (bare-name case: `f = square; f(5)`, and calling through a container
-       index/key — see parse_postfix_chain, parser.c). Same bulk-copy/frame-push mechanism
-       as OP_CALL, but callee_reg is read at DISPATCH time (a register holding a runtime
-       TYPE_FUNCTION AerVal) instead of callee_offset being a compile-time constant. Also fills
-       any omitted trailing arguments from the AerFunction's own defaults, mirroring
-       setup_call's (vm.c) default-filling. */
-    OP_CALL_VALUE, /* operands: dest_reg, arg_reg_base, arg_count, callee_reg — arity-checks
-                          against aer_as_function(registers[callee_reg]), bulk-copies
-                          registers[arg_reg_base..+arg_count) into the new callee frame same as
-                          OP_CALL, fills [arg_count, arity) from the function's own defaults[],
-                          jumps to its code_offset */
+    /* Call through a runtime function value in a register; fills omitted trailing args from defaults. */
+    OP_CALL_VALUE, /* dest_reg, arg_reg_base, arg_count, callee_reg */
 
-    /* Tail-call optimization: when `return f(args)` is the WHOLE return expression (nothing wraps
-       the call — checked at compile time, parser.c's own last_bare_call_end), the call's own
-       already-emitted OP_CALL/OP_CALL_VALUE descriptor word is patched in place to this
-       opcode instead (same operand shape — only the low byte, the opcode itself, changes;
-       PACK's encoding keeps A/B/C in separate bits, so this is a blind byte-level OR/mask, no
-       re-encoding needed).
-         Handled by literally the SAME dispatch label as OP_CALL (see the dispatch table, vm.c)
-       — cur_op distinguishes them once the callee is confirmed valid: the current
-       call_stack[call_depth]'s OWN registers[0..arg_count) are overwritten with the new args
-       (always safe: a call's argument registers are always temps, hence numerically above every
-       permanent parameter/local register a would-be overlapping destination slot could be) and
-       vm->ip jumps straight to callee_offset — call_depth, dest_reg, and return_ip are left
-       completely untouched, so whatever the ORIGINAL (pre-recursion) caller expected back still
-       arrives in the right place once the chain of tail calls finally returns. */
+    /* `return f(args)` with nothing wrapping the call: the already-emitted OP_CALL word's opcode
+       byte is patched in place. Same dispatch label as OP_CALL; overwrites the CURRENT frame's
+       registers[0..arg_count) (arg registers are always temps, above any local) and jumps —
+       call_depth/dest_reg/return_ip stay untouched. */
     OP_TAIL_CALL,        /* same operands as OP_CALL; dest_reg is unused (ignored) here */
     OP_TAIL_CALL_VALUE,  /* same operands as OP_CALL_VALUE; dest_reg is unused (ignored) here */
 
-    /* Module/stdlib calls (module.function(args)). Bridges into shared stdlib infrastructure
-       (aer_math_call() and friends, vm.c) rather than reimplementing every stdlib function for a
-       register calling convention: pushes arg_count values from the registers onto vm->stack,
-       calls the same aer_*_call() (pops arg_count args, pushes exactly one result on success),
-       then pops that single result back into dest_reg. Also the bridge for a FILE-BASED import's
-       function (aer_module_call, aer_module.c) — that path runs the imported file's OWN call
-       chain (VM.call_stack), not this one. Stack-neutral from the caller's perspective —
-       vm->stack_top ends exactly where it started. */
-    /* operands: dest_reg, module_pool_idx, fn_pool_idx, arg_reg_base, arg_count (all packed into
-       one word, PACK_CALL_MODULE), plus two trailing plain words: module_id (CALL_MODULE_MATH
-       etc., below) and fn_id (FN_MATH_SQRT etc., below) — both resolved at parse time (the
-       module and function names in `module.fn(...)` are always literal identifiers, never
-       ambiguous), so the VM can switch on two small ints instead of running a strcmp chain
-       against every known built-in module's name, then another against every one of that
-       module's function names, on every single call. CALL_MODULE_DYNAMIC means "not a known
-       core built-in" (a host-registered module or a user file import) — those are genuinely
-       only resolvable by name at runtime, so that path still runs the original
-       strcmp/aer_host_is_module logic unchanged, and never resolves an fn_id. Couldn't fit this as a packed bit-field instead:
-       PACK_CALL_MODULE already uses 63 of the word's 64 bits, and shrinking module_idx/fn_idx's
-       17-bit pool-index fields to make room would risk breaking large programs with many string
-       constants (unlike FIELD_NAME's narrower 14-bit budget, a pool index here isn't scoped to
-       just module/function names — chunk_add_pool's global dedup means it reflects total pool
-       position, so a big program could plausibly exceed a shrunk field). A trailing word matches
-       the same convention already used by OP_LOADK/OP_DEFINE_STRUCT/etc. */
+    /* Bridges to the stack-based stdlib dispatch: push args from registers, call aer_*_call(),
+       pop the one result into dest_reg. Stack-neutral. */
+    /* One packed word (dest, module_idx, fn_idx, arg base/count) + two trailing words:
+       parse-time-resolved module_id and fn_id (CALL_MODULE_DYNAMIC = host/file module,
+       resolved by name at runtime). */
     OP_CALL_MODULE,
 
-    /* Global builtins (length/delete/append/print/type/assert/panic) called bare, e.g.
-       `length(arr)`. Bridges to vm_call_builtin() (vm.c), which takes a plain AerVal* array, so
-       unlike OP_CALL_MODULE this needs no push/pop bridge to vm->stack at all — registers are
-       copied into a small local array and passed straight through. Struct construction is never
-       reached here — it's already resolved at compile time (is_struct_name/OP_STRUCT_NEW), so only
-       the seven builtin names above are ever checked at parse time (is_builtin_name, parser.c)
-       before this opcode is emitted. Trailing word: builtin_id, same convention as OP_CALL_MODULE's
-       module_id. */
+    /* Bare global builtins (length/print/type/assert/panic/Result): bridges to vm_call_builtin()
+       via a small local array. Trailing word: builtin_id. */
     OP_CALL_BUILTIN, /* operands: dest_reg, name_pool_idx, arg_reg_base, arg_count, builtin_id */
 
-    /* Registers can hold heap-allocated values (arrays/dicts/strings/functions), which is why
-       mark_vm_roots (vm.c) scans all of registers[] for every live frame. */
-    OP_ARRAY_NEW,  /* operands: dest_reg, item_reg_base, item_count — bulk-copies
-                          registers[item_reg_base..+item_count) into a freshly allocated
-                          AerArray's items buffer in one dispatch, registers[dest_reg] = the new array */
-    OP_INDEX_GET,  /* operands: dest_reg, arr_reg, rk_idx — registers[dest_reg] =
-                          registers[arr_reg][rk_idx], via the existing, type-generic
-                          vm_index_get_compute() (vm.c) — arr_reg is always a register (a
-                          collection can't be a pool constant); rk_idx is RK-encoded like
-                          OP_BINARY's operands */
-    OP_INDEX_SET,  /* operands: arr_reg, rk_idx, rk_val — registers[arr_reg][rk_idx] =
-                          rk_val, via the existing vm_index_set_compute() (vm.c), which also
-                          runs the GC write barrier */
+    /* Registers can hold heap values — mark_vm_roots scans all of registers[] per live frame. */
+    OP_ARRAY_NEW,  /* dest_reg, item_reg_base, item_count */
+    OP_INDEX_GET,  /* dest_reg, arr_reg, rk_idx — via vm_index_get_compute */
+    OP_INDEX_SET,  /* arr_reg, rk_idx, rk_val — via vm_index_set_compute (includes the write barrier) */
 
-    /* `arr[a:b]`/`arr[a:]`/`arr[:b]`/`arr[:]` (array or string; a struct-shaped array can't be
-       sliced). Reuses the shared vm_slice_bounds() helper — no logic duplicated, just reading the
-       collection/bounds from registers and writing the result to one instead of stack pop/push. A
-       missing start or end compiles to an RK-encoded null constant, so this opcode itself never
-       needs to know which bound was actually written by the user. */
-    OP_SLICE_GET,  /* operands: dest_reg, arr_reg, rk_start, rk_end — registers[dest_reg] =
-                          the sub-range of registers[arr_reg] from rk_start to rk_end */
+    /* Slicing (array or string); a missing bound compiles to an RK null constant. */
+    OP_SLICE_GET,  /* dest_reg, arr_reg, rk_start, rk_end */
 
-    /* `x as Point` where Point is a known STRUCT type (not integer/float/boolean/string,
-       OP_CAST's own scope) — errors unless src_reg holds exactly that struct type, else passes
-       the value through unchanged (never converts). */
-    OP_CHECK_SHAPE, /* operands: dest_reg, src_reg, type_name_pool_idx — errors unless
-                           registers[src_reg] is an instance of that struct type, else
-                           registers[dest_reg] = registers[src_reg] unchanged */
+    /* `x as Point` for a struct type — shape check only, never converts. */
+    OP_CHECK_SHAPE, /* dest_reg, src_reg, type_name_pool_idx */
 
-    /* Same bulk-copy-from-registers mechanism as OP_ARRAY_NEW, applied to key/value pairs
-       instead of a flat item list; get/set already work on dicts for free through
-       OP_INDEX_GET/SET's shared vm_index_get_compute()/vm_index_set_compute() calls. Mirrors
-       the dict-construction key-must-be-string validation and owned-copy-of-the-key discipline
-       exactly, just reading pairs from registers instead of popping them off a stack in reverse. */
-    OP_DICT_NEW,   /* operands: dest_reg, pair_reg_base, pair_count — reads pair_count
-                          (key,val) register pairs starting at pair_reg_base (key at
-                          pair_reg_base + 2*i, val at + 2*i + 1), builds a fresh AerDict,
-                          registers[dest_reg] = the new dict */
+    /* OP_ARRAY_NEW's bulk-copy applied to (key,val) register pairs; same key validation and
+       owned-key discipline as stack dict construction. */
+    OP_DICT_NEW,   /* dest_reg, pair_reg_base, pair_count — key at base+2*i, val at +2*i+1 */
 
-    /* Array/dict/string iteration, single-loop-variable form. col_reg/idx_reg are just two more
-       registers the caller already owns — no exit-time cleanup needed, and `break` out of a
-       for-loop is just a plain jump. item_dest_reg IS the loop variable's register directly. */
-    OP_ITER_NEXT_ARRAY, /* operands: col_reg, idx_reg, item_dest_reg, end_target — if
-                              registers[idx_reg] >= array(col_reg).count: jump to end_target
-                              (loop exit, item_dest_reg untouched); else registers[item_dest_reg]
-                              = array.items[idx], registers[idx_reg] += 1, fall through.
-                              Despite the name, also accepts a dict (single-variable `for k in
-                              dict:` yields keys) or a string (yields one-character strings),
-                              mirroring the identical dict/string branches vm_index_get_compute's
-                              own dispatch shape uses — kept as one opcode/one name rather than a
-                              separate opcode per type, since all three cases differ only in how
-                              idx_reg maps to "the next item" (array slot, hashmap bucket scan, or
-                              string byte offset). */
+    /* Single-variable iteration; break is a plain jump, no cleanup needed. */
+    OP_ITER_NEXT_ARRAY, /* col_reg, idx_reg, item_dest_reg, end_target — despite the name, also accepts a dict
+                              (yields keys) or string (yields chars) */
 
-    /* `for k, v in dict:`, the two-loop-variable form. Genuinely dict-only (unlike
-       OP_ITER_NEXT_ARRAY's single-var form, which accepts either type) since there is no
-       second value to bind a loop variable to when iterating an array or string. key_dest_reg
-       packs alongside the opcode; val_dest_reg needs its own word (only 3 narrow fields fit
-       alongside an opcode in one packed word). */
-    OP_ITER_NEXT_PAIR, /* operands: col_reg, idx_reg, key_dest_reg, val_dest_reg, end_target —
-                              if the dict's buckets starting at idx_reg are exhausted: jump to
-                              end_target (loop exit, dest regs untouched); else
-                              registers[key_dest_reg] = the next live bucket's key (a fresh
-                              owned string, never an alias), registers[val_dest_reg] = that
-                              bucket's value, registers[idx_reg] = the bucket index past it,
-                              fall through */
+    /* Dict-only two-variable form; val_dest_reg needs its own word (only 3 narrow fields pack). */
+    OP_ITER_NEXT_PAIR, /* col_reg, idx_reg, key_dest_reg, val_dest_reg, end_target — key is a fresh owned string */
 
-    /* Integer-range iteration (`for i in a..b..step:`), loop-rotated: PREP runs ONCE before the
-       loop, LOOP runs at the BOTTOM of the loop body — unlike every other loop form (which checks
-       at the top and needs a separate unconditional OP_JUMP back-edge, see parse_loop_body's own
-       comment), this pair's own bottom-of-loop branch-backward-on-continue IS the back-edge, so no
-       OP_JUMP is ever emitted for this loop form, matching Lua's own FORLOOP shape.
-         PREP precomputes a total iteration COUNT once (ceiling division so a step that doesn't
-       evenly divide the range still stops at the right point) instead of LOOP re-deriving "still in
-       range" from a direction-dependent comparison against the original limit on every single
-       dispatch — matching Lua's own FORLOOP algorithm exactly (its FORPREP does the equivalent
-       countdown setup). end_reg/step_reg are REPURPOSED by PREP into a countdown and a
-       direction-adjusted (already signed) step — LOOP reads them under this new meaning, never the
-       original bound/step values. This is safe only because cur/end/step are all snapshotted ONCE
-       by parse_for_in via arg_materialize before the loop starts — matching Lua/Python's own
-       range-for semantics (their bounds are evaluated once, never re-read from whatever variable
-       they came from) — so end_reg/step_reg are fresh, loop-owned registers nothing else in the
-       program ever reads, safe to overwrite with derived bookkeeping instead of their original
-       values. This also means LOOP never needs to re-validate cur/end/step's types per iteration
-       (PREP already checked once, and — per the same snapshot guarantee — it can't have changed
-       since): an earlier design that allowed end/step to alias an existing variable had to pay a
-       full type/step check on every single dispatch to stay safe, which is why aliasing is
-       disallowed instead. Reused only by the plain `for i in a..b..step:` form, not for-in over
-       arrays/dicts (OP_ITER_NEXT_ARRAY/PAIR), which keep the ordinary top-of-loop-plus-JUMP shape
-       unchanged — extending the same rotation to those would need their own PREP/LOOP pair, not
-       attempted here. */
-    OP_ITER_RANGE_PREP, /* operands: cur_reg, end_reg, step_reg, item_dest_reg, empty_target —
-                               validates cur/end/step are integers and step > 0 (the ONLY place this
-                               is ever checked). Computes direction (ascending iff cur < end) and a
-                               total iteration count via ceiling division; if that count is 0 (empty
-                               range): jump to empty_target (item_dest_reg untouched, loop body
-                               never runs, end_reg/step_reg untouched too — no repurposing happens on
-                               the empty-range path). Otherwise: registers[end_reg] = count - 1 (the
-                               countdown OP_ITER_RANGE_LOOP will read as "iterations remaining after
-                               this one"), registers[step_reg] = the direction-adjusted signed step,
-                               registers[item_dest_reg] = registers[cur_reg] (the first iteration's
-                               value), fall through into the loop body. Never advances cur_reg —
-                               that's OP_ITER_RANGE_LOOP's job, below. */
-    OP_ITER_RANGE_LOOP, /* operands: cur_reg, remaining_reg (was end_reg — see OP_ITER_RANGE_PREP's
-                               own comment), signed_step_reg (was step_reg), item_dest_reg,
-                               body_target — body_target is a PLAIN already-resolved address (the
-                               loop body's own start), never a placeholder needing patch_jump —
-                               unlike every other loop form's back-edge, this is the only jump target
-                               this whole construct needs to know before it's emitted. Runs once per
-                               iteration, at the BOTTOM of the loop body. If remaining_reg's countdown
-                               is already 0: exhausted, cur_reg/item_dest_reg left untouched, control
-                               simply falls through to whatever comes right after this instruction
-                               (the loop's exit code), so the loop variable's final value is always
-                               whatever the last successful iteration wrote — same as a non-rotated
-                               check-at-top loop would leave it. Otherwise: registers[cur_reg] =
-                               registers[item_dest_reg] = registers[cur_reg] + signed_step_reg's
-                               already-direction-adjusted value (no ascending/descending branch
-                               needed here at all — PREP baked the sign in once), decrements the
-                               countdown, then jumps BACKWARD to body_target — that branch, taken on
-                               every ordinary iteration, IS the back-edge. */
+    /* Rotated range-for (Lua's FORLOOP shape): PREP runs once before the loop, LOOP at the loop
+       BOTTOM is itself the back-edge (no OP_JUMP). PREP repurposes end_reg/step_reg into a
+       countdown + signed step — safe only because cur/end/step are loop-owned snapshots
+       (arg_materialize), never aliases, so LOOP never re-validates their types. */
+    OP_ITER_RANGE_PREP, /* cur, end, step, item_dest, empty_target — validates ints (the only place), computes the
+                               iteration count via ceiling division; count 0 jumps to empty_target
+                               untouched; else end_reg = count-1, step_reg = signed step,
+                               item_dest = cur */
+    OP_ITER_RANGE_LOOP, /* cur, remaining (was end), signed_step (was step), item_dest, body_target (already-resolved
+                               address) — countdown 0: fall through to the exit; else advance
+                               cur/item_dest, decrement, branch back to body_target */
 
-    /* Structs. OP_DEFINE_STRUCT itself (above) is reused unmodified for struct *definitions*;
-       these three ARE their own opcodes because instantiation, field get, and field set all need
-       register operands. */
-    OP_STRUCT_NEW, /* operands: dest_reg, type_name_pool_idx, arg_reg_base, arg_count — mirrors
-                          struct instantiation (vm.c): chunk_find_shape() by name, arity check
-                          (arg_count <= field_count), one struct_pool allocation (items inline
-                          right after the header), bulk-copies registers[arg_reg_base..+arg_count)
-                          into the leading fields, vm_default_value()-fills any trailing omitted
-                          fields */
-    OP_FIELD_GET,  /* operands: dest_reg, struct_reg, field_name_pool_idx — pool-index
-                          field-name scan (vm.c), registers[dest_reg] = the matching field */
-    OP_FIELD_SET,  /* operands: struct_reg, field_name_pool_idx, rk_val — includes the
-                          gc_barrier_array call */
+    /* Instantiation/field get/set need register operands (definitions reuse OP_DEFINE_STRUCT). */
+    OP_STRUCT_NEW, /* dest_reg, type_name_pool_idx, arg_reg_base, arg_count — arity-checked, trailing
+                          fields default-filled */
+    OP_FIELD_GET,  /* dest_reg, struct_reg, field_name_pool_idx */
+    OP_FIELD_SET,  /* struct_reg, field_name_pool_idx, rk_val — includes the gc_barrier_array call */
 
-    /* Packed struct arrays: `Type[count]` (a fixed-size, mass-allocated, inline-packed array of
-       one struct type's instances — see TYPE_PACKED_ARRAY, value.h). Only constructible for a
-       struct whose every field is a fixed-primitive type (checked at runtime here, same as
-       OP_STRUCT_NEW's own positional-arg type check, since a Shape is only fully known once
-       OP_DEFINE_STRUCT has run). Every element is default-initialized from the struct's own field
-       defaults, same as an omitted-argument OP_STRUCT_NEW. */
-    OP_PACKED_ARRAY_NEW, /* operands: dest_reg, type_name_pool_idx, rk_count — chunk_find_shape()
-                                by name, eligibility check (every field_types[i] is integer/float/
-                                boolean), one packed_array_pool allocation + one xmalloc'd data
-                                block sized count * (field_count * 8 bytes), every element
-                                default-filled */
+    /* `Type[count]` — fixed-primitive fields only (checked here at runtime, once the Shape is
+       known); every element default-initialized. */
+    OP_PACKED_ARRAY_NEW, /* dest_reg, type_name_pool_idx, rk_count */
 
-    /* The fused `obj[index].field` read/write pair — see TYPE_PACKED_ARRAY's own comment (value.h)
-       for why packed arrays have no standalone reference value: computing a packed element's
-       address is pure arithmetic (base + index * element_size), so there's nothing a standalone
-       reference would save over recomputing it, unlike today's pointer-chasing struct arrays where
-       aliasing a reference into a local genuinely saves a dereference. Because there's no
-       standalone reference, `obj[index]` alone can't represent a packed access — the parser only
-       ever emits these two opcodes for the exact syntactic pattern `expr[index].field`, immediately
-       fused (parse_postfix_chain/parse_chain_assignment, parser.c), never split into a separate
-       index step. Dispatches on aer_type(obj) at runtime: TYPE_PACKED_ARRAY takes the packed byte-
-       offset path; TYPE_ARRAY (any other array, including a struct instance produced by an outer
-       index) falls back to exactly what index-then-field already did (vm_index_get_compute() then
-       vm_resolve_field()/field-set) — so this replaces the old two-opcode compilation for this
-       specific pattern for EVERY array, not just packed ones, but is behaviorally identical to the
-       old two-step sequence for anything that isn't a packed array. */
+    /* Fused `obj[index].field` get/set — packed arrays have no standalone element reference, so
+       the parser emits these only for the exact `expr[index].field` pattern. Ordinary arrays
+       take the same opcodes with behavior identical to the old two-step sequence. */
     OP_INDEX_FIELD_GET, /* operands: dest_reg, obj_reg, field_name_pool_idx, rk_idx */
     OP_INDEX_FIELD_SET, /* operands: obj_reg, field_name_pool_idx, rk_idx, rk_val */
 
-    /* Expression-grammar completions. unary_op reuses OP_NEGATE/OP_NOT/OP_BITWISE_NOT as its
-       operand tag, same convention OP_BINARY already uses for bin_op — one opcode per operator
-       FAMILY, not one opcode per operator. and/or need no opcode at all: they compile to existing
-       OP_JUMP_IF_FALSE_REG/OP_JUMP/OP_LOADK. */
-    OP_UNARY, /* operands: dest_reg, unary_op, rk_operand — registers[dest_reg] =
-                    unary_op(rk_operand); also folds in OP_TO_STR (string interpolation's
-                    value-to-string step), calling the existing vm_to_str() helper — same
-                    one-opcode-per-family shape. */
+    /* unary_op reuses OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR as its tag, like bin_op. */
+    OP_UNARY, /* dest_reg, unary_op, rk_operand — also folds OP_TO_STR (interpolation) via vm_to_str */
 
-    /* `x as integer/float/boolean`. Separate from OP_UNARY since OP_CAST's own operand
-       (CAST_INTEGER/FLOAT/BOOLEAN, below) isn't an Opcode value the way unary_op/bin_op are, so it
-       doesn't fit that family's tag convention — but the actual conversion logic is shared via the
-       extracted vm_cast() helper (vm.c), not duplicated. `x as string` still goes through
-       OP_UNARY's OP_TO_STR case; `x as SomeStructType` is OP_CHECK_SHAPE, above. */
-    OP_CAST, /* operands: dest_reg, cast_type, rk_operand — registers[dest_reg] =
-                   vm_cast(rk_operand, cast_type) */
+    /* `x as integer/float/boolean` via vm_cast; `as string` is OP_UNARY's TO_STR, `as Struct`
+       is OP_CHECK_SHAPE. */
+    OP_CAST, /* dest_reg, cast_type, rk_operand */
 
-    /* Fusion: `x OP y.field` (e.g. nbody.aer's `dx = bix - bj.x`) always compiled as OP_FIELD_GET
-       (into a fresh temp) immediately followed by OP_BINARY reading that temp — two dispatches for
-       something that's structurally one operation. Recognized at emit time in parse_binary_ops
-       (parser.c) by truncating the just-emitted OP_FIELD_GET and re-encoding it as this opcode's
-       last two operands. */
-    OP_BINARY_FIELD, /* operands: dest_reg, rk_lhs, bin_op, struct_reg, field_name_pool_idx —
-                            registers[dest_reg] = rk_lhs OP struct_reg.field */
+    /* Fusion of `x OP y.field` — parse_binary_ops truncates the just-emitted OP_FIELD_GET and
+       re-encodes it as this opcode's trailing operands. */
+    OP_BINARY_FIELD, /* dest_reg, rk_lhs, bin_op, struct_reg, field_name_pool_idx */
 
-    /* Mirror of OP_BINARY_FIELD for the other operand order — `y.field OP x` (e.g. this exact
-       benchmark's `mj = bj.mass * mag`), field on the LEFT. No operand swap/commutativity
-       reasoning needed: this opcode encodes the field as the LEFT operand directly, so it's
-       correct for every operator, commutative or not. Recognized the same way, by checking
-       whether the LHS the caller already parsed was itself a bare OP_FIELD_GET. */
-    OP_FIELD_BINARY, /* operands: dest_reg, struct_reg, field_name_pool_idx, bin_op, rk_rhs —
-                            registers[dest_reg] = struct_reg.field OP rk_rhs */
+    /* Mirror for `y.field OP x` — the field is the LEFT operand, so correct for every operator. */
+    OP_FIELD_BINARY, /* dest_reg, struct_reg, field_name_pool_idx, bin_op, rk_rhs */
 
-    /* REPL/shell-mode support. A bare call/module-call/pipe-chain statement's result, when
-       mode == MODE_SHELL, is printed (unless null) instead of just sitting unread in a register. */
+    /* Shell mode: a bare statement's non-null result is printed. */
     OP_PRINT_REPL, /* operand: src_reg — prints registers[src_reg] unless it's TYPE_NULL */
 
-    /* "Primitive pass" — raw (unboxed) arithmetic on locals the compiler proved are always the
-       same primitive type (parser.c's var_kind/RK_RAW_*_FLAG). Operands are CallFrame.raw_ints/
-       raw_reals slot indices, never RK-encoded (no register-vs-constant runtime check at all —
-       the parser already knows statically which form applies, see PACK_RAW_ARITH_RR's own
-       comment). Comparisons produce an ordinary boxed boolean (they feed a branch, not further
-       raw arithmetic — no raw boolean type exists). OP_BOX_INT/OP_BOX_REAL are the only bridge
-       from raw storage back to a normal tagged AerVal register. */
+    /* Raw (unboxed) arithmetic on provably-monotype locals; operands are raw_ints/raw_reals slot
+       indices, no RK encoding. Comparisons produce a boxed boolean; OP_BOX_* is the only bridge
+       back to registers[]. */
     OP_RAW_LOAD_INT, OP_RAW_LOAD_REAL,
     OP_RAW_ADD_INT, OP_RAW_SUB_INT, OP_RAW_MUL_INT, OP_RAW_DIV_INT,
     OP_RAW_MOD_INT, OP_RAW_FLOOR_DIV_INT,
@@ -358,93 +154,40 @@ typedef enum {
     OP_RAW_LT_INT, OP_RAW_GT_INT, OP_RAW_LTE_INT, OP_RAW_GTE_INT,
     OP_RAW_LT_REAL, OP_RAW_GT_REAL, OP_RAW_LTE_REAL, OP_RAW_GTE_REAL,
     OP_BOX_INT, OP_BOX_REAL,
-    /* raw-to-raw copy, needed when a freshly computed raw value doesn't already sit in the exact
-       slot a variable's first assignment reserved for it (parser.c's raw_int_reserve_one/
-       raw_real_reserve_one) — the direct analog of OP_MOVE for raw_ints/raw_reals instead of
-       registers[]. */
+    /* Raw-to-raw copy — OP_MOVE's analog for raw slots. */
     OP_RAW_MOVE_INT, OP_RAW_MOVE_REAL,
-    /* Compound-assignment accumulation of an ORDINARY BOXED value straight into a raw slot, in
-       place — no shadow at all, since the slot's identity never changes. Exists for exactly the
-       "accumulate a boxed arithmetic result into a raw accumulator" pattern (e.g. nbody.aer's own
-       `energy()`: `e += 0.5 * bim * (...)` where bim/vx/vy/vz are struct-field reads, so the RHS is
-       an ordinary boxed register — never provably raw at compile time — even though it's always
-       real at runtime). A runtime tag check on the boxed operand decides: matching type ->
-       accumulate directly into the raw slot; mismatched type -> the same "Type mismatch in binary
-       expression" runtime error the boxed VM already gives for this. Only ADD/SUB/MUL — matching
-       the existing raw-raw compound-assign family's own scope (DIV/MOD/FLOOR_DIV always shadow). */
+    /* In-place accumulation of a BOXED value into a raw slot (`e += <boxed expr>`); runtime tag
+       check, ADD/SUB/MUL only. */
     OP_RAW_ADD_INT_BOXED, OP_RAW_SUB_INT_BOXED, OP_RAW_MUL_INT_BOXED,
     OP_RAW_ADD_REAL_BOXED, OP_RAW_SUB_REAL_BOXED, OP_RAW_MUL_REAL_BOXED,
-    /* Ordering comparison between a raw slot and an ORDINARY BOXED value, producing a normal boxed
-       boolean — the comparison sibling of OP_RAW_ADD_INT_BOXED above, for exactly the same reason:
-       a loop counter that's raw-tracked (parser.c's primitive pass) almost always gets compared
-       against a bound that ISN'T raw (a function parameter, an array length, ...), since parameters
-       are never raw-tracked. Without this, that comparison had to box the raw side first
-       (OP_BOX_INT) just to run an ordinary boxed OP_LTE — on sieve.aer, OP_BOX_INT was the single
-       most-executed opcode, almost entirely from `for i <= limit:`-shaped loop conditions. A
-       runtime tag check on the boxed operand decides: matching type -> compare directly against
-       the raw slot; mismatched
-       type -> the same "Type mismatch in binary expression" error the boxed VM already gives.
-       Unlike the ADD/SUB/MUL family above, this is NOT in-place (a comparison never mutates its
-       raw operand) and is used from ordinary binary expressions (try_emit_cmp_raw_boxed, parser.c),
-       not compound-assignment. */
+    /* Raw-vs-boxed comparison producing a boxed boolean — removes the OP_BOX_INT that dominated
+       `for i <= limit:`-shaped loops. Not in-place. */
     OP_RAW_LT_INT_BOXED, OP_RAW_GT_INT_BOXED, OP_RAW_LTE_INT_BOXED, OP_RAW_GTE_INT_BOXED,
     OP_RAW_LT_REAL_BOXED, OP_RAW_GT_REAL_BOXED, OP_RAW_LTE_REAL_BOXED, OP_RAW_GTE_REAL_BOXED,
-    /* OP_RAW_LOAD_INT's immediate is a signed 20-bit field (-524288..524287) — a literal outside
-       that range must NOT be silently truncated (a real bug found exactly this way: `i < 20000000`
-       packed 20000000 into 20 bits, silently becoming 77056, running a supposedly-20M-iteration
-       loop only 77056 times). This is the pool-based fallback, mirroring OP_RAW_LOAD_REAL's own
-       "always resolve genuinely large constants through the pool" approach — parser.c's
-       raw_materialize picks this over OP_RAW_LOAD_INT whenever the literal doesn't fit. */
+    /* Pool fallback for literals outside OP_RAW_LOAD_INT's signed 20-bit immediate — silent
+       truncation once turned a 20M-iteration bound into 77056. */
     OP_RAW_LOAD_INT_POOL,
 } Opcode;
 
-/* RK encoding for most opcodes' operands — see vm_rk_value (vm.c). Pool indices are always
-   small non-negative ints in practice, nowhere near this bit, so reusing it as a "this is a
-   constant, not a register" flag is safe and simple (matches Lua's own BITRK convention). */
+/* RK bit: set = constant-pool index, clear = register (Lua's BITRK convention). */
 #define RK_CONST_FLAG (1 << 30)
 
-/* parser.c-internal operand tags for the "primitive pass" — orthogonal to RK_CONST_FLAG (a
-   different bit), used only inside the compiler's own single-int rk return channel to mark "this
-   value lives in CallFrame.raw_ints/raw_reals, not registers[]", never emitted into a packed
-   instruction word directly (PACK_RAW_* macros take a plain slot index once the flag has already
-   been stripped by the caller). Bits 28/29 were unused by every existing rk convention. */
+/* Compiler-internal raw-slot tags (bits 28/29) — never emitted into an instruction word. */
 #define RK_RAW_INT_FLAG  (1 << 29)
 #define RK_RAW_REAL_FLAG (1 << 28)
 #define RK_RAW_SLOT_MASK 0x1F
 
-/* Per-call register bank size (vm.h's CallFrame) — also visible here since parser.c's
-   variable table needs to know the ceiling on distinct variable names in one frame. 128
-   comfortably covers every real test file found so far with room to grow, and stays well under
-   the packed instruction encoding's 8-bit/255-per-field ceiling (PACK1/2/3 below) — a register
-   index is still one packed byte, this only widens how many distinct values that byte can name.
-   A program needing more than 128 would still need a spill mechanism this prototype doesn't have. */
+/* Per-frame register bank size; a register index must stay within one packed byte. */
 #define FRAME_REGISTERS 128
 
-/* Raw (unboxed) scratch register counts for the "primitive pass" (CallFrame.raw_ints/raw_reals,
-   this file). Deliberately much smaller than FRAME_REGISTERS — only locals the compiler proves
-   are provably-monotype primitives ever land here, a narrow subset of a function's variables in
-   practice. 32 each is generous headroom over anything seen in this repo's own test files;
-   exceeding it falls back to ordinary boxed storage for the overflow names (parser.c's raw-slot
-   allocator), never a compile error, never silent truncation. 5 bits each in the packed opcode
-   words below (PACK_RAW_ARITH_RR etc.) is an exact fit for 32. */
+/* Raw slot counts — 5-bit fields in the packed words; overflow falls back to boxed storage. */
 #define RAW_REGISTERS_INT  32
 #define RAW_REGISTERS_REAL 32
 
-/* Packed-instruction descriptor word — every operand used to get its own full 32-bit word
-   regardless of how small its value actually was (a register index only ever needs a handful of
-   bits), each one costing its own separate array-index-and-increment fetch. Every OP_* opcode's
-   NARROW fields — register
-   indices and small enums (bin_op/unary_op/cast_type) — now pack into one shared 32-bit
-   descriptor word alongside the opcode itself: [C:8][B:8][A:8][opcode:8], opcode in the low byte
-   so extracting it is a single mask, no shift. WIDE fields — RK-encoded operands
-   (register-or-constant, RK_CONST_FLAG unchanged), bare pool indices, and jump targets — keep
-   their own dedicated word exactly as before this change; nothing about how those are read
-   (READ(), vm_rk_value()) is any different. Jump targets specifically are NEVER packed
-   alongside anything else, on purpose — patch_jump (parser.c) does a blind word overwrite
-   at dozens of call sites, and keeping every patchable field in its own dedicated word is what
-   lets that stay a blind overwrite instead of needing read-modify-write.
-   Unused fields are passed as 0 by convention (PACK1/2 wrap PACK3 for opcodes with fewer
-   than 3 narrow fields, purely for readability at the call site — the encoding is identical). */
+/* Packed descriptor word: narrow fields (registers, small tags) share the opcode's word —
+   [C:8][B:8][A:8][opcode:8]. WIDE fields (RK operands, pool indices, jump targets) keep their
+   own word. Patchable jump targets are NEVER packed alongside anything — patch_jump must stay
+   a blind word overwrite. */
 #define PACK3(op, a, b, cc) \
     (((int)(op) & 0xFF) | (((a) & 0xFF) << 8) | (((b) & 0xFF) << 16) | (((cc) & 0xFF) << 24))
 #define PACK2(op, a, b)   PACK3(op, a, b, 0)
@@ -453,32 +196,10 @@ typedef enum {
 #define UNPACK_B(word) (((word) >> 16) & 0xFF)
 #define UNPACK_C(word) (((word) >> 24) & 0xFF)
 
-/* Binary operators each get their own top-level opcode (OP_ADD, OP_SUB, OP_EQ, ... OP_IN) dispatched
-   directly by vm_run()'s computed-goto — true single-level dispatch, matching Lua's per-operator
-   opcodes, instead of routing every arithmetic/comparison/bitwise op through one shared OP_BINARY
-   opcode that then re-dispatches internally via a runtime switch (see vm_binary_cold()'s own comment,
-   vm.c, for why that second level cost real per-dispatch instructions). All of them still share
-   this single dedicated word encoding — it's the hottest opcode class in arithmetic-heavy code
-   (over a third of all dispatches on nbody.aer).
-     Packed to fit entirely within the LOW 32 bits of the 64-bit code word — opcode(7) + dest(7) +
-   two 9-bit RK operands (32 bits total) — instead of the wider 8+8+20+20 layout every other packed
-   opcode still uses. code[] stays a uint64_t array (DISPATCH() is untouched), but on this 32-bit
-   ARM target a uint64_t is fetched as two 32-bit registers; a field that straddles that boundary
-   needs a shift-and-OR reconstruction across both registers before it's usable (confirmed via
-   disassembly: ~30 of lbl_add's ~71 instructions were exactly this). Fitting entirely in the low
-   word means that reconstruction never happens for OP_ADD/SUB/MUL/... — the upper register is
-   never touched at all. Opcode uses 7 bits, not 8, matching DISPATCH()'s mask (vm.c) — 62 Opcode
-   values fit with 66 to spare (headroom for future opcodes, e.g. concurrency primitives, without
-   a second redesign; 6 bits would leave only 2 spare). Dest is 7 bits, exactly FRAME_REGISTERS
-   (128) — unchanged from today, no capacity regression — no flag needed (a plain register index
-   is provably always < FRAME_REGISTERS, same reasoning PACK_REG4 above already uses). Each RK
-   operand gets 9 bits (1 flag + 8 index = 256 slots) — comfortably above both FRAME_REGISTERS and
-   the largest constant pool measured across every .aer file in this repo (~100 entries,
-   tests/test_core.aer) — narrower than RK20's 19 index bits, but RK20 was deliberately oversized
-   "far beyond any real program" (see its own comment below); this reuses the identical overflow
-   story at a smaller, still-generous threshold: emit_binary's rk9_fits guard (parser.c) reports a
-   clean compile error, never silent truncation, if a program's resolved rk value ever actually
-   exceeds it. */
+/* Per-operator opcodes (OP_ADD..OP_IN, over a third of all dispatches on nbody) pack the whole
+   instruction into the LOW 32 bits: opcode(7, = DISPATCH's mask) + dest(7) + two RK9 operands —
+   a field straddling the 32-bit boundary costs a two-register reconstruction on 32-bit ARM.
+   RK9 = 1 flag + 8 index bits; emit_binary spills a constant past that budget to a register. */
 #define RK9_CONST_FLAG (1U << 8)
 #define RK9_INDEX_MASK 0xFFU
 #define RK9_MAX_INDEX  0xFF
@@ -491,24 +212,13 @@ typedef enum {
     | (((uint64_t)(dest) & 0x7F) << 7) \
     | ((PACK_RK9(rk_b) & 0x1FFULL) << 14) \
     | ((PACK_RK9(rk_c) & 0x1FFULL) << 23) )
-/* Cast to uint32_t before shifting, not just masking after — `word` is a uint64_t (Chunk.code's
-   element type), and every field this word needs lives in its low 32 bits (PACK_BINARY's own
-   comment above), but the compiler has no way to know that from the type alone: a shift on an
-   ordinary uint64_t is a genuine 64-bit operation that reconstructs its result from both halves
-   of a register pair on this 32-bit ARM target, exactly the tax this whole redesign exists to
-   remove — confirmed by disassembly showing the reconstruction was still happening even after the
-   PACK_BINARY layout change, until this cast was added. The explicit (uint32_t) truncation tells
-   the compiler the upper 32 bits are irrelevant, so the shift becomes a single-register operation. */
+/* Cast to uint32_t BEFORE shifting — a uint64_t shift is a real two-register operation on
+   32-bit ARM even when the useful bits fit low (confirmed via disassembly). */
 #define UNPACK_BINARY_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
 #define UNPACK_RK_B9(word)       ((((uint32_t)(word)) >> 14) & 0x1FFU)
 #define UNPACK_RK_C9(word)       ((((uint32_t)(word)) >> 23) & 0x1FFU)
 
-/* RK20 — the wider (1 flag + 19 index) RK sub-encoding every OTHER 64-bit packed opcode below still
-   uses (OP_FIELD_SET, OP_INDEX_GET, the fused field-arithmetic ops, etc.). 19 index bits (524288
-   slots) is enormous headroom over both FRAME_REGISTERS (128) and any realistic constant-pool size,
-   but genuinely large generated programs could in principle exceed it — see emit_binary's own guard
-   (parser.c), which reports a clean compile error rather than silently truncating a resolved
-   rk_lhs/rk_rhs down into this scheme. */
+/* RK20: 1 flag + 19 index bits — the wider RK scheme every other packed opcode uses. */
 #define RK20_CONST_FLAG (1ULL << 19)
 #define RK20_INDEX_MASK 0x7FFFFULL
 #define RK20_MAX_INDEX  0x7FFFF
@@ -517,16 +227,8 @@ typedef enum {
         ? (RK20_CONST_FLAG | ((uint64_t)((rk) & ~RK_CONST_FLAG) & RK20_INDEX_MASK)) \
         : ((uint64_t)(rk) & RK20_INDEX_MASK))
 
-/* Slice A of the same single-word treatment, extended to the next-hottest opcodes. A register
-   field only needs 7 bits here (not RK's 8) — exactly FRAME_REGISTERS, no headroom wasted —
-   since a plain register index (unlike an RK operand) never needs a flag bit and is provably
-   always < FRAME_REGISTERS (reg_alloc/reg_reserve already refuse to hand out more). This is what
-   makes 4 registers fit alongside an opcode with bits to spare (PACK_REG4 below).
-     Patchable jump targets are deliberately EXCLUDED from every packing here, same rule OP_JUMP's
-   family already followed before this change (see PACK3's own comment above): patch_jump does a
-   blind word overwrite at the target's own offset, so any field sharing that word would be
-   clobbered. OP_ITER_RANGE_PREP/OP_ITER_RANGE_LOOP/OP_ITER_NEXT_PAIR's target word is untouched by
-   PACK_REG4 — only their OTHER (non-target) fields get packed together. */
+/* 7-bit register fields (no flag — provably < FRAME_REGISTERS). Patchable jump targets stay
+   excluded from packing. */
 #define PACK_REG4(op, a, b, cc, d) \
     ( ((uint64_t)(op) & 0xFF) \
     | (((uint64_t)(a)  & 0x7F) << 8) \
@@ -538,10 +240,7 @@ typedef enum {
 #define UNPACK_REG4_C(word) (((word) >> 22) & 0x7F)
 #define UNPACK_REG4_D(word) (((word) >> 29) & 0x7F)
 
-/* OP_FIELD_GET: dest/struct_reg (7 bits each) + field_idx (a bare pool index, not RK — always a
-   constant name, never a register) get the whole remaining 42 bits, comfortably more than any
-   real pool will ever hold, so no overflow guard is needed here the way OP_BINARY's RK20 needs
-   one (a 30-bit-plus pool would already have failed elsewhere first). */
+/* field_idx (bare pool index) gets the remaining 42 bits — no overflow guard needed there. */
 #define PACK_FIELD_GET(dest, struct_reg, field_idx) \
     ( ((uint64_t)(OP_FIELD_GET)  & 0xFF) \
     | (((uint64_t)(dest)         & 0x7F) << 8) \
@@ -551,11 +250,7 @@ typedef enum {
 #define UNPACK_FIELD_GET_STRUCT(word) (((word) >> 15) & 0x7F)
 #define UNPACK_FIELD_GET_FIELD(word)  (((word) >> 22) & 0x3FFFFFFFFFFULL)
 
-/* OP_FIELD_SET: Tier 1 (see PACK_BINARY's own comment for the general rationale) — op(7) +
-   struct_reg(7) + field_idx(9, matching RK9's own pool-index budget — a field name is always a
-   small, dedup'd pool index, same "far more than any real program's field count" headroom
-   reasoning as RK9 itself) + rk_val (RK9:9) = 32 bits exactly, entirely in the low word. This is
-   the single hottest opcode measured on nbody.aer (30M hits) — the opcode most worth narrowing. */
+/* op(7)+struct(7)+field_idx(9)+rk_val(RK9) = 32 bits, low word — hottest opcode on nbody. */
 #define PACK_FIELD_SET(struct_reg, field_idx, rk_val) \
     ( ((uint64_t)(OP_FIELD_SET) & 0x7F) \
     | (((uint64_t)(struct_reg)  & 0x7F) << 7) \
@@ -565,8 +260,7 @@ typedef enum {
 #define UNPACK_FIELD_SET_FIELD(word)  ((((uint32_t)(word)) >> 14) & 0x1FFU)
 #define UNPACK_FIELD_SET_RK(word)     ((((uint32_t)(word)) >> 23) & 0x1FFU)
 
-/* OP_INDEX_GET: Tier 1 — op(7) + dest(7) + arr_reg(7) + rk_idx(RK9:9) = 30 bits, entirely in the
-   low word. Second-hottest opcode measured on nbody.aer (22.5M hits). */
+/* op(7)+dest(7)+arr(7)+rk_idx(RK9) = 30 bits, low word. */
 #define PACK_INDEX_GET(dest, arr_reg, rk_idx) \
     ( ((uint64_t)(OP_INDEX_GET) & 0x7F) \
     | (((uint64_t)(dest)    & 0x7F) << 7) \
@@ -576,12 +270,8 @@ typedef enum {
 #define UNPACK_INDEX_GET_ARR(word)  ((((uint32_t)(word)) >> 14) & 0x7FU)
 #define UNPACK_INDEX_GET_RK(word)   ((((uint32_t)(word)) >> 21) & 0x1FFU)
 
-/* Slice C: OP_UNARY/OP_CAST/OP_CHECK_SHAPE/OP_STRUCT_NEW — none of these have a
-   patchable target (unlike OP_JUMP_IF_FALSE_REG, which stays 2 words — see
-   emit_jump_if_false_reg's own comment), so all their fields safely fold into one word. */
-/* Shared by OP_UNARY and OP_CAST, Tier 1 — dest(7) + unary_op(7, an actual Opcode value like
-   OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR, so it needs the same width as opcode itself, not a
-   narrow tag) + rk (RK9:9) = op(7)+7+7+9 = 30 bits, entirely in the low word. */
+/* No patchable targets in these, so all fields fold into one word. */
+/* unary_op is a real Opcode value, so it needs 7 bits, not a narrow tag. */
 #define PACK_UNARY(dest, unary_op, rk) \
     ( ((uint64_t)(OP_UNARY) & 0x7F) \
     | (((uint64_t)(dest)     & 0x7F) << 7) \
@@ -591,9 +281,7 @@ typedef enum {
 #define UNPACK_UNARY_OP(word)   ((((uint32_t)(word)) >> 14) & 0x7FU)
 #define UNPACK_UNARY_RK(word)   ((((uint32_t)(word)) >> 21) & 0x1FFU)
 
-/* cast_type is CAST_INTEGER/FLOAT/BOOLEAN (below) — a genuinely small, dedicated 3-value tag,
-   unlike unary_op above, so 4 bits (some headroom over the 3 values that exist today) is enough:
-   op(7) + dest(7) + cast_type(4) + rk (RK9:9) = 27 bits, entirely in the low word. */
+/* cast_type is a 3-value tag — 4 bits is enough. */
 #define PACK_CAST(dest, cast_type, rk) \
     ( ((uint64_t)(OP_CAST) & 0x7F) \
     | (((uint64_t)(dest)      & 0x7F) << 7) \
@@ -603,21 +291,11 @@ typedef enum {
 #define UNPACK_CAST_TYPE(word) ((((uint32_t)(word)) >> 14) & 0xFU)
 #define UNPACK_CAST_RK(word)   ((((uint32_t)(word)) >> 18) & 0x1FFU)
 
-/* "Primitive pass" raw-arithmetic encodings (see OP_RAW_LOAD_INT's own enum comment above and
-   CallFrame.raw_ints/raw_reals). Unlike PACK_BINARY's RK9, there is no register-vs-constant flag
-   bit anywhere here: the parser already knows statically, at compile time, whether an operand is
-   a raw slot or an immediate — that certainty is the entire point of this feature, so encoding a
-   runtime-checked flag here would just reintroduce the exact branch this is meant to eliminate.
-   Raw slot indices need only 5 bits (RAW_REGISTERS_INT/REAL == 32, vm.h above), not the 7 a real
-   registers[] index needs. All casts to (uint32_t) before shifting are required, not decorative —
-   op_word is a uint64_t, and a shift on it is a genuine 64-bit operation regardless of whether the
-   useful bits fit in 32 unless the compiler is told so explicitly (see PACK_BINARY's own comment
-   for the disassembly-confirmed bug this guards against). */
+/* Raw-arithmetic encodings: no register-vs-constant flag anywhere — the parser knows
+   statically. 5-bit slot indices; the (uint32_t) casts before shifts are required, not
+   decorative (see PACK_BINARY's comment). */
 
-/* op(7) + dest(5) + a(5) + b(5) = 22 bits — op is baked in per call site (OP_RAW_ADD_INT,
-   OP_RAW_SUB_INT, ... one shared packed shape across many opcodes, same convention PACK_BINARY
-   uses). dest/a/b are all raw_ints[] or all raw_reals[] indices, never mixed — the caller (vm.c's
-   opcode handler) already knows which array from the opcode itself. */
+/* op(7)+dest(5)+a(5)+b(5); all three slots address the same raw array (op says which). */
 #define PACK_RAW_ARITH_RR(op, dest, a, b) \
     ( ((uint64_t)(op)    & 0x7F) \
     | (((uint64_t)(dest) & 0x1F) << 7) \
@@ -627,9 +305,7 @@ typedef enum {
 #define UNPACK_RAW_ARITH_RR_A(word)    ((((uint32_t)(word)) >> 12) & 0x1FU)
 #define UNPACK_RAW_ARITH_RR_B(word)    ((((uint32_t)(word)) >> 17) & 0x1FU)
 
-/* Comparisons produce an ordinary BOXED boolean — they feed a branch, not further raw arithmetic,
-   so no raw boolean type exists. dest is a normal registers[] index (7 bits); a/b are raw-slot
-   indices (5 bits each). op(7) + dest(7) + a(5) + b(5) = 24 bits. */
+/* Comparisons: boxed-boolean dest is a 7-bit registers[] index; a/b are 5-bit raw slots. */
 #define PACK_RAW_CMP(op, dest, a, b) \
     ( ((uint64_t)(op)    & 0x7F) \
     | (((uint64_t)(dest) & 0x7F) << 7) \
@@ -639,9 +315,7 @@ typedef enum {
 #define UNPACK_RAW_CMP_A(word)    ((((uint32_t)(word)) >> 14) & 0x1FU)
 #define UNPACK_RAW_CMP_B(word)    ((((uint32_t)(word)) >> 19) & 0x1FU)
 
-/* dest is a raw_ints[] index (5 bits); imm is a signed 20-bit immediate baked directly into the
-   word (-524288..524287) — no constant-pool lookup needed for integer literals. op(7) + dest(5) +
-   imm(20) = 32 bits. */
+/* dest(5) + signed 20-bit immediate. */
 #define PACK_RAW_LOAD_INT(dest, imm) \
     ( ((uint64_t)(OP_RAW_LOAD_INT) & 0x7F) \
     | (((uint64_t)(dest) & 0x1F) << 7) \
@@ -650,12 +324,8 @@ typedef enum {
 #define UNPACK_RAW_LOAD_INT_IMM(word) \
     (((int32_t)((((uint32_t)(word)) >> 12) << 12)) >> 12)
 
-/* Real literals need full double precision, so — like OP_LOADK — they're sourced from the existing
-   constant pool rather than a packed immediate. dest is a raw_reals[] index (5 bits); pool_idx
-   gets the rest (20 bits) — comfortably above the largest pool measured in this repo (~100
-   entries), same generous-with-a-compile-time-guard story RK9/RK20 already use (parser.c's
-   raw-slot allocator reports a clean compile error, never silent truncation, if it's ever
-   exceeded). */
+/* Reals need full precision — pool-sourced like OP_LOADK; pool_idx gets 20 bits, guarded at
+   compile time. */
 #define PACK_RAW_LOAD_REAL(dest, pool_idx) \
     ( ((uint64_t)(OP_RAW_LOAD_REAL) & 0x7F) \
     | (((uint64_t)(dest)     & 0x1F) << 7) \
@@ -663,8 +333,7 @@ typedef enum {
 #define UNPACK_RAW_LOAD_REAL_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x1FU)
 #define UNPACK_RAW_LOAD_REAL_POOL(word) ((((uint32_t)(word)) >> 12) & 0xFFFFFU)
 
-/* Pool-based fallback for an integer literal too large for OP_RAW_LOAD_INT's 20-bit immediate —
-   see the opcode's own comment. Identical shape to PACK_RAW_LOAD_REAL. */
+/* Pool fallback for integers outside the 20-bit immediate; same shape as PACK_RAW_LOAD_REAL. */
 #define PACK_RAW_LOAD_INT_POOL(dest, pool_idx) \
     ( ((uint64_t)(OP_RAW_LOAD_INT_POOL) & 0x7F) \
     | (((uint64_t)(dest)     & 0x1F) << 7) \
@@ -672,9 +341,7 @@ typedef enum {
 #define UNPACK_RAW_LOAD_INT_POOL_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x1FU)
 #define UNPACK_RAW_LOAD_INT_POOL_POOL(word) ((((uint32_t)(word)) >> 12) & 0xFFFFFU)
 
-/* The only bridge between raw storage and normal tagged AerVal registers. dest is a normal
-   registers[] index (7 bits); src is a raw_ints[]/raw_reals[] index (5 bits) — op (OP_BOX_INT or
-   OP_BOX_REAL) says which array. */
+/* The only raw-to-registers[] bridge; op (OP_BOX_INT/REAL) says which raw array. */
 #define PACK_BOX(op, dest, src) \
     ( ((uint64_t)(op)    & 0x7F) \
     | (((uint64_t)(dest) & 0x7F) << 7) \
@@ -682,10 +349,7 @@ typedef enum {
 #define UNPACK_BOX_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
 #define UNPACK_BOX_SRC(word)  ((((uint32_t)(word)) >> 14) & 0x1FU)
 
-/* Raw-to-raw copy (OP_RAW_MOVE_INT/REAL) — both dest and src are raw_ints[]/raw_reals[] indices
-   (5 bits each, same array for both — op says which). Needed when a variable's first assignment
-   reserves its own permanent raw slot but the RHS's computed value ends up sitting in a different
-   (temp) slot — the direct analog of OP_MOVE for raw storage. */
+/* Raw-to-raw copy; both 5-bit slots in the same array (op says which). */
 #define PACK_RAW_MOVE(op, dest, src) \
     ( ((uint64_t)(op)   & 0x7F) \
     | (((uint64_t)(dest) & 0x1F) << 7) \
@@ -693,10 +357,7 @@ typedef enum {
 #define UNPACK_RAW_MOVE_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x1FU)
 #define UNPACK_RAW_MOVE_SRC(word)  ((((uint32_t)(word)) >> 12) & 0x1FU)
 
-/* Compound-assign accumulation of a boxed value into a raw slot, in place (OP_RAW_*_BOXED, see
-   their own Opcode-enum comment). slot is always used as BOTH the read and write operand (dest ==
-   a — an in-place accumulation, the only way this family is ever emitted), so only one raw-slot
-   field is needed; boxed_reg is a normal registers[] index. slot(5) + boxed_reg(7) = 12 bits. */
+/* In-place boxed-into-raw accumulation: slot is both the read and write operand. */
 #define PACK_RAW_ARITH_BOXED(op, slot, boxed_reg) \
     ( ((uint64_t)(op)        & 0x7F) \
     | (((uint64_t)(slot)     & 0x1F) << 7) \
@@ -704,10 +365,7 @@ typedef enum {
 #define UNPACK_RAW_ARITH_BOXED_SLOT(word)  ((((uint32_t)(word)) >> 7)  & 0x1FU)
 #define UNPACK_RAW_ARITH_BOXED_REG(word)   ((((uint32_t)(word)) >> 12) & 0x7FU)
 
-/* Comparison between a raw slot and a boxed value (OP_RAW_*_INT_BOXED/OP_RAW_*_REAL_BOXED, see
-   their own Opcode-enum comment) — unlike PACK_RAW_ARITH_BOXED above, this isn't in-place, so it
-   needs its own normal registers[] dest for the resulting boxed boolean. dest(7) + slot(5) +
-   boxed_reg(7) = 19 bits. */
+/* Raw-vs-boxed comparison — not in-place, so it has its own boxed dest register. */
 #define PACK_RAW_CMP_BOXED(op, dest, slot, boxed_reg) \
     ( ((uint64_t)(op)        & 0x7F) \
     | (((uint64_t)(dest)     & 0x7F) << 7) \
@@ -717,9 +375,7 @@ typedef enum {
 #define UNPACK_RAW_CMP_BOXED_SLOT(word) ((((uint32_t)(word)) >> 14) & 0x1FU)
 #define UNPACK_RAW_CMP_BOXED_REG(word)  ((((uint32_t)(word)) >> 19) & 0x7FU)
 
-/* dest/lhs_reg (7 bits each) + type_name_idx — a bare pool index, not RK (always a compile-time
-   struct type name, never a register) — gets the remaining 42 bits, same reasoning as
-   OP_FIELD_GET's field_idx. */
+/* type_name_idx is a bare pool index (compile-time name), 42 bits. */
 #define PACK_CHECK_SHAPE(dest, lhs_reg, type_name_idx) \
     ( ((uint64_t)(OP_CHECK_SHAPE) & 0xFF) \
     | (((uint64_t)(dest)          & 0x7F) << 8) \
@@ -729,9 +385,7 @@ typedef enum {
 #define UNPACK_CHECK_SHAPE_LHS(word)  (((word) >> 15) & 0x7F)
 #define UNPACK_CHECK_SHAPE_NAME(word) (((word) >> 22) & 0x3FFFFFFFFFFULL)
 
-/* dest/arg_reg_base/arg_count (7 bits each) + type_name_pool_idx, gets the remaining 35 bits —
-   also a bare compile-time-only pool index, never patched (struct construction always resolves at
-   parse time, never a forward-reference placeholder the way a function call can be). */
+/* type_name_pool_idx gets 35 bits — never patched (struct types resolve at parse time). */
 #define PACK_STRUCT_NEW(dest, arg_reg_base, arg_count, type_name_idx) \
     ( ((uint64_t)(OP_STRUCT_NEW) & 0xFF) \
     | (((uint64_t)(dest)          & 0x7F) << 8) \
@@ -743,10 +397,7 @@ typedef enum {
 #define UNPACK_STRUCT_NEW_ARG_COUNT(word) (((word) >> 22) & 0x7F)
 #define UNPACK_STRUCT_NEW_NAME(word)     (((word) >> 29) & 0x7FFFFFFFFULL)
 
-/* dest(7) + type_name_idx (35 bits, same bare-pool-index convention as OP_STRUCT_NEW above — the
-   struct type is always a compile-time name, never a register) + rk_count (RK9 — a count is
-   usually a register, rarely a large literal, so RK9's smaller constant-pool budget costs
-   nothing in practice; same choice OP_FIELD_SET/OP_INDEX_GET already made for their own operands). */
+/* type_name_idx(35) + rk_count(RK9 — counts are usually registers). */
 #define PACK_PACKED_ARRAY_NEW(dest, type_name_idx, rk_count) \
     ( ((uint64_t)(OP_PACKED_ARRAY_NEW) & 0xFF) \
     | (((uint64_t)(dest)          & 0x7F) << 8) \
@@ -756,14 +407,8 @@ typedef enum {
 #define UNPACK_PACKED_ARRAY_NEW_NAME(word)  (((word) >> 15) & 0x7FFFFFFFFULL)
 #define UNPACK_PACKED_ARRAY_NEW_COUNT(word) (((word) >> 50) & 0x1FFULL)
 
-/* Slice E — the last, tightest-budget batch: OP_INDEX_SET/OP_SLICE_GET need two RK20 operands in
-   one word; OP_CALL_MODULE/OP_CALL_BUILTIN have no patchable target at all (module/function/
-   builtin names are always literal identifiers resolved at parse time, never a forward-reference
-   placeholder); OP_FIELD_BINARY/OP_BINARY_FIELD are the tightest of all — dest+struct_reg+bin_op+
-   one RK operand already use 42 bits, leaving only 14 for field_idx (16384 slots) instead of the
-   29-42 bits every other opcode's name/field index got. Still comfortably more than any real
-   program's field-name count specifically (as opposed to its total pool size, which these two
-   don't need to address) — guarded the same way. */
+/* Tightest batch: OP_FIELD_BINARY/OP_BINARY_FIELD leave only 14 bits for field_idx (16384
+   field names) — guarded like the rest. */
 #define PACK_INDEX_SET(arr_reg, rk_idx, rk_val) \
     ( ((uint64_t)(OP_INDEX_SET) & 0xFF) \
     | (((uint64_t)(arr_reg) & 0x7F) << 8) \
@@ -838,11 +483,7 @@ typedef enum {
 #define UNPACK_BINARY_FIELD_RK(word)     (((word) >> 30) & 0xFFFFFULL)
 #define UNPACK_BINARY_FIELD_NAME(word)   (((word) >> 50) & FUSED_FIELD_NAME_MASK)
 
-/* dest(7) + obj_reg(7) + field_idx (FUSED_FIELD_NAME_MASK, same 14-bit budget as the two fusions
-   just above) + rk_idx (RK20 — plenty of room left in the word, so no need to narrow this one to
-   RK9 the way OP_INDEX_FIELD_SET below has to). See OP_INDEX_FIELD_GET's own comment (above, near
-   OP_FIELD_SET) for why this replaces plain index-then-field for every array, not just packed
-   ones. */
+/* dest(7)+obj(7)+field_idx(14)+rk_idx(RK20). */
 #define PACK_INDEX_FIELD_GET(dest, obj_reg, field_idx, rk_idx) \
     ( ((uint64_t)(OP_INDEX_FIELD_GET) & 0xFF) \
     | (((uint64_t)(dest)    & 0x7F) << 8) \
@@ -854,9 +495,7 @@ typedef enum {
 #define UNPACK_INDEX_FIELD_GET_FIELD(word) (((word) >> 22) & FUSED_FIELD_NAME_MASK)
 #define UNPACK_INDEX_FIELD_GET_RK(word)    (((word) >> 36) & 0xFFFFFULL)
 
-/* obj_reg(7) + field_idx (FUSED_FIELD_NAME_MASK, 14 bits) + rk_idx + rk_val — two operands beyond
-   OP_INDEX_FIELD_GET's one, so both RK operands narrow to RK9 (same budget-vs-headroom trade
-   OP_FIELD_SET/OP_INDEX_GET already made) to fit in one word rather than needing a second. */
+/* obj(7)+field_idx(14)+rk_idx+rk_val — both RK9 to fit one word. */
 #define PACK_INDEX_FIELD_SET(obj_reg, field_idx, rk_idx, rk_val) \
     ( ((uint64_t)(OP_INDEX_FIELD_SET) & 0xFF) \
     | (((uint64_t)(obj_reg)   & 0x7F) << 8) \
@@ -873,25 +512,18 @@ typedef enum {
 #define CAST_FLOAT   1
 #define CAST_BOOLEAN 2
 
-/* OP_CALL_MODULE's trailing module_id word (see its own comment above) — resolved once at parse
-   time (parse_module_call, parser.c) by comparing the literal module name against this fixed,
-   known set of core built-ins. CALL_MODULE_DYNAMIC covers everything else (host-registered modules,
-   user file imports) — genuinely only resolvable by name at runtime. */
-#define CALL_MODULE_MATH     0
-#define CALL_MODULE_RANDOM   1
-#define CALL_MODULE_STRING   2
-#define CALL_MODULE_TIME     3
-#define CALL_MODULE_JSON     4
-#define CALL_MODULE_DYNAMIC  5
+/* OP_CALL_MODULE's trailing module_id word, resolved at parse time; CALL_MODULE_DYNAMIC =
+   host/file module, resolved by name at runtime. */
+#define CALL_MODULE_MATH       0
+#define CALL_MODULE_RANDOM     1
+#define CALL_MODULE_STRING     2
+#define CALL_MODULE_TIME       3
+#define CALL_MODULE_JSON       4
+#define CALL_MODULE_COLLECTION 5
+#define CALL_MODULE_DYNAMIC    6
 
-/* OP_CALL_MODULE's second trailing word: fn_id, the same parse-time-resolved-int trick as
-   module_id above, one level down — which specific function within a fixed module this is.
-   -1 (FN_ID_UNKNOWN) means the name didn't match any function of that module; the runtime
-   still reports "'%s' has no function '%s'" by string name in that case (vm.c), so an unknown
-   name is never silently misrouted to id 0. Each fixed module owns its own flat id space
-   (aer_math_call only ever sees FN_MATH_*, etc.) since dispatch is already split by module_id
-   first. CALL_MODULE_DYNAMIC calls never resolve or use an fn_id — genuinely only resolvable
-   by name at runtime, same as their module_id. */
+/* Second trailing word: fn_id within the module (each module owns a flat id space);
+   FN_ID_UNKNOWN still errors by name, never misroutes to id 0. */
 #define FN_ID_UNKNOWN   (-1)
 
 #define FN_MATH_SQRT    0
@@ -907,11 +539,15 @@ typedef enum {
 #define FN_MATH_LOG2    10
 #define FN_MATH_LOG10   11
 #define FN_MATH_PI      12
-#define FN_MATH_SORT    13
+#define FN_MATH_ROUND   13
+#define FN_MATH_TAN     14
+#define FN_MATH_EXP     15
 
 #define FN_RANDOM_RANDOM  0
 #define FN_RANDOM_RANDINT 1
 #define FN_RANDOM_SEED    2
+#define FN_RANDOM_CHOICE  3
+#define FN_RANDOM_SHUFFLE 4
 
 #define FN_STRING_UPPER       0
 #define FN_STRING_LOWER       1
@@ -923,26 +559,31 @@ typedef enum {
 #define FN_STRING_REPEAT      7
 #define FN_STRING_REPLACE     8
 #define FN_STRING_JOIN        9
+#define FN_STRING_INDEX_OF    10
 
 #define FN_TIME_NOW      0
 #define FN_TIME_STRFTIME 1
+#define FN_TIME_SLEEP    2
 
 #define FN_JSON_ENCODE 0
 #define FN_JSON_DECODE 1
 
-/* OP_CALL_BUILTIN's trailing builtin_id word — no DYNAMIC case, unlike CALL_MODULE_*: every call
-   site is already gated behind is_builtin_name, so builtin_call_id always matches. */
+#define FN_COLLECTION_APPEND   0
+#define FN_COLLECTION_DELETE   1
+#define FN_COLLECTION_COPY     2
+#define FN_COLLECTION_INSERT   3
+#define FN_COLLECTION_INDEX_OF 4
+#define FN_COLLECTION_KEYS     5
+#define FN_COLLECTION_SORT     6
+
+/* OP_CALL_BUILTIN's trailing builtin_id — no DYNAMIC case; is_builtin_name gates every site. */
 #define CALL_BUILTIN_LENGTH 0
-#define CALL_BUILTIN_DELETE 1
-#define CALL_BUILTIN_APPEND 2
-#define CALL_BUILTIN_PRINT  3
-#define CALL_BUILTIN_TYPE   4
-#define CALL_BUILTIN_ASSERT 5
-#define CALL_BUILTIN_PANIC  6
-/* Builds a real Result from a (value, err) pair — the only way AER source itself can construct
-   one (native stdlib code has aer_make_result() directly). Lets a user-written fallible function
-   participate in `|>`'s short-circuit check the same way io.read()/json.decode() do. */
-#define CALL_BUILTIN_RESULT 7
+#define CALL_BUILTIN_PRINT  1
+#define CALL_BUILTIN_TYPE   2
+#define CALL_BUILTIN_ASSERT 3
+#define CALL_BUILTIN_PANIC  4
+/* The only way AER source constructs a Result — lets user functions join |>'s short-circuit. */
+#define CALL_BUILTIN_RESULT 5
 
 #define MAX_STRUCT_FIELDS 16
 
@@ -952,49 +593,27 @@ struct Shape {
     unsigned int field_count;
     unsigned int field_names[MAX_STRUCT_FIELDS];     /* pool indices, declaration order       */
     AerVal       field_defaults[MAX_STRUCT_FIELDS];
-    /* TYPE_ANY (value.h) means "no declared type" — every field defaults to it, so existing
-       structs (and the whole rest of the codebase) are unaffected. A non-TYPE_ANY entry is
-       enforced once at OP_FIELD_SET/construction (vm.c) and then trusted everywhere else — the
-       fused field-arithmetic opcodes use it to skip a runtime type check on that side entirely. */
+    /* TYPE_ANY = no declared type. A declared type is enforced once at FIELD_SET/construction,
+       then trusted — the fused opcodes skip the runtime check on that side. */
     ValueType    field_types[MAX_STRUCT_FIELDS];
 };
 
-/* A function's persistent, runtime-visible registration — appended to Chunk.functions by
-   func_register (parser.c) at the same moment it updates its own parse-time-only lookup
-   tables, so a function stays FINDABLE by name after compilation finishes, not just during it.
-   Needed specifically for cross-module calls (aer_module.c): a file-based `import` compiles the
-   imported file into its own Chunk via its own parse() call, whose parser-side tables are
-   reset/reused for the NEXT compile the moment this one returns — they cannot answer "does this
-   already-compiled Chunk export a function named X" later, when `module.fn(args)` is actually
-   called. Mirrors Shape's own precedent (chunk->shapes[], appended by OP_DEFINE_STRUCT's handler,
-   outlives the parser state that created it) for exactly the same reason. */
+/* Runtime-visible function registration — outlives the parser tables so cross-module calls
+   can find exports by name after compilation (same precedent as chunk->shapes[]). */
 typedef struct {
     unsigned int name;           /* pool index of the function's name */
     unsigned int code_offset;
     unsigned int arity;
     unsigned int min_arity;
-    AerVal*      defaults;       /* xmalloc'd array of (arity - min_arity) values, or NULL — owned;
-                                     left alone for the chunk's normal life (matches Shape's own
-                                     no-cleanup precedent, since a Chunk usually lives for the whole
-                                     process anyway), freed only by chunk_free's own explicit
-                                     teardown (aer_module_free_all) */
-    /* This function's real peak register need, captured at compile time (parser.c's
-       max_register_used, patched in after the body finishes) — used at call time to bump
-       vm->registers by exactly this much instead of always FRAME_REGISTERS. chunk_add_function
-       sets this to FRAME_REGISTERS as a safe placeholder before the body compiles (self-reference
-       to this same function's own value from within its own not-yet-finished body is the one case
-       that reads it before the real peak is patched in — see parse_function's own comment) — never
-       an under-allocation, just misses the cache-locality win for that one rare pattern. */
+    AerVal*      defaults;       /* (arity - min_arity) owned values or NULL; freed by chunk_free */
+    /* Real peak register need, patched in after the body compiles; the FRAME_REGISTERS
+       placeholder (read only by in-body self-reference) is never an under-allocation. */
     unsigned int max_registers;
 } ChunkFunction;
 
 /* ------------------------------------------------------------------ */
 /* Bytecode chunk                                                       */
-/* code[] is a flat 64-bit-word array: each instruction is one opcode word, optionally followed by
-   one or more operand words (or, for a packed OP_* instruction, further fields packed into that
-   same word — see PACK3/PACK_BINARY). Widened from a 32-bit int array so OP_BINARY (the single
-   hottest opcode — see PACK_BINARY's own comment) can pack its whole instruction, RK operands
-   included, into ONE word instead of three. */
+/* Flat 64-bit word array: one opcode word (with packed fields) plus optional operand words. */
 /* ------------------------------------------------------------------ */
 
 /* One per-callsite field-cache entry — see Chunk.field_cache's own comment below. */
@@ -1017,8 +636,7 @@ typedef struct {
     Shape**      shapes;
     unsigned int shape_count, shape_cap;
 
-    /* Function registry — see ChunkFunction's own comment above. Appended by func_register
-       (parser.c); searched newest-first by chunk_find_function, same convention as shapes. */
+    /* Function registry — appended by func_register, searched newest-first. */
     ChunkFunction* functions;
     unsigned int   function_count, function_cap;
 
@@ -1026,36 +644,20 @@ typedef struct {
     char**       imported_modules;
     unsigned int import_count, import_cap;
 
-    /* Bytecode-offset -> source-line mapping, one entry per statement (not instruction), so
-       runtime errors can report a line the way parse errors do. Strictly increasing by offset;
-       chunk_line_for_offset() binary-searches it. Rolled back alongside bytecode on a recovered
-       parse error so a discarded statement doesn't leave a dangling marker. */
+    /* Offset -> source line, one entry per statement; strictly increasing (binary-searched);
+       rolled back with bytecode on parse-error recovery. */
     unsigned int* line_mark_offsets;
     unsigned int* line_mark_lines;
     unsigned int  line_mark_count, line_mark_cap;
 
-    /* One inline cache slot per OP_FIELD_GET/OP_FIELD_SET site, indexed by the offset the
-       opcode itself starts at (same indexing scheme as debug_hits below) — remembers the last
-       Shape* seen at that site plus the field's resolved index within that shape, so a
-       monomorphic site (the overwhelming common case: the same struct type hitting the same
-       `.field` expression on every iteration of a hot loop) skips straight to the slot instead of
-       re-scanning shape->field_names[] every single access. A polymorphic site just keeps missing
-       the cache (one wasted pointer compare) and falls back to the existing linear scan — never
-       incorrect, only sometimes not-sped-up. Shape* is never reallocated once created (see struct
-       Shape's own comment), so a cached pointer never goes stale; grown in lockstep with `code` by
-       chunk_ensure_field_cache (vm.c), called once at the top of vm_run. NULL shape means "not
-       cached yet". One array of {shape, slot} pairs, not two parallel arrays — every real access
-       reads/writes both fields together, so this halves the cache lines touched per lookup on the
-       two hottest opcodes (FIELD_GET/FIELD_SET) instead of scattering shape/slot across two
-       independently-strided allocations. */
+    /* Per-site inline cache for FIELD_GET/SET: last Shape* + resolved slot. Monomorphic sites
+       skip the name scan; polymorphic sites just miss. Shape* is never reallocated, so a cached
+       pointer can't go stale. */
     FieldCacheEntry* field_cache;
     unsigned int field_cache_cap;
 
 #ifdef AER_DEBUG_TOOLS
-    /* One dispatch counter per bytecode word, indexed by offset — only the word an opcode itself
-       starts at is ever incremented (see DISPATCH() in vm.c), operand words stay 0. Grown in
-       lockstep with `code` by chunk_ensure_debug_hits (vm.c), called once at the top of vm_run.
-       Entirely absent from a normal build — see source/core/disasm.h. */
+    /* Per-word dispatch counters (debug-tools only); only opcode words increment. */
     uint64_t* debug_hits;
     unsigned int         debug_hits_cap;
 #endif
@@ -1069,35 +671,16 @@ typedef struct {
 #define VM_CALL_MAX     64
 #define VM_KEY_MAX      4096   /* max dict key length for stack-buffered lookups */
 
-/* Per-call register frame — every active call gets its own isolated FRAME_REGISTERS-sized
-   bank, mirroring how a stack-based VM would give every call its own call-frame; nested/recursive
-   calls can't clobber each other. Lives inside the VM struct (not a file-scope static) so a
-   nested file-module VM (aer_module.c, a file-based `import`'s own separate VM/Chunk) gets its
-   own isolated call chain instead of sharing — and thereby corrupting — the calling VM's own
-   in-progress one. */
+/* Per-call register frame; lives in the VM struct so a nested module VM gets its own chain. */
 typedef struct {
-    /* A bump-pointer base into vm->register_stack — NOT owned/freed storage, just "where this
-       frame's registers currently live," computed once at push time as
-       (caller's registers) + (caller's frame_size), matching Lua/V8's own call-cost model: a call
-       is a pointer add, never an allocation. registers[0..frame_size) is this frame's own bank;
-       nothing else in vm->register_stack is touched until a later push reuses that same range. */
+    /* Bump-pointer base into vm->register_stack — a call is a pointer add, never an allocation. */
     AerVal*      registers;
-    /* How many registers THIS frame actually reserved — a callee's ChunkFunction.max_registers/
-       AerFunction.max_registers (that specific function's real compile-time-captured peak, not a
-       flat FRAME_REGISTERS for every function regardless of need), or FRAME_REGISTERS for frame 0
-       (the top level/REPL's own usage is open-ended across statements, never "sealed" the way a
-       function body's is — see parser.c's own comment). Read at the NEXT push through this frame,
-       to know how far to bump past it. */
+    /* Registers THIS frame reserved (callee's compile-time peak; FRAME_REGISTERS for frame 0) —
+       read by the next push. */
     unsigned int frame_size;
 
-    /* Raw (unboxed) scratch for the "primitive pass" — locals the compiler proved are always the
-       same primitive type across their whole life (parser.c's var_kind/RK_RAW_*_FLAG) get a bare
-       int64_t/double here instead of a tagged AerVal, so their arithmetic can skip both the RK
-       register-vs-constant flag check and the tag check entirely (see PACK_RAW_ARITH_RR's own
-       comment, this file). Pure per-call scratch: never GC-scanned (integers/reals never had heap
-       cells even in boxed AerVal form, vm.c's value_is_young), never read before written within an
-       activation, never crosses a call boundary directly — only a raw value's BOXED form (via
-       OP_BOX_INT/OP_BOX_REAL) ever does. */
+    /* Raw unboxed scratch for the primitive pass — never GC-scanned, never crosses a call
+       boundary (only its boxed form does). */
     int64_t      raw_ints[RAW_REGISTERS_INT];
     double       raw_reals[RAW_REGISTERS_REAL];
 
@@ -1109,39 +692,23 @@ typedef struct {
     Chunk*       chunk;
     unsigned int ip;
 
-    /* Used only as a scratch argument-passing channel for calls that bridge out of the register
-       calling convention: OP_CALL_MODULE's native-stdlib bridge (aer_math_call() and friends)
-       and aer_module_call()'s cross-file-module argument hand-off. Never touched by any
-       register-native opcode itself. */
+    /* Scratch argument channel for bridging out of the register convention (stdlib/module calls). */
     AerVal       stack[VM_STACK_MAX];
     int          stack_top;
 
-    /* registers/raw_ints/raw_reals always point at call_stack[call_depth]'s own arrays —
-       repointed together on every call/return (the same handful of sites that already repoint
-       registers now repoint all three; a tail call reuses the current frame in place, so none of
-       the three need repointing there). */
+    /* Always point at call_stack[call_depth]'s arrays — repointed together on call/return. */
     CallFrame  call_stack[VM_CALL_MAX];
     AerVal*      registers;
     int64_t*     raw_ints;
     double*      raw_reals;
     int          call_depth;
 
-    /* One shared, contiguous, fixed-size register bank for the WHOLE call chain — a call never
-       allocates, it just bumps a base pointer forward by the callee's own frame_size, and a return
-       bumps it back to whatever the caller's own (already-known) base was. Sized to the same worst
-       case the original design always paid unconditionally (VM_CALL_MAX frames, each up to
-       FRAME_REGISTERS) — no new overflow class versus today, since no single frame_size can ever
-       exceed FRAME_REGISTERS (parser.c's ceiling) and there can never be more than VM_CALL_MAX
-       frames deep. The real win isn't a smaller reservation, it's that most real functions use far
-       fewer than FRAME_REGISTERS, so the ACTUAL bytes touched during a deep call chain are a much
-       smaller, more cache-friendly working set than a flat 128-per-frame design ever had. */
+    /* One shared register bank for the whole chain (calls bump a base pointer). Same worst-case
+       size as a flat design, but the actually-touched working set is far smaller. */
     AerVal       register_stack[VM_CALL_MAX * FRAME_REGISTERS];
 } VM;
 
-/* Bounds-checked push/pop against vm->stack (see the stack field's own comment above) for use
-   outside vm_run's dispatch loop, where its file-scoped PUSH()/POP() macros aren't reachable —
-   every native-module file (aer_stdlib.c, aer_json.c) needs exactly this, so it lives here once
-   instead of each keeping its own copy. */
+/* Bounds-checked push/pop for native-module files, outside vm_run's PUSH()/POP() macros. */
 static inline bool vm_stack_push(VM* vm, AerVal v) {
     if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return false; }
     vm->stack[vm->stack_top++] = v;
@@ -1163,20 +730,15 @@ void         chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line);
 /* The source line whose statement contains `offset` (the largest recorded mark at or before it), or 0 if the chunk has no marks yet. */
 unsigned int chunk_line_for_offset(Chunk* c, unsigned int offset);
 
-/* Formats a real number for display, guaranteeing a decimal point/exponent/nan-inf marker
-   survives — plain "%g" prints a whole-valued float (e.g. 42.0) as "42", indistinguishable from
-   an integer once it round-trips through print() or json.encode() (json.decode()'s own number
-   parser, aer_json.c, only treats a token as real if it contains '.' or 'e' — without this, a
-   real that happens to be a whole number silently becomes an integer on the way back in). Shared
-   by vm.c (print/interpolation, `as string`), aer_json.c (json.encode), and disasm.c (debug-tools
-   pool dump) — the one place this decision is made, not reimplemented per caller. */
+/* Formats a real guaranteeing a decimal point/exponent/nan-inf marker survives — bare "%g"
+   prints 42.0 as "42", which flips to integer through the JSON round-trip. The one shared site
+   (vm.c, aer_json.c, disasm.c). */
 void aer_format_real(double d, char* buf, size_t bufsize);
 
 unsigned int chunk_add_pool(Chunk* c, AerVal v);
 Shape*       chunk_find_shape(Chunk* c, const char* name);
 
-/* See ChunkFunction's own comment above. `defaults` is taken by ownership (never copied), matching
-   how AerFunction.defaults and Shape.field_defaults are already handled. */
+/* `defaults` is taken by ownership, never copied. */
 void           chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offset,
                                    unsigned int arity, unsigned int min_arity, AerVal* defaults);
 ChunkFunction* chunk_find_function(Chunk* c, const char* name);
@@ -1184,10 +746,8 @@ ChunkFunction* chunk_find_function(Chunk* c, const char* name);
 /* Parse-time variant — name_idx is a dedup'd pool index, so this is an int compare, no strcmp. */
 ChunkFunction* chunk_find_function_by_name_idx(Chunk* c, unsigned int name_idx);
 
-/* `name` binds the module ("mid" for both `import mid` and `import sub.mid`); `path_name` is what
-   resolves to a file, dots as directory separators ("sub.mid" -> "sub/mid.aer"), equal to name/len
-   for a plain import. Neither needs NUL-termination. Returns false if `name` isn't a native module
-   (aer_stdlib.h) and the file can't be loaded; errors via error_at() if MAX_IMPORTS is exceeded. */
+/* `name` binds the module; `path_name` resolves to the file (dots as separators). Neither
+   is NUL-terminated. */
 bool chunk_add_import(Chunk* c, const char* name, unsigned int len,
                        const char* path_name, unsigned int path_len);
 bool chunk_is_imported(Chunk* c, const char* name, unsigned int len);
@@ -1195,26 +755,17 @@ bool chunk_is_imported(Chunk* c, const char* name, unsigned int len);
 void vm_init(VM* vm, Chunk* chunk);
 void vm_free(VM* vm);
 
-/* Runs vm->chunk's bytecode from vm->ip until OP_HALT or a runtime error; returns true on a clean
-   finish, false on error (same as reading runtime_had_error right after). Embedding contract: since
-   an error no longer kills the process, a host reusing the same VM* after a false return must first
-   reset stack_top=0 and call_depth=0 (repointing registers back at frame 0) — main.c's run()
-   does this between REPL statements; other hosts must replicate it. */
+/* Runs from vm->ip to OP_HALT or runtime error (returns false). A host reusing the VM after
+   a false return must reset stack_top/call_depth first — see main.c's run(). */
 bool vm_run(VM* vm);
 
-/* GC suppression is a counter, not a flag (imports can nest: A imports B imports C). aer_module.c
-   wraps its nested vm_run() for a file-module's top-level code in suppress/unsuppress: during that
-   window the outer chunk/VM isn't in any root set yet, so a collection could sweep what the outer
-   file still needs. Imports are small and one-time, so not collecting here is cheap insurance. */
+/* A counter, not a flag — imports nest, and during a nested import's run the outer chunk
+   isn't in any root set yet. */
 void vm_gc_suppress(void);
 void vm_gc_unsuppress(void);
 
-/* Call setup used only by aer_module_call (aer_module.c) for a cross-module call into another
-   file's exported function — see ChunkFunction's own comment. Pushes a real CallFrame onto
-   target's own call stack (arity check, default-filling, mirroring lbl_call_value
-   exactly) with dest_reg fixed at 0, so the trampoline convention is: after vm_run(target) drains
-   back to call depth 0 (hitting return_ip's OP_HALT), the result is sitting in
-   target->call_stack[0].registers[0]. Full contract in setup_call's own comment in vm.c. */
+/* Cross-module call setup (aer_module_call only): pushes a real frame with dest_reg fixed at
+   0 — after the trampoline drains, the result is in call_stack[0].registers[0]. */
 bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
                     AerVal* args, unsigned int return_ip);
 
@@ -1224,21 +775,25 @@ AerArray* vm_new_array(void);
 /* Same idea, for AerDict — exposed for aer_json.c's json.decode(); caller must zero-init map itself (see lbl_dict_new's call site in vm.c). */
 AerDict* vm_new_dict(void);
 
-/* Same idea, for AerFunction — exposed for parser.c's build_function_value. Must come from
-   function_pool like every AerFunction: the GC's mark phase expects every TYPE_FUNCTION value in
-   Chunk.pool to be a real function_pool cell, and an xmalloc'd/xcalloc'd one makes pool_mark's slab
-   lookup fail outright, not just leak. Zero the struct yourself after calling — unlike the xcalloc
-   this replaced, pool_alloc returns uninitialized memory. */
+/* Generational-GC write barrier — any store of `new_value` into an already-existing array must go
+   through this (see gc_barrier_array's own comment, vm.c). Exposed for aer_collection.c's
+   append/insert; a freshly built, not-yet-returned array needs no barrier. */
+void gc_barrier_array(AerArray* a, AerVal new_value);
+
+/* Structural/reference equality with no error path (see its comment in vm.c) — exposed for
+   aer_collection.c's index_of, the same scan OP_IN's array case uses. */
+bool values_equal(AerVal a, AerVal b);
+
+/* Must come from function_pool (pool_mark's slab lookup fails on xmalloc'd cells); returns
+   uninitialized memory — zero it yourself. */
 AerFunction* vm_new_function(void);
 
-/* Reads back a register's value after a chunk has run to OP_HALT. Test-only: tests/smoke_test.c
-   is the only intended caller. */
+/* Test-only register readback (tests/smoke_test.c). */
 AerVal register_get(VM* vm, int slot);
 
 #ifdef AER_DEBUG_TOOLS
 #include <stdio.h>
-/* Prints a byte-accurate memory breakdown (header vs. payload bytes per pool, plus GC run counts)
-   to `out` — see source/core/vm.c for what "payload" means per type. Debug-build only. */
+/* Byte-accurate per-pool memory breakdown; debug-tools only. */
 void aer_debug_memory_report(FILE* out);
 #endif
 

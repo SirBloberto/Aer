@@ -1,4 +1,5 @@
 #!/usr/bin/env aer
+import collection
 # AER test suite — internal memory/allocation behavior: slab-pool boundary
 # crossing, the generational GC's write barrier, struct interpolation
 # (kept here specifically, see the note below), the 47-bit inline integer
@@ -19,7 +20,7 @@
 # that boundary.
 slab_arrays = []
 for i in 0..300:
-    append(slab_arrays, [i, i * 2])
+    collection.append(slab_arrays, [i, i * 2])
 
 assert(length(slab_arrays) == 300, "300 arrays created — crosses the 256-per-slab boundary")
 assert(slab_arrays[0][0] == 0 && slab_arrays[0][1] == 0, "the first array, from the first slab, is still intact")
@@ -29,7 +30,7 @@ assert(slab_arrays[299][0] == 299 && slab_arrays[299][1] == 598, "the last array
 
 slab_strings = []
 for i in 0..300:
-    append(slab_strings, "s" + (i as string))
+    collection.append(slab_strings, "s" + (i as string))
 
 assert(length(slab_strings) == 300, "300 strings created — crosses string_pool's 256-per-slab boundary")
 assert(slab_strings[0] == "s0" && slab_strings[255] == "s255" && slab_strings[256] == "s256" && slab_strings[299] == "s299",
@@ -51,16 +52,16 @@ gc_old_dict = {}
 
 gc_churn = []
 for i in 0..3000:
-    append(gc_churn, [i, i * 2, "s" + (i as string)])
+    collection.append(gc_churn, [i, i * 2, "s" + (i as string)])
 
-append(gc_old_container, "written after promotion")
+collection.append(gc_old_container, "written after promotion")
 gc_old_dict["fresh_key"] = {"nested": "written after promotion"}
 
 # More allocation pressure — enough to force further collections — before
 # checking the written values are still intact.
 gc_churn2 = []
 for i in 0..3000:
-    append(gc_churn2, [i, i * 2, "t" + (i as string)])
+    collection.append(gc_churn2, [i, i * 2, "t" + (i as string)])
 
 assert(length(gc_old_container) == 1 && gc_old_container[0] == "written after promotion",
        "a value written into an old (promoted) array survives further collections — the write barrier protected it")
@@ -146,7 +147,7 @@ struct SlabPoint:
 
 slab_structs = []
 for i in 0..100:
-    append(slab_structs, SlabPoint(i, i * 2))
+    collection.append(slab_structs, SlabPoint(i, i * 2))
 
 assert(length(slab_structs) == 100, "100 struct instances created — crosses struct_pool's 64-per-slab boundary")
 assert(slab_structs[0].x == 0 && slab_structs[0].y == 0, "the first struct, from the first slab, is intact")
@@ -166,13 +167,13 @@ gc_old_struct = OldStruct(null)
 
 gc_churn3 = []
 for i in 0..3000:
-    append(gc_churn3, [i, i * 2, "u" + (i as string)])
+    collection.append(gc_churn3, [i, i * 2, "u" + (i as string)])
 
 gc_old_struct.payload = "written after promotion"
 
 gc_churn4 = []
 for i in 0..3000:
-    append(gc_churn4, [i, i * 2, "v" + (i as string)])
+    collection.append(gc_churn4, [i, i * 2, "v" + (i as string)])
 
 assert(gc_old_struct.payload == "written after promotion",
        "a value written into an old (promoted) struct's field survives further collections — the write barrier protected it")

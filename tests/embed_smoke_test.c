@@ -334,7 +334,7 @@ int main(void) {
     vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     aer_gc_set_ceiling(50);
-    shell("permanent = []\nfor i in 0..5000:\n    append(permanent, [i, i * 2, i * 3])\n");
+    shell("import collection\npermanent = []\nfor i in 0..5000:\n    collection.append(permanent, [i, i * 2, i * 3])\n");
     ok = run_appended(&chunk, &vm);
 
     check(!ok, "a script whose live memory keeps growing hits the ceiling and aborts");
@@ -352,7 +352,7 @@ int main(void) {
     vm.raw_reals  = vm.call_stack[0].raw_reals;
     aer_clear_error();
     aer_gc_set_ceiling(0);
-    shell("permanent2 = []\nfor i in 0..5000:\n    append(permanent2, [i, i * 2, i * 3])\n");
+    shell("permanent2 = []\nfor i in 0..5000:\n    collection.append(permanent2, [i, i * 2, i * 3])\n");
     ok = run_appended(&chunk, &vm);
 
     check(ok, "the same shape of script succeeds once the ceiling is disabled (0)");

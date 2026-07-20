@@ -30,16 +30,10 @@
 #define ARROW_LEFT  'D'     /* Esc[D */
 #define HOME        'H'     /* Esc[H */
 #define END         'F'     /* Esc[F */
-#define DELETE_SEQ  '3'     /* Esc[3~ — named DELETE_SEQ, not DELETE: windows.h
-                                already defines DELETE as a file-access-rights
-                                constant */
+#define DELETE_SEQ  '3'     /* named DELETE_SEQ: windows.h already defines DELETE */
 
-/* Cross-platform special-key codes read_key() normalizes both platforms'
-   raw input conventions down to — deliberately outside any possible
-   char/EOF value, so a literal typed character can never collide with one
-   (unlike ARROW_UP/etc. above, which reuse printable-letter byte values
-   safely only because they're compared solely against the third byte of
-   an already-confirmed POSIX escape sequence, never a top-level key). */
+/* read_key()'s normalized special-key codes — outside any char/EOF value so a typed character
+   can never collide with one. */
 #define KEY_ARROW_UP    1000
 #define KEY_ARROW_DOWN  1001
 #define KEY_ARROW_RIGHT 1002
@@ -82,8 +76,7 @@ static int   length;
 static int   buffer_length = 1024;
 
 #ifndef _WIN32
-/* Set when SIGWINCH fires; main loop checks and calls refresh(). No Windows
-   equivalent signal exists — handle_terminal() polls check_resize() instead. */
+/* Set by SIGWINCH; Windows has no equivalent signal, so handle_terminal polls check_resize(). */
     static volatile sig_atomic_t resize_pending = 0;
 #endif
 
@@ -117,12 +110,9 @@ void start_terminal(char* name) {
     if (!GetConsoleMode(hStdout, &original_out_mode)) die("GetConsoleMode (stdout)");
     atexit(end_terminal);
 
-    /* No line buffering | no auto-echo | no Ctrl-C-as-signal handling —
-       the direct equivalents of clearing ICANON|ECHO|ISIG in termios. */
+    /* Equivalent of clearing ICANON|ECHO|ISIG in termios. */
     SetConsoleMode(hStdin, original_in_mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT));
-    /* refresh() already writes plain ANSI/VT100 escapes (cursor movement,
-       clear-to-end, hide/show cursor) — Windows 10+ renders them natively
-       once this is set, so none of that code needs to change per platform. */
+    /* Lets Windows 10+ render the ANSI escapes refresh() writes, no per-platform output code. */
     SetConsoleMode(hStdout, original_out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 
     CONSOLE_SCREEN_BUFFER_INFO info;
@@ -162,10 +152,8 @@ void start_terminal(char* name) {
     history_length = (unsigned long)ftell(history);
     unsigned int read_size = MIN(history_length, COMMAND_SIZE);
     fseek(history, -(long)read_size, SEEK_END);
-    /* Read into a temp buffer, then place each byte at its true logical slot
-       (logical_start + k) % COMMAND_SIZE — a plain fread would misalign
-       against the modulo-indexed scheme once history exceeds COMMAND_SIZE
-       bytes across sessions. */
+    /* Place each byte at (logical_start + k) % COMMAND_SIZE — a plain fread misaligns once
+       history exceeds COMMAND_SIZE bytes across sessions. */
     char temp[COMMAND_SIZE];
     size_t got = fread(temp, 1, read_size, history);
     read_size = (unsigned int)got;
@@ -193,16 +181,13 @@ char* handle_terminal() {
         }
 #endif
 
-        int key = read_key();  /* int — preserves high-bit chars, EOF, and the
-                                   out-of-band KEY_* special-key sentinels */
+        int key = read_key();  /* int: preserves high-bit chars, EOF, and KEY_* sentinels */
 
         if (key == KEY_ARROW_UP) {
             if (history_position < 2) continue;  /* underflow guard */
             reset();
             clear();
-            /* The ring only holds the most recent COMMAND_SIZE bytes — anything
-               before this floor has been overwritten by wraparound and would
-               alias unrelated bytes if the scan below were allowed past it. */
+            /* Bytes before this floor were overwritten by ring wraparound — scanning past it aliases. */
             unsigned long floor_pos = (history_length > COMMAND_SIZE) ? (history_length - COMMAND_SIZE) : 0;
             /* Step back past the trailing newline of the previous entry */
             unsigned long pos = history_position - 2;
@@ -258,18 +243,13 @@ char* handle_terminal() {
             length--;
 
         } else if (key == NEW_LINE) {
-            /* length can equal buffer_length exactly (insert only grows the
-               buffer before writing the char AT length, so it never grows
-               for the byte written just past it) — reserve room here for
-               both the newline and the NUL below before writing either. */
+            /* length can equal buffer_length exactly — reserve room for newline AND NUL before writing. */
             if (length + 2 > buffer_length) {
                 buffer_length *= 2;
                 buffer = xrealloc(buffer, buffer_length);
             }
             buffer[length] = '\n';
-            /* Backspace/Delete shrink `length` without clearing the vacated
-               tail, so without this, main.c's strlen(line) could read past
-               the newline into a stale byte from a longer previous edit. */
+            /* Backspace leaves stale bytes past `length` — NUL-terminate or strlen reads a longer edit's tail. */
             buffer[length + 1] = '\0';
             if (length != 0) {
                 /* Persist to history file */
@@ -289,17 +269,8 @@ char* handle_terminal() {
             return buffer;
 
         } else if (key == END_OF_TEXT) {   /* Ctrl-C */
-            /* Cancels the current INPUT, like Python's REPL — not just the one physical line
-               being edited, but a whole in-progress multi-line block (a `function`/`if`/`for`
-               body still being typed, prompt showing "..."). It does NOT exit the shell, which
-               surprises people used to a terminal where Ctrl-C kills the process. Ctrl-D (EOF)
-               is the actual exit; say so every time, since there's no other way to discover it
-               (no exit()/quit() builtin exists).
-                 Returning NULL here (rather than clearing the line and looping back to read
-               more of it, as this used to) is what makes this actually abandon a multi-line
-               block: main.c's run_shell() owns the block-accumulation state (in_block/
-               block_buf), not this file, so only handing control all the way back up lets it
-               reset that state instead of silently continuing to append to the old buffer. */
+            /* Ctrl-C cancels the whole in-progress input (including a multi-line block), not the shell;
+               Ctrl-D exits — say so, there's no other way to discover it. */
             if (screen_rows > screen_row)
                 printf("\x1b[%dB", screen_rows - screen_row);
             printf("\nKeyboardInterrupt (press Ctrl-D to exit)\n");
@@ -313,9 +284,7 @@ char* handle_terminal() {
             exit(0);
 
         } else if (key == EOF) {
-            /* stdin closed/exhausted (not interactive Ctrl-D — that's
-               END_OF_TRANS above). Without this check, EOF falls into the
-               "insert character" branch below and loops forever. */
+            /* stdin closed/exhausted — without this, EOF loops forever in the insert branch. */
             printf("\n");
             end_terminal();
             exit(0);
@@ -357,16 +326,14 @@ static void refresh() {
     /* Move cursor back to the start row of our input */
     reset();
 
-    /* Count how many terminal rows the current text occupies and where the
-       cursor sits within them, accounting for the prompt width. */
+    /* Rows occupied by the current text and where the cursor sits, prompt width included. */
     int text_cols = prompt_len;
     for (int c = text_cols + position; c >= (int)screen_columns; c -= screen_columns)
         screen_row++;
     for (int c = (int)prompt_len + length; c > (int)screen_columns; c -= screen_columns)
         screen_rows++;
 
-    /* Handle the edge case where text fills exactly to the right margin:
-       the terminal won't auto-scroll so we emit a newline manually. */
+    /* Text ending exactly at the right margin doesn't auto-scroll — emit the newline manually. */
     if (((int)prompt_len + length) % (int)screen_columns == 0
             && position == length
             && (int)prompt_len + position > screen_position) {
@@ -394,9 +361,7 @@ static void refresh() {
 }
 
 #ifdef _WIN32
-/* No SIGWINCH on Windows — polled once per input-loop iteration instead
-   (see handle_terminal). Re-queries the console size and only calls
-   refresh() if it actually changed since last checked. */
+/* Polled resize check for Windows (no SIGWINCH); refresh() only on an actual change. */
 static void check_resize() {
     CONSOLE_SCREEN_BUFFER_INFO info;
     if (!GetConsoleScreenBufferInfo(hStdout, &info)) return;
@@ -414,19 +379,12 @@ static void handle_resize(int sig) {
 }
 #endif
 
-/* Resolves one logical keypress, normalizing each platform's raw-input
-   convention to a plain character/control code or one of the KEY_* special-
-   key sentinels above — the only thing handle_terminal()'s dispatch chain
-   ever looks at, so it's identical for both platforms. */
+/* Normalizes each platform's raw input to a char/control code or a KEY_* sentinel. */
 #ifdef _WIN32
 static int read_key(void) {
     int c = _getch();
     if (c == '\r') return NEW_LINE;   /* Windows Enter is CR, not LF */
-    if (c == '\b') return BACKSPACE;  /* Windows Backspace is BS (0x08), not DEL (127) —
-                                          without this, the raw 0x08 byte falls through
-                                          to the line-editing loop's default character-
-                                          insert path instead of the BACKSPACE branch,
-                                          and the key appears to do nothing */
+    if (c == '\b') return BACKSPACE;  /* Windows Backspace is BS (0x08), not DEL (127) */
     if (c != 0 && c != 0xE0) return c;
     switch (_getch()) {   /* extended-key scan code */
         case 72: return KEY_ARROW_UP;
@@ -472,11 +430,7 @@ static void reset() {
 
 static void die(const char* message) {
 #ifdef _WIN32
-    /* perror()/errno describe C-runtime failures, not Win32 API ones (the
-       only kind this function is ever called for) — GetLastError() is the
-       one that actually has useful content here. Most likely cause: stdin
-       isn't a real console (redirected/piped) — GetConsoleMode only works
-       on an actual console handle. */
+    /* GetLastError(), not errno — Win32 failures; likely cause is a redirected (non-console) stdin. */
     DWORD err = GetLastError();
     char* msg = NULL;
     FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,

@@ -1,4 +1,5 @@
 #!/usr/bin/env aer
+import collection
 # AER test suite — tail-call optimization, call-site/LOAD-STORE inline
 # caching, and compile-time opcode fusion (compound assignment and
 # array-index-get). Ground-truth coverage these optimizations must
@@ -245,7 +246,7 @@ assert(llc_recurse_local(5, 0) == 30, "a function-local var resolves correctly a
 function llc_nested_loops(limit):
     flags = []
     for i in 0..limit+1:
-        append(flags, 0)
+        collection.append(flags, 0)
     p = 2
     for p * p <= limit:
         if flags[p] == 0:
@@ -442,7 +443,7 @@ assert(cb_r == true, "a comparison whose operands are complex sub-expressions (c
 function cb_sieve(limit):
     flags = []
     for i in 0..limit+1:
-        append(flags, 0)
+        collection.append(flags, 0)
     p = 2
     for p * p <= limit:
         if flags[p] == 0:

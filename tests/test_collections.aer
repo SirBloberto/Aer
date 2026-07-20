@@ -1,4 +1,5 @@
 #!/usr/bin/env aer
+import collection
 # AER test suite — arrays, dicts, and nested collections.
 # Machine-checked via assert(): a clean run exits 0; any failure prints
 # "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
@@ -14,20 +15,20 @@ assert(arr[-1] == 30, "negative array indexing")
 arr[1] = 99
 assert(arr[0] == 10 && arr[1] == 99 && arr[2] == 30, "array index assignment")
 
-append(arr, 40)
+collection.append(arr, 40)
 assert(length(arr) == 4 && arr[3] == 40, "append adds to the end and updates length")
 
-# delete(arr, index) removes by index, shifting subsequent elements down to
+# collection.delete(arr, index) removes by index, shifting subsequent elements down to
 # preserve order — negative indices work the same as bracket indexing.
-delete(arr, 1)                        # removes 99
+collection.delete(arr, 1)                        # removes 99
 assert(length(arr) == 3 && arr[0] == 10 && arr[1] == 30 && arr[2] == 40, "delete by index shifts subsequent elements down")
 
-delete(arr, -1)                       # removes the last element (40)
-assert(length(arr) == 2 && arr[0] == 10 && arr[1] == 30, "delete(-1) removes the last element — no separate pop() needed")
+collection.delete(arr, -1)                       # removes the last element (40)
+assert(length(arr) == 2 && arr[0] == 10 && arr[1] == 30, "collection.delete(-1) removes the last element — no separate pop() needed")
 
-# append()/delete() both mutate in place and also return the array; the
+# collection.append()/collection.delete() both mutate in place and also return the array; the
 # return value is only useful if you don't already have a reference to it.
-# delete(arr, 99)   # would error: Array index 99 out of bounds (len 2)
+# collection.delete(arr, 99)   # would error: Array index 99 out of bounds (len 2)
 
 # Slicing — [a:b], [a:], [:b], [:] — always returns a new array
 nums2 = [0, 1, 2, 3, 4, 5]
@@ -70,7 +71,7 @@ d["z"] = 3
 assert("z" in d, "dict key assignment")
 assert(length(d) == 3, "dict length after assignment")
 
-delete(d, "y")
+collection.delete(d, "y")
 assert(!("y" in d), "delete removes a dict key")
 
 # Dicts have reference semantics
@@ -105,5 +106,41 @@ assert(record["scores"][-1] == 88, "dict containing an array, negative index")
 
 nested = {"a": {"b": {"c": 42}}}
 assert(nested["a"]["b"]["c"] == 42, "deeply nested dicts")
+
+# ------------------------------------------------------------------ #
+# 16. collection module — copy, insert, index_of, keys, sort           #
+# ------------------------------------------------------------------ #
+
+orig = [1, 2, 3]
+copied = collection.copy(orig)
+copied[0] = 99
+assert(orig[0] == 1 && copied[0] == 99, "collection.copy(array) is a real copy — mutating it leaves the original alone")
+assert(length(copied) == 3, "collection.copy(array) preserves length")
+
+orig_d = {"x": 1, "y": 2}
+copied_d = collection.copy(orig_d)
+copied_d["x"] = 99
+assert(orig_d["x"] == 1 && copied_d["x"] == 99, "collection.copy(dict) is a real copy")
+assert(length(copied_d) == 2 && copied_d["y"] == 2, "collection.copy(dict) preserves every entry")
+
+ins = [1, 3]
+collection.insert(ins, 1, 2)
+assert(length(ins) == 3 && ins[0] == 1 && ins[1] == 2 && ins[2] == 3, "collection.insert() places the value at the index, shifting the rest up")
+collection.insert(ins, 3, 4)
+assert(ins[3] == 4, "collection.insert() at index == length appends")
+collection.insert(ins, 0, 0)
+assert(ins[0] == 0 && ins[4] == 4, "collection.insert() at 0 prepends")
+
+haystack = ["a", "b", "c", "b"]
+assert(collection.index_of(haystack, "b") == 1, "collection.index_of() returns the first match's index")
+assert(collection.index_of(haystack, "z") == -1, "collection.index_of() returns -1 when absent")
+
+key_dict = {"beta": 2, "alpha": 1}
+key_list = collection.sort(collection.keys(key_dict))
+assert(length(key_list) == 2 && key_list[0] == "alpha" && key_list[1] == "beta",
+       "collection.keys() returns every key — sorted here since dict order is hash-bucket order")
+
+sorted_here = collection.sort([3, 1, 2])
+assert(sorted_here[0] == 1 && sorted_here[2] == 3, "collection.sort() on numbers (moved from math.sort)")
 
 print("test_collections.aer: all assertions passed.")

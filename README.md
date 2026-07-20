@@ -119,23 +119,10 @@ make
 ```
 
 Output is written to `binary/aer` (`binary/aer.exe` on Windows — the Makefile handles the suffix).
-This is the dev build (debug symbols, no profile data) — use it for anything that might need gdb
-or a readable ASAN/fuzzer backtrace.
-
-For a release build, use profile-guided optimization instead:
-
-```sh
-make pgo
-```
-
-This is a two-pass build: pass 1 instruments a build and runs it against a representative workload
-plus the full test suite to record real execution-frequency data; pass 2 recompiles from that
-profile so the compiler lays out hot/cold code using actual behavior instead of static heuristics.
-Output is `binary/aer-pgo` (measured ~6-9% fewer instructions/cycles than the plain build on this
-project's own reference benchmark — re-run the comparison on your own workload before relying on
-that number, since PGO's benefit is workload-shaped by construction). Rebuild with `make pgo`
-whenever the source changes — the profile data is regenerated from the current binary each time,
-not cached.
+One build for everything — it carries debug symbols and is the same binary the test suite runs.
+(A PGO build variant used to exist and measured ~6-9% faster; it was dropped to keep the makefile
+small. If you ever need it back: `-fprofile-generate`, run `bench/nbody.aer`, rebuild with
+`-fprofile-use`.)
 
 To clean:
 
@@ -190,12 +177,12 @@ lookup), then the grammar and semantics organized by topic.
 
 ## Keywords
 
-AER has **13 reserved words**, plus the two boolean literals. That's the entire list — nothing else
+AER has **12 reserved words**, plus the two boolean literals. That's the entire list — nothing else
 in the language is reserved:
 
 | Keyword | Role |
 |---------|------|
-| `if` / `else` | conditional statement and inline expression |
+| `if` / `else` | conditional statement |
 | `for` | the single iteration keyword — while, for-each, and ranges all use it |
 | `in` | membership test, and the `for x in ...` iteration form |
 | `as` | cast to a primitive type, or shape-check against a struct type |
@@ -207,9 +194,9 @@ in the language is reserved:
 | `import` | bring a native or file-based module into scope |
 | `true` / `false` | boolean literals |
 
-**Everything else is an ordinary identifier**, including `print`, `length`, `append`, `delete`,
-`type`, `assert`, and `panic` (see [Built-in Functions](#built-in-functions)) and every stdlib name
-(`math`, `random`, `string`, `time`). None of these are keywords — they can be shadowed by a local
+**Everything else is an ordinary identifier**, including `print`, `length`, `type`, `assert`, and
+`panic` (see [Built-in Functions](#built-in-functions)) and every stdlib name
+(`math`, `random`, `string`, `time`, `collection`). None of these are keywords — they can be shadowed by a local
 variable or parameter of the same name, and they compose with everything else a function value can
 (passed around, stored in a variable, piped through `|>`).
 
@@ -239,9 +226,11 @@ matching Rust's `as` precedence convention. `in` sits at comparison precedence, 
 not).
 
 **Assignment** is a statement, not an expression, and isn't part of the precedence table at all:
-`=`, and the compound forms `+=  -=  *=  /=  %=  //=  <<=  >>=  &=  |=  ^=`. Compound assignment
+`=`, and the arithmetic compound forms `+=  -=  *=  /=  %=  //=`. Compound assignment
 works on plain names, indexed targets, and dot-field targets alike — `x += 1`, `arr[i] += 1`, and
-`p.x += 1` are all supported, at any chain depth (`bodies[i].pos[0].x += v`).
+`p.x += 1` are all supported, at any chain depth (`bodies[i].pos[0].x += v`). There are
+deliberately no bitwise compound forms (`&=`, `<<=`, ...) — a second spelling of `x = x & m` with
+no new capability; write it out.
 
 `/` always performs true division and returns a real; `//` is floor division, rounding toward
 negative infinity (matching Python, not C):
@@ -259,22 +248,22 @@ result.
 
 ## Built-in Functions
 
-Eight **core builtins** are always available, with no `import` — ordinary identifiers dispatched
-directly by the VM, not syntax:
+Six **core builtins** are always available, with no `import` — ordinary identifiers dispatched
+directly by the VM, not syntax. The bar for being a builtin is "meaningful for (almost) any value":
 
 | Function | Signature | Behaviour |
 |----------|-----------|-----------|
 | `print(x)` | 1 arg | writes `x`'s string form to stdout, followed by a newline |
 | `type(x)` | 1 arg | returns `x`'s type name as a string (a struct instance returns its declared name) |
 | `length(x)` | 1 arg | element count of an array, entry count of a dict, or a string's character count |
-| `append(arr, x)` | 2 args | mutates `arr` in place, adding `x` at the end; returns `arr` (redundant to capture) |
-| `delete(x, key)` | 2 args | removes index `key` from an array or key `key` from a dict, mutating in place; returns `x` |
 | `assert(cond, msg)` | 2 args | prints `ASSERT FAILED: msg` on a false `cond` and keeps running — see [Error Handling](#error-handling) |
 | `panic(msg)` | 1 arg | aborts like any runtime error, with your own message — see [Error Handling](#error-handling) |
 | `Result(value, err)` | 2 args | builds a genuine `Result` — exactly one argument must be null — capitalized like a struct constructor, not a plain builtin (see [Error Handling](#error-handling)) |
 
-Everything past this — `math`, `random`, `string`, `time`, `io` — requires an explicit `import` and
-is covered in [Standard Library](#standard-library).
+Everything past this — `math`, `random`, `string`, `time`, `collection`, `io` — requires an
+explicit `import` and is covered in [Standard Library](#standard-library). In particular
+`append`/`delete`, which used to be builtins, live in `collection` now, alongside every other
+array/dict operation.
 
 ## Syntax
 
@@ -387,7 +376,7 @@ for ch in word:
 
 Strings support the same comparison operators numbers do — `<`/`>`/`<=`/`>=` compare
 lexicographically (byte-wise, then by length if one is a prefix of the other; the same order
-`math.sort()` already uses for an array of strings), and `in` tests substring membership:
+`collection.sort()` already uses for an array of strings), and `in` tests substring membership:
 
 ```
 print("apple" < "banana")   # true
@@ -727,14 +716,17 @@ print(arr[-1])       # 3  (negative indexing)
 arr[1] = 99
 print(arr)           # [1, 99, 3]
 
-append(arr, 4)        # append (mutates in place; the returned array is redundant to capture)
-delete(arr, 1)        # remove index 1, shifting subsequent elements down (preserves order)
+import collection
+collection.append(arr, 4)  # append (mutates in place; the returned array is redundant to capture)
+collection.delete(arr, 1)  # remove index 1, shifting subsequent elements down (preserves order)
 print(length(arr))    # length
 ```
 
-`delete()` on an array removes by index (negative indices allowed, out-of-range errors) rather than
-by value, and returns the array. There is no separate "remove the last element" function;
-`delete(arr, -1)` covers it.
+Growing, shrinking, reordering, and copying all live in the `collection` module — see
+[Standard Library](#standard-library) for the full list (`append`, `delete`, `insert`, `index_of`,
+`copy`, `keys`, `sort`). `collection.delete()` on an array removes by index (negative indices
+allowed, out-of-range errors) rather than by value, and returns the array. There is no separate
+"remove the last element" function; `collection.delete(arr, -1)` covers it.
 
 Slicing returns a new array — `[a:b]`, `[a:]`, `[:b]`, `[:]`. Out-of-range bounds are clamped
 rather than erroring, matching Python's slicing behavior:
@@ -768,7 +760,7 @@ print(d["missing"])     # null
 
 d["z"] = 3
 "z" in d                # true
-delete(d, "y")          # remove key
+collection.delete(d, "y")  # remove key (import collection)
 length(d)                # number of entries
 ```
 
@@ -826,12 +818,12 @@ print(p1)                # Point{x: 10, y: 2}
 ```
 
 **Isolated data boundaries:** structs are dot-only, collections are bracket-only, and the two
-don't mix. Bracket indexing, slicing, `append()`, and `delete()` are all rejected on a struct
+don't mix. Bracket indexing, slicing, `collection.append()`, and `collection.delete()` are all rejected on a struct
 instance:
 
 ```
 # p1[0]           # error: use '.' not '[]'
-# append(p1, 1)    # error: structs have a fixed shape
+# collection.append(p1, 1)    # error: structs have a fixed shape
 ```
 
 AER has no methods — all functions live in one flat global scope. A function that operates on a
@@ -948,7 +940,7 @@ A pipe chain also works as a bare statement, its result discarded — useful whe
 in place and the return value is redundant to capture:
 
 ```
-b.neighbors |> append(a)   # same as append(b.neighbors, a) — b.neighbors mutates in place
+b.neighbors |> collection.append(a)   # same as collection.append(b.neighbors, a) — mutates in place
 ```
 
 **Enforced:** a pipe target's arguments may not contain a function call at any nesting depth,
@@ -1075,7 +1067,7 @@ print(math.sqrt(16.0))     # 4
 print(random.randint(1, 6))
 ```
 
-There are five native modules — `math`, `random`, `string`, `time`, `json` — not files on disk, but a
+There are six native modules — `math`, `random`, `string`, `time`, `json`, `collection` — not files on disk, but a
 hardcoded set the parser recognizes (see [Standard Library](#standard-library) for the full
 function list). `import math` itself emits no bytecode; it just records "math" as a known module
 name for the rest of the file (or REPL session), consulted entirely at parse time. There's no
@@ -1161,53 +1153,81 @@ rather than any in-language concurrency primitive.
 
 ## Standard Library
 
-There are currently five native modules — `math`, `random`, `string`, `time`, and `json` — plus one
-opt-in host capability, `io`. See [Modularity](#modularity) for how `import` resolves these.
+There are currently six native modules — `math`, `random`, `string`, `time`, `json`, and
+`collection` — plus one opt-in host capability, `io`. See [Modularity](#modularity) for how
+`import` resolves these.
 
 ```
 math.sqrt(x)          # square root, always returns a real; x must be non-negative
 math.pow(x, y)        # x to the power of y, always returns a real; a negative x requires a whole-number y
 math.floor(x)         # round toward negative infinity, returns an integer
 math.ceil(x)          # round toward positive infinity, returns an integer
+math.round(x)         # round to the nearest integer (halves away from zero), returns an integer
 math.abs(x)           # absolute value, preserves integer/real
 math.min(a, b)        # the smaller of two numbers, preserves whichever argument's type
 math.max(a, b)        # the larger of two numbers, preserves whichever argument's type
-math.sort(arr)        # sorts in place (ascending) and returns the array
-math.sin(x), math.cos(x)     # standard trig, x in radians
+math.sin(x), math.cos(x), math.tan(x)   # standard trig, x in radians
+math.exp(x)           # e to the power of x
 math.log(x)           # natural log, x must be positive
 math.log2(x), math.log10(x)  # base-2 / base-10 log, x must be positive
 math.pi()             # the constant, as a function — every native module exposes functions only
 random.random()       # a real in [0, 1)
 random.randint(a, b)  # an integer in [a, b], inclusive of both ends
 random.seed(n)        # reseeds the RNG — makes subsequent random()/randint() calls reproducible
+random.choice(arr)    # one element of a non-empty array, uniformly
+random.shuffle(arr)   # permutes the array in place (Fisher-Yates) and returns it
 string.upper(s)       # ASCII-only uppercase
 string.lower(s)       # ASCII-only lowercase
 string.trim(s)        # strips leading/trailing whitespace
 string.contains(s, sub) # true if sub occurs anywhere in s
+string.index_of(s, sub) # byte index of sub's first occurrence in s, or -1
 string.starts_with(s, prefix), string.ends_with(s, suffix)
 string.repeat(s, n)   # s repeated n times (n must be >= 0)
 string.replace(s, old, new)  # every occurrence of old (non-empty) replaced with new
 string.split(s, sep)  # splits on a non-empty separator, returns an array of strings
 string.join(arr, sep) # joins an array of strings with sep, returns a string
 time.now()            # current epoch time as a real, with sub-second precision
+time.sleep(s)         # pauses for s seconds (integer or real, e.g. 0.25)
 time.strftime(t, fmt) # formats an epoch time (e.g. from time.now()) using C strftime format codes,
                       # in local time — time.strftime(time.now(), "%Y-%m-%d %H:%M:%S")
 json.encode(value)    # returns a JSON string
 json.decode(s)        # returns (value, err) — err non-null on malformed input
 ```
 
-`math.sort(arr)` requires every element to be a number (compared numerically, integer and real mix
-freely) or every element to be a string (compared lexicographically) — mixing the two is rejected
-rather than falling back to some arbitrary tie-break.
-
-`random.randint`'s implementation uses `rand() % span`, which is very slightly biased toward the
-low end of the range for spans that don't evenly divide `RAND_MAX + 1`. A bias-free version needs
-rejection sampling; not worth the complexity here.
+`random` runs its own xoshiro256** generator, not C `rand()` — `random.seed(n)` reproduces the
+identical sequence on every platform, `randint` is bias-free (rejection sampling), and the full
+range of any span is reachable. (C `rand()` was dropped after `RAND_MAX` turned out to be 32767 on
+the MinGW target, which silently capped `randint` at the bottom 32,768 values of a wide range.)
 
 `time.now()` is wall-clock (`clock_gettime(CLOCK_REALTIME, ...)`), not monotonic — a system clock
 adjustment (NTP sync, manual change) could in principle make two successive calls disagree about
 ordering. Good enough for logging and for measuring durations in ordinary scripts; not a substitute
 for a monotonic clock in code that must be robust to clock adjustments mid-run.
+
+### Collections — `collection`
+
+Everything that grows, shrinks, reorders, or duplicates an array or dict lives here — one module,
+rather than a few blessed global builtins (`append`/`delete` used to be builtins; they moved here
+so the global namespace stays tiny and every collection operation is spelled the same way).
+
+```
+import collection
+
+collection.append(arr, x)     # adds x at the end; mutates in place, returns arr (redundant to capture)
+collection.delete(x, key)     # removes index key from an array (negative ok) or key from a dict; mutates in place
+collection.insert(arr, i, x)  # places x at index i, shifting the rest up; i == length(arr) appends
+collection.index_of(arr, x)   # index of the first element equal to x, or -1
+collection.copy(x)            # a new array/dict with the same entries — a shallow copy, one level deep
+collection.keys(d)            # a dict's keys as a new array (hash-bucket order — sort it for determinism)
+collection.sort(arr)          # sorts in place (ascending) and returns the array
+```
+
+`collection.sort(arr)` requires every element to be a number (compared numerically, integer and
+real mix freely) or every element to be a string (compared lexicographically) — mixing the two is
+rejected rather than falling back to some arbitrary tie-break.
+
+`collection.copy` is shallow: the new container has the same *values*, so nested arrays/dicts are
+still shared references. Struct instances are excluded — construct a fresh one instead.
 
 ### JSON — `json`
 
@@ -1231,7 +1251,7 @@ convention as the rest of the fallible stdlib rather than aborting the script on
 
 ### File I/O — `io`, an opt-in host capability, not a native module
 
-Unlike the five native modules above, `io` is **not** hardcoded into the parser's native-module
+Unlike the six native modules above, `io` is **not** hardcoded into the parser's native-module
 table — it's registered like any other host function, via `aer_register_function` (see
 [Embedding](#embedding)). `source/main.c` (the reference CLI) registers it, so `./binary/aer
 script.aer` has file access; an embedding host that links AER into a game or a config parser simply
@@ -1248,7 +1268,10 @@ if err != null:
 io.read(path)     # opens, reads the whole file, and closes it in one call — returns (contents, err)
 io.write(path, s) # opens (truncating), writes s, and closes it — returns (null, err)
 io.append(path, s) # same as io.write(), but opens in append mode instead of truncating
+io.exists(path)   # plain boolean — "no" is an answer here, not an error, so no Result
+io.remove(path)   # deletes the file — returns (null, err)
 io.stdin()        # returns a handle for piped input (always succeeds) — pass it to io.read() instead of a path
+io.args()         # the script's own command-line arguments (everything after the script path), as an array of strings
 ```
 
 Every `io` function follows the `(value, err)` convention `safe_div` establishes at the user level
@@ -1371,12 +1394,12 @@ game, a config parser) simply doesn't call it, and its scripts have none.
 | Behaviour | What happens | Workaround |
 |-----------|-------------|------------|
 | `/` always returns real | `1 / 1` → `1.0` | Use `//` for integer floor division |
-| Arrays and dicts are references | `b = a; b[0] = 99` modifies `a` too | No built-in copy; iterate to clone |
+| Arrays and dicts are references | `b = a; b[0] = 99` modifies `a` too | `b = collection.copy(a)` when you really want a distinct container (shallow — one level) |
 | `&&`/`||` return boolean, not operand | `x = x \|\| "default"` doesn't work | `if x:` ... `else: x = "default"` |
 | Referencing a name that was never assigned is a compile error | `print(x)` with no prior `x = ...` anywhere fails to compile | Assign it first (`x = null` if there's genuinely nothing better) |
 | Missing dict key returns `null` | No error, silent | Use `key in dict` before access |
-| `append()`/`delete()` mutate arrays in place and also return them | `arr = append(arr, v)` works but is redundant — the mutation already happened | Call `append(arr, v)` / `delete(arr, i)` as a statement |
-| Repeated `s += x` in a loop is quadratic | Strings are immutable — every `+=` allocates a fresh buffer and copies the whole thing so far, not just the addition | Build a list with `append()` and join once: `parts = []; for ...: append(parts, x); s = string.join(parts, "")` |
+| `collection.append()`/`delete()`/`sort()`/`shuffle()` mutate in place and also return the container | `arr = collection.append(arr, v)` works but is redundant — the mutation already happened | Call them as statements |
+| Repeated `s += x` in a loop is quadratic | Strings are immutable — every `+=` allocates a fresh buffer and copies the whole thing so far, not just the addition | Build a list with `collection.append()` and join once: `parts = []; for ...: collection.append(parts, x); s = string.join(parts, "")` |
 | `as Type` never converts | `some_dict as Point` errors rather than reshaping the dict into a Point | Build the struct explicitly: `Point(some_dict["x"], ...)` |
 | Struct instances are still `AerArray` under the hood | `length(p)` works and returns the field count (not blocked) | Harmless but not the intended API — use dot access |
 | Pipe rejects nested calls in target args | `x \|> f(g(1))` is a parse error, at any depth | Assign the inner call to a variable first: `t = g(1); x \|> f(t)` |
@@ -1403,7 +1426,7 @@ game, a config parser) simply doesn't call it, and its scripts have none.
   function/struct persistence work. The file-module registry grows the same way during normal
   execution, but an embedding host can explicitly reclaim it via `aer_module_free_all()` (see
   [Embedding](#embedding)) when tearing the process down.
-- No networking, regex, or date/time parsing — `time` covers `now()`/`strftime()` only. File I/O
+- No networking, regex, or date/time parsing — `time` covers `now()`/`sleep()`/`strftime()` only. File I/O
   exists but is a host-registered opt-in ([Standard Library](#standard-library)), not always
   available.
 - No try/catch **at the AER language level** — runtime errors are still not catchable AER
@@ -1425,48 +1448,23 @@ game, a config parser) simply doesn't call it, and its scripts have none.
 
 ## Benchmarking
 
-A benchmark script is included at [`tests/benchmark.sh`](tests/benchmark.sh). It compares AER against Python
-(required) and Lua (optional) across five workloads: recursive Fibonacci, a tight counting loop, dict
-insert/lookup, higher-order function calls, and struct field access.
+Two canonical workloads live in [`bench/`](bench/): [`nbody.aer`](bench/nbody.aer) (float-heavy
+struct arithmetic — the workload every performance decision in this project was measured against)
+and [`sieve.aer`](bench/sieve.aer) (integer/array-heavy iteration). Time them with your shell's
+`time` (or `perf stat` on Linux) against equivalent Python/Lua if you want a comparison — the
+cross-language harness and reference implementations that used to live in the repo were dropped as
+clutter; the workloads themselves are trivial to port.
 
-```sh
-chmod +x tests/benchmark.sh
-./tests/benchmark.sh
-```
+**Where AER lands:** faster than CPython across these workloads, and within striking distance of
+Lua everywhere except raw tight-loop iteration (a specializing interpreter is hard to beat there
+without a JIT). AER's advantage is startup time, simplicity of embedding, and being fast enough
+that the difference rarely matters.
 
-**Expected results:** AER beats Python on every workload, and matches or beats Lua outside of the
-raw tight-loop case (Lua's own bytecode VM is hard to beat on pure iteration without a JIT). The VM
-has no JIT and no type specialisation, so it won't out-loop a specializing interpreter — its
-advantage is startup time, simplicity of embedding, and being fast enough that the difference rarely
-matters in practice.
-
-### Packed arrays at scale
-
-[`bench/nbody.aer`](bench/nbody.aer) (the classic n-body benchmark, N=5 bodies) is small enough
-that its whole working set stays resident in L1 cache regardless of memory layout — it doesn't
-exercise packed arrays' actual advantage. [`bench/nbody_large_packed.aer`](bench/nbody_large_packed.aer)
-and [`bench/nbody_large_boxed.aer`](bench/nbody_large_boxed.aer) run the identical physics and deterministic
-initial conditions at N=1024, differing only in one line: a packed `Body[1024]` versus an ordinary
-array of individually heap-allocated `Body()` instances. Measured on a Raspberry Pi (5-run-averaged
-`perf stat`, interleaved):
-
-| Metric | Packed | Boxed | Difference |
-|--------|-------:|------:|:-----------|
-| Instructions | 25.86B | 32.33B | -20.0% |
-| Cycles | 14.38B | 18.72B | -23.2% |
-| Cache misses | 4.76M (0.048% of refs) | 42.0M (0.307% of refs) | ~8.8x fewer |
-| Wall clock | 8.16s | 10.03s | -18.6% |
-
-This is the honest, at-scale number for AER's stated data-oriented-design purpose — the cache-miss
-reduction specifically is packed arrays' actual value proposition, not the smaller (and less
-dramatic) instruction-count win alone.
-
-### Profile-guided optimization
-
-`make pgo` (see [Building](#building)) measured ~6-9% fewer instructions/cycles than the plain
-build on `nbody.aer` — re-run the comparison on your own workload before relying on that exact
-number, since PGO's benefit is workload-shaped by construction (it profiles against `nbody.aer`
-plus the test suite, not your specific program).
+**Packed arrays at scale** (recorded result — the N=1024 variant files were dropped from the repo,
+the numbers stand): `nbody` at N=1024 with a packed `Body[1024]` versus an ordinary array of
+heap-allocated instances, on a Raspberry Pi (5-run-averaged `perf stat`): -20% instructions, -23%
+cycles, ~8.8x fewer cache misses, -18.6% wall clock. The cache-miss reduction is packed arrays'
+actual value proposition; `bench/nbody.aer` at N=5 fits in L1 and cannot show it.
 
 ---
 
@@ -1882,8 +1880,7 @@ raises a normal AER runtime error instead of risking a stack overflow.
 | `tests/embed_smoke_test.c` | Minimal standalone embedding host — proves a runtime error doesn't kill the process, demonstrates the VM-reuse-after-error contract, and registers/calls a custom host function. Build/run with `make test-embed`. |
 | `tests/smoke_test.c` | Register-VM unit test — hand-built bytecode plus real-source coverage below the level of a full `.aer` file. Build/run with `make test-smoke`. |
 | `tests/fuzz.py` | Mutation-based fuzzer against an ASAN build — reports crashes and hangs. Run with `make fuzz`. |
-| `tests/benchmark.sh` | Cross-language benchmark against Python/Lua (see [Benchmarking](#benchmarking)) |
-| `bench/` | Standalone benchmark scripts — `nbody.aer`/`nbody_large_*.aer` (packed arrays, see [Benchmarking](#benchmarking)), `fib_bench.aer`, `sieve.aer`, micro-benches, plus the Python/Lua reference versions of nbody and sieve |
-| `.github/workflows/ci.yml` | CI: builds, runs `make test`, `make test-embed`, `make fuzz` (ASAN, fixed seed), and `make coverage` |
+| `bench/` | The two canonical benchmark workloads — `nbody.aer` and `sieve.aer` (see [Benchmarking](#benchmarking)) |
+| `.github/workflows/ci.yml` | CI: Ubuntu (`make test`, `make test-embed`, `make fuzz`) and Windows/MSYS2 (`make test`, `make test-embed`, `make test-smoke`) |
 
 ---

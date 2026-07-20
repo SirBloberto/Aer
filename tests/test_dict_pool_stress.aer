@@ -1,5 +1,6 @@
 # Dict payload pooling (hashtable.c's size-classed key/bucket-array pools) stress coverage.
-# Existing dict coverage in test_collections.aer is light (one dict, one delete(), no rehash, no
+import collection
+# Existing dict coverage in test_collections.aer is light (one dict, one collection.delete(), no rehash, no
 # fallback path) — this exercises the specific patterns the pooling change needs to get right:
 # multi-tier rehash growth, scrambled removal/reinsertion, both fallback paths (oversized key,
 # oversized bucket array), an embedded-NUL key, and Chunk.name_index (the shared, easy-to-forget
@@ -31,7 +32,7 @@ for i < 500:
 i = 0
 for i < 500:
     scrambled = (i * 137) % 500
-    delete(d2, "k_{scrambled}")
+    collection.delete(d2, "k_{scrambled}")
     d2["fresh_{i}"] = i * 2
     i += 1
 assert(length(d2) == 500, "500 keys remain after 500 scrambled deletes interleaved with 500 fresh inserts")

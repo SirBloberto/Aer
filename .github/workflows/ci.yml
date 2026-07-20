@@ -19,8 +19,11 @@ jobs:
 
       # Fixed seed for reproducibility — see tests/fuzz.py's docstring on why
       # an unseeded run occasionally reports a non-actionable "hang" from a
-      # seed fixture's own recursive logic, not an AER defect.
+      # seed fixture's own recursive logic, not an AER defect. timeout-minutes
+      # so a genuinely stuck run fails the job fast instead of eating GitHub's
+      # 6-hour default (a fuzz-runner hang has happened before).
       - name: Fuzz (ASAN build, fixed seed)
+        timeout-minutes: 20
         shell: bash
         run: |
           set -o pipefail
@@ -29,17 +32,28 @@ jobs:
           make fuzz 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Code coverage
-        shell: bash
-        run: |
-          set -o pipefail
-          echo "## Code coverage" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          make coverage 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+  # The primary development platform is Windows/MSYS2 — this job catches Windows-only breakage
+  # (SEH/longjmp interplay, terminal.c's Win32 console paths, MinGW libc differences) that the
+  # Ubuntu job structurally cannot see.
+  build-and-test-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Upload coverage data
-        uses: actions/upload-artifact@v4
+      - uses: msys2/setup-msys2@v2
         with:
-          name: coverage-gcov
-          path: object-cov/*.gcov
+          msystem: MINGW64
+          update: false
+          install: make mingw-w64-x86_64-gcc
+
+      - name: Run test suite
+        run: make test
+
+      - name: Run embedding smoke test
+        run: make test-embed
+
+      - name: Run register-VM smoke test
+        run: make test-smoke

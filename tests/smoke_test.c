@@ -916,8 +916,8 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "x = 6\nx &= 3\n");
-        check(ok, "real source bitwise compound assignment ('x = 6; x &= 3') ran without error");
+        bool ok = run_source(&c, &vm, "x = 6\nx = x & 3\n");
+        check(ok, "real source bitwise and-with-reassign ('x = x & 3') ran without error — the compound '&=' spelling was deliberately removed");
         check(aer_as_int(register_get(&vm, 0)) == 2, "x == 2 (6 & 3)");
         chunk_free(&c);
     }
@@ -1289,7 +1289,7 @@ int main(void) {
         chunk_free(&c);
     }
 
-    /* Test 57 (feature completeness): global builtins — length(), append(), type(). */
+    /* Test 57 (feature completeness): global builtins — length(), collection.append(), type(). */
     {
         Chunk c;
         chunk_init(&c);
@@ -1303,9 +1303,9 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "arr = [1, 2]\nappend(arr, 3)\ny = length(arr)\n");
-        check(ok, "real source 'append(arr, 3)' as a bare statement ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 3, "y == 3 — append() grew the same array in place");
+        bool ok = run_source(&c, &vm, "import collection\narr = [1, 2]\ncollection.append(arr, 3)\ny = length(arr)\n");
+        check(ok, "real source 'collection.append(arr, 3)' as a bare statement ran without error");
+        check(aer_as_int(register_get(&vm, 1)) == 3, "y == 3 — collection.append() grew the same array in place");
         chunk_free(&c);
     }
     {
@@ -1762,8 +1762,9 @@ int main(void) {
             "fn = greet\n"
             "assert(fn(\"Value\") == \"Hello, Value!\", \"default still applies through a function-value call\")\n"
             "\n"
+            "import collection\n"
             "function collect(x, seen = []):\n"
-            "    append(seen, x)\n"
+            "    collection.append(seen, x)\n"
             "    return seen\n"
             "r1 = collect(1)\n"
             "r2 = collect(2)\n"

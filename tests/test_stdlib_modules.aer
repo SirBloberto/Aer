@@ -10,6 +10,7 @@
 
 import math
 import random
+import collection
 
 assert(math.sqrt(16.0) == 4, "math.sqrt")
 assert(math.pow(2, 10) == 1024, "math.pow")
@@ -20,17 +21,22 @@ assert(math.abs(-5.5) == 5.5, "math.abs on a real")
 assert(math.min(3, 7) == 3, "math.min")
 assert(math.max(3, 7) == 7, "math.max")
 
-sorted_nums = math.sort([5, 3, 8, 1, 9, 2])
-assert(sorted_nums[0] == 1 && sorted_nums[1] == 2 && sorted_nums[5] == 9, "math.sort on numbers, ascending")
+sorted_nums = collection.sort([5, 3, 8, 1, 9, 2])
+assert(sorted_nums[0] == 1 && sorted_nums[1] == 2 && sorted_nums[5] == 9, "collection.sort on numbers, ascending")
 
-sorted_words = math.sort(["banana", "apple", "cherry"])
-assert(sorted_words[0] == "apple" && sorted_words[1] == "banana" && sorted_words[2] == "cherry", "math.sort on strings, lexicographic")
+sorted_words = collection.sort(["banana", "apple", "cherry"])
+assert(sorted_words[0] == "apple" && sorted_words[1] == "banana" && sorted_words[2] == "cherry", "collection.sort on strings, lexicographic")
 
 assert(math.sin(0) == 0, "math.sin(0)")
 assert(math.cos(0) == 1, "math.cos(0)")
 assert(math.log(1) == 0, "math.log(1) — natural log")
 assert(math.log2(8) == 3, "math.log2(8)")
 assert(math.log10(1000) == 3, "math.log10(1000)")
+assert(math.round(2.5) == 3 && math.round(2.4) == 2, "math.round() rounds to nearest integer")
+assert(math.round(-2.5) == -3, "math.round() rounds negative halves away from zero, not toward zero")
+assert(math.tan(0) == 0, "math.tan(0)")
+assert(math.exp(0) == 1, "math.exp(0)")
+assert(math.exp(1) > 2.718 && math.exp(1) < 2.719, "math.exp(1) is e")
 assert(math.pi() > 3.14 && math.pi() < 3.15, "math.pi() is a function, not a bare module value")
 
 r = random.random()
@@ -47,6 +53,28 @@ random.seed(42)
 seeded_second = random.random()
 assert(seeded_first == seeded_second, "random.seed() makes subsequent random() calls reproducible")
 
+# Wide spans — the old C-rand() implementation (RAND_MAX 32767 on MinGW) could never produce a
+# value above min+32767 for a span this wide; 60 draws each miss the top half with p < 1e-7.
+random.seed(7)
+randint_saw_high = false
+for wide_i in 0..60:
+    if random.randint(1, 100000) > 50000:
+        randint_saw_high = true
+assert(randint_saw_high, "random.randint() reaches the full requested range, not just the bottom 32768 values")
+
+choice_pool = [10, 20, 30]
+chosen = random.choice(choice_pool)
+assert(chosen == 10 || chosen == 20 || chosen == 30, "random.choice() returns one of the array's own elements")
+
+shuffle_arr = [1, 2, 3, 4, 5, 6, 7, 8]
+random.shuffle(shuffle_arr)
+shuffle_sorted = collection.sort(collection.copy(shuffle_arr))
+shuffle_ok = length(shuffle_arr) == 8
+for shuffle_i in 0..8:
+    if shuffle_sorted[shuffle_i] != shuffle_i + 1:
+        shuffle_ok = false
+assert(shuffle_ok, "random.shuffle() permutes in place — same elements, same length")
+
 # sqrt(16.0) — error: stdlib functions require the module prefix once imported
 
 import string
@@ -57,6 +85,9 @@ assert(string.lower("HELLO") == "hello", "string.lower")
 assert(string.trim("  padded  ") == "padded", "string.trim")
 assert(string.contains("hello world", "wor"), "string.contains — match")
 assert(!string.contains("hello world", "xyz"), "string.contains — no match")
+assert(string.index_of("hello world", "wor") == 6, "string.index_of — position of the first match")
+assert(string.index_of("hello world", "xyz") == -1, "string.index_of — -1 when absent")
+assert(string.index_of("aXbXc", "X") == 1, "string.index_of — first of several matches")
 
 split_result = string.split("a,b,c", ",")
 assert(length(split_result) == 3 && split_result[0] == "a" && split_result[2] == "c", "string.split")
@@ -94,6 +125,11 @@ assert(t_after - t_before < 5.0, "the same short interval measures as a small fr
 # parts that don't depend on timezone are asserted.
 formatted = time.strftime(1700000000, "%Y")
 assert(formatted == "2023", "time.strftime() formats a timestamp using a strftime-style format string")
+
+sleep_before = time.now()
+time.sleep(0.05)
+sleep_after = time.now()
+assert(sleep_after - sleep_before >= 0.04, "time.sleep() really waits at least (about) the requested interval")
 
 # ------------------------------------------------------------------ #
 # 26. File-based imports                                              #
@@ -167,6 +203,19 @@ assert(append_err == null, "io.append() succeeds and returns no error")
 appended_contents, appended_read_err = io.read(scratch_path)
 assert(appended_read_err == null && appended_contents == "hello from AER\nsecond line\nthird line",
        "io.append() adds to the end of an existing file rather than truncating it")
+
+assert(io.exists(scratch_path), "io.exists() is true for a file that was just written")
+assert(!io.exists("tests/definitely_does_not_exist.txt"), "io.exists() is false for a missing path — an answer, not an error")
+
+remove_result, remove_err = io.remove(scratch_path)
+assert(remove_err == null, "io.remove() deletes an existing file without error")
+assert(!io.exists(scratch_path), "the removed file is really gone")
+missing_remove, missing_remove_err = io.remove(scratch_path)
+assert(missing_remove_err != null, "io.remove() on a now-missing path reports an error through the Result, not an abort")
+
+# The test suite runs scripts with no extra CLI arguments, so args() is empty here; the CLI
+# passes everything after the script path through (see main.c).
+assert(length(io.args()) == 0, "io.args() with no script arguments is an empty array")
 
 # ------------------------------------------------------------------ #
 # json — encode/decode (a native module, same dispatch as math/string) #

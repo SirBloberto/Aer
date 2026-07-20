@@ -38,11 +38,6 @@ typedef enum TokenType {
     TOKEN_DIVIDE_ASSIGN,    /* /=  */
     TOKEN_MODULO_ASSIGN,    /* %=  */
     TOKEN_FLOOR_DIVIDE_ASSIGN, /* //= */
-    TOKEN_LEFT_SHIFT_ASSIGN,/* <<= */
-    TOKEN_RIGHT_SHIFT_ASSIGN,/* >>= */
-    TOKEN_AND_ASSIGN,       /* &=  */
-    TOKEN_OR_ASSIGN,        /* |=  */
-    TOKEN_XOR_ASSIGN,       /* ^=  */
 
     /* Unary operators */
     TOKEN_NOT,              /* !  */
@@ -108,11 +103,8 @@ extern Token token;
 const char* current_source_start();
 const char* current_source_cursor();
 
-/* Exposed so parser.c's forward-reference resolution can report a deferred "genuinely never
-   defined" error at the ORIGINAL call site instead of wherever the cursor ends up once that's
-   detected (end of compile). Callers must save current_source_cursor()'s return value before
-   overriding it with this, then restore it via a second call — this mutates the current File's
-   cursor field in place; it does not switch files like lexer_save_state/lexer_restore_state do. */
+/* Report a deferred error at a SAVED cursor position: save current_source_cursor() first,
+   override, then restore. Mutates the current File's cursor; does not switch files. */
 void lexer_set_cursor(const char* pos);
 
 /* Exposed so parser.c can tag each statement's bytecode with its source line (see Chunk.line_mark_offsets, vm.h). */

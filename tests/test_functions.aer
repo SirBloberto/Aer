@@ -1,4 +1,5 @@
 #!/usr/bin/env aer
+import collection
 # AER test suite — functions, the pipe operator, multiple return
 # values, and destructuring.
 # Machine-checked via assert(): a clean run exits 0; any failure prints
@@ -118,7 +119,7 @@ assert(result2 == 16, "pipe chains read left to right ((3+1)^2 = 16)")
 # assignment ... is not supported") since only calls and assignments were
 # recognized as valid statement shapes.
 function pipe_stmt_append(entry, tag):
-    append(entry, tag)
+    collection.append(entry, tag)
 
 numbers_list = [1, 2, 3]
 numbers_list |> pipe_stmt_append("touched")
@@ -168,6 +169,10 @@ assert(bump_err == null && bumped == 42,
 # side.
 increment(1, 1) |> square2()               # a plain (non-module) call leading a pipe statement
 io.read(pipe_json_path) |> json.decode()   # a module call leading a pipe statement
+
+# Fixture cleanup — the suite shouldn't leave scratch files behind in the working tree.
+cleanup_ok, cleanup_err = io.remove(pipe_json_path)
+assert(cleanup_err == null, "pipe fixture file removed after the pipe/Result tests")
 
 # Result() -- the only way AER source itself can construct a genuine Result, so a
 # user-written fallible function can participate in `|>`'s short-circuit the same way
@@ -235,9 +240,9 @@ assert(error == "not a keyword", "error is an ordinary variable name outside a r
 # recognized as a statement; `queue[i](args)` hit the same "compound
 # assignment" error pipe chains used to.
 function log_a(log):
-    append(log, "a")
+    collection.append(log, "a")
 function log_b(log):
-    append(log, "b")
+    collection.append(log, "b")
 
 call_log = []
 queue = [log_a, log_b]
@@ -300,7 +305,7 @@ assert(f("Value") == "Hello, Value!", "a default still applies through a functio
 #     failing with "Expression too large to compile")                 #
 # ------------------------------------------------------------------ #
 
-# The same lexicographic order math.sort() already assumes for strings (aer_math.c's sort_cmp),
+# The same lexicographic order collection.sort() already assumes for strings (aer_math.c's sort_cmp),
 # exposed as ordinary comparison operators instead of only being reachable through sort().
 assert("apple" < "banana", "string < is lexicographic")
 assert(!("banana" < "apple"), "string < is false the other way around")

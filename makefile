@@ -1,11 +1,5 @@
-# Windows/MSYS2 needs a .exe suffix, kernel32 (terminal.c's Win32 console API), and
-# -static (otherwise the exe depends on MSYS2's libwinpthread-1.dll and silently fails
-# to launch outside the exact shell it was built in). Detected via `uname -s`, not
-# $(OS) — that env var doesn't reliably survive into an MSYS2 login shell.
-# Match "_NT" rather than "MINGW": a bash launched without MSYSTEM=MINGW64 set (e.g.
-# a plain Git Bash / VS Code terminal session) reports "MSYS_NT-..." instead of
-# "MINGW64_NT-...", which "MINGW" alone misses — silently skipping this whole branch
-# and producing an unstatic, un-kernel32-linked .exe that looks like a normal build.
+# Match "_NT" not "MINGW": plain Git Bash reports "MSYS_NT-...", which "MINGW" misses — and
+# without -static the exe silently depends on MSYS2 DLLs and won't launch outside its build shell.
 ifneq (,$(findstring _NT,$(shell uname -s 2>/dev/null)))
     EXE     := .exe
     WINLIBS := -lkernel32 -static
@@ -14,48 +8,33 @@ else
     WINLIBS :=
 endif
 
-# -flto: pool_cell_state/pool_is_young/gc_barrier_array (utilities/pool.c) are hot, tiny functions
-# called constantly from vm.c — a different translation unit, so without LTO every call pays full
-# cross-TU call/return overhead no matter how small the callee is. Measured real win on nbody.aer:
-# ~4.4% fewer instructions, ~5-7% fewer cycles/faster wall clock, on top of everything else this
-# session landed. All 3 test suites verified unaffected before making this the default.
+# -flto is load-bearing: pool.c's tiny hot helpers are called constantly from vm.c cross-TU.
 FLAGS := -O2 -g -flto -Wall -Wextra -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities
 
 SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/stdlib/*.c source/utilities/*.c)
 OBJECT := $(patsubst source/%.c,object/%.o,$(SOURCE))
 
-# object/%.o only depends on its own .c file (below), not on any header it includes — editing a
-# shared header (e.g. vm.h) leaves every OTHER .o that includes it stale, and they still link in
-# without error, just with mismatched struct layouts against whatever .o *did* get rebuilt.
-# Confirmed as a real, reproducible bug this way, not theoretical: a CallFrame layout change built
-# via plain `make` (no clean) linked cleanly and then produced silently wrong runtime results. A
-# `-MMD -MP` + generated-.d-file fix was tried and reverted — GNU Make under MSYS2/Windows didn't
-# reliably pick up the generated dependencies (confirmed via `make -n` still showing only the
-# directly-touched .c file needing a rebuild even after regenerating .d files), so it wasn't a real
-# fix, just untested-looking safety. Until this is solved properly: run `make clean` before
-# rebuilding whenever a header's struct layout changed, not just `make`.
+# Deliberately coarse: any header edit rebuilds everything. -MMD/-MP was tried and genuinely does
+# not work under GNU Make on MSYS2, and a stale .o with a mismatched struct layout links cleanly
+# and misbehaves silently at runtime.
+HEADERS := $(wildcard include/*.h source/*.h source/compiler/*.h source/core/*.h source/stdlib/*.h source/utilities/*.h)
 
-
-# Everything except main.c — conflicts with test-embed's/test-smoke's own main() below.
+# Everything except main.c — conflicts with test-embed's/test-smoke's own main().
 LIBOBJECT := $(filter-out object/main.o,$(OBJECT))
 
 all: $(OBJECT)
 	@mkdir -p binary object
 	gcc $(FLAGS) -o binary/aer$(EXE) $^ -lm $(WINLIBS)
 
-object/%.o: source/%.c
+object/%.o: source/%.c $(HEADERS)
 	@mkdir -p $(dir $@)
 	gcc $(FLAGS) -c $< -o $@
 
-# Disassembler + opcode/memory profiling (source/core/disasm.c, AER_DEBUG_TOOLS-gated code in
-# vm.c/vm.h) — entirely absent from every other target, including `all`. Pass --debug-path=<path>
-# (a path, or "-" for stderr) to dump a disassembly + hit-count summary + memory report after the
-# script runs; omitted behaves exactly like a normal build.
+# Disassembler/profiler build (AER_DEBUG_TOOLS): pass --debug-path=<path|-> to dump after a run.
 debug-tools: $(SOURCE)
 	@mkdir -p binary
 	gcc $(FLAGS) -DAER_DEBUG_TOOLS -o binary/aer-debug$(EXE) $(SOURCE) -lm $(WINLIBS)
 
-# Split across focused files rather than one monolith — run all in sequence, stop at the first failure.
 TESTS := tests/test_core.aer \
          tests/test_collections.aer \
          tests/test_functions.aer \
@@ -76,73 +55,31 @@ test: all
 	@echo "=== tests/test_stdin.aer (piped input) ==="
 	@echo "expected stdin content" | ./binary/aer$(EXE) tests/test_stdin.aer
 
-# Builds and runs tests/embed_smoke_test.c, which links the library directly (no main.c/CLI).
+# Embedding smoke test — links the library directly, no main.c/CLI.
 test-embed: $(LIBOBJECT)
 	@mkdir -p binary object
 	gcc $(FLAGS) -c tests/embed_smoke_test.c -o object/embed_smoke_test.o
 	gcc $(FLAGS) -o binary/embed_smoke_test$(EXE) $(LIBOBJECT) object/embed_smoke_test.o -lm $(WINLIBS)
 	./binary/embed_smoke_test$(EXE)
 
-# Register-VM unit test (tests/smoke_test.c) — exercises the allocator and opcodes directly,
-# below the level of a real .aer file (hand-built register trees, REPL-persistence behavior, etc.),
-# complementing the `test` target's end-to-end .aer coverage. Has its own main(), so main.c is
-# excluded here too, matching test-embed's pattern above.
+# Register-VM unit test — exercises allocator/opcodes below the .aer-file level.
 test-smoke: $(LIBOBJECT)
 	@mkdir -p binary object
 	gcc $(FLAGS) -c tests/smoke_test.c -o object/smoke_test.o
 	gcc $(FLAGS) -o binary/smoke_test$(EXE) $(LIBOBJECT) object/smoke_test.o -lm $(WINLIBS)
 	./binary/smoke_test$(EXE)
 
-# ASAN build for tests/fuzz.py — catches non-crashing memory bugs a plain build misses.
-# Needs libasan (standard on Linux/macOS); may not link on a bare MinGW/MSYS2 install.
+# ASAN build for tests/fuzz.py; may not link on a bare MinGW install (needs libasan).
 asan: $(SOURCE)
 	@mkdir -p binary
 	gcc $(FLAGS) -fsanitize=address -fno-omit-frame-pointer -o binary/aer-asan$(EXE) $(SOURCE) -lm $(WINLIBS)
 
-# Fixed seed keeps CI deterministic (see tests/fuzz.py's docstring on its one known
-# non-actionable "hang" class). Override for exploratory runs, e.g. FUZZ_SEED= FUZZ_ITERATIONS=5000.
+# Fixed seed keeps CI deterministic; override for exploratory runs (FUZZ_SEED= FUZZ_ITERATIONS=5000).
 FUZZ_ITERATIONS := 300
 FUZZ_SEED       := --seed 100
 
 fuzz: asan
 	python3 tests/fuzz.py --binary binary/aer-asan$(EXE) --iterations $(FUZZ_ITERATIONS) $(FUZZ_SEED)
 
-# Profile-guided optimization: a two-pass build, not a source change. Pass 1 instruments a build
-# with -fprofile-generate and runs it against bench/nbody.aer (the actual workload this targets) plus the
-# full test suite (broader code-path coverage), producing real execution-frequency data in
-# object-pgo/*.gcda; pass 2 recompiles with -fprofile-use so gcc lays out hot/cold code from that
-# real profile instead of static heuristics.
-PGO_DIR := object-pgo
-
-pgo: $(SOURCE)
-	@rm -rf $(PGO_DIR)
-	@mkdir -p binary $(PGO_DIR)
-	gcc $(FLAGS) -fprofile-generate=$(PGO_DIR) -o binary/aer-pgo-gen$(EXE) $(SOURCE) -lm $(WINLIBS)
-	./binary/aer-pgo-gen$(EXE) bench/nbody.aer
-	@for t in $(TESTS); do ./binary/aer-pgo-gen$(EXE) $$t >/dev/null 2>&1 || true; done
-	gcc $(FLAGS) -fprofile-use=$(PGO_DIR) -fprofile-correction -Wno-coverage-mismatch -Wno-missing-profile -o binary/aer-pgo$(EXE) $(SOURCE) -lm $(WINLIBS)
-
-COVOBJECT := $(patsubst source/%.c,object-cov/%.o,$(SOURCE))
-
-object-cov/%.o: source/%.c
-	@mkdir -p $(dir $@)
-	gcc $(FLAGS) --coverage -O0 -c $< -o $@
-
-# Coverage build: runs the test suite + a fuzz pass, then prints a per-file/overall
-# line-coverage percentage via gcov (no lcov dependency). Raw .gcov files land in object-cov/.
-coverage: $(COVOBJECT)
-	@mkdir -p binary
-	gcc $(FLAGS) --coverage -O0 -o binary/aer-cov$(EXE) $(COVOBJECT) -lm $(WINLIBS)
-	@for t in $(TESTS); do ./binary/aer-cov$(EXE) $$t >/dev/null 2>&1 || true; done
-	@echo "expected stdin content" | ./binary/aer-cov$(EXE) tests/test_stdin.aer >/dev/null 2>&1 || true
-	python3 tests/fuzz.py --binary binary/aer-cov$(EXE) --iterations 200 $(FUZZ_SEED) || true
-	@for o in $(COVOBJECT); do \
-		subdir=$$(dirname $$o); \
-		src=$${o#object-cov/}; src=source/$${src%.o}.c; \
-		gcov -abcfu -o $$subdir $$src > /dev/null 2>&1; \
-	done
-	@mv -f *.gcov object-cov/ 2>/dev/null || true
-	python3 tests/coverage_summary.py object-cov
-
 clean:
-	rm -rf binary/* object/* object-cov/* object-pgo/* tests/fuzz_crashes
+	rm -rf binary/* object/* tests/fuzz_crashes

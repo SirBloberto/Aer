@@ -41,13 +41,12 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_STRING_CONTAINS && arg_count == 2) {
         AerVal needle = vm_stack_pop(vm); AerVal hay = vm_stack_pop(vm);
         if (aer_type(hay) != TYPE_STRING || aer_type(needle) != TYPE_STRING) { error("string.contains() requires two strings"); vm_stack_push(vm, aer_null()); return true; }
-        AerString* hs = aer_as_string(hay);
-        AerString* ns = aer_as_string(needle);
-        unsigned int hlen = hs->length, nlen = ns->length;
-        bool found = nlen == 0;
-        for (unsigned int i = 0; !found && i + nlen <= hlen; i++)
-            if (memcmp(hs->data + i, ns->data, nlen) == 0) found = true;
-        vm_stack_push(vm, aer_bool(found)); return true;
+        vm_stack_push(vm, aer_bool(aer_string_find(aer_as_string(hay), aer_as_string(needle)) >= 0)); return true;
+    }
+    if (fn_id == FN_STRING_INDEX_OF && arg_count == 2) {
+        AerVal needle = vm_stack_pop(vm); AerVal hay = vm_stack_pop(vm);
+        if (aer_type(hay) != TYPE_STRING || aer_type(needle) != TYPE_STRING) { error("string.index_of() requires two strings"); vm_stack_push(vm, aer_null()); return true; }
+        vm_stack_push(vm, aer_int(aer_string_find(aer_as_string(hay), aer_as_string(needle)))); return true;
     }
     if (fn_id == FN_STRING_SPLIT && arg_count == 2) {
         AerVal sep_v = vm_stack_pop(vm); AerVal s_v = vm_stack_pop(vm);
@@ -110,6 +109,11 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
         int64_t n = aer_as_int(n_v);
         if (n < 0) { error("string.repeat() count must not be negative"); vm_stack_push(vm, aer_null()); return true; }
         AerString* ss = aer_as_string(s_v);
+        /* Checked in 64 bits before the 32-bit multiply below — length * n silently wrapping
+           would undersize the buffer and the copy loop would write past it. */
+        if (ss->length > 0 && (uint64_t)ss->length * (uint64_t)n > 0x7FFFFFFFULL) {
+            error("string.repeat() result too large"); vm_stack_push(vm, aer_null()); return true;
+        }
         unsigned int total = ss->length * (unsigned int)n;
         char* buf = xmalloc(total + 1);
         for (int64_t i = 0; i < n; i++) memcpy(buf + (unsigned int)i * ss->length, ss->data, ss->length);
@@ -126,7 +130,7 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
         AerString* nsv = aer_as_string(new_v);
         if (os->length == 0) { error("string.replace() 'old' argument cannot be empty"); vm_stack_push(vm, aer_null()); return true; }
 
-        /* Two passes — count matches first so the output buffer is sized exactly once, same discipline string.join uses, rather than a growable buffer. */
+        /* Count matches first so the output buffer is sized exactly once */
         unsigned int matches = 0;
         for (unsigned int i = 0; i + os->length <= ss->length; ) {
             if (memcmp(ss->data + i, os->data, os->length) == 0) { matches++; i += os->length; }

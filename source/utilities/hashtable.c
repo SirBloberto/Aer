@@ -11,29 +11,16 @@
 
 static void rehash(HashTable* t);
 
-/* t->capacity is always a power of two (starts at HASHTABLE_INIT_SIZE, only ever doubles in
-   rehash), so every probe index below uses `& (capacity - 1)` instead of `% capacity`. */
+/* t->capacity is always a power of two, so every probe index uses `& (capacity - 1)`. */
 
-/* Size-classed slab pools for the two payload categories that never grow in place — a dict's
-   bucket array is always alloc-new+copy+free-old on growth (rehash below never reallocs in place),
-   and a key is alloc-once/free-once for its whole life (rehash moves ownership by pointer, never
-   re-copies). Reuses pool.c's existing slab mechanism verbatim; not a general-purpose arena — a
-   size beyond the largest tier falls back to plain xmalloc/xcalloc/free, unchanged from before
-   these pools existed. String/array payloads are explicitly out of scope: they grow via xrealloc,
-   which can extend in place, a property this alloc-new+copy+free-old scheme can't replicate without
-   risking a regression there. */
+/* Size-classed slab pools for keys and bucket arrays (both alloc-new/free-old, never realloc'd
+   in place); sizes past the largest tier fall back to plain malloc. */
 #define KEY_TIER_COUNT 4
-/* 16-byte floor is not a tuning choice — pool_free (pool.c) writes a free-list pointer at
-   [sizeof(void*), 2*sizeof(void*)), which is [8,16) on a 64-bit build; anything smaller is unsafe. */
+/* 16-byte floor is required, not tuning — pool_free writes its free-list pointer at bytes [8,16). */
 static const size_t       KEY_TIER_SIZE[KEY_TIER_COUNT]           = { 16, 32, 64, 128 };
 static const unsigned int KEY_TIER_ELEMS_PER_SLAB[KEY_TIER_COUNT] = { 256, 128, 64, 32 };
 static Pool key_pools[KEY_TIER_COUNT];
 
-/* 16 = HASHTABLE_INIT_SIZE exactly (every table's first allocation); doubling matches rehash()'s
-   own growth; 256 * HASHTABLE_HIGH% =~ 179 live entries before another rehash, covering small/
-   medium dicts. Byte size per tier is capacity * sizeof(HashTableEntry), computed at pool_init
-   time below (never hardcoded — sizeof(HashTableEntry) varies by target: 24 bytes on 32-bit ARM,
-   32 on a 64-bit dev box). */
 #define BUCKET_TIER_COUNT 5
 static const unsigned int BUCKET_TIER_CAPACITY[BUCKET_TIER_COUNT]       = { 16, 32, 64, 128, 256 };
 static const unsigned int BUCKET_TIER_ELEMS_PER_SLAB[BUCKET_TIER_COUNT] = { 64, 32, 16, 8, 4 };
@@ -66,9 +53,7 @@ static HashTableEntry* bucket_array_alloc(unsigned int capacity) {
     for (unsigned int i = 0; i < BUCKET_TIER_COUNT; i++)
         if (capacity == BUCKET_TIER_CAPACITY[i]) {
             HashTableEntry* b = pool_alloc(&bucket_pools[i]);
-            /* pool_alloc returns uninitialized memory (pool.h) — key==NULL meaning "empty slot" is
-               semantically required here, unlike xcalloc's zero-init this replaces, so it must be
-               explicit. */
+            /* pool_alloc is uninitialized and key==NULL means "empty slot" — zeroing is required */
             memset(b, 0, (size_t)capacity * sizeof(HashTableEntry));
             return b;
         }
@@ -149,9 +134,7 @@ AerVal* hashtable_get(HashTable* t, const char* key) {
     return NULL;
 }
 
-/* Inserts into buckets already sized for it, never growing/rehashing — used only by
-   hashtable_remove's repair loop below, where t->capacity must stay fixed across every
-   reinsertion (rehash mid-loop would strand pos/cap in the old array's coordinates). */
+/* Never rehashes — hashtable_remove's repair loop needs capacity fixed for the whole walk. */
 static void hashtable_put_raw(HashTable* t, char* key, AerVal value) {
     uint64_t hash   = hash_key(key);
     unsigned int length = (unsigned int)strlen(key);
@@ -188,7 +171,7 @@ void hashtable_remove(HashTable* t, const char* key) {
     t->buckets[found] = (HashTableEntry){0};
     t->count--;
 
-    /* Reinsert entries in the probe chain that may now be unreachable: advance to the next empty slot, removing and reinserting each to restore the invariant. hashtable_put_raw (not hashtable_put) is load-bearing here — it never rehashes, so cap/pos stay valid against t->buckets for the whole loop. */
+    /* Reinsert the rest of the probe chain so open-addressing lookups can still reach it. */
     unsigned int pos = (found + 1) & (cap - 1);
     while (t->buckets[pos].key) {
         HashTableEntry e = t->buckets[pos];

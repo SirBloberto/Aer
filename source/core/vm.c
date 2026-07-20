@@ -14,55 +14,32 @@
 static Pool string_pool, array_pool, dict_pool, function_pool, struct_pool, packed_array_pool, result_pool;
 static bool pools_initialized = false;
 
-/* struct_pool holds struct instances (AerArray with shape != NULL) as ONE allocation instead of
-   the usual header-plus-separate-items-buffer two-allocation layout ordinary arrays use — see the
-   struct-construction sites below for why this is sound (a struct's field count never changes
-   after construction, so there's no reallocation to support, unlike a plain array's items[]).
-   Sized for MAX_STRUCT_FIELDS (the worst case) since Pool requires uniform cell size — wastes some
-   space for shapes with fewer fields, a bounded, deliberate trade for collapsing two dependent
-   pointer dereferences (header, then its separately-allocated items[]) into one on every struct
-   field access. */
-/* Test-only accessor (tests/smoke_test.c is the only intended caller) — reads back a register's
-   final value after a chunk has run to OP_HALT. Reads whichever frame is currently active, which
-   is frame 0 (the top level) once a chunk has run to completion with every call balanced by a
-   return. See CallFrame's own comment in vm.h for the call_stack/registers/
-   call_depth fields this reads — per-VM-instance so a nested file-module VM (aer_module.c) gets
-   its own isolated call chain instead of sharing/corrupting the calling VM's in-progress one. */
+/* A struct instance's field count never changes, so header+items are one allocation, sized
+   for the MAX_STRUCT_FIELDS worst case (Pool needs a uniform cell size). */
+/* Test-only (tests/smoke_test.c) -- reads a register from whichever frame is active, per VM
+   instance so a nested module VM stays isolated. */
 AerVal register_get(VM* vm, int slot) {
     return vm->registers[slot];
 }
 
-/* Decodes an ordinary (32-bit, RK_CONST_FLAG-at-bit-30) RK operand — see RK_CONST_FLAG's comment
-   in vm.h. Used by every opcode except the packed-single-word OP_BINARY below, which has its own
-   narrower RK20 scheme instead. */
+/* Ordinary 32-bit RK operand (RK_CONST_FLAG at bit 30) -- every opcode except OP_BINARY,
+   which has its own narrower RK9 scheme. */
 static inline AerVal vm_rk_value(VM* vm, Chunk* c, int rk) {
     if (rk & RK_CONST_FLAG) return c->pool[rk & ~RK_CONST_FLAG];
     return vm->registers[rk];
 }
 
-/* Decodes one of the wider 20-bit RK operands (RK20_CONST_FLAG at bit 19, vm.h) still used by
-   every packed opcode other than OP_BINARY's own family (OP_FIELD_SET, OP_INDEX_GET, the fused
-   field-arithmetic ops, etc. — see vm_rk_ptr9 below for OP_BINARY's narrower scheme). Returns a
-   pointer straight into the pool/register array (hoisted `const_pool` — see vm_run's top — rather
-   than re-deriving c->pool on every call) instead of copying the 16-byte AerVal out by value:
-   every call site either dereferences once at its single point of use, or forwards the pointer
-   into an always_inline consumer (vm_binary_fast, vm_truthy, vm_index_get/set_compute), so the value
-   is fetched from its home location without an intermediate copy sitting in between. */
+/* RK20 (1 flag + 19 index bits) for every packed opcode but OP_BINARY. Returns a pointer into
+   the hoisted const_pool/registers, not a copy, so callers dereference once or forward it into
+   an always_inline consumer. */
 static inline AerVal* vm_rk_ptr20(VM* vm, AerVal* const_pool, uint64_t rk) {
     if (rk & RK20_CONST_FLAG) return &const_pool[rk & RK20_INDEX_MASK];
     return &vm->registers[rk & RK20_INDEX_MASK];
 }
 
-/* Decodes one of PACK_BINARY's compact 9-bit RK operands (RK9_CONST_FLAG at bit 8, vm.h) — the
-   arithmetic/comparison/bitwise/OP_IN family's own narrower RK scheme, sized so the whole packed
-   word fits in the low 32 bits (see PACK_BINARY's own comment in vm.h for why that matters on this
-   32-bit ARM target). Same pointer-return shape as vm_rk_ptr20 above, same reasoning.
-     A branch-free variant of this (reading a per-frame copy of the constant pool instead of
-   const_pool directly, so the flag bit could fold into arithmetic) was tried and reverted: it
-   required giving every call frame its own pool-allocated window, which made calls themselves
-   slower. Lua/V8 don't try to eliminate this branch either — they accept it and instead make calls
-   themselves free (a bump-pointer register stack, see VM.register_stack), which is the direction
-   this codebase went instead. */
+/* PACK_BINARY's compact RK9 (1 flag + 8 index), sized so the whole word fits the low 32 bits
+   on 32-bit ARM. A branch-free variant (per-frame pool window) was tried and reverted -- it made
+   calls slower; Lua/V8 accept this branch too and make calls free instead (register_stack). */
 static inline AerVal* vm_rk_ptr9(VM* vm, AerVal* const_pool, uint32_t rk) {
     if (rk & RK9_CONST_FLAG) return &const_pool[rk & RK9_INDEX_MASK];
     return &vm->registers[rk & RK9_INDEX_MASK];
@@ -135,27 +112,21 @@ static void gc_remember(void* ptr, RememberedKind kind) {
     remembered_count++;
 }
 
-/* Set once, forever, the first time gc_run_collection_cycle actually runs — never cleared. Guards
-   gc_barrier_array/gc_barrier_dict: POOL_OLD is only ever set by pool_sweep's promotion step, which
-   only ever runs inside a collection cycle, so before this flag is true nothing in any pool can be
-   old — the write barrier is provably a no-op for every write until then, not just usually one. */
+/* Set once, forever, on the first real collection -- before that, POOL_OLD can't be set
+   anywhere, so the write barrier is provably a no-op. */
 static bool gc_ever_collected = false;
 
-/* Write barrier for array item writes (index-assign, append, struct field-set via lbl_field_set —
-   a struct is an array with a shape, now backed by struct_pool instead of array_pool — see
-   vm_pools_init_once). Branches on a->shape to pick the right pool/remembered-kind pair, mirroring
-   gc_barrier_dict's single-pool pattern but for whichever of the two pools actually owns `a`. */
-static void gc_barrier_array(AerArray* a, AerVal new_value) {
+/* Array write barrier (index-assign, append, struct field-set -- a struct is struct_pool-backed,
+   not array_pool). */
+void gc_barrier_array(AerArray* a, AerVal new_value) {
     if (!gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
     Pool* p = a->shape ? &struct_pool : &array_pool;
-    if (pool_is_young(p, a)) return;   /* young containers are already
-                                          re-traced normally next cycle */
+    if (pool_is_young(p, a)) return;   /* young containers are re-traced normally next cycle */
     if (!value_is_young(new_value)) return;
     gc_remember(a, a->shape ? REMEMBERED_STRUCT : REMEMBERED_ARRAY);
 }
 
-/* Write barrier for dict entry writes (both the update-in-place and
-   new-entry paths in lbl_index_set). `d` is always dict_pool-tracked. */
+/* Dict entry write barrier (update-in-place and new-entry paths). */
 static void gc_barrier_dict(AerDict* d, AerVal new_value) {
     if (!gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
     if (pool_is_young(&dict_pool, d)) return;
@@ -215,9 +186,7 @@ static void mark_value(AerVal v) {
             mark_function(aer_as_function(v));
             break;
         case TYPE_PACKED_ARRAY:
-            /* A leaf, unlike TYPE_ARRAY — every field is a fixed primitive (integer/float/boolean,
-               enforced at construction), never a heap reference, so there's nothing to push onto
-               the worklist. */
+            /* A GC leaf -- every field is a fixed primitive, never a heap reference. */
             pool_mark(&packed_array_pool, aer_as_packed_array(v));
             break;
         case TYPE_RESULT: {
@@ -243,17 +212,9 @@ static void mark_vm_roots(VM* vm) {
     for (int i = 0; i < vm->stack_top; i++)
         worklist_push(vm->stack[i]);
 
-    /* Registers can hold heap references (arrays/dicts/strings/functions). Scanned
-       unconditionally, not tracked for liveness: an idle register is zero-init, which decodes as
-       TYPE_NULL (value.h — the tag field defaults to 0 on zero-init) and is a harmless no-op leaf
-       in mark_value's default case. Scanned per-frame, bounded to the live call chain
-       (0..call_depth) rather than all VM_CALL_MAX frames regardless of depth — a blanket scan
-       over every frame was a real, measured cache-miss hotspot, since even shallow recursion was
-       walking every frame's worth of cold, mostly-zeroed memory on every GC pass. Frames beyond
-       call_depth are dead (already returned), so bounding the scan to the live call chain can't
-       under-collect. frame_size, not FRAME_REGISTERS — frames pack contiguously in
-       vm->register_stack, so scanning a flat 128 per frame would re-visit deeper frames'
-       overlapping windows and mark stale values left by already-returned calls. */
+    /* Scanned unconditionally (zero-init decodes as harmless TYPE_NULL), bounded to the live call
+       chain (0..call_depth, by each frame's real frame_size) -- a blanket scan over every frame was
+       a measured cache-miss hotspot, and frames past call_depth are already dead. */
     for (int f = 0; f <= vm->call_depth; f++)
         for (unsigned int i = 0; i < vm->call_stack[f].frame_size; i++)
             worklist_push(vm->call_stack[f].registers[i]);
@@ -306,11 +267,9 @@ static void gc_collect(VM* vm, bool minor) {
     }
 
     if (minor) {
-        /* Old objects the write barrier caught holding a young reference, traced as extra
-           roots since a minor pass never looks at old cells otherwise. A MAJOR pass can
-           legitimately free a remembered object between when it was added and now (entries
-           are never proactively removed), so check liveness before dereferencing each one
-           and compact the array in place rather than leaving a dangling pointer. */
+        /* Remembered old objects, traced as extra roots (a minor pass skips old cells otherwise). A
+           remembered entry can outlive its object (never proactively removed), so check liveness
+           before dereferencing and compact in place. */
         unsigned int kept = 0;
         for (unsigned int i = 0; i < remembered_count; i++) {
             RememberedEntry* e = &remembered_set[i];
@@ -404,9 +363,7 @@ void aer_gc_set_ceiling(unsigned int max_live_cells) {
     gc_live_cell_ceiling = max_live_cells;
 }
 
-/* Split out from gc_maybe_collect so that stays small enough to inline into DISPATCH(). Only
-   ever runs between two complete opcodes, where stack/scope/call-frame invariants are
-   self-consistent (no handler leaves those half-updated across its own DISPATCH() call). */
+/* Runs only between complete opcodes, where stack/scope/frame invariants are consistent. */
 static void gc_run_collection_cycle(VM* vm) {
     gc_ever_collected = true;
     gc_collect(vm, true);
@@ -421,10 +378,7 @@ static void gc_run_collection_cycle(VM* vm) {
         major_ran = true;
     }
 
-    /* Ceiling check runs AFTER the normal trigger logic so a ceiling'd host still gets the
-       usual cheap minor/major rhythm; checked once per opcode (not per-allocation), so one
-       opcode's worth of allocation can slip past the ceiling before the abort fires — a
-       deliberate, minor looseness. */
+    /* Checked once per opcode, not per allocation -- a ceiling'd host can slip slightly past it. */
     if (gc_live_cell_ceiling == 0) return;
     unsigned int live = gc_count_live_cells();
     if (live <= gc_live_cell_ceiling) return;
@@ -454,11 +408,8 @@ void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
 }
 
 #ifdef AER_DEBUG_TOOLS
-/* Byte-accurate memory report — aer_gc_stats() only gives a live *cell* count, which understates
-   real usage for string/array/dict: their pool cell is a fixed-size header only, the actual
-   payload (string bytes, array items[], dict hash buckets) is a separate xmalloc'd/xrealloc'd
-   allocation the pool system doesn't track at all. Walks each pool the same way
-   gc_count_live_cells does, but reads each live cell's own size fields instead of just counting. */
+/* aer_gc_stats() only counts live cells, which understates real usage -- string/array/dict
+   payloads are separate xmalloc'd allocations the pool doesn't track. */
 void aer_debug_memory_report(FILE* out) {
     fprintf(out, "\n--- memory ---\n");
 
@@ -524,11 +475,8 @@ void aer_debug_memory_report(FILE* out) {
     }
     fprintf(out, "  function header %10llu B  payload %10llu B\n", fn_hdr, fn_payload);
 
-    /* struct_pool cells are fixed-size (sizeof(AerArray) + MAX_STRUCT_FIELDS*sizeof(AerVal)) —
-       "header" here is the fixed per-cell reservation, "payload" is the sum of each live
-       instance's ACTUAL field_count*sizeof(AerVal), so the gap between the two is exactly the
-       over-provisioning cost the MAX_STRUCT_FIELDS-sized single pool trades for one allocation
-       instead of two — see vm_pools_init_once. */
+    /* header = the fixed per-cell reservation; payload = each instance's real field_count -- the
+       gap is MAX_STRUCT_FIELDS's over-provisioning cost. */
     uint64_t struct_hdr = 0, struct_payload = 0;
     {
         Pool* p = &struct_pool;
@@ -568,11 +516,9 @@ void chunk_free(Chunk* c) {
     free(c->line_mark_lines);
     for (unsigned int i = 0; i < c->import_count; i++) free(c->imported_modules[i]);
     free(c->imported_modules);
-    /* functions[]/shapes[] are otherwise deliberately left unfreed for a chunk's whole life (see
-       their own comments, vm.h) since a Chunk normally lives for the process's life anyway — but
-       chunk_free itself is only ever reached via aer_module_free_all(), the one path that exists
-       specifically so an embedding host can reclaim memory WITHOUT exiting the process, so it must
-       actually free everything rather than rely on process exit to do it. */
+    /* functions[]/shapes[] are normally left unfreed (a Chunk usually outlives the process), but
+       chunk_free is only reached via aer_module_free_all -- the one path that must actually free
+       everything, not rely on process exit. */
     for (unsigned int i = 0; i < c->function_count; i++) free(c->functions[i].defaults);
     free(c->functions);
     for (unsigned int i = 0; i < c->shape_count; i++) free(c->shapes[i]);
@@ -616,13 +562,10 @@ static unsigned int lookup_runtime_line(void) {
     return chunk_line_for_offset(active_vm_for_errors->chunk, active_vm_for_errors->ip);
 }
 
-/* Wraps (data, length) — caller must already exclusively own data — in a fresh heap box; never
-   allocates or copies the character data itself. vm_pools_init_once() is normally reached via
-   vm_init() before anything compiles, but the lexer can call this (via emit_string_token, for
-   every identifier/string token) during compilation itself, before any VM exists yet. Without this
-   guard, string_pool is still the zero-initialized static (elem_size=0, elems_per_slab=0), so
-   pool_alloc's slab xmalloc(0*0) hands back a ~1-byte allocation that this function then writes a
-   pointer into — a real heap-buffer-overflow (confirmed via ASAN). */
+/* Wraps an exclusively-owned (data, length) in a fresh heap box; never copies. Guarded because
+   the lexer can call this (emit_string_token) before any VM/pool exists -- without the guard,
+   string_pool's zero-initialized elem_size=0 makes pool_alloc hand back a ~1-byte allocation
+   (confirmed heap-buffer-overflow via ASAN). */
 AerVal aer_make_string(char* data, unsigned int length) {
     vm_pools_init_once();
     AerString* s = pool_alloc(&string_pool);
@@ -661,11 +604,8 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
         AerVal* existing = hashtable_get(&c->name_index, key);
         if (existing) { free(key); return (unsigned int)aer_as_int(*existing); }
 
-        /* vs->data was already an owned, single-reference buffer at every call site (e.g. the
-           lexer's emit_string_token freshly xmalloc's one per token) — free it before replacing
-           it with `key`, or it's orphaned with nothing left pointing to it. Confirmed as a real
-           leak via LeakSanitizer (Raspberry Pi ASAN build) once the unrelated pool-initialization
-           crash that had been masking it was fixed. */
+        /* vs->data was already owned at every call site -- free before replacing, or it's orphaned
+           (confirmed real leak via ASAN). */
         char* old_data = vs->data;
         vs->data = key;   /* pool entry takes ownership of `key` */
         free(old_data);
@@ -700,8 +640,7 @@ Shape* chunk_find_shape(Chunk* c, const char* name) {
     return NULL;
 }
 
-/* See ChunkFunction's own comment in vm.h. Appended by func_register (parser.c) at the same
-   moment it updates its own parse-time-only lookup tables. */
+/* Appended by func_register at the same moment it updates its own parse-time lookup tables. */
 void chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offset,
                          unsigned int arity, unsigned int min_arity, AerVal* defaults) {
     if (c->function_count >= c->function_cap) {
@@ -714,10 +653,8 @@ void chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offse
     f->arity         = arity;
     f->min_arity     = min_arity;
     f->defaults      = defaults;
-    /* Safe placeholder until parse_function patches in the real captured peak after the body
-       finishes compiling — see ChunkFunction's own comment. Never an under-allocation even for the
-       one case that can read it before the patch runs (self-reference from within this same
-       function's own body). */
+    /* Placeholder until parse_function patches in the real peak -- never an under-allocation even
+       for in-body self-reference, the one case that reads it early. */
     f->max_registers = FRAME_REGISTERS;
 }
 
@@ -730,8 +667,7 @@ ChunkFunction* chunk_find_function(Chunk* c, const char* name) {
     return NULL;
 }
 
-/* Parse-time lookup — name_idx is a dedup'd pool index (chunk_add_pool), so this is a plain int
-   compare, no strcmp. Newest-first, same convention as chunk_find_function. */
+/* Dedup'd pool index -- a plain int compare, no strcmp. Newest-first. */
 ChunkFunction* chunk_find_function_by_name_idx(Chunk* c, unsigned int name_idx) {
     for (unsigned int i = c->function_count; i > 0; i--) {
         ChunkFunction* f = &c->functions[i - 1];
@@ -773,14 +709,10 @@ bool chunk_add_import(Chunk* c, const char* name, unsigned int len,
 void vm_init(VM* vm, Chunk* chunk) {
     memset(vm, 0, sizeof(*vm));
     vm->chunk = chunk;
-    aer_stdlib_init();
     vm_pools_init_once();
     runtime_line_lookup = lookup_runtime_line;
-    /* Resets this VM's own call stack for a fresh run — a chunk that ended mid-call (a bug, or
-       a deliberately unbalanced test) must not leak into this VM's next run. Frame 0's registers
-       base never moves again after this — the top level's own usage is open-ended (globals persist
-       and can grow across REPL statements), so unlike a real function call it always gets a flat
-       FRAME_REGISTERS reservation. */
+    /* Resets this VM's call stack -- a chunk that ended mid-call must not leak into the next run.
+       Frame 0 always gets a flat FRAME_REGISTERS reservation (top-level usage is open-ended). */
     vm->call_depth = 0;
     vm->call_stack[0].registers  = &vm->register_stack[0];
     vm->call_stack[0].frame_size = FRAME_REGISTERS;
@@ -805,9 +737,7 @@ static const char* vm_type_name(Chunk* c, AerVal v) {
     if (aer_type(v) == TYPE_ARRAY && aer_as_array(v)->shape)
         return aer_as_string(c->pool[aer_as_array(v)->shape->name])->data;
     if (aer_type(v) == TYPE_PACKED_ARRAY) {
-        /* static buf is safe only because every call site consumes the result immediately (copies
-           or formats it) before this function could be called again — never hold this return value
-           across a second call. */
+        /* static buf is safe only because every caller consumes the result immediately. */
         AerPackedArray* pa = aer_as_packed_array(v);
         static char buf[128];
         snprintf(buf, sizeof(buf), "%s[]", aer_as_string(c->pool[pa->shape->name])->data);
@@ -819,8 +749,7 @@ static const char* vm_type_name(Chunk* c, AerVal v) {
 
 void aer_format_real(double d, char* buf, size_t bufsize) {
     snprintf(buf, bufsize, "%g", d);
-    /* '.'/'e'/'E' already mark an ordinary real; 'n'/'N'/'i'/'I' cover every case spelling of
-       "nan"/"inf"/"-inf" — none of those need (or should get) a trailing ".0" appended. */
+    /* Skip nan/inf spellings -- they should never get a trailing ".0". */
     if (!strpbrk(buf, ".eEnNiI")) {
         size_t len = strlen(buf);
         if (len + 3 <= bufsize) { buf[len] = '.'; buf[len + 1] = '0'; buf[len + 2] = '\0'; }
@@ -931,8 +860,7 @@ static inline __attribute__((always_inline)) bool vm_truthy(AerVal v) {
         case TYPE_ARRAY:    return aer_as_array(v)->count > 0;
         case TYPE_DICT:     return aer_as_dict(v)->map.count > 0;
         case TYPE_PACKED_ARRAY: return aer_as_packed_array(v)->count > 0;
-        /* "Did this succeed" — `if result { ... }` reads the same way `if err == null` does, just
-           inverted, without needing to destructure first. */
+        /* `if result:` reads like `if err == null:`, without destructuring first. */
         case TYPE_RESULT:   return aer_type(aer_as_result(v)->err) == TYPE_NULL;
         case TYPE_ANY:      break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
     }
@@ -948,8 +876,8 @@ static inline __attribute__((always_inline)) AerVal vm_promote_real(AerVal v) {
 /* Binary operation dispatch                                            */
 /* ------------------------------------------------------------------ */
 
-/* Structural/reference equality with no error path — unlike OP_EQ, a type mismatch here just means "not this one, keep looking." Used by OP_IN's array scan. */
-static bool values_equal(AerVal a, AerVal b) {
+/* Structural/reference equality with no error path — unlike OP_EQ, a type mismatch here just means "not this one, keep looking." Used by OP_IN's array scan and collection.index_of (aer_collection.c). */
+bool values_equal(AerVal a, AerVal b) {
     if (aer_type(a) != aer_type(b)) return false;
     switch (aer_type(a)) {
         case TYPE_NULL:     return true;
@@ -968,14 +896,9 @@ static bool values_equal(AerVal a, AerVal b) {
     return false;
 }
 
-/* Int/int and real/real only — the two type-pairs common enough in arithmetic-heavy code to be
-   worth an inlined fast path at a call site, and small enough (no string/array/dict/bool/null/
-   AND-OR-IN handling) that always_inline-ing this at its two call sites (the OP_BINARY_FIELD/
-   OP_FIELD_BINARY field-fusion opcodes below) doesn't bloat the icache the way inlining a full
-   binary-op dispatch would. Everything else falls through to vm_binary_cold() (a real,
-   non-inlined function, just below) — *handled is set false and the caller must call that instead.
-   ta/tb are passed in rather than recomputed since every caller already computed them for its own
-   dispatch. */
+/* Int/int and real/real fast path only -- small enough to always_inline at its two callers
+   (the field-fusion opcodes) without icache bloat. Sets *handled = false for anything else;
+   caller falls back to vm_binary_cold(). */
 static inline __attribute__((always_inline)) AerVal vm_binary_fast(AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb, bool* handled) {
     *handled = true;
     if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) {
@@ -1035,49 +958,40 @@ static inline __attribute__((always_inline)) AerVal vm_binary_fast(AerVal a, Aer
     return aer_bool(false);   /* unused by the caller when *handled is false */
 }
 
-/* Cold path for the per-operator OP_ADD/OP_SUB/.../OP_GTE labels in vm_run() (see PACK_BINARY's
-   own comment, vm.h) and for the OP_BINARY_FIELD/OP_FIELD_BINARY field-fusion opcodes —
-   everything vm_binary_fast() (just above) doesn't handle: IN, null, promoted-real, boolean,
-   string, array, dict, and the final type-mismatch error. Deliberately a real, non-inlined
-   function rather than always_inline like vm_binary_fast(): this path only runs for the rare
-   case, and NOT inlining it avoids duplicating this whole body across every call site. ta/tb are
-   passed in rather than recomputed since every caller already computed them for its own
-   fast-path check. */
-static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
-    /* Checked before null-handling below so `null in arr` isn't intercepted by the "null op anything-else errors" rule, which is about direct comparison, not container search. */
-    if (op == OP_IN) {
-        if (aer_type(b) == TYPE_DICT) {
-            if (aer_type(a) != TYPE_STRING) { error("Left side of 'in' must be a string when testing dict membership"); return aer_bool(false); }
-            AerString* as = aer_as_string(a);
-            unsigned int klen = as->length;
-            if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return aer_bool(false); }
-            char kbuf[VM_KEY_MAX + 1];
-            memcpy(kbuf, as->data, klen);
-            kbuf[klen] = '\0';
-            return aer_bool(hashtable_get(&aer_as_dict(b)->map, kbuf) != NULL);
+/* Cold path for the per-operator labels and the field-fusion opcodes -- everything
+   vm_binary_fast() doesn't handle. Real, non-inlined: this path is rare, and not inlining it
+   avoids duplicating the body across every call site. */
+/* The one `in` implementation -- called by lbl_in and by vm_binary_cold (reached when a fused
+   opcode carries OP_IN as its runtime bin_op). */
+static AerVal vm_in(AerVal a, AerVal b) {
+    if (aer_type(b) == TYPE_DICT) {
+        if (aer_type(a) != TYPE_STRING) { error("Left side of 'in' must be a string when testing dict membership"); return aer_bool(false); }
+        AerString* as = aer_as_string(a);
+        unsigned int klen = as->length;
+        if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return aer_bool(false); }
+        char kbuf[VM_KEY_MAX + 1];
+        memcpy(kbuf, as->data, klen);
+        kbuf[klen] = '\0';
+        return aer_bool(hashtable_get(&aer_as_dict(b)->map, kbuf) != NULL);
+    }
+    if (aer_type(b) == TYPE_ARRAY) {
+        AerArray* arr = aer_as_array(b);
+        for (unsigned int i = 0; i < arr->count; i++) {
+            if (values_equal(a, arr->items[i])) return aer_bool(true);
         }
-        if (aer_type(b) == TYPE_ARRAY) {
-            AerArray* arr = aer_as_array(b);
-            for (unsigned int i = 0; i < arr->count; i++) {
-                if (values_equal(a, arr->items[i])) return aer_bool(true);
-            }
-            return aer_bool(false);
-        }
-        if (aer_type(b) == TYPE_STRING) {
-            /* Substring search — mirrors string.contains() (aer_string.c) exactly; kept as its
-               own small loop rather than shared, since the two live in different modules with
-               different (stack-based vs. binary-op) calling conventions. */
-            if (aer_type(a) != TYPE_STRING) { error("Left side of 'in' must be a string when testing string membership"); return aer_bool(false); }
-            AerString* needle = aer_as_string(a);
-            AerString* hay    = aer_as_string(b);
-            bool found = needle->length == 0;
-            for (unsigned int i = 0; !found && i + needle->length <= hay->length; i++)
-                if (memcmp(hay->data + i, needle->data, needle->length) == 0) found = true;
-            return aer_bool(found);
-        }
-        error("Right side of 'in' must be a dict, array, or string");
         return aer_bool(false);
     }
+    if (aer_type(b) == TYPE_STRING) {
+        if (aer_type(a) != TYPE_STRING) { error("Left side of 'in' must be a string when testing string membership"); return aer_bool(false); }
+        return aer_bool(aer_string_find(aer_as_string(b), aer_as_string(a)) >= 0);
+    }
+    error("Right side of 'in' must be a dict, array, or string");
+    return aer_bool(false);
+}
+
+static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
+    /* Checked before null-handling below so `null in arr` isn't intercepted by the "null op anything-else errors" rule, which is about direct comparison, not container search. */
+    if (op == OP_IN) return vm_in(a, b);
 
     /* null equality: null == null is true; null op anything-else errors */
     if (ta == TYPE_NULL || tb == TYPE_NULL) {
@@ -1137,12 +1051,8 @@ static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueT
             return aer_make_string(buf, len);
         }
         if (op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE) {
-            /* Same total order math.sort() already assumes and implements for strings
-               (aer_math.c's sort_cmp) — exposed here as the ordinary comparison operators
-               instead of only being reachable indirectly through sort(). */
-            unsigned int n = as->length < bs->length ? as->length : bs->length;
-            int cmp = n > 0 ? memcmp(as->data, bs->data, n) : 0;
-            if (cmp == 0) cmp = (int)as->length - (int)bs->length;
+            /* Same total order collection.sort() uses for strings — one shared helper (value.h). */
+            int cmp = aer_string_compare(as, bs);
             switch (op) {
                 case OP_LT:  return aer_bool(cmp < 0);
                 case OP_GT:  return aer_bool(cmp > 0);
@@ -1225,17 +1135,10 @@ static bool vm_slice_bounds(AerVal start_v, AerVal end_v, int64_t len,
     return true;
 }
 
-/* A baked default value — a struct field's (Shape.field_defaults) or a function parameter's
-   (AerFunction.defaults) — needs one of two treatments when it's actually applied: a primitive
-   (int/real/bool/null/string) is safe to copy as-is — AerVal for those is either inline or (for a
-   string) an immutable shared buffer. An array or dict is NOT safe to copy as-is: every struct
-   instance, or every call that omits that argument, would then alias the exact same AerArray/
-   AerDict the default is stored as, so append()ing to one's default field/argument would silently
-   show up on every other one ever constructed/called (and on the stored default itself) —
-   Python's mutable-default-argument bug, reproduced. parser.c's default-value grammar only ever
-   bakes an EMPTY array/dict literal ('[]' / '{}') as such a default (see parse_literal_default),
-   so a fresh empty one is always the correct replacement here — never a deep copy of arbitrary
-   contents, since there aren't any. */
+/* A baked default (struct field or function parameter): primitives copy as-is; an array/dict
+   default must become a FRESH empty container, or every omitted call/instance would alias the
+   same one (Python's mutable-default bug). parser.c only ever bakes an empty '[]'/'{}' as such
+   a default, so a fresh empty one is always correct -- no deep copy needed. */
 static AerVal vm_default_value(AerVal dflt) {
     if (aer_type(dflt) == TYPE_ARRAY && !aer_as_array(dflt)->shape) {
         AerArray* a = pool_alloc(&array_pool);
@@ -1252,15 +1155,10 @@ static AerVal vm_default_value(AerVal dflt) {
     return dflt;
 }
 
-/* Used only by aer_module_call for a cross-module call into a v3-compiled file's exported
-   function (see ChunkFunction's own comment, vm.h) — mirrors lbl_call_value's frame-push
-   exactly (arity check, default-filling), just as a standalone function since
-   aer_module_call isn't inside vm_run's computed-goto dispatch loop. dest_reg is fixed at 0: this
-   always sets up the SECOND frame (index target->call_depth + 1) above target's own top-level
-   (frame 0), so once vm_run(target) drains back to depth 0 on return_ip's OP_HALT, the result is
-   sitting in target->call_stack[0].registers[0] — a fixed, known slot the caller
-   (aer_module_call) can read without needing any of target's own variables' registers to stay
-   predictable. */
+/* Cross-module call setup (aer_module_call): mirrors lbl_call_value's frame-push, standalone
+   since this isn't inside vm_run's dispatch loop. dest_reg fixed at 0 sets up the frame right
+   above target's own frame 0, so once vm_run(target) drains back to depth 0, the result sits
+   in target->call_stack[0].registers[0]. */
 bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
                     AerVal* args, unsigned int return_ip) {
     if (arg_count < (int)fn->min_arity || arg_count > (int)fn->arity) {
@@ -1290,15 +1188,9 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
     return true;
 }
 
-/* Used by lbl_call_value (vm_run, below), factored out into a plain function since DISPATCH()'s
-   computed-goto only needs to run in the caller, after this returns (a plain C function can't
-   itself jump to a vm_run-local label, but it doesn't need to: it just does the work and lets
-   the caller DISPATCH() once it's back). `dest_reg`/`arg_reg_base`/`arg_count` are the caller's
-   own operands; `is_tail_call` is whether the calling label's own opcode was its
-   OP_TAIL_CALL_* counterpart. `return_ip` is the caller's own local `ip` (the resume address,
-   already past this instruction's operands) — passed explicitly rather than read from vm->ip so
-   this function has no dependency on that field being kept in sync for anything but error
-   reporting. */
+/* Factored out of lbl_call_value since a plain function can't itself jump to a vm_run-local
+   label -- it does the work and lets the caller DISPATCH(). return_ip is the caller's own
+   resume address, passed explicitly rather than read from vm->ip. */
 static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int arg_count,
                               bool is_tail_call, unsigned int return_ip) {
     if (aer_type(fv) != TYPE_FUNCTION) { error("Value is not callable"); return; }
@@ -1310,13 +1202,9 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
             error("Function expects between %u and %u arguments, got %d", (unsigned int)f->min_arity, (unsigned int)f->arity, arg_count);
         return;
     }
-    /* Tail-call reuse, see OP_TAIL_CALL's own comment in vm.h. `f` is already a plain pointer by
-       this point, so overwriting its source register during the copy below — entirely possible
-       when the callee names a LOCAL variable's own permanent register, not a temp, e.g.
-       `f = some_fn; return f(x)` — can't invalidate anything already read out of it. The two
-       loops below are the same always-safe-forward-shift copy lbl_call's own comment explains,
-       done in this order (args, then defaults) specifically so every SOURCE register the arg-copy
-       loop reads is read before the defaults-fill loop can possibly overwrite it. */
+    /* Tail-call reuse -- `f` is already a plain pointer, so overwriting its source register during
+       the copy can't invalidate it. Args copied before defaults, so no source register is
+       overwritten before it's read. */
     if (is_tail_call) {
         for (int i = 0; i < arg_count; i++)
             vm->registers[i] = vm->registers[arg_reg_base + i];
@@ -1345,14 +1233,9 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     vm->ip = f->code_offset;
 }
 
-/* Resolves field_idx to a slot within shape, checking the per-callsite inline cache
-   (field_cache, keyed by `site` — this instruction's own bytecode offset) first. The shape-only
-   half of vm_resolve_field's lookup, split out so a caller that already has a Shape* without
-   going through a register/AerArray (OP_INDEX_FIELD_GET/SET's packed branch, keyed off
-   AerPackedArray.shape directly) can share the same cache — safe to share: the cache only ever
-   stores (shape, slot) pairs, and a given field name's slot within a given Shape is identical
-   whether that shape backs a boxed struct instance or a packed array. Returns false (error
-   already reported) if shape has no such field. */
+/* Resolves field_idx within shape via the per-site inline cache (keyed by bytecode offset) --
+   shared by both boxed-struct and packed-array callers, since a field's slot within a given
+   Shape is identical either way. False (error reported) if shape has no such field. */
 static inline __attribute__((always_inline)) bool vm_resolve_field_by_shape(Chunk* c, unsigned int site, Shape* shape, int field_idx, int* out_slot) {
     FieldCacheEntry* entry = &c->field_cache[site];
     if (entry->shape == shape) {
@@ -1372,11 +1255,9 @@ static inline __attribute__((always_inline)) bool vm_resolve_field_by_shape(Chun
     return false;
 }
 
-/* Resolves struct_reg's field (by field_idx) to an (AerArray*, item slot) pair — the register/
-   struct-instance-validating half, delegating the shape+cache lookup to vm_resolve_field_by_shape
-   above. Shared by every field-access opcode: lbl_field_get, the fused lbl_binary_field/
-   lbl_field_binary (both operand orders), and lbl_field_set. Returns false (error already
-   reported) if struct_reg isn't a struct instance or has no such field. */
+/* Resolves struct_reg's field to an (AerArray*, slot) pair, delegating the shape+cache lookup
+   above. Shared by every field-access opcode. False (error reported) if not a struct instance
+   or no such field. */
 static inline __attribute__((always_inline)) bool vm_resolve_field(VM* vm, Chunk* c, unsigned int site, int struct_reg, int field_idx,
                                  AerArray** out_oa, int* out_slot) {
     AerVal* obj = &vm->registers[struct_reg];
@@ -1389,14 +1270,9 @@ static inline __attribute__((always_inline)) bool vm_resolve_field(VM* vm, Chunk
     return vm_resolve_field_by_shape(c, site, oa->shape, field_idx, out_slot);
 }
 
-/* Reads an AerVal out of one 8-byte packed slot per its declared field type — shared by the
-   packed branches of lbl_index_field_get/set and lbl_packed_array_new's own default-fill.
-     No switch on ftype: AerVal.as is exactly 8 bytes, and for TYPE_INTEGER/TYPE_REAL the packed
-   slot's raw bytes already ARE that union's bit pattern. TYPE_BOOLEAN's slot holds an 8-byte 0/1
-   (see vm_packed_slot_write) whose low byte is a little-endian machine's first byte — the same
-   byte .as.b reads — so one branchless memcpy is correct for all three eligible field types. A
-   3-way switch here regresses packed arrays slower than plain struct arrays on ARM (weaker branch
-   prediction than x86) — keep this branchless. */
+/* Reads one 8-byte packed slot as AerVal -- no switch on field type needed since AerVal.as is
+   exactly 8 bytes and every eligible type's bit pattern matches directly. A 3-way switch here
+   measurably regressed packed arrays on ARM -- keep this branchless. */
 static inline AerVal vm_packed_slot_read(unsigned char* slot, ValueType ftype) {
     AerVal v;
     v.tag = ftype;
@@ -1404,18 +1280,14 @@ static inline AerVal vm_packed_slot_read(unsigned char* slot, ValueType ftype) {
     return v;
 }
 
-/* Inverse of vm_packed_slot_read — writes v's raw 8-byte payload into one packed slot. Caller
-   must already have type-checked v against the field's declared type. */
+/* Inverse of vm_packed_slot_read. Caller must already have type-checked v. */
 static inline void vm_packed_slot_write(unsigned char* slot, ValueType ftype, AerVal v) {
     (void)ftype;
     memcpy(slot, &v.as, 8);
 }
 
-/* Scans a dict's bucket array forward from *idx, skipping empty buckets, and returns an owned
-   copy of the first live key found as an AerVal (aer_make_string) — shared by lbl_iter_next_array's
-   dict branch and lbl_iter_next_pair, both of which iterate dict keys this way. *idx is left at
-   the found bucket (caller advances it by 1 after also reading the value, if needed). Returns
-   false (nothing written) once *idx reaches d->map.capacity with no more live buckets. */
+/* Scans forward from *idx for the next live bucket, returning an owned copy of its key.
+   Shared by array-iteration's dict branch and pair-iteration. False once exhausted. */
 static bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
     while ((uint64_t)*idx < d->map.capacity && !d->map.buckets[*idx].key) (*idx)++;
     if ((uint64_t)*idx >= d->map.capacity) return false;
@@ -1446,8 +1318,7 @@ AerFunction* vm_new_function(void) {
     return pool_alloc(&function_pool);
 }
 
-/* builtin_id is resolved at parse time (builtin_call_id) — always one of the cases below. Returns
-   true if arg_count matched, result in *out. */
+/* builtin_id resolved at parse time. Returns true if arg_count matched, result in *out. */
 static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_count, AerVal* out) {
     *out = aer_null();
 
@@ -1460,51 +1331,6 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
             else if (aer_type(a) == TYPE_DICT)   *out = aer_int((int64_t)aer_as_dict(a)->map.count);
             else if (aer_type(a) == TYPE_PACKED_ARRAY) *out = aer_int((int64_t)aer_as_packed_array(a)->count);
             else error("length() requires an array, dict, string, or packed array");
-            return true;
-        }
-        case CALL_BUILTIN_DELETE: {
-            if (arg_count != 2) return false;
-            AerVal obj = args[0], key = args[1];
-            if (aer_type(obj) == TYPE_DICT) {
-                if (aer_type(key) != TYPE_STRING) { error("delete() key must be a string"); return true; }
-                AerString* ks = aer_as_string(key);
-                unsigned int klen = ks->length;
-                if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return true; }
-                char kbuf[VM_KEY_MAX + 1];
-                memcpy(kbuf, ks->data, klen);
-                kbuf[klen] = '\0';
-                hashtable_remove(&aer_as_dict(obj)->map, kbuf);
-                *out = obj;
-                return true;
-            }
-            if (aer_type(obj) == TYPE_ARRAY) {
-                AerArray* a = aer_as_array(obj);
-                if (a->shape) { error("delete() cannot remove fields from a struct instance — structs have a fixed shape"); return true; }
-                if (aer_type(key) != TYPE_INTEGER) { error("Array delete() index must be an integer"); return true; }
-                int64_t i = aer_as_int(key);
-                if (i < 0) i += (int64_t)a->count;
-                if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", aer_as_int(key), a->count); return true; }
-                memmove(&a->items[i], &a->items[i + 1], (size_t)(a->count - (uint64_t)i - 1) * sizeof(AerVal));
-                a->count--;
-                *out = obj;
-                return true;
-            }
-            error("delete() requires a dict or array");
-            return true;
-        }
-        case CALL_BUILTIN_APPEND: {
-            if (arg_count != 2) return false;
-            AerVal arr = args[0], val = args[1];
-            if (aer_type(arr) != TYPE_ARRAY) { error("append() requires an array"); return true; }
-            AerArray* a = aer_as_array(arr);
-            if (a->shape) { error("append() cannot add fields to a struct instance — structs have a fixed shape"); return true; }
-            if (a->count >= a->capacity) {
-                a->capacity = a->capacity ? a->capacity * 2 : 4;
-                a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
-            }
-            gc_barrier_array(a, val);
-            a->items[a->count++] = val;
-            *out = arr;
             return true;
         }
         case CALL_BUILTIN_PRINT: {
@@ -1557,20 +1383,10 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
     return false;
 }
 
-/* Shared by lbl_index_get and the OP_INDEX_GET_*_* fused handlers (see
-   Part 2 of the array-index-get fusion comment in vm.h) — identical
-   type dispatch, bounds/negative-index handling, and error messages as
-   the original inline body, just returning the value instead of
-   PUSH()ing it so callers can fuse it into a stack-neutral read. On any
-   error path this calls error() (setting runtime_had_error) and returns
-   aer_null(); every caller must PUSH/DISPATCH exactly as before — the
-   returned null is never actually used once DISPATCH() bails. */
-/* Writes through `out` instead of returning AerVal by value — its one call site (lbl_index_get,
-   below) assigns straight into vm->registers[dest_reg], and returning by value across this many
-   branches meant the compiler couldn't avoid materializing the result on the stack first (same
-   16-byte ldmia/stmia round trip found and fixed in BINARY_OP_INT_REAL/INT_ONLY just above; see
-   that comment for the full story). Safe even if `out` aliases obj's or idx's own register: both
-   are function parameters, already copied by value, before `*out` is ever touched. */
+/* Shared by lbl_index_get and the fused index-get handlers -- same dispatch, bounds, and
+   errors as the original inline body, returning the value instead of pushing it. */
+/* Writes through `out` (avoids a 16-byte stack round-trip returning by value -- see
+   BINARY_OP_INT_REAL's comment). Safe even if `out` aliases obj's/idx's register. */
 static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
     if (aer_type(obj) == TYPE_ARRAY) {
         AerArray* a = aer_as_array(obj);
@@ -1604,9 +1420,8 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         ch_buf[1] = '\0';
         *out = aer_make_string(ch_buf, 1); return;   /* no chunk_add_pool interning — see vm_to_str's comment */
     } else if (aer_type(obj) == TYPE_RESULT) {
-        /* `result[0]` is the value, `result[1]` is the err — the same (value, err) order every
-           stdlib fallible function returns, so destructuring (`a, b = io.read(path)`, which
-           desugars to exactly this indexing) reads them out in the expected order. */
+        /* result[0] is the value, result[1] is the err -- the same order every stdlib fallible
+           function returns. */
         if (aer_type(idx) != TYPE_INTEGER) { error("Result index must be an integer"); *out = aer_null(); return; }
         int64_t i = aer_as_int(idx);
         AerResult* r = aer_as_result(obj);
@@ -1620,11 +1435,8 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
     }
 }
 
-/* Shared by lbl_index_set and the OP_INDEX_SET_*_* fused handlers (see the array-index-set
-   fusion comment in vm.h) — identical type dispatch, bounds/negative-index handling, and error
-   messages as the original inline body. Every caller must DISPATCH() immediately after (same
-   discipline as vm_index_get_compute): on an error path this calls error() and simply returns,
-   leaving runtime_had_error set for DISPATCH() to catch. */
+/* Shared by lbl_index_set and the fused index-set handlers -- same dispatch/bounds/errors.
+   Caller must DISPATCH() immediately after. */
 static inline void vm_index_set_compute(AerVal obj, AerVal idx, AerVal val) {
     if (aer_type(obj) == TYPE_ARRAY) {
         AerArray* a = aer_as_array(obj);
@@ -1675,11 +1487,7 @@ static AerVal vm_cast(AerVal v, int cast_type) {
                                           ? vs->length : sizeof(buf) - 1;
                     memcpy(buf, vs->data, n);
                     buf[n] = '\0';
-                    /* strtoll, not atoll — atoll returns 0 for a non-numeric string with no way
-                       to tell "parsed as zero" apart from "wasn't a number at all"; checking end
-                       against the buffer's own end (after skipping the same leading whitespace/
-                       sign atoll would) catches that case as a real error instead of fabricating
-                       a plausible-looking wrong number. */
+                    /* strtoll, not atoll -- atoll can't distinguish "parsed as zero" from "not a number". */
                     char* end;
                     long long parsed = strtoll(buf, &end, 10);
                     while (*end == ' ' || *end == '\t') end++;   /* tolerate trailing whitespace, same as leading */
@@ -1704,8 +1512,7 @@ static AerVal vm_cast(AerVal v, int cast_type) {
                                           ? vs->length : sizeof(buf) - 1;
                     memcpy(buf, vs->data, n);
                     buf[n] = '\0';
-                    /* strtod, not atof — same "distinguish a real 0 from not-a-number-at-all"
-                       reasoning as CAST_INTEGER above. */
+                    /* strtod, not atof -- same reasoning as CAST_INTEGER above. */
                     char* end;
                     double parsed = strtod(buf, &end);
                     while (*end == ' ' || *end == '\t') end++;
@@ -1731,9 +1538,8 @@ static AerVal vm_cast(AerVal v, int cast_type) {
 /* ------------------------------------------------------------------ */
 
 #ifdef AER_DEBUG_TOOLS
-/* Grows Chunk.debug_hits to cover every word currently in c->code, zero-filling the new region —
-   called once at the top of vm_run so DISPATCH() can index it unconditionally. Safe to call every
-   run() (REPL appends code across calls): a no-op once debug_hits_cap already covers c->count. */
+/* Grows debug_hits to cover c->code, zero-filling the new region; a no-op once already covered
+   (REPL appends code across calls). */
 static void chunk_ensure_debug_hits(Chunk* c) {
     if (c->count <= c->debug_hits_cap) return;
     unsigned int old_cap = c->debug_hits_cap;
@@ -1743,11 +1549,7 @@ static void chunk_ensure_debug_hits(Chunk* c) {
 }
 #endif
 
-/* Grows Chunk.field_cache to cover every word currently in c->code, zero-filling the new region
-   (NULL shape = not cached) — same growth idiom as chunk_ensure_debug_hits above, but
-   unconditional: this is a real always-on perf feature, not a debug tool. Called once at the top
-   of vm_run; a no-op once field_cache_cap already covers c->count (REPL appends code across
-   vm_run calls, same as debug_hits). */
+/* Same growth idiom as chunk_ensure_debug_hits, but always-on (a real perf feature, not debug). */
 static void chunk_ensure_field_cache(Chunk* c) {
     if (c->count <= c->field_cache_cap) return;
     unsigned int old_cap = c->field_cache_cap;
@@ -1758,26 +1560,15 @@ static void chunk_ensure_field_cache(Chunk* c) {
 
 bool vm_run(VM* vm) {
     Chunk* c = vm->chunk;
-    /* Hoisted once here instead of re-deriving c->pool inside vm_rk_ptr20 on every call — c->pool
-       is only ever mutated by chunk_add_pool, which is parse-time only (parser.c), never called
-       during vm_run's own execution, so this is stable for the whole call. */
+    /* Hoisted once -- c->pool is only mutated at parse time, stable for the whole call. */
     AerVal* const_pool = c->pool;
-    /* Installs this call's own catch point for error()/error_at() to longjmp back to, saving
-       whatever was previously active so a nested vm_run() (cross-module calls, via setup_call/
-       aer_module_call) catches its own errors and unwinds no further than here — restored before
-       every return below, so the caller's own catch point (if any) is exactly as it was. Nothing
-       about aer_module_load/aer_module_call's own post-call `if (runtime_had_error)` cascade
-       logic needed to change: runtime_had_error is still set by error() exactly as before, still
-       read by those call sites exactly where they already read it; only the per-instruction
-       DISPATCH() flag check is gone, replaced by jumping directly here the moment an error fires. */
+    /* Installs this call's error catch point, saving the previous one so nested vm_run calls
+       catch their own errors and unwind no further than here; restored on every return. */
     AerJmpBuf  catch_point;
     AerJmpBuf* saved_unwind_target = runtime_error_unwind_target;
     runtime_error_unwind_target    = &catch_point;
-    /* Was set on every single DISPATCH() before — this call's own VM never changes for the
-       whole run (a nested module/stdlib call either runs on a different VM's own vm_run(),
-       which does this same save/restore, or never touches active_vm_for_errors at all), so one
-       store here plus one restore at each of this call's two exits (below, and lbl_halt) is
-       exactly equivalent, at a fraction of the cost. */
+    /* One store here + one restore at each exit, instead of every DISPATCH() -- the VM never
+       changes mid-call. */
     VM* saved_active_vm  = active_vm_for_errors;
     active_vm_for_errors = vm;
     if (AER_SETJMP(catch_point) != 0) {
@@ -1786,34 +1577,13 @@ bool vm_run(VM* vm) {
         return false;
     }
     Opcode cur_op;
-    /* The just-fetched instruction word, opcode and all — outer-scope for the same reason cur_op
-       is: it must still be readable inside the handler body the goto jumps to, past the end of
-       DISPATCH()'s own do-while block. For a plain (unpacked) instruction this is just cur_op's
-       own value with zero upper bits, unused by that handler. For a packed OP_* instruction (see
-       PACK3's comment in vm.h) the upper bits hold that instruction's narrow operands, read via
-       UNPACK_A/B/C — every opcode value is < 256, so masking this word with & 0xFF to get cur_op
-       is a complete no-op for every unpacked instruction and correctly extracts the opcode from a
-       packed one too; one shared DISPATCH() handles both without needing to know in advance which
-       kind of instruction it's about to fetch — which matters because a handful of opcodes
-       (OP_JUMP, OP_DEFINE_STRUCT, OP_HALT) are reached from both packed and unpacked contexts
-       through the exact same handler code. Kept the full 64 bits wide (not truncated to 32) so
-       OP_BINARY's packed RK operands (bits 24-63 — see PACK_BINARY, vm.h) survive; every other
-       opcode's packed fields still live in the low 32 bits exactly as before. */
+    /* Full 64-bit instruction word (opcode + packed operands) -- must survive past DISPATCH()'s
+       own do-while into the handler body the goto jumps to. Masking with & 0xFF extracts cur_op
+       whether the word is packed or not, so one shared DISPATCH() handles both. */
     uint64_t op_word;
-    /* Hoisted out of vm->ip, which every jump/call/return/READ() would otherwise reload from and
-       store back to on every single touch — cheap individually since vm is already register-
-       resident, but READ() alone does it on every dispatch, and some opcodes (OP_DEFINE_STRUCT's
-       field loop, trailing jump-target words) call READ() several times per dispatch, each paying
-       a fresh load+store. Kept in sync with vm->ip at exactly two kinds of point: the end of every
-       DISPATCH() (so active_vm_for_errors->ip stays correct for any error() call the next opcode's
-       body makes, identical to today's behavior) and immediately around the vm_call_value() call
-       below (the only place outside this function that writes the SAME vm's ip — module/stdlib
-       calls operate on a different VM or never touch ip at all, confirmed by inspection, so they
-       need no such sync; vm_call_value's own return-address computation takes `ip` as an explicit
-       parameter now, not a read of vm->ip, so this reload is purely to pick up the new entry point
-       vm_call_value wrote on a successful call). Every other jump/call/return site in this
-       function only ever reads/writes ip using data already local to it, so using the hoisted
-       local instead of vm->ip directly is a pure substitution there — no additional sync needed. */
+    /* Hoisted local for vm->ip -- every jump/call/READ() would otherwise reload/store it on every
+       touch. Synced at the end of every DISPATCH() and around vm_call_value (the only other
+       write to this VM's ip). */
     unsigned int ip = vm->ip;
 #ifdef AER_DEBUG_TOOLS
     chunk_ensure_debug_hits(c);
@@ -1824,41 +1594,21 @@ bool vm_run(VM* vm) {
 #define PUSH(v)    do { if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return false; } vm->stack[vm->stack_top++] = (v); } while(0)
 #define POP()      (vm->stack_top > 0 ? vm->stack[--vm->stack_top] : (error("Stack underflow"), aer_null()))
 #ifdef AER_DEBUG_TOOLS
-/* gc_maybe_collect() is no longer called from here — see each allocating label's own call,
-   placed by hand right after its result is stored into a VM-visible root (a register, or for
-   OP_CALL_VALUE's non-tail path, after call_depth++ makes the new frame
-   part of mark_vm_roots's 0..call_depth scan). Labels that can never reach pool_alloc (MOVE,
-   JUMP, FIELD_GET/SET, OP_CALL/OP_TAIL_CALL — confirmed by direct inspection,
-   not assumed) have no call at all, not a skipped one — a real Lua-style zero-cost dispatch for
-   the common case, unlike the opcode_can_allocate[] gate this replaces (which still paid a
-   lookup+branch on every dispatch, including the allocating ones, and measured as a net loss). */
-/* No error check here anymore — error()/error_at() longjmp straight back to this call's own
-   catch_point (see vm_run's preamble, above) the moment a fault fires, instead of setting a flag
-   for the next DISPATCH() to notice. That was the last unconditional per-instruction cost left in
-   this macro after the GC-check relocation (see gc_maybe_collect's own comment, DISPATCH()'s
-   longtime neighbor) — this closes the other half of the gap explained to the user against Lua's
-   longjmp-based error propagation. */
+/* Not called from DISPATCH() -- each allocating label calls it right after storing its result
+   into a VM-visible root. Labels that can never allocate (confirmed by inspection) have no call
+   at all, a real zero-cost dispatch for the common case. */
+/* No error check here -- error()/error_at() longjmp straight to this call's catch_point on
+   fault, replacing the last unconditional per-instruction cost this macro used to pay. */
 #define DISPATCH() do { unsigned int op_ip = ip; op_word = READ(); vm->ip = ip; cur_op = (Opcode)(op_word & 0x7F); c->debug_hits[op_ip]++; goto *dt[cur_op]; } while(0)
 #else
-/* Masked to 7 bits (0x7F), not 8 — 62 Opcode values fit with 66 to spare (room for future opcodes,
-   e.g. concurrency primitives, without a second redesign). Every existing packed format (PACK3,
-   PACK_REG4, ...) already starts its next field at bit 8, so bit 7 was already unused padding for
-   them; narrowing the mask changes nothing for those. It exists so newly designed compact formats
-   (PACK_BINARY, see vm.h) can start their own next field at bit 7 instead of being forced to
-   reserve all of bit 7 for no reason. */
+/* 7-bit mask, not 8 -- 62 Opcode values fit with 66 to spare, and every existing packed format
+   already leaves bit 7 as padding, so narrowing costs nothing. */
 #define DISPATCH() do { op_word = READ(); vm->ip = ip; cur_op = (Opcode)(op_word & 0x7F); goto *dt[cur_op]; } while(0)
 #endif
 
     static const void* const dt[] = {
-        /* OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR have no entries here at all — they're never
-           dispatched as a standalone instruction, only ever embedded as a unary_op TAG inside an
-           OP_UNARY instruction's packed word (see PACK3's comment above). OP_ADD..OP_RSHIFT/OP_IN
-           below, by contrast, ARE real top-level dispatch targets now — true single-level dispatch
-           for binary operators (see PACK_BINARY's own comment, vm.h): each one is dispatched
-           directly by DISPATCH()'s computed-goto instead of riding along as a second-level
-           bin_op tag re-dispatched via a shared runtime switch (now vm_binary_cold(), see its own
-           comment above). OP_AND/OP_OR/OP_PIPE still
-           have no entries — still genuinely never dispatched (see their own comment, vm.h). */
+        /* Unary ops have no entries -- only ever embedded as a tag inside OP_UNARY. OP_ADD..OP_IN ARE
+           real top-level dispatch targets (true single-level dispatch, PACK_BINARY). */
         [OP_ADD]         = &&lbl_add,
         [OP_SUB]         = &&lbl_sub,
         [OP_MUL]         = &&lbl_mul,
@@ -1913,9 +1663,8 @@ bool vm_run(VM* vm) {
         [OP_FIELD_BINARY]      = &&lbl_field_binary,
         [OP_PRINT_REPL]        = &&lbl_print_repl,
 
-        /* "Primitive pass" raw-arithmetic family (vm.h's OP_RAW_LOAD_INT comment) — see the
-           lbl_raw_* labels themselves, below lbl_halt, for why they need no vm_rk_ptr9/tag-check
-           at all. */
+        /* Raw-arithmetic family -- see the lbl_raw_* labels below for why no vm_rk_ptr9/tag-check
+           is needed. */
         [OP_RAW_LOAD_INT]      = &&lbl_raw_load_int,
         [OP_RAW_LOAD_REAL]     = &&lbl_raw_load_real,
         [OP_RAW_ADD_INT]       = &&lbl_raw_add_int,
@@ -2006,37 +1755,15 @@ lbl_is_result: {
     DISPATCH();
 }
 
-/* Dest + both RK operands packed into the single op_word DISPATCH() already fetched (see
-   PACK_BINARY's comment in vm.h) — no further READ() at all. Each operator below is its own
-   top-level dispatch target (true single-level dispatch, matching Lua's per-operator opcodes)
-   instead of a shared OP_BINARY re-dispatching via a runtime switch (now vm_binary_cold()): DISPATCH()'s
-   computed-goto already picked the exact right label, so there's no second jump to make. Each
-   label checks its own int/int (and, where it applies, real/real) fast path locally — the common
-   case for arithmetic-heavy code — and falls back to vm_binary_cold() (a real, non-inlined
-   function; see its own comment above) only for anything else: nulls, strings, booleans, arrays,
-   dicts, or a genuinely mixed int/real pair needing promotion. BINARY_OP_INT_REAL is for operators
-   with both a fast int/int and fast real/real case; BINARY_OP_INT_ONLY is for the five bitwise/
-   shift operators, which have no real/real meaning (vm_binary_cold's real/real switch already
-   errors "Operator not valid for reals" for these, same as vm_binary_fast's always has). */
-/* `result` is a pointer straight at the destination register, not a separate local — each
-   INT_STMT/REAL_STMT below writes through it directly (`*result = ...`). Found via perf annotate:
-   building a standalone AerVal local and copying it into vm->registers[dest] afterward compiled to
-   a 16-byte ldmia/stmia round trip through the stack that was, on its own, the single hottest
-   instruction in the entire nbody.aer profile (~3.6% of all cycles) — bigger than the RK9-decode
-   branch it sits next to. Writing directly at the final address instead gives the compiler a real
-   shot at folding each op's 1-2 field writes straight into vm->registers[dest], no intermediate.
-   Safe even when dest aliases ra's or rb's register (e.g. `x = x + 1`): l and rv already snapshotted
-   ra->as.i and rb->as.i by value before result is ever touched, and vm_binary_cold's (*ra, *rb) args
-   are likewise passed by value at the call, before *result is written. */
-/* gc_maybe_collect() lives ONLY in the vm_binary_cold() branch below, not after the whole if/else —
-   confirmed by direct inspection of vm_binary_cold's own body that the ONLY allocation reachable
-   from ANY instantiation of this macro (add/sub/mul/div/floor_div/eq/neq/lt/gt/lte/gte) is OP_ADD's
-   string-concatenation case (an xmalloc + aer_make_string). Every int/int and real/real fast-path
-   result (aer_int()/aer_real()) is a plain tagged-union construction, never heap allocation, so it
-   never needs a GC checkpoint — this call's own two comparisons (gc_suppress_depth/
-   pool_total_alloc_count) would otherwise run on literally every dispatch of the single most
-   common opcode family regardless of operator or operand type, when 10 of these 11 operators
-   (everything except OP_ADD) could never possibly need it in any branch at all. */
+/* Dest + both RK operands already in op_word -- no further READ(). Each operator is its own
+   top-level dispatch target, checks its own fast path, and falls back to vm_binary_cold() for
+   anything else. BINARY_OP_INT_REAL has both fast paths; BINARY_OP_INT_ONLY (bitwise/shift) has
+   no real/real meaning. */
+/* `result` points straight at the destination register -- building a local AerVal and copying
+   it measured as a 16-byte stack round-trip that was the single hottest instruction in the
+   nbody profile. Safe even when dest aliases ra/rb (l/rv already snapshotted by value). */
+/* Only in the vm_binary_cold() branch -- every int/int and real/real fast-path result is a
+   plain tagged-union construction, never an allocation. */
 #define BINARY_OP_INT_REAL(NAME, OPENUM, INT_STMT, REAL_STMT) \
 lbl_##NAME: { \
     int dest = (int)UNPACK_BINARY_DEST(op_word); \
@@ -2056,9 +1783,7 @@ lbl_##NAME: { \
     } \
     DISPATCH(); \
 }
-/* Bitwise family (AND/OR/XOR/LSHIFT/RSHIFT) — int-only, and vm_binary_cold's error path for a
-   non-integer operand never allocates either, so gc_maybe_collect() is never reachable from here at
-   all, in any branch — removed outright rather than kept as unreachable-but-harmless insurance. */
+/* Bitwise family never allocates in any branch, so no gc_maybe_collect at all. */
 #define BINARY_OP_INT_ONLY(NAME, OPENUM, INT_STMT) \
 lbl_##NAME: { \
     int dest = (int)UNPACK_BINARY_DEST(op_word); \
@@ -2102,61 +1827,16 @@ BINARY_OP_INT_ONLY(rshift, OP_RSHIFT, { *result = aer_int(l >> rv); })
 #undef BINARY_OP_INT_REAL
 #undef BINARY_OP_INT_ONLY
 
-/* `in` has no int/int or real/real fast path of its own — dict-key lookup or an array element
-   scan either way — so it's just its own label with the same dict/array logic vm_binary_cold() uses
-   for every other operator that reaches it, verbatim. */
+/* No int/int or real/real fast path -- dispatches straight to the shared vm_in(). */
 lbl_in: {
     int dest = (int)UNPACK_BINARY_DEST(op_word);
     AerVal a = *vm_rk_ptr9(vm, const_pool, UNPACK_RK_B9(op_word));
     AerVal b = *vm_rk_ptr9(vm, const_pool, UNPACK_RK_C9(op_word));
-    AerVal* result = &vm->registers[dest];
-    if (aer_type(b) == TYPE_DICT) {
-        if (aer_type(a) != TYPE_STRING) {
-            error("Left side of 'in' must be a string when testing dict membership");
-            *result = aer_bool(false);
-        } else {
-            AerString* as = aer_as_string(a);
-            unsigned int klen = as->length;
-            if (klen > VM_KEY_MAX) {
-                error("Dict key too long (max %d bytes)", VM_KEY_MAX);
-                *result = aer_bool(false);
-            } else {
-                char kbuf[VM_KEY_MAX + 1];
-                memcpy(kbuf, as->data, klen);
-                kbuf[klen] = '\0';
-                *result = aer_bool(hashtable_get(&aer_as_dict(b)->map, kbuf) != NULL);
-            }
-        }
-    } else if (aer_type(b) == TYPE_ARRAY) {
-        AerArray* arr = aer_as_array(b);
-        bool found = false;
-        for (unsigned int i = 0; i < arr->count; i++) {
-            if (values_equal(a, arr->items[i])) { found = true; break; }
-        }
-        *result = aer_bool(found);
-    } else if (aer_type(b) == TYPE_STRING) {
-        /* Substring search — same as vm_binary_cold's own OP_IN case and string.contains() (aer_string.c). */
-        if (aer_type(a) != TYPE_STRING) {
-            error("Left side of 'in' must be a string when testing string membership");
-            *result = aer_bool(false);
-        } else {
-            AerString* needle = aer_as_string(a);
-            AerString* hay    = aer_as_string(b);
-            bool found = needle->length == 0;
-            for (unsigned int i = 0; !found && i + needle->length <= hay->length; i++)
-                if (memcmp(hay->data + i, needle->data, needle->length) == 0) found = true;
-            *result = aer_bool(found);
-        }
-    } else {
-        error("Right side of 'in' must be a dict, array, or string");
-        *result = aer_bool(false);
-    }
+    vm->registers[dest] = vm_in(a, b);
     DISPATCH();
 }
 
-/* M2 — control flow. Stack-neutral, same as the M1 opcodes above — reads vm->registers[]/the chunk
-   pool only, never pops/pushes anything, and OP_JUMP (reused as-is for unconditional jumps) is
-   already stack-neutral too. */
+/* Control flow -- stack-neutral, reads only registers[]/the pool. */
 lbl_jump_if_false_reg: {
     int reg    = (int)UNPACK_A(op_word);
     int target = READ();
@@ -2164,26 +1844,16 @@ lbl_jump_if_false_reg: {
     DISPATCH();
 }
 
-/* M5 — real per-call register windowing. Bulk-copies arg_reg_base..+arg_count from the CALLER's
-   bank into the NEW callee frame's bank (always starting at its own register 0 — no more fixed
-   shared offset to agree on) in one dispatch, same bulk-copy mechanism M3 proved, now landing in
-   an isolated frame instead of a shared fixed range. Mirrors the stack VM's own overflow check
-   (vm.c's vm_setup_call: `if (target->call_depth >= VM_CALL_MAX) { error("Call stack overflow");
-   ... }`) almost verbatim — same ceiling, same error-then-DISPATCH() discipline. */
+/* Bulk-copies args from the caller's bank into the new frame's bank at register 0; overflow
+   check mirrors vm_setup_call's own ceiling. */
 lbl_call: {
     int dest_reg      = (int)UNPACK_A(op_word);
     int arg_reg_base  = (int)UNPACK_B(op_word);
     int arg_count     = (int)UNPACK_C(op_word);
     int callee_offset = READ();
-    /* tail-call reuse, see OP_TAIL_CALL's own comment in vm.h. The copy below iterates
-       i in INCREASING order with dest_i (== i) always <= source_i (== arg_reg_base + i, and
-       arg_reg_base is never negative) — the same "shift toward a lower-or-equal address" pattern
-       memmove(dest, src, n) uses when dest <= src, which is always safe to do element-by-element
-       forward regardless of how much the two ranges overlap (each register is read as a source at
-       most once, always before whichever later iteration — if any — overwrites it as a
-       destination). So this needs no special-casing for overlap, whether or not it aliases the
-       CALLEE's own parameter registers (which may have nothing to do with the CALLER's own
-       reserved_floor — a genuinely different function's arity). */
+    /* Tail-call reuse -- the copy iterates with dest_i always <= source_i, the same
+       always-safe-forward-shift pattern memmove uses when dest <= src, so no overlap
+       special-casing is needed. */
     if (cur_op == OP_TAIL_CALL) {
         for (int i = 0; i < arg_count; i++)
             vm->registers[i] = vm->registers[arg_reg_base + i];
@@ -2193,15 +1863,9 @@ lbl_call: {
     if (vm->call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); DISPATCH(); }
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
-    /* FRAME_REGISTERS, not the callee's own real max_registers: OP_CALL only carries a raw code
-       offset, not a stable function reference the way setup_call/vm_call_value's ChunkFunction and
-       AerFunction pointers already do — getting the real per-function count here would need
-       OP_CALL to also carry a function index, patched the same way callee_offset itself is for a
-       forward reference (parser.c's pending_call_add), which self-recursive calls make non-trivial
-       (this function's own max_registers isn't captured until its body finishes — see
-       parse_function's comment). Deliberately not built: this still gets the zero-allocation
-       bump-pointer property (the actual regression fix), just not the cache-locality bonus, for
-       this one call path. */
+    /* FRAME_REGISTERS, not the callee's real max_registers -- OP_CALL carries only a raw offset,
+       not a stable function reference (getting the real count would need a function index too,
+       non-trivial for self-recursive calls). Still zero-allocation, just no cache-locality bonus. */
     callee->registers  = caller->registers + caller->frame_size;
     callee->frame_size  = FRAME_REGISTERS;
     for (int i = 0; i < arg_count; i++)
@@ -2216,28 +1880,23 @@ lbl_call: {
     DISPATCH();
 }
 
-/* Functions as values. Same frame-push/bulk-copy shape as lbl_call, but the target is read from
-   a REGISTER at dispatch time (a runtime AerFunction, built by build_function_value at the point
-   a function name was referenced as a value) instead of a compile-time callee_offset. */
+/* Same frame-push shape as lbl_call, but the target is a runtime AerFunction read from a register. */
 lbl_call_value: {
     int dest_reg     = (int)UNPACK_REG4_A(op_word);
     int arg_reg_base = (int)UNPACK_REG4_B(op_word);
     int arg_count    = (int)UNPACK_REG4_C(op_word);
     int callee_reg   = (int)UNPACK_REG4_D(op_word);
-    /* vm_call_value writes a new vm->ip internally (function entry) or leaves it untouched (an
-       error return) — either way, ip must be reloaded from it before the next READ(), since
-       DISPATCH() only writes vm->ip, it doesn't read it back. OP_CALL_VALUE is a single packed
-       word with no trailing operand (PACK_REG4), so the local `ip` already holds the correct
-       resume address (past this instruction, nothing else to skip) to pass as return_ip. */
+    /* vm_call_value writes vm->ip on success (or leaves it untouched on error) -- reload before
+       the next READ(). No trailing operand (PACK_REG4), so `ip` is already the correct resume
+       address. */
     vm_call_value(vm, vm->registers[callee_reg], dest_reg, arg_reg_base, arg_count,
                       cur_op == OP_TAIL_CALL_VALUE, ip);
     ip = vm->ip;
     DISPATCH();
 }
 
-/* src_reg is a plain 0-based index into the CALLEE's own frame. return_ip/dest_reg live in the
-   callee's own frame (not a single shared global), which is exactly what makes nested/recursive
-   calls safe: an outer call's return info can't be clobbered by an inner one. */
+/* return_ip/dest_reg live in the callee's own frame, not a shared global -- what makes
+   nested/recursive calls safe. */
 lbl_return: {
     int src_reg = (int)UNPACK_A(op_word);
     CallFrame* callee = &vm->call_stack[vm->call_depth];
@@ -2254,9 +1913,7 @@ lbl_return: {
     DISPATCH();
 }
 
-/* See OP_CALL_MODULE's comment in vm.h — bridges to the exact same stack-based stdlib dispatch
-   lbl_call_module uses, since reimplementing every stdlib function for registers would be pure
-   duplication. */
+/* Bridges to the same stack-based stdlib dispatch lbl_call_module uses. */
 lbl_call_module: {
     int dest_reg     = (int)UNPACK_CALL_MODULE_DEST(op_word);
     int arg_reg_base = (int)UNPACK_CALL_MODULE_ARG_BASE(op_word);
@@ -2267,19 +1924,15 @@ lbl_call_module: {
     int fn_id        = READ();
     for (int i = 0; i < arg_count; i++) PUSH(vm->registers[arg_reg_base + i]);
     bool handled = false;
-    /* module_id/fn_id were resolved once, at parse time (module_call_id/module_fn_id, parser.c)
-       — a switch on two small ints instead of a strcmp chain against every known built-in
-       module's name, then another against every one of that module's function names, on every
-       single call. Only CALL_MODULE_DYNAMIC (a host-registered module or a user file import —
-       never a fixed core built-in) still needs the original by-name resolution, since those are
-       genuinely only knowable at runtime; module/fn names are resolved below only on that path
-       and on the error path — the happy path here never touches the constant pool. */
+    /* module_id/fn_id resolved at parse time -- a switch on two ints instead of a strcmp chain.
+       CALL_MODULE_DYNAMIC (host/file module) still resolves by name at runtime. */
     switch (module_id) {
         case CALL_MODULE_MATH:   handled = aer_math_call(vm, fn_id, arg_count);   break;
         case CALL_MODULE_RANDOM: handled = aer_random_call(vm, fn_id, arg_count); break;
         case CALL_MODULE_STRING: handled = aer_string_call(vm, fn_id, arg_count); break;
         case CALL_MODULE_TIME:   handled = aer_time_call(vm, fn_id, arg_count);   break;
         case CALL_MODULE_JSON:   handled = aer_json_call(vm, c, fn_id, arg_count);   break;
+        case CALL_MODULE_COLLECTION: handled = aer_collection_call(vm, fn_id, arg_count); break;
         default: {
             const char* module = aer_as_string(c->pool[module_idx])->data;
             const char* fn     = aer_as_string(c->pool[fn_idx])->data;
@@ -2297,9 +1950,7 @@ lbl_call_module: {
     DISPATCH();
 }
 
-/* See OP_CALL_BUILTIN's comment in vm.h — vm_call_builtin() already takes a plain AerVal*
-   array, so unlike OP_CALL_MODULE this needs no push/pop bridge to vm->stack at all. 4 local
-   slots is headroom over every builtin's real max arity (2 — delete/append/assert). */
+/* vm_call_builtin takes a plain AerVal* array -- no push/pop bridge needed. */
 lbl_call_builtin: {
     int dest_reg     = (int)UNPACK_CALL_BUILTIN_DEST(op_word);
     int arg_reg_base = (int)UNPACK_CALL_BUILTIN_ARG_BASE(op_word);
@@ -2321,9 +1972,8 @@ lbl_call_builtin: {
     DISPATCH();
 }
 
-/* Builds a new array from an already-in-order register range (pool_alloc/capacity/items/shape
-   setup) — this and every opcode below that can put a heap pointer into vm->registers[] rely on
-   mark_vm_roots's registers scan to keep it alive across a GC cycle. */
+/* Builds an array from an in-order register range -- mark_vm_roots's registers scan keeps the
+   result alive across GC. */
 lbl_array_new: {
     int dest_reg      = (int)UNPACK_A(op_word);
     int item_reg_base = (int)UNPACK_B(op_word);
@@ -2340,26 +1990,20 @@ lbl_array_new: {
     DISPATCH();
 }
 
-/* Reuses vm_index_get_compute (above) as-is — already type-generic (array/dict/string) and
-   already has all bounds/negative-index logic, so nothing about indexing itself needed
-   reimplementing for the register path. */
+/* Already type-generic (array/dict/string) with all bounds/negative-index logic. */
 lbl_index_get: {
     int dest_reg = (int)UNPACK_INDEX_GET_DEST(op_word);
     int arr_reg  = (int)UNPACK_INDEX_GET_ARR(op_word);
     AerVal* idx = vm_rk_ptr9(vm, const_pool, UNPACK_INDEX_GET_RK(op_word));
     AerVal obj = vm->registers[arr_reg];
     vm_index_get_compute(obj, *idx, &vm->registers[dest_reg]);
-    /* Only single-char string indexing allocates (a fresh 1-char string, vm_index_get_compute) —
-       array/dict indexing just copies an existing value, never touching the heap. Checked here
-       instead of calling unconditionally so the array/dict common case (e.g. nbody.aer's own
-       struct-field arrays, dominant in real code) never pays for a GC check it can't need. */
+    /* Only single-char string indexing allocates -- array/dict indexing never touches the heap, so
+       skip the check for the dominant common case. */
     if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);
     DISPATCH();
 }
 
-/* Reuses vm_index_set_compute (above) as-is — including its internal gc_barrier_array/
-   gc_barrier_dict call, which this is the first v3 opcode to exercise against a register-held
-   reference rather than a stack-held one. */
+/* Includes the internal write barrier, now exercised against a register-held reference. */
 lbl_index_set: {
     int arr_reg = (int)UNPACK_INDEX_SET_ARR(op_word);
     AerVal idx = *vm_rk_ptr20(vm, const_pool, UNPACK_INDEX_SET_IDX(op_word));
@@ -2405,8 +2049,7 @@ lbl_slice_get: {
     DISPATCH();
 }
 
-/* `x as Point` where Point is a known struct type: errors unless src_reg holds exactly that
-   struct type, else passes the value through unchanged (never converts). */
+/* Errors unless src_reg holds exactly that struct type; never converts. */
 lbl_check_shape: {
     int dest_reg = (int)UNPACK_CHECK_SHAPE_DEST(op_word);
     int src_reg  = (int)UNPACK_CHECK_SHAPE_LHS(op_word);
@@ -2421,8 +2064,7 @@ lbl_check_shape: {
     DISPATCH();
 }
 
-/* Dict literal — keys must be strings; each key is stored as an owned copy (hashtable_key_dup),
-   never an alias into the source string. */
+/* Dict literal -- each key stored as an owned copy, never an alias into the source string. */
 lbl_dict_new: {
     int dest_reg      = (int)UNPACK_A(op_word);
     int pair_reg_base = (int)UNPACK_B(op_word);
@@ -2442,8 +2084,7 @@ lbl_dict_new: {
     DISPATCH();
 }
 
-/* `for x in collection:` — arrays yield items, dicts yield keys, strings yield 1-char strings
-   (see OP_ITER_NEXT_ARRAY's comment, vm.h). */
+/* Arrays yield items, dicts yield keys, strings yield 1-char strings. */
 lbl_iter_next_array: {
     int col_reg       = (int)UNPACK_A(op_word);
     int idx_reg       = (int)UNPACK_B(op_word);
@@ -2464,8 +2105,7 @@ lbl_iter_next_array: {
         DISPATCH();
     }
     if (aer_type(col) == TYPE_STRING) {
-        /* `for c in string:` yields one-character strings, same as `for k in dict:` yields keys
-           above rather than a dedicated opcode. */
+        /* Yields one-character strings, same shape as dict-key iteration. */
         AerString* cs = aer_as_string(col);
         if ((uint64_t)idx >= cs->length) {
             ip = (unsigned int)end_target;
@@ -2520,10 +2160,8 @@ lbl_iter_next_pair: {
     DISPATCH();
 }
 
-/* Runs ONCE, before a rotated range-for loop (see OP_ITER_RANGE_PREP's own comment, vm.h) — same
-   TYPE_INTEGER checks/direction-inference/exit-condition shape as OP_ITER_RANGE_LOOP below, just
-   never advances cur_reg (there is no "next iteration" to prepare for yet; OP_ITER_RANGE_LOOP owns
-   advancing). */
+/* Runs once before the loop -- same checks as OP_ITER_RANGE_LOOP below, but never advances
+   cur_reg (nothing to prepare yet). */
 lbl_iter_range_prep: {
     int cur_reg       = (int)UNPACK_REG4_A(op_word);
     int end_reg       = (int)UNPACK_REG4_B(op_word);
@@ -2544,55 +2182,31 @@ lbl_iter_range_prep: {
         ip = (unsigned int)empty_target;
         DISPATCH();
     }
-    /* Precomputes a total iteration count ONCE, instead of re-deriving "still in range" from a
-       direction-dependent comparison against the original limit on every single dispatch of
-       OP_ITER_RANGE_LOOP — matching Lua's own FORLOOP design (its FORPREP does the equivalent
-       count computation). Ceiling division so a step that doesn't evenly divide the range still
-       gets the correct final count (e.g. 0..10..3 must stop after 0,3,6,9 — 4 iterations, not 3
-       or 4.33). count==0 means an empty range, same exit as before. */
+    /* Precomputes the iteration count once (ceiling division, matching Lua's FORLOOP) instead of
+       re-deriving it every dispatch. count==0 means empty range. */
     bool ascending = cur < rng_end;
     int64_t diff  = ascending ? (rng_end - cur) : (cur - rng_end);
-    /* step == 1 (the overwhelmingly common case — no explicit `..step` in the source) skips the
-       division entirely: count is just diff. This target has no fast hardware integer divide, and
-       short, frequently-re-entered range-for loops (nbody.aer's inner loops, not a long-running
-       counting loop) pay PREP's one-time division cost often enough that skipping it here is a
-       real win, not just a theoretical one. */
+    /* step==1 (the common case) skips the division -- this target has no fast hardware divide,
+       and short re-entered loops pay that cost often enough for it to be a real win. */
     int64_t count = (step == 1) ? diff : (diff + step - 1) / step;
     if (count == 0) {
         ip = (unsigned int)empty_target;
         DISPATCH();
     }
-    /* end_reg/step_reg are repurposed from here on, for the rest of this loop's life —
-       parse_for_in's arg_materialize snapshot already guarantees they're fresh, loop-owned
-       registers nothing else in the program ever reads, so overwriting their ORIGINAL
-       bound/step values with derived bookkeeping (a countdown, and a direction-adjusted step) is
-       safe. OP_ITER_RANGE_LOOP reads them back under their new meaning — see its own comment. */
+    /* end_reg/step_reg repurposed for this loop's life -- arg_materialize's snapshot guarantees
+       they're fresh, loop-owned registers nothing else reads. */
     vm->registers[end_reg]       = aer_int(count - 1);                 /* iterations remaining AFTER this one */
     vm->registers[step_reg]      = aer_int(ascending ? step : -step);  /* direction baked in once, not re-inferred every iteration */
     vm->registers[item_dest_reg] = cur_v;
     DISPATCH();
 }
 
-/* Runs once per iteration, at the BOTTOM of a rotated range-for loop's body (see
-   OP_ITER_RANGE_LOOP's own comment, vm.h). end_reg/step_reg no longer hold the range's original
-   bound/step here — OP_ITER_RANGE_PREP repurposes them into a countdown ("remaining_reg") and a
-   direction-adjusted step ("signed_step_reg") the first time it runs, so this handler never needs
-   to re-derive "still in range" from a fresh comparison against the original limit, matching how
-   Lua's own FORLOOP works (its FORPREP does the equivalent countdown setup) — found by comparing
-   AER's actual per-iteration cost against Lua's real algorithm, not just its opcode name. cur_reg
-   holds the value the body just used (written by lbl_iter_range_prep for the first iteration, or
-   by this same label for every iteration after) — advances it by the already-signed step (no
-   direction ternary needed here at all now), and only writes back (to cur_reg, item_dest_reg, and
-   the countdown) and branches backward if iterations remain; otherwise leaves cur_reg/item_dest_reg
-   untouched and falls through to the exit code right after this instruction. body_target is always
-   a plain, already-resolved address — never a patch_jump placeholder, unlike every other loop
-   form's back-edge (see parse_for_in, parser.c). No type/step re-validation here — parse_for_in
-   snapshots cur/end/step once via arg_materialize before the loop starts, so they can never be an
-   alias to a mutable variable, and OP_ITER_RANGE_PREP already validated them once; see this
-   opcode's own top comment, vm.h. No gc_maybe_collect() — aer_int() is a plain tagged-union
-   construction (value.h), never heap allocation, under the current AerVal representation; an
-   earlier "overflow-box path" concern applied to this project's prior NaN-boxing representation,
-   eliminated by the later tagged-union migration but never cleaned out of this comment until now. */
+/* Runs at the bottom of the loop body. end_reg/step_reg hold PREP's repurposed countdown/signed
+   step, not the original bound -- so no fresh comparison against the original limit is ever
+   needed (Lua's FORLOOP shape). Advances cur_reg by the already-signed step; on exhaustion,
+   falls through leaving cur_reg/item_dest_reg at their last value. body_target is always a
+   resolved address, never a patch placeholder. No re-validation -- PREP already checked once and
+   the snapshot can't have changed. No gc_maybe_collect -- aer_int is a plain construction. */
 lbl_iter_range_loop: {
     int cur_reg         = (int)UNPACK_REG4_A(op_word);
     int remaining_reg   = (int)UNPACK_REG4_B(op_word);
@@ -2613,8 +2227,8 @@ lbl_iter_range_loop: {
     DISPATCH();
 }
 
-/* Struct instantiation — chunk_find_shape() by name, arity check, one struct_pool allocation
-   with items inline after the header, omitted trailing fields default-filled. */
+/* chunk_find_shape() by name, arity check, one struct_pool allocation, trailing fields
+   default-filled. */
 lbl_struct_new: {
     int dest_reg           = (int)UNPACK_STRUCT_NEW_DEST(op_word);
     int arg_reg_base       = (int)UNPACK_STRUCT_NEW_ARG_BASE(op_word);
@@ -2628,10 +2242,8 @@ lbl_struct_new: {
               name, shape->field_count, shape->field_count == 1 ? "" : "s", arg_count);
         DISPATCH();
     }
-    /* Positional constructor args must match a typed field's declared type too — OP_FIELD_SET
-       isn't the only way a field's value is ever set, and the fused field-arithmetic opcodes'
-       typed fast path trusts every field unconditionally, not just ones reached via `.field =`.
-       Checked before allocating anything, so a mismatch never leaves a half-built struct behind. */
+    /* Positional args must match a typed field too -- the fused field-arithmetic fast path trusts
+       every field unconditionally, not just ones set via `.field =`. Checked before allocating. */
     for (int i = 0; i < arg_count; i++) {
         ValueType declared = shape->field_types[i];
         if (declared != TYPE_ANY && vm->registers[arg_reg_base + i].tag != declared) {
@@ -2653,8 +2265,7 @@ lbl_struct_new: {
     DISPATCH();
 }
 
-/* Reading struct_reg from a register instead of popping the stack; see vm_resolve_field (above)
-   for the shared field-slot lookup/cache. */
+/* Reads struct_reg from a register instead of popping the stack. */
 lbl_field_get: {
     unsigned int site = ip - 1;
     int dest_reg   = (int)UNPACK_FIELD_GET_DEST(op_word);
@@ -2666,13 +2277,9 @@ lbl_field_get: {
     DISPATCH();
 }
 
-/* Fusion opcode — see its own comment in vm.h and vm_resolve_field (above) for the shared
-   field-slot lookup/cache. Feeds the field value straight into the binary op instead of writing
-   it to a register first. bin_op is a runtime value here (unlike lbl_add/lbl_sub/etc., which each
-   get their own statically-known opcode), so a per-operator switch can't be avoided the way it was
-   for the standalone case — but the int/int and real/real cases (the common ones for arithmetic-
-   heavy code) are still handled by the small always_inline vm_binary_fast() below, falling back to
-   the non-inlined vm_binary_cold() only for anything else. */
+/* Feeds the field value straight into the binary op instead of a register first. bin_op is a
+   runtime value here, so the int/int and real/real cases still route through vm_binary_fast,
+   falling back to vm_binary_cold for anything else. */
 lbl_binary_field: {
     unsigned int site   = ip - 1;
     int dest_reg   = (int)UNPACK_BINARY_FIELD_DEST(op_word);
@@ -2686,9 +2293,7 @@ lbl_binary_field: {
     ValueType ta = aer_type(*lhs), tb = aer_type(rhs);
     bool handled;
     vm->registers[dest_reg] = vm_binary_fast(*lhs, rhs, bin_op, ta, tb, &handled);
-    /* gc_maybe_collect only ever needed on the cold path (string concat) — see BINARY_OP_INT_REAL's
-       own comment above for why the fast path (vm_binary_fast's int/int and real/real cases) can
-       never allocate. */
+    /* Only needed on the cold path (string concat) -- the fast path never allocates. */
     if (!handled) {
         vm->registers[dest_reg] = vm_binary_cold(*lhs, rhs, bin_op, ta, tb);
         gc_maybe_collect(vm);
@@ -2696,8 +2301,7 @@ lbl_binary_field: {
     DISPATCH();
 }
 
-/* Mirror of lbl_binary_field for the other operand order — see OP_FIELD_BINARY's own comment in
-   vm.h. */
+/* Mirror of lbl_binary_field for the other operand order. */
 lbl_field_binary: {
     unsigned int site   = ip - 1;
     int dest_reg   = (int)UNPACK_FIELD_BINARY_DEST(op_word);
@@ -2729,8 +2333,7 @@ lbl_print_repl: {
     DISPATCH();
 }
 
-/* See vm_resolve_field (above) for the shared field-slot lookup/cache. gc_barrier_array is the
-   write barrier every mutating struct/array/dict write needs. */
+/* gc_barrier_array is the write barrier every mutating struct/array/dict write needs. */
 lbl_field_set: {
     unsigned int site = ip - 1;
     int struct_reg = (int)UNPACK_FIELD_SET_STRUCT(op_word);
@@ -2738,9 +2341,8 @@ lbl_field_set: {
     AerVal* val = vm_rk_ptr9(vm, const_pool, UNPACK_FIELD_SET_RK(op_word));
     AerArray* oa; int slot;
     if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
-    /* Enforced once here, at the only place a field's value ever changes — trusted everywhere
-       else (including the fused field-arithmetic opcodes' typed fast path below), never
-       re-checked on read. TYPE_ANY means the field is untyped, same as today. */
+    /* Enforced once here (the only place a field's value changes), trusted everywhere else
+       including the fused fast path. TYPE_ANY means untyped. */
     ValueType declared = oa->shape->field_types[slot];
     if (declared != TYPE_ANY && val->tag != declared) {
         error("Field '%s' is declared as a fixed type and cannot be assigned a different type",
@@ -2752,10 +2354,8 @@ lbl_field_set: {
     DISPATCH();
 }
 
-/* `Type[count]` — see TYPE_PACKED_ARRAY's own comment, value.h. Eligibility (every field is a
-   fixed primitive) is checked here, at runtime, for the same reason OP_STRUCT_NEW's positional-arg
-   type check is: a Shape is only fully known once its OP_DEFINE_STRUCT has actually run, not at
-   parse time. */
+/* Eligibility (every field a fixed primitive) checked at runtime -- a Shape is only fully known
+   once its OP_DEFINE_STRUCT has run. */
 lbl_packed_array_new: {
     int dest_reg            = (int)UNPACK_PACKED_ARRAY_NEW_DEST(op_word);
     int type_name_pool_idx  = (int)UNPACK_PACKED_ARRAY_NEW_NAME(op_word);
@@ -2779,9 +2379,8 @@ lbl_packed_array_new: {
     AerPackedArray* pa = pool_alloc(&packed_array_pool);
     pa->count = (unsigned int)count;
     pa->shape = shape;
-    /* malloc(0)'s return value is implementation-defined (NULL is allowed) — xmalloc would
-       misreport that as out-of-memory, so a zero-count packed array skips the call entirely; every
-       later access is already rejected by the bounds check regardless. */
+    /* malloc(0) is implementation-defined -- skip it for a zero-count array; bounds checks reject
+       every later access anyway. */
     pa->data  = count > 0 ? xmalloc((size_t)count * (size_t)element_size) : NULL;
     for (int64_t e = 0; e < count; e++) {
         unsigned char* elem = pa->data + (size_t)e * element_size;
@@ -2793,13 +2392,9 @@ lbl_packed_array_new: {
     DISPATCH();
 }
 
-/* The fused `obj[index].field` read — see OP_INDEX_FIELD_GET's own comment, vm.h, for why this
-   handles BOTH a packed array and an ordinary struct array in one opcode (the parser can't know
-   which at compile time — functions are untyped, so a packed array flows through a parameter
-   exactly like any other value). The non-packed branch reproduces vm_index_get_compute() +
-   vm_resolve_field() exactly, just without needing a register for the intermediate value (no
-   dest_reg is free to stash it in ahead of the final write, the way the old two-opcode sequence
-   used one temp register for both steps). */
+/* Handles both a packed array and an ordinary struct array (the parser can't know which --
+   functions are untyped). The non-packed branch reproduces the plain index+field path exactly,
+   just without needing a scratch register for the intermediate. */
 lbl_index_field_get: {
     unsigned int site = ip - 1;
     int dest_reg  = (int)UNPACK_INDEX_FIELD_GET_DEST(op_word);
@@ -2837,9 +2432,7 @@ lbl_index_field_get: {
     DISPATCH();
 }
 
-/* The fused `obj[index].field = value` / compound-assign write — mirror of lbl_index_field_get
-   above, same dual dispatch, same reason it needs no scratch register for the non-packed
-   intermediate (vm_resolve_field_by_shape works off the intermediate's own ->shape directly). */
+/* Mirror of lbl_index_field_get -- same dual dispatch, same reason no scratch register is needed. */
 lbl_index_field_set: {
     unsigned int site   = ip - 1;
     int obj_reg         = (int)UNPACK_INDEX_FIELD_SET_OBJ(op_word);
@@ -2890,10 +2483,8 @@ lbl_index_field_set: {
     DISPATCH();
 }
 
-/* One handler for negate/not/bitwise-not, keyed by unary_op — same "reuse the Opcode value as an
-   operand tag" convention lbl_binary uses. Also folds in OP_TO_STR (string interpolation's
-   "{name}" -> string conversion), calling the existing vm_to_str() helper (shared with
-   print()/lbl_to_str above) rather than reimplementing value formatting. */
+/* Keyed by unary_op, same tag convention as lbl_binary. Also folds in OP_TO_STR
+   (interpolation's string conversion) via the shared vm_to_str(). */
 lbl_unary: {
     int dest        = (int)UNPACK_UNARY_DEST(op_word);
     Opcode unary_op = (Opcode)UNPACK_UNARY_OP(op_word);
@@ -2913,11 +2504,8 @@ lbl_unary: {
             else *result = aer_int(~aer_as_int(v));
             break;
         case OP_TO_STR:
-            /* The only case here that can ever allocate (vm_to_str/aer_make_string) — NEGATE/NOT/
-               BITWISE_NOT only ever produce aer_int/aer_real/aer_bool, plain tagged-union
-               constructions (value.h) with no heap involvement at all under the current AerVal
-               representation, so gc_maybe_collect is scoped to just this case, not the whole
-               opcode. */
+            /* The only allocating case -- NEGATE/NOT/BITWISE_NOT only ever produce plain tagged-union
+               values. */
             *result = vm_to_str(vm, v);
             gc_maybe_collect(vm);
             break;
@@ -2928,10 +2516,8 @@ lbl_unary: {
     DISPATCH();
 }
 
-/* `x as integer/float/boolean` — see vm_cast() above. No gc_maybe_collect: every cast_type only
-   ever produces aer_null/aer_int/aer_real/aer_bool (confirmed by direct inspection of vm_cast's
-   body, including its string-parsing sub-cases, which only ever populate a local stack buffer),
-   never heap allocation. */
+/* No gc_maybe_collect -- every cast_type only ever produces a plain tagged-union value
+   (confirmed by inspection, including vm_cast's string-parsing sub-cases). */
 lbl_cast: {
     int dest      = (int)UNPACK_CAST_DEST(op_word);
     int cast_type = (int)UNPACK_CAST_TYPE(op_word);
@@ -2940,14 +2526,8 @@ lbl_cast: {
     DISPATCH();
 }
 
-/* "Primitive pass" raw-arithmetic handlers (vm.h's OP_RAW_LOAD_INT comment, CallFrame.raw_ints/
-   raw_reals) — skip both vm_rk_ptr9's RK-flag check and the usual tag check entirely, since the
-   parser has already proven, at compile time, that every operand here is the stated type. None of
-   these call gc_maybe_collect(): integers/reals/booleans never have heap cells (see
-   value_is_young's default case, above), so nothing in this whole family — arithmetic, comparison,
-   or boxing — ever allocates pool memory, unlike the boxed BINARY_OP_INT_REAL family (whose
-   gc_maybe_collect call is a general periodic safepoint, not a response to that specific op
-   allocating). */
+/* Skip both the RK-flag check and the tag check -- the parser already proved every operand's
+   type at compile time. None allocate: integers/reals/booleans never have heap cells. */
 lbl_raw_load_int: {
     int dest = (int)UNPACK_RAW_LOAD_INT_DEST(op_word);
     vm->raw_ints[dest] = UNPACK_RAW_LOAD_INT_IMM(op_word);
@@ -2985,11 +2565,8 @@ lbl_raw_mul_int: {
     DISPATCH();
 }
 
-/* Matches OP_DIV's own boxed semantics exactly: integer division always promotes to a real result
-   — AER has no truncating "/" (see BINARY_OP_INT_REAL(div, ...) above, which produces aer_real()
-   even for two integer operands). So, uniquely among the OP_RAW_*_INT family, this opcode's dest
-   is a raw_reals[] slot, not raw_ints[] — the parser's var_kind classification must know this:
-   `x = a / b` for raw-int a/b makes x RAW_REAL, never RAW_INT. */
+/* Matches OP_DIV's own semantics: int/int division always promotes to real, so this is the one
+   OP_RAW_*_INT opcode whose dest is raw_reals[], not raw_ints[]. */
 lbl_raw_div_int: {
     int dest = (int)UNPACK_RAW_ARITH_RR_DEST(op_word);
     int a    = (int)UNPACK_RAW_ARITH_RR_A(op_word);
@@ -3054,9 +2631,7 @@ lbl_raw_div_real: {
     DISPATCH();
 }
 
-/* Comparisons produce an ordinary BOXED boolean, in a normal registers[] slot (dest here is 7
-   bits, not 5 — see PACK_RAW_CMP's own comment, vm.h) — they feed a branch, not further raw
-   arithmetic, so there's no raw boolean type to keep this result in. */
+/* Comparisons produce a boxed boolean (no raw boolean type exists) -- dest is 7 bits, not 5. */
 lbl_raw_lt_int: {
     int dest = (int)UNPACK_RAW_CMP_DEST(op_word);
     int a    = (int)UNPACK_RAW_CMP_A(op_word);
@@ -3121,8 +2696,7 @@ lbl_raw_gte_real: {
     DISPATCH();
 }
 
-/* The only bridge from raw storage back to a normal tagged AerVal register — see PACK_BOX's own
-   comment, vm.h. */
+/* The only bridge from raw storage back to a tagged AerVal register. */
 lbl_box_int: {
     int dest = (int)UNPACK_BOX_DEST(op_word);
     int src  = (int)UNPACK_BOX_SRC(op_word);
@@ -3151,11 +2725,8 @@ lbl_raw_move_real: {
     DISPATCH();
 }
 
-/* Compound-assign accumulation of a boxed value into a raw slot, in place — see the opcode's own
-   comment in vm.h. A runtime tag check decides: matching type accumulates directly into the raw
-   slot (no shadow, no allocation — safe to repeat every loop iteration since the slot's identity
-   never changes); mismatched type is the same "Type mismatch in binary expression" runtime error
-   vm_binary_cold already gives for this, not a crash or silent corruption. */
+/* A runtime tag check decides: matching type accumulates in place (safe every iteration, the
+   slot's identity never changes); mismatched type is the same runtime error vm_binary_cold gives. */
 lbl_raw_add_int_boxed: {
     int slot = (int)UNPACK_RAW_ARITH_BOXED_SLOT(op_word);
     int reg  = (int)UNPACK_RAW_ARITH_BOXED_REG(op_word);
@@ -3217,11 +2788,9 @@ lbl_raw_load_int_pool: {
     DISPATCH();
 }
 
-/* rhs may legitimately be TYPE_REAL even though the raw slot is int (e.g. `time.now() > 1700000000`
-   — the literal is raw-composable int, time.now()'s boxed result is real) — the ordinary boxed
-   comparison this replaces silently promotes int<->real for exactly this reason (vm_binary_fast's
-   own int/real promotion), so a hard type-check here would be a real regression, not just a missed
-   optimization. Only a genuinely non-numeric boxed type still errors. */
+/* rhs may legitimately be TYPE_REAL against an int raw slot (e.g. comparing against
+   time.now()'s real result) -- the ordinary boxed comparison this replaces promotes int<->real
+   too, so a hard type check here would be a real regression. */
 lbl_raw_lt_int_boxed: {
     int dest = (int)UNPACK_RAW_CMP_BOXED_DEST(op_word);
     int slot = (int)UNPACK_RAW_CMP_BOXED_SLOT(op_word);

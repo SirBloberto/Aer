@@ -8,7 +8,7 @@ underneath it.
 Source map: `source/compiler/{lexer,parser}.c` (front end), `source/core/vm.{c,h}` (bytecode
 format + the VM itself), `source/value.h` (value representation and its accessors),
 `source/utilities/pool.{c,h}` (allocator), `source/stdlib/aer_*.c` (built-in library modules:
-math/random/string/time/json/io), `source/core/aer_module.c`/`aer_host.c` (import and
+math/random/string/time/json/collection/io), `source/core/aer_module.c`/`aer_host.c` (import and
 host-embedding mechanisms), `source/core/disasm.c` (debug-only disassembler/profiler).
 
 ---
@@ -468,7 +468,7 @@ outer check. Since a module name in `module.fn(...)` is always a literal identif
 ambiguous), it's resolved once at *parse* time to a small integer ID (`CALL_MODULE_MATH` etc.),
 and the VM switches on that int instead. `CALL_MODULE_DYNAMIC` (a host-registered module or a file
 import — genuinely only resolvable by name at runtime) is the sole remaining `strcmp` path.
-`OP_CALL_BUILTIN`'s own dispatch (`length`/`append`/`print`/...) got the identical treatment:
+`OP_CALL_BUILTIN`'s own dispatch (`length`/`print`/`type`/...) got the identical treatment:
 `builtin_call_id` (parser.c) resolves the literal name to a `CALL_BUILTIN_LENGTH`-etc. int once at
 parse time, emitted as a trailing word exactly like `OP_CALL_MODULE`'s `module_id`, and
 `vm_call_builtin` switches on it instead of running a 7-entry `strcmp` chain per call. No
@@ -494,11 +494,10 @@ after the split: -1.6–1.7% instructions relative to the pre-split baseline.
   `gc_barrier_array`) are called from `vm.c` — a different translation unit — so without LTO every
   call pays full cross-TU call/return overhead no matter how trivial the callee's body is. Added to
   the shared build flags: ~4.4% fewer instructions, ~5–7% faster wall clock.
-- **PGO** (`make pgo`, a two-stage `-fprofile-generate`/`-fprofile-use` build): a real 7–9% wall-clock
-  win on `nbody.aer` with **zero source changes**, compounding automatically with LTO (same shared
-  build-flags variable). Not the default `make` target — it roughly doubles build time for a build
-  that must be trained on a representative workload, a real cost/benefit tradeoff for a fast
-  edit-compile-test loop during development.
+- **PGO** (a two-stage `-fprofile-generate`/`-fprofile-use` build): a real 7–9% wall-clock win on
+  `nbody.aer` with **zero source changes**, compounding automatically with LTO. The dedicated
+  makefile target was dropped in a cleanup pass (it doubled build time and needed workload
+  training); the measured result stands, and the recipe is two flags if it's ever wanted again.
 
 ---
 
@@ -593,7 +592,7 @@ Called from the handful of opcode handlers listed in B/C above, immediately afte
 already reachable from a root (a register or the value stack) — never before. Every non-allocating
 opcode (`OP_MOVE`, `OP_JUMP`, field get/set, global load/store, `OP_CALL`/`OP_TAIL_CALL`, all the
 "primitive pass" raw-arithmetic opcodes, ...) calls it **zero** times — not a skipped check, a
-genuinely absent one (§5.1). `append()`'s items-buffer growth and `vm_call_builtin`'s few
+genuinely absent one (§5.1). `collection.append()`'s items-buffer growth and `vm_call_builtin`'s few
 allocating branches (`type()`, struct construction) follow the same rule, called from
 `vm_call_builtin`'s own return path.
 

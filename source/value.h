@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>   /* memcmp, for the inline string helpers below */
 
 /* Forward declarations — mutual references between AerVal and collection types */
 typedef struct AerArray       AerArray;
@@ -23,33 +24,18 @@ typedef enum ValueType {
     TYPE_FUNCTION,
     TYPE_ARRAY,
     TYPE_DICT,
-    /* A fixed-size, mass-allocated array of one struct type's instances, packed inline (no
-       per-element heap allocation, no pointer indirection) — see AerPackedArray below. Only
-       constructible for a struct whose every field is a fixed-primitive type (integer/float/
-       boolean; enforced at construction, vm.c) — never any/string/nested-struct, since those can't
-       be packed at a uniform byte width. Deliberately has no standalone per-element reference
-       value: `arr[i]` alone is not legal, only `arr[i].field` (get/set) is — see OP_INDEX_FIELD_GET/
-       SET's own comment, vm.h, for why (packed indexing is pure arithmetic, so there's nothing a
-       standalone reference would save over recomputing it at each access). */
+    /* Struct instances packed inline at 8 bytes/field — fixed-primitive fields only, and no
+       standalone `arr[i]` reference value (only `arr[i].field`); see AerPackedArray below. */
     TYPE_PACKED_ARRAY,
-    /* A tagged (value, err) pair — the stdlib's fallible-function convention (`io.read`,
-       `json.decode`, etc.). Exactly one of the two fields is ever non-null. A real type (not a
-       2-element AerArray) specifically so indexing/truthiness/dispatch can tell a Result apart
-       from an ordinary array on sight, instead of guessing from shape. */
+    /* Tagged (value, err) pair, exactly one non-null — a real type (not a 2-array) so dispatch
+       can recognize a Result on sight. */
     TYPE_RESULT,
-    /* Not a real value tag — never written into an AerVal.tag, only into Shape.field_types[] (see
-       Shape's own comment, vm.h) to mean "this struct field has no declared type." Appended last
-       so it can't disturb TYPE_NULL's load-bearing == 0 invariant or any existing tag value. */
+    /* Never a real AerVal tag — only Shape.field_types[]'s "no declared type"; must stay last. */
     TYPE_ANY,
 } ValueType;
 
-/* AerVal: the one runtime value type, everywhere — every VM stack slot, register, array element,
-   dict entry, struct field, and host-embedding argument/result (AerNativeFn, include/aer.h) is one
-   of these. See the accessor functions further down this file.
-   The tag MUST default to TYPE_NULL (0) on zero-init — mark_vm_roots (vm.c) scans every
-   register unconditionally, relying on a never-yet-written register decoding as a harmless leaf
-   value. TYPE_NULL is declared first in ValueType above specifically so this holds automatically
-   for any zero-initialized AerVal. */
+/* The one runtime value type everywhere. Zero-init MUST decode as null (TYPE_NULL == 0) —
+   mark_vm_roots scans never-written registers unconditionally. */
 typedef struct AerVal {
     ValueType tag;
     union {
@@ -60,9 +46,7 @@ typedef struct AerVal {
     } as;
 } AerVal;
 
-/* Defined after AerVal so items[] can use the complete internal value type.
-   gc_state must be first — pool.c treats every pool-managed struct's leading byte as its GC
-   state, generically, without knowing the rest of the layout (see pool.h). */
+/* gc_state must be byte 0 in every pool-managed struct — pool.c reads the leading byte generically. */
 struct AerArray {
     unsigned char gc_state;
     AerVal*      items;
@@ -72,14 +56,9 @@ struct AerArray {
 };
 _Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* One struct type's instances, packed inline in one raw byte block instead of AerArray's per-
-   element AerVal pointers-to-scattered-instances — see TYPE_PACKED_ARRAY's own comment above.
-   Every field packs at a fixed 8-byte slot (matching AerVal's numeric payload width — no bit-width
-   type support), in the struct's declared field order, so element i's field j lives at
-   `data + i * (shape->field_count * 8) + j * 8`. A LEAF for the GC — every field is a fixed
-   primitive (integer/float/boolean), never a heap reference, so unlike AerArray this never needs a
-   write barrier and its mark step never recurses into contents (see mark_value's TYPE_PACKED_ARRAY
-   case, vm.c). gc_state first, same reasoning as AerArray above. */
+/* One raw byte block, 8 bytes per field in declared order: element i's field j is at
+   data + i*(field_count*8) + j*8. A GC leaf — fields are fixed primitives, never heap refs, so no
+   write barrier and no mark recursion. */
 struct AerPackedArray {
     unsigned char gc_state;
     unsigned char* data;
@@ -88,11 +67,7 @@ struct AerPackedArray {
 };
 _Static_assert(offsetof(struct AerPackedArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* gc_state first, same reasoning as AerArray above. Then pointer, then the pool-index-sized int
-   (code_offset can exceed 65535 in a large program's constant pool, so it stays full width), then
-   the two fields bounded by a language-level cap (arity/min_arity <= MAX_PARAMS ==
-   SCOPE_SLOT_MAX == 32, comfortably inside uint16_t) — every AerFunction is a plain function value
-   now that closures (and their upvalues array) are gone. */
+/* Field order is size-sorted to minimize padding; arity fields fit uint16_t (MAX_PARAMS == 32). */
 struct AerFunction {
     unsigned char gc_state;
     AerVal*      defaults;        /* NULL if min_arity == arity; else (arity - min_arity) compile-time-literal values */
@@ -103,14 +78,8 @@ struct AerFunction {
 };
 _Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* `data` is always owned by the AerString — every construction site (lexer
-   tokenizing, string ops in vm.c, stdlib functions) hands aer_make_string() a
-   freshly xmalloc'd buffer it exclusively owns, never a borrowed view into
-   another string/buffer. This is load-bearing for the garbage collector
-   (see Memory and Security in the README): sweeping an AerString always
-   frees `data` unconditionally, so a borrowed pointer would double-free or
-   dangle the moment either the borrower or the lender is collected.
-   gc_state first, same reasoning as AerArray above. */
+/* `data` is always exclusively owned, never a borrowed view — the GC sweep frees it
+   unconditionally, so a borrowed pointer would double-free or dangle. */
 struct AerString {
     unsigned char gc_state;
     char*        data;
@@ -118,9 +87,7 @@ struct AerString {
 };
 _Static_assert(offsetof(struct AerString, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* See TYPE_RESULT's own comment above. Fields are set once at construction (aer_make_result) and
-   never mutated afterward — there's no language-level `result[0] = ...` — so unlike AerArray/
-   AerDict this never needs a write barrier. gc_state first, same reasoning as AerArray above. */
+/* Set once at construction, never mutated — so no write barrier needed, unlike AerArray/AerDict. */
 struct AerResult {
     unsigned char gc_state;
     AerVal value;
@@ -130,22 +97,13 @@ _Static_assert(offsetof(struct AerResult, gc_state) == 0, "pool.c assumes gc_sta
 
 /* AerDict is defined in vm.h (needs HashTable which is in hashtable.h) */
 
-/* Wraps an existing (data, length) pair in a fresh heap-allocated AerString
-   box and returns it as a TYPE_STRING AerVal. The caller must pass a buffer
-   it owns exclusively (see AerString above) — aer_make_string() takes
-   ownership, it never copies. Defined in vm.c; declared here so the lexer
-   and parser (which construct string values directly from source text) can
-   use it too, not just the VM itself. Internal-only (not part of the public
-   embedding surface) — see include/aer.h for what host code actually uses. */
+/* Boxes an exclusively-owned buffer as a TYPE_STRING — takes ownership, never copies. */
 AerVal aer_make_string(char* data, unsigned int length);
 
-/* Builds a Result from a native module's (value, err) pair — exactly one of the two should be
-   null. Defined in vm.c (needs pool_alloc); declared here so stdlib modules (aer_io.c,
-   aer_json.c) can use it without reaching into vm.c internals. */
+/* Builds a Result from a (value, err) pair — exactly one of the two should be null. */
 AerVal aer_make_result(AerVal value, AerVal err);
 
-/* Accessors for AerVal above — every read/write of its payload goes through one of these, never a
-   direct `.as.x` elsewhere, so the representation can change again without touching call sites. */
+/* Every payload read/write goes through these accessors, never a direct `.as.x` elsewhere. */
 
 static inline ValueType aer_type(AerVal v) { return v.tag; }
 
@@ -154,9 +112,7 @@ static inline AerVal aer_null(void) {
 }
 
 static inline AerVal aer_bool(bool b) {
-    /* as.i = 0 first: as.b only occupies byte 0, and vm_packed_slot_write (vm.c) memcpy's the
-       whole 8-byte union into packed-array storage — without this, its other 7 bytes would be
-       whatever garbage was already on the caller's stack. */
+    /* as.i = 0 first — vm_packed_slot_write memcpy's the whole 8-byte union, not just byte 0 */
     AerVal v; v.tag = TYPE_BOOLEAN; v.as.i = 0; v.as.b = b; return v;
 }
 
@@ -191,8 +147,24 @@ static inline AerDict*     aer_as_dict(AerVal v)      { return (AerDict*)v.as.pt
 static inline AerPackedArray* aer_as_packed_array(AerVal v) { return (AerPackedArray*)v.as.ptr; }
 static inline AerResult*      aer_as_result(AerVal v)        { return (AerResult*)v.as.ptr; }
 
-/* Integer and real are both "a number" as far as most native-module math/time functions are
-   concerned — coerces either into a plain double, false for any other type. */
+/* Byte-index of needle's first occurrence in hay, or -1; empty needle matches at 0. The one
+   substring search behind string.contains/index_of and `in` on strings. */
+static inline int64_t aer_string_find(const AerString* hay, const AerString* needle) {
+    if (needle->length == 0) return 0;
+    for (unsigned int i = 0; i + needle->length <= hay->length; i++)
+        if (memcmp(hay->data + i, needle->data, needle->length) == 0) return (int64_t)i;
+    return -1;
+}
+
+/* Lexicographic byte order, length tiebreak — the one ordering behind collection.sort and `<` on strings. */
+static inline int aer_string_compare(const AerString* a, const AerString* b) {
+    unsigned int n = a->length < b->length ? a->length : b->length;
+    int c = memcmp(a->data, b->data, n);
+    if (c != 0) return c;
+    return (int)a->length - (int)b->length;
+}
+
+/* Coerces integer or real to a plain double; false for any other type. */
 static inline bool aer_as_double(AerVal v, double* out) {
     if (aer_type(v) == TYPE_INTEGER) { *out = (double)aer_as_int(v); return true; }
     if (aer_type(v) == TYPE_REAL)    { *out = aer_as_real(v);        return true; }

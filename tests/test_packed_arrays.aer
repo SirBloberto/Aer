@@ -1,4 +1,5 @@
 #!/usr/bin/env aer
+import collection
 # AER test suite — packed struct arrays (`Type[count]`): fixed-size, mass-allocated,
 # inline-packed arrays of one struct type's instances. Machine-checked via assert():
 # a clean run exits 0; any failure prints "ASSERT FAILED: ..." and the process exits
@@ -115,8 +116,8 @@ survivor[3].v = 12345
 
 gc_churn = []
 for i in 0..5000:
-    append(gc_churn, GcPoint[4])
-    append(gc_churn, [i, i * 2, "u" + (i as string)])
+    collection.append(gc_churn, GcPoint[4])
+    collection.append(gc_churn, [i, i * 2, "u" + (i as string)])
 
 assert(survivor[3].v == 12345, "a packed array held in a still-live variable survives GC pressure from unrelated allocations")
 assert(length(gc_churn) == 10000, "all the churn allocations (including throwaway packed arrays) completed without corrupting anything")

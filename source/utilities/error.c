@@ -18,7 +18,6 @@ static char             last_error_msg[ERROR_MSG_MAX] = "";
 static AerErrorCallback error_callback                = NULL;
 static void*            error_callback_userdata       = NULL;
 
-/* Appends a formatted piece to buf[*pos..], clamped to bufsize, so error formatting can never overrun its buffer regardless of source-line or message length. */
 static void append_fmt(char* buf, size_t bufsize, size_t* pos, const char* fmt, ...) {
     if (*pos >= bufsize) return;
     va_list args;
@@ -30,7 +29,7 @@ static void append_fmt(char* buf, size_t bufsize, size_t* pos, const char* fmt, 
     if (*pos >= bufsize) *pos = bufsize - 1;
 }
 
-/* Sends a fully-formatted message to whichever sink is active — a host-registered callback, or stderr by default (unchanged CLI/REPL behavior) — and updates aer_last_error() either way. */
+/* Routes to the host-registered callback if any, else stderr; updates aer_last_error() either way. */
 static void emit_error(const char* msg) {
     strncpy(last_error_msg, msg, ERROR_MSG_MAX - 1);
     last_error_msg[ERROR_MSG_MAX - 1] = '\0';
@@ -64,7 +63,6 @@ void aer_report_fatal(const char* msg) {
     exit(1);
 }
 
-/* Allocation wrappers — aer_report_fatal() never returns, so these never return NULL; every call site is spared its own "if (!p) ..." check. */
 void* xmalloc(size_t size) {
     void* p = malloc(size);
     if (!p) aer_report_fatal("Out of memory");
@@ -111,12 +109,6 @@ void error(const char* format, ...) {
     parse_had_error   = true;
     runtime_had_error = true;
 
-    /* Jumps straight back to the currently-executing vm_run() call's own dispatch loop instead of
-       waiting for its next DISPATCH() to notice the flag (there is no such per-instruction check
-       anymore — see DISPATCH()'s own comment, vm.c). NULL here means no vm_run() call is active
-       (a parse-time error, or error()/error_at() called from parser.c) — falls through to the
-       same "set flags, return normally" behavior this always had, letting the parser's own
-       recursive-descent recovery run unchanged. */
     if (runtime_error_unwind_target) AER_LONGJMP(*runtime_error_unwind_target, 1);
 }
 
@@ -164,11 +156,5 @@ void error_at(const char* format, ...) {
     parse_had_error   = true;
     runtime_had_error = true;
 
-    /* Jumps straight back to the currently-executing vm_run() call's own dispatch loop instead of
-       waiting for its next DISPATCH() to notice the flag (there is no such per-instruction check
-       anymore — see DISPATCH()'s own comment, vm.c). NULL here means no vm_run() call is active
-       (a parse-time error, or error()/error_at() called from parser.c) — falls through to the
-       same "set flags, return normally" behavior this always had, letting the parser's own
-       recursive-descent recovery run unchanged. */
     if (runtime_error_unwind_target) AER_LONGJMP(*runtime_error_unwind_target, 1);
 }

@@ -1,17 +1,19 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include "aer_stdlib.h"
 #include "aer_host.h"
 #include "error.h"
 
-/* io is a host-registered module, not hardcoded like math/random/string — see aer_stdlib.h; registered once by main.c, and embed_smoke_test.c deliberately never registers it, proving file access is opt-in. */
+/* io is host-registered, not a native module — file access is opt-in per host (see aer_stdlib.h). */
 
-/* io.stdin()'s handle — the only "handle" concept left in this API. Every other operation is
-   one-shot and path-based (open, do the thing, close, all inside the native call), so there's no
-   persistent file table to manage anymore. */
+/* io.stdin()'s handle — the only handle in this API; everything else is one-shot and path-based. */
 #define STDIN_HANDLE 0
-static FILE* stdin_file = NULL;
+
+/* Borrowed argv slice for io.args() — see aer_io_set_args (aer_stdlib.h). */
+static int    io_argc = 0;
+static char** io_argv = NULL;
 
 static AerVal make_error(const char* msg) {
     size_t n   = strlen(msg);
@@ -35,8 +37,7 @@ static AerVal io_read_until_eof(FILE* fp) {
     return aer_make_result(aer_make_string(buf, (unsigned int)len), aer_null());
 }
 
-/* Shared by the path-open and stdin branches of io_read — tries the fast seek-and-presize path
-   first, falling back to io_read_until_eof for a non-seekable stream (fseek fails on a pipe). */
+/* Seek-and-presize when possible; io_read_until_eof for non-seekable streams (pipes). */
 static AerVal io_read_fp(FILE* fp) {
     if (fseek(fp, 0, SEEK_END) != 0) return io_read_until_eof(fp);
     long size = ftell(fp);
@@ -49,9 +50,6 @@ static AerVal io_read_fp(FILE* fp) {
     return aer_make_result(aer_make_string(buf, (unsigned int)nread), aer_null());
 }
 
-/* io.read(path) opens, reads the whole file, and closes it in one call; io.read(io.stdin())
-   reads the already-open stdin stream instead — the only handle-shaped value this API still
-   produces, since there's no path for piped input. */
 static AerVal io_read(VM* vm, int arg_count, AerVal* args, void* userdata) {
     (void)vm; (void)userdata;
     if (arg_count != 1) {
@@ -72,13 +70,12 @@ static AerVal io_read(VM* vm, int arg_count, AerVal* args, void* userdata) {
         return result;
     }
     if (aer_type(args[0]) == TYPE_INTEGER && aer_as_int(args[0]) == STDIN_HANDLE) {
-        return io_read_fp(stdin_file);
+        return io_read_fp(stdin);
     }
     error("io.read() requires a path string or io.stdin()'s handle");
     return aer_null();
 }
 
-/* Shared by io_write/io_append — opens `path` in `mode`, writes the whole string, closes it. */
 static AerVal io_write_mode(AerVal path_v, AerVal data_v, const char* mode) {
     const char* path = aer_as_string(path_v)->data;
     FILE* fp = fopen(path, mode);
@@ -112,8 +109,52 @@ static AerVal io_append(VM* vm, int arg_count, AerVal* args, void* userdata) {
     return io_write_mode(args[0], args[1], "a");
 }
 
-/* Always handle 0 — the one reserved handle. Same call site as every other io function; kept
-   since there's no module-constant mechanism, and it's the only way to reach piped stdin data. */
+/* A plain boolean, not a Result — "no" is an answer here, never an error. */
+static AerVal io_exists(VM* vm, int arg_count, AerVal* args, void* userdata) {
+    (void)vm; (void)userdata;
+    if (arg_count != 1 || aer_type(args[0]) != TYPE_STRING) {
+        error("io.exists() requires a path string");
+        return aer_null();
+    }
+    struct stat st;
+    return aer_bool(stat(aer_as_string(args[0])->data, &st) == 0);
+}
+
+static AerVal io_remove(VM* vm, int arg_count, AerVal* args, void* userdata) {
+    (void)vm; (void)userdata;
+    if (arg_count != 1 || aer_type(args[0]) != TYPE_STRING) {
+        error("io.remove() requires a path string");
+        return aer_null();
+    }
+    const char* path = aer_as_string(args[0])->data;
+    if (remove(path) != 0) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s: %s", path, strerror(errno));
+        return aer_make_result(aer_null(), make_error(buf));
+    }
+    return aer_make_result(aer_null(), aer_null());
+}
+
+static AerVal io_args(VM* vm, int arg_count, AerVal* args, void* userdata) {
+    (void)vm; (void)args; (void)userdata;
+    if (arg_count != 0) {
+        error("io.args() takes no arguments");
+        return aer_null();
+    }
+    AerArray* r = vm_new_array();
+    r->count    = 0;
+    r->capacity = io_argc > 0 ? (unsigned int)io_argc : 4;
+    r->items    = xmalloc(sizeof(AerVal) * r->capacity);
+    r->shape    = NULL;
+    for (int i = 0; i < io_argc; i++) {
+        size_t n   = strlen(io_argv[i]);
+        char*  buf = xmalloc(n + 1);
+        memcpy(buf, io_argv[i], n + 1);
+        r->items[r->count++] = aer_make_string(buf, (unsigned int)n);
+    }
+    return aer_array_val(r);
+}
+
 static AerVal io_stdin(VM* vm, int arg_count, AerVal* args, void* userdata) {
     (void)vm; (void)args; (void)userdata;
     if (arg_count != 0) {
@@ -123,10 +164,17 @@ static AerVal io_stdin(VM* vm, int arg_count, AerVal* args, void* userdata) {
     return aer_int(STDIN_HANDLE);
 }
 
+void aer_io_set_args(int argc, char** argv) {
+    io_argc = argc;
+    io_argv = argv;
+}
+
 void aer_io_register(void) {
-    stdin_file = stdin;
     aer_register_function("io", "read",   io_read,   NULL);
     aer_register_function("io", "write",  io_write,  NULL);
     aer_register_function("io", "append", io_append, NULL);
+    aer_register_function("io", "exists", io_exists, NULL);
+    aer_register_function("io", "remove", io_remove, NULL);
     aer_register_function("io", "stdin",  io_stdin,  NULL);
+    aer_register_function("io", "args",   io_args,   NULL);
 }

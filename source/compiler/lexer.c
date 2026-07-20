@@ -40,8 +40,7 @@ const char* current_source_start()  { return current->start; }
 const char* current_source_cursor() { return current->buffer; }
 const char* current_source_name()   { return current->name; }
 
-/* See this function's own comment in lexer.h — a deliberately narrow escape hatch for reporting a
-   deferred error at a saved earlier position, not a general-purpose seek. */
+/* Narrow escape hatch for reporting a deferred error at a saved position, not a general seek. */
 void lexer_set_cursor(const char* pos) { current->buffer = (char*)pos; }
 
 /* For parser.c to tag bytecode with its source line (Chunk.line_mark_offsets) — same scan as error_at(), just returning the number. */
@@ -139,16 +138,8 @@ void shell(char* line) {
     indent_reset();
 }
 
-/* Begins lexing a fresh, independent text span — not a file, a page of shell input — used for
-   string interpolation's `{expr}` sub-expression (parser.c's parse_string_literal). Caller must
-   have already called lexer_save_state() to preserve whatever the lexer was doing before (almost
-   certainly mid-way through a STRING token's own raw byte scan, nowhere near a normal token
-   boundary), and must call lexer_restore_state() once the sub-expression has been fully consumed.
-   A fresh heap File (not a shared static slot, unlike shell()'s) — an interpolated expression can
-   itself contain a nested string literal with its own interpolation, and each nesting level needs
-   its own independent buffer alive at the same time, not one shared slot stomped by the next call.
-   text need not be NUL-terminated by the caller — copied here, into an owned, NUL-terminated
-   buffer lex_string()/friends can scan past the end of safely. */
+/* Fresh, independent text span (string interpolation's `{expr}` body). Caller must bracket
+   with lexer_save_state()/lexer_restore_state(). Uses its own heap File, freed on restore. */
 void lexer_begin_span(const char* text, unsigned int len) {
     char* buf = xmalloc((size_t)len + 1);
     memcpy(buf, text, len);
@@ -165,13 +156,8 @@ void lexer_begin_span(const char* text, unsigned int len) {
     files_storage[file_index++] = file;
     current = file;
     indent_reset();
-    /* A span is always a single inline expression, never a multi-line block — a plain string
-       literal can't even contain a raw newline (lex_string() stops at '\n'), so indentation
-       tracking is not just unnecessary here but actively wrong: at_line_start's default true
-       would measure any leading whitespace before the span's first real token as an indent level
-       relative to a freshly-reset stack, spuriously emitting TOKEN_INDENT instead of that token
-       (caught by `"{ expr }"` — the entirely ordinary, readable style of leaving space around an
-       interpolated expression — failing where `"{expr}"` with no leading space did not). */
+    /* A span is one inline expression, never a block — at_line_start's default true would misread
+       leading whitespace as an indent level and emit a spurious TOKEN_INDENT. */
     at_line_start = false;
 }
 
@@ -225,9 +211,7 @@ static void skip_comment() {
 static void skip_whitespace_and_comments() {
     while (true) {
         skip_whitespace();
-        /* Inside an unclosed bracket, a newline is just whitespace — swallow
-           it here so lex()'s '\n' case (and the indentation scan it would
-           otherwise trigger) never sees it. */
+        /* Inside an unclosed bracket a newline is just whitespace — swallow before the indent scan. */
         if (*current->buffer == '\n' && bracket_depth > 0) { current->buffer++; continue; }
         if (*current->buffer != '#') return;
         skip_comment();
@@ -469,27 +453,18 @@ void lex() {
                    emit(TOKEN_NOT,      1); return;
         case '=':  if (b[1]=='=') { emit(TOKEN_EQUAL,           2); return; }
                    emit(TOKEN_ASSIGN,   1); return;
-        case '<':  if (b[1]=='<') {
-                       if (b[2]=='=') { emit(TOKEN_LEFT_SHIFT_ASSIGN, 3); return; }
-                       emit(TOKEN_LEFT_SHIFT, 2); return;
-                   }
+        case '<':  if (b[1]=='<') { emit(TOKEN_LEFT_SHIFT, 2); return; }
                    if (b[1]=='=') { emit(TOKEN_LESS_EQUAL, 2); return; }
                    emit(TOKEN_LESS, 1); return;
-        case '>':  if (b[1]=='>') {
-                       if (b[2]=='=') { emit(TOKEN_RIGHT_SHIFT_ASSIGN, 3); return; }
-                       emit(TOKEN_RIGHT_SHIFT, 2); return;
-                   }
+        case '>':  if (b[1]=='>') { emit(TOKEN_RIGHT_SHIFT, 2); return; }
                    if (b[1]=='=') { emit(TOKEN_GREATER_EQUAL, 2); return; }
                    emit(TOKEN_GREATER, 1); return;
         case '&':  if (b[1]=='&') { emit(TOKEN_AND,        2); return; }
-                   if (b[1]=='=') { emit(TOKEN_AND_ASSIGN,  2); return; }
                    emit(TOKEN_BITWISE_AND, 1); return;
         case '|':  if (b[1]=='|') { emit(TOKEN_OR,         2); return; }
                    if (b[1]=='>') { emit(TOKEN_PIPE,        2); return; }
-                   if (b[1]=='=') { emit(TOKEN_OR_ASSIGN,   2); return; }
                    emit(TOKEN_BITWISE_OR, 1); return;
-        case '^':  if (b[1]=='=') { emit(TOKEN_XOR_ASSIGN,  2); return; }
-                   emit(TOKEN_BITWISE_XOR, 1); return;
+        case '^':  emit(TOKEN_BITWISE_XOR, 1); return;
     }
 
     /* Unrecognized byte: error_at() doesn't exit in MODE_SHELL, so it must still be consumed here or parser.c's error-recovery loop spins forever re-lexing it. */

@@ -4,33 +4,13 @@
 #include "aer_stdlib.h"
 #include "error.h"
 
-/* Pops one argument and coerces it to a double via aer_as_double(); on failure, reports "<name>()
-   requires a number", pushes null, and returns false — every single-arg math function below
-   follows this exact pop-check-report shape. Caller should `return true` immediately when this
-   returns false (the error's already been reported and the null result already pushed). */
+/* Pop-and-coerce for single-arg functions; on false the error is already reported and null pushed. */
 static bool math_pop_double(VM* vm, const char* name, double* out) {
     AerVal a = vm_stack_pop(vm);
     if (aer_as_double(a, out)) return true;
     error("%s() requires a number", name);
     vm_stack_push(vm, aer_null());
     return false;
-}
-
-/* qsort() comparator for sort() — only called once the caller has verified every element is TYPE_STRING or every element is numeric, so no type-mismatch case needs handling here. */
-static int sort_cmp(const void* pa, const void* pb) {
-    const AerVal* a = (const AerVal*)pa;
-    const AerVal* b = (const AerVal*)pb;
-    if (aer_type(*a) == TYPE_STRING) {
-        AerString* as = aer_as_string(*a);
-        AerString* bs = aer_as_string(*b);
-        unsigned int n = as->length < bs->length ? as->length : bs->length;
-        int c = memcmp(as->data, bs->data, n);
-        if (c != 0) return c;
-        return (int)as->length - (int)bs->length;
-    }
-    double da = aer_type(*a) == TYPE_INTEGER ? (double)aer_as_int(*a) : aer_as_real(*a);
-    double db = aer_type(*b) == TYPE_INTEGER ? (double)aer_as_int(*b) : aer_as_real(*b);
-    return da < db ? -1 : (da > db ? 1 : 0);
 }
 
 bool aer_math_call(VM* vm, int fn_id, int arg_count) {
@@ -44,9 +24,7 @@ bool aer_math_call(VM* vm, int fn_id, int arg_count) {
         AerVal ey = vm_stack_pop(vm); AerVal ex = vm_stack_pop(vm);
         double x, y;
         if (!aer_as_double(ex, &x) || !aer_as_double(ey, &y)) { error("pow() requires two numbers"); vm_stack_push(vm, aer_null()); return true; }
-        /* A negative base with a non-whole exponent has no real result (it's only defined over
-           complex numbers) — same domain-guard shape as sqrt()/log()/log2()/log10() just above,
-           rejecting the case that would otherwise silently produce nan instead of erroring. */
+        /* No real result exists for a negative base with a fractional exponent — error, not nan */
         if (x < 0 && floor(y) != y) { error("pow() with a negative base requires a whole-number exponent"); vm_stack_push(vm, aer_null()); return true; }
         vm_stack_push(vm, aer_real(pow(x, y))); return true;
     }
@@ -59,6 +37,12 @@ bool aer_math_call(VM* vm, int fn_id, int arg_count) {
         double x;
         if (!math_pop_double(vm, "ceil", &x)) return true;
         vm_stack_push(vm, aer_int((int64_t)ceil(x))); return true;
+    }
+    if (fn_id == FN_MATH_ROUND && arg_count == 1) {
+        double x;
+        if (!math_pop_double(vm, "round", &x)) return true;
+        /* llround, not (int64_t)(x + 0.5) — the latter mis-rounds negatives (-2.5 -> -1). */
+        vm_stack_push(vm, aer_int((int64_t)llround(x))); return true;
     }
     if (fn_id == FN_MATH_ABS && arg_count == 1) {
         AerVal a = vm_stack_pop(vm);
@@ -94,6 +78,16 @@ bool aer_math_call(VM* vm, int fn_id, int arg_count) {
         if (!math_pop_double(vm, "cos", &x)) return true;
         vm_stack_push(vm, aer_real(cos(x))); return true;
     }
+    if (fn_id == FN_MATH_TAN && arg_count == 1) {
+        double x;
+        if (!math_pop_double(vm, "tan", &x)) return true;
+        vm_stack_push(vm, aer_real(tan(x))); return true;
+    }
+    if (fn_id == FN_MATH_EXP && arg_count == 1) {
+        double x;
+        if (!math_pop_double(vm, "exp", &x)) return true;
+        vm_stack_push(vm, aer_real(exp(x))); return true;
+    }
     if (fn_id == FN_MATH_LOG && arg_count == 1) {
         double x;
         if (!math_pop_double(vm, "log", &x)) return true;
@@ -113,26 +107,8 @@ bool aer_math_call(VM* vm, int fn_id, int arg_count) {
         vm_stack_push(vm, aer_real(log10(x))); return true;
     }
     if (fn_id == FN_MATH_PI && arg_count == 0) {
-        /* A function, not a bare module value, for consistency with every other native module (none expose non-function bindings yet); literal digits rather than M_PI, which isn't guaranteed defined on every target toolchain. */
+        /* Literal digits — M_PI isn't guaranteed by every toolchain */
         vm_stack_push(vm, aer_real(3.14159265358979323846)); return true;
-    }
-    if (fn_id == FN_MATH_SORT && arg_count == 1) {
-        AerVal arr = vm_stack_pop(vm);
-        if (aer_type(arr) != TYPE_ARRAY) { error("sort() requires an array"); vm_stack_push(vm, aer_null()); return true; }
-        AerArray* a = aer_as_array(arr);
-        if (a->shape) { error("sort() cannot sort a struct instance"); vm_stack_push(vm, aer_null()); return true; }
-        /* Ordering across mixed types has no sensible answer, so it's rejected up front rather than falling back to an arbitrary tie-break. */
-        bool numeric = true, stringy = true;
-        for (unsigned int i = 0; i < a->count; i++) {
-            if (aer_type(a->items[i]) != TYPE_INTEGER && aer_type(a->items[i]) != TYPE_REAL) numeric = false;
-            if (aer_type(a->items[i]) != TYPE_STRING) stringy = false;
-        }
-        if (a->count > 0 && !numeric && !stringy) {
-            error("sort() requires all elements to be numbers, or all to be strings");
-            vm_stack_push(vm, aer_null()); return true;
-        }
-        qsort(a->items, a->count, sizeof(AerVal), sort_cmp);
-        vm_stack_push(vm, arr); return true;
     }
 
     return false;

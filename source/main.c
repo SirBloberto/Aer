@@ -24,27 +24,20 @@ static bool run_file(char* path);
 static void help();
 
 #ifdef AER_DEBUG_TOOLS
-/* Set by main()'s own argv scan below, read by run_file()'s dump block. Only meaningful in this
-   debug-tools build (aer-debug) — the regular aer binary has none of debug_hits/aer_disassemble's
-   supporting Chunk fields at all (see vm.h), so there's nothing for this flag to control there. */
 static const char* debug_dump_path = NULL;
 #endif
 
 int main(int argc, char** argv) {
     chunk_init(&chunk);
     vm_init(&vm, &chunk);
-    /* Opt-in host capability, not a built-in module (see aer_io.h) — the reference CLI grants file access; an embedding host that wants a sandboxed script simply doesn't call this. */
+    /* io is an opt-in host capability — a sandboxing host simply doesn't call this */
     aer_io_register();
-    /* Once, at process start — parse() (called from run(), below) accumulates state (variable/
-       function/struct tables, the register allocator) across every call for the rest of the
-       process's life; resetting it here and never again is what lets a REPL session's later lines
-       see an earlier line's variables/functions. See parser_reset's own comment (parser.c). */
+    /* Once per process — parser state persists across parse() calls, which is what makes REPL
+       variable/function persistence work */
     parser_reset();
 
 #ifdef AER_DEBUG_TOOLS
-    /* `--debug-path=<path>` is filtered out of argv here, before help/version/run_file ever see
-       it, so it can appear alongside a script path in any position without disturbing the
-       existing argc==1/help/version/file dispatch below. */
+    /* Filter --debug-path=<path> out of argv before the help/version/file dispatch sees it */
     int    real_argc = 1;
     char** real_argv = xmalloc(sizeof(char*) * (size_t)argc);
     real_argv[0] = argv[0];
@@ -68,6 +61,8 @@ int main(int argc, char** argv) {
     } else if (strcmp(argv[1], "version") == 0) {
         printf("Aer %s\n", VERSION);
     } else {
+        /* Everything after the script path belongs to the script, via io.args(). */
+        aer_io_set_args(argc - 2, argv + 2);
         status = run_file(argv[1]) ? 0 : 1;
     }
 
@@ -110,10 +105,7 @@ static void run_shell() {
     while (1) {
         char* line = handle_terminal();
         if (!line) {
-            /* Ctrl-C (handle_terminal's own NULL return) — abandon whatever multi-line block
-               was in progress, exactly like Python's REPL, rather than leaving in_block/
-               block_buf pointing at a now-stale, partially-typed statement the next line would
-               otherwise silently keep appending to. */
+            /* Ctrl-C — abandon any in-progress multi-line block, like Python's REPL */
             free(block_buf);
             block_buf  = NULL;
             block_size = 0;
@@ -174,9 +166,7 @@ static bool run_file(char* path) {
     read_file(path);
     run();
 #ifdef AER_DEBUG_TOOLS
-    /* --debug-path=<path> unset: skip entirely, zero cost. Set to a path: write there. Set to "-"
-       (or anything else, e.g. empty): stderr. Checked after run() so both the static bytecode and
-       the full run's dispatch/hit counts are available together in one dump. */
+    /* After run() so the dump has both the bytecode and the run's hit counts; "-" means stderr */
     const char* dump_path = debug_dump_path;
     if (dump_path) {
         FILE* dump_out = strcmp(dump_path, "-") == 0 ? stderr : fopen(dump_path, "w");
@@ -194,7 +184,7 @@ static void help() {
     printf("Usage: aer [command|file]\n");
     printf("  help      Show this message\n");
     printf("  version   Show Aer version\n");
-    printf("  <file>    Execute an Aer source file\n");
+    printf("  <file> [args...]   Execute an Aer source file; extra arguments reach the script via io.args()\n");
     printf("  (no args) Start interactive shell\n");
 #ifdef AER_DEBUG_TOOLS
     printf("  --debug-path=<path>  Write a disassembly + hit-count/memory dump here after running\n");

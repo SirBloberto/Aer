@@ -46,7 +46,9 @@ def load_seeds():
     ]
     seeds = []
     for pattern in patterns:
-        for path in glob.glob(pattern, recursive=True):
+        # sorted() — glob order is filesystem-dependent, and an unsorted seed list made
+        # --seed runs irreproducible across machines (same seed, different mutation targets).
+        for path in sorted(glob.glob(pattern, recursive=True)):
             with open(path, "rb") as f:
                 data = f.read()
             if data:

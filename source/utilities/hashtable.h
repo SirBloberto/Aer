@@ -3,9 +3,8 @@
 
 #include "value.h"
 
-/* Open-addressing string-keyed table backing both Chunk's name_index and AerDict; payload is a
-   plain AerVal stored inline in the bucket, never boxed — string/array/dict/function payloads are
-   heap cells owned by the GC, so the table never needs to free one, only the key. */
+/* Open-addressing string-keyed table backing Chunk's name_index and AerDict. The table owns only
+   the key; the AerVal payload's heap cells belong to the GC. */
 typedef struct {
     char*        key;
     unsigned int length;
@@ -24,13 +23,9 @@ void    hashtable_remove(HashTable* t, const char* key);
 void    hashtable_clear(HashTable* t);
 void    hashtable_free(HashTable* t);
 
-/* Every owned key copy backing either a Chunk's name_index or an AerDict goes through this pair,
-   not a bare xmalloc/memcpy — see hashtable.c's size-classed key/bucket-array pools. Truncates at
-   the first embedded NUL byte: hash_match already compares keys via strlen+strcmp, so bytes past a
-   NUL are already invisible to every get/put/remove — truncating here keeps the allocated size and
-   hashtable_put's own strlen-derived entry->length identical, which the pool's size-class lookup
-   depends on. `len` is the strlen-equivalent (entry->length), not len+1 — the NUL terminator is
-   accounted for internally. */
+/* Every owned key copy must go through this pair (they use hashtable.c's size-class pools, and
+   the pool lookup needs alloc size == free size). Truncates at the first embedded NUL; `len` is
+   the strlen-equivalent, the NUL is accounted for internally. */
 char* hashtable_key_dup(const char* data, unsigned int len, unsigned int* out_len);
 void  hashtable_key_free(char* key, unsigned int len);
 

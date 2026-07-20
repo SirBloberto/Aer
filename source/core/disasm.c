@@ -24,25 +24,16 @@ typedef struct {
     const char* desc;
     Field       fields[MAX_FIELDS];
     bool        variable;   /* true only for OP_DEFINE_STRUCT — see disassemble_one */
-    /* How many of fields[] (always the FIRST `packed` of them) come from the CURRENT instruction's
-       own descriptor word (UNPACK_A/B/C, vm.h) instead of a separate word of their own — 0 for
-       an opcode with no packed fields at all (OP_JUMP, OP_DEFINE_STRUCT, OP_HALT). See
-       disassemble_one's own comment for the full reasoning. */
+    /* How many of fields[] come packed in the instruction's own descriptor word (rest are wide words). */
     int packed;
 } OpInfo;
 
-/* OP_RAW_LOAD_INT_POOL is the last member of the Opcode enum (vm.h) — appended after the
-   "primitive pass" raw-arithmetic family, which itself was appended after OP_PRINT_REPL. */
+/* OP_RAW_LOAD_INT_POOL is the last member of the Opcode enum (vm.h). */
 #define OP_INFO_MAX OP_RAW_LOAD_INT_POOL
 
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
-    /* OP_ADD..OP_RSHIFT/OP_IN are now real top-level dispatch targets, one opcode per operator
-       (true single-level dispatch — see PACK_BINARY's own comment, vm.h) instead of riding along
-       as a bin_op TAG inside a shared OP_BINARY word. Each gets a full entry, special-cased below
-       in disassemble_one exactly like OP_BINARY used to be (dest + both RK operands all live in
-       the one descriptor word, nothing trails) — see binary_op_dispatched(). `fields`/`packed`
-       aren't actually read for special-cased opcodes (only `.name`/`.desc` are), kept here purely
-       for documentation, matching the convention every other packed opcode in this table uses. */
+    /* OP_ADD..OP_IN: one opcode per operator, whole instruction in one word — special-cased in
+       disassemble_one via binary_op_dispatched(). */
     [OP_ADD] = { "OP_ADD", "reg = rk + rk", {FLD_REG}, false, 1 },
     [OP_SUB] = { "OP_SUB", "reg = rk - rk", {FLD_REG}, false, 1 },
     [OP_MUL] = { "OP_MUL", "reg = rk * rk", {FLD_REG}, false, 1 },
@@ -62,14 +53,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_LSHIFT] = { "OP_LSHIFT", "reg = rk << rk", {FLD_REG}, false, 1 },
     [OP_RSHIFT] = { "OP_RSHIFT", "reg = rk >> rk", {FLD_REG}, false, 1 },
 
-    /* OP_AND/OP_OR/OP_PIPE/OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR are never dispatched as a
-       standalone instruction — OP_AND/OP_OR/OP_PIPE purely as parser.c operator-token lookup tags
-       (see their own comment, vm.h), the unary ones only ever embedded as a unary_op TAG inside
-       OP_UNARY's packed word. They still need a `.name`-only entry here: print_field's FLD_BINOP
-       case calls opcode_name(word) to render an embedded tag like that, which reads straight out
-       of this table. Their `desc`/`fields` are never used (disassemble_one only reaches those for
-       an instruction actually fetched via DISPATCH(), which these opcode values never are), so
-       left blank. */
+    /* Never dispatched standalone (parser tags / OP_UNARY-embedded), but FLD_BINOP rendering
+       still reads their names from this table. */
     [OP_AND] = { "OP_AND" }, [OP_OR] = { "OP_OR" }, [OP_PIPE] = { "OP_PIPE" },
     [OP_NEGATE] = { "OP_NEGATE" }, [OP_NOT] = { "OP_NOT" }, [OP_BITWISE_NOT] = { "OP_BITWISE_NOT" },
     [OP_TO_STR] = { "OP_TO_STR" },
@@ -78,45 +63,26 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_DEFINE_STRUCT] = { "OP_DEFINE_STRUCT", "register a struct type (variable-length: name, field count, then that many field/default pairs)", {FLD_NAME, FLD_COUNT}, true },
     [OP_HALT]          = { "OP_HALT",          "stop execution", {0} },
 
-    /* Register-VM opcodes. `packed` narrow fields (register indices, bin_op/unary_op/cast_type
-       tags) come from the instruction's own descriptor word — see disassemble_one's own comment;
-       everything after them in fields[] is a WIDE word exactly like OP_JUMP/OP_DEFINE_STRUCT/
-       OP_HALT above. FLD_JUMP is reused for callee_offset (OP_CALL) too — a function entry
-       point is exactly as absolute-code-address-shaped as a jump target for disassembly
-       purposes. */
+    /* `packed` narrow fields come from the descriptor word; later fields[] are wide words.
+       FLD_JUMP doubles for OP_CALL's callee_offset. */
     [OP_LOADK] = { "OP_LOADK", "reg = pool constant", {FLD_REG, FLD_POOL}, false, 1 },
     [OP_MOVE]  = { "OP_MOVE",  "reg = reg", {FLD_REG, FLD_REG}, false, 2 },
     [OP_IS_RESULT] = { "OP_IS_RESULT", "reg = is-result(reg)", {FLD_REG, FLD_REG}, false, 2 },
-    /* OP_BINARY is the sole exception to the "packed fields come from A/B/C, everything else is a
-       separate wide word" rule described above: its whole instruction (dest, bin_op, AND both RK
-       operands) is packed into ONE word (PACK_BINARY, vm.h), so it has no trailing wide fields at
-       all — disassemble_one special-cases it rather than going through the generic field loop. */
+    /* Whole instruction in one word (PACK_BINARY) — special-cased, no trailing wide fields. */
     [OP_BINARY] = { "OP_BINARY", "reg = rk OP rk", {FLD_REG, FLD_BINOP}, false, 2 },
     [OP_JUMP_IF_FALSE_REG] = { "OP_JUMP_IF_FALSE_REG", "jump if !reg, no pop", {FLD_REG, FLD_JUMP}, false, 1 },
     [OP_CALL]  = { "OP_CALL",  "call by compile-time-resolved offset", {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP}, false, 3 },
-    /* OP_CALL_VALUE/OP_TAIL_CALL_VALUE pack all 4 fields into one word (PACK_REG4, vm.h) —
-       callee_reg is always a plain register, never a patched target, unlike OP_CALL's
-       callee_offset (see emit_call_value's own comment) — special-cased in disassemble_one. */
+    /* All 4 fields in one word (PACK_REG4); callee_reg is never a patched target. */
     [OP_CALL_VALUE] = { "OP_CALL_VALUE", "call a runtime function value held in a register", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 4 },
     [OP_TAIL_CALL]       = { "OP_TAIL_CALL",       "tail call by compile-time-resolved offset, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP}, false, 3 },
     [OP_TAIL_CALL_VALUE] = { "OP_TAIL_CALL_VALUE", "tail call through a register value, reuses this frame", {FLD_REG, FLD_REG, FLD_COUNT, FLD_REG}, false, 4 },
     [OP_RETURN] = { "OP_RETURN", "return reg to caller", {FLD_REG}, false, 1 },
-    /* No patchable target at all — module/function/builtin names are always literal identifiers
-       resolved at parse time — so everything packs into one word (PACK_CALL_MODULE/
-       PACK_CALL_BUILTIN, vm.h). Special-cased in disassemble_one. */
-    /* Trailing FLD_COUNT past `packed`: word-count only, for aer_disassemble's summary walk — the
-       real trailing word is decoded/printed specially in disassemble_one below. */
+    /* Names resolved at parse time, no patchable target — everything packs into one word. */
+    /* Trailing FLD_COUNT is word-count only; the real trailing word prints specially below. */
     [OP_CALL_MODULE]  = { "OP_CALL_MODULE",  "call a native or file-module function by (module, function) name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_NAME}, false, 5 },
-    [OP_CALL_BUILTIN] = { "OP_CALL_BUILTIN", "global builtin (length/append/etc.) by name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_COUNT}, false, 4 },
+    [OP_CALL_BUILTIN] = { "OP_CALL_BUILTIN", "global builtin (length/print/etc.) by name", {FLD_REG, FLD_REG, FLD_COUNT, FLD_NAME, FLD_COUNT}, false, 4 },
     [OP_ARRAY_NEW] = { "OP_ARRAY_NEW", "reg = new array from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT}, false, 3 },
-    /* OP_INDEX_GET/OP_ITER_NEXT_PAIR/OP_ITER_RANGE_PREP/OP_ITER_RANGE_LOOP/OP_FIELD_GET/
-       OP_FIELD_SET are the Slice A
-       extension of OP_BINARY's single-word treatment (PACK_INDEX_GET/PACK_REG4/PACK_FIELD_GET/
-       PACK_FIELD_SET, vm.h) — disassemble_one special-cases all of them below the same way it
-       does OP_BINARY, since their RK/name fields no longer live in separate trailing words. Their
-       `packed` count here still needs to equal fields[]'s full length (nothing genuinely trailing)
-       so aer_disassemble's word-count accounting stays correct even though the generic per-field
-       loop never actually runs for them. */
+    /* Single-word packed family — special-cased in disassemble_one like OP_BINARY. */
     [OP_INDEX_GET] = { "OP_INDEX_GET", "reg = reg[rk]", {FLD_REG, FLD_REG, FLD_RK}, false, 3 },
     [OP_INDEX_SET] = { "OP_INDEX_SET", "reg[rk] = rk", {FLD_REG, FLD_RK, FLD_RK}, false, 3 },
     [OP_SLICE_GET] = { "OP_SLICE_GET", "reg = reg[rk:rk]", {FLD_REG, FLD_REG, FLD_RK, FLD_RK}, false, 4 },
@@ -138,10 +104,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_FIELD_BINARY] = { "OP_FIELD_BINARY", "fused: reg = struct.field OP rk (field on the left)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_NAME, FLD_RK}, false, 5 },
     [OP_PRINT_REPL] = { "OP_PRINT_REPL", "shell mode: print reg unless null", {FLD_REG}, false, 1 },
 
-    /* "Primitive pass" raw-arithmetic family (vm.h's OP_RAW_LOAD_INT comment) — all special-cased
-       in disassemble_one below exactly like OP_UNARY/OP_CAST above (their own custom packed
-       shape, not the generic fields[]-driven loop), so fields[]/packed here are unused and kept
-       purely for documentation, same convention every other special-cased opcode's entry follows. */
+    /* Raw-arithmetic family — special-cased below; fields[]/packed kept for documentation only. */
     [OP_RAW_LOAD_INT]      = { "OP_RAW_LOAD_INT",      "rawi = imm", {FLD_REG}, false, 1 },
     [OP_RAW_LOAD_REAL]     = { "OP_RAW_LOAD_REAL",     "rawr = pool constant", {FLD_REG}, false, 1 },
     [OP_RAW_ADD_INT]       = { "OP_RAW_ADD_INT",       "rawi = rawi + rawi", {FLD_REG}, false, 1 },
@@ -192,10 +155,7 @@ static const char* cast_name(int k) {
     }
 }
 
-/* Brief, one-line rendering of a pool constant — deliberately not the full recursive formatter
-   vm.c's print()/interpolation use, since a struct/array/dict is never actually stored as a pool
-   *literal* (those are always built at runtime by OP_ARRAY_NEW etc.) except a function value,
-   which just gets a short tag here. */
+/* One-line pool-constant rendering — containers are never pool literals, so no recursion needed. */
 static void print_pool_value(FILE* out, AerVal v) {
     switch (aer_type(v)) {
         case TYPE_NULL:     fprintf(out, "null"); break;
@@ -217,9 +177,7 @@ static const char* opcode_name(int op) {
     return (op >= 0 && op <= OP_INFO_MAX && op_info[op].name) ? op_info[op].name : "?";
 }
 
-/* Prints one field's already-extracted value, whether it came from a packed sub-field of the
-   descriptor word or a separate wide word of its own — the caller (disassemble_one) handles
-   telling the two apart; from here they're identical. */
+/* Prints one already-extracted field value — packed vs wide is the caller's problem. */
 static void print_field(FILE* out, Chunk* c, Field kind, int word) {
     switch (kind) {
         case FLD_POOL: fprintf(out, "  val="); print_pool_value(out, c->pool[word]); break;
@@ -237,37 +195,24 @@ static void print_field(FILE* out, Chunk* c, Field kind, int word) {
     }
 }
 
-/* Decodes and prints one instruction starting at c->code[offset]; returns the offset of the next
-   instruction. OP_DEFINE_STRUCT is the sole variable-length exception (its field count is read
-   from the operand stream itself, not known statically).
-     Every register-VM instruction packs its narrow fields (registers, bin_op/unary_op/cast_type
-   tags) into the SAME word as the opcode itself (PACK1/2/3, vm.h) — op_word is kept unmasked
-   here specifically so those can still be extracted via UNPACK_A/B/C; OP_JUMP/OP_DEFINE_STRUCT/
-   OP_HALT have packed==0, so the loop below is a no-op for them. */
+/* Decodes/prints one instruction, returning the next offset. op_word stays unmasked so packed
+   sub-fields can be extracted; OP_DEFINE_STRUCT is the sole variable-length opcode. */
 static void print_rk20(FILE* out, Chunk* c, uint64_t rk) {
     if (rk & RK20_CONST_FLAG) { fprintf(out, "  rk=const:"); print_pool_value(out, c->pool[rk & RK20_INDEX_MASK]); }
     else                          fprintf(out, "  rk=reg%llu", rk & RK20_INDEX_MASK);
 }
 
-/* Same as print_rk20 above, for PACK_BINARY's narrower 9-bit RK operands (RK9_CONST_FLAG/
-   RK9_INDEX_MASK, vm.h). */
+/* print_rk20's narrower sibling for PACK_BINARY's 9-bit RK operands. */
 static void print_rk9(FILE* out, Chunk* c, uint64_t rk) {
     if (rk & RK9_CONST_FLAG) { fprintf(out, "  rk=const:"); print_pool_value(out, c->pool[rk & RK9_INDEX_MASK]); }
     else                         fprintf(out, "  rk=reg%llu", rk & RK9_INDEX_MASK);
 }
 
-/* "Primitive pass" raw-slot printers — CallFrame.raw_ints/raw_reals indices, never RK-encoded
-   (see PACK_RAW_ARITH_RR's own comment, vm.h, for why there's no register-vs-constant flag here
-   at all). Kept as separate tiny helpers, one per array, purely so a reader scanning a
-   disassembly dump can immediately tell a raw slot from a normal registers[] index (FLD_REG's
-   "reg=%d") or an RK operand ("rk=..."). */
+/* Raw-slot printers — kept separate so a dump reader can tell int=/real= from reg=/rk=. */
 static void print_rawi(FILE* out, int slot) { fprintf(out, "  rawi=%d", slot); }
 static void print_rawr(FILE* out, int slot) { fprintf(out, "  rawr=%d", slot); }
 
-/* True for the 18 per-operator opcodes sharing PACK_BINARY's encoding (dest + both RK operands,
-   all in the one descriptor word — see PACK_BINARY's own comment, vm.h). Each used to be a single
-   bin_op TAG value inside a shared OP_BINARY word; now each is its own top-level dispatch target,
-   but the word shape (and so the decoding needed here) is identical across all of them. */
+/* The per-operator opcodes sharing PACK_BINARY's one-word shape — decoded identically. */
 static bool binary_op_dispatched(Opcode op) {
     switch (op) {
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_FLOOR_DIV:
@@ -281,22 +226,14 @@ static bool binary_op_dispatched(Opcode op) {
 
 static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     uint64_t op_word = c->code[offset];
-    /* Masked to 7 bits (0x7F), matching DISPATCH()'s mask in vm.c exactly — must stay in sync,
-       since PACK_BINARY's dest field now starts at bit 7 (vm.h); an 8-bit mask here would leak
-       dest's LSB into the decoded opcode whenever dest is odd. */
+    /* 7-bit mask must match DISPATCH()'s exactly — 8 bits would leak dest's LSB into the opcode. */
     Opcode op = (Opcode)(op_word & 0x7F);
     const OpInfo* info = &op_info[op];
     fprintf(out, "%6u  %-28s  %s", offset, opcode_name(op), info->desc);
 
     unsigned int pos = offset + 1;
     if (info->variable) {
-        /* OP_DEFINE_STRUCT: name pool idx, field_count, then field_count * (field-name, default,
-           field-type) triples — the trailing type word was added by the typed-struct-fields
-           feature (parse_struct, parser.c) but never wired up here, so this loop kept reading only
-           2 words per field: every field after the first was decoded 1 word short, eventually
-           reading an unrelated word (a field-type enum value, or a later opcode's own operand) as a
-           pool index and crashing in aer_as_string. Found via gdb on a real segfault disassembling
-           nbody.aer's own (untyped) Body struct. */
+        /* name idx, field_count, then (name, default, type) triples — 3 words per field, not 2. */
         int name_idx    = (int)c->code[pos++];
         int field_count = (int)c->code[pos++];
         fprintf(out, "  name=%s fields=%d [", aer_as_string(c->pool[name_idx])->data, field_count);
@@ -315,13 +252,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         }
         fprintf(out, "]");
     } else if (binary_op_dispatched(op)) {
-        /* Packed single-word encoding (PACK_BINARY, vm.h) — dest and both RK operands live
-           entirely within the low 32 bits of this same word (opcode:7 + dest:7 + RK9:9 + RK9:9),
-           not the wider RK20 scheme every other packed opcode still uses, so they're decoded here
-           via the narrower UNPACK_BINARY_DEST/UNPACK_RK_B9/C9 macros and print_rk9 (not print_rk20)
-           rather than through the generic fields[]-driven loop below (which each of these opcodes'
-           own op_info entry has no entries left for). There's no bin_op field to print anymore —
-           the opcode itself (already printed via opcode_name() above) IS the operator. */
+        /* One-word PACK_BINARY shape — decoded via the RK9 macros, not the generic field loop. */
         print_field(out, c, FLD_REG, (int)UNPACK_BINARY_DEST(op_word));
         print_rk9(out, c, UNPACK_RK_B9(op_word));
         print_rk9(out, c, UNPACK_RK_C9(op_word));
@@ -355,9 +286,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rk9(out, c, UNPACK_INDEX_FIELD_SET_VAL(op_word));
     } else if (op == OP_ITER_NEXT_PAIR ||
                op == OP_ITER_RANGE_PREP || op == OP_ITER_RANGE_LOOP) {
-        /* 4 registers packed via PACK_REG4 (vm.h); the loop-exit target still gets its own
-           trailing word regardless — a patchable jump target is never packed alongside anything
-           else (see PACK_REG4's own comment), so pos must still advance past it here. */
+        /* PACK_REG4 + a trailing patchable jump-target word pos must still advance past. */
         print_field(out, c, FLD_REG, (int)UNPACK_REG4_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_REG4_B(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_REG4_C(op_word));
@@ -365,9 +294,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         int target = (int)c->code[pos++];
         print_field(out, c, FLD_JUMP, target);
     } else if (op == OP_CALL_VALUE || op == OP_TAIL_CALL_VALUE) {
-        /* See PACK_REG4's comment in vm.h / emit_call_value's own comment (parser.c) — callee_reg
-           is never a patched target, so it packs alongside the other 3 fields with nothing left
-           trailing. */
+        /* callee_reg is never a patched target, so nothing trails. */
         print_field(out, c, FLD_REG,   (int)UNPACK_REG4_A(op_word));
         print_field(out, c, FLD_REG,   (int)UNPACK_REG4_B(op_word));
         print_field(out, c, FLD_COUNT, (int)UNPACK_REG4_C(op_word));
@@ -400,22 +327,20 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rk20(out, c, UNPACK_SLICE_GET_END(op_word));
     } else if (op == OP_CALL_MODULE) {
         static const char* const call_module_id_names[] = {
-            "math", "random", "string", "time", "json", "dynamic"
+            "math", "random", "string", "time", "json", "collection", "dynamic"
         };
         print_field(out, c, FLD_REG,   (int)UNPACK_CALL_MODULE_DEST(op_word));
         print_field(out, c, FLD_REG,   (int)UNPACK_CALL_MODULE_ARG_BASE(op_word));
         print_field(out, c, FLD_COUNT, (int)UNPACK_CALL_MODULE_ARG_COUNT(op_word));
         print_field(out, c, FLD_NAME,  (int)UNPACK_CALL_MODULE_MODULE(op_word));
         print_field(out, c, FLD_NAME,  (int)UNPACK_CALL_MODULE_FN(op_word));
-        /* Two trailing words (see OP_CALL_MODULE's own comment, vm.h): module_id and fn_id, both
-           resolved once at parse time so the VM can switch on small ints instead of running a
-           strcmp chain (module name, then function name) per call. */
+        /* Two trailing words: parse-time-resolved module_id and fn_id. */
         int module_id = (int)c->code[pos++];
         int fn_id      = (int)c->code[pos++];
         fprintf(out, "  id=%s fn_id=%d", call_module_id_names[module_id], fn_id);
     } else if (op == OP_CALL_BUILTIN) {
         static const char* const call_builtin_id_names[] = {
-            "length", "delete", "append", "print", "type", "assert", "panic"
+            "length", "print", "type", "assert", "panic", "Result"
         };
         print_field(out, c, FLD_REG,   (int)UNPACK_CALL_BUILTIN_DEST(op_word));
         print_field(out, c, FLD_REG,   (int)UNPACK_CALL_BUILTIN_ARG_BASE(op_word));
@@ -444,9 +369,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_pool_value(out, c->pool[UNPACK_RAW_LOAD_REAL_POOL(op_word)]);
     } else if (op == OP_RAW_ADD_INT || op == OP_RAW_SUB_INT || op == OP_RAW_MUL_INT ||
                op == OP_RAW_DIV_INT || op == OP_RAW_MOD_INT || op == OP_RAW_FLOOR_DIV_INT) {
-        /* OP_RAW_DIV_INT is the sole exception: dest addresses raw_reals[], not raw_ints[] (int/
-           int division always promotes to real — see this opcode's own comment, vm.c) — the two
-           operands are still raw_ints[] either way, so only the dest printer differs here. */
+        /* OP_RAW_DIV_INT alone writes raw_reals[] (int/int division promotes) — dest printer differs. */
         if (op == OP_RAW_DIV_INT) print_rawr(out, (int)UNPACK_RAW_ARITH_RR_DEST(op_word));
         else                      print_rawi(out, (int)UNPACK_RAW_ARITH_RR_DEST(op_word));
         print_rawi(out, (int)UNPACK_RAW_ARITH_RR_A(op_word));
