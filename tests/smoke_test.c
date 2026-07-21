@@ -837,8 +837,8 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "x = true\ny = !x\n");
-        check(ok, "real source unary not ('y = !x') ran without error");
+        bool ok = run_source(&c, &vm, "x = true\ny = not x\n");
+        check(ok, "real source unary not ('y = not x') ran without error");
         check(aer_as_bool(register_get(&vm, 1)) == false, "y == false");
         chunk_free(&c);
     }
@@ -861,15 +861,14 @@ int main(void) {
         chunk_free(&c);
     }
 
-    /* Test 27 (M5 slice 7): and/or short-circuit — all four truth-table corners. AER spells these
-       `&&`/`||` (lexer.h's TOKEN_AND/TOKEN_OR comments), not the words "and"/"or" — `y` is
-       register 0 (the only variable in each script). */
+    /* Test 27 (M5 slice 7): and/or short-circuit — all four truth-table corners. `y` is register 0
+       (the only variable in each script). */
     {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "y = true && true\n");
-        check(ok, "'y = true && true' ran without error");
+        bool ok = run_source(&c, &vm, "y = true and true\n");
+        check(ok, "'y = true and true' ran without error");
         check(aer_as_bool(register_get(&vm, 0)) == true, "y == true");
         chunk_free(&c);
     }
@@ -877,8 +876,8 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "y = true && false\n");
-        check(ok, "'y = true && false' ran without error");
+        bool ok = run_source(&c, &vm, "y = true and false\n");
+        check(ok, "'y = true and false' ran without error");
         check(aer_as_bool(register_get(&vm, 0)) == false, "y == false");
         chunk_free(&c);
     }
@@ -886,8 +885,8 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "y = false || true\n");
-        check(ok, "'y = false || true' ran without error");
+        bool ok = run_source(&c, &vm, "y = false or true\n");
+        check(ok, "'y = false or true' ran without error");
         check(aer_as_bool(register_get(&vm, 0)) == true, "y == true");
         chunk_free(&c);
     }
@@ -895,8 +894,8 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "y = false || false\n");
-        check(ok, "'y = false || false' ran without error");
+        bool ok = run_source(&c, &vm, "y = false or false\n");
+        check(ok, "'y = false or false' ran without error");
         check(aer_as_bool(register_get(&vm, 0)) == false, "y == false");
         chunk_free(&c);
     }
@@ -1719,9 +1718,9 @@ int main(void) {
         bool ok = run_source(&c, &vm,
             "nums = [0, 1, 2, 3, 4, 5]\n"
             "a = nums[1:4]\n"
-            "assert(length(a) == 3 && a[0] == 1 && a[1] == 2 && a[2] == 3, \"array slice [a:b]\")\n"
-            "assert(length(nums[3:]) == 3 && nums[3:][0] == 3, \"array slice [a:]\")\n"
-            "assert(length(nums[:3]) == 3 && nums[:3][0] == 0, \"array slice [:b]\")\n"
+            "assert(length(a) == 3 and a[0] == 1 and a[1] == 2 and a[2] == 3, \"array slice [a:b]\")\n"
+            "assert(length(nums[3:]) == 3 and nums[3:][0] == 3, \"array slice [a:]\")\n"
+            "assert(length(nums[:3]) == 3 and nums[:3][0] == 0, \"array slice [:b]\")\n"
             "assert(length(nums[:]) == 6, \"array slice [:] copies the whole array\")\n"
             "word = \"hello\"\n"
             "assert(word[1:3] == \"el\", \"string slice [a:b]\")\n"
@@ -1768,8 +1767,8 @@ int main(void) {
             "    return seen\n"
             "r1 = collect(1)\n"
             "r2 = collect(2)\n"
-            "assert(length(r1) == 1 && r1[0] == 1, \"first call's omitted default starts fresh\")\n"
-            "assert(length(r2) == 1 && r2[0] == 2, \"second call's own default is independent, not the first call's mutated array\")\n");
+            "assert(length(r1) == 1 and r1[0] == 1, \"first call's omitted default starts fresh\")\n"
+            "assert(length(r2) == 1 and r2[0] == 2, \"second call's own default is independent, not the first call's mutated array\")\n");
         check(ok, "real source default parameters (trailing defaults, multiple omitted counts, function-value calls, fresh-per-call array defaults) ran without error, all assertions passed");
         chunk_free(&c);
     }

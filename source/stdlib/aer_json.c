@@ -78,9 +78,8 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
             AerDict* d = aer_as_dict(v);
             strbuf_append_char(b, '{');
             bool first = true;
-            for (unsigned int i = 0; i < d->map.capacity; i++) {
-                HashTableEntry* e = &d->map.buckets[i];
-                if (!e->key) continue;
+            for (unsigned int i = 0; i < d->map.count; i++) {
+                HashTableEntry* e = &d->map.dense[i];
                 if (!first) strbuf_append_char(b, ',');
                 first = false;
                 json_encode_string(b, e->key, e->length);
@@ -271,8 +270,9 @@ static AerVal json_parse_object(JsonParser* p) {
         AerVal val = json_parse_value(p);
         if (p->err) return aer_null();
 
-        char* k = hashtable_key_dup(ks->data, ks->length, NULL);
-        hashtable_put(&d->map, k, val);
+        unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
+        char* k = hashtable_key_dup(ks->data, klen, NULL);
+        hashtable_put(&d->map, k, klen, val);
 
         json_skip_ws(p);
         if (p->pos >= p->len) { json_set_error(p, "Unterminated object in JSON"); return aer_null(); }

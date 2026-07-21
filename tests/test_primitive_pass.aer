@@ -1,5 +1,5 @@
 #!/usr/bin/env aer
-# AER test suite — the "primitive pass" (raw unboxed storage for provably-monotype int/real
+# AER test suite — the "primitive pass" (raw unboxed storage for provably-monotype int/float
 # locals, source/core/vm.h's OP_RAW_* family + parser.c's var_kind). Ground-truth coverage: every
 # result here must match exactly what the fully-boxed VM would have produced, since this feature
 # is purely an internal storage optimization — no AER program's observable behavior should change.
@@ -7,7 +7,7 @@
 # the process exits nonzero (see main.c/error.c).
 
 # ------------------------------------------------------------------ #
-# Raw arithmetic — int and real, matching boxed semantics exactly     #
+# Raw arithmetic — int and float, matching boxed semantics exactly     #
 # ------------------------------------------------------------------ #
 
 function raw_int_arith():
@@ -16,15 +16,15 @@ function raw_int_arith():
     sum = a + b
     diff = a - b
     prod = a * b
-    quot = a / b          # int/int division always promotes to real, even when raw
+    quot = a / b          # int/int division always promotes to float, even when raw
     rem = a % b
     fdiv = a // b
     return [sum, diff, prod, quot, rem, fdiv]
 
 r = raw_int_arith()
-assert(r[0] == 13 && r[1] == 7 && r[2] == 30, "raw int add/sub/mul match boxed semantics")
-assert(r[3] == 10.0 / 3.0, "raw int division promotes to real (matching OP_DIV's own boxed semantics)")
-assert(r[4] == 1 && r[5] == 3, "raw int mod/floor_div stay integer")
+assert(r[0] == 13 and r[1] == 7 and r[2] == 30, "raw int add/sub/mul match boxed semantics")
+assert(r[3] == 10.0 / 3.0, "raw int division promotes to float (matching OP_DIV's own boxed semantics)")
+assert(r[4] == 1 and r[5] == 3, "raw int mod/floor_div stay integer")
 
 # OP_RAW_LOAD_INT's immediate is a signed 20-bit field (-524288..524287) — a literal outside that
 # range must go through the constant pool (OP_RAW_LOAD_INT_POOL), not be silently truncated. Real
@@ -37,7 +37,7 @@ function large_raw_literal():
 
 bl = large_raw_literal()
 assert(bl[0] == 20000000, "a raw int literal outside OP_RAW_LOAD_INT's 20-bit immediate range loads correctly via the pool fallback")
-assert(bl[1] == 20000001 && bl[2] == 40000000, "arithmetic on a pool-loaded large raw literal is still correct")
+assert(bl[1] == 20000001 and bl[2] == 40000000, "arithmetic on a pool-loaded large raw literal is still correct")
 
 function large_raw_loop_bound():
     total = 0
@@ -55,7 +55,7 @@ function raw_real_arith():
     return [a + b, a - b, a * b, a / b]
 
 rr = raw_real_arith()
-assert(rr[0] == 6.5 && rr[1] == -1.5 && rr[2] == 10.0 && rr[3] == 0.625, "raw real arithmetic matches boxed semantics")
+assert(rr[0] == 6.5 and rr[1] == -1.5 and rr[2] == 10.0 and rr[3] == 0.625, "raw float arithmetic matches boxed semantics")
 
 # ------------------------------------------------------------------ #
 # Shadow transition — a raw-tracked name reassigned to a different    #
@@ -134,14 +134,14 @@ function escape_sites():
     n = 42
     passed_through = identity(n)          # call argument
     arr = [n, n + 1]                      # array element
-    d = {"key": n}                        # dict value
+    d = {"key": n}                        # hashtable value
     interpolated = "value is {n}"          # string interpolation
     return [passed_through, arr[0], arr[1], d["key"], interpolated]
 
 es = escape_sites()
 assert(es[0] == 42, "raw local passed as a call argument boxes correctly")
-assert(es[1] == 42 && es[2] == 43, "raw locals written into array elements box correctly")
-assert(es[3] == 42, "raw local written into a dict value boxes correctly")
+assert(es[1] == 42 and es[2] == 43, "raw locals written into array elements box correctly")
+assert(es[3] == 42, "raw local written into a hashtable value boxes correctly")
 assert(es[4] == "value is 42", "raw local interpolated into a string boxes correctly")
 
 struct Holder:

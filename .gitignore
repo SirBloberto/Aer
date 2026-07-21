@@ -28,6 +28,9 @@
 #PGO build artifacts
 /object-pgo/*
 
+#npm dependencies for the VS Code extension — installed locally, not shipped in the tree
+/tools/vscode-aer/node_modules/
+
 #Profiling/debugging leftovers — never fixtures to keep
 *.o
 perf.data*

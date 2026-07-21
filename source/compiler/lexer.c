@@ -288,10 +288,19 @@ static bool lex_keyword(unsigned int length) {
         { "struct",   sizeof("struct")   - 1, TOKEN_STRUCT   },
         { "function", sizeof("function") - 1, TOKEN_FUNCTION },
         { "return",   sizeof("return")   - 1, TOKEN_RETURN   },
+        { "raise",    sizeof("raise")    - 1, TOKEN_RAISE    },
         { "break",    sizeof("break")    - 1, TOKEN_BREAK    },
         { "continue", sizeof("continue") - 1, TOKEN_CONTINUE },
         { "null",     sizeof("null")     - 1, TOKEN_NULL     },
         { "import",   sizeof("import")   - 1, TOKEN_IMPORT   },
+        { "integer",   sizeof("integer")   - 1, TOKEN_TYPE_INTEGER   },
+        { "float",     sizeof("float")     - 1, TOKEN_TYPE_FLOAT     },
+        { "boolean",   sizeof("boolean")   - 1, TOKEN_TYPE_BOOLEAN   },
+        { "array",     sizeof("array")     - 1, TOKEN_TYPE_ARRAY     },
+        { "hashtable", sizeof("hashtable") - 1, TOKEN_TYPE_HASHTABLE },
+        { "and",       sizeof("and")       - 1, TOKEN_AND            },
+        { "or",        sizeof("or")        - 1, TOKEN_OR             },
+        { "not",       sizeof("not")       - 1, TOKEN_NOT            },
     };
     static const int keyword_count = sizeof(keywords) / sizeof(*keywords);
 
@@ -307,9 +316,18 @@ static bool lex_keyword(unsigned int length) {
 static void lex_string() {
     current->buffer++; /* skip opening " */
     char* start = current->buffer;
-    while (*current->buffer != '"' && *current->buffer != '\0' && *current->buffer != '\n') {
-        if (*current->buffer == '\\' && *(current->buffer + 1) != '\0')
-            current->buffer++;  /* skip escaped char so \" doesn't end the string */
+    /* Brace-depth aware so a '"' inside an active {expr} (e.g. "{result["total"]}") isn't
+       mistaken for the string's own closing quote -- parse_string_literal's later interpolation
+       scan already tracks this same depth; this just makes the token-boundary scan agree with it. */
+    int brace_depth = 0;
+    while (*current->buffer != '\0' && *current->buffer != '\n' &&
+           !(*current->buffer == '"' && brace_depth == 0)) {
+        if (*current->buffer == '\\' && *(current->buffer + 1) != '\0') {
+            current->buffer += 2;  /* skip escaped char (e.g. \" \{) so it's never treated specially */
+            continue;
+        }
+        if (*current->buffer == '{') brace_depth++;
+        else if (*current->buffer == '}' && brace_depth > 0) brace_depth--;
         current->buffer++;
     }
     if (*current->buffer != '"') { error_at("Unterminated string"); return; }
@@ -461,7 +479,7 @@ void lex() {
         case '-':  if (b[1]=='=') { emit(TOKEN_SUBTRACT_ASSIGN, 2); return; }
                    emit(TOKEN_SUBTRACT, 1); return;
         case '!':  if (b[1]=='=') { emit(TOKEN_NOT_EQUAL,       2); return; }
-                   emit(TOKEN_NOT,      1); return;
+                   error_at("'!' is not an operator -- use 'not'"); emit(TOKEN_ERROR, 1); return;
         case '=':  if (b[1]=='=') { emit(TOKEN_EQUAL,           2); return; }
                    emit(TOKEN_ASSIGN,   1); return;
         case '<':  if (b[1]=='<') { emit(TOKEN_LEFT_SHIFT, 2); return; }
@@ -470,9 +488,9 @@ void lex() {
         case '>':  if (b[1]=='>') { emit(TOKEN_RIGHT_SHIFT, 2); return; }
                    if (b[1]=='=') { emit(TOKEN_GREATER_EQUAL, 2); return; }
                    emit(TOKEN_GREATER, 1); return;
-        case '&':  if (b[1]=='&') { emit(TOKEN_AND,        2); return; }
+        case '&':  if (b[1]=='&') { error_at("'&&' is not an operator -- use 'and'"); emit(TOKEN_ERROR, 2); return; }
                    emit(TOKEN_BITWISE_AND, 1); return;
-        case '|':  if (b[1]=='|') { emit(TOKEN_OR,         2); return; }
+        case '|':  if (b[1]=='|') { error_at("'||' is not an operator -- use 'or'"); emit(TOKEN_ERROR, 2); return; }
                    if (b[1]=='>') { emit(TOKEN_PIPE,        2); return; }
                    emit(TOKEN_BITWISE_OR, 1); return;
         case '^':  emit(TOKEN_BITWISE_XOR, 1); return;

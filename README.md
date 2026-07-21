@@ -5,14 +5,8 @@ Greek and Latin word for *air* — the language is designed around three values:
 codebase, no bloat), **fast** (bytecode VM, not tree-walking), and **easy to understand** (both the
 language syntax and the implementation).
 
-It is a learning and research project, not a production language. The goal is to see how far a clean,
-principled design can go with very little code.
-
----
-
 ## Contents
 
-- [What Makes AER Interesting](#what-makes-aer-interesting)
 - [Practical Applications](#practical-applications)
 - [Getting Started](#getting-started)
 - **Guide**
@@ -25,7 +19,7 @@ principled design can go with very little code.
   - [Control Flow](#control-flow)
   - [Functions](#functions)
   - [Lists](#lists)
-  - [Maps](#maps)
+  - [Hashtables](#hashtables)
   - [Structs](#structs)
   - [Method Calls and Pipes](#method-calls-and-pipes)
   - [Error Handling](#error-handling)
@@ -42,46 +36,6 @@ principled design can go with very little code.
 
 ---
 
-## What Makes AER Interesting
-
-**Single-pass elegance.** Most textbook compilers make three separate passes: lex → parse → codegen.
-AER collapses all three. Every `parse_*` function is simultaneously the grammar rule and the code
-generator.
-
-**Precedence climbing.** One function and a table (see [Operators](#operators)) replace the
-traditional cascade of `parse_addition`, `parse_multiplication`, `parse_unary`, etc. Adding an
-operator is one line — plus, for the handful whose right-hand side isn't a general expression
-(`in` is; `as` and `|>` aren't), one small special case.
-
-**The VM is a computed-goto dispatch loop over integers.** No virtual dispatch, no pointer chasing,
-no heap allocation in the hot loop. Direct-threaded dispatch lets the CPU's branch predictor learn
-per-instruction patterns instead of funnelling every opcode through one `switch`.
-
-**Every local is a flat, compile-time-resolved slot — no closures.** Assignment inside a function
-is always local, which means every name in a function body resolves to a fixed slot at parse time,
-not a runtime scope-chain walk. A function's data access is always either its own parameters/locals
-or an explicit reference passed in — never an implicit reach into an enclosing function's variables.
-
-**A real module system without a module value type.** `import math` and `import helpers` both work,
-resolved entirely at parse time — file-based imports even run the imported file synchronously,
-in a fully isolated `Chunk`/`VM`, before the importing file's own parse continues. No `TYPE_MODULE`,
-no runtime namespace object, just a name the parser remembers.
-
-**REPL function and struct persistence.** Functions and struct types survive across interactive
-calls because the bytecode array and struct registry grow monotonically and are never reset. This
-just falls out naturally from the design — no special handling required.
-
-**`OP_CALL_VALUE`.** Functions stored in arrays and dicts can be called directly:
-`ops[0](3, 4)` or `dispatch["add"](10, 20)`. The opcode removes the function value from the stack
-in-place before jumping, which keeps the call convention identical to a named call.
-
-**Structs without a new value type.** A struct instance is an array with a shape pointer — printing,
-reference semantics, and heap layout are all inherited for free. The interesting engineering is
-entirely in the guards that keep structs from silently behaving like arrays where that would be
-surprising.
-
----
-
 ## Practical Applications
 
 AER is genuinely suited to:
@@ -89,7 +43,7 @@ AER is genuinely suited to:
 | Use case | Why AER fits |
 |----------|-------------|
 | Embedded scripting DSL | Self-contained C VM, no external deps, embeds in any C project |
-| Game logic / NPC behaviour | First-class functions, structs, dicts, and arrays cover most logic patterns; lightweight enough for per-frame calls |
+| Game logic / NPC behaviour | First-class functions, structs, hashtables, and arrays cover most logic patterns; lightweight enough for per-frame calls |
 | Config with computation | More expressive than JSON/TOML; simpler to embed than Lua |
 | Teaching language design | Full compiler + VM in a few thousand lines of readable C; fits on one screen at a time |
 | Automation scripts | Real data structures without Python startup overhead |
@@ -162,7 +116,7 @@ A handful of global flags work in any mode (before the script path, if there is 
 
 `--memory-size` is a cell-count ceiling with a familiar-looking suffix, not a byte-accurate memory
 limit — `aer_gc_set_ceiling()` (the function this maps to) counts live GC cells, and cell sizes
-differ per pool (a string cell isn't the size of a dict cell), so there's no accurate bytes-to-cells
+differ per pool (a string cell isn't the size of a hashtable cell), so there's no accurate bytes-to-cells
 conversion without a much bigger per-allocation byte-accounting subsystem this project doesn't
 have. `K`/`M`/`G` multiply by 1,000/1,000,000/1,000,000,000 cells. See
 [Embedding](#embedding)/[Security concerns](#security-concerns) for what these flags actually do and
@@ -204,7 +158,7 @@ lookup), then the grammar and semantics organized by topic.
 
 ## Keywords
 
-AER has **12 reserved words**, plus the two boolean literals. That's the entire list — nothing else
+AER has **21 reserved words**, plus the two boolean literals. That's the entire list — nothing else
 in the language is reserved:
 
 | Keyword | Role |
@@ -212,20 +166,40 @@ in the language is reserved:
 | `if` / `else` | conditional statement |
 | `for` | the single iteration keyword — while, for-each, and ranges all use it |
 | `in` | membership test, and the `for x in ...` iteration form |
+| `and` / `or` / `not` | logical operators (see [Operators](#operators) for precedence) |
 | `as` | cast to a primitive type, or shape-check against a struct type |
 | `struct` | declare a fixed-shape record type |
 | `function` | declare a named function, or start an anonymous function value |
 | `return` | return from a function, optionally with a value (or several) |
+| `raise` | signal a recoverable failure from a function (see [Error Handling](#error-handling)) |
 | `break` / `continue` | loop control |
 | `null` | the absence-of-a-value literal |
 | `import` | bring a native or file-based module into scope |
 | `true` / `false` | boolean literals |
+| `integer` / `float` / `boolean` | primitive type names — only meaningful after `as`, but reserved everywhere so they can never be shadowed |
+| `array` / `hashtable` | collection type names — not valid `as` cast targets themselves (there's no generic value-to-collection conversion), but reserved for the same reason |
 
-**Everything else is an ordinary identifier**, including `print`, `length`, `type`, `assert`, and
-`panic` (see [Built-in Functions](#built-in-functions)) and every stdlib name
-(`math`, `random`, `string`, `time`, `collection`, `net`, `regex`, `json`, `io`). None of these are keywords — they can be shadowed by a local
-variable or parameter of the same name, and they compose with everything else a function value can
-(passed around, stored in a variable, piped through `|>`).
+`string` is deliberately **not** on this list, even though it's a valid `as` cast target
+(`x as string`) — it collides with the stdlib `string` module (`import string`), so it stays an
+ordinary identifier like every other module name, matched by text rather than reserved. This costs
+nothing in practice: `as string`'s grammar is a fixed, non-lookup production regardless (same as
+every other cast target), so it was never shadowable to begin with.
+
+**Everything else is an ordinary identifier**, including every stdlib module name
+(`math`, `random`, `string`, `time`, `collection`, `net`, `regex`, `json`, `io`) — none of these are
+keywords, and they can be shadowed by a local variable or parameter of the same name, composing with
+everything else a function value can (passed around, stored in a variable, piped through `|>`).
+
+**One narrower exception:** `print`, `length`, `type`, `assert`, `panic`, and `Result` (see
+[Built-in Functions](#built-in-functions)) aren't reserved words — they're ordinary identifiers,
+same as a stdlib module name — but calling one, e.g. `Result(value, err)`, always resolves to the
+real builtin regardless of any same-named local variable or function, and declaring a function with
+one of these names is a compile error. This is deliberately stricter than module-name shadowing:
+ordinary function-call resolution checks user-defined functions before falling back to a builtin, so
+without this guard a script defining its own `function Result(a, b): ...` would silently hijack
+every `Result(...)` call site with no error at all — module names don't carry this risk, since
+shadowing one is an intentional, well-understood feature, not an accidental collision with a
+fixed, load-bearing builtin.
 
 ## Operators
 
@@ -233,24 +207,31 @@ Binary operators are looked up by one precedence table, from lowest to highest:
 
 | Precedence | Operators | Meaning |
 |:-:|-----------|---------|
-| 1 (lowest) | `\|\|`  `\|>` | logical or (short-circuit) · pipe |
-| 2 | `&&` | logical and (short-circuit) |
-| 3 | `\|` | bitwise or |
-| 4 | `^` | bitwise xor |
-| 5 | `&` | bitwise and |
-| 6 | `==`  `!=` | equality |
-| 7 | `<`  `>`  `<=`  `>=`  `in` | comparison · membership |
-| 8 | `<<`  `>>` | bit shift |
-| 9 | `+`  `-` | add · subtract |
-| 10 | `*`  `/`  `%`  `//` | multiply · true-divide · modulo · floor-divide |
-| 11 (highest) | `as` | cast / shape-check |
+| 1 (lowest) | `or`  `\|>` | logical or (short-circuit) · pipe |
+| 2 | `and` | logical and (short-circuit) |
+| 3 | `not` | logical not |
+| 4 | `\|` | bitwise or |
+| 5 | `^` | bitwise xor |
+| 6 | `&` | bitwise and |
+| 7 | `==`  `!=` | equality |
+| 8 | `<`  `>`  `<=`  `>=`  `in` | comparison · membership |
+| 9 | `<<`  `>>` | bit shift |
+| 10 | `+`  `-` | add · subtract |
+| 11 | `*`  `/`  `%`  `//` | multiply · true-divide · modulo · floor-divide |
+| 12 (highest) | `as` | cast / shape-check |
 
 `as` binding tighter than everything else means `x as integer + 1` reads as `(x as integer) + 1`,
 matching Rust's `as` precedence convention. `in` sits at comparison precedence, not its own tier —
 `a == b in list` parses as `a == (b in list)`.
 
-**Unary** (bind tighter than any binary operator): `!x` (logical not), `-x` (negate), `~x` (bitwise
-not).
+`not` sits between `and`/`or` and everything else — tighter than `and`/`or`, looser than
+comparison/`in`/arithmetic/`as` — matching Python. This is why `not "age" in person` reads as
+`not ("age" in person)` rather than `(not "age") in person`: `not`'s operand grabs the whole `in`
+expression before `not` itself is applied. `-`/`~` don't share this: they bind tighter than any
+binary operator, same as `x as integer + 1`'s `as`.
+
+**Unary** (bind tighter than any binary operator): `-x` (negate), `~x` (bitwise not). `not` is
+unary too but sits at its own, looser precedence — see above, not this list.
 
 **Assignment** is a statement, not an expression, and isn't part of the precedence table at all:
 `=`, and the arithmetic compound forms `+=  -=  *=  /=  %=  //=`. Compound assignment
@@ -259,7 +240,7 @@ works on plain names, indexed targets, and dot-field targets alike — `x += 1`,
 deliberately no bitwise compound forms (`&=`, `<<=`, ...) — a second spelling of `x = x & m` with
 no new capability; write it out.
 
-`/` always performs true division and returns a real; `//` is floor division, rounding toward
+`/` always performs true division and returns a float; `//` is floor division, rounding toward
 negative infinity (matching Python, not C):
 
 ```
@@ -268,14 +249,14 @@ negative infinity (matching Python, not C):
 -7 // 2         # -4   — floors toward negative infinity, not toward zero
 ```
 
-`&&` and `||` **return the deciding operand itself**, not a coerced boolean (Python/Lua semantics,
-not C/JS's strict-boolean `&&`/`||`): `a || b` is `a` if `a` is truthy, else `b`; `a && b` is `a` if
+`and` and `or` **return the deciding operand itself**, not a coerced boolean (Python/Lua semantics,
+not C/JS's strict-boolean `&&`/`||`): `a or b` is `a` if `a` is truthy, else `b`; `a and b` is `a` if
 `a` is falsy, else `b`. Both short-circuit — the right-hand side is only evaluated if the left side
-doesn't already determine the result. This is what makes `x = x || "default"` work as a default-value
+doesn't already determine the result. This is what makes `x = x or "default"` work as a default-value
 idiom:
 
 ```
-name = user_input || "Anonymous"    # "Anonymous" if user_input is falsy (null, "", 0, ...)
+name = user_input or "Anonymous"    # "Anonymous" if user_input is falsy (null, "", 0, ...)
 ```
 
 ## Built-in Functions
@@ -287,14 +268,14 @@ directly by the VM, not syntax. The bar for being a builtin is "meaningful for (
 |----------|-----------|-----------|
 | `print(x)` | 1 arg | writes `x`'s string form to stdout, followed by a newline |
 | `type(x)` | 1 arg | returns `x`'s type name as a string (a struct instance returns its declared name) |
-| `length(x)` | 1 arg | element count of an array, entry count of a dict, or a string's character count |
+| `length(x)` | 1 arg | element count of an array, entry count of a hashtable, or a string's character count |
 | `assert(cond, msg)` | 2 args | prints `ASSERT FAILED: msg` on a false `cond` and keeps running — see [Error Handling](#error-handling) |
 | `panic(msg)` | 1 arg | aborts like any runtime error, with your own message — see [Error Handling](#error-handling) |
 | `Result(value, err)` | 2 args | builds a genuine `Result` — exactly one argument must be null — capitalized like a struct constructor, not a plain builtin (see [Error Handling](#error-handling)) |
 
 Everything past this — `math`, `random`, `string`, `time`, `collection`, `io` — requires an
 explicit `import` and is covered in [Standard Library](#standard-library). In particular
-`append`/`delete` live in `collection`, alongside every other array/dict operation.
+`append`/`delete` live in `collection`, alongside every other array/hashtable operation.
 
 ## Syntax
 
@@ -334,7 +315,7 @@ AER is dynamically typed. There are eight underlying value types:
 | String | `"hello"` | Immutable; supports indexing, slicing, iteration, interpolation and escapes |
 | Function | `function foo(): ...` | First-class; stores code offset and arity |
 | Array | `[1, 2, 3]` | Mutable; reference semantics — see [Lists](#lists) |
-| Dict | `{"a": 1}` | Mutable string-keyed; reference semantics — see [Maps](#maps) |
+| Hashtable | `{"a": 1}` | Mutable string-keyed; reference semantics — see [Hashtables](#hashtables) |
 
 Struct instances (see [Structs](#structs)) are a fixed-shape variant of Array — same reference
 semantics, but dot-accessed only and reported by their declared name (`type(p)` returns `"Point"`,
@@ -354,11 +335,11 @@ else:
     print("null")     # prints this
 ```
 
-Missing dict keys return `null` rather than erroring — see [Maps](#maps).
+Missing hashtable keys return `null` rather than erroring — see [Hashtables](#hashtables).
 
 ### Numbers
 
-Mixing an integer and a real promotes the integer:
+Mixing an integer and a float promotes the integer:
 
 ```
 1 + 2.5         # 3.5
@@ -435,7 +416,7 @@ print("{name} is {double(age)} in dog years")
 
 `{expr}` is parsed as a genuine sub-expression (its own independent lex/parse pass, saved and
 restored around the outer string), not a text-to-variable lookup — so it accepts anything
-`parse_binary` does, including a nested `{}` (a dict literal). The one thing it *doesn't* handle is
+`parse_binary` does, including a nested `{}` (a hashtable literal). The one thing it *doesn't* handle is
 a nested string literal's own quotes: the outer string's own lexing decides where the whole string
 token ends before interpolation ever runs, and it has no idea `{}` exists — so a literal `"` inside
 an interpolated expression still needs the same `\"` escaping any other embedded quote would:
@@ -561,7 +542,7 @@ for ch in "abc":
     print(ch)
 ```
 
-**Dict iteration — keys only, or key-value pairs:**
+**Hashtable iteration — keys only, or key-value pairs:**
 
 ```
 scores = {"alice": 95, "bob": 87}
@@ -678,7 +659,7 @@ print(read_it(outer))     # 10
 
 This is stricter than "assignment is always local" — it's "the name doesn't exist in here at
 all." To share state across calls, mutate something you were explicitly given a reference to (a
-struct, array, or dict — all reference types), instead of relying on a function reaching outward
+struct, array, or hashtable — all reference types), instead of relying on a function reaching outward
 by bare name:
 
 ```
@@ -770,7 +751,7 @@ print(nums[3:])      # [3, 4, 5]
 print(nums[:3])      # [0, 1, 2]
 ```
 
-Index access chains — nested arrays and dicts support `[...][...]` syntax:
+Index access chains — nested arrays and hashtables support `[...][...]` syntax:
 
 ```
 matrix = [[1, 2], [3, 4]]
@@ -780,9 +761,9 @@ matrix[0][1] = 99            # nested assignment
 print(matrix[0])              # [1, 99]
 ```
 
-## Maps
+## Hashtables
 
-Dicts are mutable string-keyed hash tables with reference semantics. Missing keys return `null`
+Hashtables are mutable string-keyed hash tables with reference semantics. Missing keys return `null`
 rather than erroring.
 
 ```
@@ -796,11 +777,12 @@ collection.delete(d, "y")  # remove key (import collection)
 length(d)                # number of entries
 ```
 
-Dictionary keys are always strings — no mixed-type key lookups, no hash collision between
+Hashtable keys are always strings — no mixed-type key lookups, no hash collision between
 integer `1` and string `"1"`.
 
-Iterating a dict (`for k in d:`, `print(d)`, `json.encode(d)`) visits entries in hash-bucket order,
-not insertion order — don't rely on a dict preserving the order its keys were added in.
+Iterating a hashtable (`for k in d:`, `print(d)`, `json.encode(d)`) visits entries in an unspecified
+internal order that can change across insertions and removals — don't rely on a hashtable
+preserving the order its keys were added in.
 
 ## Structs
 
@@ -816,7 +798,7 @@ struct Point:
 
 **Every field must have an explicit default — there's no separate type annotation at all.** A
 field's type is always exactly its default's type: `0.0` makes `x` a `float` field, `0` would make
-it `integer`, `""` a `string`, `[]` an `array`, `{}` a `dict`. `null` is the one default with no
+it `integer`, `""` a `string`, `[]` an `array`, `{}` a `hashtable`. `null` is the one default with no
 matching type — it leaves that field genuinely unconstrained, since there's no dedicated "accepts
 anything" keyword (a nested struct instance, which can't be written as a literal default, is the
 main reason to reach for this — see `Outer`/`Inner` below). Defaults must be literals — no
@@ -906,7 +888,7 @@ print(length(bodies))   # 1024
 
 **Eligibility is per-struct-type**, checked at construction (the first `Type[count]`, a VM runtime
 check, not a parse-time one): every field must be `integer`, `float`, or `boolean` — a `string`,
-`array`, `dict`, or unconstrained (`null`-defaulted) field all disqualify a struct from
+`array`, `hashtable`, or unconstrained (`null`-defaulted) field all disqualify a struct from
 `Type[count]` construction (they can't be packed at a uniform byte width), even though that same
 struct works fine as an ordinary, individually-constructed instance (`Type()`).
 
@@ -1008,64 +990,69 @@ print(dispatch["add"](3, 4))   # 7
 Two unrelated things are both called "errors" in AER and it's worth keeping them apart.
 
 **The `(value, err)` convention** is a coding pattern, not a language feature. A fallible function
-returns `value, null` on success and `null, "message"` on failure; the caller checks with a plain
-`if`. AER has no exceptions.
+returns its success value on its own (`return value`) or signals failure with `raise <reason>`; the
+caller checks with a plain `if`. AER has no exceptions — no `try`/`catch`, no distant handler.
 
 ```
 function safe_div(a, b):
     if b == 0:
-        return null, "division by zero"
-    return a / b, null
+        raise "division by zero"
+    return a / b
 
 result, err = safe_div(10, 0)
 if err != null:
     print("Error: {err}")
 ```
 
-A function you write this way (`return a, b`) returns a plain 2-element array — `a, b = ...`
-destructures it the same way it destructures any array. Every fallible *native* stdlib function
-(`io.read`, `json.decode`, etc.) returns something slightly stricter instead: a real `Result` type,
-distinct from an ordinary array (`type(x)` reports `"Result"`, not `"array"`). Destructuring
-looks identical either way — `value, err = io.read(path)` works whether `io.read` is yours or the
-stdlib's — the difference only shows up if you try to misuse one: indexing anything but `0`/`1` on
-a `Result` is a clear error rather than quietly doing whatever an out-of-bounds array access does,
-and a `Result` can't be silently handed to something expecting a plain array. A bare `Result` is
-also truthy exactly when it succeeded, so `if io.read(path): ...` reads as "if that worked" without
-destructuring first. `==`/`!=` on a `Result` is reference equality, same as arrays/dicts — two
+A function's plain success path (`return value`) doesn't need to build anything special for this to
+work — destructuring an ordinary value at the call site (`a, b = ...`) treats it as `(value, null)`
+automatically, the same "not a real Result? just a plain value" rule the pipe operator (`|>`, below)
+already applies on its own left operand. Every fallible *native* stdlib function (`io.read`,
+`json.decode`, etc.) and every `raise` both return something stricter: a real `Result` type, distinct
+from an ordinary array (`type(x)` reports `"Result"`, not `"array"`). Destructuring looks identical
+either way — `value, err = io.read(path)` works whether the failure came from the stdlib or your own
+`raise` — the difference only shows up if you try to misuse one: indexing anything but `0`/`1` on a
+`Result` is a clear error rather than quietly doing whatever an out-of-bounds array access does, and
+a `Result` can't be silently handed to something expecting a plain array. A bare `Result` is also
+truthy exactly when it succeeded, so `if io.read(path): ...` reads as "if that worked" without
+destructuring first. `==`/`!=` on a `Result` is reference equality, same as arrays/hashtables — two
 separately-built Results with identical contents are not `==` to each other, only a `Result`
 compared against itself (or a variable holding the same one) is.
 
-**`Result(value, err)`** builds a genuine `Result` from AER source itself — the only way to, since
-`io`/`json` build theirs from native code directly. Capitalized like a struct constructor
-(`Basket(...)`, not `print(...)`) rather than a plain builtin — deliberately, since a lowercase
-`result` is exactly the kind of name a script would otherwise pick for an ordinary local variable,
-and this way it can't be silently shadowed by one. Exactly one of the two arguments must be null;
-passing both (or neither) is a runtime error. Use it so your own fallible functions return the same
-shape `io.read`/`json.decode` do, letting them participate in `|>`'s short-circuit below:
+**`raise <expr>`** is the one way user code signals a recoverable failure — a full, visible,
+keyword-led statement, exactly like `return`/`break`/`continue`, never a symbol embedded in an
+expression and never unwinding across more than the enclosing function's own return:
 
 ```
 function parse_positive(n):
     if n <= 0:
-        return Result(null, "must be positive")
-    return Result(n, null)
+        raise "must be positive"
+    return n
 ```
 
-**`return value, error(err)`** (and `return error(err)` alone) is sugar for exactly the same thing,
-spelled to match a plain `return value, err`'s shape. `error(x)` is recognized only as the first
-token of a return statement's own value — the identifier `error` immediately followed by `(` — and
-only as the last value in a 1- or 2-value return; everywhere else, including a plain variable
-literally named `error`, it's a completely ordinary identifier:
+`<expr>` is usually a string message, but can be any value — a struct instance works too, if you
+want a caller to distinguish *kinds* of failure via `type(err)` rather than matching a message
+string, with no separate exception-class feature needed (structs and `type()` already do this).
+Under the hood, `raise` builds exactly what `Result(value, err)` does (below), with the value forced
+to `null` — a plain `return` always means a success value and `raise` always means failure, never
+mixed within the same function, so there's no shape ambiguity to check for.
 
-```
-function parse_positive(n):
-    if n <= 0:
-        return error("must be positive")   # same as return Result(null, "must be positive")
-    return n, error(null)                  # same as return Result(n, null)
-```
+**`Result(value, err)`** builds a genuine `Result` directly, for the rarer case of constructing or
+forwarding one outside a `return`/`raise` statement (storing one in a variable or an array, say).
+Capitalized like a struct constructor (`Basket(...)`, not `print(...)`) rather than a plain builtin —
+deliberately, since a lowercase `result` is exactly the kind of name a script would otherwise pick
+for an ordinary local variable, and this way it can't be silently shadowed by one. Exactly one of
+the two arguments must be null; passing both (or neither) is a runtime error.
 
 **Runtime errors** are a VM-level thing and are not values at all — out-of-bounds access, wrong
 argument count, dividing by zero with `/`, a shape mismatch from `as Type`, and similar faults print
-a message (prefixed with the source line it happened on, e.g. `Line 12: ...`) and then:
+a message identifying the file, line, and enclosing function (if any), e.g.
+`test.aer:2, in c(): Error: Division by zero` — and, if the fault happened inside a chain of nested
+calls, one `called from line N, in fn()` line per enclosing call beneath it, innermost first. A
+frame reached via tail-call optimization has no separate identity left to report (the whole point of
+the optimization is that it doesn't keep one), so that's called out explicitly
+(`(+N tail call(s) not shown)`) instead of silently presenting an incomplete trace as a complete one.
+Then:
 
 - In the REPL, **abort the rest of the current statement only** — the REPL keeps going and the next
   line is unaffected.
@@ -1084,11 +1071,14 @@ function handle(mode):
 ```
 
 `message` must be a string. `panic()` behaves identically to any other runtime error in every way —
-same abort behavior, same REPL-vs-file distinction, same unreachability from AER code.
+same abort behavior, same REPL-vs-file distinction, same unreachability from AER code. It's
+deliberately a plain function rather than a keyword, unlike `raise` — the two are meant to look
+different at a glance precisely because they mean different things: `raise` hands control back to
+the caller, `panic()` ends things.
 
-**`assert(condition, message)`** is a third, separate thing — a check for tests and invariants, not
-an error. A failed assertion prints `ASSERT FAILED: message` and the script **keeps running** — it
-does not abort the current statement the way a runtime error does:
+**`assert(condition, message)`** is a separate thing entirely — a check for tests and invariants,
+not an error. A failed assertion prints `ASSERT FAILED: message` and the script **keeps running** —
+it does not abort the current statement the way a runtime error does:
 
 ```
 assert(1 + 1 == 2, "arithmetic works")
@@ -1249,12 +1239,12 @@ under the hood but just as unconditionally available (see [File I/O](#file-io--i
 [Modularity](#modularity) for how `import` resolves these.
 
 ```
-math.sqrt(x)          # square root, always returns a real; x must be non-negative
-math.pow(x, y)        # x to the power of y, always returns a real; a negative x requires a whole-number y
+math.sqrt(x)          # square root, always returns a float; x must be non-negative
+math.pow(x, y)        # x to the power of y, always returns a float; a negative x requires a whole-number y
 math.floor(x)         # round toward negative infinity, returns an integer
 math.ceil(x)          # round toward positive infinity, returns an integer
 math.round(x)         # round to the nearest integer (halves away from zero), returns an integer
-math.abs(x)           # absolute value, preserves integer/real
+math.abs(x)           # absolute value, preserves integer/float
 math.min(a, b)        # the smaller of two numbers, preserves whichever argument's type
 math.max(a, b)        # the larger of two numbers, preserves whichever argument's type
 math.sin(x), math.cos(x), math.tan(x)   # standard trig, x in radians
@@ -1262,7 +1252,7 @@ math.exp(x)           # e to the power of x
 math.log(x)           # natural log, x must be positive
 math.log2(x), math.log10(x)  # base-2 / base-10 log, x must be positive
 math.pi()             # the constant, as a function — every native module exposes functions only
-random.random()       # a real in [0, 1)
+random.random()       # a float in [0, 1)
 random.randint(a, b)  # an integer in [a, b], inclusive of both ends
 random.seed(n)        # reseeds the RNG — makes subsequent random()/randint() calls reproducible
 random.choice(arr)    # one element of a non-empty array, uniformly
@@ -1277,13 +1267,13 @@ string.repeat(s, n)   # s repeated n times (n must be >= 0)
 string.replace(s, old, new)  # every occurrence of old (non-empty) replaced with new
 string.split(s, sep)  # splits on a non-empty separator, returns an array of strings
 string.join(arr, sep) # joins an array of strings with sep, returns a string
-time.now()            # current epoch time as a real, with sub-second precision
-time.sleep(s)         # pauses for s seconds (integer or real, e.g. 0.25)
+time.now()            # current epoch time as a float, with sub-second precision
+time.sleep(s)         # pauses for s seconds (integer or float, e.g. 0.25)
 time.strftime(t, fmt) # formats an epoch time (e.g. from time.now()) using C strftime format codes,
                       # in local time — time.strftime(time.now(), "%Y-%m-%d %H:%M:%S")
 time.parse(s, fmt)    # the strptime side of strftime — %Y %m %d %H %M %S %% only, hand-rolled
                       # (strptime itself isn't reliably present on the MinGW target); returns an
-                      # epoch time as a real, or a runtime error if s doesn't match fmt exactly
+                      # epoch time as a float, or a runtime error if s doesn't match fmt exactly
 json.encode(value)    # returns a JSON string
 json.decode(s)        # returns (value, err) — err non-null on malformed input
 ```
@@ -1300,7 +1290,7 @@ for a monotonic clock in code that must be robust to clock adjustments mid-run.
 
 ### Collections — `collection`
 
-Everything that grows, shrinks, reorders, or duplicates an array or dict lives here — one module,
+Everything that grows, shrinks, reorders, or duplicates an array or hashtable lives here — one module,
 rather than a few blessed global builtins, so the global namespace stays tiny and every collection
 operation is spelled the same way.
 
@@ -1308,19 +1298,19 @@ operation is spelled the same way.
 import collection
 
 collection.append(arr, x)     # adds x at the end; mutates in place, returns arr (redundant to capture)
-collection.delete(x, key)     # removes index key from an array (negative ok) or key from a dict; mutates in place
+collection.delete(x, key)     # removes index key from an array (negative ok) or key from a hashtable; mutates in place
 collection.insert(arr, i, x)  # places x at index i, shifting the rest up; i == length(arr) appends
 collection.index_of(arr, x)   # index of the first element equal to x, or -1
-collection.copy(x)            # a new array/dict with the same entries — a shallow copy, one level deep
-collection.keys(d)            # a dict's keys as a new array (hash-bucket order — sort it for determinism)
+collection.copy(x)            # a new array/hashtable with the same entries — a shallow copy, one level deep
+collection.keys(d)            # a hashtable's keys as a new array (unspecified order — sort it for determinism)
 collection.sort(arr)          # sorts in place (ascending) and returns the array
 ```
 
 `collection.sort(arr)` requires every element to be a number (compared numerically, integer and
-real mix freely) or every element to be a string (compared lexicographically) — mixing the two is
+float mix freely) or every element to be a string (compared lexicographically) — mixing the two is
 rejected rather than falling back to some arbitrary tie-break.
 
-`collection.copy` is shallow: the new container has the same *values*, so nested arrays/dicts are
+`collection.copy` is shallow: the new container has the same *values*, so nested arrays/hashtables are
 still shared references. Struct instances are excluded — construct a fresh one instead.
 
 ### JSON — `json`
@@ -1328,18 +1318,18 @@ still shared references. Struct instances are excluded — construct a fresh one
 ```
 data = {"name": "AER", "version": 2, "tags": ["scripting", "small"]}
 s = json.encode(data)
-print(s)    # a JSON object with all three keys — order follows dict iteration order
-            # (hash-bucket order), not insertion order (see Maps)
+print(s)    # a JSON object with all three keys — order follows hashtable iteration order
+            # (unspecified, not insertion order — see Hashtables)
 
 decoded, err = json.decode(s)
 if err == null:
     print(decoded["name"])    # AER
 ```
 
-`json.encode` maps null/boolean/integer/real/string/array/dict onto their obvious JSON
+`json.encode` maps null/boolean/integer/float/string/array/hashtable onto their obvious JSON
 counterparts. A struct instance encodes as a JSON *object* keyed by its field names (not a bare
 positional array), so the field names survive — but since JSON itself has no struct types, decoding
-always produces a plain dict back, never the original struct. Encoding a function value is a
+always produces a plain hashtable back, never the original struct. Encoding a function value is a
 runtime error — there's nothing to serialize. `json.decode` follows the same `(value, err)`
 convention as the rest of the fallible stdlib rather than aborting the script on malformed input.
 
@@ -1577,13 +1567,13 @@ what a real permission system would still need on top of this.
 
 | Behaviour | What happens | Workaround |
 |-----------|-------------|------------|
-| `/` always returns real | `1 / 1` → `1.0` | Use `//` for integer floor division |
-| Arrays and dicts are references | `b = a; b[0] = 99` modifies `a` too | `b = collection.copy(a)` when you really want a distinct container (shallow — one level) |
+| `/` always returns float | `1 / 1` → `1.0` | Use `//` for integer floor division |
+| Arrays and hashtables are references | `b = a; b[0] = 99` modifies `a` too | `b = collection.copy(a)` when you really want a distinct container (shallow — one level) |
 | Referencing a name that was never assigned is a compile error | `print(x)` with no prior `x = ...` anywhere fails to compile | Assign it first (`x = null` if there's genuinely nothing better) |
-| Missing dict key returns `null` | No error, silent | Use `key in dict` before access |
+| Missing hashtable key returns `null` | No error, silent | Use `key in hashtable` before access |
 | `collection.append()`/`delete()`/`sort()`/`shuffle()` mutate in place and also return the container | `arr = collection.append(arr, v)` works but is redundant — the mutation already happened | Call them as statements |
 | Repeated `s += x` in a loop is quadratic | Strings are immutable — every `+=` allocates a fresh buffer and copies the whole thing so far, not just the addition | Build a list with `collection.append()` and join once: `parts = []; for ...: collection.append(parts, x); s = string.join(parts, "")` |
-| `as Type` never converts | `some_dict as Point` errors rather than reshaping the dict into a Point | Build the struct explicitly: `Point(some_dict["x"], ...)` |
+| `as Type` never converts | `some_table as Point` errors rather than reshaping the hashtable into a Point | Build the struct explicitly: `Point(some_table["x"], ...)` |
 | Struct instances are still `AerArray` under the hood | `length(p)` works and returns the field count (not blocked) | Harmless but not the intended API — use dot access |
 | Pipe rejects nested calls in target args | `x \|> f(g(1))` is a parse error, at any depth | Assign the inner call to a variable first: `t = g(1); x \|> f(t)` |
 
@@ -1598,7 +1588,7 @@ what a real permission system would still need on top of this.
 | Destructuring targets | 16 |
 | Struct fields | 16 |
 | Interpolation buffer | 4 096 chars |
-| Dict key length | 4 096 bytes |
+| Hashtable key length | 4 096 bytes |
 
 ### Missing features
 
@@ -1673,7 +1663,7 @@ expression bytecode, then lowered into a chain of `OP_TO_STR` / `OP_ADD` instruc
 literal segments — no runtime parsing, and no different from typing that expression anywhere else.
 
 For-each loops compile to register-based iterator opcodes (`OP_ITER_NEXT_ARRAY`/`OP_ITER_NEXT_PAIR`
-for arrays/dicts/strings, `OP_ITER_RANGE_PREP`/`OP_ITER_RANGE_LOOP` for `a..b..step` ranges) whose
+for arrays/hashtables/strings, `OP_ITER_RANGE_PREP`/`OP_ITER_RANGE_LOOP` for `a..b..step` ranges) whose
 state lives in a couple of registers the loop already owns — no heap allocation per iteration, and
 the range form is loop-rotated (PREP once before the loop, LOOP at the bottom) to match Lua's own
 FORLOOP shape rather than paying a separate top-of-loop check plus an unconditional back-edge jump.
@@ -1746,7 +1736,7 @@ mark step never recurses into its contents.
 
 **Collections:** `AerArray` and `AerDict` are heap-allocated structs held by pointer inside an
 `AerVal`. Assignment copies the pointer — all aliases share the same data. Arrays grow with doubling
-reallocation; dicts use `source/utilities/hashtable.c`'s open-addressed hash table (FNV-1a, linear
+reallocation; hashtables use `source/utilities/hashtable.c`'s open-addressed hash table (FNV-1a, linear
 probing, size-classed slab pools for small key/bucket allocations — see below). A struct instance is
 an `AerArray` with a non-`NULL` `shape` pointer into the chunk's struct-type registry — same
 allocation and reference semantics as an ordinary array, with bracket/slice/append/delete rejected
@@ -1783,11 +1773,20 @@ call before returning control to the caller.
 
 ### Hash table (`source/utilities/hashtable.c`)
 
-FNV-1a hash with open addressing and linear probing, growing at 70% load; deletion uses the reinsert
-technique to preserve the probe-chain invariant without tombstones. Backs every `AerDict` and, less
-visibly, `Chunk.name_index` (the pool's own string-constant dedup table) — both consumers share the
-same size-classed slab pools for small key buffers and bucket arrays, falling back to plain
-malloc/xcalloc only past the largest size class.
+FNV-1a hash, split into a small sparse array of open-addressed probe indices (linear probing,
+growing at 70% load) pointing into a dense array of the actual key/hash/payload entries, packed in
+insertion order with no holes. Growing the table only ever reallocates and repopulates the sparse
+array — the dense array's entries are never moved by a rehash, only appended to, which keeps the
+randomly-probed structure small (4 bytes/slot) even at hundreds of thousands of entries. Deletion
+uses the reinsert technique to repair the sparse array's probe chain, with no tombstones, exactly
+as before; the dense array separately stays hole-free by swapping the last entry into the vacated
+slot. This also means iteration order is no longer hash-bucket order — it's dense-array order,
+locally perturbed by swap-compaction on removal, still unspecified from a script's perspective
+either way. Backs every `AerDict` and, less visibly, `Chunk.name_index` (the pool's own
+string-constant dedup table) — both consumers share the same size-classed slab pools for small key
+buffers and the sparse array, falling back to plain malloc only past the sparse array's largest
+size class. The dense array is a separate, plain xrealloc-doubling allocation, not pooled at all —
+its access pattern is sequential append/scan, not the random-access pattern pooling helps with.
 
 ---
 
@@ -1845,10 +1844,10 @@ iteration count once before the loop, and `OP_ITER_RANGE_LOOP` counts down at th
 loop body, matching Lua's own FORLOOP shape — no unconditional back-edge jump instruction is ever
 emitted for this loop form at all.
 
-### Short-circuit `&&`/`||` return the deciding operand
+### Short-circuit `and`/`or` return the deciding operand
 
-`&&`/`||` return whichever operand's own value decided the result (Python/Lua semantics), not a
-coerced `true`/`false` — `x = x || "default"` works exactly like it does in Python. `vm_truthy`
+`and`/`or` return whichever operand's own value decided the result (Python/Lua semantics), not a
+coerced `true`/`false` — `x = x or "default"` works exactly like it does in Python. `vm_truthy`
 (the same general truthy-coercion `if`/`while` conditions already use for every type) decides which
 operand wins; the codegen (`compile_and`/`compile_or`, parser.c) just leaves that operand's own
 register in place instead of loading a fresh boolean constant.
@@ -1868,7 +1867,7 @@ variable is the same `'x' is not defined` (or, if the name happens to be a top-l
 This was a deliberate choice, not a missing feature: a closure is a function value carrying
 *implicit* bound state from wherever it happened to be created, invisible at every later call site —
 the same category of hidden indirection AER avoids elsewhere in the language. Sharing state across
-calls still works — just explicitly, by mutating a struct/array/dict you were actually passed as a
+calls still works — just explicitly, by mutating a struct/array/hashtable you were actually passed as a
 parameter (see [Scope inside a function](#scope-inside-a-function)) — the same idiom C uses for a
 callback that needs extra context (`void* userdata`), rather than a compiler-managed heap promotion
 behind the scenes.
@@ -1924,7 +1923,7 @@ statement from executing and returns control to the prompt — it does not conti
 placeholder value, and it does not exit the process. File execution still exits immediately on any
 error, unchanged.
 
-### Dictionary keys are always strings
+### Hashtable keys are always strings
 
 No mixed-type key lookups, no hash collision between integer `1` and string `"1"`. Keeps the
 hashmap implementation simple and the semantics predictable.
@@ -1978,7 +1977,7 @@ separate `Chunk`+`VM` — see [Modularity](#modularity)), so a collection trigge
 every loaded module's roots too, not just the VM that triggered it.
 
 **The write barrier** — the mechanism that makes minor collections safe — only has two real call
-sites: array item writes (index-assignment, `append`, struct field assignment) and dict entry
+sites: array item writes (index-assignment, `append`, struct field assignment) and hashtable entry
 writes. Stack and scope writes need no barrier at all: both are small and fully re-walked as roots
 on *every* collection regardless of generation, so anything reachable from them is never missed by a
 minor pass. Remembered-set entries are added but never proactively removed — simpler, and impossible
@@ -2019,7 +2018,7 @@ no per-`VM` granularity. Running genuinely untrusted AER source still needs more
 permission system would need per-`VM` capability sets and, for `io`/`import` specifically, path
 allowlisting, neither of which exist today.
 
-Dict key lookups (`in`, `delete`, index get/set) build a null-terminated copy of the key into a
+Hashtable key lookups (`in`, `delete`, index get/set) build a null-terminated copy of the key into a
 fixed `VM_KEY_MAX` (4096 byte) stack buffer rather than a length-sized VLA, so an oversized key
 raises a normal AER runtime error instead of risking a stack overflow.
 
@@ -2031,7 +2030,7 @@ raises a normal AER runtime error instead of risking a stack overflow.
 |------|---------|
 | `source/main.c` | Entry point, REPL loop, file runner |
 | `source/terminal.h/c` | Raw-mode interactive REPL terminal |
-| `source/value.h` | `AerVal` — the one tagged-union value type, used internally and at the embedding boundary alike: null / boolean / integer / real / string / function / array / dict / packed array, and the `Shape` forward declaration |
+| `source/value.h` | `AerVal` — the one tagged-union value type, used internally and at the embedding boundary alike: null / boolean / integer / float / string / function / array / hashtable / packed array, and the `Shape` forward declaration |
 | `source/compiler/lexer.h/c` | Source text → token stream, indent/dedent tracking |
 | `source/compiler/parser.h/c` | Single-pass compiler: tokens → register-based bytecode, escape processing |
 | `source/core/vm.h/c` | Bytecode chunk, register-based VM (`CallFrame`/bump-pointer register stack), struct-type registry, computed-goto dispatch loop, built-ins |

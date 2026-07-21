@@ -1,0 +1,28 @@
+import io
+import json
+
+function validate_roster(roster):
+    for person in roster:
+        if person["age"] == null or person["age"] < 18:
+            raise person["name"] + " is underage"
+    return roster
+
+function summarize(roster):
+    total_age = 0
+    for person in roster:
+        total_age += person["age"]
+    average_age = total_age / length(roster)
+    return {"total": length(roster), "average_age": average_age}
+
+args = io.args()
+if length(args) == 0:
+    panic("usage: aer test.aer <roster.json>")
+path = args[0]
+
+result, err = io.read(path) |> json.decode() |> validate_roster() |> summarize()
+if err != null:
+    panic("error: {err}")
+
+total = result["total"]
+average_age = result["average_age"]
+print("total: {total}, average age: {average_age}")

@@ -1,10 +1,10 @@
-# Dict payload pooling (hashtable.c's size-classed key/bucket-array pools) stress coverage.
+# Hashtable payload pooling (hashtable.c's size-classed key/bucket-array pools) stress coverage.
 import collection
-# Existing dict coverage in test_collections.aer is light (one dict, one collection.delete(), no rehash, no
+# Existing hashtable coverage in test_collections.aer is light (one hashtable, one collection.delete(), no rehash, no
 # fallback path) — this exercises the specific patterns the pooling change needs to get right:
 # multi-tier rehash growth, scrambled removal/reinsertion, both fallback paths (oversized key,
 # oversized bucket array), an embedded-NUL key, and Chunk.name_index (the shared, easy-to-forget
-# consumer of the same pools that isn't dict-shaped from an AER author's perspective).
+# consumer of the same pools that isn't hashtable-shaped from an AER author's perspective).
 
 import json
 
@@ -55,14 +55,14 @@ d3 = {}
 d3[long_key] = "fallback works"
 assert(d3[long_key] == "fallback works", "a key past the largest tier correctly falls back to plain malloc, not corrupted")
 
-# --- Explicit fallback forcing: a dict pushed past the largest 256-capacity bucket tier ---
+# --- Explicit fallback forcing: a hashtable pushed past the largest 256-capacity bucket tier ---
 d4 = {}
 i = 0
 for i < 300:
     d4["b_{i}"] = i
     i += 1
-assert(length(d4) == 300, "a dict grown past capacity 256 correctly falls back to plain xcalloc for its bucket array")
-assert(d4["b_0"] == 0 && d4["b_299"] == 299, "values at both ends of a fallback-sized dict are still correct")
+assert(length(d4) == 300, "a hashtable grown past capacity 256 correctly falls back to plain xcalloc for its bucket array")
+assert(d4["b_0"] == 0 and d4["b_299"] == 299, "values at both ends of a fallback-sized hashtable are still correct")
 
 # --- Embedded-NUL regression: JSON's own unicode-codepoint escape for NUL decodes to a literal
 # NUL byte mid-key. Built via concatenation, not one literal, so the escape sequence never appears
@@ -76,10 +76,45 @@ found_embedded_nul_key = false
 for k in decoded:
     if length(k) == 2:
         found_embedded_nul_key = true
-assert(found_embedded_nul_key, "the embedded-NUL key round-trips through insert/lookup, truncated to its 2 visible bytes by hash_match's strlen-based comparison, matching hashtable_key_dup's own truncation")
+assert(found_embedded_nul_key, "the embedded-NUL key round-trips through insert/lookup, truncated to its 2 visible bytes, matching hashtable_key_dup's own truncation")
+
+# --- delete() at every relative position vs. the most-recently-inserted key ---
+d5 = {}
+d5["a"] = 1
+d5["b"] = 2
+d5["c"] = 3
+collection.delete(d5, "c")
+assert(length(d5) == 2 and d5["a"] == 1 and d5["b"] == 2, "delete() of the last-inserted key leaves the rest correct")
+
+d6 = {}
+d6["a"] = 1
+d6["b"] = 2
+d6["c"] = 3
+collection.delete(d6, "a")
+assert(length(d6) == 2 and d6["b"] == 2 and d6["c"] == 3, "delete() of the first-inserted key leaves the rest correct")
+
+d7 = {}
+d7["a"] = 1
+d7["b"] = 2
+d7["c"] = 3
+collection.delete(d7, "b")
+assert(length(d7) == 2 and d7["a"] == 1 and d7["c"] == 3, "delete() of a middle-inserted key leaves the rest correct")
+
+# --- Embedded-NUL through delete()/copy(), not just get/put/json-decode ---
+json_src2 = "\{\"xy" + backslash + "u0000zz\": 99}"
+decoded2, err2 = json.decode(json_src2)
+assert(err2 == null, "second embedded-NUL JSON decode is clean")
+copied_nul_dict = collection.copy(decoded2)
+copied_nul_key = ""
+for k in copied_nul_dict:
+    if length(k) == 2:
+        copied_nul_key = k
+assert(length(copied_nul_key) == 2, "copy() preserves an embedded-NUL-truncated key correctly")
+collection.delete(copied_nul_dict, copied_nul_key)
+assert(length(copied_nul_dict) == 0, "delete() correctly removes an embedded-NUL-truncated key")
 
 # --- name_index stress: many distinct string/identifier literals in one file, not script-visible
-# as a "dict" at all, but backed by the exact same size-classed pools ---
+# as a "hashtable" at all, but backed by the exact same size-classed pools ---
 s0 = "lit_0"
 s1 = "lit_1"
 s2 = "lit_2"
@@ -100,6 +135,6 @@ s16 = "lit_16"
 s17 = "lit_17"
 s18 = "lit_18"
 s19 = "lit_19"
-assert(s0 == "lit_0" && s19 == "lit_19", "many distinct string literals in one chunk all resolve correctly through name_index's own pooled keys")
+assert(s0 == "lit_0" and s19 == "lit_19", "many distinct string literals in one chunk all resolve correctly through name_index's own pooled keys")
 
 print("test_dict_pool_stress.aer: all assertions passed.")

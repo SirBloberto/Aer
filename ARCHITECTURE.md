@@ -17,9 +17,48 @@ spawning and a host-side mailbox, reachable from AER scripts via the `actor` mod
 
 ---
 
+## Design highlights
+
+**Single-pass elegance.** Lexing, parsing, and codegen collapse into one pass. Every `parse_*`
+function is simultaneously the grammar rule and the code generator.
+
+**Precedence climbing.** One function and a table (see README's [Operators](README.md#operators))
+replace the traditional cascade of `parse_addition`, `parse_multiplication`, `parse_unary`, etc.
+Adding an operator is one line — plus, for the handful whose right-hand side isn't a general
+expression (`in` is; `as` and `|>` aren't), one small special case.
+
+**The VM is a computed-goto dispatch loop over integers.** No virtual dispatch, no pointer chasing,
+no heap allocation in the hot loop. Direct-threaded dispatch lets the CPU's branch predictor learn
+per-instruction patterns instead of funnelling every opcode through one `switch`.
+
+**Every local is a flat, compile-time-resolved slot — no closures.** Assignment inside a function
+is always local, which means every name in a function body resolves to a fixed slot at parse time,
+not a runtime scope-chain walk. A function's data access is always either its own parameters/locals
+or an explicit reference passed in — never an implicit reach into an enclosing function's variables.
+
+**A real module system without a module value type.** `import math` and `import helpers` both work,
+resolved entirely at parse time — file-based imports even run the imported file synchronously,
+in a fully isolated `Chunk`/`VM`, before the importing file's own parse continues. No `TYPE_MODULE`,
+no runtime namespace object, just a name the parser remembers.
+
+**REPL function and struct persistence.** Functions and struct types survive across interactive
+calls because the bytecode array and struct registry grow monotonically and are never reset. This
+falls out naturally from the design — no special handling required.
+
+**`OP_CALL_VALUE`.** Functions stored in arrays and hashtables can be called directly:
+`ops[0](3, 4)` or `dispatch["add"](10, 20)`. The opcode removes the function value from the stack
+in-place before jumping, which keeps the call convention identical to a named call.
+
+**Structs without a new value type.** A struct instance is an array with a shape pointer — printing,
+reference semantics, and heap layout are all inherited for free. The interesting engineering is
+entirely in the guards that keep structs from silently behaving like arrays where that would be
+surprising.
+
+---
+
 ## 1. Value representation
 
-Every runtime value — a VM register, an array element, a dict entry, a struct field, a stack slot
+Every runtime value — a VM register, an array element, a hashtable entry, a struct field, a stack slot
 — is an `AerVal` (`value.h`):
 
 ```c
@@ -102,7 +141,7 @@ individually `xmalloc`/`xrealloc`'d allocation the pool system doesn't track at 
 - `AerString.data` — the actual character bytes.
 - `AerArray.items` — the element buffer (grows via `xrealloc`, doubling, in `lbl_array_new`/append
   paths). Not applicable to a struct instance (see above — inline, no separate buffer).
-- `AerDict`'s hash buckets (`DictMap`, `dictmap.c`/`hashtable.c`).
+- `AerDict`'s hash table (`HashTable`'s sparse and dense arrays, `hashtable.c`).
 - `AerFunction.defaults` — only when the function has default parameters.
 
 Each corresponds to one line in `aer_debug_memory_report`'s "header vs. payload" breakdown
@@ -130,7 +169,7 @@ Mapping a live cell pointer back to its state byte (`pool_cell_state_or_null`) i
 over the pool's slabs, checking which slab's address range contains the pointer. Scanned
 **newest-slab-first**, not oldest: `pool_alloc` always bump-allocates fresh cells from the newest
 slab once the free list is empty, and the hottest caller (`gc_barrier_array`, invoked on every
-array/dict/struct-field write) is disproportionately likely to be checking a cell that was itself
+array/hashtable/struct-field write) is disproportionately likely to be checking a cell that was itself
 just allocated. (Measured to make no difference on `nbody.aer` specifically — its steady-state
 allocation pattern keeps `slab_count` small — but sound and free, and could matter for a
 longer-accumulating program.)
@@ -159,7 +198,7 @@ reference-counted, not incremental.
   imported file plus one per live actor), not N separate collectors.
 
 **Mark phase**: an explicit growable worklist (`MarkWorklist`), not C call-stack recursion — user
-data structures (deeply nested arrays/dicts) have no depth limit, so recursion would risk a native
+data structures (deeply nested arrays/hashtables) have no depth limit, so recursion would risk a native
 stack overflow on adversarial input; `pool_mark`'s "already marked" return is what terminates
 cycles (a self-referential array marks itself once, then stops).
 
@@ -352,7 +391,7 @@ described in §3.2, decided at *compile* time and baked into the emitted instruc
 ### 4.3 The "primitive pass" — raw unboxed locals
 
 A local variable the compiler can *prove*, from information already visible at each assignment, is
-always the same primitive type (`integer` or `real`, never string/array/dict/struct/function) gets
+always the same primitive type (`integer` or `float`, never string/array/hashtable/struct/function) gets
 a raw, unboxed `int64_t`/`double` slot in `CallFrame.raw_ints`/`raw_reals` instead of a tagged
 `AerVal` register — and dedicated opcodes (`OP_RAW_ADD_INT`, `OP_RAW_LT_REAL`, ...) that skip both
 the RK register-vs-constant check *and* the value's tag check entirely, since the compiler already
@@ -375,7 +414,7 @@ Real, deliberately narrow scope rules (each one closes a specific correctness ga
   disqualify — a loop body runs unconditionally each time it runs, no divergent-paths-reconverging
   ambiguity.
 
-Overflowing the raw-slot budget (32 int + 32 real per call) is never a compile error — it's a
+Overflowing the raw-slot budget (32 int + 32 float per call) is never a compile error — it's a
 graceful fallback to ordinary boxed storage for the overflow names, mirrored by the raw allocator's
 own `-1`-on-overflow return convention (unlike the *boxed* register allocator, which does hard-error
 on overflow, since that ceiling is a real architectural limit with no fallback).
@@ -473,11 +512,6 @@ default build, to keep the makefile small.
 
 ## 6. Known architectural limitations (current, unresolved)
 
-- **`x as integer`/`x as float` silently return 0 for an unparseable string.** `vm_cast` uses
-  `atoll`/`atof`, neither of which reports a conversion failure — `"abc" as integer` quietly
-  becomes `0` rather than raising the same runtime error every *other* unconvertible case in the
-  same `switch` already does. An open design decision (should it error, matching the surrounding
-  cases and the project's own Go-lineage error philosophy?), not yet made.
 - **RK9-decode cost is real and not eliminated.** The register-vs-constant flag test inside
   `vm_rk_ptr9` remains a measurable cost even after PGO (shrunk, not eliminated — same code shape
   under profiling). An RR-opcode-split (separate register-register and register-constant opcode
@@ -545,7 +579,7 @@ Two entirely separate allocation lifetimes exist in this codebase. Don't conflat
 | `OP_DICT_NEW` (`{...}` literal) | `dict_pool` | + one `xmalloc`'d owned key copy per entry (`dictmap_put`) |
 | `OP_STRUCT_NEW` / bare `Point(1,2)` call (`vm_call_builtin`'s struct-construction fallback) | `struct_pool` | header + fields in **one** cell (§2.1) — no separate items allocation |
 | `OP_SLICE_GET`, array branch (`arr[a:b]`) | `array_pool` | + fresh `xmalloc`'d `items[]` for the sub-range copy |
-| `vm_default_value` (an omitted array/dict-defaulted parameter, or an omitted struct field) | `array_pool` or `dict_pool` | a **fresh empty** container every time — deliberately never the stored default itself (Python's mutable-default-argument bug, avoided on purpose) |
+| `vm_default_value` (an omitted array/hashtable-defaulted parameter, or an omitted struct field) | `array_pool` or `dict_pool` | a **fresh empty** container every time — deliberately never the stored default itself (Python's mutable-default-argument bug, avoided on purpose) |
 | `build_function_value` (`parser.c`, **compile time**, not per-call) | `function_pool` | a function *value* is constructed once, when its declaration/literal is compiled — calling the function later never allocates one |
 
 ### C. Runtime, GC-tracked — string allocations (`aer_make_string`, always a fresh owned buffer; never pool-interned — see below)
@@ -557,7 +591,7 @@ Every one of these calls `aer_make_string`, which itself calls `pool_alloc(&stri
 - `type(x)` (a fresh copy of the type-name string, never a pointer into static/pool data).
 - `OP_SLICE_GET`, string branch (`s[a:b]`).
 - Single-character indexing/iteration (`s[i]`, `for ch in some_string:`) — each character is its own fresh one-byte string.
-- Dict key iteration (`for k in dict:` / `for k, v in dict:`) — each yielded key is a fresh owned copy, never an alias into the dict's own bucket storage.
+- Hashtable key iteration (`for k in hashtable:` / `for k, v in hashtable:`) — each yielded key is a fresh owned copy, never an alias into the hashtable's own bucket storage.
 
 **Deliberately never pool-interned** (no `chunk_add_pool` call) — measured 7x slower for 100,000
 unique runtime-cast strings vs. 10 distinct ones, since interning would grow the pool and its

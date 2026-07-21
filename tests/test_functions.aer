@@ -46,9 +46,9 @@ ops = [add, double]
 assert(ops[0](3, 4) == 7, "OP_CALL_VALUE — function stored in an array, called via index")
 assert(ops[1](5) == 10, "OP_CALL_VALUE — a different array-stored function")
 
-# Function stored in dict
+# Function stored in hashtable
 dispatch = {"add": add, "double": double}
-assert(dispatch["add"](10, 20) == 30, "function stored in a dict, called via key")
+assert(dispatch["add"](10, 20) == 30, "function stored in a hashtable, called via key")
 
 # Bare return / falling off end returns null
 function no_return():
@@ -123,7 +123,7 @@ function pipe_stmt_append(entry, tag):
 
 numbers_list = [1, 2, 3]
 numbers_list |> pipe_stmt_append("touched")
-assert(length(numbers_list) == 4 && numbers_list[3] == "touched",
+assert(length(numbers_list) == 4 and numbers_list[3] == "touched",
        "a bare-name pipe chain works as a statement, not just an expression")
 
 struct Basket:
@@ -131,7 +131,7 @@ struct Basket:
 
 basket = Basket([1, 2])
 basket.items |> pipe_stmt_append("added")
-assert(length(basket.items) == 3 && basket.items[2] == "added",
+assert(length(basket.items) == 3 and basket.items[2] == "added",
        "a field-chain pipe (a.b |> f(...)) works as a statement too")
 
 # `x |> f(args)` short-circuits when x is a Result (io.read()/json.decode()/etc.): a failed
@@ -143,11 +143,11 @@ write_ok, write_err = io.write(pipe_json_path, "\{\"name\": \"pipe test\", \"n\"
 assert(write_err == null, "fixture write for the pipe/Result tests succeeded")
 
 data, decode_err = io.read(pipe_json_path) |> json.decode()
-assert(decode_err == null && data["name"] == "pipe test" && data["n"] == 41,
+assert(decode_err == null and data["name"] == "pipe test" and data["n"] == 41,
        "io.read(path) |> json.decode() unwraps a successful Result before calling the next stage")
 
 missing_data, missing_decode_err = io.read("tests/pipe_scratch_missing.json") |> json.decode()
-assert(missing_data == null && missing_decode_err != null,
+assert(missing_data == null and missing_decode_err != null,
        "a failed io.read() short-circuits the chain -- json.decode() never runs")
 assert(string.contains(missing_decode_err, "No such file"),
        "the propagated error is io.read()'s own file error, not a JSON parse error -- proves json.decode() was actually skipped, not just erroring on a null input")
@@ -157,7 +157,7 @@ function bump(n, amount):
 
 bump_data, bump_err = io.read(pipe_json_path) |> json.decode()
 bumped = bump_data["n"] |> bump(1)
-assert(bump_err == null && bumped == 42,
+assert(bump_err == null and bumped == 42,
        "a chain can keep going after an unwrap -- the pipe operator's own short-circuit check only ever fires for a genuine Result, never for an ordinary value like the unwrapped int here")
 
 # A pipe chain starting from a CALL (not a bare name) used as a bare statement, its result
@@ -186,46 +186,51 @@ r_ok = parse_positive(5)
 assert(type(r_ok) == "Result", "Result() builds a genuine Result, not a plain array")
 assert(r_ok, "a successful Result is truthy")
 
-# == on a Result -- reference equality, same as arrays/dicts, rather than falling through to a
-# generic "Type mismatch in binary expression" error.
+# == on a Result -- reference equality, same as arrays/hashtables, rather than falling through to a
+# generic "Cannot apply '==' to ..." type-mismatch error.
 r_ok_same_ref = r_ok
 r_ok_other = parse_positive(5)
 assert(r_ok == r_ok_same_ref, "== is true for the same Result reference")
-assert(!(r_ok == r_ok_other), "== is false for two separately-built, equal-looking Results (reference equality, not structural)")
+assert(not (r_ok == r_ok_other), "== is false for two separately-built, equal-looking Results (reference equality, not structural)")
 assert(r_ok != r_ok_other, "!= is the inverse of ==")
 
 function double_it(n):
     return Result(n * 2, null)
 
 doubled, double_err = parse_positive(5) |> double_it()
-assert(double_err == null && doubled == 10,
+assert(double_err == null and doubled == 10,
        "a user function built with Result() composes with |>'s short-circuit exactly like a native stdlib call")
 
 skipped, skip_err = parse_positive(-5) |> double_it()
-assert(skipped == null && skip_err == "must be positive",
+assert(skipped == null and skip_err == "must be positive",
        "a failing user-constructed Result short-circuits the chain too -- double_it() never runs")
 
-# `return value, error(err)` / `return error(err)` -- sugar over Result(value, err) recognized
-# only in a return statement's own value list (the identifier `error` immediately followed by
-# `(`); everywhere else, including a plain variable literally named `error`, it's an ordinary
-# identifier.
+# `raise <expr>` -- the sole way user code signals a recoverable failure: a full, visible
+# statement (never a symbol embedded in an expression), reusing Result's own construction with
+# the value forced to null. The success path is just a plain `return n`, no Result involved at
+# all -- destructuring assignment treats a bare non-Result value as (value, null) automatically
+# (see the destructuring section), so there's nothing to fake here just to satisfy the shape.
 function parse_positive_v2(n):
     if n <= 0:
-        return error("must be positive")
-    return n, error(null)
+        raise "must be positive"
+    return n
 
 ok_val, ok_err = parse_positive_v2(5)
-assert(ok_err == null && ok_val == 5, "return value, error(null) builds a successful Result")
-assert(type(Result(1, null)) == type(parse_positive_v2(5)),
-       "return value, error(err) produces the exact same Result type as Result(value, err) directly")
+assert(ok_err == null and ok_val == 5, "a plain 'return n' success path destructures to (n, null) automatically")
+assert(type(parse_positive_v2(5)) == "integer",
+       "the success path is a bare value, not a Result -- only raise builds one")
 
 bad_val, bad_err = parse_positive_v2(-1)
-assert(bad_val == null && bad_err == "must be positive",
-       "return error(err) alone defaults the value to null")
+assert(bad_val == null and bad_err == "must be positive", "raise builds a proper Result with the value forced to null")
+assert(type(Result(1, null)) == "Result", "Result() itself is unaffected by any of this -- still a genuine constructor")
 
 doubled_v2, double_err_v2 = parse_positive_v2(5) |> double_it()
-assert(double_err_v2 == null && doubled_v2 == 10,
-       "a return-error(...)-built Result composes with |>'s short-circuit exactly like Result() does")
+assert(double_err_v2 == null and doubled_v2 == 10,
+       "a plain success value flows through |> normally (not a Result, so no short-circuit check even fires)")
+
+skipped_v2, skip_err_v2 = parse_positive_v2(-1) |> double_it()
+assert(skipped_v2 == null and skip_err_v2 == "must be positive",
+       "a raise-built failure still short-circuits the pipe chain -- double_it() never runs")
 
 # `error` remains an ordinary identifier everywhere else, including elsewhere in the same
 # return's value list -- only "error(" right at the start of a return value is special.
@@ -233,7 +238,7 @@ error = "not a keyword"
 assert(error == "not a keyword", "error is an ordinary variable name outside a return statement")
 
 # Calling a function value reached through indexing/field access, as a bare
-# statement (not assigned to anything) — functions stored in an array/dict
+# statement (not assigned to anything) — functions stored in an array/hashtable
 # and dispatched dynamically is a common pattern once functions are
 # first-class values. This landed in the same fallback as the pipe-as-
 # statement cases above: previously only a bare `name(args)` call was
@@ -248,7 +253,7 @@ call_log = []
 queue = [log_a, log_b]
 for i in 0..length(queue):
     queue[i](call_log)
-assert(length(call_log) == 2 && call_log[0] == "a" && call_log[1] == "b",
+assert(length(call_log) == 2 and call_log[0] == "a" and call_log[1] == "b",
        "calling a function value via queue[i](args) works as a bare statement")
 
 # ------------------------------------------------------------------ #
@@ -266,17 +271,33 @@ function min_max(arr):
     return lo, hi
 
 lo, hi = min_max([3, 1, 4, 1, 5, 9, 2, 6])
-assert(lo == 1 && hi == 9, "multiple return values, destructured directly")
+assert(lo == 1 and hi == 9, "multiple return values, destructured directly")
 
 # ------------------------------------------------------------------ #
 # 20. Destructuring                                                    #
 # ------------------------------------------------------------------ #
 
 a2, b2 = 10, 20
-assert(a2 == 10 && b2 == 20, "destructuring from a comma-separated expression list")
+assert(a2 == 10 and b2 == 20, "destructuring from a comma-separated expression list")
 
 a2, b2 = b2, a2                          # swap — RHS fully evaluated before assignment
-assert(a2 == 20 && b2 == 10, "destructuring swap — RHS fully evaluated before any assignment")
+assert(a2 == 20 and b2 == 10, "destructuring swap — RHS fully evaluated before any assignment")
+
+# A single-RHS-expression, 2-target destructuring (the (value, err) convention's own shape) tolerates
+# a bare non-Result/non-array value, treating it as (value, null) -- so a function that can never
+# fail doesn't need to fabricate a second return value just to satisfy this shape. Unaffected: an
+# explicit multi-value RHS (a2, b2 = 10, 20 above) always builds a real array regardless.
+function bare_value():
+    return 7
+
+x2, y2 = bare_value()
+assert(x2 == 7 and y2 == null, "a single bare value destructures to (value, null)")
+
+function real_pair():
+    return [1, 2]
+
+x3, y3 = real_pair()
+assert(x3 == 1 and y3 == 2, "a single-RHS real 2-element array still unpacks positionally, unaffected")
 
 # ------------------------------------------------------------------ #
 # 21. Default parameters                                               #
@@ -308,7 +329,7 @@ assert(f("Value") == "Hello, Value!", "a default still applies through a functio
 # The same lexicographic order collection.sort() already assumes for strings (aer_math.c's sort_cmp),
 # exposed as ordinary comparison operators instead of only being reachable through sort().
 assert("apple" < "banana", "string < is lexicographic")
-assert(!("banana" < "apple"), "string < is false the other way around")
+assert(not ("banana" < "apple"), "string < is false the other way around")
 assert("apple" <= "apple", "string <= includes equal strings")
 assert("b" > "a", "string >")
 assert("ab" < "abc", "a proper prefix sorts before the longer string")
@@ -317,7 +338,7 @@ assert("ab" < "abc", "a proper prefix sorts before the longer string")
 # sliceable, iterable, length()-able); `in` used to reject them entirely, forcing
 # string.contains() to exist as the only way to ask this question.
 assert("ell" in "hello", "in finds a substring")
-assert(!("xyz" in "hello"), "in correctly reports a non-substring as absent")
+assert(not ("xyz" in "hello"), "in correctly reports a non-substring as absent")
 assert("" in "hello", "an empty needle is trivially in any string")
 
 print("test_functions.aer: all assertions passed.")

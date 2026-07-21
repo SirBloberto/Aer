@@ -10,6 +10,9 @@ bool         parse_had_error    = false;
 bool         runtime_had_error  = false;
 unsigned int assert_failure_count = 0;
 unsigned int (*runtime_line_lookup)(void) = NULL;
+const char*  (*runtime_filename_lookup)(void) = NULL;
+const char*  (*runtime_function_lookup)(void) = NULL;
+unsigned int (*runtime_stack_trace_lookup)(char* out, unsigned int out_size) = NULL;
 AerJmpBuf*   runtime_error_unwind_target  = NULL;
 
 #define ERROR_MSG_MAX 2048
@@ -97,8 +100,16 @@ char* xstrdup(const char* s) {
 void error(const char* format, ...) {
     char   buf[ERROR_MSG_MAX];
     size_t pos = 0;
-    unsigned int line = runtime_line_lookup ? runtime_line_lookup() : 0;
-    if (line > 0) append_fmt(buf, sizeof(buf), &pos, "Line %u: ", line);
+    unsigned int line          = runtime_line_lookup     ? runtime_line_lookup()     : 0;
+    const char*  filename      = runtime_filename_lookup ? runtime_filename_lookup() : NULL;
+    const char*  function_name = runtime_function_lookup ? runtime_function_lookup() : NULL;
+
+    if (filename && line > 0) {
+        if (function_name) append_fmt(buf, sizeof(buf), &pos, "%s:%u, in %s(): ", filename, line, function_name);
+        else                append_fmt(buf, sizeof(buf), &pos, "%s:%u: ", filename, line);
+    } else if (line > 0) {
+        append_fmt(buf, sizeof(buf), &pos, "Line %u: ", line);
+    }
     append_fmt(buf, sizeof(buf), &pos, "Error: ");
 
     char msg_only[ERROR_MSG_MAX];
@@ -107,6 +118,12 @@ void error(const char* format, ...) {
     vsnprintf(msg_only, sizeof(msg_only), format, args);
     va_end(args);
     append_fmt(buf, sizeof(buf), &pos, "%s", msg_only);
+
+    if (runtime_stack_trace_lookup) {
+        char trace[1024];
+        unsigned int n = runtime_stack_trace_lookup(trace, sizeof(trace));
+        if (n > 0) append_fmt(buf, sizeof(buf), &pos, "%s", trace);
+    }
 
     append_fmt(buf, sizeof(buf), &pos, "\n");
     emit_error(buf);
@@ -142,6 +159,8 @@ void error_at(const char* format, ...) {
 
     char   buf[ERROR_MSG_MAX];
     size_t pos = 0;
+    const char* filename = runtime_filename_lookup ? runtime_filename_lookup() : NULL;
+    if (filename) append_fmt(buf, sizeof(buf), &pos, "%s:", filename);
     append_fmt(buf, sizeof(buf), &pos, "%u | %.*s\n    ", line_number, (int)line_len, line_start);
     for (unsigned int i = 0; i < col && pos < sizeof(buf) - 1; i++) buf[pos++] = ' ';
     append_fmt(buf, sizeof(buf), &pos, "^\nError: ");

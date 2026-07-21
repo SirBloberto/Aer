@@ -882,7 +882,9 @@ static unsigned int pool_escaped_string(Chunk* c, const char* s, unsigned int le
 }
 
 /* `and`/`or`/`as`/`|>` are handled specially elsewhere (short-circuit jumps, a bare type name,
-   call-argument prepending) -- returns false for anything outside this table. */
+   call-argument prepending) -- returns false for anything outside this table. `not` isn't in this
+   table at all: it's a prefix parsed by parse_not, recursing into parse_binary at precedence 2
+   (and's own slot) so it binds tighter than and/or but looser than everything below. */
 static bool binary_op_info(TokenType t, unsigned int* prec, Opcode* op) {
     switch (t) {
         case TOKEN_OR:            *prec = 1;  *op = OP_OR;         return true;
@@ -1105,9 +1107,7 @@ static int parse_primary_inner(Chunk* c) {
             return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
         }
 
-        /* A genuine read of a name never assigned anywhere reachable -- used to silently fall through
-           to var_slot and create an uninitialized local (real bug: read garbage from an
-           unrelated prior call's leftover register). */
+        /* Must not fall through to var_slot -- that would read an uninitialized register. */
         if (report_if_shadowed_global(c, name_idx)) return 0;
         error_at("'%s' is not defined", aer_as_string(c->pool[name_idx])->data);
         return 0;
@@ -1219,11 +1219,31 @@ static int parse_primary(Chunk* c) {
     return parse_postfix_chain(c, parse_primary_inner(c));
 }
 
-/* Recurses into parse_unary so chained unary (`!!x`) works. rk is RK-encoded like OP_BINARY. */
+/* `not` binds tighter than `and`/`or` but looser than every other operator (bitwise, comparison,
+   `in`, arithmetic, `as`) -- Python's placement, not a uniform-tight unary like -/~. Achieved by
+   recursing into the binary climb at `and`'s own precedence (2) instead of back into parse_unary:
+   `not x in y` grabs `x in y` (prec 7 > 2) as its operand before `not` is applied, so it parses as
+   `not (x in y)`, while a following `and`/`or` (prec <= 2) stops the climb and combines with the
+   whole `not ...` result at the outer level. */
+static int parse_not(Chunk* c) {
+    int rk = parse_binary(c, 2);
+    rk = box_if_raw(c, rk);
+    if (is_temp(rk)) reg_free(1);
+    int dest = reg_alloc();
+    if (!rk9_fits(rk)) {
+        error_at("Expression too large to compile (register/constant index exceeds the unary-op encoding's range)");
+        return dest;
+    }
+    chunk_emit(c, PACK_UNARY(dest, OP_NOT, rk));
+    return dest;
+}
+
+/* Recurses into parse_unary so chained unary (`~~x`) works. rk is RK-encoded like OP_BINARY. */
 static int parse_unary_inner(Chunk* c) {
+    if (consume(TOKEN_NOT)) return parse_not(c);
+
     Opcode unary_op;
-    if      (consume(TOKEN_NOT))         unary_op = OP_NOT;
-    else if (consume(TOKEN_BITWISE_NOT)) unary_op = OP_BITWISE_NOT;
+    if      (consume(TOKEN_BITWISE_NOT)) unary_op = OP_BITWISE_NOT;
     else if (consume(TOKEN_SUBTRACT))    unary_op = OP_NEGATE;
     else return parse_primary(c);
 
@@ -1434,13 +1454,15 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
         if (op == OP_PIPE) { lhs = compile_pipe(c, lhs);      lhs_start = c->count; continue; }
 
         /* T is a bare type name. `x as Point` routes to OP_CHECK_SHAPE, checked via is_struct_name
-           before the primitive-name checks (the two tables are disjoint). */
+           before the primitive-name checks (the two tables are disjoint). integer/float/boolean/
+           array/hashtable are reserved keywords, dispatched by token type directly so they can't
+           be shadowed. `string` stays an ordinary identifier (matched by text, like a struct name)
+           since it collides with the stdlib `string` module -- already immune to shadowing either
+           way, since this whole cast grammar is a fixed production, never a name lookup. */
         if (op == OP_CAST) {
-            if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a type name after 'as'"); return lhs; }
-            unsigned int type_name_idx = chunk_add_pool(c, token.value);
-            const char* type_name = aer_as_string(token.value)->data;
-            unsigned int type_len = aer_as_string(token.value)->length;
-            lex();
+            bool is_reserved_type = equal(TOKEN_TYPE_INTEGER) || equal(TOKEN_TYPE_FLOAT) ||
+                                     equal(TOKEN_TYPE_BOOLEAN) || equal(TOKEN_TYPE_ARRAY) || equal(TOKEN_TYPE_HASHTABLE);
+            if (!equal(TOKEN_IDENTIFIER) && !is_reserved_type) { error_at("Expected a type name after 'as'"); return lhs; }
 
             /* A raw-tracked lhs has no raw-native cast form -- box it first. */
             lhs = box_if_raw(c, lhs);
@@ -1448,25 +1470,38 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             if (is_temp(lhs)) reg_free(1);
             int dest = reg_alloc();
 
-            if (is_struct_name(type_name_idx)) {
-                /* lhs is always a plain register here -- no rk20_fits guard needed. */
-                chunk_emit(c, PACK_CHECK_SHAPE(dest, lhs, type_name_idx));
-            } else if (type_len == 6 && strncmp(type_name, "string", 6) == 0) {
-                if (!rk9_fits(lhs)) {
-                    error_at("Expression too large to compile (register/constant index exceeds the cast encoding's range)");
-                    return dest;
-                }
-                chunk_emit(c, PACK_UNARY(dest, OP_TO_STR, lhs));
-            } else {
-                int cast_type;
-                if      (type_len == 7 && strncmp(type_name, "integer", 7) == 0) cast_type = CAST_INTEGER;
-                else if (type_len == 5 && strncmp(type_name, "float",   5) == 0) cast_type = CAST_FLOAT;
-                else if (type_len == 7 && strncmp(type_name, "boolean", 7) == 0) cast_type = CAST_BOOLEAN;
-                else {
-                    error_at("Unknown type '%.*s' in 'as' cast (must be string/integer/float/boolean, or a known struct type)",
+            if (equal(TOKEN_IDENTIFIER)) {
+                unsigned int type_name_idx = chunk_add_pool(c, token.value);
+                const char* type_name = aer_as_string(token.value)->data;
+                unsigned int type_len = aer_as_string(token.value)->length;
+                lex();
+                if (is_struct_name(type_name_idx)) {
+                    /* lhs is always a plain register here -- no rk20_fits guard needed. */
+                    chunk_emit(c, PACK_CHECK_SHAPE(dest, lhs, type_name_idx));
+                } else if (type_len == 6 && strncmp(type_name, "string", 6) == 0) {
+                    if (!rk9_fits(lhs)) {
+                        error_at("Expression too large to compile (register/constant index exceeds the cast encoding's range)");
+                        return dest;
+                    }
+                    chunk_emit(c, PACK_UNARY(dest, OP_TO_STR, lhs));
+                } else {
+                    error_at("Unknown type '%.*s' in 'as' cast (must be string/integer/float/boolean/array/hashtable, or a known struct type)",
                              (int)type_len, type_name);
                     return dest;
                 }
+            } else {
+                int cast_type;
+                if      (equal(TOKEN_TYPE_INTEGER)) cast_type = CAST_INTEGER;
+                else if (equal(TOKEN_TYPE_FLOAT))    cast_type = CAST_FLOAT;
+                else if (equal(TOKEN_TYPE_BOOLEAN)) cast_type = CAST_BOOLEAN;
+                else if (equal(TOKEN_TYPE_ARRAY)) {
+                    error_at("Cannot cast to 'array' -- casting only supports integer/float/string/boolean, or a struct type for a shape check");
+                    return dest;
+                } else {
+                    error_at("Cannot cast to 'hashtable' -- casting only supports integer/float/string/boolean, or a struct type for a shape check");
+                    return dest;
+                }
+                lex();
                 if (!rk9_fits(lhs)) {
                     error_at("Expression too large to compile (register/constant index exceeds the cast encoding's range)");
                     return dest;
@@ -1617,9 +1652,14 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             emit_array_new(c, arr_reg, rhs_reg_base, (int)rhs_count);
         }
 
-        for (unsigned int i = 0; i < count; i++) {
-            unsigned int pool_i = chunk_add_pool(c, aer_int((int64_t)i));
-            emit_index_get(c, target_regs[i], arr_reg, (int)pool_i | RK_CONST_FLAG);
+        /* 2 targets, 1 source: the (value, err) convention, tolerant of a bare non-Result value. */
+        if (count == 2 && rhs_count == 1) {
+            chunk_emit(c, PACK_DESTRUCTURE(target_regs[0], target_regs[1], arr_reg));
+        } else {
+            for (unsigned int i = 0; i < count; i++) {
+                unsigned int pool_i = chunk_add_pool(c, aer_int((int64_t)i));
+                emit_index_get(c, target_regs[i], arr_reg, (int)pool_i | RK_CONST_FLAG);
+            }
         }
         reg_free(1);   /* arr_reg — always a temp, guaranteed by arg_materialize */
         return;
@@ -2638,6 +2678,9 @@ static int parse_packed_array_new(Chunk* c, unsigned int name_idx) {
 }
 
 static int parse_call(Chunk* c, unsigned int name_idx) {
+    /* Builtins win unconditionally -- length/print/type/assert/panic/Result can never be shadowed. */
+    if (is_builtin_name(c, name_idx)) return parse_builtin_call(c, name_idx);
+
     /* A call through an existing local variable resolves via OP_CALL_VALUE instead of compile-time
        name resolution. A top-level variable of this name is never callable from inside a
        function -- reported immediately so it isn't mistaken for a forward reference. */
@@ -2660,11 +2703,12 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
                    func_full_lookup(c, name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
                                         &func_max_registers);
     /* Optimistically assumed to be a function defined later in this same parse() call -- caught
-       and reported once parse()'s top-level loop ends if it never actually is. */
+       and reported once parse()'s top-level loop ends if it never actually is. Builtins are already
+       handled unconditionally at the top of this function, so reaching here with none of
+       is_var/is_struct/is_func true always means an unresolved name, never a builtin. */
     bool is_forward_ref = false;
     const char* call_site_cursor = NULL;
     if (!is_var && !is_struct && !is_func) {
-        if (is_builtin_name(c, name_idx)) return parse_builtin_call(c, name_idx);
         is_forward_ref = true;
         call_site_cursor = current_source_cursor();   /* captured NOW — before the arg list below consumes past it */
     }
@@ -2730,32 +2774,8 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     return dest;
 }
 
-/* `error(x)` is recognized as a marker for Result's err slot, sugar for `Result(value, err)` --
-   reserved only in this one exact position (start of a return value, immediately followed by
-   '('), an ordinary identifier everywhere else. */
-static int parse_return_value(Chunk* c, bool* is_error_marker) {
-    *is_error_marker = false;
-    if (equal(TOKEN_IDENTIFIER)) {
-        AerString* s = aer_as_string(token.value);
-        if (s->length == 5 && strncmp(s->data, "error", 5) == 0) {
-            lex();
-            if (consume(TOKEN_OPEN_PARENTHESE)) {
-                int rk = parse_binary(c, 0);
-                if (parse_had_error) return rk;
-                require(TOKEN_CLOSE_PARENTHESE, "expected ')' after error(...)'s argument");
-                if (parse_had_error) return rk;
-                *is_error_marker = true;
-                return rk;
-            }
-            error_at("'error' must be called as error(...) in a return statement (e.g. 'return value, error(err)')");
-            return 0;
-        }
-    }
-    return parse_binary(c, 0);
-}
-
 /* Emits exactly what `Result(value, err)` itself would (CALL_BUILTIN_RESULT), reusing its
-   validation rather than duplicating it. */
+   validation rather than duplicating it. Shared by `raise`'s own Result construction. */
 static void emit_result_call_and_return(Chunk* c, int reg_base) {
     reg_free(1);   /* the err register — only dest (== reg_base) stays live past the call, same convention parse_builtin_call's own arg_count>1 case follows */
     char* name_buf = xmalloc(7);
@@ -2769,66 +2789,28 @@ static void emit_result_call_and_return(Chunk* c, int reg_base) {
 /* `return a, b, ...` packs into an array (OP_ARRAY_NEW) -- destructuring's single-RHS-expression
    case already treats a call's result as "the array to unpack". Tail-call optimization: `return
    f(args)` with nothing else wrapping the call patches that call's opcode in place, not
-   reachable for the multi-return case (the array built there isn't the call's own result). */
+   reachable for the multi-return case (the array built there isn't the call's own result). A
+   plain `return` always means "a success value (or values)" -- signaling failure is `raise`'s job
+   alone, so there's no shape ambiguity left for this to detect or reject. */
 static void parse_return(Chunk* c) {
     if (function_depth == 0) { error_at("'return' outside function"); return; }
 
     if (!equal(TOKEN_NEW_LINE) && !equal(TOKEN_END_OF_FILE) && !equal(TOKEN_DEDENT)) {
-        bool is_error0;
-        int rk_first = parse_return_value(c, &is_error0);
+        int rk_first = parse_binary(c, 0);
         if (parse_had_error) return;
 
         if (equal(TOKEN_COMMA)) {
-            if (is_error0) { error_at("error(...) must be the last value in a return statement"); return; }
-
             int reg_base = arg_materialize(c, rk_first);
             unsigned int count = 1;
-            /* Deliberately not materialized immediately when it's the error slot -- done next, once the
-               loop confirms it really was last. */
-            bool have_error_slot = false;
-            int  error_rk = 0;
             while (consume(TOKEN_COMMA)) {
-                bool is_error_n;
-                int rk_next = parse_return_value(c, &is_error_n);
+                int rk_next = parse_binary(c, 0);
                 if (parse_had_error) return;
-
-                if (have_error_slot) {
-                    /* A value (marker or not) appeared after the error slot — it wasn't last. */
-                    error_at("error(...) must be the last value in a return statement");
-                    return;
-                }
-                if (is_error_n) {
-                    if (count > 1) {
-                        error_at("error(...) may only appear in a 1- or 2-value return (Result has exactly two slots)");
-                        return;
-                    }
-                    have_error_slot = true;
-                    error_rk = rk_next;
-                } else {
-                    arg_materialize(c, rk_next);
-                }
+                arg_materialize(c, rk_next);
                 count++;
             }
-
-            if (have_error_slot) {
-                arg_materialize(c, error_rk);
-                emit_result_call_and_return(c, reg_base);
-                return;
-            }
-
             reg_free((int)count - 1);
             emit_array_new(c, reg_base, reg_base, (int)count);
             emit_return(c, reg_base);
-            return;
-        }
-
-        if (is_error0) {
-            /* `return error(err)` alone: value defaults to null, matching the convention's "exactly one
-               is meaningful" shape. */
-            unsigned int null_idx = chunk_add_pool(c, aer_null());
-            int reg_base = arg_materialize(c, (int)null_idx | RK_CONST_FLAG);
-            arg_materialize(c, rk_first);
-            emit_result_call_and_return(c, reg_base);
             return;
         }
 
@@ -2850,6 +2832,17 @@ static void parse_return(Chunk* c) {
     int rk = (int)chunk_add_pool(c, aer_null()) | RK_CONST_FLAG;
     int reg = materialize(c, rk);
     emit_return(c, reg);
+}
+
+/* `raise <expr>` signals a recoverable failure -- builds a Result with the value forced to null. */
+static void parse_raise(Chunk* c) {
+    if (function_depth == 0) { error_at("'raise' outside function"); return; }
+    unsigned int null_idx = chunk_add_pool(c, aer_null());
+    int reg_base = arg_materialize(c, (int)null_idx | RK_CONST_FLAG);
+    int rk_err = parse_binary(c, 0);
+    if (parse_had_error) return;
+    arg_materialize(c, rk_err);
+    emit_result_call_and_return(c, reg_base);
 }
 
 /* A function value in expression position, near-duplicate of parse_function's logic rather
@@ -2960,6 +2953,11 @@ static int parse_function_expr(Chunk* c) {
 static void parse_function(Chunk* c) {
     if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected function name"); return; }
     unsigned int name_idx = chunk_add_pool(c, token.value);
+    if (is_builtin_name(c, name_idx)) {
+        error_at("'%s' is a reserved builtin name and can't be redefined as a function",
+                 aer_as_string(token.value)->data);
+        return;
+    }
     lex();
 
     require(TOKEN_OPEN_PARENTHESE, "expected '(' after function name");
@@ -3218,10 +3216,23 @@ static void parse_statement(Chunk* c) {
     if (consume(TOKEN_FOR))      { parse_for_while(c); return; }
     if (consume(TOKEN_FUNCTION)) { parse_function(c);  return; }
     if (consume(TOKEN_RETURN))   { parse_return(c);    return; }
+    if (consume(TOKEN_RAISE))    { parse_raise(c);     return; }
     if (consume(TOKEN_STRUCT))   { parse_struct(c);    return; }
     if (consume(TOKEN_BREAK))    { parse_break(c);     return; }
     if (consume(TOKEN_CONTINUE)) { parse_continue(c);  return; }
     if (consume(TOKEN_IMPORT))   { parse_import(c);    return; }
+    {
+        const char* reserved_word = NULL;
+        if      (equal(TOKEN_TYPE_INTEGER))   reserved_word = "integer";
+        else if (equal(TOKEN_TYPE_FLOAT))      reserved_word = "float";
+        else if (equal(TOKEN_TYPE_BOOLEAN))   reserved_word = "boolean";
+        else if (equal(TOKEN_TYPE_ARRAY))     reserved_word = "array";
+        else if (equal(TOKEN_TYPE_HASHTABLE)) reserved_word = "hashtable";
+        if (reserved_word) {
+            error_at("'%s' is a reserved type name and can't be used as a variable", reserved_word);
+            return;
+        }
+    }
     /* Checked right after the call, alongside the bare-name and field-chain pipe-statement cases
        elsewhere. */
     if (at_module_name(c)) {

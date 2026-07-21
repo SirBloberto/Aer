@@ -82,6 +82,9 @@ typedef enum {
     OP_INDEX_GET,  /* dest_reg, arr_reg, rk_idx — via vm_index_get_compute */
     OP_INDEX_SET,  /* arr_reg, rk_idx, rk_val — via vm_index_set_compute (includes the write barrier) */
 
+    /* `a, b = expr`: Result/array unpacks normally, anything else becomes (value, null). */
+    OP_DESTRUCTURE, /* target0_reg, target1_reg, src_reg */
+
     /* Slicing (array or string); a missing bound compiles to an RK null constant. */
     OP_SLICE_GET,  /* dest_reg, arr_reg, rk_start, rk_end */
 
@@ -269,6 +272,18 @@ typedef enum {
 #define UNPACK_INDEX_GET_DEST(word) ((((uint32_t)(word)) >> 7)  & 0x7FU)
 #define UNPACK_INDEX_GET_ARR(word)  ((((uint32_t)(word)) >> 14) & 0x7FU)
 #define UNPACK_INDEX_GET_RK(word)   ((((uint32_t)(word)) >> 21) & 0x1FFU)
+
+/* Three plain registers, no RK encoding needed -- the source is already a materialized register
+   by the time parse_assignment reaches this (arg_materialize already ran), same as PACK_INDEX_GET's
+   own arr_reg operand. */
+#define PACK_DESTRUCTURE(t0, t1, src_reg) \
+    ( ((uint64_t)(OP_DESTRUCTURE) & 0x7F) \
+    | (((uint64_t)(t0)      & 0x7F) << 7) \
+    | (((uint64_t)(t1)      & 0x7F) << 14) \
+    | (((uint64_t)(src_reg) & 0x7F) << 21) )
+#define UNPACK_DESTRUCTURE_T0(word)  ((((uint32_t)(word)) >> 7)  & 0x7FU)
+#define UNPACK_DESTRUCTURE_T1(word)  ((((uint32_t)(word)) >> 14) & 0x7FU)
+#define UNPACK_DESTRUCTURE_SRC(word) ((((uint32_t)(word)) >> 21) & 0x7FU)
 
 /* No patchable targets in these, so all fields fold into one word. */
 /* unary_op is a real Opcode value, so it needs 7 bits, not a narrow tag. */
@@ -648,6 +663,8 @@ typedef struct {
     uint64_t* code;
     unsigned int count, capacity;
 
+    char* source_filename;   /* owned copy; NULL for a chunk with no real file (e.g. aer_run_source on a raw string) */
+
     AerVal*      pool;           /* constants and variable names — all deduplicated by value */
     unsigned int pool_count, pool_cap;
 
@@ -708,6 +725,10 @@ typedef struct {
 
     unsigned int return_ip;   /* where to resume in the CALLER */
     int          dest_reg;    /* which of the CALLER's registers gets the return value */
+
+    unsigned int code_offset;  /* this frame's entry point, for stack traces; unset on frame 0 */
+    unsigned int tail_calls_collapsed;  /* tail calls collapsed into this frame since its last real push */
+    bool synthetic_entry;  /* true for a setup_call()-pushed frame -- return_ip isn't a real caller line */
 } CallFrame;
 
 typedef struct {
@@ -767,6 +788,9 @@ ChunkFunction* chunk_find_function(Chunk* c, const char* name);
 
 /* Parse-time variant — name_idx is a dedup'd pool index, so this is an int compare, no strcmp. */
 ChunkFunction* chunk_find_function_by_name_idx(Chunk* c, unsigned int name_idx);
+
+/* Recovers a frame's function from its code_offset, for stack traces. Cold path only. */
+ChunkFunction* chunk_find_function_by_offset(Chunk* c, unsigned int code_offset);
 
 /* `name` binds the module; `path_name` resolves to the file (dots as separators). Neither
    is NUL-terminated. */

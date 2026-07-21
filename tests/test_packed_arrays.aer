@@ -17,20 +17,20 @@ struct Point:
 
 pa1 = Point[5]
 assert(length(pa1) == 5, "packed array reports its declared count via length()")
-assert(pa1[0].x == 0 && pa1[0].y == 0.0 && pa1[0].flag == false, "every element starts at the struct's own declared defaults")
+assert(pa1[0].x == 0 and pa1[0].y == 0.0 and pa1[0].flag == false, "every element starts at the struct's own declared defaults")
 assert(pa1[4].x == 0, "the last element is default-initialized too, not just the first")
 
 pa1[2].x = 42
 pa1[2].y = 3.5
 pa1[2].flag = true
-assert(pa1[2].x == 42 && pa1[2].y == 3.5 && pa1[2].flag == true, "field set/get round-trips for all three eligible types")
+assert(pa1[2].x == 42 and pa1[2].y == 3.5 and pa1[2].flag == true, "field set/get round-trips for all three eligible types")
 
 # ------------------------------------------------------------------ #
 # 41. Elements are independent — writing one never touches another   #
 #     (the whole point of packed storage: no aliasing between slots).#
 # ------------------------------------------------------------------ #
 
-assert(pa1[0].x == 0 && pa1[1].x == 0 && pa1[3].x == 0, "writing element 2 left every other element at its own default")
+assert(pa1[0].x == 0 and pa1[1].x == 0 and pa1[3].x == 0, "writing element 2 left every other element at its own default")
 
 # ------------------------------------------------------------------ #
 # 42. Compound assignment on a packed field.                          #
@@ -85,7 +85,7 @@ assert(length(pa_empty) == 0, "a zero-count packed array constructs cleanly and 
 # ------------------------------------------------------------------ #
 # 47. Eligibility is per-struct-type, not global — a struct with only #
 #     fixed-primitive fields can be packed even if OTHER structs in   #
-#     the same program have untyped/string/array/dict fields (which   #
+#     the same program have untyped/string/array/hashtable fields (which   #
 #     just can't be packed themselves — see the commented "would      #
 #     error" case below).                                             #
 # ------------------------------------------------------------------ #
@@ -95,7 +95,7 @@ struct Dynamic:
     label = "x"
 
 d = Dynamic()
-assert(d.tag == null && d.label == "x", "a struct with an untyped/string field still works fine as a plain (unpacked) instance")
+assert(d.tag == null and d.label == "x", "a struct with an untyped/string field still works fine as a plain (unpacked) instance")
 
 # pd = Dynamic[3]   # would error: 'Dynamic' cannot be packed into an array: field 'tag' must be integer/float/boolean, not untyped (no annotation)
 

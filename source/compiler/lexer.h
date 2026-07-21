@@ -4,12 +4,12 @@
 #include <stdbool.h>
 #include "value.h"
 
-/* Binary-operator tokens must be contiguous and in the same order as BinaryOperation in parser.h — the parser's precedence table relies on this. */
 typedef enum TokenType {
-    /* Binary ops (contiguous block — do not reorder) */
-    TOKEN_OR,               /* || */
+    /* Binary ops — precedence is looked up by binary_op_info()'s switch in parser.c, not by enum
+       order, so nothing here needs to stay contiguous. */
+    TOKEN_OR,               /* or */
     TOKEN_PIPE,             /* |> — x |> f(a) desugars to f(x, a) */
-    TOKEN_AND,              /* && */
+    TOKEN_AND,              /* and */
     TOKEN_BITWISE_OR,       /* |  */
     TOKEN_BITWISE_XOR,      /* ^  */
     TOKEN_BITWISE_AND,      /* &  */
@@ -40,7 +40,7 @@ typedef enum TokenType {
     TOKEN_FLOOR_DIVIDE_ASSIGN, /* //= */
 
     /* Unary operators */
-    TOKEN_NOT,              /* !  */
+    TOKEN_NOT,              /* not — see binary_op_info's comment: binds tighter than and/or, looser than everything else */
     TOKEN_BITWISE_NOT,      /* ~  */
 
     /* Punctuation */
@@ -69,10 +69,19 @@ typedef enum TokenType {
     TOKEN_STRUCT,
     TOKEN_FUNCTION,
     TOKEN_RETURN,
+    TOKEN_RAISE,
     TOKEN_BREAK,
     TOKEN_CONTINUE,
     TOKEN_NULL,
     TOKEN_IMPORT,
+
+    /* Reserved type names, unusable as any identifier. `string` is excluded -- it collides with the stdlib `string` module. */
+    TOKEN_TYPE_INTEGER,
+    TOKEN_TYPE_FLOAT,
+    TOKEN_TYPE_BOOLEAN,
+    TOKEN_TYPE_ARRAY,
+    TOKEN_TYPE_HASHTABLE,
+
     TOKEN_COMMA,
 
     TOKEN_INDENT,

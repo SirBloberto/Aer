@@ -181,11 +181,11 @@ assert(ig_local_const(ig_arr) == 10, "LOCAL[CONST] fuses to OP_INDEX_GET_LOCAL_C
 assert(ig_local_local(ig_arr, 4) == 50, "LOCAL[LOCAL] fuses to OP_INDEX_GET_LOCAL_LOCAL")
 assert(ig_local_local(ig_arr, ig_idx) == 40, "arr[idx] where idx is passed through, matching the value the removed NAME index case used")
 
-# Dict and string indexing through the same fused NAME[CONST]/NAME[NAME]
+# Hashtable and string indexing through the same fused NAME[CONST]/NAME[NAME]
 # paths — the handler stays fully polymorphic, matching lbl_index_get.
-assert(ig_dict["a"] == 1, "dict indexing still works through a fused NAME[CONST] path")
+assert(ig_dict["a"] == 1, "hashtable indexing still works through a fused NAME[CONST] path")
 ig_key = "b"
-assert(ig_dict[ig_key] == 2, "dict indexing still works through a fused NAME[NAME] path")
+assert(ig_dict[ig_key] == 2, "hashtable indexing still works through a fused NAME[NAME] path")
 assert(ig_str[1] == "e", "string indexing still works through a fused NAME[CONST] path")
 
 # Explicit non-fusing cases — must still produce correct results via the
@@ -193,7 +193,7 @@ assert(ig_str[1] == "e", "string indexing still works through a fused NAME[CONST
 assert(ig_arr[ig_idx + 1] == 50, "arr[i + 1] (arithmetic index) does not fuse but still works")
 ig_nested = [[1, 2], [3, 4]]
 assert(ig_nested[0][1] == 2, "arr[0][1] — the first bracket fuses (NAME[CONST]), the chained second bracket doesn't, and the result is still correct")
-assert(length(ig_arr[1:3]) == 2 && ig_arr[1:3][0] == 20 && ig_arr[1:3][1] == 30, "arr[a:b] (slice) does not fuse but still works")
+assert(length(ig_arr[1:3]) == 2 and ig_arr[1:3][0] == 20 and ig_arr[1:3][1] == 30, "arr[a:b] (slice) does not fuse but still works")
 
 # Bounds/type-error cases for the fused paths (out-of-bounds index, wrong
 # key type) can't be asserted against here — this file runs in MODE_RUN,
@@ -257,7 +257,7 @@ function llc_nested_loops(limit):
         p += 1
     count = 0
     for i in 0..limit+1:
-        if flags[i] == 0 && i >= 2:
+        if flags[i] == 0 and i >= 2:
             count += 1
     return count
 assert(llc_nested_loops(30) == 10, "primes below 30 via nested in-function loops (2,3,5,7,11,13,17,19,23,29) — proves reused loop-variable names across separate loops don't collide")
@@ -297,11 +297,11 @@ assert(is_local_const([0, 0]) == 1, "LOCAL[CONST] = CONST fuses to OP_INDEX_SET_
 assert(is_local_local([0, 0, 0], 1) == 2, "LOCAL[LOCAL] = CONST fuses to OP_INDEX_SET_LOCAL_LOCAL")
 assert(is_local_local([0, 0, 0, 0], is_idx) == 2, "arr[idx] = CONST where idx is passed through, matching the value the removed NAME index case used")
 
-# Dict indexing still works through the same fused NAME[CONST] path — the
+# Hashtable indexing still works through the same fused NAME[CONST] path — the
 # handler stays fully polymorphic, matching lbl_index_set.
 is_dict = {"a": 1}
 is_dict["a"] = 2
-assert(is_dict["a"] == 2, "dict assignment still works through a fused NAME[CONST] path")
+assert(is_dict["a"] == 2, "hashtable assignment still works through a fused NAME[CONST] path")
 
 # Explicit non-fusing cases — must still produce correct results via the
 # unfused fallback, unchanged.
@@ -336,7 +336,7 @@ function is_order_side_effect(idx):
     idx[0] = 1     # reassigns the index holder as a side effect
     return 999
 is_order_arr[is_order_idx[0]] = is_order_side_effect(is_order_idx)
-assert(is_order_arr[0] == 999 && is_order_arr[1] == 200,
+assert(is_order_arr[0] == 999 and is_order_arr[1] == 200,
        "arr[i] = f() writes to the index i had BEFORE f() ran, not after — proof the value-must-be-CONST restriction correctly forces this through the unfused, correctly-ordered path")
 
 # ------------------------------------------------------------------ #
@@ -401,17 +401,17 @@ for cb_i < 5:
 assert(cb_wsum == 10, "a while-style for-loop condition (i < 5) fuses and still terminates/accumulates correctly")
 
 # Non-fusing: and/or conditions (short-circuit jumps, not a bare comparison — the outermost
-# operator here is && / ||, so parse_binary_ops's last_cmp correctly comes back -1).
-if 1 < 2 && 3 < 4:
+# operator here is and/or, so parse_binary_ops's last_cmp correctly comes back -1).
+if 1 < 2 and 3 < 4:
     cb_r = true
 else:
     cb_r = false
-assert(cb_r == true, "a && condition does not fuse (last operator is &&, not a bare comparison) but still works")
-if 1 > 2 || 3 < 4:
+assert(cb_r == true, "a and condition does not fuse (last operator is 'and', not a bare comparison) but still works")
+if 1 > 2 or 3 < 4:
     cb_r = true
 else:
     cb_r = false
-assert(cb_r == true, "a || condition does not fuse but still works")
+assert(cb_r == true, "a or condition does not fuse but still works")
 
 # Non-fusing: a bare boolean variable/expression, no comparison at all.
 cb_flag = true
@@ -454,7 +454,7 @@ function cb_sieve(limit):
         p += 1
     count = 0
     for i in 0..limit+1:
-        if flags[i] == 0 && i >= 2:
+        if flags[i] == 0 and i >= 2:
             count += 1
     return count
 assert(cb_sieve(30) == 10, "sieve-shaped nested-loop comparisons (p*p<=limit, i<=limit) all fuse and still count primes correctly")

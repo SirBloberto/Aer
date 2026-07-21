@@ -20,12 +20,12 @@ assert(n == null, "null literal")
 assert(b == true, "boolean literal true")
 assert(false == false, "boolean literal false")
 assert(i == 42, "integer literal")
-assert(r == 3.14, "real literal")
+assert(r == 3.14, "float literal")
 assert(s == "hello", "string literal")
 
 assert(n == null, "null equals null")
-assert(!(n != null), "null != null is false")
-assert(!(null == false), "null does not equal a different type")
+assert(not (n != null), "null != null is false")
+assert(not (null == false), "null does not equal a different type")
 assert(null == null, "null == null is true")
 
 # ------------------------------------------------------------------ #
@@ -33,19 +33,19 @@ assert(null == null, "null == null is true")
 # ------------------------------------------------------------------ #
 
 assert(5 + 3 * 2 == 11, "precedence: * before +")
-assert(10 / 3 > 3.33 && 10 / 3 < 3.34, "true division always returns real")
+assert(10 / 3 > 3.33 and 10 / 3 < 3.34, "true division always returns float")
 assert(10 // 3 == 3, "floor division")
 assert(-7 // 2 == -4, "floor division floors toward -inf, not toward zero")
 assert(10 % 3 == 1, "modulo")
 assert(2 + 2 == 4, "addition")
-assert(1 + 2.5 == 3.5, "integer promoted to real when mixed")
+assert(1 + 2.5 == 3.5, "integer promoted to float when mixed")
 
-# A whole-number real must still display its decimal point -- plain "%g" formatting used to print
+# A whole-number float must still display its decimal point -- plain "%g" formatting used to print
 # 42.0 as bare "42", indistinguishable from an integer once round-tripped through print()/
 # interpolation/json.encode() (see test_stdlib_modules.aer for the json.encode/decode round-trip
 # side of this same fix).
 assert("{42 as float}" == "42.0", "a whole-number float shows its decimal point when interpolated")
-assert("{3.5}" == "3.5", "a fractional real is untouched by the same formatting fix")
+assert("{3.5}" == "3.5", "a fractional float is untouched by the same formatting fix")
 
 # ------------------------------------------------------------------ #
 # 3. Strings — interpolation, escapes, indexing, slicing               #
@@ -65,8 +65,8 @@ assert(length("\r") == 1, "\\r decodes to one real byte, not a literal backslash
 assert("say \"hi\"" == "say " + "\"" + "hi" + "\"", "escaped double quote")
 assert("use \{name} to interpolate" == "use " + "\{" + "name}" + " to interpolate", "escaped brace suppresses interpolation")
 
-# Interpolating an array/dict used to fall back to a terse
-# "<array[3]>"/"<dict[2]>" placeholder (vm_to_str's fixed-size buffer
+# Interpolating an array/hashtable used to fall back to a terse
+# "<array[3]>"/"<hashtable[2]>" placeholder (vm_to_str's fixed-size buffer
 # couldn't hold recursive, unbounded content) even though print() already
 # rendered full contents recursively — now both go through the same
 # formatter (vm_format_value), so interpolation matches print() exactly.
@@ -76,7 +76,7 @@ interp_arr = [1, 2, "three"]
 assert("arr is {interp_arr}" == "arr is [1, 2, \"three\"]", "interpolating an array shows its contents, not a placeholder")
 
 interp_dict = {"a": 1}
-assert("dict is {interp_dict}" == "dict is \{\"a\": 1}", "interpolating a dict shows its contents, not a placeholder")
+assert("hashtable is {interp_dict}" == "hashtable is \{\"a\": 1}", "interpolating a hashtable shows its contents, not a placeholder")
 
 # {expr} interpolates any expression (calls, arithmetic, indexing, field access, ...), not just a
 # bare name -- sub-parsed via its own independent lexer span (parser.c's parse_interpolated_expr),
@@ -107,13 +107,13 @@ function interp_shout(interp_s):
     return interp_s + "!"
 assert("{interp_shout(\"hi\")}" == "hi!", "a nested string literal argument inside \{}, quotes escaped")
 
-# A dict literal (its own '{'/'}') inside an interpolated expression -- depth-aware scanning must
-# not mistake the dict literal's own braces for the interpolation's closing brace.
-assert("{ {\"z\": 9}[\"z\"] }" == "9", "a dict literal (nested braces) inside \{}")
+# A hashtable literal (its own '{'/'}') inside an interpolated expression -- depth-aware scanning must
+# not mistake the hashtable literal's own braces for the interpolation's closing brace.
+assert("{ {\"z\": 9}[\"z\"] }" == "9", "a hashtable literal (nested braces) inside \{}")
 
 # String comparison
 assert("abc" == "abc", "string equality")
-assert(!("abc" == "xyz"), "string inequality via ==")
+assert(not ("abc" == "xyz"), "string inequality via ==")
 assert("abc" != "xyz", "string inequality via !=")
 
 # String ordering and `in`-on-strings are exercised in test_functions.aer instead (this file's
@@ -134,7 +134,7 @@ assert(word[:] == "hello", "string slice [:] copies the whole string")
 chars = []
 for ch in "abc":
     collection.append(chars, ch)
-assert(length(chars) == 3 && chars[0] == "a" && chars[1] == "b" && chars[2] == "c", "string iteration yields one character at a time, in order")
+assert(length(chars) == 3 and chars[0] == "a" and chars[1] == "b" and chars[2] == "c", "string iteration yields one character at a time, in order")
 
 # Strings are immutable
 # word[0] = "H"   # would error: Strings are immutable
@@ -154,50 +154,50 @@ assert(1 < 2, "less than")
 assert(2 >= 2, "greater-or-equal")
 assert(1 == 1, "equal")
 assert(1 != 2, "not equal")
-assert((true && false) == false, "logical and")
-assert((true || false) == true, "logical or")
-assert(!false, "logical not")
+assert((true and false) == false, "logical and")
+assert((true or false) == true, "logical or")
+assert(not false, "logical not")
 
-# && and || short-circuit — RHS is only evaluated if needed
+# and and or short-circuit — RHS is only evaluated if needed
 x = null
 short_circuit_result = "unset"
-if x != null && x == 42:    # safe: x==42 never runs when x is null
+if x != null and x == 42:    # safe: x==42 never runs when x is null
     short_circuit_result = "found"
 else:
     short_circuit_result = "safe"
-assert(short_circuit_result == "safe", "&& short-circuits before a null index/compare runs")
+assert(short_circuit_result == "safe", "and short-circuits before a null index/compare runs")
 
-# || short-circuit: second side skipped when first is true
+# or short-circuit: second side skipped when first is true
 boom_log = []
 function boom(log):
     collection.append(log, true)
     return false
 short_circuited = false
-if true || boom(boom_log):
+if true or boom(boom_log):
     short_circuited = true
-assert(short_circuited && length(boom_log) == 0, "|| short-circuits, boom() never called")
+assert(short_circuited and length(boom_log) == 0, "or short-circuits, boom() never called")
 
-# && and || return the winning OPERAND, not a coerced boolean (Python/Lua semantics) — the
-# common "x = x || default" idiom this enables is the whole point of the change.
-assert((0 || "default") == "default", "|| falls through to the rhs operand when the lhs is falsy")
-assert(("set" || "default") == "set", "|| returns the lhs operand itself when it's truthy, unchanged")
-assert((null || "fallback") == "fallback", "|| treats null as falsy, same as an if condition would")
-assert((5 && "b") == "b", "&& returns the rhs operand when the lhs is truthy")
-assert((0 && "b") == 0, "&& returns the lhs operand itself when it's falsy, unchanged")
-default_val = 3 || 99
-assert(default_val == 3, "x = x || default: a truthy existing value wins, unmodified")
+# and and or return the winning OPERAND, not a coerced boolean (Python/Lua semantics) — the
+# common "x = x or default" idiom this enables is the whole point of the change.
+assert((0 or "default") == "default", "or falls through to the rhs operand when the lhs is falsy")
+assert(("set" or "default") == "set", "or returns the lhs operand itself when it's truthy, unchanged")
+assert((null or "fallback") == "fallback", "or treats null as falsy, same as an if condition would")
+assert((5 and "b") == "b", "and returns the rhs operand when the lhs is truthy")
+assert((0 and "b") == 0, "and returns the lhs operand itself when it's falsy, unchanged")
+default_val = 3 or 99
+assert(default_val == 3, "x = x or default: a truthy existing value wins, unmodified")
 missing_val = null
-resolved = missing_val || "computed"
-assert(resolved == "computed", "x = x || default: a null value falls through to the default")
+resolved = missing_val or "computed"
+assert(resolved == "computed", "x = x or default: a null value falls through to the default")
 
-# in — membership test for arrays and dicts
+# in — membership test for arrays and hashtables
 nums = [1, 2, 3]
 assert(2 in nums, "value membership in an array")
-assert(!(9 in nums), "value not in an array")
+assert(not (9 in nums), "value not in an array")
 
 scores = {"alice": 95, "bob": 87}
-assert("alice" in scores, "key membership in a dict")
-assert(!("carol" in scores), "key not in a dict")
+assert("alice" in scores, "key membership in a hashtable")
+assert(not ("carol" in scores), "key not in a hashtable")
 
 # ------------------------------------------------------------------ #
 # 5. Bitwise                                                          #
@@ -228,9 +228,9 @@ assert(bw == 60, "bitwise update chain spelled out")
 # ------------------------------------------------------------------ #
 
 assert(("42" as integer) == 42, "string to integer cast")
-assert((42 as float) == 42, "integer to real cast (compares equal via promotion)")
+assert((42 as float) == 42, "integer to float cast (compares equal via promotion)")
 assert((42 as string) == "42", "integer to string cast")
-assert((3.7 as integer) == 3, "real to integer cast truncates, does not round")
+assert((3.7 as integer) == 3, "float to integer cast truncates, does not round")
 assert((0 as boolean) == false, "0 casts to false")
 assert((1 as boolean) == true, "nonzero casts to true")
 assert(("" as boolean) == false, "empty string casts to false")
@@ -278,7 +278,7 @@ llwalked = []
 for llcur != null:
     collection.append(llwalked, llcur.value)
     llcur = llcur.next
-assert(length(llwalked) == 3 && llwalked[0] == 1 && llwalked[1] == 2 && llwalked[2] == 3,
+assert(length(llwalked) == 3 and llwalked[0] == 1 and llwalked[1] == 2 and llwalked[2] == 3,
        "while-form for loop whose condition is a field/postfix chain (linked-list traversal)")
 
 llcur2 = lln1
@@ -306,12 +306,12 @@ assert(i == 1, "%= compound assign")
 ascending = []
 for i in 0..5:
     collection.append(ascending, i)
-assert(length(ascending) == 5 && ascending[0] == 0 && ascending[4] == 4, "range 0..5 yields 0,1,2,3,4 in order")
+assert(length(ascending) == 5 and ascending[0] == 0 and ascending[4] == 4, "range 0..5 yields 0,1,2,3,4 in order")
 
 descending = []
 for i in 5..0:
     collection.append(descending, i)
-assert(length(descending) == 5 && descending[0] == 5 && descending[4] == 1, "range auto-reverses when start > end")
+assert(length(descending) == 5 and descending[0] == 5 and descending[4] == 1, "range auto-reverses when start > end")
 
 # ------------------------------------------------------------------ #
 # 10. For — array iteration                                            #
@@ -321,25 +321,25 @@ fruits = ["apple", "banana", "cherry"]
 visited_fruits = []
 for fruit in fruits:
     collection.append(visited_fruits, fruit)
-assert(length(visited_fruits) == 3 && visited_fruits[0] == "apple" && visited_fruits[1] == "banana" && visited_fruits[2] == "cherry", "array iteration visits every element in order")
+assert(length(visited_fruits) == 3 and visited_fruits[0] == "apple" and visited_fruits[1] == "banana" and visited_fruits[2] == "cherry", "array iteration visits every element in order")
 
 # ------------------------------------------------------------------ #
-# 11. For — dict iteration                                             #
+# 11. For — hashtable iteration                                             #
 # ------------------------------------------------------------------ #
 
 scores2 = {"alice": 95, "bob": 87, "carol": 92}
 
 key_count = 0
 for name2 in scores2:
-    assert(name2 in scores2, "each iterated key is really a key of the dict")
+    assert(name2 in scores2, "each iterated key is really a key of the hashtable")
     key_count += 1
-assert(key_count == 3, "dict key iteration visits every entry exactly once")
+assert(key_count == 3, "hashtable key iteration visits every entry exactly once")
 
 pair_count = 0
 for name2, score in scores2:
     assert(scores2[name2] == score, "iterated value matches a direct lookup by the iterated key")
     pair_count += 1
-assert(pair_count == 3, "dict pair iteration visits every entry exactly once")
+assert(pair_count == 3, "hashtable pair iteration visits every entry exactly once")
 
 # ------------------------------------------------------------------ #
 # 12. Break and continue                                               #
@@ -352,7 +352,7 @@ for i in 0..10:
     if i > 7:
         break
     collection.append(kept, i)
-assert(length(kept) == 4 && kept[0] == 1 && kept[1] == 3 && kept[2] == 5 && kept[3] == 7, "continue skips even numbers, break stops once i > 7")
+assert(length(kept) == 4 and kept[0] == 1 and kept[1] == 3 and kept[2] == 5 and kept[3] == 7, "continue skips even numbers, break stops once i > 7")
 
 # ------------------------------------------------------------------ #
 # 24. Truthiness rules                                                 #
@@ -370,16 +370,16 @@ function truthy(v):
 assert(truthy(null) == "falsy", "null is falsy")
 assert(truthy(false) == "falsy", "false is falsy")
 assert(truthy(0) == "falsy", "integer 0 is falsy")
-assert(truthy(0.0) == "falsy", "real 0.0 is falsy")
+assert(truthy(0.0) == "falsy", "float 0.0 is falsy")
 assert(truthy("") == "falsy", "empty string is falsy")
 assert(truthy([]) == "falsy", "empty array is falsy")
-assert(truthy({}) == "falsy", "empty dict is falsy")
+assert(truthy({}) == "falsy", "empty hashtable is falsy")
 
 assert(truthy(true) == "truthy", "true is truthy")
 assert(truthy(1) == "truthy", "nonzero integer is truthy")
 assert(truthy(-1) == "truthy", "negative integer is truthy")
 assert(truthy("x") == "truthy", "non-empty string is truthy")
 assert(truthy([0]) == "truthy", "non-empty array is truthy, even [0]")
-assert(truthy({"a": 1}) == "truthy", "non-empty dict is truthy")
+assert(truthy({"a": 1}) == "truthy", "non-empty hashtable is truthy")
 
 print("test_core.aer: all assertions passed.")

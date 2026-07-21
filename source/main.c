@@ -191,6 +191,7 @@ static void run_shell() {
 
 static bool run_file(char* path) {
     mode = MODE_RUN;
+    chunk.source_filename = xstrdup(path);
     read_file(path);
     /* read_file() can fail (missing file, unreadable, embedded NUL) without ever setting up the
        lexer's current file — calling run() anyway would lex/parse a null or stale File*. */

@@ -52,7 +52,7 @@ static void tl_push(TokList* tl, Tok t) {
 
 static const char* const OPS3[] = { "//=", NULL };
 static const char* const OPS2[] = {
-    "==", "!=", "<=", ">=", "&&", "||", "+=", "-=", "*=", "/=", "%=",
+    "==", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "%=",
     "//", "<<", ">>", "..", "|>", NULL
 };
 
@@ -223,7 +223,8 @@ static void compute_depths(LLineList* lines, TokList* tl) {
    tokens: "true - 1" is legitimate, if odd, binary subtraction) or a plain identifier/call result. */
 static bool is_flow_keyword(const Tok* t) {
     static const char* const kws[] = {
-        "if", "else", "for", "struct", "function", "return", "break", "continue", "import", "in", "as", NULL
+        "if", "else", "for", "struct", "function", "return", "raise", "break", "continue", "import", "in", "as",
+        "integer", "float", "boolean", "array", "hashtable", "and", "or", "not", NULL
     };
     if (t->type != T_WORD) return false;
     for (int i = 0; kws[i]; i++) {
@@ -233,10 +234,10 @@ static bool is_flow_keyword(const Tok* t) {
     return false;
 }
 
-/* '!'/'~' have no binary form in AER at all -- always unary. '-' is the only one that's genuinely
+/* '~' has no binary form in AER at all -- always unary. '-' is the only one that's genuinely
    context-sensitive (binary subtract vs. unary negate). */
 static bool is_unary_here(Tok* op, Tok* prev) {
-    if (op_is(op, "!") || op_is(op, "~")) return true;
+    if (op_is(op, "~")) return true;
     if (!prev) return true;
     if (prev->type == T_OP) return !is_close_bracket(prev);
     if (prev->type == T_WORD) return is_flow_keyword(prev);
@@ -292,7 +293,7 @@ static void format_file(const char* src, FILE* out) {
             }
             if (prev && needs_space(prev, t, prev_is_unary)) fputc(' ', out);
             fwrite(t->text, 1, t->len, out);
-            prev_is_unary = (t->type == T_OP && (op_is(t, "-") || op_is(t, "!") || op_is(t, "~")) && is_unary_here(t, prev));
+            prev_is_unary = (t->type == T_OP && (op_is(t, "-") || op_is(t, "~")) && is_unary_here(t, prev));
             prev = t;
         }
         fputc('\n', out);

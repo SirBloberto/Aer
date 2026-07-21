@@ -23,17 +23,17 @@ for i in 0..300:
     collection.append(slab_arrays, [i, i * 2])
 
 assert(length(slab_arrays) == 300, "300 arrays created — crosses the 256-per-slab boundary")
-assert(slab_arrays[0][0] == 0 && slab_arrays[0][1] == 0, "the first array, from the first slab, is still intact")
-assert(slab_arrays[255][0] == 255 && slab_arrays[255][1] == 510, "the array right at the slab boundary is intact")
-assert(slab_arrays[256][0] == 256 && slab_arrays[256][1] == 512, "the first array in the newly-grown second slab is intact")
-assert(slab_arrays[299][0] == 299 && slab_arrays[299][1] == 598, "the last array is intact")
+assert(slab_arrays[0][0] == 0 and slab_arrays[0][1] == 0, "the first array, from the first slab, is still intact")
+assert(slab_arrays[255][0] == 255 and slab_arrays[255][1] == 510, "the array right at the slab boundary is intact")
+assert(slab_arrays[256][0] == 256 and slab_arrays[256][1] == 512, "the first array in the newly-grown second slab is intact")
+assert(slab_arrays[299][0] == 299 and slab_arrays[299][1] == 598, "the last array is intact")
 
 slab_strings = []
 for i in 0..300:
     collection.append(slab_strings, "s" + (i as string))
 
 assert(length(slab_strings) == 300, "300 strings created — crosses string_pool's 256-per-slab boundary")
-assert(slab_strings[0] == "s0" && slab_strings[255] == "s255" && slab_strings[256] == "s256" && slab_strings[299] == "s299",
+assert(slab_strings[0] == "s0" and slab_strings[255] == "s255" and slab_strings[256] == "s256" and slab_strings[299] == "s299",
        "strings before, at, and after the slab boundary are all intact")
 
 # ------------------------------------------------------------------ #
@@ -63,16 +63,16 @@ gc_churn2 = []
 for i in 0..3000:
     collection.append(gc_churn2, [i, i * 2, "t" + (i as string)])
 
-assert(length(gc_old_container) == 1 && gc_old_container[0] == "written after promotion",
+assert(length(gc_old_container) == 1 and gc_old_container[0] == "written after promotion",
        "a value written into an old (promoted) array survives further collections — the write barrier protected it")
 assert(gc_old_dict["fresh_key"]["nested"] == "written after promotion",
-       "a value written into an old (promoted) dict survives further collections — the write barrier protected it")
+       "a value written into an old (promoted) hashtable survives further collections — the write barrier protected it")
 
 # ------------------------------------------------------------------ #
 # 31A. Struct interpolation (placed after the GC stress section)      #
 # ------------------------------------------------------------------ #
 
-# Deliberately placed here, not next to the array/dict interpolation cases
+# Deliberately placed here, not next to the array/hashtable interpolation cases
 # in test_core.aer's string section: with this same assertion positioned
 # earlier (before this file's own GC churn above), the write-barrier
 # assertions above intermittently failed — reproducible with the
@@ -80,7 +80,7 @@ assert(gc_old_dict["fresh_key"]["nested"] == "written after promotion",
 # isolated repro tried so far. Root cause not yet found; suspected to be a
 # rare, allocation-pattern-sensitive interaction between struct shapes and
 # the collector, not a bug in vm_format_value itself (which independently
-# verified correct — see test_core.aer's array/dict interpolation cases
+# verified correct — see test_core.aer's array/hashtable interpolation cases
 # and manual testing). Kept in THIS file, immediately after the heaviest
 # allocation pressure in the suite, until that's diagnosed — moving it to
 # a separate file/process would remove the preceding allocation pressure
@@ -150,10 +150,10 @@ for i in 0..100:
     collection.append(slab_structs, SlabPoint(i, i * 2))
 
 assert(length(slab_structs) == 100, "100 struct instances created — crosses struct_pool's 64-per-slab boundary")
-assert(slab_structs[0].x == 0 && slab_structs[0].y == 0, "the first struct, from the first slab, is intact")
-assert(slab_structs[63].x == 63 && slab_structs[63].y == 126, "the struct right at the slab boundary is intact")
-assert(slab_structs[64].x == 64 && slab_structs[64].y == 128, "the first struct in the newly-grown second slab is intact")
-assert(slab_structs[99].x == 99 && slab_structs[99].y == 198, "the last struct is intact")
+assert(slab_structs[0].x == 0 and slab_structs[0].y == 0, "the first struct, from the first slab, is intact")
+assert(slab_structs[63].x == 63 and slab_structs[63].y == 126, "the struct right at the slab boundary is intact")
+assert(slab_structs[64].x == 64 and slab_structs[64].y == 128, "the first struct in the newly-grown second slab is intact")
+assert(slab_structs[99].x == 99 and slab_structs[99].y == 198, "the last struct is intact")
 
 # Write barrier for struct field-set specifically (the new REMEMBERED_STRUCT
 # path in gc_barrier_array) — same pattern as gc_old_container/gc_old_dict
@@ -193,7 +193,7 @@ for i in 0..3:
 
 assert(mp.x == 10, "plain field assignment correct with inline struct storage")
 assert(mp.y == 7, "compound field assignment correct with inline struct storage")
-assert(mut_pts[0].x == 101 && mut_pts[1].x == 102 && mut_pts[2].x == 103,
+assert(mut_pts[0].x == 101 and mut_pts[1].x == 102 and mut_pts[2].x == 103,
        "arr[idx].field compound-assignment fusion correct with inline struct storage")
 
 print("test_memory_gc.aer: all assertions passed.")

@@ -30,11 +30,11 @@ p1 = Point(1.0, 2.0)
 p2 = Point(5.0)        # y defaults to 0.0
 p3 = Point()           # x and y both default to 0.0
 
-assert(p2.x == 5.0 && p2.y == 0.0, "struct instantiation with a defaulted trailing field")
-assert(p3.x == 0.0 && p3.y == 0.0, "struct instantiation with all fields defaulted")
+assert(p2.x == 5.0 and p2.y == 0.0, "struct instantiation with a defaulted trailing field")
+assert(p3.x == 0.0 and p3.y == 0.0, "struct instantiation with all fields defaulted")
 
 # Field access is dot notation only — read and write.
-assert(p1.x == 1 && p1.y == 2, "struct field access")
+assert(p1.x == 1 and p1.y == 2, "struct field access")
 p1.x = 10.0
 assert(p1.x == 10, "struct field assignment")
 
@@ -93,14 +93,14 @@ ca_outer = Outer(Inner(10))
 ca_outer.inner.v += 5
 assert(ca_outer.inner.v == 15, "compound assignment through a chained struct field (a.b.c += n)")
 
-# Index compound assignment on an array/dict — same mechanism, the other
+# Index compound assignment on an array/hashtable — same mechanism, the other
 # pending-step shape (OP_DUP_N 2, since [obj, idx] is on the stack).
 ca_arr = [1, 2, 3]
 ca_arr[1] += 100
 assert(ca_arr[1] == 102, "array element += a constant")
 ca_dict = {"count": 1}
 ca_dict["count"] += 1
-assert(ca_dict["count"] == 2, "dict value += a constant")
+assert(ca_dict["count"] == 2, "hashtable value += a constant")
 
 # The index expression itself must be evaluated exactly ONCE — proof the
 # chain isn't re-run for the write half (a real risk this feature could
@@ -135,7 +135,7 @@ nd_a.tags["x"] = 1
 
 assert(length(nd_a.items) == 2, "appending to one instance's default-array field grows it normally")
 assert(length(nd_b.items) == 0, "...and a DIFFERENT instance's default-array field is untouched — not the same shared array")
-assert(length(nd_a.tags) == 1, "the same guarantee for a default-dict field")
+assert(length(nd_a.tags) == 1, "the same guarantee for a default-hashtable field")
 assert(length(nd_b.tags) == 0, "...untouched on a different instance")
 
 # A field explicitly passed at construction is unaffected by any of this
@@ -143,10 +143,10 @@ assert(length(nd_b.tags) == 0, "...untouched on a different instance")
 nd_c = Bucket([9, 9, 9])
 assert(length(nd_c.items) == 3, "an explicitly passed array argument is used as-is, not replaced by a fresh empty one")
 
-# array/dict are enforced exactly like integer/float/string/boolean — 'items'
+# array/hashtable are enforced exactly like integer/float/string/boolean — 'items'
 # and 'tags' above are real types now, not an escape hatch.
-# nd_a.items = {}   # would error: 'items' is declared 'array', assigning a dict fails
-# nd_a.tags = []    # would error: 'tags' is declared 'dict', assigning an array fails
+# nd_a.items = {}   # would error: 'items' is declared 'array', assigning a hashtable fails
+# nd_a.tags = []    # would error: 'tags' is declared 'hashtable', assigning an array fails
 
 # Function parameter defaults get the identical per-CALL freshness — the
 # same underlying vm_default_value fix in vm.c applies to both call sites.
@@ -155,8 +155,8 @@ function collect(x, seen = []):
     return seen
 fd_r1 = collect(1)
 fd_r2 = collect(2)
-assert(length(fd_r1) == 1 && fd_r1[0] == 1, "first call's omitted-argument default starts fresh")
-assert(length(fd_r2) == 1 && fd_r2[0] == 2, "a second call's own omitted-argument default is independent, not the first call's mutated array")
+assert(length(fd_r1) == 1 and fd_r1[0] == 1, "first call's omitted-argument default starts fresh")
+assert(length(fd_r2) == 1 and fd_r2[0] == 2, "a second call's own omitted-argument default is independent, not the first call's mutated array")
 
 # ------------------------------------------------------------------ #
 # 39. Field types are inferred from the default, never declared —     #
@@ -171,7 +171,7 @@ struct Tagged:
     note = null   # untyped -- accepts any value, at construction or later
 
 t1 = Tagged()
-assert(t1.label == "untitled" && t1.active == true && t1.note == null, "an untyped field's literal default (null) applies like any other")
+assert(t1.label == "untitled" and t1.active == true and t1.note == null, "an untyped field's literal default (null) applies like any other")
 
 t2 = Tagged("x", false, 42)
 assert(t2.note == 42, "an untyped field accepts any argument type at construction — no enforcement, by design")

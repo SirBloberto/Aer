@@ -76,7 +76,7 @@ static bool value_is_young(AerVal v) {
         case TYPE_FUNCTION: return pool_is_young(&function_pool, aer_as_function(v));
         case TYPE_PACKED_ARRAY: return pool_is_young(&packed_array_pool, aer_as_packed_array(v));
         case TYPE_RESULT:   return pool_is_young(&result_pool,   aer_as_result(v));
-        default:            return false;   /* null/boolean/integer/real have no heap cell — integers are never boxed under the tagged representation */
+        default:            return false;   /* null/boolean/integer/float have no heap cell — integers are never boxed under the tagged representation */
     }
 }
 
@@ -181,10 +181,9 @@ static void mark_value(AerVal v) {
         case TYPE_DICT:
             if (!pool_mark(&dict_pool, aer_as_dict(v))) {
                 HashTable* map = &aer_as_dict(v)->map;
-                for (unsigned int i = 0; i < map->capacity; i++)
-                    if (map->buckets[i].key)
-                        worklist_push(map->buckets[i].payload);
-                /* Bucket keys are plain owned char*, not Values — nothing to push. */
+                for (unsigned int i = 0; i < map->count; i++)
+                    worklist_push(map->dense[i].payload);
+                /* Keys are plain owned char*, not Values — nothing to push. */
             }
             break;
         case TYPE_FUNCTION:
@@ -203,7 +202,7 @@ static void mark_value(AerVal v) {
             break;
         }
         default:
-            break;   /* null/boolean/integer/real reference no heap cell — integers are never boxed under the tagged representation */
+            break;   /* null/boolean/integer/float reference no heap cell — integers are never boxed under the tagged representation */
     }
 }
 
@@ -305,8 +304,8 @@ static void gc_collect(VM* vm, bool minor) {
                 }
                 case REMEMBERED_DICT: {
                     HashTable* map = &((AerDict*)e->ptr)->map;
-                    for (unsigned int j = 0; j < map->capacity; j++)
-                        if (map->buckets[j].key) worklist_push(map->buckets[j].payload);
+                    for (unsigned int j = 0; j < map->count; j++)
+                        worklist_push(map->dense[j].payload);
                     break;
                 }
             }
@@ -466,9 +465,10 @@ void aer_debug_memory_report(FILE* out) {
                 AerDict* d = (AerDict*)(p->slabs[i] + (size_t)j * p->stride);
                 if (d->gc_state & POOL_FREE) continue;
                 dict_hdr += sizeof(AerDict);
-                dict_payload += (uint64_t)d->map.capacity * sizeof(HashTableEntry);
-                for (unsigned int b = 0; b < d->map.capacity; b++)
-                    if (d->map.buckets[b].key) dict_payload += d->map.buckets[b].length + 1;
+                dict_payload += (uint64_t)d->map.capacity * sizeof(unsigned int) +
+                                (uint64_t)d->map.dense_capacity * sizeof(HashTableEntry);
+                for (unsigned int b = 0; b < d->map.count; b++)
+                    dict_payload += d->map.dense[b].length + 1;
             }
         }
     }
@@ -521,6 +521,7 @@ void chunk_init(Chunk* c) {
 }
 
 void chunk_free(Chunk* c) {
+    free(c->source_filename);
     free(c->code);
     for (unsigned int i = 0; i < c->pool_count; i++)
         if (aer_type(c->pool[i]) == TYPE_STRING) free(aer_as_string(c->pool[i])->data);
@@ -576,6 +577,64 @@ static unsigned int lookup_runtime_line(void) {
     return chunk_line_for_offset(active_vm_for_errors->chunk, active_vm_for_errors->ip);
 }
 
+static const char* lookup_runtime_filename(void) {
+    if (!active_vm_for_errors) return NULL;
+    return active_vm_for_errors->chunk->source_filename;
+}
+
+static const char* lookup_runtime_function(void) {
+    if (!active_vm_for_errors) return NULL;
+    VM* vm = active_vm_for_errors;
+    if (vm->call_depth == 0) return NULL;
+    ChunkFunction* fn = chunk_find_function_by_offset(vm->chunk, vm->call_stack[vm->call_depth].code_offset);
+    return fn ? aer_as_string(vm->chunk->pool[fn->name])->data : NULL;
+}
+
+static const char* tail_call_note(unsigned int collapsed, char* buf, size_t bufsize) {
+    if (collapsed == 0) return "";
+    snprintf(buf, bufsize, " (+%u tail call%s not shown)", collapsed, collapsed == 1 ? "" : "s");
+    return buf;
+}
+
+static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size) {
+    if (!active_vm_for_errors) return 0;
+    VM* vm = active_vm_for_errors;
+    if (vm->call_depth == 0) return 0;
+    Chunk* c = vm->chunk;
+    const unsigned int max_frames = 20;
+    unsigned int pos = 0, shown = 0;
+    bool hit_synthetic_boundary = false;
+    char note_buf[64];
+
+    unsigned int innermost_collapsed = vm->call_stack[vm->call_depth].tail_calls_collapsed;
+    if (innermost_collapsed > 0) {
+        int n = snprintf(out + pos, out_size - pos, "\n %s", tail_call_note(innermost_collapsed, note_buf, sizeof(note_buf)));
+        if (n > 0 && (unsigned int)n < out_size - pos) pos += (unsigned int)n;
+    }
+
+    for (int depth = (int)vm->call_depth; depth >= 1 && shown < max_frames; depth--) {
+        if (vm->call_stack[depth].synthetic_entry) { hit_synthetic_boundary = true; break; }
+        unsigned int line = chunk_line_for_offset(c, vm->call_stack[depth].return_ip);
+        const char* note = tail_call_note(vm->call_stack[depth - 1].tail_calls_collapsed, note_buf, sizeof(note_buf));
+        int n;
+        if (depth - 1 == 0) {
+            n = snprintf(out + pos, out_size - pos, "\n  called from line %u, at top level%s", line, note);
+        } else {
+            ChunkFunction* fn = chunk_find_function_by_offset(c, vm->call_stack[depth - 1].code_offset);
+            const char* fname = fn ? aer_as_string(c->pool[fn->name])->data : "?";
+            n = snprintf(out + pos, out_size - pos, "\n  called from line %u, in %s()%s", line, fname, note);
+        }
+        if (n < 0 || (unsigned int)n >= out_size - pos) break;
+        pos += (unsigned int)n;
+        shown++;
+    }
+    if (!hit_synthetic_boundary && shown < (unsigned int)vm->call_depth) {
+        int n = snprintf(out + pos, out_size - pos, "\n  ... and %u more", (unsigned int)vm->call_depth - shown);
+        if (n > 0 && (unsigned int)n < out_size - pos) pos += (unsigned int)n;
+    }
+    return pos;
+}
+
 /* Wraps an exclusively-owned (data, length) in a fresh heap box; never copies. Guarded because
    the lexer can call this (emit_string_token) before any VM/pool exists -- without the guard,
    string_pool's zero-initialized elem_size=0 makes pool_alloc hand back a ~1-byte allocation
@@ -615,7 +674,8 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
         memcpy(key, vs->data, vs->length);
         key[vs->length] = '\0';
 
-        AerVal* existing = hashtable_get(&c->name_index, key);
+        unsigned int key_len = hashtable_key_true_len(key, vs->length);
+        AerVal* existing = hashtable_get(&c->name_index, key, key_len);
         if (existing) { free(key); return (unsigned int)aer_as_int(*existing); }
 
         /* vs->data was already owned at every call site -- free before replacing, or it's orphaned
@@ -626,8 +686,8 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
         unsigned int idx = chunk_pool_append(c, v);
 
         /* Independent copy, not an alias of c->pool[idx]'s, so both can be freed independently without a double-free. */
-        char* index_key = hashtable_key_dup(key, (unsigned int)strlen(key), NULL);
-        hashtable_put(&c->name_index, index_key, aer_int((int64_t)idx));
+        char* index_key = hashtable_key_dup(key, key_len, NULL);
+        hashtable_put(&c->name_index, index_key, key_len, aer_int((int64_t)idx));
         return idx;
     }
 
@@ -686,6 +746,14 @@ ChunkFunction* chunk_find_function_by_name_idx(Chunk* c, unsigned int name_idx) 
     for (unsigned int i = c->function_count; i > 0; i--) {
         ChunkFunction* f = &c->functions[i - 1];
         if (f->name == name_idx) return f;
+    }
+    return NULL;
+}
+
+ChunkFunction* chunk_find_function_by_offset(Chunk* c, unsigned int code_offset) {
+    for (unsigned int i = c->function_count; i > 0; i--) {
+        ChunkFunction* f = &c->functions[i - 1];
+        if (f->code_offset == code_offset) return f;
     }
     return NULL;
 }
@@ -752,7 +820,16 @@ void vm_init(VM* vm, Chunk* chunk) {
     vm->chunk = chunk;
     vm_pools_init_once();
     ensure_io_registered();
-    runtime_line_lookup = lookup_runtime_line;
+    runtime_line_lookup        = lookup_runtime_line;
+    runtime_filename_lookup    = lookup_runtime_filename;
+    runtime_function_lookup    = lookup_runtime_function;
+    runtime_stack_trace_lookup = lookup_runtime_stack_trace;
+    /* Set here too, not just by DISPATCH() -- makes filename/line lookups correct during parsing
+       as well as running (parse happens before vm_run ever dispatches a single opcode). A nested
+       module's own vm_init (aer_vm_instantiate_from_file) correctly overwrites this to itself
+       while it parses/runs; DISPATCH() reasserts the outer VM on the first opcode after control
+       returns, exactly as it already did before this addition. */
+    active_vm_for_errors = vm;
     /* Frame 0's register window only ever needs linking once, for the life of the VM (top-level
        usage is open-ended, so it always gets a flat FRAME_REGISTERS reservation) -- everything
        else a fresh run needs is exactly what aer_vm_reset_for_reuse() already does. */
@@ -791,7 +868,7 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
 /* Struct instances report their declared name (e.g. "Player") instead of "array" — used by type() and OP_CHECK_SHAPE's error message. A packed array reports "Player[]" — distinct from a single instance's own "Player". type_names[] is indexed directly by ValueType, so it must stay exactly as long as the enum's non-specially-handled entries (value.h) — TYPE_PACKED_ARRAY is handled specially, just like TYPE_ARRAY+shape, so it's never used to index this array. */
 static const char* vm_type_name(Chunk* c, AerVal v) {
     static const char* type_names[] = {
-        "null", "boolean", "integer", "real", "string", "function", "array", "dict"
+        "null", "boolean", "integer", "float", "string", "function", "array", "hashtable"
     };
     if (aer_type(v) == TYPE_ARRAY && aer_as_array(v)->shape)
         return aer_as_string(c->pool[aer_as_array(v)->shape->name])->data;
@@ -872,9 +949,8 @@ static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) 
             AerDict* d = aer_as_dict(v);
             strbuf_append(sb, "{");
             bool first = true;
-            for (unsigned int i = 0; i < d->map.capacity; i++) {
-                HashTableEntry* e = &d->map.buckets[i];
-                if (!e->key) continue;
+            for (unsigned int i = 0; i < d->map.count; i++) {
+                HashTableEntry* e = &d->map.dense[i];
                 if (!first) strbuf_append(sb, ", ");
                 first = false;
                 strbuf_append(sb, "\"");
@@ -1026,12 +1102,12 @@ static AerVal vm_in(AerVal a, AerVal b) {
     if (aer_type(b) == TYPE_DICT) {
         if (aer_type(a) != TYPE_STRING) { error("Left side of 'in' must be a string when testing dict membership"); return aer_bool(false); }
         AerString* as = aer_as_string(a);
-        unsigned int klen = as->length;
-        if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return aer_bool(false); }
+        if (as->length > VM_KEY_MAX) { error("Hashtable key too long (max %d bytes)", VM_KEY_MAX); return aer_bool(false); }
+        unsigned int klen = hashtable_key_true_len(as->data, as->length);
         char kbuf[VM_KEY_MAX + 1];
         memcpy(kbuf, as->data, klen);
         kbuf[klen] = '\0';
-        return aer_bool(hashtable_get(&aer_as_dict(b)->map, kbuf) != NULL);
+        return aer_bool(hashtable_get(&aer_as_dict(b)->map, kbuf, klen) != NULL);
     }
     if (aer_type(b) == TYPE_ARRAY) {
         AerArray* arr = aer_as_array(b);
@@ -1048,7 +1124,28 @@ static AerVal vm_in(AerVal a, AerVal b) {
     return aer_bool(false);
 }
 
-static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
+/* Only used to name the operator in a type-mismatch message -- never on a path that already has
+   its own more specific error (e.g. 'in' has vm_in()'s own messages above). */
+static const char* binop_symbol(Opcode op) {
+    switch (op) {
+        case OP_ADD:       return "+";
+        case OP_SUB:       return "-";
+        case OP_MUL:       return "*";
+        case OP_DIV:       return "/";
+        case OP_FLOOR_DIV: return "//";
+        case OP_MOD:       return "%";
+        case OP_EQ:        return "==";
+        case OP_NEQ:       return "!=";
+        case OP_LT:        return "<";
+        case OP_GT:        return ">";
+        case OP_LTE:       return "<=";
+        case OP_GTE:       return ">=";
+        case OP_IN:        return "in";
+        default:           return "that operator";
+    }
+}
+
+static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
     /* Checked before null-handling below so `null in arr` isn't intercepted by the "null op anything-else errors" rule, which is about direct comparison, not container search. */
     if (op == OP_IN) return vm_in(a, b);
 
@@ -1140,7 +1237,7 @@ static AerVal vm_binary_cold(AerVal a, AerVal b, Opcode op, ValueType ta, ValueT
         error("Operator not valid for Results"); return aer_bool(false);
     }
 
-    error("Type mismatch in binary expression");
+    error("Cannot apply '%s' to %s and %s", binop_symbol(op), vm_type_name(c, a), vm_type_name(c, b));
     return aer_bool(false);
 }
 
@@ -1238,6 +1335,9 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
         callee->registers[i] = vm_default_value(fn->defaults[i - fn->min_arity]);
     callee->return_ip   = return_ip;
     callee->dest_reg    = 0;
+    callee->code_offset = fn->code_offset;
+    callee->tail_calls_collapsed = 0;
+    callee->synthetic_entry = true;
     target->call_depth++;   /* same rooting rule as vm_call_value's non-tail branch (above) — the defaults loop wrote into callee->registers[] before this point */
     gc_maybe_collect(target);
     target->registers = target->call_stack[target->call_depth].registers;
@@ -1252,7 +1352,7 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
    resume address, passed explicitly rather than read from vm->ip. */
 static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int arg_count,
                               bool is_tail_call, unsigned int return_ip) {
-    if (aer_type(fv) != TYPE_FUNCTION) { error("Value is not callable"); return; }
+    if (aer_type(fv) != TYPE_FUNCTION) { error("Value of type '%s' is not callable", vm_type_name(vm->chunk, fv)); return; }
     AerFunction* f = aer_as_function(fv);
     if (arg_count < (int)f->min_arity || arg_count > (int)f->arity) {
         if (f->min_arity == f->arity)
@@ -1271,6 +1371,8 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
             vm->registers[i] = vm_default_value(f->defaults[i - f->min_arity]);
         gc_maybe_collect(vm);   /* defaults just written into the CURRENT frame (tail call, call_depth unchanged) — already rooted */
         vm->ip = f->code_offset;
+        vm->call_stack[vm->call_depth].code_offset = f->code_offset;   /* reused frame now runs a different function */
+        vm->call_stack[vm->call_depth].tail_calls_collapsed++;
         return;
     }
     if (vm->call_depth + 1 >= VM_CALL_MAX) { error("v3 call stack overflow"); return; }
@@ -1284,6 +1386,9 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         callee->registers[i] = vm_default_value(f->defaults[i - f->min_arity]);
     callee->return_ip   = return_ip;
     callee->dest_reg    = dest_reg;
+    callee->code_offset = f->code_offset;
+    callee->tail_calls_collapsed = 0;
+    callee->synthetic_entry = false;
     vm->call_depth++;   /* the defaults loop above wrote into callee->registers[] BEFORE this point, when mark_vm_roots's 0..call_depth scan didn't yet cover that frame — gc_maybe_collect() must run AFTER this increment, not before, or a collection could reclaim a fresh default array/dict as unreachable */
     gc_maybe_collect(vm);
     vm->registers = vm->call_stack[vm->call_depth].registers;
@@ -1345,14 +1450,14 @@ static inline void vm_packed_slot_write(unsigned char* slot, ValueType ftype, Ae
     memcpy(slot, &v.as, 8);
 }
 
-/* Scans forward from *idx for the next live bucket, returning an owned copy of its key.
-   Shared by array-iteration's dict branch and pair-iteration. False once exhausted. */
+/* Returns an owned copy of dense[*idx]'s key. Shared by array-iteration's dict branch and
+   pair-iteration. False once exhausted -- the dense array has no holes, so this is a plain
+   bounds check, not a scan. */
 static bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
-    while ((uint64_t)*idx < d->map.capacity && !d->map.buckets[*idx].key) (*idx)++;
-    if ((uint64_t)*idx >= d->map.capacity) return false;
-    unsigned int key_len = d->map.buckets[*idx].length;
+    if ((uint64_t)*idx >= d->map.count) return false;
+    unsigned int key_len = d->map.dense[*idx].length;
     char* key_buf = xmalloc(key_len + 1);
-    memcpy(key_buf, d->map.buckets[*idx].key, key_len);
+    memcpy(key_buf, d->map.dense[*idx].key, key_len);
     key_buf[key_len] = '\0';
     *out_key = aer_make_string(key_buf, key_len);   /* no chunk_add_pool interning — see vm_to_str's comment */
     return true;
@@ -1463,14 +1568,14 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count); *out = aer_null(); return; }
         *out = a->items[i]; return;
     } else if (aer_type(obj) == TYPE_DICT) {
-        if (aer_type(idx) != TYPE_STRING) { error("Dict key must be a string"); *out = aer_null(); return; }
+        if (aer_type(idx) != TYPE_STRING) { error("Hashtable key must be a string"); *out = aer_null(); return; }
         AerString* is = aer_as_string(idx);
-        unsigned int klen = is->length;
-        if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); *out = aer_null(); return; }
+        if (is->length > VM_KEY_MAX) { error("Hashtable key too long (max %d bytes)", VM_KEY_MAX); *out = aer_null(); return; }
+        unsigned int klen = hashtable_key_true_len(is->data, is->length);
         char kbuf[VM_KEY_MAX + 1];
         memcpy(kbuf, is->data, klen);
         kbuf[klen] = '\0';
-        AerVal* found = hashtable_get(&aer_as_dict(obj)->map, kbuf);
+        AerVal* found = hashtable_get(&aer_as_dict(obj)->map, kbuf, klen);
         if (!found) { *out = aer_null(); return; }
         *out = *found; return;
     } else if (aer_type(obj) == TYPE_STRING) {
@@ -1501,6 +1606,30 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
     }
 }
 
+/* `a, b = expr` — a genuine Result unpacks to (value, err); a plain 2-element array (not a
+   struct/packed array, both dot-only) unpacks positionally; anything else is treated as (that
+   value, null), the same "not a real Result? just a plain value" duck-typing |> already applies on
+   its own left operand. Lets a function that can never fail just `return value` without fabricating
+   a second one to satisfy this shape. Never allocates -- both branches only copy existing AerVals. */
+static inline void vm_destructure_compute(AerVal src, AerVal* out0, AerVal* out1) {
+    if (aer_type(src) == TYPE_RESULT) {
+        AerResult* r = aer_as_result(src);
+        *out0 = r->value;
+        *out1 = r->err;
+        return;
+    }
+    if (aer_type(src) == TYPE_ARRAY) {
+        AerArray* a = aer_as_array(src);
+        if (!a->shape && a->count == 2) {
+            *out0 = a->items[0];
+            *out1 = a->items[1];
+            return;
+        }
+    }
+    *out0 = src;
+    *out1 = aer_null();
+}
+
 /* Shared by lbl_index_set and the fused index-set handlers -- same dispatch/bounds/errors.
    Caller must DISPATCH() immediately after. */
 static inline void vm_index_set_compute(AerVal obj, AerVal idx, AerVal val) {
@@ -1514,20 +1643,20 @@ static inline void vm_index_set_compute(AerVal obj, AerVal idx, AerVal val) {
         gc_barrier_array(a, val);
         a->items[i] = val;
     } else if (aer_type(obj) == TYPE_DICT) {
-        if (aer_type(idx) != TYPE_STRING) { error("Dict key must be a string"); return; }
+        if (aer_type(idx) != TYPE_STRING) { error("Hashtable key must be a string"); return; }
         AerString* is = aer_as_string(idx);
-        unsigned int klen = is->length;
-        if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); return; }
+        if (is->length > VM_KEY_MAX) { error("Hashtable key too long (max %d bytes)", VM_KEY_MAX); return; }
+        unsigned int klen = hashtable_key_true_len(is->data, is->length);
         char kbuf[VM_KEY_MAX + 1];
         memcpy(kbuf, is->data, klen);
         kbuf[klen] = '\0';
         gc_barrier_dict(aer_as_dict(obj), val);
-        AerVal* existing = hashtable_get(&aer_as_dict(obj)->map, kbuf);
+        AerVal* existing = hashtable_get(&aer_as_dict(obj)->map, kbuf, klen);
         if (existing) {
             *existing = val;   /* update in place — no allocation */
         } else {
-            char* k = hashtable_key_dup(is->data, klen, NULL);
-            hashtable_put(&aer_as_dict(obj)->map, k, val);
+            char* k = hashtable_key_dup(is->data, klen, NULL);   /* klen already true length */
+            hashtable_put(&aer_as_dict(obj)->map, k, klen, val);
         }
     } else if (aer_type(obj) == TYPE_STRING) {
         error("Strings are immutable — cannot assign to an index");
@@ -1718,6 +1847,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_ARRAY_NEW]         = &&lbl_array_new,
         [OP_INDEX_GET]         = &&lbl_index_get,
         [OP_INDEX_SET]         = &&lbl_index_set,
+        [OP_DESTRUCTURE]       = &&lbl_destructure,
         [OP_SLICE_GET]         = &&lbl_slice_get,
         [OP_CHECK_SHAPE]       = &&lbl_check_shape,
         [OP_DICT_NEW]          = &&lbl_dict_new,
@@ -1856,7 +1986,7 @@ lbl_##NAME: { \
         double l = ra->as.d, rv = rb->as.d; \
         REAL_STMT \
     } else { \
-        *result = vm_binary_cold(*ra, *rb, OPENUM, ta, tb); \
+        *result = vm_binary_cold(c, *ra, *rb, OPENUM, ta, tb); \
         gc_maybe_collect(vm); \
     } \
     DISPATCH(); \
@@ -1873,7 +2003,7 @@ lbl_##NAME: { \
         int64_t l = ra->as.i, rv = rb->as.i; \
         INT_STMT \
     } else { \
-        *result = vm_binary_cold(*ra, *rb, OPENUM, ta, tb); \
+        *result = vm_binary_cold(c, *ra, *rb, OPENUM, ta, tb); \
     } \
     DISPATCH(); \
 }
@@ -1936,6 +2066,8 @@ lbl_call: {
         for (int i = 0; i < arg_count; i++)
             vm->registers[i] = vm->registers[arg_reg_base + i];
         ip = (unsigned int)callee_offset;
+        vm->call_stack[vm->call_depth].code_offset = (unsigned int)callee_offset;   /* reused frame now runs a different function */
+        vm->call_stack[vm->call_depth].tail_calls_collapsed++;
         /* Every call (tail or not) is the other place a script can spend unbounded time
            (recursion instead of a loop) -- checked once ip already points at the callee's real
            entry point, so a yield here always resumes at a valid instruction boundary. */
@@ -1954,6 +2086,9 @@ lbl_call: {
         callee->registers[i] = caller->registers[arg_reg_base + i];
     callee->return_ip   = ip;   /* already past this instruction's operands — the correct resume point */
     callee->dest_reg    = dest_reg;
+    callee->code_offset = (unsigned int)callee_offset;
+    callee->tail_calls_collapsed = 0;
+    callee->synthetic_entry = false;
     vm->call_depth++;
     vm->registers = vm->call_stack[vm->call_depth].registers;
     vm->raw_ints  = vm->call_stack[vm->call_depth].raw_ints;
@@ -2101,6 +2236,16 @@ lbl_index_get: {
     DISPATCH();
 }
 
+/* a, b = expr — see vm_destructure_compute. Never allocates, unlike lbl_index_get, so no
+   gc_maybe_collect needed. */
+lbl_destructure: {
+    int t0      = (int)UNPACK_DESTRUCTURE_T0(op_word);
+    int t1      = (int)UNPACK_DESTRUCTURE_T1(op_word);
+    int src_reg = (int)UNPACK_DESTRUCTURE_SRC(op_word);
+    vm_destructure_compute(vm->registers[src_reg], &vm->registers[t0], &vm->registers[t1]);
+    DISPATCH();
+}
+
 /* Includes the internal write barrier, now exercised against a register-held reference. */
 lbl_index_set: {
     int arr_reg = (int)UNPACK_INDEX_SET_ARR(op_word);
@@ -2172,10 +2317,11 @@ lbl_dict_new: {
     for (int i = 0; i < pair_count; i++) {
         AerVal key = vm->registers[pair_reg_base + 2 * i];
         AerVal val = vm->registers[pair_reg_base + 2 * i + 1];
-        if (aer_type(key) != TYPE_STRING) { error("Dict keys must be strings"); continue; }
+        if (aer_type(key) != TYPE_STRING) { error("Hashtable keys must be strings"); continue; }
         AerString* ks = aer_as_string(key);
-        char* k = hashtable_key_dup(ks->data, ks->length, NULL);
-        hashtable_put(&d->map, k, val);
+        unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
+        char* k = hashtable_key_dup(ks->data, klen, NULL);
+        hashtable_put(&d->map, k, klen, val);
     }
     vm->registers[dest_reg] = aer_dict_val(d);
     gc_maybe_collect(vm);   /* pool_alloc(&dict_pool) above; result already rooted */
@@ -2240,7 +2386,7 @@ lbl_iter_next_pair: {
     int end_target    = READ();
     AerVal col = vm->registers[col_reg];
     if (aer_type(col) != TYPE_DICT) {
-        error("for k, v requires a dict");
+        error("for k, v requires a hashtable");
         ip = (unsigned int)end_target;
         DISPATCH();
     }
@@ -2252,7 +2398,7 @@ lbl_iter_next_pair: {
         DISPATCH();
     }
     vm->registers[key_dest_reg] = key;
-    vm->registers[val_dest_reg] = d->map.buckets[idx].payload;
+    vm->registers[val_dest_reg] = d->map.dense[idx].payload;
     vm->registers[idx_reg]      = aer_int(idx + 1);
     gc_maybe_collect(vm);   /* vm_dict_next_key's owned-copy key string allocates */
     DISPATCH();
@@ -2396,7 +2542,7 @@ lbl_binary_field: {
     vm->registers[dest_reg] = vm_binary_fast(*lhs, rhs, bin_op, ta, tb, &handled);
     /* Only needed on the cold path (string concat) -- the fast path never allocates. */
     if (!handled) {
-        vm->registers[dest_reg] = vm_binary_cold(*lhs, rhs, bin_op, ta, tb);
+        vm->registers[dest_reg] = vm_binary_cold(c, *lhs, rhs, bin_op, ta, tb);
         gc_maybe_collect(vm);
     }
     DISPATCH();
@@ -2417,7 +2563,7 @@ lbl_field_binary: {
     bool handled;
     vm->registers[dest_reg] = vm_binary_fast(lhs, *rhs, bin_op, ta, tb, &handled);
     if (!handled) {
-        vm->registers[dest_reg] = vm_binary_cold(lhs, *rhs, bin_op, ta, tb);
+        vm->registers[dest_reg] = vm_binary_cold(c, lhs, *rhs, bin_op, ta, tb);
         gc_maybe_collect(vm);
     }
     DISPATCH();
@@ -2469,7 +2615,7 @@ lbl_packed_array_new: {
         if (ft != TYPE_INTEGER && ft != TYPE_REAL && ft != TYPE_BOOLEAN) {
             const char* got = ft == TYPE_ANY ? "untyped (no annotation)"
                             : ft == TYPE_ARRAY ? "array"
-                            : ft == TYPE_DICT ? "dict" : "string";
+                            : ft == TYPE_DICT ? "hashtable" : "string";
             error("'%s' cannot be packed into an array: field '%s' must be integer/float/boolean, not %s",
                   name, aer_as_string(c->pool[shape->field_names[i]])->data, got);
             DISPATCH();
@@ -2668,7 +2814,7 @@ lbl_raw_mul_int: {
     DISPATCH();
 }
 
-/* Matches OP_DIV's own semantics: int/int division always promotes to real, so this is the one
+/* Matches OP_DIV's own semantics: int/int division always promotes to float, so this is the one
    OP_RAW_*_INT opcode whose dest is raw_reals[], not raw_ints[]. */
 lbl_raw_div_int: {
     int dest = (int)UNPACK_RAW_ARITH_RR_DEST(op_word);
@@ -2834,7 +2980,7 @@ lbl_raw_add_int_boxed: {
     int slot = (int)UNPACK_RAW_ARITH_BOXED_SLOT(op_word);
     int reg  = (int)UNPACK_RAW_ARITH_BOXED_REG(op_word);
     AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag != TYPE_INTEGER) { error("Type mismatch in binary expression"); DISPATCH(); }
+    if (rhs->tag != TYPE_INTEGER) { error("Cannot apply '+=' to integer and %s", vm_type_name(c, *rhs)); DISPATCH(); }
     vm->raw_ints[slot] += rhs->as.i;
     DISPATCH();
 }
@@ -2843,7 +2989,7 @@ lbl_raw_sub_int_boxed: {
     int slot = (int)UNPACK_RAW_ARITH_BOXED_SLOT(op_word);
     int reg  = (int)UNPACK_RAW_ARITH_BOXED_REG(op_word);
     AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag != TYPE_INTEGER) { error("Type mismatch in binary expression"); DISPATCH(); }
+    if (rhs->tag != TYPE_INTEGER) { error("Cannot apply '-=' to integer and %s", vm_type_name(c, *rhs)); DISPATCH(); }
     vm->raw_ints[slot] -= rhs->as.i;
     DISPATCH();
 }
@@ -2852,7 +2998,7 @@ lbl_raw_mul_int_boxed: {
     int slot = (int)UNPACK_RAW_ARITH_BOXED_SLOT(op_word);
     int reg  = (int)UNPACK_RAW_ARITH_BOXED_REG(op_word);
     AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag != TYPE_INTEGER) { error("Type mismatch in binary expression"); DISPATCH(); }
+    if (rhs->tag != TYPE_INTEGER) { error("Cannot apply '*=' to integer and %s", vm_type_name(c, *rhs)); DISPATCH(); }
     vm->raw_ints[slot] *= rhs->as.i;
     DISPATCH();
 }
@@ -2861,7 +3007,7 @@ lbl_raw_add_real_boxed: {
     int slot = (int)UNPACK_RAW_ARITH_BOXED_SLOT(op_word);
     int reg  = (int)UNPACK_RAW_ARITH_BOXED_REG(op_word);
     AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag != TYPE_REAL) { error("Type mismatch in binary expression"); DISPATCH(); }
+    if (rhs->tag != TYPE_REAL) { error("Cannot apply '+=' to float and %s", vm_type_name(c, *rhs)); DISPATCH(); }
     vm->raw_reals[slot] += rhs->as.d;
     DISPATCH();
 }
@@ -2870,7 +3016,7 @@ lbl_raw_sub_real_boxed: {
     int slot = (int)UNPACK_RAW_ARITH_BOXED_SLOT(op_word);
     int reg  = (int)UNPACK_RAW_ARITH_BOXED_REG(op_word);
     AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag != TYPE_REAL) { error("Type mismatch in binary expression"); DISPATCH(); }
+    if (rhs->tag != TYPE_REAL) { error("Cannot apply '-=' to float and %s", vm_type_name(c, *rhs)); DISPATCH(); }
     vm->raw_reals[slot] -= rhs->as.d;
     DISPATCH();
 }
@@ -2879,7 +3025,7 @@ lbl_raw_mul_real_boxed: {
     int slot = (int)UNPACK_RAW_ARITH_BOXED_SLOT(op_word);
     int reg  = (int)UNPACK_RAW_ARITH_BOXED_REG(op_word);
     AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag != TYPE_REAL) { error("Type mismatch in binary expression"); DISPATCH(); }
+    if (rhs->tag != TYPE_REAL) { error("Cannot apply '*=' to float and %s", vm_type_name(c, *rhs)); DISPATCH(); }
     vm->raw_reals[slot] *= rhs->as.d;
     DISPATCH();
 }
@@ -2901,7 +3047,7 @@ lbl_raw_lt_int_boxed: {
     AerVal* rhs = &vm->registers[reg];
     if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_ints[slot] < rhs->as.i);
     else if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool((double)vm->raw_ints[slot] < rhs->as.d);
-    else error("Type mismatch in binary expression");
+    else error("Cannot apply '<' to integer and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
 
@@ -2912,7 +3058,7 @@ lbl_raw_gt_int_boxed: {
     AerVal* rhs = &vm->registers[reg];
     if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_ints[slot] > rhs->as.i);
     else if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool((double)vm->raw_ints[slot] > rhs->as.d);
-    else error("Type mismatch in binary expression");
+    else error("Cannot apply '>' to integer and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
 
@@ -2923,7 +3069,7 @@ lbl_raw_lte_int_boxed: {
     AerVal* rhs = &vm->registers[reg];
     if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_ints[slot] <= rhs->as.i);
     else if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool((double)vm->raw_ints[slot] <= rhs->as.d);
-    else error("Type mismatch in binary expression");
+    else error("Cannot apply '<=' to integer and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
 
@@ -2934,7 +3080,7 @@ lbl_raw_gte_int_boxed: {
     AerVal* rhs = &vm->registers[reg];
     if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_ints[slot] >= rhs->as.i);
     else if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool((double)vm->raw_ints[slot] >= rhs->as.d);
-    else error("Type mismatch in binary expression");
+    else error("Cannot apply '>=' to integer and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
 
@@ -2945,7 +3091,7 @@ lbl_raw_lt_real_boxed: {
     AerVal* rhs = &vm->registers[reg];
     if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool(vm->raw_reals[slot] < rhs->as.d);
     else if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_reals[slot] < (double)rhs->as.i);
-    else error("Type mismatch in binary expression");
+    else error("Cannot apply '<' to float and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
 
@@ -2956,7 +3102,7 @@ lbl_raw_gt_real_boxed: {
     AerVal* rhs = &vm->registers[reg];
     if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool(vm->raw_reals[slot] > rhs->as.d);
     else if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_reals[slot] > (double)rhs->as.i);
-    else error("Type mismatch in binary expression");
+    else error("Cannot apply '>' to float and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
 
@@ -2967,7 +3113,7 @@ lbl_raw_lte_real_boxed: {
     AerVal* rhs = &vm->registers[reg];
     if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool(vm->raw_reals[slot] <= rhs->as.d);
     else if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_reals[slot] <= (double)rhs->as.i);
-    else error("Type mismatch in binary expression");
+    else error("Cannot apply '<=' to float and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
 
@@ -2978,7 +3124,7 @@ lbl_raw_gte_real_boxed: {
     AerVal* rhs = &vm->registers[reg];
     if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool(vm->raw_reals[slot] >= rhs->as.d);
     else if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_reals[slot] >= (double)rhs->as.i);
-    else error("Type mismatch in binary expression");
+    else error("Cannot apply '>=' to float and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
 

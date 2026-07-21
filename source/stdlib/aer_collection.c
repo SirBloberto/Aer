@@ -34,12 +34,12 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         if (aer_type(obj) == TYPE_DICT) {
             if (aer_type(key) != TYPE_STRING) { error("delete() key must be a string"); vm_stack_push(vm, aer_null()); return true; }
             AerString* ks = aer_as_string(key);
-            unsigned int klen = ks->length;
-            if (klen > VM_KEY_MAX) { error("Dict key too long (max %d bytes)", VM_KEY_MAX); vm_stack_push(vm, aer_null()); return true; }
+            if (ks->length > VM_KEY_MAX) { error("Hashtable key too long (max %d bytes)", VM_KEY_MAX); vm_stack_push(vm, aer_null()); return true; }
+            unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
             char kbuf[VM_KEY_MAX + 1];
             memcpy(kbuf, ks->data, klen);
             kbuf[klen] = '\0';
-            hashtable_remove(&aer_as_dict(obj)->map, kbuf);
+            hashtable_remove(&aer_as_dict(obj)->map, kbuf, klen);
             vm_stack_push(vm, obj); return true;
         }
         if (aer_type(obj) == TYPE_ARRAY) {
@@ -53,7 +53,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             a->count--;
             vm_stack_push(vm, obj); return true;
         }
-        error("delete() requires a dict or array");
+        error("delete() requires a hashtable or array");
         vm_stack_push(vm, aer_null()); return true;
     }
     if (fn_id == FN_COLLECTION_COPY && arg_count == 1) {
@@ -72,10 +72,9 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             AerDict* d = aer_as_dict(src);
             AerDict* r = vm_new_dict();
             memset(&r->map, 0, sizeof(r->map));
-            for (unsigned int i = 0; i < d->map.capacity; i++) {
-                if (!d->map.buckets[i].key) continue;
-                char* k = hashtable_key_dup(d->map.buckets[i].key, d->map.buckets[i].length, NULL);
-                hashtable_put(&r->map, k, d->map.buckets[i].payload);
+            for (unsigned int i = 0; i < d->map.count; i++) {
+                char* k = hashtable_key_dup(d->map.dense[i].key, d->map.dense[i].length, NULL);
+                hashtable_put(&r->map, k, d->map.dense[i].length, d->map.dense[i].payload);
             }
             vm_stack_push(vm, aer_dict_val(r)); return true;
         }
@@ -114,18 +113,17 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
     }
     if (fn_id == FN_COLLECTION_KEYS && arg_count == 1) {
         AerVal src = vm_stack_pop(vm);
-        if (aer_type(src) != TYPE_DICT) { error("keys() requires a dict"); vm_stack_push(vm, aer_null()); return true; }
+        if (aer_type(src) != TYPE_DICT) { error("keys() requires a hashtable"); vm_stack_push(vm, aer_null()); return true; }
         AerDict* d = aer_as_dict(src);
         AerArray* r = vm_new_array();
         r->count    = 0;
         r->capacity = d->map.count ? d->map.count : 4;
         r->items    = xmalloc(sizeof(AerVal) * r->capacity);
         r->shape    = NULL;
-        for (unsigned int i = 0; i < d->map.capacity; i++) {
-            if (!d->map.buckets[i].key) continue;
-            unsigned int n = d->map.buckets[i].length;
+        for (unsigned int i = 0; i < d->map.count; i++) {
+            unsigned int n = d->map.dense[i].length;
             char* buf = xmalloc(n + 1);
-            memcpy(buf, d->map.buckets[i].key, n);
+            memcpy(buf, d->map.dense[i].key, n);
             buf[n] = '\0';
             r->items[r->count++] = aer_make_string(buf, n);
         }

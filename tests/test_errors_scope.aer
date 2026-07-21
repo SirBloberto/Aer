@@ -16,7 +16,7 @@ function safe_div(a, b):
     return a / b, null
 
 result3, err = safe_div(10, 2)
-assert(err == null && result3 == 5, "safe_div succeeds when the divisor isn't zero")
+assert(err == null and result3 == 5, "safe_div succeeds when the divisor isn't zero")
 
 result3, err = safe_div(10, 0)
 assert(err == "division by zero", "safe_div returns an error message when the divisor is zero")
@@ -49,7 +49,7 @@ function read_it(v):
 assert(read_it(outer) == 10, "the value has to be passed in explicitly; a function has no ambient access to it")
 
 # To update shared state from inside a function, mutate something you were explicitly
-# given a reference to (a struct/array/dict), not a bare name — see the Scope section
+# given a reference to (a struct/array/hashtable), not a bare name — see the Scope section
 # of the README.
 struct Counter:
     value = 0

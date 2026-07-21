@@ -37,6 +37,15 @@ extern unsigned int assert_failure_count;
 /* Source-line lookup for runtime errors; NULL or a 0 return means "unknown", no line prefix. */
 extern unsigned int (*runtime_line_lookup)(void);
 
+/* Source filename for the currently-running chunk; NULL means unknown. */
+extern const char* (*runtime_filename_lookup)(void);
+
+/* Name of the function the current frame is executing; NULL at top level. */
+extern const char* (*runtime_function_lookup)(void);
+
+/* Appends "called from ..." trace lines into `out`; returns bytes written. */
+extern unsigned int (*runtime_stack_trace_lookup)(char* out, unsigned int out_size);
+
 void error(const char* format, ...) __attribute__((cold));
 void error_at(const char* format, ...) __attribute__((cold));
 

@@ -18,7 +18,7 @@ import net
 # Port 1 is a reserved/privileged port practically guaranteed to have nothing listening on
 # localhost in any test environment — connect() must fail with a Result, not hang or crash.
 handle, err = net.connect("127.0.0.1", 1)
-assert(handle == null && err != null, "connect() to a closed port returns Result(null, an error message), not a crash or a hang")
+assert(handle == null and err != null, "connect() to a closed port returns Result(null, an error message), not a crash or a hang")
 assert(type(err) == "string", "connect()'s error is a string message")
 
 # Wrong-argument-type cases (connect(123, 80), send() with a non-handle, etc.) can't be asserted

@@ -92,7 +92,18 @@ check(result is not None, "go-to-definition on a call to a real function returns
 if result:
     check(result["range"]["start"]["line"] == 0, "go-to-definition points at line 0, where 'function add(...)' is declared")
 
-# 6. shutdown / exit
+# 6. completion detail flags a function containing raise as "may fail", and leaves one that
+# doesn't with no detail at all.
+RAISE_SOURCE = "function risky(n):\n    if n < 0:\n        raise \"bad\"\n    return n\n\nfunction safe(n):\n    return n + 1\n"
+send("textDocument/didOpen", {"textDocument": {"uri": "file:///raise.aer", "text": RAISE_SOURCE}})
+recv()  # publishDiagnostics
+send("textDocument/completion", {"textDocument": {"uri": "file:///raise.aer"}, "position": {"line": 6, "character": 0}}, msg_id=5)
+comp2 = recv()
+by_label = {item["label"]: item for item in comp2.get("result", [])}
+check(by_label.get("risky", {}).get("detail") == "may fail", "a function containing raise is flagged 'may fail' in completion")
+check("detail" not in by_label.get("safe", {}), "a function with no raise anywhere gets no such detail")
+
+# 7. shutdown / exit
 send("shutdown", {}, msg_id=4)
 resp = recv()
 check(resp.get("id") == 4, "shutdown responds")

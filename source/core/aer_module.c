@@ -152,6 +152,7 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
     Chunk* mchunk = xmalloc(sizeof(Chunk));
     VM*    mvm    = xmalloc(sizeof(VM));
     chunk_init(mchunk);
+    mchunk->source_filename = xstrdup(path);
     vm_init(mvm, mchunk);
 
     read_file(path);

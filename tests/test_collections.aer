@@ -1,6 +1,6 @@
 #!/usr/bin/env aer
 import collection
-# AER test suite — arrays, dicts, and nested collections.
+# AER test suite — arrays, hashtables, and nested collections.
 # Machine-checked via assert(): a clean run exits 0; any failure prints
 # "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
 
@@ -13,18 +13,18 @@ assert(arr[0] == 10, "array indexing")
 assert(arr[-1] == 30, "negative array indexing")
 
 arr[1] = 99
-assert(arr[0] == 10 && arr[1] == 99 && arr[2] == 30, "array index assignment")
+assert(arr[0] == 10 and arr[1] == 99 and arr[2] == 30, "array index assignment")
 
 collection.append(arr, 40)
-assert(length(arr) == 4 && arr[3] == 40, "append adds to the end and updates length")
+assert(length(arr) == 4 and arr[3] == 40, "append adds to the end and updates length")
 
 # collection.delete(arr, index) removes by index, shifting subsequent elements down to
 # preserve order — negative indices work the same as bracket indexing.
 collection.delete(arr, 1)                        # removes 99
-assert(length(arr) == 3 && arr[0] == 10 && arr[1] == 30 && arr[2] == 40, "delete by index shifts subsequent elements down")
+assert(length(arr) == 3 and arr[0] == 10 and arr[1] == 30 and arr[2] == 40, "delete by index shifts subsequent elements down")
 
 collection.delete(arr, -1)                       # removes the last element (40)
-assert(length(arr) == 2 && arr[0] == 10 && arr[1] == 30, "collection.delete(-1) removes the last element — no separate pop() needed")
+assert(length(arr) == 2 and arr[0] == 10 and arr[1] == 30, "collection.delete(-1) removes the last element — no separate pop() needed")
 
 # collection.append()/collection.delete() both mutate in place and also return the array; the
 # return value is only useful if you don't already have a reference to it.
@@ -32,9 +32,9 @@ assert(length(arr) == 2 && arr[0] == 10 && arr[1] == 30, "collection.delete(-1) 
 
 # Slicing — [a:b], [a:], [:b], [:] — always returns a new array
 nums2 = [0, 1, 2, 3, 4, 5]
-assert(nums2[1:4][0] == 1 && nums2[1:4][1] == 2 && nums2[1:4][2] == 3 && length(nums2[1:4]) == 3, "array slice [a:b]")
-assert(length(nums2[3:]) == 3 && nums2[3:][0] == 3, "array slice [a:]")
-assert(length(nums2[:3]) == 3 && nums2[:3][0] == 0, "array slice [:b]")
+assert(nums2[1:4][0] == 1 and nums2[1:4][1] == 2 and nums2[1:4][2] == 3 and length(nums2[1:4]) == 3, "array slice [a:b]")
+assert(length(nums2[3:]) == 3 and nums2[3:][0] == 3, "array slice [a:]")
+assert(length(nums2[:3]) == 3 and nums2[:3][0] == 0, "array slice [:b]")
 assert(length(nums2[:]) == 6, "array slice [:] copies the whole array")
 
 # Arrays have reference semantics — assignment copies the reference
@@ -60,34 +60,34 @@ else:
 assert(empty_arr_label == "falsy", "empty array is falsy")
 
 # ------------------------------------------------------------------ #
-# 14. Dicts                                                            #
+# 14. Hashtables                                                            #
 # ------------------------------------------------------------------ #
 
 d = {"x": 1, "y": 2}
-assert(d["x"] == 1, "dict indexing")
+assert(d["x"] == 1, "hashtable indexing")
 assert(d["missing"] == null, "missing key returns null, not an error")
 
 d["z"] = 3
-assert("z" in d, "dict key assignment")
-assert(length(d) == 3, "dict length after assignment")
+assert("z" in d, "hashtable key assignment")
+assert(length(d) == 3, "hashtable length after assignment")
 
 collection.delete(d, "y")
-assert(!("y" in d), "delete removes a dict key")
+assert(not "y" in d, "delete removes a hashtable key")
 
-# Dicts have reference semantics
+# Hashtables have reference semantics
 d1 = {"a": 1}
 d2 = d1
 d2["a"] = 99
-assert(d1["a"] == 99, "dicts are references — mutating d2 also mutates d1")
+assert(d1["a"] == 99, "hashtables are references — mutating d2 also mutates d1")
 
-# Truthiness: empty dict is falsy
+# Truthiness: empty hashtable is falsy
 empty_dict = {}
 empty_dict_label = "unset"
 if empty_dict:
     empty_dict_label = "truthy"
 else:
     empty_dict_label = "falsy"
-assert(empty_dict_label == "falsy", "empty dict is falsy")
+assert(empty_dict_label == "falsy", "empty hashtable is falsy")
 
 # ------------------------------------------------------------------ #
 # 15. Nested collections                                               #
@@ -98,14 +98,14 @@ assert(matrix[0][1] == 2, "nested array indexing")
 assert(matrix[1][0] == 3, "nested array indexing")
 
 matrix[0][1] = 99                    # chained index assignment
-assert(matrix[0][0] == 1 && matrix[0][1] == 99, "chained nested index assignment")
+assert(matrix[0][0] == 1 and matrix[0][1] == 99, "chained nested index assignment")
 
 record = {"name": "Alice", "scores": [100, 95, 88]}
-assert(record["scores"][0] == 100, "dict containing an array")
-assert(record["scores"][-1] == 88, "dict containing an array, negative index")
+assert(record["scores"][0] == 100, "hashtable containing an array")
+assert(record["scores"][-1] == 88, "hashtable containing an array, negative index")
 
 nested = {"a": {"b": {"c": 42}}}
-assert(nested["a"]["b"]["c"] == 42, "deeply nested dicts")
+assert(nested["a"]["b"]["c"] == 42, "deeply nested hashtables")
 
 # ------------------------------------------------------------------ #
 # 16. collection module — copy, insert, index_of, keys, sort           #
@@ -114,22 +114,22 @@ assert(nested["a"]["b"]["c"] == 42, "deeply nested dicts")
 orig = [1, 2, 3]
 copied = collection.copy(orig)
 copied[0] = 99
-assert(orig[0] == 1 && copied[0] == 99, "collection.copy(array) is a real copy — mutating it leaves the original alone")
+assert(orig[0] == 1 and copied[0] == 99, "collection.copy(array) is a real copy — mutating it leaves the original alone")
 assert(length(copied) == 3, "collection.copy(array) preserves length")
 
 orig_d = {"x": 1, "y": 2}
 copied_d = collection.copy(orig_d)
 copied_d["x"] = 99
-assert(orig_d["x"] == 1 && copied_d["x"] == 99, "collection.copy(dict) is a real copy")
-assert(length(copied_d) == 2 && copied_d["y"] == 2, "collection.copy(dict) preserves every entry")
+assert(orig_d["x"] == 1 and copied_d["x"] == 99, "collection.copy(hashtable) is a real copy")
+assert(length(copied_d) == 2 and copied_d["y"] == 2, "collection.copy(hashtable) preserves every entry")
 
 ins = [1, 3]
 collection.insert(ins, 1, 2)
-assert(length(ins) == 3 && ins[0] == 1 && ins[1] == 2 && ins[2] == 3, "collection.insert() places the value at the index, shifting the rest up")
+assert(length(ins) == 3 and ins[0] == 1 and ins[1] == 2 and ins[2] == 3, "collection.insert() places the value at the index, shifting the rest up")
 collection.insert(ins, 3, 4)
 assert(ins[3] == 4, "collection.insert() at index == length appends")
 collection.insert(ins, 0, 0)
-assert(ins[0] == 0 && ins[4] == 4, "collection.insert() at 0 prepends")
+assert(ins[0] == 0 and ins[4] == 4, "collection.insert() at 0 prepends")
 
 haystack = ["a", "b", "c", "b"]
 assert(collection.index_of(haystack, "b") == 1, "collection.index_of() returns the first match's index")
@@ -137,10 +137,10 @@ assert(collection.index_of(haystack, "z") == -1, "collection.index_of() returns 
 
 key_dict = {"beta": 2, "alpha": 1}
 key_list = collection.sort(collection.keys(key_dict))
-assert(length(key_list) == 2 && key_list[0] == "alpha" && key_list[1] == "beta",
-       "collection.keys() returns every key — sorted here since dict order is hash-bucket order")
+assert(length(key_list) == 2 and key_list[0] == "alpha" and key_list[1] == "beta",
+       "collection.keys() returns every key — sorted here since hashtable iteration order is unspecified")
 
 sorted_here = collection.sort([3, 1, 2])
-assert(sorted_here[0] == 1 && sorted_here[2] == 3, "collection.sort() on numbers (moved from math.sort)")
+assert(sorted_here[0] == 1 and sorted_here[2] == 3, "collection.sort() on numbers (moved from math.sort)")
 
 print("test_collections.aer: all assertions passed.")

@@ -92,7 +92,7 @@
     "cast": {
       "patterns": [
         {
-          "match": "\\b(as)\\b\\s*\\b(integer|real|string|boolean)\\b",
+          "match": "\\b(as)\\b\\s*\\b(integer|float|string|boolean)\\b",
           "captures": {
             "1": { "name": "keyword.operator.word.aer" },
             "2": { "name": "support.type.aer" }
@@ -140,7 +140,7 @@
       "patterns": [
         {
           "name": "keyword.control.aer",
-          "match": "\\b(if|else|for|return|break|continue)\\b"
+          "match": "\\b(if|else|for|return|raise|break|continue)\\b"
         },
         {
           "name": "keyword.control.import.aer",
@@ -152,7 +152,11 @@
         },
         {
           "name": "keyword.operator.word.aer",
-          "match": "\\b(in|as)\\b"
+          "match": "\\b(in|as|and|or|not)\\b"
+        },
+        {
+          "name": "storage.type.aer",
+          "match": "\\b(integer|float|boolean|array|hashtable)\\b"
         }
       ]
     },
@@ -182,10 +186,6 @@
         {
           "name": "keyword.operator.comparison.aer",
           "match": "(==|!=|<=|>=|<|>)"
-        },
-        {
-          "name": "keyword.operator.logical.aer",
-          "match": "(&&|\\|\\||!)"
         },
         {
           "name": "keyword.operator.pipe.aer",

@@ -52,13 +52,13 @@ function run_battle(hero, villain):
     for round_num in 1..30:
         villain = battle_round(hero, villain, round_num)
         result["rounds"] = round_num
-        if !is_alive(villain):
+        if not is_alive(villain):
             result["winner"] = hero.name
             break
 
         hero = battle_round(villain, hero, round_num)
         result["rounds"] = round_num
-        if !is_alive(hero):
+        if not is_alive(hero):
             result["winner"] = villain.name
             break
 

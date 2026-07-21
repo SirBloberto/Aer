@@ -247,15 +247,19 @@ static void publish_diagnostics(const char* uri) {
 /* (comments/whitespace don't matter here, unlike aer_fmt.c)            */
 /* ------------------------------------------------------------------ */
 
-typedef struct { char name[128]; unsigned int line; bool is_struct; } Symbol;
+typedef struct { char name[128]; unsigned int line; bool is_struct; bool may_fail; } Symbol;
 static Symbol symbols[512];
 static int    symbol_count;
 
+/* Named functions can't nest (parser.c), so the next function/struct declaration always marks the
+   end of the current one's body -- a raise anywhere between one declaration and the next is
+   attributed to it. Coarse and token-based like the rest of this scan, not a real symbol table. */
 static void scan_symbols(const char* text) {
     symbol_count = 0;
     shell((char*)text);
     lex();
     TokenType prev_type = TOKEN_END_OF_FILE;
+    int current_fn_index = -1;
     while (token.type != TOKEN_END_OF_FILE && symbol_count < 512) {
         if ((prev_type == TOKEN_FUNCTION || prev_type == TOKEN_STRUCT) && token.type == TOKEN_IDENTIFIER) {
             AerString* s = aer_as_string(token.value);
@@ -264,7 +268,11 @@ static void scan_symbols(const char* text) {
             symbols[symbol_count].name[n] = '\0';
             symbols[symbol_count].line = current_source_line();
             symbols[symbol_count].is_struct = (prev_type == TOKEN_STRUCT);
+            symbols[symbol_count].may_fail = false;
+            current_fn_index = symbols[symbol_count].is_struct ? -1 : symbol_count;
             symbol_count++;
+        } else if (token.type == TOKEN_RAISE && current_fn_index >= 0) {
+            symbols[current_fn_index].may_fail = true;
         }
         prev_type = token.type;
         lex();
@@ -412,7 +420,10 @@ static void handle_completion(const char* msg) {
         for (int i = 0; i < symbol_count; i++) {
             if (!first) APPEND(",");
             first = false;
-            APPEND("{\"label\":\"%s\",\"kind\":%d}", symbols[i].name, symbols[i].is_struct ? 7 : 3);
+            if (symbols[i].may_fail)
+                APPEND("{\"label\":\"%s\",\"kind\":%d,\"detail\":\"may fail\"}", symbols[i].name, symbols[i].is_struct ? 7 : 3);
+            else
+                APPEND("{\"label\":\"%s\",\"kind\":%d}", symbols[i].name, symbols[i].is_struct ? 7 : 3);
         }
     }
     APPEND("]}");

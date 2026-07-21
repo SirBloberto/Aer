@@ -85,6 +85,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* Single-word packed family — special-cased in disassemble_one like OP_BINARY. */
     [OP_INDEX_GET] = { "OP_INDEX_GET", "reg = reg[rk]", {FLD_REG, FLD_REG, FLD_RK}, false, 3 },
     [OP_INDEX_SET] = { "OP_INDEX_SET", "reg[rk] = rk", {FLD_REG, FLD_RK, FLD_RK}, false, 3 },
+    [OP_DESTRUCTURE] = { "OP_DESTRUCTURE", "reg, reg = destructure(reg)", {FLD_REG, FLD_REG, FLD_REG}, false, 3 },
     [OP_SLICE_GET] = { "OP_SLICE_GET", "reg = reg[rk:rk]", {FLD_REG, FLD_REG, FLD_RK, FLD_RK}, false, 4 },
     [OP_CHECK_SHAPE] = { "OP_CHECK_SHAPE", "reg = check_shape(reg, type)", {FLD_REG, FLD_REG, FLD_NAME}, false, 3 },
     [OP_DICT_NEW]  = { "OP_DICT_NEW",  "reg = new dict from contiguous key/value reg pairs", {FLD_REG, FLD_REG, FLD_COUNT}, false, 3 },
@@ -238,7 +239,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         int field_count = (int)c->code[pos++];
         fprintf(out, "  name=%s fields=%d [", aer_as_string(c->pool[name_idx])->data, field_count);
         static const char* const field_type_names[] = {
-            "null", "boolean", "integer", "real", "string", "function", "array", "dict"
+            "null", "boolean", "integer", "float", "string", "function", "array", "hashtable"
         };
         for (int i = 0; i < field_count; i++) {
             int fname_idx    = (int)c->code[pos++];
@@ -261,6 +262,10 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG, (int)UNPACK_INDEX_GET_DEST(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_INDEX_GET_ARR(op_word));
         print_rk9(out, c, UNPACK_INDEX_GET_RK(op_word));
+    } else if (op == OP_DESTRUCTURE) {
+        print_field(out, c, FLD_REG, (int)UNPACK_DESTRUCTURE_T0(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_DESTRUCTURE_T1(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_DESTRUCTURE_SRC(op_word));
     } else if (op == OP_FIELD_GET) {
         print_field(out, c, FLD_REG,  (int)UNPACK_FIELD_GET_DEST(op_word));
         print_field(out, c, FLD_REG,  (int)UNPACK_FIELD_GET_STRUCT(op_word));

@@ -19,14 +19,14 @@ assert(type(handle) == "integer", "spawn() returns an integer handle")
 # ------------------------------------------------------------------ #
 
 result, call_err = actor.call(handle, "add", 3, 4)
-assert(call_err == null && result == 7, "call() runs the actor's function and returns its result")
+assert(call_err == null and result == 7, "call() runs the actor's function and returns its result")
 
 crash_result, crash_err = actor.call(handle, "crash")
-assert(crash_result == null && crash_err != null, "call() reports a Result error when the actor's own code errors, isolated to that actor")
+assert(crash_result == null and crash_err != null, "call() reports a Result error when the actor's own code errors, isolated to that actor")
 
 # The actor is still usable after one of its calls errored — isolation, not a dead VM.
 still_alive, still_err = actor.call(handle, "add", 10, 20)
-assert(still_err == null && still_alive == 30, "an actor keeps working after a previous call of its own errored")
+assert(still_err == null and still_alive == 30, "an actor keeps working after a previous call of its own errored")
 
 # ------------------------------------------------------------------ #
 # actor.send / actor.receive — a plain host-side mailbox               #

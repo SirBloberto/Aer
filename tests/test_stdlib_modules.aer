@@ -17,33 +17,33 @@ assert(math.pow(2, 10) == 1024, "math.pow")
 assert(math.floor(3.7) == 3, "math.floor")
 assert(math.ceil(3.2) == 4, "math.ceil")
 assert(math.abs(-5) == 5, "math.abs on an integer")
-assert(math.abs(-5.5) == 5.5, "math.abs on a real")
+assert(math.abs(-5.5) == 5.5, "math.abs on a float")
 assert(math.min(3, 7) == 3, "math.min")
 assert(math.max(3, 7) == 7, "math.max")
 
 sorted_nums = collection.sort([5, 3, 8, 1, 9, 2])
-assert(sorted_nums[0] == 1 && sorted_nums[1] == 2 && sorted_nums[5] == 9, "collection.sort on numbers, ascending")
+assert(sorted_nums[0] == 1 and sorted_nums[1] == 2 and sorted_nums[5] == 9, "collection.sort on numbers, ascending")
 
 sorted_words = collection.sort(["banana", "apple", "cherry"])
-assert(sorted_words[0] == "apple" && sorted_words[1] == "banana" && sorted_words[2] == "cherry", "collection.sort on strings, lexicographic")
+assert(sorted_words[0] == "apple" and sorted_words[1] == "banana" and sorted_words[2] == "cherry", "collection.sort on strings, lexicographic")
 
 assert(math.sin(0) == 0, "math.sin(0)")
 assert(math.cos(0) == 1, "math.cos(0)")
 assert(math.log(1) == 0, "math.log(1) — natural log")
 assert(math.log2(8) == 3, "math.log2(8)")
 assert(math.log10(1000) == 3, "math.log10(1000)")
-assert(math.round(2.5) == 3 && math.round(2.4) == 2, "math.round() rounds to nearest integer")
+assert(math.round(2.5) == 3 and math.round(2.4) == 2, "math.round() rounds to nearest integer")
 assert(math.round(-2.5) == -3, "math.round() rounds negative halves away from zero, not toward zero")
 assert(math.tan(0) == 0, "math.tan(0)")
 assert(math.exp(0) == 1, "math.exp(0)")
-assert(math.exp(1) > 2.718 && math.exp(1) < 2.719, "math.exp(1) is e")
-assert(math.pi() > 3.14 && math.pi() < 3.15, "math.pi() is a function, not a bare module value")
+assert(math.exp(1) > 2.718 and math.exp(1) < 2.719, "math.exp(1) is e")
+assert(math.pi() > 3.14 and math.pi() < 3.15, "math.pi() is a function, not a bare module value")
 
 r = random.random()
-assert(r >= 0.0 && r < 1.0, "random.random() is in [0, 1)")
+assert(r >= 0.0 and r < 1.0, "random.random() is in [0, 1)")
 
 ri = random.randint(1, 6)
-assert(ri >= 1 && ri <= 6, "random.randint(1, 6) is in [1, 6]")
+assert(ri >= 1 and ri <= 6, "random.randint(1, 6) is in [1, 6]")
 
 # random.seed() reseeds the RNG — the only way to prove it worked is that
 # two sequences started from the same seed agree.
@@ -64,7 +64,7 @@ assert(randint_saw_high, "random.randint() reaches the full requested range, not
 
 choice_pool = [10, 20, 30]
 chosen = random.choice(choice_pool)
-assert(chosen == 10 || chosen == 20 || chosen == 30, "random.choice() returns one of the array's own elements")
+assert(chosen == 10 or chosen == 20 or chosen == 30, "random.choice() returns one of the array's own elements")
 
 shuffle_arr = [1, 2, 3, 4, 5, 6, 7, 8]
 random.shuffle(shuffle_arr)
@@ -84,19 +84,19 @@ assert("hello" |> string.upper() == "HELLO", "pipe operator can target a module-
 assert(string.lower("HELLO") == "hello", "string.lower")
 assert(string.trim("  padded  ") == "padded", "string.trim")
 assert(string.contains("hello world", "wor"), "string.contains — match")
-assert(!string.contains("hello world", "xyz"), "string.contains — no match")
+assert(not string.contains("hello world", "xyz"), "string.contains — no match")
 assert(string.index_of("hello world", "wor") == 6, "string.index_of — position of the first match")
 assert(string.index_of("hello world", "xyz") == -1, "string.index_of — -1 when absent")
 assert(string.index_of("aXbXc", "X") == 1, "string.index_of — first of several matches")
 
 split_result = string.split("a,b,c", ",")
-assert(length(split_result) == 3 && split_result[0] == "a" && split_result[2] == "c", "string.split")
+assert(length(split_result) == 3 and split_result[0] == "a" and split_result[2] == "c", "string.split")
 assert(string.join(["a", "b", "c"], "-") == "a-b-c", "string.join")
 
 assert(string.starts_with("hello world", "hello"), "string.starts_with — match")
-assert(!string.starts_with("hello world", "world"), "string.starts_with — no match")
+assert(not string.starts_with("hello world", "world"), "string.starts_with — no match")
 assert(string.ends_with("hello world", "world"), "string.ends_with — match")
-assert(!string.ends_with("hello world", "hello"), "string.ends_with — no match")
+assert(not string.ends_with("hello world", "hello"), "string.ends_with — no match")
 assert(string.repeat("ab", 3) == "ababab", "string.repeat")
 assert(string.repeat("x", 0) == "", "string.repeat with count 0 is empty")
 assert(string.replace("foo bar foo", "foo", "baz") == "baz bar baz", "string.replace — multiple matches")
@@ -201,25 +201,25 @@ write_result, write_err = io.write(scratch_path, "hello from AER\nsecond line")
 assert(write_err == null, "io.write() succeeds and returns no error")
 
 contents, read_err = io.read(scratch_path)
-assert(read_err == null && contents == "hello from AER\nsecond line",
+assert(read_err == null and contents == "hello from AER\nsecond line",
        "io.read() returns exactly what was written")
 
 missing_contents, missing_err = io.read("tests/definitely_does_not_exist.txt")
-assert(missing_contents == null && missing_err != null,
+assert(missing_contents == null and missing_err != null,
        "io.read() on a nonexistent file returns a null value and a non-null error")
 
 append_result, append_err = io.append(scratch_path, "\nthird line")
 assert(append_err == null, "io.append() succeeds and returns no error")
 appended_contents, appended_read_err = io.read(scratch_path)
-assert(appended_read_err == null && appended_contents == "hello from AER\nsecond line\nthird line",
+assert(appended_read_err == null and appended_contents == "hello from AER\nsecond line\nthird line",
        "io.append() adds to the end of an existing file rather than truncating it")
 
 assert(io.exists(scratch_path), "io.exists() is true for a file that was just written")
-assert(!io.exists("tests/definitely_does_not_exist.txt"), "io.exists() is false for a missing path — an answer, not an error")
+assert(not io.exists("tests/definitely_does_not_exist.txt"), "io.exists() is false for a missing path — an answer, not an error")
 
 remove_result, remove_err = io.remove(scratch_path)
 assert(remove_err == null, "io.remove() deletes an existing file without error")
-assert(!io.exists(scratch_path), "the removed file is really gone")
+assert(not io.exists(scratch_path), "the removed file is really gone")
 missing_remove, missing_remove_err = io.remove(scratch_path)
 assert(missing_remove_err != null, "io.remove() on a now-missing path reports an error through the Result, not an abort")
 
@@ -238,32 +238,30 @@ assert(json.encode(true) == "true", "json.encode(true)")
 assert(json.encode(42) == "42", "json.encode() on an integer")
 assert(json.encode("hi") == "\"hi\"", "json.encode() on a plain string")
 
-# A whole-number real must round-trip as a real, not silently become an integer -- json.encode()
-# used to emit a bare "5" for 5.0 (plain "%g" formatting drops the decimal point), and
-# json.decode()'s own number parser only recognizes a token as real if it contains '.'/'e', so
-# the type flipped on the way back in. Fixed by guaranteeing the encoded text always shows a
-# decimal point (see aer_format_real, vm.c).
-assert(json.encode(5.0) == "5.0", "json.encode() on a whole-number real keeps its decimal point")
+# A whole-number float must round-trip as a float, not silently become an integer: json.encode()
+# always shows a decimal point, and json.decode()'s number parser recognizes a token as a float
+# only if it contains '.'/'e'.
+assert(json.encode(5.0) == "5.0", "json.encode() on a whole-number float keeps its decimal point")
 whole_float_json = json.encode({"price": 5.0})
 decoded_price, price_err = json.decode(whole_float_json)
-assert(price_err == null && type(decoded_price["price"]) == "real" && decoded_price["price"] == 5.0,
-       "json.encode()/decode() round-trips a whole-number real as a real, not an integer")
+assert(price_err == null and type(decoded_price["price"]) == "float" and decoded_price["price"] == 5.0,
+       "json.encode()/decode() round-trips a whole-number float as a float, not an integer")
 
 arr_json = json.encode([1, 2, "three", true, null])
 assert(arr_json == "[1,2,\"three\",true,null]", "json.encode() on a mixed array")
 
 decoded_arr, arr_err = json.decode(arr_json)
 assert(arr_err == null, "json.decode() on a well-formed array has no error")
-assert(decoded_arr[0] == 1 && decoded_arr[2] == "three" && decoded_arr[3] == true && decoded_arr[4] == null,
+assert(decoded_arr[0] == 1 and decoded_arr[2] == "three" and decoded_arr[3] == true and decoded_arr[4] == null,
        "json.decode() round-trips a mixed array exactly")
 
 dict_json = json.encode({"a": 1})
 decoded_dict, dict_err = json.decode(dict_json)
-assert(dict_err == null && decoded_dict["a"] == 1, "json.encode()/decode() round-trips a plain dict as a JSON object")
+assert(dict_err == null and decoded_dict["a"] == 1, "json.encode()/decode() round-trips a plain hashtable as a JSON object")
 
 # A struct instance encodes as a JSON object keyed by its field names, not
 # as a bare positional array — the distinction called out in the plan: a
-# struct is structurally a dict on the wire, so it decodes back as one
+# struct is structurally a hashtable on the wire, so it decodes back as one
 # (AER has no way to know which struct type a plain JSON object came from).
 struct JsonPoint:
     x = 0
@@ -274,17 +272,17 @@ point_json = json.encode(point)
 assert(point_json == "\{\"x\":3,\"y\":4}", "json.encode() encodes a struct instance as a JSON object using its field names")
 
 decoded_point, point_err = json.decode(point_json)
-assert(point_err == null && decoded_point["x"] == 3 && decoded_point["y"] == 4,
-       "json.decode() reads a struct-shaped JSON object back as a plain dict")
+assert(point_err == null and decoded_point["x"] == 3 and decoded_point["y"] == 4,
+       "json.decode() reads a struct-shaped JSON object back as a plain hashtable")
 
 # Escaping — quotes, backslashes, and control characters all round-trip.
 escaped = json.encode("line1\nline2\t\"quoted\"")
 decoded_str, str_err = json.decode(escaped)
-assert(str_err == null && decoded_str == "line1\nline2\t\"quoted\"", "json.encode()/decode() round-trips escaped characters exactly")
+assert(str_err == null and decoded_str == "line1\nline2\t\"quoted\"", "json.encode()/decode() round-trips escaped characters exactly")
 
 # Malformed input reports an error instead of aborting the script, matching
 # every other fallible stdlib function's (value, err) convention.
 bad_value, bad_err = json.decode("[1, 2,")
-assert(bad_value == null && bad_err != null, "json.decode() on malformed input returns (null, error) rather than crashing")
+assert(bad_value == null and bad_err != null, "json.decode() on malformed input returns (null, error) rather than crashing")
 
 print("test_stdlib_modules.aer: all assertions passed.")
