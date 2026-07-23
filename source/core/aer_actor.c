@@ -142,10 +142,3 @@ void aer_actor_free_all(void) {
     while (actors) aer_actor_free(actors);
 }
 
-bool aer_actor_get(unsigned int index, VM** out_vm, Chunk** out_chunk) {
-    Actor* a = actors;
-    for (unsigned int i = 0; a; i++, a = a->next) {
-        if (i == index) { *out_vm = a->vm; *out_chunk = a->chunk; return true; }
-    }
-    return false;
-}

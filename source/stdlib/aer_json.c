@@ -35,7 +35,7 @@ static void json_encode_string(StrBuf* b, const char* s, unsigned int len) {
     strbuf_append_char(b, '"');
 }
 
-/* Returns false (error() already called) for a function or packed-array value — everything else succeeds. A struct instance (AerArray with a shape) encodes as a JSON object keyed by field names, so they survive a round trip via json.decode(). */
+/* Returns false (error() already called) for a function or packed-array value — everything else succeeds. A struct instance encodes as a JSON object keyed by field names, so they survive a round trip via json.decode(). */
 static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
     char tmp[64];
     switch (aer_type(v)) {
@@ -53,25 +53,26 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
             return false;
         case TYPE_ARRAY: {
             AerArray* a = aer_as_array(v);
-            if (a->shape) {
-                Shape* shape = a->shape;
-                strbuf_append_char(b, '{');
-                for (unsigned int i = 0; i < shape->field_count; i++) {
-                    if (i > 0) strbuf_append_char(b, ',');
-                    AerString* fname = aer_as_string(c->pool[shape->field_names[i]]);
-                    json_encode_string(b, fname->data, fname->length);
-                    strbuf_append_char(b, ':');
-                    if (!json_encode_value(c, a->items[i], b)) return false;
-                }
-                strbuf_append_char(b, '}');
-                break;
-            }
             strbuf_append_char(b, '[');
             for (unsigned int i = 0; i < a->count; i++) {
                 if (i > 0) strbuf_append_char(b, ',');
                 if (!json_encode_value(c, a->items[i], b)) return false;
             }
             strbuf_append_char(b, ']');
+            break;
+        }
+        case TYPE_STRUCT: {
+            AerStruct* s = aer_as_struct(v);
+            Shape* shape = s->shape;
+            strbuf_append_char(b, '{');
+            for (unsigned int i = 0; i < shape->field_count; i++) {
+                if (i > 0) strbuf_append_char(b, ',');
+                AerString* fname = aer_as_string(c->pool[shape->field_names[i]]);
+                json_encode_string(b, fname->data, fname->length);
+                strbuf_append_char(b, ':');
+                if (!json_encode_value(c, vm_struct_field_read(s, i), b)) return false;
+            }
+            strbuf_append_char(b, '}');
             break;
         }
         case TYPE_DICT: {
@@ -250,7 +251,6 @@ static AerVal json_parse_array(JsonParser* p) {
 static AerVal json_parse_object(JsonParser* p) {
     p->pos++;   /* '{' */
     AerDict* d = vm_new_dict();
-    memset(&d->map, 0, sizeof(d->map));
 
     json_skip_ws(p);
     if (p->pos < p->len && p->s[p->pos] == '}') { p->pos++; return aer_dict_val(d); }
@@ -271,7 +271,7 @@ static AerVal json_parse_object(JsonParser* p) {
         if (p->err) return aer_null();
 
         unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
-        char* k = hashtable_key_dup(ks->data, klen, NULL);
+        char* k = hashtable_key_dup(d->map.pools, ks->data, klen, NULL);
         hashtable_put(&d->map, k, klen, val);
 
         json_skip_ws(p);

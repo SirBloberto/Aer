@@ -325,6 +325,18 @@ int main(void) {
     check(aer_assert_failure_count() == 0,
           "a failed fused index-get did not corrupt the array or leave the VM in a bad state");
 
+    /* TYPE_STRUCT split: `for x in <struct>:` has no bracket/slice/append/delete-style guard of
+       its own -- worth a direct check that it's a clean rejection ("only supports arrays, dicts,
+       and strings", the same message every other unsupported-collection-type error already uses)
+       rather than silently iterating a struct's fields the way it did before the split. Can't be
+       checked from a .aer test file for the same MODE_RUN-aborts-on-error reason as the fused
+       index-get case just above. */
+    aer_clear_error();
+    ok = aer_run_source(&vm, &chunk,
+        "struct ForInStruct:\n    a = 1\n    b = 2\nfis_s = ForInStruct()\nfor fis_x in fis_s:\n    fis_x = fis_x\n");
+    check(!ok && aer_had_error() && strstr(aer_last_error(), "only supports arrays, dicts, and strings") != NULL,
+          "'for x in <struct>:' is a clean, reported error, not a silent iteration over its fields");
+
     /* A malformed `for` while-condition (found by tests/fuzz.py) used to still compile into
        a real, infinite back-edge loop despite the reported error. Can't be tested from a
        normal .aer file (the hang IS the bug) — here we just confirm the call returns. */
@@ -415,15 +427,84 @@ int main(void) {
           "fixed-dispatch modules like math are unaffected by --no-import — only file-based import is gated");
 
     /* aer_module_free_all — searchpath_helper (loaded earlier via AER_PATH) proves there's
-       something in the registry to tear down; aer_module_get(0, ...) going from true to
-       false is the actual proof of reclamation, not just that the process exits cleanly. */
-    VM* mod_vm; Chunk* mod_chunk;
-    check(aer_module_get(0, &mod_vm, &mod_chunk), "a file-module is registered before teardown");
+       something in the registry to tear down; a real aer_module_call() succeeding, then failing
+       to resolve at all once the registry is cleared, is the actual proof of reclamation, not
+       just that the process exits cleanly. */
+    vm_stack_push(&vm, aer_int(5));
+    bool call_ok = aer_module_call(&vm, "searchpath_helper", "quadruple", 1);
+    AerVal call_result = call_ok ? vm_stack_pop(&vm) : aer_null();
+    check(call_ok && aer_type(call_result) == TYPE_INTEGER && aer_as_int(call_result) == 20,
+          "a file-module is registered before teardown");
     aer_module_free_all();
-    check(!aer_module_get(0, &mod_vm, &mod_chunk), "aer_module_free_all() actually clears the module registry");
+    vm_stack_push(&vm, aer_int(5));
+    check(!aer_module_call(&vm, "searchpath_helper", "quadruple", 1),
+          "aer_module_free_all() actually clears the module registry");
+    vm_stack_pop(&vm);   /* aer_module_call left the pushed argument on the stack when it returned false */
 
     vm_free(&vm);
     chunk_free(&chunk);
+
+    /* Per-VM heap isolation — two independent VM/Chunk pairs; heavy allocation in one must not
+       inflate the other's own live-cell count. This is the actual proof heaps are independent,
+       not just that nothing crashes: under the old shared-heap design both VMs' live_cells would
+       have risen together, since there was only ever one shared set of pools. */
+    {
+        Chunk chunk_a, chunk_b;
+        VM vm_a, vm_b;
+        chunk_init(&chunk_a); vm_init(&vm_a, &chunk_a);
+        chunk_init(&chunk_b); vm_init(&vm_b, &chunk_b);
+
+        vm_set_current_heap(&vm_b.heap);
+        unsigned int live_b_before;
+        aer_gc_stats(&live_b_before, NULL, NULL);
+
+        aer_clear_error();
+        bool iso_ok = aer_run_source(&vm_a, &chunk_a, "for i in 0..5000:\n    temp = [i, i * 2, i * 3]\n");
+
+        vm_set_current_heap(&vm_a.heap);
+        unsigned int live_a;
+        aer_gc_stats(&live_a, NULL, NULL);
+
+        vm_set_current_heap(&vm_b.heap);
+        unsigned int live_b_after;
+        aer_gc_stats(&live_b_after, NULL, NULL);
+
+        check(iso_ok, "the heavy-allocation script on vm_a ran to completion without error");
+        /* vm_a's own heap actually did the work (a real collection ran, keeping this bounded --
+           same assertion shape as the earlier single-VM GC test). */
+        check(live_a < 2000, "vm_a's own live cell count reflects its allocation, collected down same as any single VM");
+        check(live_b_before == live_b_after,
+              "vm_b's live cell count is completely unchanged by vm_a's allocation — the two heaps never touched each other");
+
+        vm_free(&vm_a);
+        chunk_free(&chunk_a);
+        vm_free(&vm_b);
+        chunk_free(&chunk_b);
+    }
+
+    /* Repeated vm_init()+run+vm_free() cycles, mirroring source/tools/aer_lsp.c's
+       run_diagnostics() — a fresh Chunk+VM per request, used once, then discarded. vm_free() used
+       to be a complete no-op, so every one of these cycles permanently grew the shared pools
+       forever in a long-running host process (the LSP server). It's real work now
+       (pool_finalize_all + pool_destroy per heap) — this proves hundreds of real init+run+free
+       cycles complete cleanly rather than crashing or corrupting, the actual risk surface a
+       previously-untested vm_free() introduces. */
+    {
+        bool cycles_ok = true;
+        for (int iter = 0; iter < 500 && cycles_ok; iter++) {
+            Chunk c;
+            VM v;
+            chunk_init(&c);
+            vm_init(&v, &c);
+            aer_clear_error();
+            cycles_ok = aer_run_source(&v, &c,
+                "arr = [1, 2, 3]\nd = {\"a\": 1, \"b\": 2}\ns = \"a fresh string literal each cycle\"\n")
+                && !aer_had_error();
+            vm_free(&v);
+            chunk_free(&c);
+        }
+        check(cycles_ok, "500 repeated vm_init()+run+vm_free() cycles (aer_lsp.c's own usage pattern) all complete cleanly");
+    }
 
     if (failures == 0) printf("\nAll embedding smoke tests passed.\n");
     else                printf("\n%d embedding smoke test(s) FAILED.\n", failures);

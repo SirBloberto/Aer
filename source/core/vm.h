@@ -3,6 +3,7 @@
 
 #include "error.h"
 #include "hashtable.h"
+#include "pool.h"
 #include "value.h"
 
 /* gc_state first — see pool.h and AerArray's own comment (value.h) for why. */
@@ -130,6 +131,12 @@ typedef enum {
     OP_INDEX_FIELD_GET, /* operands: dest_reg, obj_reg, field_name_pool_idx, rk_idx */
     OP_INDEX_FIELD_SET, /* operands: obj_reg, field_name_pool_idx, rk_idx, rk_val */
 
+    /* `obj[index].field OP= rk_rhs` — resolves the index+field exactly once (one dispatch), instead
+       of the OP_INDEX_FIELD_GET (read) + OP_INDEX_FIELD_SET (a second, redundant index+field
+       resolution just to write the same slot back) pair this used to compile to. This is the
+       pattern nbody-style code hits constantly (`bodies[j].vx += dx * mi`). */
+    OP_INDEX_FIELD_COMPOUND, /* operands: obj_reg, field_name_pool_idx, rk_idx, bin_op, rk_rhs */
+
     /* unary_op reuses OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR as its tag, like bin_op. */
     OP_UNARY, /* dest_reg, unary_op, rk_operand — also folds OP_TO_STR (interpolation) via vm_to_str */
 
@@ -143,6 +150,13 @@ typedef enum {
 
     /* Mirror for `y.field OP x` — the field is the LEFT operand, so correct for every operator. */
     OP_FIELD_BINARY, /* dest_reg, struct_reg, field_name_pool_idx, bin_op, rk_rhs */
+
+    /* `struct.field OP= rhs` — reads, computes, and writes back in one dispatch, one
+       vm_resolve_field call. Before this existed, the parser emitted OP_FIELD_BINARY (read+compute
+       into a temp) followed by a separate OP_FIELD_SET (a second, redundant field resolution just
+       to write the same field back) -- two inline-cache lookups for one logical operation. Same
+       operand shape as OP_FIELD_BINARY (dest slot unused, no destination register needed). */
+    OP_FIELD_COMPOUND, /* struct_reg, field_name_pool_idx, bin_op, rk_rhs */
 
     /* Shell mode: a bare statement's non-null result is printed. */
     OP_PRINT_REPL, /* operand: src_reg — prints registers[src_reg] unless it's TYPE_NULL */
@@ -485,6 +499,19 @@ typedef enum {
 #define UNPACK_FIELD_BINARY_NAME(word)   (((word) >> 30) & FUSED_FIELD_NAME_MASK)
 #define UNPACK_FIELD_BINARY_RK(word)     (((word) >> 44) & 0xFFFFFULL)
 
+/* Same layout as PACK_FIELD_BINARY (the dest slot is simply unused -- the result writes back into
+   the same field, no destination register needed), just tagged with OP_FIELD_COMPOUND instead. */
+#define PACK_FIELD_COMPOUND(struct_reg, bin_op, field_idx, rk_rhs) \
+    ( ((uint64_t)(OP_FIELD_COMPOUND) & 0xFF) \
+    | (((uint64_t)(struct_reg) & 0x7F) << 15) \
+    | (((uint64_t)(bin_op)     & 0xFF) << 22) \
+    | (((uint64_t)(field_idx) & FUSED_FIELD_NAME_MASK) << 30) \
+    | ((PACK_RK20(rk_rhs) & 0xFFFFFULL) << 44) )
+#define UNPACK_FIELD_COMPOUND_STRUCT(word) (((word) >> 15) & 0x7F)
+#define UNPACK_FIELD_COMPOUND_OP(word)     (((word) >> 22) & 0xFF)
+#define UNPACK_FIELD_COMPOUND_NAME(word)   (((word) >> 30) & FUSED_FIELD_NAME_MASK)
+#define UNPACK_FIELD_COMPOUND_RK(word)     (((word) >> 44) & 0xFFFFFULL)
+
 #define PACK_BINARY_FIELD(dest, struct_reg, bin_op, rk_lhs, field_idx) \
     ( ((uint64_t)(OP_BINARY_FIELD) & 0xFF) \
     | (((uint64_t)(dest)       & 0x7F) << 8) \
@@ -521,6 +548,20 @@ typedef enum {
 #define UNPACK_INDEX_FIELD_SET_FIELD(word) (((word) >> 15) & FUSED_FIELD_NAME_MASK)
 #define UNPACK_INDEX_FIELD_SET_IDX(word)   (((word) >> 29) & 0x1FFULL)
 #define UNPACK_INDEX_FIELD_SET_VAL(word)   (((word) >> 38) & 0x1FFULL)
+
+/* obj(7)+field_idx(14)+rk_idx(RK9)+bin_op(8)+rk_rhs(RK9) = 55 bits + opcode(8), fits one word. */
+#define PACK_INDEX_FIELD_COMPOUND(obj_reg, field_idx, rk_idx, bin_op, rk_rhs) \
+    ( ((uint64_t)(OP_INDEX_FIELD_COMPOUND) & 0xFF) \
+    | (((uint64_t)(obj_reg)   & 0x7F) << 8) \
+    | (((uint64_t)(field_idx) & FUSED_FIELD_NAME_MASK) << 15) \
+    | ((PACK_RK9(rk_idx) & 0x1FFULL) << 29) \
+    | (((uint64_t)(bin_op)    & 0xFFULL) << 38) \
+    | ((PACK_RK9(rk_rhs) & 0x1FFULL) << 46) )
+#define UNPACK_INDEX_FIELD_COMPOUND_OBJ(word)   (((word) >> 8)  & 0x7F)
+#define UNPACK_INDEX_FIELD_COMPOUND_FIELD(word) (((word) >> 15) & FUSED_FIELD_NAME_MASK)
+#define UNPACK_INDEX_FIELD_COMPOUND_IDX(word)   (((word) >> 29) & 0x1FFULL)
+#define UNPACK_INDEX_FIELD_COMPOUND_OP(word)    (((word) >> 38) & 0xFFULL)
+#define UNPACK_INDEX_FIELD_COMPOUND_RHS(word)   (((word) >> 46) & 0x1FFULL)
 
 /* OP_CAST operand values — target type for `x as T` (T=string compiles to OP_TO_STR instead, since that conversion already existed). */
 #define CAST_INTEGER 0
@@ -580,10 +621,12 @@ typedef enum {
 #define FN_STRING_JOIN        9
 #define FN_STRING_INDEX_OF    10
 
-#define FN_TIME_NOW      0
-#define FN_TIME_STRFTIME 1
-#define FN_TIME_SLEEP    2
-#define FN_TIME_PARSE    3
+#define FN_TIME_NOW       0
+#define FN_TIME_STRFTIME  1
+#define FN_TIME_SLEEP     2
+#define FN_TIME_PARSE     3
+#define FN_TIME_TO_PARTS  4
+#define FN_TIME_FROM_PARTS 5
 
 #define FN_JSON_ENCODE 0
 #define FN_JSON_DECODE 1
@@ -600,10 +643,13 @@ typedef enum {
 #define FN_NET_SEND    1
 #define FN_NET_RECV    2
 #define FN_NET_CLOSE   3
+#define FN_NET_LISTEN  4
+#define FN_NET_ACCEPT  5
 
-#define FN_REGEX_MATCH   0
-#define FN_REGEX_FIND    1
-#define FN_REGEX_REPLACE 2
+#define FN_REGEX_MATCH    0
+#define FN_REGEX_FIND     1
+#define FN_REGEX_REPLACE  2
+#define FN_REGEX_FIND_ALL 3
 
 #define FN_ACTOR_SPAWN   0
 #define FN_ACTOR_SEND    1
@@ -624,7 +670,8 @@ typedef enum {
 
 #define MAX_STRUCT_FIELDS 16
 
-/* A struct type's blueprint (field names in order + default literals); individually heap-allocated and never moved/realloc'd, so AerArray.shape pointers stay valid as the shape table grows. */
+/* A struct type's blueprint (field names in order + default literals); individually heap-allocated
+   and never moved/realloc'd, so AerStruct.shape pointers stay valid as the shape table grows. */
 struct Shape {
     unsigned int name;                              /* pool index of the struct's type name */
     unsigned int field_count;
@@ -633,7 +680,36 @@ struct Shape {
     /* TYPE_ANY = no declared type. A declared type is enforced once at FIELD_SET/construction,
        then trusted — the fused opcodes skip the runtime check on that side. */
     ValueType    field_types[MAX_STRUCT_FIELDS];
+    /* Byte offset of each field within an instance's fields buffer (AerStruct.fields) -- a typed
+       field (TYPE_ANY excluded) is stored RAW in 8 bytes (no tag; the type is this Shape's own
+       static knowledge, never read from the instance), an untyped (TYPE_ANY) field stays a full
+       boxed AerVal (16 bytes), since it can hold any value including a reference type the GC must
+       trace. Computed once in OP_DEFINE_STRUCT's handler, right after field_types is known. See
+       vm_struct_field_read/vm_struct_field_write. */
+    unsigned int field_offsets[MAX_STRUCT_FIELDS];
+    unsigned int instance_bytes;   /* total size of the fields buffer -- sum of every field's width above */
 };
+
+/* A single struct instance -- its own type (TYPE_STRUCT), split out from AerArray specifically
+   because sharing one C type/tag for "ordinary array" and "struct instance" meant every site
+   handling TYPE_ARRAY had to remember to ask "but what if this is actually a struct" (one real
+   site didn't -- for-x-in iteration silently walked a struct's fields with no shape check at all).
+   No count/capacity: a struct's field count is always shape->field_count, fixed, never grows --
+   carrying them the way the old shared AerArray design did was already dead weight. */
+struct AerStruct {
+    unsigned char  gc_state;   /* byte 0, same pool.c convention as every other pool-managed type */
+    Shape*         shape;
+    unsigned char* fields;     /* set to (char*)a + sizeof(AerStruct) at construction -- inline in
+                                   the same pool cell, matching AerArray's own items pointer trick */
+};
+_Static_assert(offsetof(struct AerStruct, gc_state) == 0, "pool.c assumes gc_state is byte 0");
+
+/* Reads/writes one struct field at its own byte offset -- raw (untagged, vm_packed_slot_read's
+   scheme) for a typed field, a full boxed AerVal for a TYPE_ANY one. Shared by every struct-field
+   opcode in vm.c plus json.encode's struct-serialization branch (aer_json.c), which is why these
+   aren't file-static. */
+AerVal vm_struct_field_read(AerStruct* s, unsigned int slot);
+void   vm_struct_field_write(AerStruct* s, unsigned int slot, AerVal v);
 
 /* Runtime-visible function registration — outlives the parser tables so cross-module calls
    can find exports by name after compilation (same precedent as chunk->shapes[]). */
@@ -653,10 +729,17 @@ typedef struct {
 /* Flat 64-bit word array: one opcode word (with packed fields) plus optional operand words. */
 /* ------------------------------------------------------------------ */
 
-/* One per-callsite field-cache entry — see Chunk.field_cache's own comment below. */
+/* One per-callsite field-cache entry — see Chunk.field_cache's own comment below. Caches offset
+   and ftype alongside slot, not just slot: both are pure functions of (shape, slot), so once the
+   shape comparison confirms a cache hit, re-deriving them from shape->field_offsets[slot]/
+   field_types[slot] on every single access was a second, avoidable indirection through Shape --
+   this makes a cache hit read them from the entry itself (already touched for the shape check)
+   instead. */
 typedef struct {
-    Shape* shape;
-    int    slot;
+    Shape*       shape;
+    int          slot;
+    unsigned int offset;
+    ValueType    ftype;
 } FieldCacheEntry;
 
 typedef struct {
@@ -703,6 +786,53 @@ typedef struct {
 } Chunk;
 
 /* ------------------------------------------------------------------ */
+/* Per-VM heap — every pool a VM allocates from, plus its own GC state. */
+/* ------------------------------------------------------------------ */
+
+typedef enum { REMEMBERED_ARRAY, REMEMBERED_DICT, REMEMBERED_STRUCT } RememberedKind;
+typedef struct { void* ptr; RememberedKind kind; } RememberedEntry;
+
+/* Explicit growable worklist, not C recursion, since user data structures have no depth limit;
+   pool_mark's "already marked" return terminates cycles correctly. */
+typedef struct {
+    AerVal*      items;
+    unsigned int count, cap;
+} MarkWorklist;
+
+typedef struct {
+    Pool string_pool, array_pool, dict_pool, function_pool, struct_pool, packed_array_pool, result_pool;
+    bool pools_initialized;
+
+    /* Old objects a write barrier caught holding a young reference; entries are only ever
+       added/deduped, never removed, and re-traced as extra roots on every minor collection
+       thereafter. */
+    RememberedEntry* remembered_set;
+    unsigned int     remembered_count, remembered_cap;
+    /* Set once, forever, on the first real collection this heap ever runs -- before that,
+       POOL_OLD can't be set anywhere, so the write barrier is provably a no-op. */
+    bool gc_ever_collected;
+
+    MarkWorklist gc_worklist;
+
+    /* Tuning (overridable via aer_gc_configure()): minor_gc_threshold is total cells allocated
+       across all pools since the last minor GC; major_gc_every_n_minor runs a major pass after
+       that many minor ones. 0 for gc_live_cell_ceiling means unlimited (aer_gc_set_ceiling). */
+    unsigned int minor_gc_threshold, major_gc_every_n_minor, gc_live_cell_ceiling;
+    unsigned int minor_collections_run, major_collections_run, minor_since_major;
+    int          gc_suppress_depth;
+
+    /* Cells allocated since gc_reset_alloc_counts -- gc_maybe_collect checks this against
+       minor_gc_threshold. Was a single process-global counter (pool.c); now one per heap. */
+    unsigned int pool_alloc_count;
+
+    /* Every AerDict this heap owns gets its key/sparse-array storage from here -- was a single
+       process-global HashPools (hashtable.c); now one per heap, same as the 7 GC pools above.
+       Chunk.name_index (no owning VM) uses its own separate, still-process-global HashPools --
+       see vm.c's chunk_name_index_pools. */
+    HashPools dict_hash_pools;
+} VmHeap;
+
+/* ------------------------------------------------------------------ */
 /* Virtual machine                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -734,6 +864,16 @@ typedef struct {
 typedef struct {
     Chunk*       chunk;
     unsigned int ip;
+
+    /* This VM's own heap -- every pool it allocates from, independent of every other VM's. */
+    VmHeap       heap;
+
+    /* Per-VM capability toggles, seeded from the process-wide aer_io_enabled/aer_net_enabled
+       defaults at vm_init AND every aer_run_source call (the REPL/embedding "run more code into an
+       existing VM" entry point) -- see those externs' own comment below for why io/net moved here
+       but import_enabled didn't. */
+    bool         io_enabled;
+    bool         net_enabled;
 
     /* Scratch argument channel for bridging out of the register convention (stdlib/module calls). */
     AerVal       stack[VM_STACK_MAX];
@@ -798,21 +938,30 @@ bool chunk_add_import(Chunk* c, const char* name, unsigned int len,
                        const char* path_name, unsigned int path_len);
 bool chunk_is_imported(Chunk* c, const char* name, unsigned int len);
 
-/* Coarse, process-wide capability toggles -- default true (every prior release's always-on
-   behavior, unchanged unless a host/CLI flag opts out). Plain globals, not per-VM fields, matching
-   this codebase's existing style for exactly this kind of runtime policy flag (parse_had_error,
-   runtime_had_error, mode, error.h) -- there's no current scenario needing different VMs in the
-   same process to see different capabilities, and import_enabled specifically is checked at parse
-   time (chunk_add_import), before any particular VM is even necessarily in the picture. Set via
-   aer_set_io_enabled()/aer_set_net_enabled()/aer_set_import_enabled() (include/aer.h), not
-   directly. This is a blast-radius limiter, not a real permission system -- see the README's
-   Sandboxing note. */
+/* Process-wide capability DEFAULTS -- default true (every prior release's always-on behavior,
+   unchanged unless a host/CLI flag opts out). io/net are only defaults now: vm_init copies them
+   into VM.io_enabled/net_enabled at creation, and aer_net_call/the io dispatch case in vm_run_slice
+   check the per-VM field, not these globals directly -- so two VMs in the same process can now run
+   with different io/net capabilities (a plugin host running an untrusted script alongside a
+   trusted one, say). import_enabled stays a real, directly-checked global: chunk_add_import() runs
+   at PARSE time with only a Chunk* in scope, no VM* at all (the same "Chunk has no owning VM"
+   situation the hashtable pools hit) -- giving it the same per-VM treatment would need routing
+   through current_heap-style "current VM" plumbing for a check that fires once per import
+   statement, not worth it for that. Set via aer_set_io_enabled()/aer_set_net_enabled()/
+   aer_set_import_enabled() (include/aer.h), not directly. This is a blast-radius limiter, not a
+   real permission system -- see the README's Sandboxing note. */
 extern bool aer_io_enabled;
 extern bool aer_net_enabled;
 extern bool aer_import_enabled;
 
 void vm_init(VM* vm, Chunk* chunk);
 void vm_free(VM* vm);
+
+/* Save/restore around a nested vm_init() on a fresh VM while the caller's own execution is paused
+   on the C call stack (aer_module.c's aer_vm_instantiate_from_file) -- see vm_current_heap's own
+   comment in vm.c for why vm_run_slice's save/restore alone isn't enough here. */
+VmHeap* vm_current_heap(void);
+void    vm_set_current_heap(VmHeap* heap);
 
 /* Runs from vm->ip to OP_HALT or runtime error (returns false). A host reusing the VM after
    a false return must reset stack_top/call_depth first — see main.c's run(). */
@@ -831,8 +980,11 @@ typedef enum {
    way vm_run already resumes from wherever vm->ip points (main.c's REPL already relies on this). */
 VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions);
 
-/* A counter, not a flag — imports nest, and during a nested import's run the outer chunk
-   isn't in any root set yet. */
+/* A counter, not a flag — imports/module-calls nest. Operates on whichever heap is current (see
+   vm.c's current_heap); each VM now collects only its own independent heap, so this no longer
+   guards against one VM's collection reaching into another's not-yet-rooted state (structurally
+   impossible now, separate heaps) — aer_module.c's two call sites predate that split and are kept
+   as harmless no-ops rather than removed speculatively. */
 void vm_gc_suppress(void);
 void vm_gc_unsuppress(void);
 
@@ -850,7 +1002,12 @@ AerDict* vm_new_dict(void);
 /* Generational-GC write barrier — any store of `new_value` into an already-existing array must go
    through this (see gc_barrier_array's own comment, vm.c). Exposed for aer_collection.c's
    append/insert; a freshly built, not-yet-returned array needs no barrier. */
-void gc_barrier_array(AerArray* a, AerVal new_value);
+void gc_barrier_array(VM* vm, AerArray* a, AerVal new_value);
+
+/* Same contract as gc_barrier_array, for a struct field-set -- AerStruct is its own type/pool now,
+   not a shaped AerArray, so it needs its own barrier rather than gc_barrier_array's old
+   shape-ternary dispatch. */
+void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value);
 
 /* Structural/reference equality with no error path (see its comment in vm.c) — exposed for
    aer_collection.c's index_of, the same scan OP_IN's array case uses. */

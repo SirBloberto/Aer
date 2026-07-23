@@ -154,7 +154,7 @@ static void unregister_socket(unsigned int id) {
 }
 
 bool aer_net_call(VM* vm, int fn_id, int arg_count) {
-    if (!aer_net_enabled) {
+    if (!vm->net_enabled) {
         for (int i = 0; i < arg_count; i++) vm_stack_pop(vm);
         error("net is disabled for this run (--no-net)");
         vm_stack_push(vm, aer_null());
@@ -278,6 +278,84 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
         sock_close(s);
         unregister_socket((unsigned int)aer_as_int(handle_v));
         vm_stack_push(vm, aer_null());
+        return true;
+    }
+
+    if (fn_id == FN_NET_LISTEN && arg_count == 1) {
+        AerVal port_v = vm_stack_pop(vm);
+        if (aer_type(port_v) != TYPE_INTEGER) {
+            error("net.listen() requires an integer port");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        ensure_socket_layer();
+
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%lld", (long long)aer_as_int(port_v));
+
+        /* IPv4 only, not AF_UNSPEC -- an AF_UNSPEC+AI_PASSIVE lookup can resolve to the IPv6
+           wildcard first, and Windows binds that IPv6-only by default, silently refusing IPv4
+           clients (e.g. net.connect("127.0.0.1", ...)). Forcing IPv4 keeps this deterministic and
+           matches every other net-facing test in this codebase, which already targets 127.0.0.1. */
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags    = AI_PASSIVE;
+        struct addrinfo* res = NULL;
+        int gai = getaddrinfo(NULL, port_str, &hints, &res);
+        if (gai != 0) {
+            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(gai_strerror(gai))));
+            return true;
+        }
+
+        sock_t s = SOCK_INVALID;
+        for (struct addrinfo* p = res; p; p = p->ai_next) {
+            s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+            if (s == SOCK_INVALID) continue;
+            int yes = 1;
+            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+            if (bind(s, p->ai_addr, (socklen_t)p->ai_addrlen) == 0 && listen(s, 16) == 0) break;
+            sock_close(s);
+            s = SOCK_INVALID;
+        }
+        freeaddrinfo(res);
+        if (s == SOCK_INVALID) {
+            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
+            return true;
+        }
+        vm_stack_push(vm, aer_make_result(aer_int((int64_t)register_socket(s)), aer_null()));
+        return true;
+    }
+
+    if (fn_id == FN_NET_ACCEPT && arg_count == 1) {
+        AerVal handle_v = vm_stack_pop(vm);
+        if (aer_type(handle_v) != TYPE_INTEGER) {
+            error("net.accept() requires a listening handle");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        sock_t s;
+        if (!resolve_socket(handle_v, &s)) {
+            error("net.accept(): no such connection handle");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        /* Bounded, not indefinite: an unbounded accept() would freeze the whole cooperative
+           scheduler, not just this actor -- a server script polls by calling accept() again on a
+           timeout, exactly like a client script retries connect(). */
+        if (!wait_ready(s, false, NET_TIMEOUT_SECONDS)) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "net.accept() timed out after %ds", NET_TIMEOUT_SECONDS);
+            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
+            return true;
+        }
+        sock_t conn = accept(s, NULL, NULL);
+        if (conn == SOCK_INVALID) {
+            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
+            return true;
+        }
+        vm_stack_push(vm, aer_make_result(aer_int((int64_t)register_socket(conn)), aer_null()));
         return true;
     }
 

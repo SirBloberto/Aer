@@ -1,15 +1,37 @@
 #!/usr/bin/env aer
 import net
-# AER test suite — net module: blocking TCP connect/send/recv/close.
+# AER test suite — net module: blocking TCP connect/send/recv/close/listen/accept.
 # Machine-checked via assert(): a clean run exits 0; any failure prints
 # "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
 #
-# net has no listen()/accept() (deliberately out of scope — this module covers being a CLIENT,
-# not a server), so there's no way to stand up a live peer inside this self-contained suite. The
-# happy path (connect/send/recv/close against a real listening socket) was verified manually
-# instead — see this feature's own PR/commit for the round-trip proof. What IS testable here
-# without a live server: clean Result-based failure on a connection that can't succeed, and
-# argument validation on every function, matching every other stdlib module's own coverage shape.
+# listen()/accept() let this file stand up a real peer (both sides of a loopback connection) inside
+# the same self-contained script — no separate process needed. accept()'s own timeout path (no
+# client ever connects) really does wait out NET_TIMEOUT_SECONDS (10s), so it's verified manually
+# rather than folded into this suite — adding a guaranteed 10-second wait to every regression run
+# isn't worth it for a case this manual check already covers.
+
+# ------------------------------------------------------------------ #
+# net.listen/accept/connect/send/recv — a full loopback round trip     #
+# ------------------------------------------------------------------ #
+
+listen_handle, listen_err = net.listen(58732)
+assert(listen_err == null, "net.listen() on a free port succeeds")
+
+client_handle, connect_err = net.connect("127.0.0.1", 58732)
+assert(connect_err == null, "net.connect() to our own listening socket succeeds")
+
+server_handle, accept_err = net.accept(listen_handle)
+assert(accept_err == null, "net.accept() returns a connected peer handle once a client has connected")
+
+sent, send_err = net.send(client_handle, "ping")
+assert(send_err == null and sent == 4, "net.send() reports the number of bytes sent")
+
+received, recv_err = net.recv(server_handle, 64)
+assert(recv_err == null and received == "ping", "net.recv() on the accepted side reads exactly what the client sent")
+
+net.close(client_handle)
+net.close(server_handle)
+net.close(listen_handle)
 
 # ------------------------------------------------------------------ #
 # net.connect — a definitely-closed local port fails cleanly           #
