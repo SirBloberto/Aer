@@ -15,72 +15,9 @@
 #include "strbuf.h"
 #include "vm.h"
 
-/* Whichever VM's heap is currently active -- set by vm_init(), saved/restored around vm_run_slice
-   exactly like active_vm_for_errors below (same nested-call shape, same fix). Routes every
-   allocation call that has no VM* in scope (the lexer, parts of the parser, which build pooled
-   values before/while a Chunk's own VM exists) to the right heap with no signature changes to the
-   lexer/parser themselves, since vm_init always runs before parsing starts for the Chunk it owns
-   (confirmed: aer_module.c's aer_vm_instantiate_from_file calls vm_init before parse()). */
-static VmHeap* current_heap = NULL;
-
-/* Fallback for the one case with no VM at all yet in the whole process (e.g. a host calling
-   aer_gc_configure() before ever creating a VM) -- lazily promoted to current_heap so nothing
-   dereferences NULL. Mirrors the defensiveness the old vm_pools_init_once() guard already had. */
-static VmHeap bootstrap_heap = {0};
-
-static VmHeap* require_current_heap(void) {
-    if (!current_heap) current_heap = &bootstrap_heap;
-    return current_heap;
-}
-
-/* Exposed so a caller that's about to vm_init() a NESTED VM while its own execution is paused on
-   the C call stack (aer_vm_instantiate_from_file: a file-module import, or an actor spawn) can
-   save the heap that was active before that nested vm_init unconditionally overwrites it, and
-   restore it once the nested VM's compile+run cycle is done -- vm_run_slice's own save/restore
-   only brackets vm_run() itself, not the vm_init()+parse() that happens before it, which is where
-   current_heap first gets clobbered. Without this, allocations made by the OUTER VM after a nested
-   import returns would keep landing in the nested VM's heap: a live object only reachable from the
-   outer VM's registers, invisible to the nested VM's own (now-independent) GC roots, silently
-   collected out from under it -- the exact heap corruption this was written to prevent. */
-VmHeap* vm_current_heap(void)          { return current_heap; }
-void    vm_set_current_heap(VmHeap* h) { current_heap = h; }
-
-/* Tuning defaults every freshly-initialized heap inherits -- process-wide mutable state, not
-   hardcoded constants, specifically so aer_gc_configure()/aer_gc_set_ceiling() keep working when
-   called BEFORE any VM exists yet (a real, previously-supported pattern: configure once, then
-   create VMs that pick it up). aer_gc_configure/set_ceiling update these AND current_heap's own
-   live fields, so both "configure ahead of time" and "reconfigure an already-running VM" work. */
-static unsigned int default_minor_gc_threshold     = 2048;
-static unsigned int default_major_gc_every_n_minor = 10;
-static unsigned int default_gc_live_cell_ceiling   = 0;   /* 0 = unlimited */
-
-/* Initializes one heap's pools -- called once per VM (vm_init), not once per process, since every
-   VM now owns its own. */
-static void vm_heap_init(VmHeap* heap) {
-    if (heap->pools_initialized) return;
-    pool_init(&heap->string_pool,   sizeof(AerString),   256);
-    pool_init(&heap->array_pool,    sizeof(AerArray),    256);
-    pool_init(&heap->dict_pool,     sizeof(AerDict),      64);
-    pool_init(&heap->function_pool, sizeof(AerFunction),  64);
-    pool_init(&heap->struct_pool,   sizeof(AerStruct) + MAX_STRUCT_FIELDS * sizeof(AerVal), 64);
-    pool_init(&heap->packed_array_pool, sizeof(AerPackedArray), 64);
-    pool_init(&heap->result_pool,   sizeof(AerResult),   64);
-    hashtable_pools_init(&heap->dict_hash_pools);
-    heap->minor_gc_threshold     = default_minor_gc_threshold;
-    heap->major_gc_every_n_minor = default_major_gc_every_n_minor;
-    heap->gc_live_cell_ceiling   = default_gc_live_cell_ceiling;
-    heap->pools_initialized = true;
-}
-
-/* Every allocation from one of a heap's 7 GC-managed pools goes through here instead of calling
-   pool_alloc directly, so heap->pool_alloc_count (gc_maybe_collect's trigger) stays accurate --
-   this replaces the single process-global counter pool_alloc itself used to keep before pools were
-   per-VM. Centralized here rather than at each of the ~10 call sites so there's exactly one place
-   that can get this wrong, not ten. */
-static void* heap_alloc(VmHeap* heap, Pool* p) {
-    heap->pool_alloc_count++;
-    return pool_alloc(p);
-}
+/* Slab pools for heap types confirmed (via every free() site) to never be freed individually — alloc-speed only. Guarded since vm_init() reruns per VM/module import and would otherwise leak slabs. */
+static Pool string_pool, array_pool, dict_pool, function_pool, struct_pool, packed_array_pool, result_pool;
+static bool pools_initialized = false;
 
 /* A struct instance's field count never changes, so header+items are one allocation, sized
    for the MAX_STRUCT_FIELDS worst case (Pool needs a uniform cell size). */
@@ -113,164 +50,154 @@ static inline AerVal* vm_rk_ptr9(VM* vm, AerVal* const_pool, uint32_t rk) {
     return &vm->registers[rk & RK9_INDEX_MASK];
 }
 
+static void vm_pools_init_once(void) {
+    if (pools_initialized) return;
+    pool_init(&string_pool,   sizeof(AerString),   256);
+    pool_init(&array_pool,    sizeof(AerArray),    256);
+    pool_init(&dict_pool,     sizeof(AerDict),      64);
+    pool_init(&function_pool, sizeof(AerFunction),  64);
+    pool_init(&struct_pool,   sizeof(AerArray) + MAX_STRUCT_FIELDS * sizeof(AerVal), 64);
+    pool_init(&packed_array_pool, sizeof(AerPackedArray), 64);
+    pool_init(&result_pool,   sizeof(AerResult),   64);
+    hashtable_pools_init_once();
+    pools_initialized = true;
+}
+
 /* ------------------------------------------------------------------ */
 /* Generational GC — write barrier and remembered set                   */
 /* ------------------------------------------------------------------ */
 
 /* True if v's own pooled cell is young; null/boolean/real (and inline integers) have no cell, so they're trivially "not young". */
-static bool value_is_young(VmHeap* heap, AerVal v) {
+static bool value_is_young(AerVal v) {
     switch (aer_type(v)) {
-        case TYPE_STRING:   return pool_is_young(&heap->string_pool,   aer_as_string(v));
-        case TYPE_ARRAY:    return pool_is_young(&heap->array_pool,    aer_as_array(v));
-        case TYPE_STRUCT:   return pool_is_young(&heap->struct_pool,   aer_as_struct(v));
-        case TYPE_DICT:     return pool_is_young(&heap->dict_pool,     aer_as_dict(v));
-        case TYPE_FUNCTION: return pool_is_young(&heap->function_pool, aer_as_function(v));
-        case TYPE_PACKED_ARRAY: return pool_is_young(&heap->packed_array_pool, aer_as_packed_array(v));
-        case TYPE_RESULT:   return pool_is_young(&heap->result_pool,   aer_as_result(v));
+        case TYPE_STRING:   return pool_is_young(&string_pool,   aer_as_string(v));
+        case TYPE_ARRAY:    return pool_is_young(&array_pool,    aer_as_array(v));
+        case TYPE_DICT:     return pool_is_young(&dict_pool,     aer_as_dict(v));
+        case TYPE_FUNCTION: return pool_is_young(&function_pool, aer_as_function(v));
+        case TYPE_PACKED_ARRAY: return pool_is_young(&packed_array_pool, aer_as_packed_array(v));
+        case TYPE_RESULT:   return pool_is_young(&result_pool,   aer_as_result(v));
         default:            return false;   /* null/boolean/integer/float have no heap cell — integers are never boxed under the tagged representation */
     }
 }
 
+typedef enum { REMEMBERED_ARRAY, REMEMBERED_DICT, REMEMBERED_STRUCT } RememberedKind;
+typedef struct { void* ptr; RememberedKind kind; } RememberedEntry;
+
+/* Old objects a write barrier caught holding a young reference; entries are only ever added/deduped, never removed, and re-traced as extra roots on every minor collection thereafter. */
+static RememberedEntry* remembered_set   = NULL;
+static unsigned int     remembered_count = 0;
+static unsigned int     remembered_cap   = 0;
+
 /* Pool for a remembered pointer's kind, so gc_remember can dedup via its cell's REMEMBERED bit (O(1)) instead of scanning remembered_set. */
-static Pool* remembered_pool_for(VmHeap* heap, void* ptr, RememberedKind kind) {
+static Pool* remembered_pool_for(void* ptr, RememberedKind kind) {
     (void)ptr;
     switch (kind) {
-        case REMEMBERED_ARRAY:  return &heap->array_pool;
-        case REMEMBERED_DICT:   return &heap->dict_pool;
-        case REMEMBERED_STRUCT: return &heap->struct_pool;
+        case REMEMBERED_ARRAY:  return &array_pool;
+        case REMEMBERED_DICT:   return &dict_pool;
+        case REMEMBERED_STRUCT: return &struct_pool;
     }
     return NULL;
 }
 
-static void gc_remember(VmHeap* heap, void* ptr, RememberedKind kind) {
-    Pool* p = remembered_pool_for(heap, ptr, kind);
+static void gc_remember(void* ptr, RememberedKind kind) {
+    Pool* p = remembered_pool_for(ptr, kind);
     if (p) {
         if (pool_is_remembered(p, ptr)) return;   /* already remembered */
         pool_mark_remembered(p, ptr);
     } else {
-        for (unsigned int i = 0; i < heap->remembered_count; i++)
-            if (heap->remembered_set[i].ptr == ptr) return;   /* already remembered */
+        for (unsigned int i = 0; i < remembered_count; i++)
+            if (remembered_set[i].ptr == ptr) return;   /* already remembered */
     }
-    if (heap->remembered_count >= heap->remembered_cap) {
-        heap->remembered_cap = heap->remembered_cap ? heap->remembered_cap * 2 : 64;
-        heap->remembered_set = xrealloc(heap->remembered_set, sizeof(RememberedEntry) * heap->remembered_cap);
+    if (remembered_count >= remembered_cap) {
+        remembered_cap = remembered_cap ? remembered_cap * 2 : 64;
+        remembered_set = xrealloc(remembered_set, sizeof(RememberedEntry) * remembered_cap);
     }
-    heap->remembered_set[heap->remembered_count].ptr  = ptr;
-    heap->remembered_set[heap->remembered_count].kind = kind;
-    heap->remembered_count++;
+    remembered_set[remembered_count].ptr  = ptr;
+    remembered_set[remembered_count].kind = kind;
+    remembered_count++;
 }
 
-/* Array write barrier (index-assign, append). */
-void gc_barrier_array(VM* vm, AerArray* a, AerVal new_value) {
-    VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
-    if (pool_is_young(&heap->array_pool, a)) return;   /* young containers are re-traced normally next cycle */
-    if (!value_is_young(heap, new_value)) return;
-    gc_remember(heap, a, REMEMBERED_ARRAY);
-}
+/* Set once, forever, on the first real collection -- before that, POOL_OLD can't be set
+   anywhere, so the write barrier is provably a no-op. */
+static bool gc_ever_collected = false;
 
-/* Struct field-set write barrier -- AerStruct is its own type/pool now, not a shaped AerArray, so
-   it needs its own barrier instead of gc_barrier_array's old shape-ternary dispatch. Only ever
-   needs to consider TYPE_ANY fields in practice (a raw typed field can never hold a reference the
-   GC must trace), but the caller doesn't need to know that -- value_is_young already returns false
-   for a primitive regardless. */
-void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value) {
-    VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected) return;
-    if (pool_is_young(&heap->struct_pool, s)) return;
-    if (!value_is_young(heap, new_value)) return;
-    gc_remember(heap, s, REMEMBERED_STRUCT);
+/* Array write barrier (index-assign, append, struct field-set -- a struct is struct_pool-backed,
+   not array_pool). */
+void gc_barrier_array(AerArray* a, AerVal new_value) {
+    if (!gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
+    Pool* p = a->shape ? &struct_pool : &array_pool;
+    if (pool_is_young(p, a)) return;   /* young containers are re-traced normally next cycle */
+    if (!value_is_young(new_value)) return;
+    gc_remember(a, a->shape ? REMEMBERED_STRUCT : REMEMBERED_ARRAY);
 }
 
 /* Dict entry write barrier (update-in-place and new-entry paths). */
-static void gc_barrier_dict(VM* vm, AerDict* d, AerVal new_value) {
-    VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
-    if (pool_is_young(&heap->dict_pool, d)) return;
-    if (!value_is_young(heap, new_value)) return;
-    gc_remember(heap, d, REMEMBERED_DICT);
+static void gc_barrier_dict(AerDict* d, AerVal new_value) {
+    if (!gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
+    if (pool_is_young(&dict_pool, d)) return;
+    if (!value_is_young(new_value)) return;
+    gc_remember(d, REMEMBERED_DICT);
 }
 
 /* ------------------------------------------------------------------ */
 /* Generational GC — mark phase                                        */
 /* ------------------------------------------------------------------ */
 
-/* null/boolean/integer/float reference no heap cell (integers are never boxed under the tagged
-   representation) -- filtering them out here, once, means every caller (register/stack roots,
-   array/dict/result contents) skips the push+later pop-and-dispatch for them, instead of each
-   caller needing its own check. Matters most for a large numeric-valued dict/array: without this,
-   every entry gets pushed and popped every single GC cycle for nothing. */
-static bool value_has_cell(AerVal v) {
-    switch (aer_type(v)) {
-        case TYPE_STRING: case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_DICT: case TYPE_FUNCTION:
-        case TYPE_PACKED_ARRAY: case TYPE_RESULT:
-            return true;
-        default:
-            return false;
-    }
-}
+/* Explicit growable worklist, not C recursion, since user data structures have no depth limit; pool_mark's "already marked" return terminates cycles correctly. */
+typedef struct {
+    AerVal*      items;
+    unsigned int count, cap;
+} MarkWorklist;
 
-static void worklist_push(VmHeap* heap, AerVal v) {
-    if (!value_has_cell(v)) return;
-    MarkWorklist* wl = &heap->gc_worklist;
-    if (wl->count >= wl->cap) {
-        wl->cap   = wl->cap ? wl->cap * 2 : 256;
-        wl->items = xrealloc(wl->items, sizeof(AerVal) * wl->cap);
+static MarkWorklist gc_worklist = {0};
+
+static void worklist_push(AerVal v) {
+    if (gc_worklist.count >= gc_worklist.cap) {
+        gc_worklist.cap   = gc_worklist.cap ? gc_worklist.cap * 2 : 256;
+        gc_worklist.items = xrealloc(gc_worklist.items, sizeof(AerVal) * gc_worklist.cap);
     }
-    wl->items[wl->count++] = v;
+    gc_worklist.items[gc_worklist.count++] = v;
 }
 
 /* Shared by TYPE_FUNCTION marking and CallFrame root marking (a frame's executing function is a raw AerFunction*, not a wrapped AerVal). */
-static void mark_function(VmHeap* heap, AerFunction* f) {
-    pool_mark(&heap->function_pool, f);
+static void mark_function(AerFunction* f) {
+    pool_mark(&function_pool, f);
 }
 
-static void mark_value(VmHeap* heap, AerVal v) {
+static void mark_value(AerVal v) {
     switch (aer_type(v)) {
         case TYPE_STRING:
-            pool_mark(&heap->string_pool, aer_as_string(v));   /* a leaf — data owns no other Values */
+            pool_mark(&string_pool, aer_as_string(v));   /* a leaf — data owns no other Values */
             break;
         case TYPE_ARRAY: {
             AerArray* a = aer_as_array(v);
-            if (!pool_mark(&heap->array_pool, a)) {
+            Pool* p = a->shape ? &struct_pool : &array_pool;   /* see vm_pools_init_once */
+            if (!pool_mark(p, a)) {
                 for (unsigned int i = 0; i < a->count; i++)
-                    worklist_push(heap, a->items[i]);
-            }
-            break;
-        }
-        case TYPE_STRUCT: {
-            /* A struct instance's own type/pool now, not a shaped AerArray -- see AerStruct's own
-               comment (vm.h) for why. Only TYPE_ANY fields ever need pushing: a typed (raw) field
-               has no tag and is never a GC cell, so treating it as an AerVal here would be a real
-               memory-safety bug (reading raw bytes as a fake tagged pointer during mark). */
-            AerStruct* s = aer_as_struct(v);
-            if (!pool_mark(&heap->struct_pool, s)) {
-                for (unsigned int i = 0; i < s->shape->field_count; i++)
-                    if (s->shape->field_types[i] == TYPE_ANY)
-                        worklist_push(heap, vm_struct_field_read(s, i));
+                    worklist_push(a->items[i]);
             }
             break;
         }
         case TYPE_DICT:
-            if (!pool_mark(&heap->dict_pool, aer_as_dict(v))) {
+            if (!pool_mark(&dict_pool, aer_as_dict(v))) {
                 HashTable* map = &aer_as_dict(v)->map;
                 for (unsigned int i = 0; i < map->count; i++)
-                    worklist_push(heap, map->dense[i].payload);
+                    worklist_push(map->dense[i].payload);
                 /* Keys are plain owned char*, not Values — nothing to push. */
             }
             break;
         case TYPE_FUNCTION:
-            mark_function(heap, aer_as_function(v));
+            mark_function(aer_as_function(v));
             break;
         case TYPE_PACKED_ARRAY:
             /* A GC leaf -- every field is a fixed primitive, never a heap reference. */
-            pool_mark(&heap->packed_array_pool, aer_as_packed_array(v));
+            pool_mark(&packed_array_pool, aer_as_packed_array(v));
             break;
         case TYPE_RESULT: {
             AerResult* r = aer_as_result(v);
-            if (!pool_mark(&heap->result_pool, r)) {
-                worklist_push(heap, r->value);
-                worklist_push(heap, r->err);
+            if (!pool_mark(&result_pool, r)) {
+                worklist_push(r->value);
+                worklist_push(r->err);
             }
             break;
         }
@@ -279,34 +206,32 @@ static void mark_value(VmHeap* heap, AerVal v) {
     }
 }
 
-static void mark_drain(VmHeap* heap) {
-    MarkWorklist* wl = &heap->gc_worklist;
-    while (wl->count > 0)
-        mark_value(heap, wl->items[--wl->count]);
+static void mark_drain(void) {
+    while (gc_worklist.count > 0)
+        mark_value(gc_worklist.items[--gc_worklist.count]);
 }
 
-/* Pushes every live root in vm's own heap -- vm's stack/call-frame registers only, now that each
-   VM collects only itself (no more cross-VM fan-out, see gc_collect). */
-static void mark_vm_roots(VmHeap* heap, VM* vm) {
+/* Pushes every live root in one VM; called once for the calling VM and once per file-module VM (aer_module_get) — the five pools are one shared heap fed by N independent root sets, not N separate collectors. */
+static void mark_vm_roots(VM* vm) {
     for (int i = 0; i < vm->stack_top; i++)
-        worklist_push(heap, vm->stack[i]);
+        worklist_push(vm->stack[i]);
 
     /* Scanned unconditionally (zero-init decodes as harmless TYPE_NULL), bounded to the live call
        chain (0..call_depth, by each frame's real frame_size) -- a blanket scan over every frame was
        a measured cache-miss hotspot, and frames past call_depth are already dead. */
     for (int f = 0; f <= vm->call_depth; f++)
         for (unsigned int i = 0; i < vm->call_stack[f].frame_size; i++)
-            worklist_push(heap, vm->call_stack[f].registers[i]);
+            worklist_push(vm->call_stack[f].registers[i]);
 }
 
 /* Chunk.pool and every Shape's field_defaults are permanent roots, walked fresh every cycle since mark bits are cleared each sweep. */
-static void mark_chunk_roots(VmHeap* heap, Chunk* chunk) {
+static void mark_chunk_roots(Chunk* chunk) {
     for (unsigned int i = 0; i < chunk->pool_count; i++)
-        worklist_push(heap, chunk->pool[i]);
+        worklist_push(chunk->pool[i]);
     for (unsigned int s = 0; s < chunk->shape_count; s++) {
         Shape* shape = chunk->shapes[s];
         for (unsigned int i = 0; i < shape->field_count; i++)
-            worklist_push(heap, shape->field_defaults[i]);
+            worklist_push(shape->field_defaults[i]);
     }
 }
 
@@ -326,95 +251,104 @@ static void free_result(void* cell)   { (void)cell; }   /* both fields are plain
 /* Generational GC — collection                                        */
 /* ------------------------------------------------------------------ */
 
-/* Collects only vm's own heap, against only vm's own roots -- each VM now owns an independent
-   heap, so there is no other VM's state to fan out into (file-modules and actors used to be marked
-   here too, since they all shared one heap; each now collects itself the same way, whenever ITS
-   OWN gc_maybe_collect fires). */
 static void gc_collect(VM* vm, bool minor) {
-    VmHeap* heap = &vm->heap;
     /* Must run before marking every cycle: a minor sweep never visits old cells, so without this an old cell's mark bit would stay set forever and never be re-traced. */
-    pool_clear_marks(&heap->string_pool);
-    pool_clear_marks(&heap->array_pool);
-    pool_clear_marks(&heap->dict_pool);
-    pool_clear_marks(&heap->function_pool);
-    pool_clear_marks(&heap->struct_pool);
-    pool_clear_marks(&heap->packed_array_pool);
-    pool_clear_marks(&heap->result_pool);
+    pool_clear_marks(&string_pool);
+    pool_clear_marks(&array_pool);
+    pool_clear_marks(&dict_pool);
+    pool_clear_marks(&function_pool);
+    pool_clear_marks(&struct_pool);
+    pool_clear_marks(&packed_array_pool);
+    pool_clear_marks(&result_pool);
 
-    mark_vm_roots(heap, vm);
-    mark_chunk_roots(heap, vm->chunk);
+    mark_vm_roots(vm);
+    mark_chunk_roots(vm->chunk);
+    for (unsigned int i = 0; ; i++) {
+        VM* mvm; Chunk* mchunk;
+        if (!aer_module_get(i, &mvm, &mchunk)) break;
+        mark_vm_roots(mvm);
+        mark_chunk_roots(mchunk);
+    }
+    /* Every actor is a permanent root set for as long as it's alive, not just while its own
+       vm_run() is on the stack (see aer_actor.h's own comment) — same reasoning as file-modules
+       above, just a separate registry since an actor isn't imported/name-keyed. */
+    for (unsigned int i = 0; ; i++) {
+        VM* avm; Chunk* achunk;
+        if (!aer_actor_get(i, &avm, &achunk)) break;
+        mark_vm_roots(avm);
+        mark_chunk_roots(achunk);
+    }
 
     if (minor) {
         /* Remembered old objects, traced as extra roots (a minor pass skips old cells otherwise). A
            remembered entry can outlive its object (never proactively removed), so check liveness
            before dereferencing and compact in place. */
         unsigned int kept = 0;
-        for (unsigned int i = 0; i < heap->remembered_count; i++) {
-            RememberedEntry* e = &heap->remembered_set[i];
+        for (unsigned int i = 0; i < remembered_count; i++) {
+            RememberedEntry* e = &remembered_set[i];
             bool alive;
             switch (e->kind) {
-                case REMEMBERED_ARRAY:  alive = !pool_is_freed(&heap->array_pool,  e->ptr); break;
-                case REMEMBERED_STRUCT: alive = !pool_is_freed(&heap->struct_pool, e->ptr); break;
-                case REMEMBERED_DICT:   alive = !pool_is_freed(&heap->dict_pool,   e->ptr); break;
+                case REMEMBERED_ARRAY:  alive = !pool_is_freed(&array_pool,  e->ptr); break;
+                case REMEMBERED_STRUCT: alive = !pool_is_freed(&struct_pool, e->ptr); break;
+                case REMEMBERED_DICT:   alive = !pool_is_freed(&dict_pool,   e->ptr); break;
                 default: alive = false; break;
             }
             if (!alive) continue;
 
             switch (e->kind) {
-                case REMEMBERED_ARRAY: {
-                    AerArray* a = (AerArray*)e->ptr;
-                    for (unsigned int j = 0; j < a->count; j++) worklist_push(heap, a->items[j]);
-                    break;
-                }
+                case REMEMBERED_ARRAY:
                 case REMEMBERED_STRUCT: {
-                    /* Only TYPE_ANY fields -- see mark_value's TYPE_STRUCT case for why a raw
-                       field must never be pushed as if it were a tagged AerVal. */
-                    AerStruct* s = (AerStruct*)e->ptr;
-                    for (unsigned int j = 0; j < s->shape->field_count; j++)
-                        if (s->shape->field_types[j] == TYPE_ANY)
-                            worklist_push(heap, vm_struct_field_read(s, j));
+                    AerArray* a = (AerArray*)e->ptr;
+                    for (unsigned int j = 0; j < a->count; j++) worklist_push(a->items[j]);
                     break;
                 }
                 case REMEMBERED_DICT: {
                     HashTable* map = &((AerDict*)e->ptr)->map;
                     for (unsigned int j = 0; j < map->count; j++)
-                        worklist_push(heap, map->dense[j].payload);
+                        worklist_push(map->dense[j].payload);
                     break;
                 }
             }
-            heap->remembered_set[kept++] = *e;
+            remembered_set[kept++] = *e;
         }
-        heap->remembered_count = kept;
+        remembered_count = kept;
     }
 
-    mark_drain(heap);
+    mark_drain();
 
-    pool_sweep(&heap->string_pool,   minor, free_string);
-    pool_sweep(&heap->array_pool,    minor, free_array);
-    pool_sweep(&heap->dict_pool,     minor, free_dict);
-    pool_sweep(&heap->function_pool, minor, free_function);
-    pool_sweep(&heap->struct_pool,   minor, free_struct);
-    pool_sweep(&heap->packed_array_pool, minor, free_packed_array);
-    pool_sweep(&heap->result_pool,   minor, free_result);
+    pool_sweep(&string_pool,   minor, free_string);
+    pool_sweep(&array_pool,    minor, free_array);
+    pool_sweep(&dict_pool,     minor, free_dict);
+    pool_sweep(&function_pool, minor, free_function);
+    pool_sweep(&struct_pool,   minor, free_struct);
+    pool_sweep(&packed_array_pool, minor, free_packed_array);
+    pool_sweep(&result_pool,   minor, free_result);
 }
 
 /* ------------------------------------------------------------------ */
 /* Generational GC — trigger                                           */
 /* ------------------------------------------------------------------ */
 
-/* Tuning defaults (DEFAULT_MINOR_GC_THRESHOLD/DEFAULT_MAJOR_GC_EVERY_N_MINOR, overridable per-heap
-   via aer_gc_configure()) are applied in vm_heap_init, above -- VmHeap's zero-init obviously can't
-   carry these non-zero defaults itself. */
+/* Tuning defaults (overridable via aer_gc_configure()): minor_gc_threshold is total cells allocated across all pools since the last minor GC; major_gc_every_n_minor runs a major pass after that many minor ones. */
+static unsigned int minor_gc_threshold     = 2048;
+static unsigned int major_gc_every_n_minor = 10;
 
-static void gc_reset_alloc_counts(VmHeap* heap) {
-    heap->pool_alloc_count = 0;
+/* 0 (the default) means unlimited — see aer_gc_set_ceiling. */
+static unsigned int gc_live_cell_ceiling = 0;
+
+static unsigned int minor_collections_run = 0;
+static unsigned int major_collections_run = 0;
+static unsigned int minor_since_major     = 0;
+
+static void gc_reset_alloc_counts(void) {
+    pool_total_alloc_count = 0;
 }
 
 /* Shared by aer_gc_stats and gc_maybe_collect's ceiling check — one place walking all pools' cell state, not two. */
-static unsigned int gc_count_live_cells(VmHeap* heap) {
+static unsigned int gc_count_live_cells(void) {
     unsigned int total = 0;
-    Pool* pools[] = { &heap->string_pool, &heap->array_pool, &heap->dict_pool, &heap->function_pool,
-                      &heap->struct_pool, &heap->packed_array_pool };
+    Pool* pools[] = { &string_pool, &array_pool, &dict_pool, &function_pool, &struct_pool,
+                      &packed_array_pool };
     for (unsigned int p = 0; p < sizeof(pools) / sizeof(pools[0]); p++) {
         Pool* pool = pools[p];
         for (unsigned int i = 0; i < pool->slab_count; i++) {
@@ -428,88 +362,73 @@ static unsigned int gc_count_live_cells(VmHeap* heap) {
     return total;
 }
 
-/* Embedding-facing (vm_gc_suppress/unsuppress here; aer_gc_configure/aer_gc_set_ceiling below) —
-   none of these gained a VM* parameter: changing their signatures would break every existing
-   embedder. Suppress/unsuppress and aer_gc_stats operate on whichever heap is current (there's no
-   "before any VM" case that makes sense for a nesting counter or a stats snapshot). configure/
-   set_ceiling are different: real usage calls them BEFORE creating a VM (this project's own
-   smoke_test.c does), so they also update process-wide defaults every freshly-initialized heap
-   picks up (vm_heap_init), not just current_heap -- see their own comments. */
-void vm_gc_suppress(void)   { require_current_heap()->gc_suppress_depth++; }
-void vm_gc_unsuppress(void) { VmHeap* h = require_current_heap(); if (h->gc_suppress_depth > 0) h->gc_suppress_depth--; }
+static int gc_suppress_depth = 0;
+
+void vm_gc_suppress(void)   { gc_suppress_depth++; }
+void vm_gc_unsuppress(void) { if (gc_suppress_depth > 0) gc_suppress_depth--; }
 
 void aer_gc_configure(unsigned int minor_threshold, unsigned int major_every_n_minor) {
-    if (minor_threshold)     default_minor_gc_threshold     = minor_threshold;
-    if (major_every_n_minor) default_major_gc_every_n_minor = major_every_n_minor;
-    /* Also apply immediately to whichever heap is already current, if one exists -- so
-       reconfiguring an already-running VM takes effect right away, not just for the next one. */
-    VmHeap* heap = require_current_heap();
-    if (minor_threshold)     heap->minor_gc_threshold     = minor_threshold;
-    if (major_every_n_minor) heap->major_gc_every_n_minor = major_every_n_minor;
+    if (minor_threshold)    minor_gc_threshold     = minor_threshold;
+    if (major_every_n_minor) major_gc_every_n_minor = major_every_n_minor;
 }
 
 void aer_gc_set_ceiling(unsigned int max_live_cells) {
-    default_gc_live_cell_ceiling = max_live_cells;
-    require_current_heap()->gc_live_cell_ceiling = max_live_cells;
+    gc_live_cell_ceiling = max_live_cells;
 }
 
 /* Runs only between complete opcodes, where stack/scope/frame invariants are consistent. */
 static void gc_run_collection_cycle(VM* vm) {
-    VmHeap* heap = &vm->heap;
-    heap->gc_ever_collected = true;
+    gc_ever_collected = true;
     gc_collect(vm, true);
-    heap->minor_collections_run++;
-    gc_reset_alloc_counts(heap);
+    minor_collections_run++;
+    gc_reset_alloc_counts();
 
     bool major_ran = false;
-    if (++heap->minor_since_major >= heap->major_gc_every_n_minor) {
+    if (++minor_since_major >= major_gc_every_n_minor) {
         gc_collect(vm, false);
-        heap->major_collections_run++;
-        heap->minor_since_major = 0;
+        major_collections_run++;
+        minor_since_major = 0;
         major_ran = true;
     }
 
     /* Checked once per opcode, not per allocation -- a ceiling'd host can slip slightly past it. */
-    if (heap->gc_live_cell_ceiling == 0) return;
-    unsigned int live = gc_count_live_cells(heap);
-    if (live <= heap->gc_live_cell_ceiling) return;
+    if (gc_live_cell_ceiling == 0) return;
+    unsigned int live = gc_count_live_cells();
+    if (live <= gc_live_cell_ceiling) return;
     if (!major_ran) {
         gc_collect(vm, false);
-        heap->major_collections_run++;
-        heap->minor_since_major = 0;
-        live = gc_count_live_cells(heap);
-        if (live <= heap->gc_live_cell_ceiling) return;
+        major_collections_run++;
+        minor_since_major = 0;
+        live = gc_count_live_cells();
+        if (live <= gc_live_cell_ceiling) return;
     }
-    error("Memory ceiling exceeded: %u live cells (limit %u)", live, heap->gc_live_cell_ceiling);
+    error("Memory ceiling exceeded: %u live cells (limit %u)", live, gc_live_cell_ceiling);
 }
 
 /* Checked once per opcode from DISPATCH(); kept tiny and always_inline so the common case (nowhere near threshold) costs nothing beyond what's already inlined into the dispatch loop. */
 static inline __attribute__((always_inline)) void gc_maybe_collect(VM* vm) {
-    VmHeap* heap = &vm->heap;
-    if (heap->gc_suppress_depth > 0) return;
-    if (heap->pool_alloc_count < heap->minor_gc_threshold) return;
+    if (gc_suppress_depth > 0) return;
+    if (pool_total_alloc_count < minor_gc_threshold) return;
     gc_run_collection_cycle(vm);
 }
 
-/* Embedding-facing introspection (include/aer.h); live_cells is a bookkeeping snapshot, not a fresh trace, so it undercounts unswept-but-garbage cells since the last cycle. Reads whichever heap is current -- see vm_gc_suppress's comment. */
+/* Embedding-facing introspection (include/aer.h); live_cells is a bookkeeping snapshot, not a fresh trace, so it undercounts unswept-but-garbage cells since the last cycle. */
 void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
                   unsigned int* major_collections) {
-    VmHeap* heap = require_current_heap();
-    if (live_cells)         *live_cells         = gc_count_live_cells(heap);
-    if (minor_collections)  *minor_collections  = heap->minor_collections_run;
-    if (major_collections)  *major_collections  = heap->major_collections_run;
+    if (live_cells)         *live_cells         = gc_count_live_cells();
+    if (minor_collections)  *minor_collections  = minor_collections_run;
+    if (major_collections)  *major_collections  = major_collections_run;
 }
 
 #ifdef AER_DEBUG_TOOLS
 /* aer_gc_stats() only counts live cells, which understates real usage -- string/array/dict
    payloads are separate xmalloc'd allocations the pool doesn't track. */
 void aer_debug_memory_report(FILE* out) {
-    VmHeap* heap = require_current_heap();
     fprintf(out, "\n--- memory ---\n");
 
     uint64_t str_hdr = 0, str_payload = 0;
     {
-        Pool* p = &heap->string_pool;
+        Pool* p = &string_pool;
         for (unsigned int i = 0; i < p->slab_count; i++) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
@@ -524,7 +443,7 @@ void aer_debug_memory_report(FILE* out) {
 
     uint64_t arr_hdr = 0, arr_payload = 0;
     {
-        Pool* p = &heap->array_pool;
+        Pool* p = &array_pool;
         for (unsigned int i = 0; i < p->slab_count; i++) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
@@ -539,7 +458,7 @@ void aer_debug_memory_report(FILE* out) {
 
     uint64_t dict_hdr = 0, dict_payload = 0;
     {
-        Pool* p = &heap->dict_pool;
+        Pool* p = &dict_pool;
         for (unsigned int i = 0; i < p->slab_count; i++) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
@@ -557,7 +476,7 @@ void aer_debug_memory_report(FILE* out) {
 
     uint64_t fn_hdr = 0, fn_payload = 0;
     {
-        Pool* p = &heap->function_pool;
+        Pool* p = &function_pool;
         for (unsigned int i = 0; i < p->slab_count; i++) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
@@ -570,19 +489,18 @@ void aer_debug_memory_report(FILE* out) {
     }
     fprintf(out, "  function header %10llu B  payload %10llu B\n", fn_hdr, fn_payload);
 
-    /* header = the fixed per-cell reservation; payload = each instance's own Shape.instance_bytes
-       (mixed raw/boxed per field now, not a uniform field_count * sizeof(AerVal)) -- the gap is
-       MAX_STRUCT_FIELDS's over-provisioning cost plus whatever typed fields saved by being raw. */
+    /* header = the fixed per-cell reservation; payload = each instance's real field_count -- the
+       gap is MAX_STRUCT_FIELDS's over-provisioning cost. */
     uint64_t struct_hdr = 0, struct_payload = 0;
     {
-        Pool* p = &heap->struct_pool;
+        Pool* p = &struct_pool;
         for (unsigned int i = 0; i < p->slab_count; i++) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
-                AerStruct* s = (AerStruct*)(p->slabs[i] + (size_t)j * p->stride);
-                if (s->gc_state & POOL_FREE) continue;
+                AerArray* a = (AerArray*)(p->slabs[i] + (size_t)j * p->stride);
+                if (a->gc_state & POOL_FREE) continue;
                 struct_hdr += p->stride;
-                struct_payload += s->shape->instance_bytes;
+                struct_payload += (uint64_t)a->count * sizeof(AerVal);
             }
         }
     }
@@ -598,25 +516,15 @@ void aer_debug_memory_report(FILE* out) {
 /* Chunk management                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Chunk.name_index has no owning VM (a Chunk can conceptually outlive/exist independently of any
-   one VM), so unlike an AerDict -- which gets its key/sparse-array storage from its owning VM's
-   own heap -- every Chunk's name_index shares this single, process-global HashPools instead. */
-static HashPools chunk_name_index_pools;
-
 void chunk_init(Chunk* c) {
     memset(c, 0, sizeof(*c));
-    hashtable_pools_init(&chunk_name_index_pools);
-    c->name_index.pools = &chunk_name_index_pools;
 }
 
-/* Every call site frees the owning VM first (vm_free(vm); chunk_free(chunk);) -- vm_free's
-   pool_finalize_all already frees every live cell's own payload in that VM's heap, including every
-   string constant's data reachable from c->pool[] (they live in the same heap, not owned by the
-   Chunk). Freeing them again here would be a double free; this only tears down what's genuinely
-   Chunk-owned, not heap-owned. */
 void chunk_free(Chunk* c) {
     free(c->source_filename);
     free(c->code);
+    for (unsigned int i = 0; i < c->pool_count; i++)
+        if (aer_type(c->pool[i]) == TYPE_STRING) free(aer_as_string(c->pool[i])->data);
     free(c->pool);
     hashtable_free(&c->name_index);
     free(c->line_mark_offsets);
@@ -727,15 +635,13 @@ static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size)
     return pos;
 }
 
-/* Wraps an exclusively-owned (data, length) in a fresh heap box; never copies. Routes to
-   current_heap, guarded via require_current_heap() because the lexer can call this
-   (emit_string_token) before any VM/pool exists -- without the guard, an uninitialized heap's
-   zero elem_size makes pool_alloc hand back a ~1-byte allocation (confirmed heap-buffer-overflow
-   via ASAN, back when this was a single process-global pool). */
+/* Wraps an exclusively-owned (data, length) in a fresh heap box; never copies. Guarded because
+   the lexer can call this (emit_string_token) before any VM/pool exists -- without the guard,
+   string_pool's zero-initialized elem_size=0 makes pool_alloc hand back a ~1-byte allocation
+   (confirmed heap-buffer-overflow via ASAN). */
 AerVal aer_make_string(char* data, unsigned int length) {
-    VmHeap* heap = require_current_heap();
-    vm_heap_init(heap);
-    AerString* s = heap_alloc(heap, &heap->string_pool);
+    vm_pools_init_once();
+    AerString* s = pool_alloc(&string_pool);
     s->data = data;
     s->length = length;
     return aer_string_val(s);
@@ -780,7 +686,7 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
         unsigned int idx = chunk_pool_append(c, v);
 
         /* Independent copy, not an alias of c->pool[idx]'s, so both can be freed independently without a double-free. */
-        char* index_key = hashtable_key_dup(c->name_index.pools, key, key_len, NULL);
+        char* index_key = hashtable_key_dup(key, key_len, NULL);
         hashtable_put(&c->name_index, index_key, key_len, aer_int((int64_t)idx));
         return idx;
     }
@@ -912,14 +818,7 @@ void aer_set_import_enabled(bool enabled) { aer_import_enabled = enabled; }
 void vm_init(VM* vm, Chunk* chunk) {
     memset(vm, 0, sizeof(*vm));
     vm->chunk = chunk;
-    vm->io_enabled  = aer_io_enabled;
-    vm->net_enabled = aer_net_enabled;
-    vm_heap_init(&vm->heap);
-    /* Every VM now owns its own heap -- this VM's is the active allocation target from here on,
-       for both its own execution and any parsing that immediately follows for its Chunk (see
-       current_heap's own comment). Saved/restored around vm_run_slice for nested/reentrant runs,
-       exactly like active_vm_for_errors just below. */
-    current_heap = &vm->heap;
+    vm_pools_init_once();
     ensure_io_registered();
     runtime_line_lookup        = lookup_runtime_line;
     runtime_filename_lookup    = lookup_runtime_filename;
@@ -940,40 +839,7 @@ void vm_init(VM* vm, Chunk* chunk) {
 }
 
 void vm_free(VM* vm) {
-    VmHeap* heap = &vm->heap;
-    /* Each live cell's own separately-owned payload (a string's data buffer, an array's items,
-       a dict's whole hashtable, a packed array's data buffer) must be freed before the pool's own
-       slab memory goes away -- pool_destroy alone would leak every one of them. Every cell gets
-       finalized here regardless of mark/generation state, unlike a normal sweep: the whole heap is
-       going away, not just the garbage since the last cycle. */
-    pool_finalize_all(&heap->string_pool,       free_string);
-    pool_finalize_all(&heap->array_pool,        free_array);
-    pool_finalize_all(&heap->dict_pool,         free_dict);
-    pool_finalize_all(&heap->function_pool,     free_function);
-    pool_finalize_all(&heap->struct_pool,       free_struct);
-    pool_finalize_all(&heap->packed_array_pool, free_packed_array);
-    pool_finalize_all(&heap->result_pool,       free_result);
-
-    pool_destroy(&heap->string_pool);
-    pool_destroy(&heap->array_pool);
-    pool_destroy(&heap->dict_pool);
-    pool_destroy(&heap->function_pool);
-    pool_destroy(&heap->struct_pool);
-    pool_destroy(&heap->packed_array_pool);
-    pool_destroy(&heap->result_pool);
-    /* free_dict (above, via pool_finalize_all) already freed every live AerDict's own hashtable
-       entries back into heap->dict_hash_pools, so every key it ever handed out has already been
-       returned by the time these tiers are torn down. */
-    for (unsigned int i = 0; i < HASH_KEY_TIER_COUNT; i++)
-        pool_destroy(&heap->dict_hash_pools.key_pools[i]);
-    for (unsigned int i = 0; i < HASH_SPARSE_TIER_COUNT; i++)
-        pool_destroy(&heap->dict_hash_pools.sparse_pools[i]);
-    free(heap->remembered_set);
-    free(heap->gc_worklist.items);
-    /* If this VM's heap was the active allocation target, it no longer exists -- leaving
-       current_heap dangling would be a use-after-free the moment anything allocates next. */
-    if (current_heap == heap) current_heap = NULL;
-    *heap = (VmHeap){0};
+    (void)vm;   /* nothing to free — every allocation a VM makes lives in the shared pools */
 }
 
 void aer_vm_reset_for_reuse(VM* vm) {
@@ -985,20 +851,6 @@ void aer_vm_reset_for_reuse(VM* vm) {
 }
 
 bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
-    /* parse() below runs BEFORE vm_run(vm) -- vm_run_slice's own current_heap save/restore only
-       wraps the run, not this function's own parse step, and vm_init already ran for `vm` (this
-       is the "run more code into an already-initialized VM" entry point, REPL-style), so nothing
-       else sets current_heap here. Without this, a parse-time allocation (a string literal, an
-       interned token) lands in whatever heap some OTHER, unrelated VM last left active instead of
-       this one's own -- exactly the cross-heap contamination per-VM heaps exist to prevent. */
-    vm_set_current_heap(&vm->heap);
-    /* Re-seeded on every call, not just at vm_init: aer_run_source is the "run more code into an
-       already-initialized VM" entry point (REPL, embedding), and the documented capability-toggle
-       pattern is to flip aer_set_io_enabled/net_enabled(false), run one thing, then flip it back —
-       on an existing vm, not a freshly created one (see embed_smoke_test.c). Without this, that
-       pattern would silently do nothing once the vm's own fields were seeded once at vm_init. */
-    vm->io_enabled  = aer_io_enabled;
-    vm->net_enabled = aer_net_enabled;
     aer_vm_reset_for_reuse(vm);
     vm->ip = chunk->count;
     shell((char*)source);   /* shell() strdup()s its own copy — never mutates through this pointer */
@@ -1013,13 +865,13 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
 /* Type helpers                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Struct instances report their declared name (e.g. "Player") instead of "array" — used by type() and OP_CHECK_SHAPE's error message. A packed array reports "Player[]" — distinct from a single instance's own "Player". type_names[] is indexed directly by ValueType, so it must stay exactly as long as the enum's non-specially-handled entries (value.h) — TYPE_STRUCT/TYPE_PACKED_ARRAY/TYPE_RESULT are all handled specially, so none of them is ever used to index this array. */
+/* Struct instances report their declared name (e.g. "Player") instead of "array" — used by type() and OP_CHECK_SHAPE's error message. A packed array reports "Player[]" — distinct from a single instance's own "Player". type_names[] is indexed directly by ValueType, so it must stay exactly as long as the enum's non-specially-handled entries (value.h) — TYPE_PACKED_ARRAY is handled specially, just like TYPE_ARRAY+shape, so it's never used to index this array. */
 static const char* vm_type_name(Chunk* c, AerVal v) {
     static const char* type_names[] = {
         "null", "boolean", "integer", "float", "string", "function", "array", "hashtable"
     };
-    if (aer_type(v) == TYPE_STRUCT)
-        return aer_as_string(c->pool[aer_as_struct(v)->shape->name])->data;
+    if (aer_type(v) == TYPE_ARRAY && aer_as_array(v)->shape)
+        return aer_as_string(c->pool[aer_as_array(v)->shape->name])->data;
     if (aer_type(v) == TYPE_PACKED_ARRAY) {
         /* static buf is safe only because every caller consumes the result immediately. */
         AerPackedArray* pa = aer_as_packed_array(v);
@@ -1063,26 +915,25 @@ static void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) 
         }
         case TYPE_ARRAY: {
             AerArray* a = aer_as_array(v);
+            if (a->shape) {
+                Shape* shape = a->shape;
+                strbuf_append(sb, aer_as_string(c->pool[shape->name])->data);
+                strbuf_append(sb, "{");
+                for (unsigned int i = 0; i < shape->field_count; i++) {
+                    if (i > 0) strbuf_append(sb, ", ");
+                    strbuf_append(sb, aer_as_string(c->pool[shape->field_names[i]])->data);
+                    strbuf_append(sb, ": ");
+                    vm_format_value(c, a->items[i], true, sb);
+                }
+                strbuf_append(sb, "}");
+                break;
+            }
             strbuf_append(sb, "[");
             for (unsigned int i = 0; i < a->count; i++) {
                 if (i > 0) strbuf_append(sb, ", ");
                 vm_format_value(c, a->items[i], true, sb);
             }
             strbuf_append(sb, "]");
-            break;
-        }
-        case TYPE_STRUCT: {
-            AerStruct* s = aer_as_struct(v);
-            Shape* shape = s->shape;
-            strbuf_append(sb, aer_as_string(c->pool[shape->name])->data);
-            strbuf_append(sb, "{");
-            for (unsigned int i = 0; i < shape->field_count; i++) {
-                if (i > 0) strbuf_append(sb, ", ");
-                strbuf_append(sb, aer_as_string(c->pool[shape->field_names[i]])->data);
-                strbuf_append(sb, ": ");
-                vm_format_value(c, vm_struct_field_read(s, i), true, sb);
-            }
-            strbuf_append(sb, "}");
             break;
         }
         case TYPE_PACKED_ARRAY: {
@@ -1143,7 +994,6 @@ static inline __attribute__((always_inline)) bool vm_truthy(AerVal v) {
         case TYPE_FUNCTION: return true;
         case TYPE_ARRAY:    return aer_as_array(v)->count > 0;
         case TYPE_DICT:     return aer_as_dict(v)->map.count > 0;
-        case TYPE_STRUCT:   return true;   /* a struct can never have zero fields, enforced at parse time */
         case TYPE_PACKED_ARRAY: return aer_as_packed_array(v)->count > 0;
         /* `if result:` reads like `if err == null:`, without destructuring first. */
         case TYPE_RESULT:   return aer_type(aer_as_result(v)->err) == TYPE_NULL;
@@ -1174,7 +1024,6 @@ bool values_equal(AerVal a, AerVal b) {
         case TYPE_FUNCTION: return aer_as_function(a)->code_offset == aer_as_function(b)->code_offset;
         case TYPE_ARRAY:    return aer_as_array(a) == aer_as_array(b);
         case TYPE_DICT:     return aer_as_dict(a) == aer_as_dict(b);
-        case TYPE_STRUCT:   return aer_as_struct(a) == aer_as_struct(b);
         case TYPE_PACKED_ARRAY: return aer_as_packed_array(a) == aer_as_packed_array(b);
         case TYPE_RESULT:   return aer_as_result(a) == aer_as_result(b);
         case TYPE_ANY:      break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
@@ -1258,7 +1107,7 @@ static AerVal vm_in(AerVal a, AerVal b) {
         char kbuf[VM_KEY_MAX + 1];
         memcpy(kbuf, as->data, klen);
         kbuf[klen] = '\0';
-        return aer_bool(hashtable_get_hashed(&aer_as_dict(b)->map, kbuf, klen, hashtable_hash_bytes(as->data, klen)) != NULL);
+        return aer_bool(hashtable_get(&aer_as_dict(b)->map, kbuf, klen) != NULL);
     }
     if (aer_type(b) == TYPE_ARRAY) {
         AerArray* arr = aer_as_array(b);
@@ -1398,7 +1247,7 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
     char*        owned;
     unsigned int len;
 
-    if (aer_type(v) == TYPE_ARRAY || aer_type(v) == TYPE_DICT || aer_type(v) == TYPE_STRUCT || aer_type(v) == TYPE_PACKED_ARRAY || aer_type(v) == TYPE_RESULT) {
+    if (aer_type(v) == TYPE_ARRAY || aer_type(v) == TYPE_DICT || aer_type(v) == TYPE_PACKED_ARRAY || aer_type(v) == TYPE_RESULT) {
         /* Unbounded recursive content doesn't fit the fixed buffer below, so reuse print()'s formatter; sb.buf is already a fresh allocation, handed to aer_make_string as-is. */
         StrBuf sb;
         strbuf_init(&sb);
@@ -1414,7 +1263,7 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
             case TYPE_REAL:     aer_format_real(aer_as_real(v), buf, sizeof(buf));                 break;
             case TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s",   aer_as_bool(v) ? "true" : "false"); break;
             case TYPE_FUNCTION: snprintf(buf, sizeof(buf), "<function>");                        break;
-            case TYPE_ARRAY: case TYPE_DICT: case TYPE_STRUCT: case TYPE_STRING: case TYPE_PACKED_ARRAY: case TYPE_RESULT: break;   /* handled above */
+            case TYPE_ARRAY: case TYPE_DICT: case TYPE_STRING: case TYPE_PACKED_ARRAY: case TYPE_RESULT: break;   /* handled above */
             case TYPE_ANY: break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
         }
         len   = (unsigned int)strlen(buf);
@@ -1446,18 +1295,17 @@ static bool vm_slice_bounds(AerVal start_v, AerVal end_v, int64_t len,
    default must become a FRESH empty container, or every omitted call/instance would alias the
    same one (Python's mutable-default bug). parser.c only ever bakes an empty '[]'/'{}' as such
    a default, so a fresh empty one is always correct -- no deep copy needed. */
-static AerVal vm_default_value(VM* vm, AerVal dflt) {
+static AerVal vm_default_value(AerVal dflt) {
     if (aer_type(dflt) == TYPE_ARRAY && !aer_as_array(dflt)->shape) {
-        AerArray* a = heap_alloc(&vm->heap, &vm->heap.array_pool);
+        AerArray* a = pool_alloc(&array_pool);
         a->count = a->capacity = 0;
         a->items = NULL;
         a->shape = NULL;
         return aer_array_val(a);
     }
     if (aer_type(dflt) == TYPE_DICT) {
-        AerDict* d = heap_alloc(&vm->heap, &vm->heap.dict_pool);
+        AerDict* d = pool_alloc(&dict_pool);
         memset(&d->map, 0, sizeof(d->map));
-        d->map.pools = &vm->heap.dict_hash_pools;
         return aer_dict_val(d);
     }
     return dflt;
@@ -1484,7 +1332,7 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = args[i];
     for (int i = arg_count; i < (int)fn->arity; i++)
-        callee->registers[i] = vm_default_value(target, fn->defaults[i - fn->min_arity]);
+        callee->registers[i] = vm_default_value(fn->defaults[i - fn->min_arity]);
     callee->return_ip   = return_ip;
     callee->dest_reg    = 0;
     callee->code_offset = fn->code_offset;
@@ -1520,7 +1368,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         for (int i = 0; i < arg_count; i++)
             vm->registers[i] = vm->registers[arg_reg_base + i];
         for (int i = arg_count; i < (int)f->arity; i++)
-            vm->registers[i] = vm_default_value(vm, f->defaults[i - f->min_arity]);
+            vm->registers[i] = vm_default_value(f->defaults[i - f->min_arity]);
         gc_maybe_collect(vm);   /* defaults just written into the CURRENT frame (tail call, call_depth unchanged) — already rooted */
         vm->ip = f->code_offset;
         vm->call_stack[vm->call_depth].code_offset = f->code_offset;   /* reused frame now runs a different function */
@@ -1535,7 +1383,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = caller->registers[arg_reg_base + i];
     for (int i = arg_count; i < (int)f->arity; i++)
-        callee->registers[i] = vm_default_value(vm, f->defaults[i - f->min_arity]);
+        callee->registers[i] = vm_default_value(f->defaults[i - f->min_arity]);
     callee->return_ip   = return_ip;
     callee->dest_reg    = dest_reg;
     callee->code_offset = f->code_offset;
@@ -1552,24 +1400,17 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
 /* Resolves field_idx within shape via the per-site inline cache (keyed by bytecode offset) --
    shared by both boxed-struct and packed-array callers, since a field's slot within a given
    Shape is identical either way. False (error reported) if shape has no such field. */
-static inline __attribute__((always_inline)) bool vm_resolve_field_by_shape(Chunk* c, unsigned int site, Shape* shape, int field_idx,
-                                 int* out_slot, unsigned int* out_offset, ValueType* out_ftype) {
+static inline __attribute__((always_inline)) bool vm_resolve_field_by_shape(Chunk* c, unsigned int site, Shape* shape, int field_idx, int* out_slot) {
     FieldCacheEntry* entry = &c->field_cache[site];
     if (entry->shape == shape) {
-        *out_slot   = entry->slot;
-        *out_offset = entry->offset;
-        *out_ftype  = entry->ftype;
+        *out_slot = entry->slot;
         return true;
     }
     for (unsigned int i = 0; i < shape->field_count; i++) {
         if (shape->field_names[i] == (unsigned int)field_idx) {
-            entry->shape  = shape;
-            entry->slot   = (int)i;
-            entry->offset = shape->field_offsets[i];
-            entry->ftype  = shape->field_types[i];
-            *out_slot   = (int)i;
-            *out_offset = entry->offset;
-            *out_ftype  = entry->ftype;
+            entry->shape = shape;
+            entry->slot  = (int)i;
+            *out_slot = (int)i;
             return true;
         }
     }
@@ -1578,19 +1419,19 @@ static inline __attribute__((always_inline)) bool vm_resolve_field_by_shape(Chun
     return false;
 }
 
-/* Resolves struct_reg's field to an (AerStruct*, slot, offset, ftype) tuple, delegating the
-   shape+cache lookup above. Shared by every field-access opcode. False (error reported) if not a
-   struct instance or no such field. */
+/* Resolves struct_reg's field to an (AerArray*, slot) pair, delegating the shape+cache lookup
+   above. Shared by every field-access opcode. False (error reported) if not a struct instance
+   or no such field. */
 static inline __attribute__((always_inline)) bool vm_resolve_field(VM* vm, Chunk* c, unsigned int site, int struct_reg, int field_idx,
-                                 AerStruct** out_s, int* out_slot, unsigned int* out_offset, ValueType* out_ftype) {
+                                 AerArray** out_oa, int* out_slot) {
     AerVal* obj = &vm->registers[struct_reg];
-    if (obj->tag != TYPE_STRUCT) {
+    if (obj->tag != TYPE_ARRAY || !((AerArray*)obj->as.ptr)->shape) {
         error("'.' field access requires a struct instance");
         return false;
     }
-    AerStruct* s = (AerStruct*)obj->as.ptr;
-    *out_s = s;
-    return vm_resolve_field_by_shape(c, site, s->shape, field_idx, out_slot, out_offset, out_ftype);
+    AerArray* oa = (AerArray*)obj->as.ptr;
+    *out_oa = oa;
+    return vm_resolve_field_by_shape(c, site, oa->shape, field_idx, out_slot);
 }
 
 /* Reads one 8-byte packed slot as AerVal -- no switch on field type needed since AerVal.as is
@@ -1609,47 +1450,6 @@ static inline void vm_packed_slot_write(unsigned char* slot, ValueType ftype, Ae
     memcpy(slot, &v.as, 8);
 }
 
-/* One struct field, at its own Shape-computed byte offset -- raw via vm_packed_slot_read/write for
-   a typed field, a plain 16-byte memcpy for TYPE_ANY (it isn't a fixed-width 8-byte payload, so the
-   packed-slot helpers don't apply). Declared in vm.h since aer_json.c's struct-serialization branch
-   needs these too, not just vm.c's own opcodes. Iterates every field with no per-site cache to draw
-   on (print/json.encode), so it looks offset/ftype up fresh -- vm_struct_field_read_at below is the
-   one every opcode call site should use instead, once it already has them from the field cache. */
-AerVal vm_struct_field_read(AerStruct* s, unsigned int slot) {
-    ValueType ftype = s->shape->field_types[slot];
-    unsigned int offset = s->shape->field_offsets[slot];
-    unsigned char* p = s->fields + offset;
-    if (ftype == TYPE_ANY) { AerVal v; memcpy(&v, p, sizeof(AerVal)); return v; }
-    return vm_packed_slot_read(p, ftype);
-}
-
-void vm_struct_field_write(AerStruct* s, unsigned int slot, AerVal v) {
-    ValueType ftype = s->shape->field_types[slot];
-    unsigned int offset = s->shape->field_offsets[slot];
-    unsigned char* p = s->fields + offset;
-    if (ftype == TYPE_ANY) memcpy(p, &v, sizeof(AerVal));
-    else vm_packed_slot_write(p, ftype, v);
-}
-
-/* Same contract as vm_struct_field_read/write above, but offset/ftype are already in hand (from
-   vm_resolve_field's cache output) instead of being re-derived from s->shape here -- every opcode
-   call site uses these, not the by-slot versions above. The `ftype == TYPE_ANY` branch itself is
-   not the cost this avoids: for any real (monomorphic) call site it's the same outcome every single
-   time, so branch prediction makes it free after the first iteration. What was real and worth
-   removing was the extra pointer-chase through s->shape to re-fetch offset/ftype on every access
-   even after the cache already proved the shape matched. */
-static inline AerVal vm_struct_field_read_at(AerStruct* s, unsigned int offset, ValueType ftype) {
-    unsigned char* p = s->fields + offset;
-    if (ftype == TYPE_ANY) { AerVal v; memcpy(&v, p, sizeof(AerVal)); return v; }
-    return vm_packed_slot_read(p, ftype);
-}
-
-static inline void vm_struct_field_write_at(AerStruct* s, unsigned int offset, ValueType ftype, AerVal v) {
-    unsigned char* p = s->fields + offset;
-    if (ftype == TYPE_ANY) memcpy(p, &v, sizeof(AerVal));
-    else vm_packed_slot_write(p, ftype, v);
-}
-
 /* Returns an owned copy of dense[*idx]'s key. Shared by array-iteration's dict branch and
    pair-iteration. False once exhausted -- the dense array has no holes, so this is a plain
    bounds check, not a scan. */
@@ -1664,24 +1464,15 @@ static bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
 }
 
 AerArray* vm_new_array(void) {
-    VmHeap* heap = require_current_heap();
-    return heap_alloc(heap, &heap->array_pool);
+    return pool_alloc(&array_pool);
 }
 
 AerDict* vm_new_dict(void) {
-    VmHeap* heap = require_current_heap();
-    AerDict* d = heap_alloc(heap, &heap->dict_pool);
-    /* Every caller used to memset(&d->map, 0, sizeof(d->map)) itself right after this call --
-       centralized here instead so setting .pools below can't be wiped out by a caller's own
-       zeroing running afterward. */
-    memset(&d->map, 0, sizeof(d->map));
-    d->map.pools = &heap->dict_hash_pools;
-    return d;
+    return pool_alloc(&dict_pool);
 }
 
 AerVal aer_make_result(AerVal value, AerVal err) {
-    VmHeap* heap = require_current_heap();
-    AerResult* r = heap_alloc(heap, &heap->result_pool);
+    AerResult* r = pool_alloc(&result_pool);
     r->value = value;
     r->err   = err;
     return aer_result_val(r);
@@ -1695,8 +1486,7 @@ AerVal aer_make_error(const char* msg) {
 }
 
 AerFunction* vm_new_function(void) {
-    VmHeap* heap = require_current_heap();
-    return heap_alloc(heap, &heap->function_pool);
+    return pool_alloc(&function_pool);
 }
 
 /* builtin_id resolved at parse time. Returns true if arg_count matched, result in *out. */
@@ -1785,7 +1575,7 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         char kbuf[VM_KEY_MAX + 1];
         memcpy(kbuf, is->data, klen);
         kbuf[klen] = '\0';
-        AerVal* found = hashtable_get_hashed(&aer_as_dict(obj)->map, kbuf, klen, hashtable_hash_bytes(is->data, klen));
+        AerVal* found = hashtable_get(&aer_as_dict(obj)->map, kbuf, klen);
         if (!found) { *out = aer_null(); return; }
         *out = *found; return;
     } else if (aer_type(obj) == TYPE_STRING) {
@@ -1842,7 +1632,7 @@ static inline void vm_destructure_compute(AerVal src, AerVal* out0, AerVal* out1
 
 /* Shared by lbl_index_set and the fused index-set handlers -- same dispatch/bounds/errors.
    Caller must DISPATCH() immediately after. */
-static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal val) {
+static inline void vm_index_set_compute(AerVal obj, AerVal idx, AerVal val) {
     if (aer_type(obj) == TYPE_ARRAY) {
         AerArray* a = aer_as_array(obj);
         if (a->shape) { error("Struct fields are assigned with '.', not '[]'"); return; }
@@ -1850,24 +1640,23 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         int64_t i = aer_as_int(idx);
         if (i < 0) i += (int64_t)a->count;
         if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count); return; }
-        gc_barrier_array(vm, a, val);
+        gc_barrier_array(a, val);
         a->items[i] = val;
     } else if (aer_type(obj) == TYPE_DICT) {
         if (aer_type(idx) != TYPE_STRING) { error("Hashtable key must be a string"); return; }
         AerString* is = aer_as_string(idx);
         if (is->length > VM_KEY_MAX) { error("Hashtable key too long (max %d bytes)", VM_KEY_MAX); return; }
         unsigned int klen = hashtable_key_true_len(is->data, is->length);
-        uint64_t khash = hashtable_hash_bytes(is->data, klen);
         char kbuf[VM_KEY_MAX + 1];
         memcpy(kbuf, is->data, klen);
         kbuf[klen] = '\0';
-        gc_barrier_dict(vm, aer_as_dict(obj), val);
-        AerVal* existing = hashtable_get_hashed(&aer_as_dict(obj)->map, kbuf, klen, khash);
+        gc_barrier_dict(aer_as_dict(obj), val);
+        AerVal* existing = hashtable_get(&aer_as_dict(obj)->map, kbuf, klen);
         if (existing) {
             *existing = val;   /* update in place — no allocation */
         } else {
-            char* k = hashtable_key_dup(aer_as_dict(obj)->map.pools, is->data, klen, NULL);   /* klen already true length */
-            hashtable_put_hashed(&aer_as_dict(obj)->map, k, klen, khash, val);
+            char* k = hashtable_key_dup(is->data, klen, NULL);   /* klen already true length */
+            hashtable_put(&aer_as_dict(obj)->map, k, klen, val);
         }
     } else if (aer_type(obj) == TYPE_STRING) {
         error("Strings are immutable — cannot assign to an index");
@@ -1982,15 +1771,9 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
        changes mid-call. */
     VM* saved_active_vm  = active_vm_for_errors;
     active_vm_for_errors = vm;
-    /* Same save/restore shape as active_vm_for_errors just above -- a nested vm_run_slice (module
-       instantiation, actor.call) must allocate into ITS OWN heap while it runs, then hand
-       allocation back to whichever heap was active before it, once it returns. */
-    VmHeap* saved_current_heap = current_heap;
-    current_heap = &vm->heap;
     if (AER_SETJMP(catch_point) != 0) {
         runtime_error_unwind_target = saved_unwind_target;
         active_vm_for_errors        = saved_active_vm;
-        current_heap                = saved_current_heap;
         return VM_SLICE_ERROR;
     }
     Opcode cur_op;
@@ -2078,12 +1861,10 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_PACKED_ARRAY_NEW]  = &&lbl_packed_array_new,
         [OP_INDEX_FIELD_GET]   = &&lbl_index_field_get,
         [OP_INDEX_FIELD_SET]   = &&lbl_index_field_set,
-        [OP_INDEX_FIELD_COMPOUND] = &&lbl_index_field_compound,
         [OP_UNARY]             = &&lbl_unary,
         [OP_CAST]              = &&lbl_cast,
         [OP_BINARY_FIELD]      = &&lbl_binary_field,
         [OP_FIELD_BINARY]      = &&lbl_field_binary,
-        [OP_FIELD_COMPOUND]    = &&lbl_field_compound,
         [OP_PRINT_REPL]        = &&lbl_print_repl,
 
         /* Raw-arithmetic family -- see the lbl_raw_* labels below for why no vm_rk_ptr9/tag-check
@@ -2151,17 +1932,6 @@ lbl_define_struct: {
         shape->field_names[i]    = (unsigned int)READ();
         shape->field_defaults[i] = c->pool[READ()];
         shape->field_types[i]    = (ValueType)READ();
-    }
-    /* Typed fields get 8 raw bytes (no tag -- the type is this Shape's own static knowledge);
-       TYPE_ANY fields get a full boxed AerVal (16 bytes), since they can hold a reference type the
-       GC must trace. See vm_struct_field_read/write. */
-    {
-        unsigned int offset = 0;
-        for (unsigned int i = 0; i < shape->field_count; i++) {
-            shape->field_offsets[i] = offset;
-            offset += (shape->field_types[i] == TYPE_ANY) ? sizeof(AerVal) : 8;
-        }
-        shape->instance_bytes = offset;
     }
     if (c->shape_count >= c->shape_cap) {
         c->shape_cap = c->shape_cap ? c->shape_cap * 2 : 4;
@@ -2392,7 +2162,7 @@ lbl_call_module: {
                (aer_host_call) rather than a fixed CALL_MODULE_* case -- gated here by name
                specifically so --no-io never touches a real embedding host's own custom modules,
                which go through this exact same path. */
-            if (!vm->io_enabled && strcmp(module, "io") == 0) {
+            if (!aer_io_enabled && strcmp(module, "io") == 0) {
                 for (int i = 0; i < arg_count; i++) POP();
                 error("io is disabled for this run (--no-io)");
                 PUSH(aer_null());
@@ -2441,7 +2211,7 @@ lbl_array_new: {
     int dest_reg      = (int)UNPACK_A(op_word);
     int item_reg_base = (int)UNPACK_B(op_word);
     int item_count    = (int)UNPACK_C(op_word);
-    AerArray* a = heap_alloc(&vm->heap, &vm->heap.array_pool);
+    AerArray* a = pool_alloc(&array_pool);
     a->capacity = item_count > 0 ? (unsigned int)item_count : 4;
     a->count    = (unsigned int)item_count;
     a->items    = xmalloc(sizeof(AerVal) * a->capacity);
@@ -2481,7 +2251,7 @@ lbl_index_set: {
     int arr_reg = (int)UNPACK_INDEX_SET_ARR(op_word);
     AerVal idx = *vm_rk_ptr20(vm, const_pool, UNPACK_INDEX_SET_IDX(op_word));
     AerVal val = *vm_rk_ptr20(vm, const_pool, UNPACK_INDEX_SET_VAL(op_word));
-    vm_index_set_compute(vm, vm->registers[arr_reg], idx, val);
+    vm_index_set_compute(vm->registers[arr_reg], idx, val);
     DISPATCH();
 }
 
@@ -2498,7 +2268,7 @@ lbl_slice_get: {
         int64_t start, end;
         if (!vm_slice_bounds(start_v, end_v, (int64_t)a->count, &start, &end)) { vm->registers[dest_reg] = aer_null(); DISPATCH(); }
         unsigned int n = (unsigned int)(end - start);
-        AerArray* r = heap_alloc(&vm->heap, &vm->heap.array_pool);
+        AerArray* r = pool_alloc(&array_pool);
         r->count    = n;
         r->capacity = n > 0 ? n : 4;
         r->items    = xmalloc(sizeof(AerVal) * r->capacity);
@@ -2528,7 +2298,7 @@ lbl_check_shape: {
     int src_reg  = (int)UNPACK_CHECK_SHAPE_LHS(op_word);
     int name_idx = (int)UNPACK_CHECK_SHAPE_NAME(op_word);
     AerVal v = vm->registers[src_reg];
-    if (aer_type(v) != TYPE_STRUCT || aer_as_struct(v)->shape->name != (unsigned int)name_idx) {
+    if (aer_type(v) != TYPE_ARRAY || !aer_as_array(v)->shape || aer_as_array(v)->shape->name != (unsigned int)name_idx) {
         error("Expected a '%s', got a '%s'", aer_as_string(c->pool[name_idx])->data, vm_type_name(c, v));
         vm->registers[dest_reg] = aer_null();
         DISPATCH();
@@ -2542,19 +2312,16 @@ lbl_dict_new: {
     int dest_reg      = (int)UNPACK_A(op_word);
     int pair_reg_base = (int)UNPACK_B(op_word);
     int pair_count    = (int)UNPACK_C(op_word);
-    AerDict* d = heap_alloc(&vm->heap, &vm->heap.dict_pool);
+    AerDict* d = pool_alloc(&dict_pool);
     memset(&d->map, 0, sizeof(d->map));
-    d->map.pools = &vm->heap.dict_hash_pools;
-    if (pair_count > 0) hashtable_reserve(&d->map, (unsigned int)pair_count);
     for (int i = 0; i < pair_count; i++) {
         AerVal key = vm->registers[pair_reg_base + 2 * i];
         AerVal val = vm->registers[pair_reg_base + 2 * i + 1];
         if (aer_type(key) != TYPE_STRING) { error("Hashtable keys must be strings"); continue; }
         AerString* ks = aer_as_string(key);
         unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
-        uint64_t khash = hashtable_hash_bytes(ks->data, klen);
-        char* k = hashtable_key_dup(d->map.pools, ks->data, klen, NULL);
-        hashtable_put_hashed(&d->map, k, klen, khash, val);
+        char* k = hashtable_key_dup(ks->data, klen, NULL);
+        hashtable_put(&d->map, k, klen, val);
     }
     vm->registers[dest_reg] = aer_dict_val(d);
     gc_maybe_collect(vm);   /* pool_alloc(&dict_pool) above; result already rooted */
@@ -2732,14 +2499,15 @@ lbl_struct_new: {
             DISPATCH();
         }
     }
-    AerStruct* s = heap_alloc(&vm->heap, &vm->heap.struct_pool);
-    s->shape  = shape;
-    s->fields = (unsigned char*)s + sizeof(AerStruct);
+    AerArray* a = pool_alloc(&struct_pool);
+    a->count = a->capacity = shape->field_count;
+    a->items = (AerVal*)((char*)a + sizeof(AerArray));
+    a->shape = shape;
     for (int i = 0; i < arg_count; i++)
-        vm_struct_field_write(s, (unsigned int)i, vm->registers[arg_reg_base + i]);
+        a->items[i] = vm->registers[arg_reg_base + i];
     for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
-        vm_struct_field_write(s, i, vm_default_value(vm, shape->field_defaults[i]));
-    vm->registers[dest_reg] = aer_struct_val(s);
+        a->items[i] = vm_default_value(shape->field_defaults[i]);
+    vm->registers[dest_reg] = aer_array_val(a);
     gc_maybe_collect(vm);   /* pool_alloc(&struct_pool) above, plus any vm_default_value array/dict defaults — all rooted now that the struct itself is stored */
     DISPATCH();
 }
@@ -2750,9 +2518,9 @@ lbl_field_get: {
     int dest_reg   = (int)UNPACK_FIELD_GET_DEST(op_word);
     int struct_reg = (int)UNPACK_FIELD_GET_STRUCT(op_word);
     int field_idx  = (int)UNPACK_FIELD_GET_FIELD(op_word);
-    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype)) DISPATCH();
-    vm->registers[dest_reg] = vm_struct_field_read_at(oa, foffset, ftype);
+    AerArray* oa; int slot;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
+    vm->registers[dest_reg] = oa->items[slot];
     DISPATCH();
 }
 
@@ -2766,9 +2534,9 @@ lbl_binary_field: {
     Opcode bin_op  = (Opcode)UNPACK_BINARY_FIELD_OP(op_word);
     int field_idx  = (int)UNPACK_BINARY_FIELD_NAME(op_word);
     AerVal* lhs = vm_rk_ptr20(vm, const_pool, UNPACK_BINARY_FIELD_RK(op_word));
-    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype)) DISPATCH();
-    AerVal rhs = vm_struct_field_read_at(oa, foffset, ftype);
+    AerArray* oa; int slot;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
+    AerVal rhs = oa->items[slot];
     ValueType ta = aer_type(*lhs), tb = aer_type(rhs);
     bool handled;
     vm->registers[dest_reg] = vm_binary_fast(*lhs, rhs, bin_op, ta, tb, &handled);
@@ -2788,9 +2556,9 @@ lbl_field_binary: {
     Opcode bin_op  = (Opcode)UNPACK_FIELD_BINARY_OP(op_word);
     int field_idx  = (int)UNPACK_FIELD_BINARY_NAME(op_word);
     AerVal* rhs = vm_rk_ptr20(vm, const_pool, UNPACK_FIELD_BINARY_RK(op_word));
-    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype)) DISPATCH();
-    AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype);
+    AerArray* oa; int slot;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
+    AerVal lhs = oa->items[slot];
     ValueType ta = aer_type(lhs), tb = aer_type(*rhs);
     bool handled;
     vm->registers[dest_reg] = vm_binary_fast(lhs, *rhs, bin_op, ta, tb, &handled);
@@ -2798,36 +2566,6 @@ lbl_field_binary: {
         vm->registers[dest_reg] = vm_binary_cold(c, lhs, *rhs, bin_op, ta, tb);
         gc_maybe_collect(vm);
     }
-    DISPATCH();
-}
-
-/* `struct.field OP= rhs` -- resolves the field exactly ONCE (one vm_resolve_field/cache lookup),
-   reads it, computes, type-checks, and writes back, instead of the two full field resolutions
-   (OP_FIELD_BINARY's read + a separate OP_FIELD_SET's write) this used to compile to. */
-lbl_field_compound: {
-    unsigned int site   = ip - 1;
-    int struct_reg = (int)UNPACK_FIELD_COMPOUND_STRUCT(op_word);
-    Opcode bin_op  = (Opcode)UNPACK_FIELD_COMPOUND_OP(op_word);
-    int field_idx  = (int)UNPACK_FIELD_COMPOUND_NAME(op_word);
-    AerVal* rhs = vm_rk_ptr20(vm, const_pool, UNPACK_FIELD_COMPOUND_RK(op_word));
-    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype)) DISPATCH();
-    AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype);
-    ValueType ta = aer_type(lhs), tb = aer_type(*rhs);
-    bool handled;
-    AerVal result = vm_binary_fast(lhs, *rhs, bin_op, ta, tb, &handled);
-    if (!handled) {
-        result = vm_binary_cold(c, lhs, *rhs, bin_op, ta, tb);
-        gc_maybe_collect(vm);
-    }
-    /* Same enforcement as OP_FIELD_SET's own -- the only other place a field's value changes. */
-    if (ftype != TYPE_ANY && result.tag != ftype) {
-        error("Field '%s' is declared as a fixed type and cannot be assigned a different type",
-              aer_as_string(c->pool[field_idx])->data);
-        DISPATCH();
-    }
-    gc_barrier_struct(vm, oa, result);
-    vm_struct_field_write_at(oa, foffset, ftype, result);
     DISPATCH();
 }
 
@@ -2842,23 +2580,24 @@ lbl_print_repl: {
     DISPATCH();
 }
 
-/* gc_barrier_struct is the write barrier every mutating struct field-set needs. */
+/* gc_barrier_array is the write barrier every mutating struct/array/dict write needs. */
 lbl_field_set: {
     unsigned int site = ip - 1;
     int struct_reg = (int)UNPACK_FIELD_SET_STRUCT(op_word);
     int field_idx  = (int)UNPACK_FIELD_SET_FIELD(op_word);
     AerVal* val = vm_rk_ptr9(vm, const_pool, UNPACK_FIELD_SET_RK(op_word));
-    AerStruct* oa; int slot; unsigned int foffset; ValueType declared;
-    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &declared)) DISPATCH();
+    AerArray* oa; int slot;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot)) DISPATCH();
     /* Enforced once here (the only place a field's value changes), trusted everywhere else
        including the fused fast path. TYPE_ANY means untyped. */
+    ValueType declared = oa->shape->field_types[slot];
     if (declared != TYPE_ANY && val->tag != declared) {
         error("Field '%s' is declared as a fixed type and cannot be assigned a different type",
               aer_as_string(c->pool[field_idx])->data);
         DISPATCH();
     }
-    gc_barrier_struct(vm, oa, *val);
-    vm_struct_field_write_at(oa, foffset, declared, *val);
+    gc_barrier_array(oa, *val);
+    oa->items[slot] = *val;
     DISPATCH();
 }
 
@@ -2886,7 +2625,7 @@ lbl_packed_array_new: {
     int64_t count = aer_as_int(*count_v);
     if (count < 0) { error("Packed array count must not be negative"); DISPATCH(); }
     unsigned int element_size = shape->field_count * 8;
-    AerPackedArray* pa = heap_alloc(&vm->heap, &vm->heap.packed_array_pool);
+    AerPackedArray* pa = pool_alloc(&packed_array_pool);
     pa->count = (unsigned int)count;
     pa->shape = shape;
     /* malloc(0) is implementation-defined -- skip it for a zero-count array; bounds checks reject
@@ -2921,24 +2660,24 @@ lbl_index_field_get: {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
             DISPATCH();
         }
-        int slot; unsigned int foffset; ValueType ftype;
-        if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &ftype)) DISPATCH();
+        int slot;
+        if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot)) DISPATCH();
         unsigned int element_size = pa->shape->field_count * 8;
-        unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
-        vm->registers[dest_reg] = vm_packed_slot_read(elem, ftype);
+        unsigned char* elem = pa->data + (size_t)i * element_size + (size_t)slot * 8;
+        vm->registers[dest_reg] = vm_packed_slot_read(elem, pa->shape->field_types[slot]);
         DISPATCH();
     }
     AerVal tmp;
     vm_index_get_compute(obj, *idx, &tmp);
     if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);   /* single-char string indexing allocates */
-    if (aer_type(tmp) != TYPE_STRUCT) {
+    if (aer_type(tmp) != TYPE_ARRAY || !aer_as_array(tmp)->shape) {
         error("'.' field access requires a struct instance");
         DISPATCH();
     }
-    AerStruct* oa = aer_as_struct(tmp);
-    int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot, &foffset, &ftype)) DISPATCH();
-    vm->registers[dest_reg] = vm_struct_field_read_at(oa, foffset, ftype);
+    AerArray* oa = aer_as_array(tmp);
+    int slot;
+    if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot)) DISPATCH();
+    vm->registers[dest_reg] = oa->items[slot];
     DISPATCH();
 }
 
@@ -2959,99 +2698,37 @@ lbl_index_field_set: {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
             DISPATCH();
         }
-        int slot; unsigned int foffset; ValueType declared;
-        if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &declared)) DISPATCH();
+        int slot;
+        if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot)) DISPATCH();
+        ValueType declared = pa->shape->field_types[slot];
         if (val->tag != declared) {
             error("Field '%s' is declared as a fixed type and cannot be assigned a different type",
                   aer_as_string(c->pool[field_idx])->data);
             DISPATCH();
         }
         unsigned int element_size = pa->shape->field_count * 8;
-        unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
+        unsigned char* elem = pa->data + (size_t)i * element_size + (size_t)slot * 8;
         vm_packed_slot_write(elem, declared, *val);
         DISPATCH();
     }
     AerVal tmp;
     vm_index_get_compute(obj, *idx, &tmp);
     if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);   /* single-char string indexing allocates */
-    if (aer_type(tmp) != TYPE_STRUCT) {
+    if (aer_type(tmp) != TYPE_ARRAY || !aer_as_array(tmp)->shape) {
         error("'.' field access requires a struct instance");
         DISPATCH();
     }
-    AerStruct* oa = aer_as_struct(tmp);
-    int slot; unsigned int foffset; ValueType declared;
-    if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot, &foffset, &declared)) DISPATCH();
+    AerArray* oa = aer_as_array(tmp);
+    int slot;
+    if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot)) DISPATCH();
+    ValueType declared = oa->shape->field_types[slot];
     if (declared != TYPE_ANY && val->tag != declared) {
         error("Field '%s' is declared as a fixed type and cannot be assigned a different type",
               aer_as_string(c->pool[field_idx])->data);
         DISPATCH();
     }
-    gc_barrier_struct(vm, oa, *val);
-    vm_struct_field_write_at(oa, foffset, declared, *val);
-    DISPATCH();
-}
-
-/* `obj[index].field OP= rk_rhs` -- resolves the index+field exactly once (same dual packed-array/
-   struct-instance dispatch as lbl_index_field_get/set), reads, computes, type-checks, and writes
-   back in one dispatch. Before this existed, the parser emitted OP_INDEX_FIELD_GET (read) followed
-   by a separate OP_INDEX_FIELD_SET (a second index+field resolution just to write the same slot
-   back) -- exactly the nbody-style `bodies[j].vx += dx * mi` pattern, twice resolved for one
-   logical operation. */
-lbl_index_field_compound: {
-    unsigned int site   = ip - 1;
-    int obj_reg   = (int)UNPACK_INDEX_FIELD_COMPOUND_OBJ(op_word);
-    int field_idx = (int)UNPACK_INDEX_FIELD_COMPOUND_FIELD(op_word);
-    AerVal* idx = vm_rk_ptr9(vm, const_pool, (uint32_t)UNPACK_INDEX_FIELD_COMPOUND_IDX(op_word));
-    Opcode bin_op = (Opcode)UNPACK_INDEX_FIELD_COMPOUND_OP(op_word);
-    AerVal* rhs = vm_rk_ptr9(vm, const_pool, (uint32_t)UNPACK_INDEX_FIELD_COMPOUND_RHS(op_word));
-    AerVal obj = vm->registers[obj_reg];
-    if (aer_type(obj) == TYPE_PACKED_ARRAY) {
-        AerPackedArray* pa = aer_as_packed_array(obj);
-        if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-        int64_t i = aer_as_int(*idx);
-        if (i < 0) i += (int64_t)pa->count;
-        if (i < 0 || (uint64_t)i >= pa->count) {
-            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-            DISPATCH();
-        }
-        int slot; unsigned int foffset; ValueType ftype;
-        if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &ftype)) DISPATCH();
-        unsigned int element_size = pa->shape->field_count * 8;
-        unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
-        AerVal lhs = vm_packed_slot_read(elem, ftype);
-        bool handled;
-        AerVal result = vm_binary_fast(lhs, *rhs, bin_op, ftype, aer_type(*rhs), &handled);
-        if (!handled) { result = vm_binary_cold(c, lhs, *rhs, bin_op, ftype, aer_type(*rhs)); gc_maybe_collect(vm); }
-        if (result.tag != ftype) {
-            error("Field '%s' is declared as a fixed type and cannot be assigned a different type",
-                  aer_as_string(c->pool[field_idx])->data);
-            DISPATCH();
-        }
-        vm_packed_slot_write(elem, ftype, result);
-        DISPATCH();
-    }
-    AerVal tmp;
-    vm_index_get_compute(obj, *idx, &tmp);
-    if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);   /* single-char string indexing allocates */
-    if (aer_type(tmp) != TYPE_STRUCT) {
-        error("'.' field access requires a struct instance");
-        DISPATCH();
-    }
-    AerStruct* oa = aer_as_struct(tmp);
-    int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot, &foffset, &ftype)) DISPATCH();
-    AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype);
-    ValueType ta = aer_type(lhs), tb = aer_type(*rhs);
-    bool handled;
-    AerVal result = vm_binary_fast(lhs, *rhs, bin_op, ta, tb, &handled);
-    if (!handled) { result = vm_binary_cold(c, lhs, *rhs, bin_op, ta, tb); gc_maybe_collect(vm); }
-    if (ftype != TYPE_ANY && result.tag != ftype) {
-        error("Field '%s' is declared as a fixed type and cannot be assigned a different type",
-              aer_as_string(c->pool[field_idx])->data);
-        DISPATCH();
-    }
-    gc_barrier_struct(vm, oa, result);
-    vm_struct_field_write_at(oa, foffset, ftype, result);
+    gc_barrier_array(oa, *val);
+    oa->items[slot] = *val;
     DISPATCH();
 }
 
@@ -3454,7 +3131,6 @@ lbl_raw_gte_real_boxed: {
 lbl_halt:
     runtime_error_unwind_target = saved_unwind_target;
     active_vm_for_errors        = saved_active_vm;
-    current_heap                = saved_current_heap;
     return VM_SLICE_DONE;
 }
 

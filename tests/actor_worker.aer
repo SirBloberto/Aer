@@ -3,15 +3,3 @@ function add(a, b):
 
 function crash():
     return 1 / 0
-
-# Heavy, GC-pressure-inducing allocation (throwaway arrays/strings every iteration, only the
-# running total survives) -- used to prove two actors spawned from this same script, each running
-# this independently, never corrupt each other's result (each actor now has its own heap).
-function sum_range(n):
-    total = 0
-    i = 0
-    for i < n:
-        temp = [i, i * 2, "item_{i}"]
-        total += temp[0] + temp[1]
-        i += 1
-    return total

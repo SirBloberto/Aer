@@ -99,12 +99,10 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_PACKED_ARRAY_NEW] = { "OP_PACKED_ARRAY_NEW", "reg = new packed array of Type, rk count", {FLD_REG, FLD_NAME, FLD_RK}, false, 3 },
     [OP_INDEX_FIELD_GET]  = { "OP_INDEX_FIELD_GET",  "fused: reg = reg[rk].field (packed or struct array)", {FLD_REG, FLD_REG, FLD_NAME, FLD_RK}, false, 4 },
     [OP_INDEX_FIELD_SET]  = { "OP_INDEX_FIELD_SET",  "fused: reg[rk].field = rk (packed or struct array)", {FLD_REG, FLD_NAME, FLD_RK, FLD_RK}, false, 4 },
-    [OP_INDEX_FIELD_COMPOUND] = { "OP_INDEX_FIELD_COMPOUND", "fused: reg[rk].field OP= rk (resolved once, packed or struct array)", {FLD_REG, FLD_NAME, FLD_RK, FLD_BINOP, FLD_RK}, false, 5 },
     [OP_UNARY] = { "OP_UNARY", "reg = unary_op(rk)", {FLD_REG, FLD_BINOP, FLD_RK}, false, 3 },
     [OP_CAST]  = { "OP_CAST",  "reg = cast(rk)", {FLD_REG, FLD_CAST, FLD_RK}, false, 3 },
     [OP_BINARY_FIELD] = { "OP_BINARY_FIELD", "fused: reg = rk OP struct.field (field on the right)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_RK, FLD_NAME}, false, 5 },
     [OP_FIELD_BINARY] = { "OP_FIELD_BINARY", "fused: reg = struct.field OP rk (field on the left)", {FLD_REG, FLD_REG, FLD_BINOP, FLD_NAME, FLD_RK}, false, 5 },
-    [OP_FIELD_COMPOUND] = { "OP_FIELD_COMPOUND", "fused: struct.field OP= rk (resolved once, no dest reg)", {FLD_REG, FLD_BINOP, FLD_NAME, FLD_RK}, false, 4 },
     [OP_PRINT_REPL] = { "OP_PRINT_REPL", "shell mode: print reg unless null", {FLD_REG}, false, 1 },
 
     /* Raw-arithmetic family — special-cased below; fields[]/packed kept for documentation only. */
@@ -291,12 +289,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_NAME, (int)UNPACK_INDEX_FIELD_SET_FIELD(op_word));
         print_rk9(out, c, UNPACK_INDEX_FIELD_SET_IDX(op_word));
         print_rk9(out, c, UNPACK_INDEX_FIELD_SET_VAL(op_word));
-    } else if (op == OP_INDEX_FIELD_COMPOUND) {
-        print_field(out, c, FLD_REG,   (int)UNPACK_INDEX_FIELD_COMPOUND_OBJ(op_word));
-        print_field(out, c, FLD_NAME,  (int)UNPACK_INDEX_FIELD_COMPOUND_FIELD(op_word));
-        print_rk9(out, c, UNPACK_INDEX_FIELD_COMPOUND_IDX(op_word));
-        print_field(out, c, FLD_BINOP, (int)UNPACK_INDEX_FIELD_COMPOUND_OP(op_word));
-        print_rk9(out, c, UNPACK_INDEX_FIELD_COMPOUND_RHS(op_word));
     } else if (op == OP_ITER_NEXT_PAIR ||
                op == OP_ITER_RANGE_PREP || op == OP_ITER_RANGE_LOOP) {
         /* PACK_REG4 + a trailing patchable jump-target word pos must still advance past. */
@@ -373,11 +365,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_BINOP, (int)UNPACK_FIELD_BINARY_OP(op_word));
         print_field(out, c, FLD_NAME,  (int)UNPACK_FIELD_BINARY_NAME(op_word));
         print_rk20(out, c, UNPACK_FIELD_BINARY_RK(op_word));
-    } else if (op == OP_FIELD_COMPOUND) {
-        print_field(out, c, FLD_REG,   (int)UNPACK_FIELD_COMPOUND_STRUCT(op_word));
-        print_field(out, c, FLD_BINOP, (int)UNPACK_FIELD_COMPOUND_OP(op_word));
-        print_field(out, c, FLD_NAME,  (int)UNPACK_FIELD_COMPOUND_NAME(op_word));
-        print_rk20(out, c, UNPACK_FIELD_COMPOUND_RK(op_word));
     } else if (op == OP_RAW_LOAD_INT) {
         print_rawi(out, (int)UNPACK_RAW_LOAD_INT_DEST(op_word));
         fprintf(out, "  imm=%d", UNPACK_RAW_LOAD_INT_IMM(op_word));

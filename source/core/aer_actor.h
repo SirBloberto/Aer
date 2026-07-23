@@ -55,4 +55,10 @@ bool aer_actor_try_receive(Actor* actor, char** out_message, unsigned int* out_l
 void aer_actor_free(Actor* actor);
 void aer_actor_free_all(void);
 
+/* GC root enumeration (vm.c) — mirrors aer_module_get: every actor's VM is a permanent root set
+   for as long as it's alive, not just while its own vm_run() is on the stack, or a collection
+   triggered by unrelated work elsewhere in the process could sweep an idle actor's still-live
+   state. Returns false once `index` is past the last live actor. */
+bool aer_actor_get(unsigned int index, VM** out_vm, Chunk** out_chunk);
+
 #endif

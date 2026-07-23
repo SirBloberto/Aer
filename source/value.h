@@ -11,7 +11,6 @@ typedef struct AerArray       AerArray;
 typedef struct AerDict        AerDict;
 typedef struct AerFunction    AerFunction;
 typedef struct AerString      AerString;
-typedef struct AerStruct      AerStruct;   /* full definition in vm.h — needs Shape's real definition, defined there too */
 typedef struct AerPackedArray AerPackedArray;
 typedef struct AerResult      AerResult;
 typedef struct Shape       Shape;   /* full definition in vm.h — needs pool-index arrays */
@@ -25,11 +24,7 @@ typedef enum ValueType {
     TYPE_FUNCTION,
     TYPE_ARRAY,
     TYPE_DICT,
-    /* A single struct instance — its own type, not an AerArray with shape set (that was the old
-       design; see AerStruct's own comment in vm.h for why it was split out). Fields are either raw
-       (typed, 8 bytes, no tag) or a full boxed AerVal (TYPE_ANY only) per-field, per Shape.field_offsets. */
-    TYPE_STRUCT,
-    /* Struct-typed *arrays* packed inline at 8 bytes/field — fixed-primitive fields only, and no
+    /* Struct instances packed inline at 8 bytes/field — fixed-primitive fields only, and no
        standalone `arr[i]` reference value (only `arr[i].field`); see AerPackedArray below. */
     TYPE_PACKED_ARRAY,
     /* Tagged (value, err) pair, exactly one non-null — a real type (not a 2-array) so dispatch
@@ -84,11 +79,7 @@ struct AerFunction {
 _Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
 /* `data` is always exclusively owned, never a borrowed view — the GC sweep frees it
-   unconditionally, so a borrowed pointer would double-free or dangle. No dict-key hash cache here
-   (tried as cached_hash/hash_valid fields, then again as a side array keyed off an aligned-slab
-   pool redesign) -- both were removed: the first for coupling a leaf value type to hashtable.c's
-   hashing details for a narrow win, the second measured as a net regression across most real
-   workloads (see pool.h). */
+   unconditionally, so a borrowed pointer would double-free or dangle. */
 struct AerString {
     unsigned char gc_state;
     char*        data;
@@ -146,7 +137,6 @@ static inline AerVal aer_string_val(AerString* s)     { return aer_box_ptr(TYPE_
 static inline AerVal aer_function_val(AerFunction* f)  { return aer_box_ptr(TYPE_FUNCTION, f); }
 static inline AerVal aer_array_val(AerArray* a)        { return aer_box_ptr(TYPE_ARRAY, a); }
 static inline AerVal aer_dict_val(AerDict* d)          { return aer_box_ptr(TYPE_DICT, d); }
-static inline AerVal aer_struct_val(AerStruct* s)      { return aer_box_ptr(TYPE_STRUCT, s); }
 static inline AerVal aer_packed_array_val(AerPackedArray* a) { return aer_box_ptr(TYPE_PACKED_ARRAY, a); }
 static inline AerVal aer_result_val(AerResult* r)       { return aer_box_ptr(TYPE_RESULT, r); }
 
@@ -158,7 +148,6 @@ static inline AerString*   aer_as_string(AerVal v)   { return (AerString*)v.as.p
 static inline AerFunction* aer_as_function(AerVal v) { return (AerFunction*)v.as.ptr; }
 static inline AerArray*    aer_as_array(AerVal v)     { return (AerArray*)v.as.ptr; }
 static inline AerDict*     aer_as_dict(AerVal v)      { return (AerDict*)v.as.ptr; }
-static inline AerStruct*   aer_as_struct(AerVal v)    { return (AerStruct*)v.as.ptr; }
 static inline AerPackedArray* aer_as_packed_array(AerVal v) { return (AerPackedArray*)v.as.ptr; }
 static inline AerResult*      aer_as_result(AerVal v)        { return (AerResult*)v.as.ptr; }
 

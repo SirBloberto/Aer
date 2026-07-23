@@ -106,6 +106,13 @@ static char* resolve_path(const char* path_name, unsigned int len) {
     return same_dir_path;
 }
 
+bool aer_module_get(unsigned int index, VM** out_vm, Chunk** out_chunk) {
+    if ((int)index >= module_count) return false;
+    *out_vm    = modules[index].vm;
+    *out_chunk = modules[index].chunk;
+    return true;
+}
+
 void aer_module_free_all(void) {
     for (int i = 0; i < module_count; i++) {
         vm_free(modules[i].vm);
@@ -141,12 +148,6 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
     /* Save the parser's file-scope tables too, or compiling this corrupts the caller's own
        still-in-progress compile. */
     ParserState* saved_parser = parser_save_state();
-    /* vm_init(mvm, ...) below unconditionally repoints current_heap at mvm's own heap so parsing
-       (which starts right after, before mvm ever runs) allocates into the right place -- but that
-       happens outside vm_run_slice's own save/restore, which only brackets vm_run(mvm) itself, not
-       this whole compile+run cycle. Without this, every allocation the CALLER makes after this
-       function returns would keep landing in mvm's heap instead of its own. */
-    VmHeap* saved_heap = vm_current_heap();
 
     Chunk* mchunk = xmalloc(sizeof(Chunk));
     VM*    mvm    = xmalloc(sizeof(VM));
@@ -168,12 +169,10 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
     if (ok) {
         runtime_had_error = false;
         mvm->ip = 0;
-        /* mvm now collects only its own independent heap (see vm.c's VmHeap), so a collection
-           triggered by this nested run can no longer reach anything belonging to the caller's
-           heap at all — this suppress/unsuppress pairing predates that split, from when every VM
-           shared one heap and the caller's own chunk/VM (not yet registered as a root at this
-           point) could be swept by mistake. Left in place as a harmless, still-correct no-op
-           rather than removed speculatively; see vm_gc_suppress's comment in vm.h. */
+        /* The caller's own chunk/VM isn't registered as a GC root yet (that happens once this
+           function returns and the caller registers it), so a collection triggered by this
+           nested run could sweep something the caller still needs — see vm_gc_suppress's comment
+           in vm.h. */
         vm_gc_suppress();
         vm_run(mvm);
         vm_gc_unsuppress();
@@ -189,11 +188,6 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
     lexer_restore_state(saved);
     token = saved_token;
     parser_restore_state(saved_parser);
-    /* Restored on every path, success or failure -- mvm's own heap stays valid and independently
-       reachable whenever mvm itself runs later (vm_run_slice's save/restore handles that case
-       correctly on its own); this only fixes where allocations land in the CALLER's own code from
-       here on. */
-    vm_set_current_heap(saved_heap);
 
     if (!ok) {
         /* Never handed back to the caller, so nothing else can reach these — free here. */
@@ -284,11 +278,7 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
         return true;
     }
 
-    /* mv now collects only its own independent heap (see vm.c's VmHeap), so mv's own GC can no
-       longer reach anything belonging to vm's heap at all — this suppress/unsuppress pairing
-       predates that split, from when every VM shared one heap and mv's collection had to be kept
-       from sweeping vm's not-yet-rooted state. Left in place as a harmless, still-correct no-op
-       rather than removed speculatively; see vm_gc_suppress's comment in vm.h. */
+    /* The calling vm isn't reachable from mv's own roots, and isn't in aer_module_get's list either (vm might be the main VM, never a file-module one) — same missing-root hazard as aer_module_load's nested run; see vm_gc_suppress's comment in vm.h. */
     vm_gc_suppress();
     vm_run(mv);
     vm_gc_unsuppress();

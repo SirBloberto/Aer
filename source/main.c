@@ -45,15 +45,13 @@ static unsigned int parse_memory_size(const char* s) {
 
 int main(int argc, char** argv) {
     chunk_init(&chunk);
+    vm_init(&vm, &chunk);   /* registers io, same as every other stdlib module */
     /* Once per process — parser state persists across parse() calls, which is what makes REPL
        variable/function persistence work */
     parser_reset();
 
     /* Filter recognized global flags out of argv before the help/version/file dispatch sees them
-       — everything after the script path still reaches the script untouched, via io.args(). Must
-       run BEFORE vm_init below: vm_init seeds vm.io_enabled/net_enabled from the current
-       aer_io_enabled/aer_net_enabled globals once, so --no-io/--no-net need to already be applied
-       to those globals by the time it runs, or the flag would silently do nothing for this vm. */
+       — everything after the script path still reaches the script untouched, via io.args(). */
     int    real_argc = 1;
     char** real_argv = xmalloc(sizeof(char*) * (size_t)argc);
     real_argv[0] = argv[0];
@@ -83,8 +81,6 @@ int main(int argc, char** argv) {
     }
     argc = real_argc;
     argv = real_argv;
-
-    vm_init(&vm, &chunk);   /* registers io, same as every other stdlib module */
 
     int status = 0;
     if (argc == 1) {

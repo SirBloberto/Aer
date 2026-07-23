@@ -48,31 +48,4 @@ actor.send(handle, "second")
 assert(actor.receive(handle) == "first", "messages are delivered in the order they were sent")
 assert(actor.receive(handle) == "second", "...second message follows the first")
 
-# ------------------------------------------------------------------ #
-# Per-VM heap isolation — two independent actors, each doing its own   #
-# heavy, GC-pressure-inducing allocation, must not interfere           #
-# ------------------------------------------------------------------ #
-
-handle_a, err_a = actor.spawn("tests/actor_worker.aer")
-handle_b, err_b = actor.spawn("tests/actor_worker.aer")
-assert(err_a == null and err_b == null, "two independent actors from the same script both spawn cleanly")
-
-result_a, err_sum_a = actor.call(handle_a, "sum_range", 3000)
-result_b, err_sum_b = actor.call(handle_b, "sum_range", 1500)
-assert(err_sum_a == null and err_sum_b == null, "both actors' heavy-allocation calls complete without error")
-
-expected_a = 0
-i = 0
-for i < 3000:
-    expected_a += i + i * 2
-    i += 1
-expected_b = 0
-i = 0
-for i < 1500:
-    expected_b += i + i * 2
-    i += 1
-
-assert(result_a == expected_a, "actor A's own heavy allocation computed the correct result, unaffected by actor B")
-assert(result_b == expected_b, "actor B's own heavy allocation computed the correct result, unaffected by actor A — each actor's own heap stayed independent")
-
 print("test_actor.aer: all assertions passed.")

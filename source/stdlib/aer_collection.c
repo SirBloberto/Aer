@@ -25,7 +25,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             a->capacity = a->capacity ? a->capacity * 2 : 4;
             a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
         }
-        gc_barrier_array(vm, a, val);
+        gc_barrier_array(a, val);
         a->items[a->count++] = val;
         vm_stack_push(vm, arr); return true;
     }
@@ -71,14 +71,10 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         if (aer_type(src) == TYPE_DICT) {
             AerDict* d = aer_as_dict(src);
             AerDict* r = vm_new_dict();
-            if (d->map.count > 0) hashtable_reserve(&r->map, d->map.count);
+            memset(&r->map, 0, sizeof(r->map));
             for (unsigned int i = 0; i < d->map.count; i++) {
-                /* Duped into r's own pools, not d's -- the copy owns r->map, not the original.
-                   Each source entry's own .hash was already computed once at its original
-                   insertion (cached right there in the dense array, not on any AerString) --
-                   reused here instead of hashing the same bytes again. */
-                char* k = hashtable_key_dup(r->map.pools, d->map.dense[i].key, d->map.dense[i].length, NULL);
-                hashtable_put_hashed(&r->map, k, d->map.dense[i].length, d->map.dense[i].hash, d->map.dense[i].payload);
+                char* k = hashtable_key_dup(d->map.dense[i].key, d->map.dense[i].length, NULL);
+                hashtable_put(&r->map, k, d->map.dense[i].length, d->map.dense[i].payload);
             }
             vm_stack_push(vm, aer_dict_val(r)); return true;
         }
@@ -100,7 +96,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             a->capacity = a->capacity ? a->capacity * 2 : 4;
             a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
         }
-        gc_barrier_array(vm, a, val);
+        gc_barrier_array(a, val);
         memmove(&a->items[i + 1], &a->items[i], (size_t)(a->count - (uint64_t)i) * sizeof(AerVal));
         a->items[i] = val;
         a->count++;

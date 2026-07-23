@@ -6,15 +6,7 @@
 
 /* Slab allocator for fixed-size objects, extended for generational mark-sweep GC. Each cell's
    one-byte GC state is the owning struct's own first field (pinned to offset 0 by _Static_asserts
-   in value.h) — in the object, not a side table, so barrier checks need no reverse lookup.
-
-   An aligned-slab + per-slab packed side-array alternative (state bytes moved out of the struct
-   entirely, addressed by masking a cell pointer) was prototyped and measured against sieve/nbody/
-   fib/dict/small-dict/lookup-table/hash-cache-micro: no net win on the large-dict case it targeted,
-   and a real ~8-20% regression on sieve, small_dict_bench, lookup_table_bench, and
-   hash_cache_micro (the extra mask+divide+separate-cache-line cost on every individual
-   pool_mark/pool_is_young call outweighed the sweep/clear_marks locality win everywhere but the one
-   case it was aimed at). Reverted; this embedded-byte design stays. */
+   in value.h) — in the object, not a side table, so barrier checks need no reverse lookup. */
 #define POOL_MARKED     0x1   /* this collection cycle only */
 #define POOL_OLD        0x2   /* set once a cell survives a collection; cleared on every pool_alloc */
 #define POOL_FREE       0x4   /* on the free-list — stops pool_sweep re-pushing, and lets a stale remembered-set entry be detected */
@@ -30,17 +22,10 @@ typedef struct {
     void*           free_list;       /* linked through freed cells' bytes [8,16) — offset 0 would clobber gc_state */
 } Pool;
 
+/* Cells allocated across all GC-managed pools since last reset — gc_maybe_collect (vm.c) checks this on allocating opcodes; one shared counter beats summing per-pool fields that often. */
+extern unsigned int pool_total_alloc_count;
+
 void  pool_init(Pool* p, size_t elem_size, unsigned int elems_per_slab);
-
-/* Calls on_free on every live (non-free-listed) cell, ignoring mark/generation bits entirely --
-   for tearing down a whole pool (every cell's payload needs freeing, not just the ones a normal
-   generational sweep would collect). Call before pool_destroy, which only frees the pool's own
-   slab memory, not each cell's own separately-owned payload. */
-void  pool_finalize_all(Pool* p, void (*on_free)(void* cell));
-
-/* Frees every slab buffer plus the slabs array itself -- for tearing down a whole pool (a VM's own
-   heap going away), not for freeing one cell (see pool_free). Leaves *p zeroed, safe to reuse. */
-void  pool_destroy(Pool* p);
 
 /* Returns uninitialized memory, like malloc — caller fills it in; always born young, whether reused from the free-list or carved from a fresh slab. */
 void* pool_alloc(Pool* p);

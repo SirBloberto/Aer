@@ -1,8 +1,9 @@
-#include <stdlib.h>
 #include "error.h"
 #include "pool.h"
 
 #define POOL_INITIAL_SLABS 4
+
+unsigned int pool_total_alloc_count = 0;
 
 void pool_init(Pool* p, size_t elem_size, unsigned int elems_per_slab) {
     p->slabs          = NULL;
@@ -29,24 +30,8 @@ static void pool_grow(Pool* p) {
     p->next_index = 0;
 }
 
-void pool_finalize_all(Pool* p, void (*on_free)(void* cell)) {
-    for (unsigned int i = 0; i < p->slab_count; i++) {
-        unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
-        for (unsigned int j = 0; j < count; j++) {
-            char* cell = p->slabs[i] + (size_t)j * p->stride;
-            if (*(unsigned char*)cell & POOL_FREE) continue;
-            on_free(cell);
-        }
-    }
-}
-
-void pool_destroy(Pool* p) {
-    for (unsigned int i = 0; i < p->slab_count; i++) free(p->slabs[i]);
-    free(p->slabs);
-    *p = (Pool){0};
-}
-
 void* pool_alloc(Pool* p) {
+    pool_total_alloc_count++;
     if (p->free_list) {
         void* cell = p->free_list;
         /* Next-pointer lives at [sizeof(void*), 2*sizeof(void*)), not [0, sizeof(void*)) — see pool.h. */
@@ -64,7 +49,7 @@ void* pool_alloc(Pool* p) {
 void pool_free(Pool* p, void* cell) {
     /* Discards whatever mark/generation bits the cell had — neither is consulted on the free-list, and pool_alloc zeroes the byte again on reuse anyway. */
     *(unsigned char*)cell = POOL_FREE;
-    *(void**)((char*)cell + sizeof(void*)) = p->free_list;   /* see pool_free's own comment on why not offset 0 */
+    *(void**)((char*)cell + sizeof(void*)) = p->free_list;   /* see pool.h on why not offset 0 */
     p->free_list = cell;
 }
 

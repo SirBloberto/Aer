@@ -1973,16 +1973,14 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 if (is_temp(rk_val)) reg_free(1);
             } else {
                 lex();
+                int field_reg = reg_alloc();
+                chunk_emit(c, PACK_INDEX_FIELD_GET(field_reg, obj_reg, fused_field_idx, pending_rk_idx));
                 int rk_rhs = parse_binary(c, 0);
                 if (parse_had_error) return;
-                rk_rhs = box_if_raw(c, rk_rhs);
-                if (!rk9_fits(rk_rhs)) {
-                    error_at("Expression too large to compile (value exceeds the fused index-field-compound encoding's range)");
-                    return;
-                }
-                chunk_emit(c, PACK_INDEX_FIELD_COMPOUND(obj_reg, fused_field_idx, pending_rk_idx,
-                                                         compound_assign_ops[compound_i].op, rk_rhs));
+                emit_binary(c, field_reg, compound_assign_ops[compound_i].op, field_reg, rk_rhs);
                 if (is_temp(rk_rhs)) reg_free(1);
+                chunk_emit(c, PACK_INDEX_FIELD_SET(obj_reg, fused_field_idx, pending_rk_idx, field_reg));
+                reg_free(1);   /* field_reg */
             }
             if (is_temp(pending_rk_idx)) reg_free(1);
             if (!obj_is_base) reg_free(1);
@@ -2057,9 +2055,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         if (!consume(compound_assign_ops[i].tok)) continue;
 
         if (pending_is_field) {
-            /* One fused OP_FIELD_COMPOUND -- read, compute, and write back in a single dispatch,
-               a single vm_resolve_field call. No temp register needed: the result writes straight
-               back into the same field, never through a register at all. */
+            int field_reg = reg_alloc();
+
             int rk_rhs = parse_binary(c, 0);
             if (parse_had_error) return;
             rk_rhs = box_if_raw(c, rk_rhs);   /* no raw-native fused field-op form exists */
@@ -2068,8 +2065,11 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 error_at("Expression too large to compile (register/constant/field index exceeds the fused field-op encoding's range)");
                 return;
             }
-            chunk_emit(c, PACK_FIELD_COMPOUND(obj_reg, compound_assign_ops[i].op, pending_field_idx, rk_rhs));
+            chunk_emit(c, PACK_FIELD_BINARY(field_reg, obj_reg, compound_assign_ops[i].op, pending_field_idx, rk_rhs));
             if (is_temp(rk_rhs)) reg_free(1);
+
+            emit_field_set(c, obj_reg, pending_field_idx, field_reg);
+            reg_free(1);   /* field_reg */
         } else {
             int item_reg = reg_alloc();
             emit_index_get(c, item_reg, obj_reg, pending_rk_idx);
@@ -2468,12 +2468,10 @@ static int module_fn_id(int module_id, AerString* name) {
             if (NAME_IS("index_of"))    return FN_STRING_INDEX_OF;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_TIME:
-            if (NAME_IS("now"))        return FN_TIME_NOW;
-            if (NAME_IS("strftime"))   return FN_TIME_STRFTIME;
-            if (NAME_IS("sleep"))      return FN_TIME_SLEEP;
-            if (NAME_IS("parse"))      return FN_TIME_PARSE;
-            if (NAME_IS("to_parts"))   return FN_TIME_TO_PARTS;
-            if (NAME_IS("from_parts")) return FN_TIME_FROM_PARTS;
+            if (NAME_IS("now"))      return FN_TIME_NOW;
+            if (NAME_IS("strftime")) return FN_TIME_STRFTIME;
+            if (NAME_IS("sleep"))    return FN_TIME_SLEEP;
+            if (NAME_IS("parse"))    return FN_TIME_PARSE;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_JSON:
             if (NAME_IS("encode")) return FN_JSON_ENCODE;
@@ -2493,14 +2491,11 @@ static int module_fn_id(int module_id, AerString* name) {
             if (NAME_IS("send"))    return FN_NET_SEND;
             if (NAME_IS("recv"))    return FN_NET_RECV;
             if (NAME_IS("close"))   return FN_NET_CLOSE;
-            if (NAME_IS("listen"))  return FN_NET_LISTEN;
-            if (NAME_IS("accept"))  return FN_NET_ACCEPT;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_REGEX:
-            if (NAME_IS("match"))     return FN_REGEX_MATCH;
-            if (NAME_IS("find"))      return FN_REGEX_FIND;
-            if (NAME_IS("replace"))   return FN_REGEX_REPLACE;
-            if (NAME_IS("find_all"))  return FN_REGEX_FIND_ALL;
+            if (NAME_IS("match"))   return FN_REGEX_MATCH;
+            if (NAME_IS("find"))    return FN_REGEX_FIND;
+            if (NAME_IS("replace")) return FN_REGEX_REPLACE;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_ACTOR:
             if (NAME_IS("spawn"))   return FN_ACTOR_SPAWN;
@@ -3111,6 +3106,7 @@ static bool parse_literal_default(Chunk* c, AerVal* out) {
         lex();
         if (token.type != TOKEN_CLOSE_BRACE) return false;
         AerDict* d = vm_new_dict();
+        memset(&d->map, 0, sizeof(d->map));
         *out = aer_dict_val(d);
     } else {
         return false;
