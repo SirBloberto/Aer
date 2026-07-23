@@ -1,0 +1,10 @@
+import time
+start = time.now()
+total = 0
+i = 0
+for i < 200000:
+    rec = {"id": i, "name": "item_{i}", "active": true, "score": i * 2}
+    total += rec["id"] + rec["score"]
+    i += 1
+dur = time.now() - start
+print("200k small (4-key) dicts, build+read: {dur}s, total={total}")

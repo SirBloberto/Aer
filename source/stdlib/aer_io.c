@@ -157,6 +157,72 @@ static AerVal io_stdin(VM* vm, int arg_count, AerVal* args, void* userdata) {
     return aer_int(STDIN_HANDLE);
 }
 
+/* Handles both '/' and '\\' -- a path from io.args() may be OS-native on Windows. */
+static const char* io_last_sep(const char* s, unsigned int len) {
+    for (unsigned int i = len; i-- > 0;) {
+        if (s[i] == '/' || s[i] == '\\') return s + i;
+    }
+    return NULL;
+}
+
+static AerVal io_basename(VM* vm, int arg_count, AerVal* args, void* userdata) {
+    (void)vm; (void)userdata;
+    if (arg_count != 1 || aer_type(args[0]) != TYPE_STRING) {
+        error("io.basename() requires a path string");
+        return aer_null();
+    }
+    AerString* s = aer_as_string(args[0]);
+    const char* sep = io_last_sep(s->data, s->length);
+    const char* start = sep ? sep + 1 : s->data;
+    unsigned int n = (unsigned int)((s->data + s->length) - start);
+    char* buf = xmalloc((size_t)n + 1);
+    memcpy(buf, start, n);
+    buf[n] = '\0';
+    return aer_make_string(buf, n);
+}
+
+static AerVal io_dirname(VM* vm, int arg_count, AerVal* args, void* userdata) {
+    (void)vm; (void)userdata;
+    if (arg_count != 1 || aer_type(args[0]) != TYPE_STRING) {
+        error("io.dirname() requires a path string");
+        return aer_null();
+    }
+    AerString* s = aer_as_string(args[0]);
+    const char* sep = io_last_sep(s->data, s->length);
+    if (!sep) {
+        char* buf = xmalloc(2);
+        buf[0] = '.';
+        buf[1] = '\0';
+        return aer_make_string(buf, 1);
+    }
+    /* A separator at position 0 ("/etc") means the directory is "/" itself, not "". */
+    unsigned int n = (unsigned int)(sep - s->data);
+    if (n == 0) n = 1;
+    char* buf = xmalloc((size_t)n + 1);
+    memcpy(buf, s->data, n);
+    buf[n] = '\0';
+    return aer_make_string(buf, n);
+}
+
+static AerVal io_join(VM* vm, int arg_count, AerVal* args, void* userdata) {
+    (void)vm; (void)userdata;
+    if (arg_count != 2 || aer_type(args[0]) != TYPE_STRING || aer_type(args[1]) != TYPE_STRING) {
+        error("io.join() requires two path strings");
+        return aer_null();
+    }
+    AerString* a = aer_as_string(args[0]);
+    AerString* b = aer_as_string(args[1]);
+    bool need_sep = a->length > 0 && a->data[a->length - 1] != '/' && a->data[a->length - 1] != '\\';
+    unsigned int n = a->length + (need_sep ? 1u : 0u) + b->length;
+    char* buf = xmalloc((size_t)n + 1);
+    memcpy(buf, a->data, a->length);
+    unsigned int pos = a->length;
+    if (need_sep) buf[pos++] = '/';
+    memcpy(buf + pos, b->data, b->length);
+    buf[n] = '\0';
+    return aer_make_string(buf, n);
+}
+
 void aer_io_set_args(int argc, char** argv) {
     io_argc = argc;
     io_argv = argv;
@@ -170,4 +236,7 @@ void aer_io_register(void) {
     aer_register_function("io", "remove", io_remove, NULL);
     aer_register_function("io", "stdin",  io_stdin,  NULL);
     aer_register_function("io", "args",   io_args,   NULL);
+    aer_register_function("io", "basename", io_basename, NULL);
+    aer_register_function("io", "dirname",  io_dirname,  NULL);
+    aer_register_function("io", "join",     io_join,     NULL);
 }

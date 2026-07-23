@@ -141,6 +141,29 @@ assert(round_trip == "2024-01-15 13:45:30", "time.parse() followed by time.strft
 date_only = time.strftime(time.parse("2024-01-15", "%Y-%m-%d"), "%Y-%m-%d")
 assert(date_only == "2024-01-15", "time.parse() with a date-only format round-trips exactly")
 
+# to_parts/from_parts — a fixed, known timestamp so the parts are deterministic regardless of
+# timezone (only the calendar fields are asserted, not epoch/weekday, which shift with local tz).
+known = time.parse("2024-03-15 09:30:45", "%Y-%m-%d %H:%M:%S")
+parts = time.to_parts(known)
+assert(parts["year"] == 2024, "time.to_parts() extracts the year")
+assert(parts["month"] == 3, "time.to_parts() extracts the month (1-indexed)")
+assert(parts["day"] == 15, "time.to_parts() extracts the day")
+assert(parts["hour"] == 9, "time.to_parts() extracts the hour")
+assert(parts["min"] == 30, "time.to_parts() extracts the minute")
+assert(parts["sec"] == 45, "time.to_parts() extracts the second")
+
+assert(time.from_parts(time.to_parts(known)) == known, "from_parts(to_parts(x)) round-trips to the same epoch")
+
+# Calendar arithmetic falls out of to_parts/from_parts for free: mktime() normalizes an
+# out-of-range day, so adding days doesn't need any dedicated add/subtract logic.
+tomorrow_parts = time.to_parts(known)
+tomorrow_parts["day"] = tomorrow_parts["day"] + 1
+assert(time.strftime(time.from_parts(tomorrow_parts), "%Y-%m-%d") == "2024-03-16", "adding 1 to the day field and calling from_parts() advances the date by a day")
+
+month_rollover = time.to_parts(time.parse("2024-01-31", "%Y-%m-%d"))
+month_rollover["day"] = month_rollover["day"] + 1
+assert(time.strftime(time.from_parts(month_rollover), "%Y-%m-%d") == "2024-02-01", "adding a day past a month's end rolls over into the next month via mktime()'s own normalization")
+
 # ------------------------------------------------------------------ #
 # 26. File-based imports                                              #
 # ------------------------------------------------------------------ #
@@ -226,6 +249,17 @@ assert(missing_remove_err != null, "io.remove() on a now-missing path reports an
 # The test suite runs scripts with no extra CLI arguments, so args() is empty here; the CLI
 # passes everything after the script path through (see main.c).
 assert(length(io.args()) == 0, "io.args() with no script arguments is an empty array")
+
+# Path utilities — pure string manipulation, no filesystem access; handle both '/' and '\' since
+# io.args() can hand back an OS-native path on Windows.
+assert(io.basename("a/b/c.txt") == "c.txt", "io.basename() returns the substring after the last separator")
+assert(io.basename("a\\b\\c.txt") == "c.txt", "io.basename() also recognizes a backslash separator")
+assert(io.basename("c.txt") == "c.txt", "io.basename() with no separator returns the whole string")
+assert(io.dirname("a/b/c.txt") == "a/b", "io.dirname() returns everything before the last separator")
+assert(io.dirname("c.txt") == ".", "io.dirname() with no separator returns '.', matching POSIX dirname")
+assert(io.dirname("/etc") == "/", "io.dirname() of a top-level path returns '/', not an empty string")
+assert(io.join("a/b", "c.txt") == "a/b/c.txt", "io.join() inserts exactly one separator")
+assert(io.join("a/b/", "c.txt") == "a/b/c.txt", "io.join() doesn't double a separator already present")
 
 # ------------------------------------------------------------------ #
 # json — encode/decode (a native module, same dispatch as math/string) #

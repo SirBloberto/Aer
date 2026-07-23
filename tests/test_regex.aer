@@ -83,6 +83,19 @@ assert(regex.replace("abc", "x*", "-") == "-a-b-c-", "replace() with a zero-widt
 assert(regex.replace("aaa", "^a", "X") == "Xaa", "^ in replace() only matches the true start of the subject, not every cursor position")
 
 # ------------------------------------------------------------------ #
+# regex.find_all — every non-overlapping match, as an array             #
+# ------------------------------------------------------------------ #
+
+all_nums = regex.find_all("price: 42, tax: 7, total: 49", "[0-9]+")
+assert(length(all_nums) == 3 and all_nums[0] == "42" and all_nums[1] == "7" and all_nums[2] == "49",
+       "find_all() collects every non-overlapping match in order")
+
+assert(length(regex.find_all("no digits here", "[0-9]+")) == 0, "find_all() returns an empty array, not null or an error, when nothing matches")
+
+# A zero-width pattern must still advance past a real character each time, same guard replace() uses.
+assert(length(regex.find_all("abc", "x*")) == 4, "find_all() with a zero-width pattern still terminates, matching once at every position including the end")
+
+# ------------------------------------------------------------------ #
 # Catastrophic-backtracking safety net                                 #
 # ------------------------------------------------------------------ #
 

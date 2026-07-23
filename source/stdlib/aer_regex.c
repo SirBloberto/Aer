@@ -404,5 +404,50 @@ bool aer_regex_call(VM* vm, int fn_id, int arg_count) {
         return true;
     }
 
+    if (fn_id == FN_REGEX_FIND_ALL && arg_count == 2) {
+        AerVal pat_v = vm_stack_pop(vm);
+        AerVal str_v = vm_stack_pop(vm);
+        if (aer_type(str_v) != TYPE_STRING || aer_type(pat_v) != TYPE_STRING) {
+            error("regex.find_all() requires a string and a pattern string");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        Group* g = regex_compile(aer_as_string(pat_v)->data);
+        if (!g) { error("regex.find_all(): invalid pattern '%s'", aer_as_string(pat_v)->data); vm_stack_push(vm, aer_null()); return true; }
+
+        AerString* subject = aer_as_string(str_v);
+        AerArray* r = vm_new_array();
+        r->count    = 0;
+        r->capacity = 4;
+        r->items    = xmalloc(sizeof(AerVal) * r->capacity);
+        r->shape    = NULL;
+
+        const char* cursor = subject->data;
+        for (;;) {
+            int mlen;
+            const char* at = regex_search(g, subject->data, cursor, &mlen);
+            if (!at) break;
+            char* buf = xmalloc((size_t)mlen + 1);
+            memcpy(buf, at, (size_t)mlen);
+            buf[mlen] = '\0';
+            if (r->count >= r->capacity) {
+                r->capacity *= 2;
+                r->items = xrealloc(r->items, sizeof(AerVal) * r->capacity);
+            }
+            r->items[r->count++] = aer_make_string(buf, (unsigned int)mlen);
+            /* A zero-width match (e.g. pattern "a*" against "bbb") must still advance past one
+               real character, or this loop never terminates -- same guard replace() uses. */
+            if (mlen == 0) {
+                if (at[0] == '\0') break;
+                cursor = at + 1;
+            } else {
+                cursor = at + mlen;
+            }
+        }
+        free_group(g);
+        vm_stack_push(vm, aer_array_val(r));
+        return true;
+    }
+
     return false;
 }

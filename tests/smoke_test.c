@@ -1780,7 +1780,11 @@ int main(void) {
        tier-selection bug at any boundary would show up here rather than only under later, harder-to-
        attribute dict stress tests. */
     {
-        hashtable_pools_init_once();   /* idempotent — safe even though vm_pools_init_once already calls this */
+        /* This test's own HashPools instance -- each hashtable-owning heap gets its own now (see
+           vm.h's VmHeap), not a single process-global one, so a standalone test like this needs
+           to create the one it exercises. */
+        static HashPools test_pools;
+        hashtable_pools_init(&test_pools);   /* idempotent */
 
         const unsigned int sizes[] = { 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 200, 500 };
         bool round_trip_ok = true;
@@ -1791,9 +1795,9 @@ int main(void) {
             src[len] = '\0';
 
             unsigned int out_len = 0;
-            char* k = hashtable_key_dup(src, len, &out_len);
+            char* k = hashtable_key_dup(&test_pools, src, len, &out_len);
             if (out_len != len || memcmp(k, src, len) != 0 || k[len] != '\0') round_trip_ok = false;
-            hashtable_key_free(k, out_len);
+            hashtable_key_free(&test_pools, k, out_len);
             free(src);
         }
         check(round_trip_ok, "hashtable_key_dup/hashtable_key_free round-trip correctly across every key-tier boundary (16/32/64/128) and the malloc-fallback threshold");
@@ -1804,10 +1808,10 @@ int main(void) {
            free to the wrong size-class tier. */
         char embedded[6] = { 'a', 'b', '\0', 'c', 'd', '\0' };
         unsigned int nul_out_len = 0;
-        char* nul_k = hashtable_key_dup(embedded, 5, &nul_out_len);
+        char* nul_k = hashtable_key_dup(&test_pools, embedded, 5, &nul_out_len);
         check(nul_out_len == 2 && memcmp(nul_k, "ab", 2) == 0 && nul_k[2] == '\0',
               "hashtable_key_dup truncates at the first embedded NUL byte, matching hash_match's own strlen-based comparison");
-        hashtable_key_free(nul_k, nul_out_len);
+        hashtable_key_free(&test_pools, nul_k, nul_out_len);
     }
 
     if (failures == 0) printf("\nAll v3 smoke tests passed.\n");

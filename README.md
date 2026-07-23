@@ -1180,16 +1180,18 @@ An embedding host can add its own modules the same way — see [Embedding](#embe
 
 ## Concurrency
 
-**No OS-thread parallelism.** AER has no threads, `async`/`await`, or event loop — the VM is a
+**No OS-thread parallelism yet.** AER has no threads, `async`/`await`, or event loop — the VM is a
 single, synchronous dispatch loop. **Multiple independent `VM`+`Chunk` pairs can coexist in one
-process** (file-based `import` already relies on this — each imported file gets its own), but they
-are **not safe to run simultaneously on separate OS threads**: a `VM`'s registers/call-stack are
-per-instance, but the underlying GC-managed heap (`string_pool`/`array_pool`/`dict_pool`/etc.,
-`source/core/vm.c`) is a single set of pools shared by the whole process, not one per `VM`. Two VMs
-executing at the same instant on different threads would race on the allocator and the collector.
-This is a deliberate scope limit for a "light" embedded scripting language, not an oversight — true
-parallelism would need every pool moved from a process-global static into a per-`VM` field, a
-rewrite comparable in size to the generational GC or value-representation work.
+process** (file-based `import` already relies on this — each imported file gets its own), and as of
+this heap-independence work, each `VM` genuinely owns its own GC-managed heap (`VmHeap`,
+`source/core/vm.h`/`vm.c`) — allocating, collecting, and freeing entirely on its own, with no shared
+pools between VMs. That was the harder half of what real thread-safety would need, and it's done.
+What's still missing is everything *around* it: the scheduler (`vm_run_slice`) is still cooperative
+and single-threaded, and process-global state elsewhere (the error-unwind target, the currently-
+active-VM-for-errors pointer, the lexer/parser's own file-static state) still assumes only one VM
+ever dispatches at a time. Two VMs running on separate OS threads today would no longer race on the
+*allocator*, but would still race on that remaining shared state — a real, but now much smaller,
+remaining gap than a from-scratch rewrite.
 
 **Cooperative, single-threaded concurrency exists at the language level** via the `actor` and
 `scheduler` modules:
@@ -1206,9 +1208,8 @@ msg = actor.receive(worker)                  # drain worker's mailbox (actor.sen
 result, call_err = actor.call(worker, "add", 3, 4)   # a direct, synchronous call outside the scheduler
 ```
 
-`actor.spawn(path)` starts an independent VM (the same instantiation `import` uses internally,
-sharing the same process-global GC pools above — safe because only one actor's bytecode ever
-executes at a given instant). `actor.send`/`actor.receive` move plain strings through a host-side
+`actor.spawn(path)` starts an independent VM (the same instantiation `import` uses internally, with
+its own independent heap — see above). `actor.send`/`actor.receive` move plain strings through a host-side
 mailbox — a value from one actor's pools is meaningless in another's, so message content (JSON,
 typically) is entirely up to each side's own `json.encode()`/`decode()` calls; the mailbox itself
 never moves a live value. `actor.call` runs a named function on an actor synchronously, to
@@ -1224,7 +1225,7 @@ loop) means `scheduler.run()` never returns, the same as any other infinite loop
 behaves.
 
 **What this is not:** the scheduler does not preempt a native call. An actor blocked inside
-`net.recv()`, a slow `io.read()`, or a pathological regex still runs that call to completion before
+`net.recv()`/`net.accept()`, a slow `io.read()`, or a pathological regex still runs that call to completion before
 the next scheduler slice can fire, because it's a C function call the instruction-budget check
 can't see inside of. Cooperative scheduling interleaves AER-level work between actors; it does not
 make any single blocking call itself non-blocking.
@@ -1335,9 +1336,9 @@ convention as the rest of the fallible stdlib rather than aborting the script on
 
 ### Networking — `net`
 
-Blocking TCP only — connect/send/recv/close, the common "talk to a server" case. No HTTP/TLS
-layer and no listen/accept (there's no way to *be* a server yet); deliberately scoped small rather
-than half-implementing a much bigger surface.
+Blocking TCP only — connect/send/recv/close plus listen/accept, the common "talk to a server" and
+"be a server" cases. No HTTP/TLS layer; deliberately scoped small rather than half-implementing a
+much bigger surface.
 
 ```
 import net
@@ -1349,18 +1350,31 @@ if err == null:
     net.close(handle)
 ```
 
-Every call is blocking, matching AER's single-threaded execution model — no async I/O, no event
-loop. `connect()`, `send()`, and `recv()` all share the same 10-second timeout: a plain blocking
-call has no bound of its own and can hang far longer than a normal refusal/EOF against a peer
-that's merely slow or silent (an unreachable address for `connect()`, a connection that's open but
-never sends for `recv()`, a full receive buffer on the other end for `send()`) — past 10 seconds
-each reports the same kind of `Result` error every other AER fault does, rather than hanging the
-whole script.
+```
+listen_handle, err = net.listen(port)     # binds + listens on every local IPv4 interface
+if err == null:
+    conn, aerr = net.accept(listen_handle)  # blocks (bounded, see below) for the next incoming connection
+    if aerr == null:
+        # conn works with send()/recv()/close() exactly like a connect()-returned handle
+        net.close(conn)
+    net.close(listen_handle)
+```
 
-A connection handle is a plain integer, but never a raw OS socket cast through one — it's resolved
-through a small internal registry, so a wrong or stale handle (a typo, reusing one after `close()`)
-is a clean, reported error, never an operation on whatever OS handle that integer happens to
-collide with.
+Every call is blocking, matching AER's single-threaded execution model — no async I/O, no event
+loop. `connect()`, `send()`, `recv()`, and `accept()` all share the same 10-second timeout: a plain
+blocking call has no bound of its own and can hang far longer than a normal refusal/EOF against a
+peer that's merely slow or silent (an unreachable address for `connect()`, a connection that's open
+but never sends for `recv()`, a full receive buffer on the other end for `send()`, no client ever
+connecting for `accept()`) — past 10 seconds each reports the same kind of `Result` error every
+other AER fault does, rather than hanging the whole script (and, for `accept()` specifically,
+rather than freezing every other actor `scheduler.run()` is trying to interleave). A script standing
+up a long-lived server calls `accept()` in a loop and treats a timeout as "no client yet, try
+again," not a fatal error.
+
+A connection or listening handle is a plain integer, but never a raw OS socket cast through one —
+both are resolved through the same small internal registry, so a wrong or stale handle (a typo,
+reusing one after `close()`) is a clean, reported error, never an operation on whatever OS handle
+that integer happens to collide with.
 
 ### Regular Expressions — `regex`
 
@@ -1377,6 +1391,7 @@ import regex
 
 regex.match(s, pattern)          # true/false — does pattern occur anywhere in s
 regex.find(s, pattern)           # the first matching substring, or null
+regex.find_all(s, pattern)       # every non-overlapping matching substring, as an array (empty, not null, if none)
 regex.replace(s, pattern, repl)  # every non-overlapping match replaced with repl (a literal string, no backreferences)
 ```
 
@@ -1434,6 +1449,9 @@ io.exists(path)   # plain boolean — "no" is an answer here, not an error, so n
 io.remove(path)   # deletes the file — returns (null, err)
 io.stdin()        # returns a handle for piped input (always succeeds) — pass it to io.read() instead of a path
 io.args()         # the script's own command-line arguments (everything after the script path), as an array of strings
+io.basename(path) # the substring after the last '/' or '\' (the whole string if neither is present)
+io.dirname(path)  # the substring before the last '/' or '\' ('.' if neither is present, POSIX-style)
+io.join(a, b)     # a + b with exactly one '/' inserted between them — no filesystem access, pure string logic
 ```
 
 Every `io` function follows the `(value, err)` convention `safe_div` establishes at the user level
@@ -1966,15 +1984,16 @@ time a cell survives any collection), a free-list bit, and a remembered-set bit 
 Allocation is unchanged from the pooled/slab design (a free-list pop, or a bump into the current
 slab) — collection is what's new.
 
-**Two collection modes, one shared heap.** A *minor* collection traces the normal roots (the VM
-stack and every live call frame's registers) plus a *remembered set* — old
+**Two collection modes, each VM's own independent heap.** A *minor* collection traces the normal
+roots (the VM stack and every live call frame's registers) plus a *remembered set* — old
 objects a write barrier caught being mutated to hold a young reference — and only sweeps young
 cells; old cells are presumed live and left untouched, which is what keeps minor collections cheap.
 A *major* collection (run periodically, after a fixed number of minor ones) traces the same roots
-with no remembered set needed and sweeps both generations. The seven pools are process-global and
-shared by the main VM *and* every file-module's own VM (`import` still runs each file in a fully
-separate `Chunk`+`VM` — see [Modularity](#modularity)), so a collection triggered anywhere marks
-every loaded module's roots too, not just the VM that triggered it.
+with no remembered set needed and sweeps both generations. The seven pools live on a `VmHeap`
+embedded in each `VM` (`source/core/vm.h`), not a process-global — the main VM, every file-module's
+own VM, and every actor's own VM (`import`/`actor.spawn` both run their target in a fully separate
+`Chunk`+`VM` — see [Modularity](#modularity)) each collect only their own heap. A collection
+triggered by one VM's allocation pressure never marks or sweeps any other VM's cells.
 
 **The write barrier** — the mechanism that makes minor collections safe — only has two real call
 sites: array item writes (index-assignment, `append`, struct field assignment) and hashtable entry
@@ -2010,7 +2029,7 @@ runtime error (`aer_last_error()`) — the same non-fatal path every other runti
 | No arithmetic overflow checks | `arr[9999999999999]` on a 32-bit platform behaves unexpectedly | Array bounds are checked; index arithmetic is not |
 | `io` has no path restriction within itself | Every AER script gets real file access (see [File I/O](#file-io--io)) | A host can disable it entirely with `aer_set_io_enabled(false)`/`--no-io` (see [Embedding](#embedding)), but there's no path allowlisting *within* `io` — it's all-or-nothing, not a real permission system |
 | File-based `import` reads arbitrary files by name | `import` resolves and executes `<name>.aer` (or a file found via `AER_PATH`) from disk | `aer_set_import_enabled(false)`/`--no-import` disables file-based import entirely (fixed stdlib modules are unaffected); same-directory/`AER_PATH` resolution limits the blast radius further when it's left on |
-| `net` makes outbound TCP connections with no restriction | Any script can `net.connect()` to any host/port reachable from the process | `aer_set_net_enabled(false)`/`--no-net` disables it entirely; no host/port allowlisting within `net` itself |
+| `net` makes outbound TCP connections and accepts inbound ones, with no restriction | Any script can `net.connect()` to any host/port reachable from the process, or `net.listen()`/`net.accept()` to receive connections from anywhere reachable to it | `aer_set_net_enabled(false)`/`--no-net` disables the whole module, inbound and outbound alike — deliberately one flag, one meaning, rather than a separate toggle for listening; no host/port allowlisting, and no way to permit outbound while refusing inbound, within `net` itself |
 
 The three toggles above (`io`/`net`/file-based `import`) are a blast-radius limiter, not a real
 permission system — whole capability on/off, process-wide, no allowlisting of specific paths/hosts,

@@ -155,11 +155,12 @@ assert(slab_structs[63].x == 63 and slab_structs[63].y == 126, "the struct right
 assert(slab_structs[64].x == 64 and slab_structs[64].y == 128, "the first struct in the newly-grown second slab is intact")
 assert(slab_structs[99].x == 99 and slab_structs[99].y == 198, "the last struct is intact")
 
-# Write barrier for struct field-set specifically (the new REMEMBERED_STRUCT
-# path in gc_barrier_array) — same pattern as gc_old_container/gc_old_dict
-# above, but for a struct instance. Without the barrier, a value written
-# into an already-old struct instance could be swept as unreachable by a
-# later minor collection, which never re-traces old cells on its own.
+# Write barrier for struct field-set specifically (gc_barrier_struct, its own
+# barrier now that TYPE_STRUCT is a real type instead of a shaped AerArray) —
+# same pattern as gc_old_container/gc_old_dict above, but for a struct
+# instance. Without the barrier, a value written into an already-old struct
+# instance could be swept as unreachable by a later minor collection, which
+# never re-traces old cells on its own.
 struct OldStruct:
     payload = null
 
@@ -195,5 +196,26 @@ assert(mp.x == 10, "plain field assignment correct with inline struct storage")
 assert(mp.y == 7, "compound field assignment correct with inline struct storage")
 assert(mut_pts[0].x == 101 and mut_pts[1].x == 102 and mut_pts[2].x == 103,
        "arr[idx].field compound-assignment fusion correct with inline struct storage")
+
+# A TYPE_ANY field holding a real reference (an array, not just a string this
+# time) must survive not only a minor collection but a MAJOR one too — the
+# default major_gc_every_n_minor is 10, so this needs enough allocation
+# pressure to actually cross that, not just the ~3 minor cycles the write-
+# barrier test above triggers. mark_value's TYPE_STRUCT case must keep
+# pushing this field's content every cycle for as long as it's reachable.
+struct RefHolder:
+    tag = "holder"
+    ref = null
+
+gc_ref_holder = RefHolder("holder", [1, 2, 3])
+
+gc_churn5 = []
+for i in 0..30000:
+    collection.append(gc_churn5, [i, "w" + (i as string)])
+
+assert(gc_ref_holder.ref[0] == 1 and gc_ref_holder.ref[1] == 2 and gc_ref_holder.ref[2] == 3,
+       "a struct's TYPE_ANY field holding an array reference survives enough collections to include at least one major cycle")
+assert(gc_ref_holder.tag == "holder",
+       "the same struct's typed (raw) field is untouched by the same collections")
 
 print("test_memory_gc.aer: all assertions passed.")
