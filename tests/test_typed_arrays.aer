@@ -1,0 +1,98 @@
+#!/usr/bin/env aer
+# AER test suite — bare numeric typed arrays (`[value; count]`, the numeric half of the
+# repeat-literal — see test_packed_arrays.aer for the struct half). Machine-checked via assert():
+# a clean run exits 0; any failure prints "ASSERT FAILED: ..." and the process exits nonzero
+# (see main.c/error.c).
+
+# ------------------------------------------------------------------ #
+# 1. Wide (unsuffixed) integer/float arrays — construction, get/set,  #
+#    independence between elements.                                  #
+# ------------------------------------------------------------------ #
+
+ints = [0; 5]
+assert(length(ints) == 5, "wide int typed array reports its declared count via length()")
+assert(ints[0] == 0 and ints[4] == 0, "every element starts at the fill value")
+assert(type(ints) == "integer[]", "wide int typed array's type() name")
+
+ints[2] = 42
+assert(ints[2] == 42, "element set/get round-trips")
+assert(ints[0] == 0 and ints[1] == 0 and ints[3] == 0 and ints[4] == 0, "writing one element leaves every other element untouched")
+
+reals = [1.5; 4]
+assert(type(reals) == "float[]", "wide float typed array's type() name")
+assert(reals[0] == 1.5 and reals[3] == 1.5, "a non-zero fill value replicates to every element")
+reals[1] = 9.25
+assert(reals[1] == 9.25, "float element set/get round-trips")
+
+# An integer written into a wide float[] array promotes, same convention as arithmetic.
+reals[2] = 7
+assert(reals[2] == 7.0, "an integer literal assigned into a float[] array promotes")
+
+# ------------------------------------------------------------------ #
+# 2. Narrow (`i`/`f`-suffixed) int32/float32 arrays.                  #
+# ------------------------------------------------------------------ #
+
+narrow_ints = [0i; 5]
+assert(type(narrow_ints) == "int32[]", "narrow int32 typed array's type() name")
+narrow_ints[0] = 100
+narrow_ints[4] = -100
+assert(narrow_ints[0] == 100 and narrow_ints[4] == -100, "int32 element set/get round-trips, including negative")
+
+narrow_floats = [0.0f; 5]
+assert(type(narrow_floats) == "float32[]", "narrow float32 typed array's type() name")
+narrow_floats[0] = 3.5
+assert(narrow_floats[0] == 3.5, "float32 element set/get round-trips")
+narrow_floats[1] = 2
+assert(narrow_floats[1] == 2.0, "an integer literal assigned into a float32[] array promotes")
+
+# Only a BARE suffixed literal directly in the fill position selects narrow storage -- a variable
+# holding the identical value does not (the suffix is parse-time-only information; see Token.narrow's
+# own comment, lexer.h). This is expected, not a bug: it's the same "not wrapped in anything else"
+# rule that decides which repeat literals are eligible.
+one_narrow = 0i
+computed = [one_narrow; 3]
+assert(type(computed) == "integer[]", "a variable holding a narrow-suffixed value does NOT select narrow storage -- only a bare literal does")
+
+# ------------------------------------------------------------------ #
+# 3. Iteration -- unlike a packed array's struct elements (no          #
+#    standalone reference, so no iteration), a typed array's elements #
+#    are plain scalars and iterate like an ordinary array's.          #
+# ------------------------------------------------------------------ #
+
+total = 0
+for v in [10; 4]:
+    total += v
+assert(total == 40, "typed array iteration yields each element's value")
+
+# ------------------------------------------------------------------ #
+# 4. Two independent typed arrays don't share storage.                #
+# ------------------------------------------------------------------ #
+
+a1 = [0; 3]
+a2 = [0; 3]
+a1[0] = 5
+assert(a1[0] != a2[0], "two separate typed arrays are independently allocated, not aliased")
+
+# ------------------------------------------------------------------ #
+# 5. Zero-count typed array -- the empty-block edge case (malloc(0)   #
+#    is implementation-defined, must not be misreported as            #
+#    out-of-memory or crash).                                         #
+# ------------------------------------------------------------------ #
+
+empty_typed = [0; 0]
+assert(length(empty_typed) == 0, "a zero-count typed array constructs cleanly and reports length 0")
+
+# ------------------------------------------------------------------ #
+# 6. Out-of-range/type-mismatch errors (documented, not run -- same    #
+#    convention as test_packed_arrays.aer: a real runtime error aborts #
+#    the whole script, so these can't be exercised inline in a script  #
+#    that must exit 0).                                                #
+# ------------------------------------------------------------------ #
+
+# narrow_ints[0] = 5000000000     # would error: Value 5000000000 out of range for an int32[] array
+# ints[0] = 3.5                   # would error: Cannot assign a float into an integer[] array
+# ints[0] = "not a number"        # would error: Cannot assign a string into an integer[] array
+# bad = ints[100]                 # would error: Array index 100 out of bounds (len 5)
+# bad = [Point(); 3][0]           # would error handled by test_packed_arrays.aer instead -- struct half
+
+print("test_typed_arrays.aer: all assertions passed.")

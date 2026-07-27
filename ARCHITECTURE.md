@@ -621,10 +621,14 @@ default build, to keep the makefile small.
   bug above (that's about *how often* the array gets rescanned once old, not the reallocation cost),
   but is a real, complementary, and much cheaper win for the same "build a huge array via many
   appends" pattern. Not built yet.
-- **TODO: opt-in 32-bit (`int32`/`float32`) fields for structs and packed arrays.** Distinct from —
-  and a much better-grounded idea than — shrinking the general `AerVal` (see below): a struct/
-  packed-array field's type is already known statically at compile time via `Shape.field_types[]`,
-  and every access already goes through a fixed byte offset with zero runtime type-tag recovery (e.g.
+- **TODO: opt-in 32-bit (`int32`/`float32`) fields for structs** (narrow *arrays* already landed —
+  `[0i; n]`/`[0.0f; n]` build an `AerTypedArray` with no `Shape` involved at all, see
+  [Repeat-Literal Arrays](README.md#repeat-literal-arrays); this entry is specifically about
+  extending the same `i`/`f` literal-suffix convention to a struct's own per-field defaults, e.g.
+  `x = 0.0f` inside a `struct` body). Distinct from — and a much better-grounded idea than —
+  shrinking the general `AerVal` (see below): a struct field's type is already known statically at
+  compile time via `Shape.field_types[]`, and every access already goes through a fixed byte offset
+  with zero runtime type-tag recovery (e.g.
   `OP_FIELD_GET_RAW_REAL`, `off=24`) — so narrowing a field from 8 to 4 bytes doesn't reintroduce the
   per-access unpacking cost that made NaN-boxing a measured regression (see below); it's a direct
   continuation of the already-validated principle behind the existing typed-struct-fields work

@@ -33,7 +33,7 @@ function nudge_x(bodies, n, dx):
     for i in 0..n:
         bodies[i].x += dx
 
-bodies = Body[5]
+bodies = [Body(); 5]
 bodies[0].x = 1.0
 bodies[0].y = 2.0
 bodies[0].mass = 10.0
@@ -170,7 +170,7 @@ function scale_move(ms, cnt, scale, extra):
         idx += 1
     return extra
 
-movers = Mover[3]
+movers = [Mover(); 3]
 movers[0].vx = 1.0
 movers[1].vx = 2.0
 movers[2].vx = 3.0
@@ -210,7 +210,7 @@ function scale_with_local(ms, cnt, scale):
         idx += 1
     return total
 
-movers2 = Mover[2]
+movers2 = [Mover(); 2]
 movers2[0].vx = 1.0
 movers2[1].vx = 1.0
 total = scale_with_local(movers2, 2, 3.0)

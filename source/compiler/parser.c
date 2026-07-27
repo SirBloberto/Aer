@@ -264,9 +264,13 @@ void emit_struct_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, in
     chunk_emit(c, (uint32_t)type_name_pool_idx);
 }
 
-void emit_packed_array_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int rk_count) {
-    chunk_emit(c, PACK_OP_A_W16(OP_PACKED_ARRAY_NEW, dest_reg, pack_rk16(rk_count)));
-    chunk_emit(c, (uint32_t)type_name_pool_idx);
+/* `[value; count]` -- fill_reg is already-materialized (the fill expression, evaluated exactly
+   once); narrow_flag (0/1/2 = none/int32/float32) is a pure parse-time decision, set only when the
+   fill expression was written as an `i`/`f`-suffixed literal directly in this position (see
+   parse_primary_inner's own comment). */
+void emit_array_repeat(Chunk* c, int dest_reg, int fill_reg, int narrow_flag, int rk_count) {
+    chunk_emit(c, PACK3(OP_ARRAY_REPEAT, dest_reg, fill_reg, narrow_flag));
+    chunk_emit(c, (uint32_t)pack_rk16(rk_count));
 }
 
 void emit_field_get(Chunk* c, int dest_reg, int struct_reg, unsigned int field_name_pool_idx) {
@@ -310,7 +314,6 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond);
 static void parse_assignment(Chunk* c, unsigned int name_idx);
 static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_is_index);
 static int  parse_call(Chunk* c, unsigned int name_idx);
-static int  parse_packed_array_new(Chunk* c, unsigned int name_idx);
 static void parse_function(Chunk* c);
 static bool parse_literal_default(Chunk* c, AerVal* out);
 static void parse_return(Chunk* c);
@@ -1273,16 +1276,67 @@ static int parse_primary_inner(Chunk* c) {
         require(TOKEN_CLOSE_PARENTHESE, "expected ')' after expression");
         return rk;
     }
-    /* Elements share call arguments' contiguous-materialization helper, then OP_ARRAY_NEW. */
+    /* `[]`/`[a, b, c]` (ordinary array literal, sharing call arguments' contiguous-materialization
+       helper, then OP_ARRAY_NEW) vs. `[value; count]` (the repeat-literal -- replaces the old
+       `Type[count]` entirely, see OP_ARRAY_REPEAT's own comment, vm.h). The two can't be told apart
+       until the first element is already parsed (nothing before it distinguishes them), so the
+       first element is always parsed as an ordinary expression first, then the next token decides
+       which construct this actually is. */
     if (consume(TOKEN_OPEN_BRACKET)) {
-        int item_reg_base;
-        int item_count = parse_contiguous_exprs(c, TOKEN_CLOSE_BRACKET, &item_reg_base);
+        if (consume(TOKEN_CLOSE_BRACKET)) {
+            int dest = reg_alloc();
+            emit_array_new(c, dest, dest, 0);
+            return dest;
+        }
+        /* A bare `i`/`f`-suffixed numeric literal directly here (not wrapped in any other
+           expression) selects narrow (int32/float32) storage for the repeat-literal's numeric case
+           -- a suffix is parse-time-only information (see Token.narrow's own comment, lexer.h), so
+           this has to be decided from the token BEFORE parse_binary consumes it, not from the
+           runtime value it produces. Confirmed "not wrapped in anything else" by checking that
+           parsing the first element emitted zero opcodes -- a lone literal folds straight into a
+           constant-pool operand with no codegen, while `0.0f + 1` or any other compound expression
+           emits at least one real instruction. */
+        bool narrow_int_candidate   = (token.type == TOKEN_INTEGER && token.narrow);
+        bool narrow_float_candidate = (token.type == TOKEN_REAL    && token.narrow);
+        unsigned int emit_count_before = c->count;
+        int rk_first = parse_binary(c, 0);
+        if (parse_had_error) return 0;
+
+        if (consume(TOKEN_SEMICOLON)) {
+            int narrow_flag = 0;
+            if (c->count == emit_count_before) {
+                if (narrow_int_candidate)   narrow_flag = 1;
+                else if (narrow_float_candidate) narrow_flag = 2;
+            }
+            int fill_reg = arg_materialize(c, rk_first);
+            int rk_count = parse_binary(c, 0);
+            require(TOKEN_CLOSE_BRACKET, "expected ']' after repeat-literal count");
+            if (parse_had_error) return 0;
+            rk_count = box_if_raw(c, rk_count);
+            if (!rk16_fits(rk_count)) {
+                error_at("Expression too large to compile (register/constant exceeds the repeat-literal count encoding's range)");
+                return 0;
+            }
+            /* Strict LIFO free order -- rk_count was allocated (if a temp at all) after fill_reg. */
+            if (is_temp(rk_count)) reg_free(1);
+            if (is_temp(fill_reg)) reg_free(1);
+            int dest = reg_alloc();
+            emit_array_repeat(c, dest, fill_reg, narrow_flag, rk_count);
+            return dest;
+        }
+
+        int item_reg_base = arg_materialize(c, rk_first);
+        int item_count = 1;
+        while (consume(TOKEN_COMMA)) {
+            int rk = parse_binary(c, 0);
+            arg_materialize(c, rk);
+            item_count++;
+        }
         require(TOKEN_CLOSE_BRACKET, "expected ']' after array literal");
         if (parse_had_error) return 0;
-        int dest = (item_count > 0) ? item_reg_base : reg_alloc();
         if (item_count > 1) reg_free(item_count - 1);
-        emit_array_new(c, dest, item_reg_base < 0 ? dest : item_reg_base, item_count);
-        return dest;
+        emit_array_new(c, item_reg_base, item_reg_base, item_count);
+        return item_reg_base;
     }
     /* Each item is a key:value pair, so key/value materialize back to back, landing at
        pair_reg_base+2i/+2i+1 to match OP_DICT_NEW's layout. */
@@ -1324,18 +1378,6 @@ static int parse_primary_inner(Chunk* c) {
         unsigned int name_idx = chunk_add_pool(c, token.value);
         lex();
         if (consume(TOKEN_OPEN_PARENTHESE)) return parse_call(c, name_idx);
-
-        /* Packed array construction, same is_struct_name precedence as `Type(...)`. Peeked (not
-           consumed) so ordinary `someVar[i]` falls through untouched. */
-        if (equal(TOKEN_OPEN_BRACKET)) {
-            int dummy_reg;
-            bool shadowed = var_lookup(name_idx, &dummy_reg) ||
-                             (function_depth > 0 && global_lookup(name_idx, &dummy_reg));
-            if (!shadowed && is_struct_name(name_idx)) {
-                lex();   /* consume '[' */
-                return parse_packed_array_new(c, name_idx);
-            }
-        }
 
         /* A raw-tracked name returns an RK_RAW_*_FLAG-tagged operand, letting a bare reference compose
            through further arithmetic without boxing. */
@@ -3079,24 +3121,6 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
    simplest correct approach regardless). */
 static unsigned int last_bare_call_end   = (unsigned int)-1;
 static unsigned int last_bare_call_start = (unsigned int)-1;
-
-/* Reuses the indexing-bracket grammar rather than a call-with-type-as-value form, consistent
-   with `Type(...)` meaning construct. Eligibility can't be checked here (a Shape is only fully
-   known once OP_DEFINE_STRUCT runs) -- deferred to OP_PACKED_ARRAY_NEW's own runtime check. */
-static int parse_packed_array_new(Chunk* c, unsigned int name_idx) {
-    int rk_count = parse_binary(c, 0);
-    require(TOKEN_CLOSE_BRACKET, "expected ']' after packed array count");
-    if (parse_had_error) return 0;
-    rk_count = box_if_raw(c, rk_count);   /* no raw-native form of this opcode exists */
-    if (!rk16_fits(rk_count)) {
-        error_at("Expression too large to compile (register/constant exceeds the packed-array-count encoding's range)");
-        return 0;
-    }
-    if (is_temp(rk_count)) reg_free(1);
-    int dest = reg_alloc();
-    emit_packed_array_new(c, dest, name_idx, rk_count);
-    return dest;
-}
 
 static int parse_call(Chunk* c, unsigned int name_idx) {
     /* string(x) is a cast (TO_STR), checked before anything else -- matching the exact "immune to

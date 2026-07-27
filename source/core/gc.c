@@ -17,6 +17,7 @@ static bool value_is_young(VmHeap* heap, AerVal v) {
         case TYPE_DICT:     return pool_is_young(&heap->dict_pool,     aer_as_dict(v));
         case TYPE_FUNCTION: return pool_is_young(&heap->function_pool, aer_as_function(v));
         case TYPE_PACKED_ARRAY: return pool_is_young(&heap->packed_array_pool, aer_as_packed_array(v));
+        case TYPE_TYPED_ARRAY: return pool_is_young(&heap->typed_array_pool, aer_as_typed_array(v));
         case TYPE_RESULT:   return pool_is_young(&heap->result_pool,   aer_as_result(v));
         default:            return false;   /* null/boolean/integer/float have no heap cell — integers are never boxed under the tagged representation */
     }
@@ -94,7 +95,7 @@ void gc_barrier_dict(VM* vm, AerDict* d, AerVal new_value) {
 static bool value_has_cell(AerVal v) {
     switch (aer_type(v)) {
         case TYPE_STRING: case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_DICT: case TYPE_FUNCTION:
-        case TYPE_PACKED_ARRAY: case TYPE_RESULT:
+        case TYPE_PACKED_ARRAY: case TYPE_TYPED_ARRAY: case TYPE_RESULT:
             return true;
         default:
             return false;
@@ -157,6 +158,11 @@ static void mark_value(VmHeap* heap, AerVal v) {
             /* A GC leaf -- every field is a fixed primitive, never a heap reference. */
             pool_mark(&heap->packed_array_pool, aer_as_packed_array(v));
             break;
+        case TYPE_TYPED_ARRAY:
+            /* A GC leaf, same reasoning as TYPE_PACKED_ARRAY above -- every element is a fixed
+               numeric primitive. */
+            pool_mark(&heap->typed_array_pool, aer_as_typed_array(v));
+            break;
         case TYPE_RESULT: {
             AerResult* r = aer_as_result(v);
             if (!pool_mark(&heap->result_pool, r)) {
@@ -211,6 +217,7 @@ static void free_dict(void* cell)     { hashtable_free(&((AerDict*)cell)->map); 
 static void free_function(void* cell) { (void)cell; }   /* nothing to free — no closure upvalues array anymore */
 static void free_struct(void* cell)   { (void)cell; }   /* items lives inline in this same cell — nothing separate to free */
 static void free_packed_array(void* cell) { free(((AerPackedArray*)cell)->data); }
+static void free_typed_array(void* cell)  { free(((AerTypedArray*)cell)->data); }
 static void free_result(void* cell)   { (void)cell; }   /* both fields are plain AerVals — nothing separately owned */
 
 /* vm_free's own teardown call (vm.c) -- every cell finalized regardless of mark/generation state,
@@ -224,6 +231,7 @@ void gc_finalize_all_pools(VmHeap* heap) {
     pool_finalize_all(&heap->function_pool,     free_function);
     pool_finalize_all(&heap->struct_pool,       free_struct);
     pool_finalize_all(&heap->packed_array_pool, free_packed_array);
+    pool_finalize_all(&heap->typed_array_pool,  free_typed_array);
     pool_finalize_all(&heap->result_pool,       free_result);
 }
 
@@ -244,6 +252,7 @@ static void gc_collect(VM* vm, bool minor) {
     pool_clear_marks(&heap->function_pool);
     pool_clear_marks(&heap->struct_pool);
     pool_clear_marks(&heap->packed_array_pool);
+    pool_clear_marks(&heap->typed_array_pool);
     pool_clear_marks(&heap->result_pool);
 
     mark_vm_roots(heap, vm);
@@ -300,6 +309,7 @@ static void gc_collect(VM* vm, bool minor) {
     pool_sweep(&heap->function_pool, minor, free_function);
     pool_sweep(&heap->struct_pool,   minor, free_struct);
     pool_sweep(&heap->packed_array_pool, minor, free_packed_array);
+    pool_sweep(&heap->typed_array_pool, minor, free_typed_array);
     pool_sweep(&heap->result_pool,   minor, free_result);
 }
 
@@ -319,7 +329,7 @@ static void gc_reset_alloc_counts(VmHeap* heap) {
 unsigned int gc_count_live_cells(VmHeap* heap) {
     unsigned int total = 0;
     Pool* pools[] = { &heap->string_pool, &heap->array_pool, &heap->dict_pool, &heap->function_pool,
-                      &heap->struct_pool, &heap->packed_array_pool };
+                      &heap->struct_pool, &heap->packed_array_pool, &heap->typed_array_pool };
     for (unsigned int p = 0; p < sizeof(pools) / sizeof(pools[0]); p++) {
         Pool* pool = pools[p];
         for (unsigned int i = 0; i < pool->slab_count; i++) {

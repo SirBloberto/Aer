@@ -13,6 +13,7 @@ typedef struct AerFunction    AerFunction;
 typedef struct AerString      AerString;
 typedef struct AerStruct      AerStruct;   /* full definition in vm.h — needs Shape's real definition, defined there too */
 typedef struct AerPackedArray AerPackedArray;
+typedef struct AerTypedArray  AerTypedArray;
 typedef struct AerResult      AerResult;
 typedef struct Shape       Shape;   /* full definition in vm.h — needs pool-index arrays */
 
@@ -32,6 +33,11 @@ typedef enum ValueType {
     /* Struct-typed *arrays* packed inline at 8 bytes/field — fixed-primitive fields only, and no
        standalone `arr[i]` reference value (only `arr[i].field`); see AerPackedArray below. */
     TYPE_PACKED_ARRAY,
+    /* A dense, uniformly-typed numeric array (int32/float32/int64/float64) — the numeric half of the
+       `[value; count]` repeat-literal (the struct half is TYPE_PACKED_ARRAY above). Unlike
+       AerPackedArray this has no Shape at all -- just one fixed element kind for the whole array.
+       See AerTypedArray below. */
+    TYPE_TYPED_ARRAY,
     /* Tagged (value, err) pair, exactly one non-null — a real type (not a 2-array) so dispatch
        can recognize a Result on sight. */
     TYPE_RESULT,
@@ -78,6 +84,28 @@ struct AerPackedArray {
     Shape*        shape;
 };
 _Static_assert(offsetof(struct AerPackedArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
+
+/* Which numeric width/kind a TYPE_TYPED_ARRAY's elements are stored as. INT64/FLOAT64 are the
+   "wide" (unsuffixed-literal) case, INT32/FLOAT32 the "narrow" (`i`/`f`-suffixed-literal) one --
+   see the repeat-literal construction opcode's own comment (vm.h) for how one is chosen. */
+typedef enum {
+    TYPED_ELEM_INT32,
+    TYPED_ELEM_FLOAT32,
+    TYPED_ELEM_INT64,
+    TYPED_ELEM_FLOAT64,
+} TypedArrayElemKind;
+
+/* A dense, fixed-width numeric array -- element i's raw bytes are at data + i*elem_width. A GC
+   leaf, same reasoning as AerPackedArray above: every element is a fixed numeric primitive, never a
+   heap reference, so no write barrier and no mark recursion. No Shape -- there are no fields, just
+   one uniform element kind for the whole array. */
+struct AerTypedArray {
+    unsigned char      gc_state;
+    unsigned char*     data;
+    unsigned int       count;
+    TypedArrayElemKind elem_kind;
+};
+_Static_assert(offsetof(struct AerTypedArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
 /* Field order is size-sorted to minimize padding; arity fields fit uint16_t (MAX_PARAMS == 32). */
 struct AerFunction {
@@ -157,6 +185,7 @@ static inline AerVal aer_array_val(AerArray* a)        { return aer_box_ptr(TYPE
 static inline AerVal aer_dict_val(AerDict* d)          { return aer_box_ptr(TYPE_DICT, d); }
 static inline AerVal aer_struct_val(AerStruct* s)      { return aer_box_ptr(TYPE_STRUCT, s); }
 static inline AerVal aer_packed_array_val(AerPackedArray* a) { return aer_box_ptr(TYPE_PACKED_ARRAY, a); }
+static inline AerVal aer_typed_array_val(AerTypedArray* a) { return aer_box_ptr(TYPE_TYPED_ARRAY, a); }
 static inline AerVal aer_result_val(AerResult* r)       { return aer_box_ptr(TYPE_RESULT, r); }
 
 static inline bool      aer_as_bool(AerVal v) { return v.as.b; }
@@ -169,6 +198,7 @@ static inline AerArray*    aer_as_array(AerVal v)     { return (AerArray*)v.as.p
 static inline AerDict*     aer_as_dict(AerVal v)      { return (AerDict*)v.as.ptr; }
 static inline AerStruct*   aer_as_struct(AerVal v)    { return (AerStruct*)v.as.ptr; }
 static inline AerPackedArray* aer_as_packed_array(AerVal v) { return (AerPackedArray*)v.as.ptr; }
+static inline AerTypedArray*  aer_as_typed_array(AerVal v)  { return (AerTypedArray*)v.as.ptr; }
 static inline AerResult*      aer_as_result(AerVal v)        { return (AerResult*)v.as.ptr; }
 
 /* Byte-index of needle's first occurrence in hay, or -1; empty needle matches at 0. The one

@@ -82,6 +82,7 @@ typedef enum TokenType {
     TOKEN_TYPE_HASHTABLE,
 
     TOKEN_COMMA,
+    TOKEN_SEMICOLON,        /* ;  — the repeat-literal separator, `[value; count]`, and nothing else */
 
     TOKEN_INDENT,
     TOKEN_DEDENT,
@@ -95,6 +96,11 @@ typedef enum TokenType {
 typedef struct Token {
     TokenType type;
     AerVal    value;
+    /* Set only for TOKEN_INTEGER/TOKEN_REAL immediately suffixed `i`/`f` (`42i`, `0.0f`) -- a
+       parse-time-only marker (a runtime AerVal has no memory of it) selecting 32-bit int32/float32
+       storage in a repeat-literal array (`[0.0f; n]`) or a struct field's default. Meaningless on
+       any other token type. */
+    bool      narrow;
 } Token;
 
 void read_file(char* name);

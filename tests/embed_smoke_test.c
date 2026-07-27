@@ -344,7 +344,7 @@ int main(void) {
     aer_clear_error();
     ok = aer_run_source(&vm, &chunk,
         "struct ForInStruct:\n    a = 1\n    b = 2\nfis_s = ForInStruct()\nfor fis_x in fis_s:\n    fis_x = fis_x\n");
-    check(!ok && aer_had_error() && strstr(aer_last_error(), "only supports arrays, dicts, and strings") != NULL,
+    check(!ok && aer_had_error() && strstr(aer_last_error(), "only supports arrays, dicts, strings, and typed arrays") != NULL,
           "'for x in <struct>:' is a clean, reported error, not a silent iteration over its fields");
 
     /* A malformed `for` while-condition (found by tests/fuzz.py) used to still compile into

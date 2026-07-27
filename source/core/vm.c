@@ -64,6 +64,7 @@ static void vm_heap_init(VmHeap* heap) {
     pool_init(&heap->function_pool, sizeof(AerFunction),  64);
     pool_init(&heap->struct_pool,   sizeof(AerStruct) + MAX_STRUCT_FIELDS * sizeof(AerVal), 64);
     pool_init(&heap->packed_array_pool, sizeof(AerPackedArray), 64);
+    pool_init(&heap->typed_array_pool, sizeof(AerTypedArray), 64);
     pool_init(&heap->result_pool,   sizeof(AerResult),   64);
     hashtable_pools_init(&heap->dict_hash_pools);
     heap->minor_gc_threshold     = default_minor_gc_threshold;
@@ -480,8 +481,8 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
    the one way to check a struct's shape now (type(x) == "Player") since OP_CHECK_SHAPE was removed.
    A packed array reports "Player[]" — distinct from a single instance's own "Player". type_names[]
    is indexed directly by ValueType, so it must stay exactly as long as the enum's non-specially-
-   handled entries (value.h) — TYPE_STRUCT/TYPE_PACKED_ARRAY/TYPE_RESULT are all handled specially,
-   so none of them is ever used to index this array. */
+   handled entries (value.h) — TYPE_STRUCT/TYPE_PACKED_ARRAY/TYPE_TYPED_ARRAY/TYPE_RESULT are all
+   handled specially, so none of them is ever used to index this array. */
 static const char* vm_type_name(Chunk* c, AerVal v) {
     static const char* type_names[] = {
         "null", "boolean", "integer", "float", "string", "function", "array", "hashtable"
@@ -493,6 +494,12 @@ static const char* vm_type_name(Chunk* c, AerVal v) {
         AerPackedArray* pa = aer_as_packed_array(v);
         static char buf[128];
         snprintf(buf, sizeof(buf), "%s[]", aer_as_string(c->pool[pa->shape->name])->data);
+        return buf;
+    }
+    if (aer_type(v) == TYPE_TYPED_ARRAY) {
+        static const char* elem_names[] = { "int32", "float32", "integer", "float" };
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%s[]", elem_names[aer_as_typed_array(v)->elem_kind]);
         return buf;
     }
     if (aer_type(v) == TYPE_RESULT) return "Result";
@@ -513,6 +520,7 @@ static inline __attribute__((always_inline)) bool vm_truthy(AerVal v) {
         case TYPE_DICT:     return aer_as_dict(v)->map.count > 0;
         case TYPE_STRUCT:   return true;   /* a struct can never have zero fields, enforced at parse time */
         case TYPE_PACKED_ARRAY: return aer_as_packed_array(v)->count > 0;
+        case TYPE_TYPED_ARRAY:  return aer_as_typed_array(v)->count > 0;
         /* `if result:` reads like `if err == null:`, without destructuring first. */
         case TYPE_RESULT:   return aer_type(aer_as_result(v)->err) == TYPE_NULL;
         case TYPE_ANY:      break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
@@ -745,7 +753,7 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
     char*        owned;
     unsigned int len;
 
-    if (aer_type(v) == TYPE_ARRAY || aer_type(v) == TYPE_DICT || aer_type(v) == TYPE_STRUCT || aer_type(v) == TYPE_PACKED_ARRAY || aer_type(v) == TYPE_RESULT) {
+    if (aer_type(v) == TYPE_ARRAY || aer_type(v) == TYPE_DICT || aer_type(v) == TYPE_STRUCT || aer_type(v) == TYPE_PACKED_ARRAY || aer_type(v) == TYPE_TYPED_ARRAY || aer_type(v) == TYPE_RESULT) {
         /* Unbounded recursive content doesn't fit the fixed buffer below, so reuse print()'s formatter; sb.buf is already a fresh allocation, handed to aer_make_string as-is. */
         StrBuf sb;
         strbuf_init(&sb);
@@ -761,7 +769,7 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
             case TYPE_REAL:     aer_format_real(aer_as_real(v), buf, sizeof(buf));                 break;
             case TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s",   aer_as_bool(v) ? "true" : "false"); break;
             case TYPE_FUNCTION: snprintf(buf, sizeof(buf), "<function>");                        break;
-            case TYPE_ARRAY: case TYPE_DICT: case TYPE_STRUCT: case TYPE_STRING: case TYPE_PACKED_ARRAY: case TYPE_RESULT: break;   /* handled above */
+            case TYPE_ARRAY: case TYPE_DICT: case TYPE_STRUCT: case TYPE_STRING: case TYPE_PACKED_ARRAY: case TYPE_TYPED_ARRAY: case TYPE_RESULT: break;   /* handled above */
             case TYPE_ANY: break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
         }
         len   = (unsigned int)strlen(buf);
@@ -1014,6 +1022,73 @@ static inline void vm_struct_field_write_at(AerStruct* s, unsigned int offset, V
     else vm_packed_slot_write(p, ftype, v);
 }
 
+/* One element of a TYPE_TYPED_ARRAY (AerTypedArray) -- a completely separate function from
+   vm_packed_slot_read/write above, deliberately NOT merged into one wider-switch helper: that
+   function's own comment documents a real, measured ARM regression from adding exactly this kind of
+   branch to its hot path, and struct-field access (already tuned, already fusion-opcode-heavy) has
+   nothing to gain from sharing code with a brand new, unrelated value kind. */
+static inline unsigned int vm_typed_elem_width(TypedArrayElemKind kind) {
+    return (kind == TYPED_ELEM_INT32 || kind == TYPED_ELEM_FLOAT32) ? 4 : 8;
+}
+
+static inline AerVal vm_typed_elem_read(unsigned char* slot, TypedArrayElemKind kind) {
+    switch (kind) {
+        case TYPED_ELEM_INT32:   { int32_t v; memcpy(&v, slot, 4); return aer_int(v); }
+        case TYPED_ELEM_FLOAT32: { float    v; memcpy(&v, slot, 4); return aer_real((double)v); }
+        case TYPED_ELEM_INT64:   { int64_t v; memcpy(&v, slot, 8); return aer_int(v); }
+        case TYPED_ELEM_FLOAT64: { double   v; memcpy(&v, slot, 8); return aer_real(v); }
+    }
+    return aer_null();
+}
+
+/* Caller must already have validated v against kind -- see vm_typed_array_check. int32 in
+   particular is never silently wrapped: an out-of-range value is rejected there, not truncated
+   here. */
+static inline void vm_typed_elem_write(unsigned char* slot, TypedArrayElemKind kind, AerVal v) {
+    switch (kind) {
+        case TYPED_ELEM_INT32:   { int32_t iv = (int32_t)aer_as_int(v); memcpy(slot, &iv, 4); break; }
+        case TYPED_ELEM_FLOAT32: { float    fv = (float)(aer_type(v) == TYPE_INTEGER ? (double)aer_as_int(v) : aer_as_real(v)); memcpy(slot, &fv, 4); break; }
+        case TYPED_ELEM_INT64:   { int64_t iv = aer_as_int(v); memcpy(slot, &iv, 8); break; }
+        case TYPED_ELEM_FLOAT64: { double   dv = (aer_type(v) == TYPE_INTEGER ? (double)aer_as_int(v) : aer_as_real(v)); memcpy(slot, &dv, 8); break; }
+    }
+}
+
+/* Natural literal shape, not exact-tag matching (unlike a typed struct field's OP_FIELD_SET) --
+   `arr[i] = 5` into a float32 array shouldn't require writing `5.0`. int32/int64 variants still
+   require TYPE_INTEGER; int32 additionally range-checks (erroring rather than silently wrapping,
+   this project's established "fail loudly" convention -- see OP_CAST's own integer-overflow
+   handling). float32/float64 accept TYPE_INTEGER or TYPE_REAL, promoted, matching the existing
+   promotion convention in the raw-arithmetic `_boxed` handlers. */
+static bool vm_typed_array_check(Chunk* c, TypedArrayElemKind kind, AerVal val) {
+    switch (kind) {
+        case TYPED_ELEM_INT64:
+            if (aer_type(val) != TYPE_INTEGER) {
+                error("Cannot assign a %s into an integer[] array", vm_type_name(c, val));
+                return false;
+            }
+            return true;
+        case TYPED_ELEM_INT32:
+            if (aer_type(val) != TYPE_INTEGER) {
+                error("Cannot assign a %s into an int32[] array", vm_type_name(c, val));
+                return false;
+            }
+            if (aer_as_int(val) < INT32_MIN || aer_as_int(val) > INT32_MAX) {
+                error("Value %lld out of range for an int32[] array", (long long)aer_as_int(val));
+                return false;
+            }
+            return true;
+        case TYPED_ELEM_FLOAT64:
+        case TYPED_ELEM_FLOAT32:
+            if (aer_type(val) != TYPE_INTEGER && aer_type(val) != TYPE_REAL) {
+                error("Cannot assign a %s into a %s array", vm_type_name(c, val),
+                      kind == TYPED_ELEM_FLOAT32 ? "float32[]" : "float[]");
+                return false;
+            }
+            return true;
+    }
+    return false;
+}
+
 /* Returns an owned copy of dense[*idx]'s key. Shared by array-iteration's dict branch and
    pair-iteration. False once exhausted -- the dense array has no holes, so this is a plain
    bounds check, not a scan. */
@@ -1075,7 +1150,8 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
             else if (aer_type(a) == TYPE_STRING) *out = aer_int((int64_t)aer_as_string(a)->length);
             else if (aer_type(a) == TYPE_DICT)   *out = aer_int((int64_t)aer_as_dict(a)->map.count);
             else if (aer_type(a) == TYPE_PACKED_ARRAY) *out = aer_int((int64_t)aer_as_packed_array(a)->count);
-            else error("length() requires an array, dict, string, or packed array");
+            else if (aer_type(a) == TYPE_TYPED_ARRAY) *out = aer_int((int64_t)aer_as_typed_array(a)->count);
+            else error("length() requires an array, dict, string, packed array, or typed array");
             return true;
         }
         case CALL_BUILTIN_PRINT: {
@@ -1174,6 +1250,14 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         if (i == 1) { *out = r->err;   return; }
         error("Result index %lld out of bounds (a Result only has indices 0 and 1)", (long long)aer_as_int(idx));
         *out = aer_null();
+    } else if (aer_type(obj) == TYPE_TYPED_ARRAY) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        if (aer_type(idx) != TYPE_INTEGER) { error("Array index must be an integer"); *out = aer_null(); return; }
+        int64_t i = aer_as_int(idx);
+        if (i < 0) i += (int64_t)ta->count;
+        if (i < 0 || (uint64_t)i >= ta->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), ta->count); *out = aer_null(); return; }
+        unsigned int width = vm_typed_elem_width(ta->elem_kind);
+        *out = vm_typed_elem_read(ta->data + (size_t)i * width, ta->elem_kind);
     } else {
         error("Cannot index type");
         *out = aer_null();
@@ -1239,6 +1323,15 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         }
     } else if (aer_type(obj) == TYPE_STRING) {
         error("Strings are immutable — cannot assign to an index");
+    } else if (aer_type(obj) == TYPE_TYPED_ARRAY) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        if (aer_type(idx) != TYPE_INTEGER) { error("Array index must be an integer"); return; }
+        int64_t i = aer_as_int(idx);
+        if (i < 0) i += (int64_t)ta->count;
+        if (i < 0 || (uint64_t)i >= ta->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), ta->count); return; }
+        if (!vm_typed_array_check(vm->chunk, ta->elem_kind, val)) return;
+        unsigned int width = vm_typed_elem_width(ta->elem_kind);
+        vm_typed_elem_write(ta->data + (size_t)i * width, ta->elem_kind, val);
     } else {
         error("Cannot index type");
     }
@@ -1453,7 +1546,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_STRUCT_NEW]        = &&lbl_struct_new,
         [OP_FIELD_GET]         = &&lbl_field_get,
         [OP_FIELD_SET]         = &&lbl_field_set,
-        [OP_PACKED_ARRAY_NEW]  = &&lbl_packed_array_new,
+        [OP_ARRAY_REPEAT]      = &&lbl_array_repeat,
         [OP_INDEX_FIELD_GET]   = &&lbl_index_field_get,
         [OP_INDEX_FIELD_SET]   = &&lbl_index_field_set,
         [OP_INDEX_FIELD_COMPOUND] = &&lbl_index_field_compound,
@@ -2227,8 +2320,22 @@ lbl_iter_next_array: {
         gc_maybe_collect(vm);
         DISPATCH();
     }
+    if (aer_type(col) == TYPE_TYPED_ARRAY) {
+        /* Unlike a packed array's struct elements (no standalone `arr[i]` reference, so no
+           iteration either -- see README), a typed array's elements ARE plain scalar values, so
+           iteration works exactly like an ordinary array's. */
+        AerTypedArray* ta = aer_as_typed_array(col);
+        if ((uint64_t)idx >= ta->count) {
+            ip = (unsigned int)end_target;
+            DISPATCH();
+        }
+        unsigned int width = vm_typed_elem_width(ta->elem_kind);
+        vm->registers[item_dest_reg] = vm_typed_elem_read(ta->data + (size_t)idx * width, ta->elem_kind);
+        vm->registers[idx_reg]       = aer_int(idx + 1);
+        DISPATCH();
+    }
     if (aer_type(col) != TYPE_ARRAY) {
-        error("'for x in ...' only supports arrays, dicts, and strings");
+        error("'for x in ...' only supports arrays, dicts, strings, and typed arrays");
         DISPATCH();
     }
     AerArray* a = aer_as_array(col);
@@ -2777,42 +2884,72 @@ lbl_unbox_param_real: {
     DISPATCH();
 }
 
-/* Eligibility (every field a fixed primitive) checked at runtime -- a Shape is only fully known
-   once its OP_DEFINE_STRUCT has run. */
-lbl_packed_array_new: {
-    int dest_reg            = (int)UNPACK_A(op_word);
-    AerVal* count_v = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
-    int type_name_pool_idx  = (int)READ();
-    const char* name = aer_as_string(c->pool[type_name_pool_idx])->data;
-    Shape* shape = chunk_find_shape(c, name);
-    if (!shape) { error("'%s' is not defined", name); DISPATCH(); }
-    for (unsigned int i = 0; i < shape->field_count; i++) {
-        ValueType ft = shape->field_types[i];
-        if (ft != TYPE_INTEGER && ft != TYPE_REAL && ft != TYPE_BOOLEAN) {
-            const char* got = ft == TYPE_ANY ? "untyped (no annotation)"
-                            : ft == TYPE_ARRAY ? "array"
-                            : ft == TYPE_DICT ? "hashtable" : "string";
-            error("'%s' cannot be packed into an array: field '%s' must be integer/float/boolean, not %s",
-                  name, aer_as_string(c->pool[shape->field_names[i]])->data, got);
-            DISPATCH();
-        }
-    }
-    if (aer_type(*count_v) != TYPE_INTEGER) { error("Packed array count must be an integer"); DISPATCH(); }
+/* `[value; count]` -- replaces the old `Type[count]` (OP_PACKED_ARRAY_NEW) entirely. fill_reg has
+   already been evaluated exactly once by the parser's own codegen; this handler just branches on
+   its RUNTIME type. Eligibility (every field a fixed primitive) is checked here for the same reason
+   the old opcode checked it here -- a Shape is only fully known once its OP_DEFINE_STRUCT has run. */
+lbl_array_repeat: {
+    int dest_reg    = (int)UNPACK_A(op_word);
+    int fill_reg    = (int)UNPACK_B(op_word);
+    int narrow_flag = (int)UNPACK_C(op_word);
+    uint32_t count_word = READ();
+    AerVal* count_v = vm_rk_ptr16(vm, const_pool, (uint16_t)count_word);
+    if (aer_type(*count_v) != TYPE_INTEGER) { error("Repeat-literal array count must be an integer"); DISPATCH(); }
     int64_t count = aer_as_int(*count_v);
-    if (count < 0) { error("Packed array count must not be negative"); DISPATCH(); }
-    unsigned int element_size = shape->field_count * 8;
-    AerPackedArray* pa = heap_alloc(&vm->heap, &vm->heap.packed_array_pool);
-    pa->count = (unsigned int)count;
-    pa->shape = shape;
-    /* malloc(0) is implementation-defined -- skip it for a zero-count array; bounds checks reject
-       every later access anyway. */
-    pa->data  = count > 0 ? xmalloc((size_t)count * (size_t)element_size) : NULL;
-    for (int64_t e = 0; e < count; e++) {
-        unsigned char* elem = pa->data + (size_t)e * element_size;
-        for (unsigned int f = 0; f < shape->field_count; f++)
-            vm_packed_slot_write(elem + f * 8, shape->field_types[f], shape->field_defaults[f]);
+    if (count < 0) { error("Repeat-literal array count must not be negative"); DISPATCH(); }
+
+    AerVal fill = vm->registers[fill_reg];
+    if (aer_type(fill) == TYPE_STRUCT) {
+        AerStruct* src = aer_as_struct(fill);
+        Shape* shape = src->shape;
+        for (unsigned int i = 0; i < shape->field_count; i++) {
+            ValueType ft = shape->field_types[i];
+            if (ft != TYPE_INTEGER && ft != TYPE_REAL && ft != TYPE_BOOLEAN) {
+                const char* got = ft == TYPE_ANY ? "untyped (no annotation)"
+                                : ft == TYPE_ARRAY ? "array"
+                                : ft == TYPE_DICT ? "hashtable" : "string";
+                error("'%s' cannot be packed into an array: field '%s' must be integer/float/boolean, not %s",
+                      aer_as_string(c->pool[shape->name])->data,
+                      aer_as_string(c->pool[shape->field_names[i]])->data, got);
+                DISPATCH();
+            }
+        }
+        unsigned int element_size = shape->field_count * 8;
+        AerPackedArray* pa = heap_alloc(&vm->heap, &vm->heap.packed_array_pool);
+        pa->count = (unsigned int)count;
+        pa->shape = shape;
+        /* malloc(0) is implementation-defined -- skip it for a zero-count array; bounds checks
+           reject every later access anyway. */
+        pa->data  = count > 0 ? xmalloc((size_t)count * (size_t)element_size) : NULL;
+        /* Every eligible field is raw 8 bytes (TYPE_ANY, the only wider field kind, was already
+           rejected above), so src->fields IS one element's worth of bytes, laid out identically --
+           a straight memcpy per element, not a field-by-field copy. This is also the real capability
+           gain over the old opcode: src's OWN field values are replicated, not the Shape's static
+           defaults, so `[Particle(1.0, 2.0); n]` now differs from `[Particle(); n]`. */
+        for (int64_t e = 0; e < count; e++)
+            memcpy(pa->data + (size_t)e * element_size, src->fields, element_size);
+        vm->registers[dest_reg] = aer_packed_array_val(pa);
+    } else if (aer_type(fill) == TYPE_INTEGER || aer_type(fill) == TYPE_REAL) {
+        /* narrow_flag is a pure parse-time decision (was the fill expression written as an
+           `i`/`f`-suffixed literal directly in this position?) -- by construction, that always
+           agrees with fill's own runtime tag (an `i`-suffixed literal is always a TYPE_INTEGER
+           token, `f` always TYPE_REAL), so no cross-check against narrow_flag is needed here. */
+        TypedArrayElemKind kind;
+        if (narrow_flag == 1)      kind = TYPED_ELEM_INT32;
+        else if (narrow_flag == 2) kind = TYPED_ELEM_FLOAT32;
+        else                       kind = (aer_type(fill) == TYPE_INTEGER) ? TYPED_ELEM_INT64 : TYPED_ELEM_FLOAT64;
+        unsigned int width = vm_typed_elem_width(kind);
+        AerTypedArray* ta = heap_alloc(&vm->heap, &vm->heap.typed_array_pool);
+        ta->count     = (unsigned int)count;
+        ta->elem_kind = kind;
+        ta->data      = count > 0 ? xmalloc((size_t)count * width) : NULL;
+        for (int64_t e = 0; e < count; e++)
+            vm_typed_elem_write(ta->data + (size_t)e * width, kind, fill);
+        vm->registers[dest_reg] = aer_typed_array_val(ta);
+    } else {
+        error("Cannot build a repeat-literal array from a %s value -- the fill value must be a struct instance or a number", vm_type_name(c, fill));
+        DISPATCH();
     }
-    vm->registers[dest_reg] = aer_packed_array_val(pa);
     gc_maybe_collect(vm);
     DISPATCH();
 }

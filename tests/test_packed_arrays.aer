@@ -1,9 +1,9 @@
 #!/usr/bin/env aer
 import collection
-# AER test suite — packed struct arrays (`Type[count]`): fixed-size, mass-allocated,
-# inline-packed arrays of one struct type's instances. Machine-checked via assert():
-# a clean run exits 0; any failure prints "ASSERT FAILED: ..." and the process exits
-# nonzero (see main.c/error.c).
+# AER test suite — packed struct arrays (`[StructName(); count]`, the struct-typed half of the
+# repeat-literal): fixed-size, mass-allocated, inline-packed arrays of one struct type's instances.
+# Machine-checked via assert(): a clean run exits 0; any failure prints "ASSERT FAILED: ..." and the
+# process exits nonzero (see main.c/error.c).
 
 # ------------------------------------------------------------------ #
 # 40. Construction, defaults, and get/set across all three eligible   #
@@ -15,7 +15,7 @@ struct Point:
     y = 0.0
     flag = false
 
-pa1 = Point[5]
+pa1 = [Point(); 5]
 assert(length(pa1) == 5, "packed array reports its declared count via length()")
 assert(pa1[0].x == 0 and pa1[0].y == 0.0 and pa1[0].flag == false, "every element starts at the struct's own declared defaults")
 assert(pa1[4].x == 0, "the last element is default-initialized too, not just the first")
@@ -61,7 +61,7 @@ assert(total == 0 + 100 + 200 + 300 + 400, "a loop writing then reading every el
 #     share storage.                                                  #
 # ------------------------------------------------------------------ #
 
-pa2 = Point[3]
+pa2 = [Point(); 3]
 pa2[0].x = 7
 assert(pa1[0].x != pa2[0].x, "two separate Point[] arrays are independently allocated, not aliased")
 
@@ -79,7 +79,7 @@ assert(type(p_single) == "Point", "a plain (unpacked) struct instance's type nam
 #     misreported as out-of-memory or crash).                         #
 # ------------------------------------------------------------------ #
 
-pa_empty = Point[0]
+pa_empty = [Point(); 0]
 assert(length(pa_empty) == 0, "a zero-count packed array constructs cleanly and reports length 0")
 
 # ------------------------------------------------------------------ #
@@ -97,7 +97,7 @@ struct Dynamic:
 d = Dynamic()
 assert(d.tag == null and d.label == "x", "a struct with an untyped/string field still works fine as a plain (unpacked) instance")
 
-# pd = Dynamic[3]   # would error: 'Dynamic' cannot be packed into an array: field 'tag' must be integer/float/boolean, not untyped (no annotation)
+# pd = [Dynamic(); 3]   # would error: 'Dynamic' cannot be packed into an array: field 'tag' must be integer/float/boolean, not untyped (no annotation)
 
 # ------------------------------------------------------------------ #
 # 48. GC correctness — allocate many packed arrays under real         #
@@ -111,12 +111,12 @@ assert(d.tag == null and d.label == "x", "a struct with an untyped/string field 
 struct GcPoint:
     v = 0
 
-survivor = GcPoint[10]
+survivor = [GcPoint(); 10]
 survivor[3].v = 12345
 
 gc_churn = []
 for i in 0..5000:
-    collection.append(gc_churn, GcPoint[4])
+    collection.append(gc_churn, [GcPoint(); 4])
     collection.append(gc_churn, [i, i * 2, "u" + string(i)])
 
 assert(survivor[3].v == 12345, "a packed array held in a still-live variable survives GC pressure from unrelated allocations")

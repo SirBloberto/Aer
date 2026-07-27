@@ -119,9 +119,19 @@ typedef enum {
     OP_FIELD_GET,  /* dest_reg, struct_reg, field_name_pool_idx */
     OP_FIELD_SET,  /* struct_reg, field_name_pool_idx, rk_val — includes the gc_barrier_array call */
 
-    /* `Type[count]` — fixed-primitive fields only (checked here at runtime, once the Shape is
-       known); every element default-initialized. */
-    OP_PACKED_ARRAY_NEW, /* dest_reg, type_name_pool_idx, rk_count */
+    /* `[value; count]` repeat-literal -- replaces the old `Type[count]` entirely. Evaluates the
+       fill expression exactly once (into fill_reg), then branches on ITS RUNTIME TYPE: TYPE_STRUCT
+       builds a packed array (AerPackedArray, fixed-primitive fields only, checked here just like
+       the old opcode did) with every element a copy of that one instance's own field values (not
+       necessarily the Shape's static defaults -- a real capability gain over the old `Type[count]`,
+       which could only ever use declared defaults); TYPE_INTEGER/TYPE_REAL builds a bare numeric
+       array (AerTypedArray) instead. narrow_flag (0 = none, 1 = int32, 2 = float32) is a pure
+       parse-time decision -- set only when the fill expression was written as a literal `i`/`f`
+       suffixed token directly in this position (`[0.0f; n]`), never derived from a runtime value
+       (see parse_primary_inner's own comment on where this is decided). Any other fill type is a
+       runtime error -- the fill expression is arbitrary, so eligibility can't be known until it
+       actually evaluates. */
+    OP_ARRAY_REPEAT, /* word0: dest_reg, fill_reg, narrow_flag -- word1: rk_count (RK16) */
 
     /* Fused `obj[index].field` get/set — packed arrays have no standalone element reference, so
        the parser emits these only for the exact `expr[index].field` pattern. Ordinary arrays
@@ -358,7 +368,7 @@ static inline uint16_t pack_rk16(int rk) {
 
 /* op(8) | a(8) | w16(16) -- one small field plus one 16-bit field, both in word0. Used by opcodes
    whose only two real fields are a register/small-count and one RK16/count16 value (OP_FIELD_SET,
-   OP_PACKED_ARRAY_NEW, OP_INDEX_FIELD_SET's obj_reg+rk_idx half). */
+   OP_INDEX_FIELD_SET's obj_reg+rk_idx half). */
 #define PACK_OP_A_W16(op, a, w16) \
     (((uint32_t)(op) & 0xFF) | (((uint32_t)(a) & 0xFF) << 8) | (((uint32_t)(w16) & 0xFFFF) << 16))
 #define UNPACK_W16(word) (((word) >> 16) & 0xFFFFU)
@@ -736,7 +746,7 @@ typedef struct {
 } MarkWorklist;
 
 typedef struct {
-    Pool string_pool, array_pool, dict_pool, function_pool, struct_pool, packed_array_pool, result_pool;
+    Pool string_pool, array_pool, dict_pool, function_pool, struct_pool, packed_array_pool, typed_array_pool, result_pool;
     bool pools_initialized;
 
     /* Old objects a write barrier caught holding a young reference; entries are only ever

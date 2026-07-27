@@ -198,11 +198,13 @@ static void emit(TokenType type, unsigned int length) {
 
 static void emit_integer(int64_t integer, unsigned int length) {
     token.value = aer_int(integer);
+    token.narrow = false;
     emit(TOKEN_INTEGER, length);
 }
 
 static void emit_real(double real, unsigned int length) {
     token.value = aer_real(real);
+    token.narrow = false;
     emit(TOKEN_REAL, length);
 }
 
@@ -272,6 +274,15 @@ static void lex_number() {
 
     /* Not a float, or range operator (..) follows */
     if (*end != '.' || end[1] == '.') {
+        /* `i` immediately after an integer literal (`42i`), not followed by another identifier
+           character (so `42if` etc. still falls through to the ordinary error below) -- selects
+           narrow (int32) storage in a repeat-literal array or struct field default. Parse-time-only:
+           the emitted AerVal is an ordinary aer_int either way, `narrow` is a sibling marker. */
+        if (*end == 'i' && !(isalnum((unsigned char)end[1]) || end[1] == '_')) {
+            emit_integer(int_val, int_len + 1);
+            token.narrow = true;
+            return;
+        }
         if (isalpha((unsigned char)*end) || *end == '_')
             error_at("Invalid character after integer literal");
         emit_integer(int_val, int_len);
@@ -282,6 +293,13 @@ static void lex_number() {
     double real_val = strtod(buf, &end);
     unsigned int len = (unsigned int)(end - buf);
     if (len <= int_len + 1) error_at("Expected digit after '.'");
+    /* `f` immediately after a float literal (`0.0f`) -- same narrow-marker convention as `i` above,
+       selecting float32 storage instead of int32. */
+    if (*end == 'f' && !(isalnum((unsigned char)end[1]) || end[1] == '_')) {
+        emit_real(real_val, len + 1);
+        token.narrow = true;
+        return;
+    }
     if (isalpha((unsigned char)*end) || *end == '_')
         error_at("Invalid character after float literal");
     emit_real(real_val, len);
@@ -457,6 +475,7 @@ void lex() {
 
     switch (*b) {
         case ',':  emit(TOKEN_COMMA,              1); return;
+        case ';':  emit(TOKEN_SEMICOLON,          1); return;
         case '\n': at_line_start = true; emit(TOKEN_NEW_LINE, 1); return;
         case '\0':
             /* No trailing newline — flush remaining indent levels */

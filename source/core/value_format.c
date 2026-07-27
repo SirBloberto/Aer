@@ -66,6 +66,18 @@ void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
             strbuf_append(sb, "]");
             break;
         }
+        case TYPE_TYPED_ARRAY: {
+            /* Terse summary, matching TYPE_PACKED_ARRAY's own -- vm_type_name (vm.c) already
+               derives "int32[]"/"float32[]"/"integer[]"/"float[]" from elem_kind. */
+            static const char* elem_names[] = { "int32", "float32", "integer", "float" };
+            AerTypedArray* ta = aer_as_typed_array(v);
+            strbuf_append(sb, elem_names[ta->elem_kind]);
+            strbuf_append(sb, "[");
+            snprintf(tmp, sizeof(tmp), "%u", ta->count);
+            strbuf_append(sb, tmp);
+            strbuf_append(sb, "]");
+            break;
+        }
         case TYPE_DICT: {
             AerDict* d = aer_as_dict(v);
             strbuf_append(sb, "{");
@@ -118,6 +130,7 @@ bool values_equal(AerVal a, AerVal b) {
         case TYPE_DICT:     return aer_as_dict(a) == aer_as_dict(b);
         case TYPE_STRUCT:   return aer_as_struct(a) == aer_as_struct(b);
         case TYPE_PACKED_ARRAY: return aer_as_packed_array(a) == aer_as_packed_array(b);
+        case TYPE_TYPED_ARRAY: return aer_as_typed_array(a) == aer_as_typed_array(b);
         case TYPE_RESULT:   return aer_as_result(a) == aer_as_result(b);
         case TYPE_ANY:      break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
     }

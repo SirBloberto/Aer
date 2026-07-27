@@ -85,7 +85,7 @@ function advance(bodies, dt):
         bodies[i].y += bodies[i].vy * dt
         bodies[i].z += bodies[i].vz * dt
 
-bodies = Body[5]
+bodies = [Body(); 5]
 
 bodies[0].mass = SOLAR_MASS
 

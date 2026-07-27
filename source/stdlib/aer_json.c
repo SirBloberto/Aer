@@ -93,6 +93,9 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
         case TYPE_PACKED_ARRAY:
             error("json.encode() cannot serialize a packed array value");
             return false;
+        case TYPE_TYPED_ARRAY:
+            error("json.encode() cannot serialize a typed array value");
+            return false;
         case TYPE_RESULT:
             error("json.encode() cannot serialize a Result value");
             return false;

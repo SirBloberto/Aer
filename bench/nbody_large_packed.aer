@@ -81,7 +81,7 @@ function advance(bodies, dt):
 # which doesn't scale to N=1024) — every (x,y,z,vx,vy,vz,mass) is a pure
 # function of the index i, so the packed and boxed variants of this benchmark
 # start from bit-identical initial conditions.
-bodies = Body[N]
+bodies = [Body(); N]
 for i in 0..N:
     bodies[i].x = math.sin(i * 0.10) * 10.0
     bodies[i].y = math.cos(i * 0.15) * 10.0

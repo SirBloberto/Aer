@@ -56,8 +56,8 @@ void emit_struct_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, in
 void emit_field_get(Chunk* c, int dest_reg, int struct_reg, unsigned int field_name_pool_idx);
 void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, int rk_val);
 
-/* `Type[count]` packed-array construction; rk_count is RK-encoded. */
-void emit_packed_array_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int rk_count);
+/* `[value; count]` repeat-literal construction; rk_count is RK-encoded. */
+void emit_array_repeat(Chunk* c, int dest_reg, int fill_reg, int narrow_flag, int rk_count);
 
 /* Reset every persistent compile table — ONCE per independent program, never between
    statements of the same session (REPL persistence depends on it). */

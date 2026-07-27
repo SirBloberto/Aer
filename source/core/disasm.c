@@ -109,8 +109,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_FIELD_GET]  = { "OP_FIELD_GET",  "reg = struct.field", {0}, false, 1, 0 },
     /* word0: struct_reg+rk_val16. word1: field_name_idx. */
     [OP_FIELD_SET]  = { "OP_FIELD_SET",  "struct.field = rk", {0}, false, 1, 0 },
-    /* word0: dest+rk_count16. word1: type_name_idx. */
-    [OP_PACKED_ARRAY_NEW] = { "OP_PACKED_ARRAY_NEW", "reg = new packed array of Type, rk count", {0}, false, 1, 0 },
+    /* word0: dest+fill_reg+narrow_flag. word1: rk_count16. */
+    [OP_ARRAY_REPEAT] = { "OP_ARRAY_REPEAT", "reg = [fill_reg; rk_count] (struct -> packed array, number -> typed array)", {0}, false, 1, 0 },
     /* word0: dest+obj_reg. word1: field_idx16+rk_idx16. */
     [OP_INDEX_FIELD_GET]  = { "OP_INDEX_FIELD_GET",  "fused: reg = reg[rk].field (packed or struct array)", {0}, false, 1, 0 },
     /* word0: obj_reg+rk_idx16. word1: field_idx16+rk_val16. */
@@ -332,11 +332,12 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rk16(out, c, UNPACK_W16(op_word));
         int field_idx = (int)c->code[pos++];
         print_field(out, c, FLD_NAME, field_idx);
-    } else if (op == OP_PACKED_ARRAY_NEW) {
+    } else if (op == OP_ARRAY_REPEAT) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rk16(out, c, UNPACK_W16(op_word));
-        int type_name_idx = (int)c->code[pos++];
-        print_field(out, c, FLD_NAME, type_name_idx);
+        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
+        print_field(out, c, FLD_COUNT, (int)UNPACK_C(op_word));
+        uint32_t count_word = c->code[pos++];
+        print_rk16(out, c, count_word & 0xFFFFU);
     } else if (op == OP_INDEX_FIELD_GET) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));

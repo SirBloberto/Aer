@@ -872,16 +872,23 @@ point_translate(p1, 1.0, 1.0)
 `type(p) == "Point"` is a standalone runtime shape check, not part of a function signature — see
 [Casting and Shape-Checking](#casting-and-shape-checking).
 
-### Packed Arrays
+### Repeat-Literal Arrays
 
-`Type[count]` constructs a fixed-size, mass-allocated array of `count` instances of struct `Type`,
-packed inline in one contiguous block instead of `count` separately heap-allocated instances
-linked through an ordinary array of references. This is AER's answer to data-oriented design: a
-tight loop over a large `Type[]` touches far fewer cache lines than the same loop over an ordinary
-array of struct instances. Measured at scale (N=1024, Raspberry Pi, 5-run-averaged `perf stat`): a
-packed `Body[1024]` versus an ordinary array of heap-allocated instances is -20% instructions, -23%
-cycles, ~8.8x fewer cache misses, -18.6% wall clock — the cache-miss reduction is packed arrays'
-actual value proposition, not visible at small N where everything fits in L1.
+`[value; count]` evaluates `value` exactly once, then builds a dense array of `count` copies —
+Rust's own repeat-literal syntax, the one place in AER's grammar with a semicolon. What kind of
+array comes out depends entirely on `value`'s own type:
+
+- **A struct instance** (`Point()`, `Point(1.0, 2.0)`, ...) produces a **packed array**: `count`
+  instances of that struct, packed inline in one contiguous block instead of `count` separately
+  heap-allocated instances linked through an ordinary array of references. This is AER's answer to
+  data-oriented design: a tight loop over a large packed array touches far fewer cache lines than
+  the same loop over an ordinary array of struct instances. Measured at scale (N=1024, Raspberry Pi,
+  5-run-averaged `perf stat`): a packed 1024-body array versus an ordinary array of heap-allocated
+  instances is -20% instructions, -23% cycles, ~8.8x fewer cache misses, -18.6% wall clock — the
+  cache-miss reduction is packed arrays' actual value proposition, not visible at small N where
+  everything fits in L1.
+- **A number** (`0`, `0.0`, or an `i`/`f`-suffixed narrow literal — see below) produces a **typed
+  array**: a dense, uniformly-typed numeric array with no struct or `Shape` involved at all.
 
 ```
 struct Body:
@@ -889,33 +896,48 @@ struct Body:
     y = 0.0
     mass = 0.0
 
-bodies = Body[1024]
+bodies = [Body(); 1024]
 bodies[0].x = 1.5
 print(bodies[0].x)      # 1.5
 print(length(bodies))   # 1024
+
+scores = [0; 100]        # a plain integer[] array, all 100 elements starting at 0
+scores[3] = 42
 ```
 
-**Eligibility is per-struct-type**, checked at construction (the first `Type[count]`, a VM runtime
-check, not a parse-time one): every field must be `integer`, `float`, or `boolean` — a `string`,
-`array`, `hashtable`, or unconstrained (`null`-defaulted) field all disqualify a struct from
-`Type[count]` construction (they can't be packed at a uniform byte width), even though that same
-struct works fine as an ordinary, individually-constructed instance (`Type()`).
+Unlike the old `Type[count]` this replaced, the fill value isn't limited to a struct's own declared
+defaults — `[Particle(1.0, 2.0, 5.0); n]` builds a packed array where every element starts with
+those exact field values, not `Particle()`'s defaults.
 
-**Field access only — no standalone per-element reference.** `arr[i].field` (get and set,
-including compound assignment) is the only supported form; a bare `arr[i]` alone is a compile
+**Struct eligibility is per-struct-type**, checked at construction (a VM runtime check, not a
+parse-time one): every field must be `integer`, `float`, or `boolean` — a `string`, `array`,
+`hashtable`, or unconstrained (`null`-defaulted) field all disqualify a struct from packed
+construction (they can't be packed at a uniform byte width), even though that same struct works
+fine as an ordinary, individually-constructed instance (`Type()`).
+
+**Narrow numeric arrays**: an `i`- or `f`-suffixed literal *written directly as the fill value*
+(`[0i; n]`, `[0.0f; n]`) selects 32-bit storage (`int32`/`float32`) instead of the default 64-bit
+(`integer`/`float`). This only works for a literal in that exact position — the suffix is
+parse-time-only information, so `x = 0.0f; [x; n]` builds an ordinary (wide) `float[]` array, not a
+narrow one.
+
+**Packed arrays: field access only, no standalone per-element reference.** `arr[i].field` (get and
+set, including compound assignment) is the only supported form; a bare `arr[i]` alone is a compile
 error (`Cannot index type`), and so is `for x in arr:` — a packed array can't be iterated directly
 (index with an ordinary counting loop instead: `for i in 0..length(arr): ... arr[i].field ...`).
 This isn't an arbitrary restriction: a packed element has no standalone value to hand back — its
 "address" is pure arithmetic (`base + i * stride`), recomputed at each `.field` access, not a
-pointer to save or a value to box.
+pointer to save or a value to box. **Typed arrays have no such restriction** — an element is a
+plain scalar, so `arr[i]` alone and `for x in arr:` both work exactly like an ordinary array's.
 
-**Not yet supported for a packed array specifically** (an ordinary struct array works fine with
-all of these): `json.encode()` (errors — "cannot serialize a packed array value"), and crossing
-into or out of host code through `AerNativeFn` — the embedding API's `AerVal` boundary doesn't yet
-handle a packed array on either side of that call.
+**Not yet supported for a packed or typed array specifically** (an ordinary struct array works fine
+with all of these): `json.encode()` (errors — "cannot serialize a packed/typed array value"), and
+crossing into or out of host code through `AerNativeFn` — the embedding API's `AerVal` boundary
+doesn't yet handle either one on either side of that call.
 
-`type()` reports a distinct name (`"Point[]"`, not `"Point"`) so packed and ordinary instances of
-the same struct are still distinguishable at runtime.
+`type()` reports a distinct name for each: `"Point[]"` for a packed array (not `"Point"`, so packed
+and ordinary instances of the same struct are still distinguishable at runtime), and
+`"integer[]"`/`"float[]"`/`"int32[]"`/`"float32[]"` for a typed array depending on its element kind.
 
 ## Method Calls and Pipes
 
@@ -1714,10 +1736,13 @@ targets, computed at compile time — there's no separate runtime scope or itera
 since a loop's iteration state is just ordinary registers.
 
 Struct **names** are tracked in a parse-time table (`struct_names`) as soon as a `struct` statement
-is parsed, which is what lets `Type()`/`Type[count]` be recognized immediately after — but the
-struct's actual shape (field names, types, defaults) is only registered into the chunk's runtime
-shape registry when `OP_DEFINE_STRUCT` actually executes, exactly like a function name is knowable
-before its body has run.
+is parsed, which is what lets `Type()` be recognized (as struct construction, not an ordinary
+function call) immediately after — but the struct's actual shape (field names, types, defaults) is
+only registered into the chunk's runtime shape registry when `OP_DEFINE_STRUCT` actually executes,
+exactly like a function name is knowable before its body has run. A repeat-literal (`[Type(); n]`)
+needs no equivalent parse-time recognition of its own — it's just an ordinary call inside ordinary
+`[...]` grammar, with the struct-vs-number branch resolved at runtime (see
+[Repeat-Literal Arrays](#repeat-literal-arrays)) once `value` has actually been evaluated.
 
 `import` is resolved entirely at parse time (see [Modularity](#modularity)) — a file-based import
 runs the imported file's code synchronously, in an isolated `Chunk`/`VM`, before the importing
@@ -1768,12 +1793,16 @@ register at the few places that need one (a call argument, a return value, a con
 match on the next visit skips the by-name field scan entirely. Populated lazily and never
 invalidated (a struct's field layout never changes after `OP_DEFINE_STRUCT` registers it).
 
-**Packed arrays** (`Type[count]`, see [Packed Arrays](#packed-arrays)) are a separate value type,
-`AerPackedArray` — one raw byte block holding `count` instances of one struct type's fields at a
-fixed per-field 8-byte slot, addressed by pure arithmetic (`base + i * stride + field_offset`)
-instead of `count` individually heap-allocated, pointer-linked instances. Every field is a fixed
-primitive (never a heap reference), so a packed array is a leaf for the garbage collector — its own
-mark step never recurses into its contents.
+**Packed arrays** (`[Type(); count]`, see [Repeat-Literal Arrays](#repeat-literal-arrays)) are a
+separate value type, `AerPackedArray` — one raw byte block holding `count` instances of one struct
+type's fields at a fixed per-field 8-byte slot, addressed by pure arithmetic
+(`base + i * stride + field_offset`) instead of `count` individually heap-allocated, pointer-linked
+instances. Every field is a fixed primitive (never a heap reference), so a packed array is a leaf
+for the garbage collector — its own mark step never recurses into its contents. **Typed arrays**
+(`[0; count]`/`[0i; count]`, the numeric half of the same repeat-literal) are `AerTypedArray` — the
+same "one raw byte block, no per-element boxing" idea, but with no `Shape` at all: just one fixed
+element kind (`int32`/`float32`/`integer`/`float`) for the whole array, since there are no named
+fields to lay out.
 
 **Collections:** `AerArray` and `AerDict` are heap-allocated structs held by pointer inside an
 `AerVal`. Assignment copies the pointer — all aliases share the same data. Arrays grow with doubling
