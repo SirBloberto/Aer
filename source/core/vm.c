@@ -3731,29 +3731,92 @@ lbl_raw_load_real: {
     DISPATCH();
 }
 
-lbl_raw_add_int: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->raw_ints[dest] = vm->raw_ints[a] + vm->raw_ints[b];
-    DISPATCH();
+/* Source-level dedup only, zero behavior/codegen change (each invocation below still expands to
+   its own full label + body, byte-for-byte what was hand-written here before) -- NOT a NOINLINE
+   shared-function refactor, which would trade a real per-dispatch call+branch cost on these
+   extremely hot opcodes for a code-size win already confirmed not to matter (icache misses are
+   16-140x rarer than dcache misses on every workload measured this session). #undef'd right after
+   the last family that needs them. */
+#define RAW_ARITH_INT(name, op) \
+lbl_raw_##name##_int: { \
+    int dest = (int)UNPACK_A(op_word); \
+    int a    = (int)UNPACK_B(op_word); \
+    int b    = (int)UNPACK_C(op_word); \
+    vm->raw_ints[dest] = vm->raw_ints[a] op vm->raw_ints[b]; \
+    DISPATCH(); \
+}
+#define RAW_ARITH_REAL(name, op) \
+lbl_raw_##name##_real: { \
+    int dest = (int)UNPACK_A(op_word); \
+    int a    = (int)UNPACK_B(op_word); \
+    int b    = (int)UNPACK_C(op_word); \
+    vm->raw_reals[dest] = vm->raw_reals[a] op vm->raw_reals[b]; \
+    DISPATCH(); \
+}
+#define RAW_CMP_INT(name, op) \
+lbl_raw_##name##_int: { \
+    int dest = (int)UNPACK_A(op_word); \
+    int a    = (int)UNPACK_B(op_word); \
+    int b    = (int)UNPACK_C(op_word); \
+    vm->registers[dest] = aer_bool(vm->raw_ints[a] op vm->raw_ints[b]); \
+    DISPATCH(); \
+}
+#define RAW_CMP_REAL(name, op) \
+lbl_raw_##name##_real: { \
+    int dest = (int)UNPACK_A(op_word); \
+    int a    = (int)UNPACK_B(op_word); \
+    int b    = (int)UNPACK_C(op_word); \
+    vm->registers[dest] = aer_bool(vm->raw_reals[a] op vm->raw_reals[b]); \
+    DISPATCH(); \
+}
+/* A runtime tag check decides: matching type accumulates in place (safe every iteration, the
+   slot's identity never changes); mismatched type is the same runtime error vm_binary_cold gives. */
+#define RAW_ARITH_INT_BOXED(name, op, opstr) \
+lbl_raw_##name##_int_boxed: { \
+    int slot = (int)UNPACK_A(op_word); \
+    int reg  = (int)UNPACK_B(op_word); \
+    AerVal* rhs = &vm->registers[reg]; \
+    if (rhs->tag != TYPE_INTEGER) { error("Cannot apply '" opstr "' to integer and %s", vm_type_name(c, *rhs)); DISPATCH(); } \
+    vm->raw_ints[slot] op##= rhs->as.i; \
+    DISPATCH(); \
+}
+/* An integer rhs promotes to real here (vm_promote_real's own rule) instead of erroring -- matches
+   the fully-boxed path's own int/real mixing semantics (vm_binary_cold/fast), which this opcode is
+   otherwise a drop-in replacement for. Without this, `real_value OP boxed_int_expr` (extremely
+   common -- any loop counter or other plain int composed with a real, e.g. `i * 0.10`) would
+   incorrectly reject a completely ordinary mixed-numeric expression the boxed path already
+   supports. Only int/real mix; any other type still errors exactly as before. */
+#define RAW_ARITH_REAL_BOXED(name, op, opstr) \
+lbl_raw_##name##_real_boxed: { \
+    int slot = (int)UNPACK_A(op_word); \
+    int reg  = (int)UNPACK_B(op_word); \
+    AerVal* rhs = &vm->registers[reg]; \
+    if (rhs->tag == TYPE_REAL) vm->raw_reals[slot] op##= rhs->as.d; \
+    else if (rhs->tag == TYPE_INTEGER) vm->raw_reals[slot] op##= (double)rhs->as.i; \
+    else error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs)); \
+    DISPATCH(); \
+}
+/* Non-destructive counterpart of RAW_ARITH_REAL_BOXED -- (dest, src_raw, boxed_reg) instead of
+   (slot, reg) in-place. src_raw is read-only here, letting a caller compose a permanent raw local
+   with a boxed value into a FRESH slot without a defensive OP_RAW_MOVE_REAL first (see
+   try_emit_arith_raw_boxed, parser.c). Error messages say '+'/'*' rather than the compound forms
+   since this is always a general expression, never a compound assignment -- opstr is passed
+   un-suffixed for exactly that reason (contrast RAW_ARITH_REAL_BOXED's "+="/"-="/"*="). */
+#define RAW_ARITH_REAL_BOXED_TO(name, op, opstr) \
+lbl_raw_##name##_real_boxed_to: { \
+    int dest = (int)UNPACK_A(op_word); \
+    int src  = (int)UNPACK_B(op_word); \
+    int reg  = (int)UNPACK_C(op_word); \
+    AerVal* rhs = &vm->registers[reg]; \
+    if (rhs->tag == TYPE_REAL) vm->raw_reals[dest] = vm->raw_reals[src] op rhs->as.d; \
+    else if (rhs->tag == TYPE_INTEGER) vm->raw_reals[dest] = vm->raw_reals[src] op (double)rhs->as.i; \
+    else error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs)); \
+    DISPATCH(); \
 }
 
-lbl_raw_sub_int: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->raw_ints[dest] = vm->raw_ints[a] - vm->raw_ints[b];
-    DISPATCH();
-}
-
-lbl_raw_mul_int: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->raw_ints[dest] = vm->raw_ints[a] * vm->raw_ints[b];
-    DISPATCH();
-}
+RAW_ARITH_INT(add, +)
+RAW_ARITH_INT(sub, -)
+RAW_ARITH_INT(mul, *)
 
 /* Matches OP_DIV's own semantics: int/int division always promotes to float, so this is the one
    OP_RAW_*_INT opcode whose dest is raw_reals[], not raw_ints[]. */
@@ -3787,29 +3850,9 @@ lbl_raw_floor_div_int: {
     DISPATCH();
 }
 
-lbl_raw_add_real: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->raw_reals[dest] = vm->raw_reals[a] + vm->raw_reals[b];
-    DISPATCH();
-}
-
-lbl_raw_sub_real: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->raw_reals[dest] = vm->raw_reals[a] - vm->raw_reals[b];
-    DISPATCH();
-}
-
-lbl_raw_mul_real: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->raw_reals[dest] = vm->raw_reals[a] * vm->raw_reals[b];
-    DISPATCH();
-}
+RAW_ARITH_REAL(add, +)
+RAW_ARITH_REAL(sub, -)
+RAW_ARITH_REAL(mul, *)
 
 lbl_raw_div_real: {
     int dest = (int)UNPACK_A(op_word);
@@ -3822,69 +3865,14 @@ lbl_raw_div_real: {
 }
 
 /* Comparisons produce a boxed boolean (no raw boolean type exists) -- dest is 7 bits, not 5. */
-lbl_raw_lt_int: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->registers[dest] = aer_bool(vm->raw_ints[a] < vm->raw_ints[b]);
-    DISPATCH();
-}
-
-lbl_raw_gt_int: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->registers[dest] = aer_bool(vm->raw_ints[a] > vm->raw_ints[b]);
-    DISPATCH();
-}
-
-lbl_raw_lte_int: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->registers[dest] = aer_bool(vm->raw_ints[a] <= vm->raw_ints[b]);
-    DISPATCH();
-}
-
-lbl_raw_gte_int: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->registers[dest] = aer_bool(vm->raw_ints[a] >= vm->raw_ints[b]);
-    DISPATCH();
-}
-
-lbl_raw_lt_real: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->registers[dest] = aer_bool(vm->raw_reals[a] < vm->raw_reals[b]);
-    DISPATCH();
-}
-
-lbl_raw_gt_real: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->registers[dest] = aer_bool(vm->raw_reals[a] > vm->raw_reals[b]);
-    DISPATCH();
-}
-
-lbl_raw_lte_real: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->registers[dest] = aer_bool(vm->raw_reals[a] <= vm->raw_reals[b]);
-    DISPATCH();
-}
-
-lbl_raw_gte_real: {
-    int dest = (int)UNPACK_A(op_word);
-    int a    = (int)UNPACK_B(op_word);
-    int b    = (int)UNPACK_C(op_word);
-    vm->registers[dest] = aer_bool(vm->raw_reals[a] >= vm->raw_reals[b]);
-    DISPATCH();
-}
+RAW_CMP_INT(lt,  <)
+RAW_CMP_INT(gt,  >)
+RAW_CMP_INT(lte, <=)
+RAW_CMP_INT(gte, >=)
+RAW_CMP_REAL(lt,  <)
+RAW_CMP_REAL(gt,  >)
+RAW_CMP_REAL(lte, <=)
+RAW_CMP_REAL(gte, >=)
 
 /* The only bridge from raw storage back to a tagged AerVal register. */
 lbl_box_int: {
@@ -3915,97 +3903,24 @@ lbl_raw_move_real: {
     DISPATCH();
 }
 
-/* A runtime tag check decides: matching type accumulates in place (safe every iteration, the
-   slot's identity never changes); mismatched type is the same runtime error vm_binary_cold gives. */
-lbl_raw_add_int_boxed: {
-    int slot = (int)UNPACK_A(op_word);
-    int reg  = (int)UNPACK_B(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag != TYPE_INTEGER) { error("Cannot apply '+=' to integer and %s", vm_type_name(c, *rhs)); DISPATCH(); }
-    vm->raw_ints[slot] += rhs->as.i;
-    DISPATCH();
-}
+RAW_ARITH_INT_BOXED(add, +, "+=")
+RAW_ARITH_INT_BOXED(sub, -, "-=")
+RAW_ARITH_INT_BOXED(mul, *, "*=")
 
-lbl_raw_sub_int_boxed: {
-    int slot = (int)UNPACK_A(op_word);
-    int reg  = (int)UNPACK_B(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag != TYPE_INTEGER) { error("Cannot apply '-=' to integer and %s", vm_type_name(c, *rhs)); DISPATCH(); }
-    vm->raw_ints[slot] -= rhs->as.i;
-    DISPATCH();
-}
+RAW_ARITH_REAL_BOXED(add, +, "+=")
+RAW_ARITH_REAL_BOXED(sub, -, "-=")
+RAW_ARITH_REAL_BOXED(mul, *, "*=")
 
-lbl_raw_mul_int_boxed: {
-    int slot = (int)UNPACK_A(op_word);
-    int reg  = (int)UNPACK_B(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag != TYPE_INTEGER) { error("Cannot apply '*=' to integer and %s", vm_type_name(c, *rhs)); DISPATCH(); }
-    vm->raw_ints[slot] *= rhs->as.i;
-    DISPATCH();
-}
+RAW_ARITH_REAL_BOXED_TO(add, +, "+")
+RAW_ARITH_REAL_BOXED_TO(mul, *, "*")
 
-/* An integer rhs promotes to real here (vm_promote_real's own rule) instead of erroring -- matches
-   the fully-boxed path's own int/real mixing semantics (vm_binary_cold/fast), which this opcode is
-   otherwise a drop-in replacement for. Without this, `real_value OP boxed_int_expr` (extremely
-   common -- any loop counter or other plain int composed with a real, e.g. `i * 0.10`) would
-   incorrectly reject a completely ordinary mixed-numeric expression the boxed path already
-   supports. Only int/real mix; any other type still errors exactly as before. */
-lbl_raw_add_real_boxed: {
-    int slot = (int)UNPACK_A(op_word);
-    int reg  = (int)UNPACK_B(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_REAL) vm->raw_reals[slot] += rhs->as.d;
-    else if (rhs->tag == TYPE_INTEGER) vm->raw_reals[slot] += (double)rhs->as.i;
-    else error("Cannot apply '+=' to float and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
-
-lbl_raw_sub_real_boxed: {
-    int slot = (int)UNPACK_A(op_word);
-    int reg  = (int)UNPACK_B(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_REAL) vm->raw_reals[slot] -= rhs->as.d;
-    else if (rhs->tag == TYPE_INTEGER) vm->raw_reals[slot] -= (double)rhs->as.i;
-    else error("Cannot apply '-=' to float and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
-
-lbl_raw_mul_real_boxed: {
-    int slot = (int)UNPACK_A(op_word);
-    int reg  = (int)UNPACK_B(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_REAL) vm->raw_reals[slot] *= rhs->as.d;
-    else if (rhs->tag == TYPE_INTEGER) vm->raw_reals[slot] *= (double)rhs->as.i;
-    else error("Cannot apply '*=' to float and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
-
-/* Non-destructive counterparts of the 3 handlers just above -- (dest, src_raw, boxed_reg) instead
-   of (slot, reg) in-place. src_raw is read-only here, letting a caller compose a permanent raw
-   local with a boxed value into a FRESH slot without a defensive OP_RAW_MOVE_REAL first (see
-   try_emit_arith_raw_boxed, parser.c). Error messages say '+'/'-'/'*' rather than the compound
-   forms since this is always a general expression, never a compound assignment. */
-lbl_raw_add_real_boxed_to: {
-    int dest = (int)UNPACK_A(op_word);
-    int src  = (int)UNPACK_B(op_word);
-    int reg  = (int)UNPACK_C(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_REAL) vm->raw_reals[dest] = vm->raw_reals[src] + rhs->as.d;
-    else if (rhs->tag == TYPE_INTEGER) vm->raw_reals[dest] = vm->raw_reals[src] + (double)rhs->as.i;
-    else error("Cannot apply '+' to float and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
-
-lbl_raw_mul_real_boxed_to: {
-    int dest = (int)UNPACK_A(op_word);
-    int src  = (int)UNPACK_B(op_word);
-    int reg  = (int)UNPACK_C(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_REAL) vm->raw_reals[dest] = vm->raw_reals[src] * rhs->as.d;
-    else if (rhs->tag == TYPE_INTEGER) vm->raw_reals[dest] = vm->raw_reals[src] * (double)rhs->as.i;
-    else error("Cannot apply '*' to float and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
+#undef RAW_ARITH_INT
+#undef RAW_ARITH_REAL
+#undef RAW_CMP_INT
+#undef RAW_CMP_REAL
+#undef RAW_ARITH_INT_BOXED
+#undef RAW_ARITH_REAL_BOXED
+#undef RAW_ARITH_REAL_BOXED_TO
 
 lbl_raw_load_int_pool: {
     int dest = (int)UNPACK_A(op_word);
