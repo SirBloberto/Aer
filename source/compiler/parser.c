@@ -315,7 +315,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx);
 static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_is_index);
 static int  parse_call(Chunk* c, unsigned int name_idx);
 static void parse_function(Chunk* c);
-static bool parse_literal_default(Chunk* c, AerVal* out);
+static bool parse_literal_default(Chunk* c, AerVal* out, bool* out_narrow);
 static void parse_return(Chunk* c);
 static void parse_struct(Chunk* c);
 static bool at_module_name(Chunk* c);
@@ -414,13 +414,21 @@ static void mark_shape_sensitive(int reg) {
    entirely, since the shape is already a compile-time fact here. False means the field doesn't
    exist on this shape -- callers fall back to the generic (runtime-checked, correctly-erroring)
    opcode path rather than treating this as an internal error, since a genuinely missing field is
-   a normal source-level mistake the generic path already reports correctly. */
+   a normal source-level mistake the generic path already reports correctly.
+   *out_narrow is true for a narrow (int32/float32) field -- every caller of this function treats
+   that the same way as "not int/real" (falls back to the generic, non-raw-opcode path): the
+   existing raw-field opcode family (OP_FIELD_GET_RAW_INT/REAL, OP_INDEX_FIELD_GET_RAW_INT/REAL,
+   and the RAW_INT/RAW_REAL compound-assignment variants) all assume an unconditional 8-byte raw
+   slot, so a narrow field is deliberately kept out of shape specialization's raw fast path
+   entirely for now -- see Shape.field_narrow's own comment (vm.h) for why this was chosen over
+   also doubling that opcode family. */
 static bool shape_find_field(Shape* shape, unsigned int field_name_idx,
-                                 unsigned int* out_offset, ValueType* out_type) {
+                                 unsigned int* out_offset, ValueType* out_type, bool* out_narrow) {
     for (unsigned int i = 0; i < shape->field_count; i++) {
         if (shape->field_names[i] == field_name_idx) {
             *out_offset = shape->field_offsets[i];
             *out_type   = shape->field_types[i];
+            *out_narrow = shape->field_narrow[i];
             return true;
         }
     }
@@ -1468,9 +1476,9 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                        or if the raw-slot budget is exhausted (raw_int_alloc/raw_real_alloc return
                        -1) -- same graceful-overflow convention raw locals already use. */
                     Shape* known = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? reg_known_shape[arr_reg] : NULL;
-                    unsigned int foffset; ValueType ftype;
-                    if (known && shape_find_field(known, field_idx, &foffset, &ftype) &&
-                        (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
+                    unsigned int foffset; ValueType ftype; bool narrow;
+                    if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
+                        !narrow && (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
                         bool is_int = (ftype == TYPE_INTEGER);
                         int slot = is_int ? raw_int_alloc() : raw_real_alloc();
                         if (slot >= 0) {
@@ -1540,9 +1548,9 @@ static int parse_postfix_chain(Chunk* c, int rk) {
             mark_shape_sensitive(struct_reg);
             {
                 Shape* known = (struct_reg >= 0 && struct_reg < FRAME_REGISTERS) ? reg_known_shape[struct_reg] : NULL;
-                unsigned int foffset; ValueType ftype;
-                if (known && shape_find_field(known, field_idx, &foffset, &ftype) &&
-                    (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
+                unsigned int foffset; ValueType ftype; bool narrow;
+                if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
+                    !narrow && (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
                     bool is_int = (ftype == TYPE_INTEGER);
                     int slot = is_int ? raw_int_alloc() : raw_real_alloc();
                     if (slot >= 0) {
@@ -2290,9 +2298,9 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                postfix step on the name, no chaining happened before it. */
             mark_shape_sensitive(obj_reg);
             Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
-            unsigned int foffset = 0; ValueType ftype = TYPE_ANY;
+            unsigned int foffset = 0; ValueType ftype = TYPE_ANY; bool field_narrow_bit = false;
             RawKind field_kind = RAWK_NONE;
-            if (known && shape_find_field(known, fused_field_idx, &foffset, &ftype)) {
+            if (known && shape_find_field(known, fused_field_idx, &foffset, &ftype, &field_narrow_bit) && !field_narrow_bit) {
                 if (ftype == TYPE_INTEGER) field_kind = RAWK_INT;
                 else if (ftype == TYPE_REAL) field_kind = RAWK_REAL;
             }
@@ -2434,8 +2442,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         if (pending_is_field && obj_is_base) {
             mark_shape_sensitive(obj_reg);
             Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
-            unsigned int foffset; ValueType ftype;
-            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype)) {
+            unsigned int foffset; ValueType ftype; bool field_narrow_bit;
+            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit) && !field_narrow_bit) {
                 RawKind field_kind = (ftype == TYPE_INTEGER) ? RAWK_INT : (ftype == TYPE_REAL) ? RAWK_REAL : RAWK_NONE;
                 if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
                     int slot = raw_materialize(c, rk_val, field_kind);
@@ -2472,9 +2480,9 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                when obj_is_base (this register really is the shape-sensitive parameter/alias, not
                an intermediate chain link -- reg_known_shape is never seeded for those). */
             Shape* known = (obj_is_base && obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
-            unsigned int foffset = 0; ValueType ftype = TYPE_ANY;
+            unsigned int foffset = 0; ValueType ftype = TYPE_ANY; bool field_narrow_bit = false;
             RawKind field_kind = RAWK_NONE;
-            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype)) {
+            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit) && !field_narrow_bit) {
                 if (ftype == TYPE_INTEGER) field_kind = RAWK_INT;
                 else if (ftype == TYPE_REAL) field_kind = RAWK_REAL;
             }
@@ -3362,7 +3370,8 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
             param_names[param_count] = chunk_add_pool(c, token.value);
             lex();
             if (consume(TOKEN_ASSIGN)) {
-                if (!parse_literal_default(c, &param_defaults[param_count])) {
+                bool unused_narrow;
+                if (!parse_literal_default(c, &param_defaults[param_count], &unused_narrow)) {
                     error_at("Parameter defaults must be a literal value");
                     return;
                 }
@@ -3679,7 +3688,8 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
 /* Includes a `[]`/`{}` empty-container template special case -- vm_default_value allocates a
    fresh empty array/dict at each use, avoiding Python's mutable-default bug. Returns false if the
    current token isn't a valid literal default. */
-static bool parse_literal_default(Chunk* c, AerVal* out) {
+static bool parse_literal_default(Chunk* c, AerVal* out, bool* out_narrow) {
+    *out_narrow = false;
     bool negative = false;
     if (token.type == TOKEN_SUBTRACT) {
         /* Peeked, not consumed -- only actually a negative-number prefix if a number follows. */
@@ -3689,9 +3699,11 @@ static bool parse_literal_default(Chunk* c, AerVal* out) {
     if (token.type == TOKEN_INTEGER) {
         int64_t n = aer_as_int(token.value);
         *out = aer_int(negative ? -n : n);
+        *out_narrow = token.narrow;
     } else if (token.type == TOKEN_REAL) {
         double d = aer_as_real(token.value);
         *out = aer_real(negative ? -d : d);
+        *out_narrow = token.narrow;
     } else if (negative) {
         return false;   /* '-' is only meaningful before a number */
     } else if (token.type == TOKEN_TRUE || token.type == TOKEN_FALSE) {
@@ -3736,6 +3748,7 @@ static void parse_struct(Chunk* c) {
     unsigned int field_names[MAX_STRUCT_FIELDS];
     AerVal       field_defaults[MAX_STRUCT_FIELDS];
     ValueType    field_types[MAX_STRUCT_FIELDS];
+    bool         field_narrow[MAX_STRUCT_FIELDS];
     unsigned int field_count = 0;
 
     while (!equal(TOKEN_END_OF_FILE) && !equal(TOKEN_DEDENT)) {
@@ -3756,14 +3769,29 @@ static void parse_struct(Chunk* c) {
                      (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
             return;
         }
-        AerVal dflt;
-        if (!parse_literal_default(c, &dflt)) {
+        AerVal dflt; bool narrow;
+        if (!parse_literal_default(c, &dflt, &narrow)) {
             error_at("Struct field defaults must be a literal value");
             return;
         }
         field_names[field_count]    = fname;
         field_defaults[field_count] = dflt;
         field_types[field_count]    = aer_type(dflt) == TYPE_NULL ? TYPE_ANY : aer_type(dflt);
+        /* Only integer/float can be narrow -- token.narrow can't be true for any other literal
+           kind (see lex_number, lexer.c), but stay explicit about it rather than trust that by
+           omission. */
+        field_narrow[field_count]   = narrow && (field_types[field_count] == TYPE_INTEGER || field_types[field_count] == TYPE_REAL);
+        /* Caught here, at definition, rather than deferred to first construction -- every other
+           construction-time int32 range check (vm_check_narrow_field_write, vm.c) trusts a field's
+           OWN default without re-validating it (same "enforced once, trusted everywhere after"
+           convention as an ordinary declared-type check), so an out-of-range default has to be
+           rejected before that trust is established. */
+        if (field_narrow[field_count] && field_types[field_count] == TYPE_INTEGER &&
+            (aer_as_int(dflt) < INT32_MIN || aer_as_int(dflt) > INT32_MAX)) {
+            error_at("Struct field '%.*s' default is out of range for a narrow (int32) field",
+                     (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
+            return;
+        }
         field_count++;
 
         if (!equal(TOKEN_DEDENT) && !equal(TOKEN_END_OF_FILE))
@@ -3778,7 +3806,9 @@ static void parse_struct(Chunk* c) {
     for (unsigned int i = 0; i < field_count; i++) {
         unsigned int default_idx = chunk_add_pool(c, field_defaults[i]);
         chunk_emit(c, PACK_2X16(field_names[i], default_idx));
-        chunk_emit(c, (uint32_t)field_types[i]);
+        /* Low byte is the ValueType tag, bit 0x100 is the narrow (`i`/`f`-suffixed-literal) marker
+           -- decoded by OP_DEFINE_STRUCT's handler (vm.c). */
+        chunk_emit(c, (uint32_t)field_types[i] | (field_narrow[i] ? 0x100u : 0u));
     }
 
     struct_register(name_idx);

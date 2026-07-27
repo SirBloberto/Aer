@@ -872,6 +872,37 @@ point_translate(p1, 1.0, 1.0)
 `type(p) == "Point"` is a standalone runtime shape check, not part of a function signature — see
 [Casting and Shape-Checking](#casting-and-shape-checking).
 
+### Narrow Struct Fields
+
+An `i`- or `f`-suffixed literal default (`x = 42i`, `y = 0.0f`) declares that field as narrow —
+stored in 4 bytes (`int32`/`float32`) instead of the usual 8 (`integer`/`float`, which stay 64-bit
+everywhere else in the language; this is purely a storage-size opt-in, not a second numeric type
+you can write ordinary arithmetic against differently):
+
+```
+struct Point:
+    x = 0i
+    y = 0.0f
+    label = "point"
+
+p = Point(5, 2.5, "p1")
+print(p.x)   # 5 -- reads back as an ordinary integer
+p.x += 10    # ordinary compound assignment works
+```
+
+A narrow field reads back as an ordinary `integer`/`float` value — nothing about using it looks any
+different from a normal field. `p.x = 5000000000` (or a construction argument, or the field's own
+default) is a runtime error if it doesn't fit an `int32`, rather than silently wrapping.
+
+This is a correctness/memory-focused first step, not (yet) a speed one: a narrow field always goes
+through the same field-access opcodes an ordinary field does — it does not (yet) participate in the
+VM's shape-specialization raw-unboxed-local fast path, so a tight loop reading a narrow field gets
+the memory-density win but not (yet) the same per-access speed a wide field gets once a function
+specializes around it. **Not yet supported**: a struct with any narrow field cannot be used as the
+fill value of a [repeat-literal](#repeat-literal-arrays)'s packed-array construction (`[Point(); n]`)
+— every packed array assumes a uniform 8-bytes-per-field element stride today, an invariant a narrow
+field would break.
+
 ### Repeat-Literal Arrays
 
 `[value; count]` evaluates `value` exactly once, then builds a dense array of `count` copies —
@@ -917,9 +948,9 @@ fine as an ordinary, individually-constructed instance (`Type()`).
 
 **Narrow numeric arrays**: an `i`- or `f`-suffixed literal *written directly as the fill value*
 (`[0i; n]`, `[0.0f; n]`) selects 32-bit storage (`int32`/`float32`) instead of the default 64-bit
-(`integer`/`float`). This only works for a literal in that exact position — the suffix is
-parse-time-only information, so `x = 0.0f; [x; n]` builds an ordinary (wide) `float[]` array, not a
-narrow one.
+(`integer`/`float`) — the same suffix convention as [Narrow Struct Fields](#narrow-struct-fields).
+This only works for a literal in that exact position — the suffix is parse-time-only information,
+so `x = 0.0f; [x; n]` builds an ordinary (wide) `float[]` array, not a narrow one.
 
 **Packed arrays: field access only, no standalone per-element reference.** `arr[i].field` (get and
 set, including compound assignment) is the only supported form; a bare `arr[i]` alone is a compile

@@ -1,0 +1,97 @@
+#!/usr/bin/env aer
+import collection
+# AER test suite — narrow (int32/float32) struct fields via the `i`/`f` literal suffix on a
+# field's default value (`x = 42i`, `y = 0.0f`). A correctness-focused first pass: narrow fields
+# get the memory-density win (4 bytes instead of 8 in the struct layout) via the same
+# generic FIELD_GET/FIELD_SET path every field already uses, but deliberately do NOT participate in
+# shape specialization's raw-opcode fast path (OP_FIELD_GET_RAW_REAL and friends) -- that fast path
+# assumes a uniform 8-byte raw slot, so a narrow field always falls back to the ordinary (still
+# correct, just not raw-unboxed) opcodes instead. Machine-checked via assert(): a clean run exits 0;
+# any failure prints "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
+
+# ------------------------------------------------------------------ #
+# 1. Construction, defaults, read/write for both narrow kinds,        #
+#    alongside an ordinary (wide) field on the same struct.           #
+# ------------------------------------------------------------------ #
+
+struct Point:
+    x = 0i
+    y = 0.0f
+    label = "point"
+
+p1 = Point(5, 2.5, "p1")
+assert(p1.x == 5, "narrow int32 field constructed with an explicit arg")
+assert(p1.y == 2.5, "narrow float32 field constructed with an explicit arg")
+assert(p1.label == "p1", "an ordinary (wide) string field on the same struct is unaffected")
+
+p2 = Point()
+assert(p2.x == 0 and p2.y == 0.0 and p2.label == "point", "default-filled narrow fields (and the ordinary field alongside them) all use their own declared defaults")
+
+p1.x = 42
+p1.y = 9.5
+assert(p1.x == 42 and p1.y == 9.5, "plain assignment to a narrow field round-trips")
+
+# ------------------------------------------------------------------ #
+# 2. Compound assignment on a narrow field.                           #
+# ------------------------------------------------------------------ #
+
+p1.x += 8
+assert(p1.x == 50, "compound assignment (+=) on a narrow int32 field")
+p1.y -= 1.5
+assert(p1.y == 8.0, "compound assignment (-=) on a narrow float32 field")
+
+p1.y = 3.0
+assert(p1.y == 3.0, "plain assignment of a fresh float literal to a narrow float32 field")
+# p1.y = 3   # would error, same as an ordinary (wide) float field: struct FIELD_SET requires an
+#              exact type match, no int->float promotion (unlike a typed array's element assignment)
+
+# ------------------------------------------------------------------ #
+# 3. Elements are independent -- two instances never share storage.   #
+# ------------------------------------------------------------------ #
+
+assert(p1.x != p2.x, "two separate Point instances have independent narrow field storage")
+
+# ------------------------------------------------------------------ #
+# 4. Narrow field access still works correctly through every ordinary #
+#    access path a ValueType field goes through: index-fused (arr[i].field),
+#    a plain function parameter, and inside a loop.                   #
+# ------------------------------------------------------------------ #
+
+pts = []
+collection.append(pts, Point(1, 1.0, "a"))
+collection.append(pts, Point(2, 2.0, "b"))
+collection.append(pts, Point(3, 3.0, "c"))
+
+pts[1].x = 99
+assert(pts[1].x == 99, "narrow field access through an indexed array element (obj[index].field)")
+
+function sum_narrow_x(points, n):
+    total = 0
+    for i in 0..n:
+        total += points[i].x
+    return total
+
+assert(sum_narrow_x(pts, 3) == 1 + 99 + 3, "narrow int32 field summed across a plain array of structs via a function parameter")
+
+function nudge_all_y(points, n, dy):
+    for i in 0..n:
+        points[i].y += dy
+
+nudge_all_y(pts, 3, 0.5)
+assert(pts[0].y == 1.5 and pts[1].y == 2.5 and pts[2].y == 3.5, "compound assignment on a narrow float32 field through a function parameter and loop")
+
+# ------------------------------------------------------------------ #
+# 5. Out-of-range/type-mismatch/packed-array-rejection errors         #
+#    (documented, not run -- same convention as every other error-    #
+#    path example in this suite: a real runtime error aborts the      #
+#    whole script, so these can't be exercised inline in a script     #
+#    that must exit 0).                                                #
+# ------------------------------------------------------------------ #
+
+# struct Bad:
+#     n = 5000000000i    # would error at struct definition: default out of range for a narrow (int32) field
+# p1.x = 5000000000       # would error: Value 5000000000 out of range for a narrow (int32) field
+# bad = Point(5000000000, 1.0, "x")   # would error the same way, at construction
+# packed = [Point(); 3]   # would error: 'Point' cannot be packed into an array -- narrow fields not yet supported there
+
+print("test_narrow_fields.aer: all assertions passed.")

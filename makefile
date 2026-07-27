@@ -47,6 +47,7 @@ TESTS := tests/test_core.aer \
          tests/test_dict_pool_stress.aer \
          tests/test_packed_arrays.aer \
          tests/test_typed_arrays.aer \
+         tests/test_narrow_fields.aer \
          tests/test_shape_specialization.aer \
          tests/test_net.aer \
          tests/test_regex.aer \

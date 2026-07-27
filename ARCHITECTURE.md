@@ -621,34 +621,29 @@ default build, to keep the makefile small.
   bug above (that's about *how often* the array gets rescanned once old, not the reallocation cost),
   but is a real, complementary, and much cheaper win for the same "build a huge array via many
   appends" pattern. Not built yet.
-- **TODO: opt-in 32-bit (`int32`/`float32`) fields for structs** (narrow *arrays* already landed —
-  `[0i; n]`/`[0.0f; n]` build an `AerTypedArray` with no `Shape` involved at all, see
-  [Repeat-Literal Arrays](README.md#repeat-literal-arrays); this entry is specifically about
-  extending the same `i`/`f` literal-suffix convention to a struct's own per-field defaults, e.g.
-  `x = 0.0f` inside a `struct` body). Distinct from — and a much better-grounded idea than —
-  shrinking the general `AerVal` (see below): a struct field's type is already known statically at
-  compile time via `Shape.field_types[]`, and every access already goes through a fixed byte offset
-  with zero runtime type-tag recovery (e.g.
-  `OP_FIELD_GET_RAW_REAL`, `off=24`) — so narrowing a field from 8 to 4 bytes doesn't reintroduce the
-  per-access unpacking cost that made NaN-boxing a measured regression (see below); it's a direct
-  continuation of the already-validated principle behind the existing typed-struct-fields work
-  (raw 8-byte fields over full 16-byte boxed `AerVal`, chosen for exactly this reason). Confirmed
-  feasible with no infrastructure redesign: `Shape.field_offsets[]` (vm.c, `OP_DEFINE_STRUCT`'s
-  handler) is already a genuine per-field cumulative sum (`offset += field_types[i] == TYPE_ANY ?
-  sizeof(AerVal) : 8`), not a fixed stride — a third, 4-byte case slots directly into that existing
-  loop. Real costs: (1) needs new opt-in syntax (`int32`/`float32` as distinct declared field types,
-  not silently narrowing the existing `integer`/`float`, which must stay 64-bit everywhere else in
-  the language); (2) doubles the raw-field-access opcode surface for structs/packed arrays
-  specifically (32-bit counterparts of `OP_FIELD_GET_RAW_REAL`/`OP_FIELD_SET`/
-  `OP_FIELD_COMPOUND_RAW_REAL`/etc.); (3) real precision-loss risk needing validation against a
-  correctness oracle, not just assumed fine — `nbody.aer`'s own energy-conservation check (already
-  used elsewhere this session to catch other regressions) is the natural test, since accumulated
-  float32 rounding error over many iterations could plausibly drift further than float64 does today.
-  Expected payoff shape: for an array already far larger than any cache (`struct_array_scan.aer`'s
-  2,000,000 × 56 bytes = 112MB, already streaming from main memory every pass regardless of field
-  width), halving field width mainly cuts memory *bandwidth* consumed per pass, not miss *rate* —
-  consistent with that benchmark's own existing design comment, which already reasons about "total
-  byte footprint... determines how much survives in cache between passes." Not scoped in detail yet.
+- **DONE (correctness-only pass): opt-in 32-bit (`int32`/`float32`) fields for structs**, via the
+  same `i`/`f` literal-suffix convention as narrow typed arrays (`x = 42i`, `y = 0.0f` inside a
+  `struct` body — see [Narrow Struct Fields](README.md#narrow-struct-fields)). `Shape.field_offsets[]`
+  (vm.c, `OP_DEFINE_STRUCT`'s handler) already was a genuine per-field cumulative sum, not a fixed
+  stride, so a third (4-byte) case slotted in directly; `Shape.field_narrow[]` records which fields
+  are narrow, threaded through the field-access inline cache (`FieldCacheEntry.narrow`) so
+  `vm_struct_field_read_at`/`write_at` — the one path every ordinary (non-specialized) `.field`
+  opcode uses — can dispatch correctly. **Deliberately excluded from this pass, a real remaining
+  TODO**: shape specialization's raw-unboxed-local fast path (`OP_FIELD_GET_RAW_REAL` and the whole
+  `_RAW_INT`/`_RAW_REAL` family) still assumes an unconditional 8-byte slot — `shape_find_field`
+  (parser.c) now reports a field's narrowness precisely so every one of that family's 5 eligibility
+  checks can exclude a narrow field, forcing it through the generic (still fully correct, just not
+  raw-unboxed) path instead. This means a narrow field gets today's whole memory-density win but not
+  yet the matching per-access speed win a wide field gets once a function specializes around it —
+  that would need 32-bit counterparts of the whole raw-opcode family (`OP_FIELD_GET_RAW_REAL`'s
+  int32/float32 equivalents, etc.), deferred until real `perf stat` numbers justify doubling that
+  opcode surface, mirroring how packed arrays themselves were only fast-pathed after benchmark
+  evidence existed. **Also deliberately excluded**: packed-array construction of a struct with any
+  narrow field (`[Point(); n]` where `Point` has a narrow field) is a compile-clean *runtime* error —
+  every packed-array element access (10 call sites across `lbl_index_field_get/set/compound` and
+  `lbl_array_repeat`) assumes a uniform 8-bytes-per-field stride (`field_count * 8`, not
+  `shape->instance_bytes`), and generalizing all 10 was judged out of scope for a first pass focused
+  on plain (non-packed) struct instances.
 
 ---
 

@@ -498,12 +498,21 @@ struct Shape {
     /* TYPE_ANY = no declared type. A declared type is enforced once at FIELD_SET/construction,
        then trusted — the fused opcodes skip the runtime check on that side. */
     ValueType    field_types[MAX_STRUCT_FIELDS];
+    /* True for a TYPE_INTEGER/TYPE_REAL field whose default was written with an `i`/`f` literal
+       suffix (`x = 42i`, `x = 0.0f`) -- selects narrow (4-byte int32/float32) storage instead of the
+       usual 8-byte int64/float64, on a plain (non-packed) struct instance only: a struct with any
+       narrow field is NOT eligible for packed-array construction (see lbl_array_repeat, vm.c) --
+       every packed-array element read/write assumes a uniform 8-bytes-per-field stride
+      (field_count * 8), and preserving that invariant unchanged was chosen over auditing/generalizing
+       every one of those call sites for a first, correctness-focused pass. False (meaningless) for
+       any other field kind. */
+    bool         field_narrow[MAX_STRUCT_FIELDS];
     /* Byte offset of each field within an instance's fields buffer (AerStruct.fields) -- a typed
        field (TYPE_ANY excluded) is stored RAW in 8 bytes (no tag; the type is this Shape's own
-       static knowledge, never read from the instance), an untyped (TYPE_ANY) field stays a full
-       boxed AerVal (16 bytes), since it can hold any value including a reference type the GC must
-       trace. Computed once in OP_DEFINE_STRUCT's handler, right after field_types is known. See
-       vm_struct_field_read/vm_struct_field_write. */
+       static knowledge, never read from the instance) unless field_narrow marks it 4 instead, an
+       untyped (TYPE_ANY) field stays a full boxed AerVal (16 bytes), since it can hold any value
+       including a reference type the GC must trace. Computed once in OP_DEFINE_STRUCT's handler,
+       right after field_types/field_narrow are known. See vm_struct_field_read/vm_struct_field_write. */
     unsigned int field_offsets[MAX_STRUCT_FIELDS];
     unsigned int instance_bytes;   /* total size of the fields buffer -- sum of every field's width above */
 };
@@ -652,6 +661,7 @@ typedef struct {
     int          slot;
     unsigned int offset;
     ValueType    ftype;
+    bool         narrow;   /* same reasoning as offset/ftype above -- cached, not re-derived from shape */
 } FieldCacheEntry;
 
 /* One per-callsite specialization-dispatch cache entry (OP_CALL_SPEC) -- same monomorphic-inline-

@@ -925,12 +925,13 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
    shared by both boxed-struct and packed-array callers, since a field's slot within a given
    Shape is identical either way. False (error reported) if shape has no such field. */
 static inline __attribute__((always_inline)) bool vm_resolve_field_by_shape(Chunk* c, unsigned int site, Shape* shape, int field_idx,
-                                 int* out_slot, unsigned int* out_offset, ValueType* out_ftype) {
+                                 int* out_slot, unsigned int* out_offset, ValueType* out_ftype, bool* out_narrow) {
     FieldCacheEntry* entry = &c->field_cache[site];
     if (entry->shape == shape) {
         *out_slot   = entry->slot;
         *out_offset = entry->offset;
         *out_ftype  = entry->ftype;
+        *out_narrow = entry->narrow;
         return true;
     }
     for (unsigned int i = 0; i < shape->field_count; i++) {
@@ -939,9 +940,11 @@ static inline __attribute__((always_inline)) bool vm_resolve_field_by_shape(Chun
             entry->slot   = (int)i;
             entry->offset = shape->field_offsets[i];
             entry->ftype  = shape->field_types[i];
+            entry->narrow = shape->field_narrow[i];
             *out_slot   = (int)i;
             *out_offset = entry->offset;
             *out_ftype  = entry->ftype;
+            *out_narrow = entry->narrow;
             return true;
         }
     }
@@ -950,11 +953,11 @@ static inline __attribute__((always_inline)) bool vm_resolve_field_by_shape(Chun
     return false;
 }
 
-/* Resolves struct_reg's field to an (AerStruct*, slot, offset, ftype) tuple, delegating the
+/* Resolves struct_reg's field to an (AerStruct*, slot, offset, ftype, narrow) tuple, delegating the
    shape+cache lookup above. Shared by every field-access opcode. False (error reported) if not a
    struct instance or no such field. */
 static inline __attribute__((always_inline)) bool vm_resolve_field(VM* vm, Chunk* c, unsigned int site, int struct_reg, int field_idx,
-                                 AerStruct** out_s, int* out_slot, unsigned int* out_offset, ValueType* out_ftype) {
+                                 AerStruct** out_s, int* out_slot, unsigned int* out_offset, ValueType* out_ftype, bool* out_narrow) {
     AerVal* obj = &vm->registers[struct_reg];
     if (obj->tag != TYPE_STRUCT) {
         error("'.' field access requires a struct instance");
@@ -962,7 +965,7 @@ static inline __attribute__((always_inline)) bool vm_resolve_field(VM* vm, Chunk
     }
     AerStruct* s = (AerStruct*)obj->as.ptr;
     *out_s = s;
-    return vm_resolve_field_by_shape(c, site, s->shape, field_idx, out_slot, out_offset, out_ftype);
+    return vm_resolve_field_by_shape(c, site, s->shape, field_idx, out_slot, out_offset, out_ftype, out_narrow);
 }
 
 /* Reads one 8-byte packed slot as AerVal -- no switch on field type needed since AerVal.as is
@@ -979,47 +982,6 @@ static inline AerVal vm_packed_slot_read(unsigned char* slot, ValueType ftype) {
 static inline void vm_packed_slot_write(unsigned char* slot, ValueType ftype, AerVal v) {
     (void)ftype;
     memcpy(slot, &v.as, 8);
-}
-
-/* One struct field, at its own Shape-computed byte offset -- raw via vm_packed_slot_read/write for
-   a typed field, a plain 16-byte memcpy for TYPE_ANY (it isn't a fixed-width 8-byte payload, so the
-   packed-slot helpers don't apply). Declared in vm.h since aer_json.c's struct-serialization branch
-   needs these too, not just vm.c's own opcodes. Iterates every field with no per-site cache to draw
-   on (print/json.encode), so it looks offset/ftype up fresh -- vm_struct_field_read_at below is the
-   one every opcode call site should use instead, once it already has them from the field cache. */
-AerVal vm_struct_field_read(AerStruct* s, unsigned int slot) {
-    ValueType ftype = s->shape->field_types[slot];
-    unsigned int offset = s->shape->field_offsets[slot];
-    unsigned char* p = s->fields + offset;
-    if (ftype == TYPE_ANY) { AerVal v; memcpy(&v, p, sizeof(AerVal)); return v; }
-    return vm_packed_slot_read(p, ftype);
-}
-
-void vm_struct_field_write(AerStruct* s, unsigned int slot, AerVal v) {
-    ValueType ftype = s->shape->field_types[slot];
-    unsigned int offset = s->shape->field_offsets[slot];
-    unsigned char* p = s->fields + offset;
-    if (ftype == TYPE_ANY) memcpy(p, &v, sizeof(AerVal));
-    else vm_packed_slot_write(p, ftype, v);
-}
-
-/* Same contract as vm_struct_field_read/write above, but offset/ftype are already in hand (from
-   vm_resolve_field's cache output) instead of being re-derived from s->shape here -- every opcode
-   call site uses these, not the by-slot versions above. The `ftype == TYPE_ANY` branch itself is
-   not the cost this avoids: for any real (monomorphic) call site it's the same outcome every single
-   time, so branch prediction makes it free after the first iteration. What was real and worth
-   removing was the extra pointer-chase through s->shape to re-fetch offset/ftype on every access
-   even after the cache already proved the shape matched. */
-static inline AerVal vm_struct_field_read_at(AerStruct* s, unsigned int offset, ValueType ftype) {
-    unsigned char* p = s->fields + offset;
-    if (ftype == TYPE_ANY) { AerVal v; memcpy(&v, p, sizeof(AerVal)); return v; }
-    return vm_packed_slot_read(p, ftype);
-}
-
-static inline void vm_struct_field_write_at(AerStruct* s, unsigned int offset, ValueType ftype, AerVal v) {
-    unsigned char* p = s->fields + offset;
-    if (ftype == TYPE_ANY) memcpy(p, &v, sizeof(AerVal));
-    else vm_packed_slot_write(p, ftype, v);
 }
 
 /* One element of a TYPE_TYPED_ARRAY (AerTypedArray) -- a completely separate function from
@@ -1051,6 +1013,31 @@ static inline void vm_typed_elem_write(unsigned char* slot, TypedArrayElemKind k
         case TYPED_ELEM_INT64:   { int64_t iv = aer_as_int(v); memcpy(slot, &iv, 8); break; }
         case TYPED_ELEM_FLOAT64: { double   dv = (aer_type(v) == TYPE_INTEGER ? (double)aer_as_int(v) : aer_as_real(v)); memcpy(slot, &dv, 8); break; }
     }
+}
+
+/* One struct field, at its own Shape-computed byte offset -- raw via vm_packed_slot_read/write for
+   a typed 8-byte field, vm_typed_elem_read/write above for a narrow (4-byte int32/float32) one, or a
+   plain 16-byte memcpy for TYPE_ANY (neither packed-slot scheme applies to a full boxed AerVal).
+   Declared in vm.h since aer_json.c's struct-serialization branch needs these too, not just vm.c's
+   own opcodes. Iterates every field with no per-site cache to draw on (print/json.encode), so it
+   looks offset/ftype/narrow up fresh -- vm_struct_field_read_at below is the one every opcode call
+   site should use instead, once it already has them from the field cache. */
+AerVal vm_struct_field_read(AerStruct* s, unsigned int slot) {
+    ValueType ftype = s->shape->field_types[slot];
+    unsigned int offset = s->shape->field_offsets[slot];
+    unsigned char* p = s->fields + offset;
+    if (ftype == TYPE_ANY) { AerVal v; memcpy(&v, p, sizeof(AerVal)); return v; }
+    if (s->shape->field_narrow[slot]) return vm_typed_elem_read(p, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32);
+    return vm_packed_slot_read(p, ftype);
+}
+
+void vm_struct_field_write(AerStruct* s, unsigned int slot, AerVal v) {
+    ValueType ftype = s->shape->field_types[slot];
+    unsigned int offset = s->shape->field_offsets[slot];
+    unsigned char* p = s->fields + offset;
+    if (ftype == TYPE_ANY) { memcpy(p, &v, sizeof(AerVal)); return; }
+    if (s->shape->field_narrow[slot]) { vm_typed_elem_write(p, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32, v); return; }
+    vm_packed_slot_write(p, ftype, v);
 }
 
 /* Natural literal shape, not exact-tag matching (unlike a typed struct field's OP_FIELD_SET) --
@@ -1087,6 +1074,41 @@ static bool vm_typed_array_check(Chunk* c, TypedArrayElemKind kind, AerVal val) 
             return true;
     }
     return false;
+}
+
+/* Same "fail loudly, don't silently truncate" convention as vm_typed_array_check -- a narrow
+   (int32) struct field additionally range-checks; a non-narrow field's ordinary
+   `declared != TYPE_ANY && val->tag != declared` check (every OP_FIELD_SET-family handler's own)
+   already confirms val really is an integer whenever ftype/declared is TYPE_INTEGER, so this only
+   needs to add the extra range check on top of that, not re-verify the type itself. */
+static bool vm_check_narrow_field_write(ValueType ftype, bool narrow, AerVal val) {
+    if (!narrow || ftype != TYPE_INTEGER) return true;
+    if (aer_as_int(val) < INT32_MIN || aer_as_int(val) > INT32_MAX) {
+        error("Value %lld out of range for a narrow (int32) field", (long long)aer_as_int(val));
+        return false;
+    }
+    return true;
+}
+
+/* Same contract as vm_struct_field_read/write above, but offset/ftype/narrow are already in hand
+   (from vm_resolve_field's cache output) instead of being re-derived from s->shape here -- every
+   opcode call site uses these, not the by-slot versions above. The `ftype == TYPE_ANY`/`narrow`
+   branches themselves are not the cost this avoids: for any real (monomorphic) call site it's the
+   same outcome every single time, so branch prediction makes it free after the first iteration.
+   What was real and worth removing was the extra pointer-chase through s->shape to re-fetch
+   offset/ftype/narrow on every access even after the cache already proved the shape matched. */
+static inline AerVal vm_struct_field_read_at(AerStruct* s, unsigned int offset, ValueType ftype, bool narrow) {
+    unsigned char* p = s->fields + offset;
+    if (ftype == TYPE_ANY) { AerVal v; memcpy(&v, p, sizeof(AerVal)); return v; }
+    if (narrow) return vm_typed_elem_read(p, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32);
+    return vm_packed_slot_read(p, ftype);
+}
+
+static inline void vm_struct_field_write_at(AerStruct* s, unsigned int offset, ValueType ftype, bool narrow, AerVal v) {
+    unsigned char* p = s->fields + offset;
+    if (ftype == TYPE_ANY) { memcpy(p, &v, sizeof(AerVal)); return; }
+    if (narrow) { vm_typed_elem_write(p, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32, v); return; }
+    vm_packed_slot_write(p, ftype, v);
 }
 
 /* Returns an owned copy of dense[*idx]'s key. Shared by array-iteration's dict branch and
@@ -1639,16 +1661,20 @@ lbl_define_struct: {
         uint32_t name_default_word = READ();
         shape->field_names[i]    = UNPACK_2X16_HI(name_default_word);
         shape->field_defaults[i] = c->pool[UNPACK_2X16_LO(name_default_word)];
-        shape->field_types[i]    = (ValueType)READ();
+        /* Low byte is the ValueType tag, bit 0x100 is the narrow (`i`/`f`-suffixed-literal) marker
+           -- see emit_struct_field_type/parse_struct's own comment (parser.c). */
+        uint32_t ftype_word = READ();
+        shape->field_types[i]  = (ValueType)(ftype_word & 0xFF);
+        shape->field_narrow[i] = (ftype_word & 0x100) != 0;
     }
-    /* Typed fields get 8 raw bytes (no tag -- the type is this Shape's own static knowledge);
-       TYPE_ANY fields get a full boxed AerVal (16 bytes), since they can hold a reference type the
-       GC must trace. See vm_struct_field_read/write. */
+    /* Typed fields get 8 raw bytes (no tag -- the type is this Shape's own static knowledge), or 4
+       if narrow (int32/float32); TYPE_ANY fields get a full boxed AerVal (16 bytes), since they can
+       hold a reference type the GC must trace. See vm_struct_field_read/write. */
     {
         unsigned int offset = 0;
         for (unsigned int i = 0; i < shape->field_count; i++) {
             shape->field_offsets[i] = offset;
-            offset += (shape->field_types[i] == TYPE_ANY) ? sizeof(AerVal) : 8;
+            offset += (shape->field_types[i] == TYPE_ANY) ? sizeof(AerVal) : (shape->field_narrow[i] ? 4 : 8);
         }
         shape->instance_bytes = offset;
     }
@@ -2469,6 +2495,7 @@ lbl_struct_new: {
                   name, aer_as_string(c->pool[shape->field_names[i]])->data);
             DISPATCH();
         }
+        if (!vm_check_narrow_field_write(declared, shape->field_narrow[i], vm->registers[arg_reg_base + i])) DISPATCH();
     }
     AerStruct* s = heap_alloc(&vm->heap, &vm->heap.struct_pool);
     s->shape  = shape;
@@ -2488,9 +2515,9 @@ lbl_field_get: {
     int dest_reg   = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
     int field_idx  = (int)READ();
-    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype)) DISPATCH();
-    vm->registers[dest_reg] = vm_struct_field_read_at(oa, foffset, ftype);
+    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype; bool narrow;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype, &narrow)) DISPATCH();
+    vm->registers[dest_reg] = vm_struct_field_read_at(oa, foffset, ftype, narrow);
     DISPATCH();
 }
 
@@ -2505,9 +2532,9 @@ lbl_binary_field: {
     uint32_t field_rk_word = READ();
     int field_idx  = (int)UNPACK_2X16_HI(field_rk_word);
     AerVal* lhs = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype)) DISPATCH();
-    AerVal rhs = vm_struct_field_read_at(oa, foffset, ftype);
+    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype; bool narrow;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype, &narrow)) DISPATCH();
+    AerVal rhs = vm_struct_field_read_at(oa, foffset, ftype, narrow);
     ValueType ta = aer_type(*lhs), tb = aer_type(rhs);
     bool handled;
     vm->registers[dest_reg] = vm_binary_fast(*lhs, rhs, bin_op, ta, tb, &handled);
@@ -2528,9 +2555,9 @@ lbl_field_binary: {
     uint32_t field_rk_word = READ();
     int field_idx  = (int)UNPACK_2X16_HI(field_rk_word);
     AerVal* rhs = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype)) DISPATCH();
-    AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype);
+    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype; bool narrow;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype, &narrow)) DISPATCH();
+    AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype, narrow);
     ValueType ta = aer_type(lhs), tb = aer_type(*rhs);
     bool handled;
     vm->registers[dest_reg] = vm_binary_fast(lhs, *rhs, bin_op, ta, tb, &handled);
@@ -2551,9 +2578,9 @@ lbl_field_compound: {
     uint32_t field_rk_word = READ();
     int field_idx  = (int)UNPACK_2X16_HI(field_rk_word);
     AerVal* rhs = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype)) DISPATCH();
-    AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype);
+    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype; bool narrow;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype, &narrow)) DISPATCH();
+    AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype, narrow);
     ValueType ta = aer_type(lhs), tb = aer_type(*rhs);
     bool handled;
     AerVal result = vm_binary_fast(lhs, *rhs, bin_op, ta, tb, &handled);
@@ -2567,8 +2594,9 @@ lbl_field_compound: {
               aer_as_string(c->pool[field_idx])->data);
         DISPATCH();
     }
+    if (!vm_check_narrow_field_write(ftype, narrow, result)) DISPATCH();
     gc_barrier_struct(vm, oa, result);
-    vm_struct_field_write_at(oa, foffset, ftype, result);
+    vm_struct_field_write_at(oa, foffset, ftype, narrow, result);
     DISPATCH();
 }
 
@@ -2589,8 +2617,8 @@ lbl_field_set: {
     int struct_reg = (int)UNPACK_A(op_word);
     AerVal* val = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
     int field_idx  = (int)READ();
-    AerStruct* oa; int slot; unsigned int foffset; ValueType declared;
-    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &declared)) DISPATCH();
+    AerStruct* oa; int slot; unsigned int foffset; ValueType declared; bool narrow;
+    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &declared, &narrow)) DISPATCH();
     /* Enforced once here (the only place a field's value changes), trusted everywhere else
        including the fused fast path. TYPE_ANY means untyped. */
     if (declared != TYPE_ANY && val->tag != declared) {
@@ -2598,8 +2626,9 @@ lbl_field_set: {
               aer_as_string(c->pool[field_idx])->data);
         DISPATCH();
     }
+    if (!vm_check_narrow_field_write(declared, narrow, *val)) DISPATCH();
     gc_barrier_struct(vm, oa, *val);
-    vm_struct_field_write_at(oa, foffset, declared, *val);
+    vm_struct_field_write_at(oa, foffset, declared, narrow, *val);
     DISPATCH();
 }
 
@@ -2913,6 +2942,19 @@ lbl_array_repeat: {
                       aer_as_string(c->pool[shape->field_names[i]])->data, got);
                 DISPATCH();
             }
+            /* Not yet supported: every packed-array element read/write (this handler and
+               OP_INDEX_FIELD_GET/SET/COMPOUND's packed branches) assumes a uniform 8-bytes-per-field
+               stride (field_count * 8) -- correct today because every packable field type above is
+               always exactly 8 bytes. A narrow field would silently break that invariant, so it's
+               rejected here rather than corrupting element layout; the fix (using shape->
+               instance_bytes as the real per-element stride everywhere) is deferred until narrow
+               fields need to compose with packed arrays. */
+            if (shape->field_narrow[i]) {
+                error("'%s' cannot be packed into an array: field '%s' is a narrow (int32/float32) field, not yet supported in a packed array",
+                      aer_as_string(c->pool[shape->name])->data,
+                      aer_as_string(c->pool[shape->field_names[i]])->data);
+                DISPATCH();
+            }
         }
         unsigned int element_size = shape->field_count * 8;
         AerPackedArray* pa = heap_alloc(&vm->heap, &vm->heap.packed_array_pool);
@@ -2974,8 +3016,8 @@ lbl_index_field_get: {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
             DISPATCH();
         }
-        int slot; unsigned int foffset; ValueType ftype;
-        if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &ftype)) DISPATCH();
+        int slot; unsigned int foffset; ValueType ftype; bool narrow;
+        if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &ftype, &narrow)) DISPATCH();
         unsigned int element_size = pa->shape->field_count * 8;
         unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
         vm->registers[dest_reg] = vm_packed_slot_read(elem, ftype);
@@ -2989,9 +3031,9 @@ lbl_index_field_get: {
         DISPATCH();
     }
     AerStruct* oa = aer_as_struct(tmp);
-    int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot, &foffset, &ftype)) DISPATCH();
-    vm->registers[dest_reg] = vm_struct_field_read_at(oa, foffset, ftype);
+    int slot; unsigned int foffset; ValueType ftype; bool narrow;
+    if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot, &foffset, &ftype, &narrow)) DISPATCH();
+    vm->registers[dest_reg] = vm_struct_field_read_at(oa, foffset, ftype, narrow);
     DISPATCH();
 }
 
@@ -3013,8 +3055,8 @@ lbl_index_field_set: {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
             DISPATCH();
         }
-        int slot; unsigned int foffset; ValueType declared;
-        if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &declared)) DISPATCH();
+        int slot; unsigned int foffset; ValueType declared; bool narrow;
+        if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &declared, &narrow)) DISPATCH();
         if (val->tag != declared) {
             error("Field '%s' is declared as a fixed type and cannot be assigned a different type",
                   aer_as_string(c->pool[field_idx])->data);
@@ -3033,15 +3075,16 @@ lbl_index_field_set: {
         DISPATCH();
     }
     AerStruct* oa = aer_as_struct(tmp);
-    int slot; unsigned int foffset; ValueType declared;
-    if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot, &foffset, &declared)) DISPATCH();
+    int slot; unsigned int foffset; ValueType declared; bool narrow;
+    if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot, &foffset, &declared, &narrow)) DISPATCH();
     if (declared != TYPE_ANY && val->tag != declared) {
         error("Field '%s' is declared as a fixed type and cannot be assigned a different type",
               aer_as_string(c->pool[field_idx])->data);
         DISPATCH();
     }
+    if (!vm_check_narrow_field_write(declared, narrow, *val)) DISPATCH();
     gc_barrier_struct(vm, oa, *val);
-    vm_struct_field_write_at(oa, foffset, declared, *val);
+    vm_struct_field_write_at(oa, foffset, declared, narrow, *val);
     DISPATCH();
 }
 
@@ -3070,8 +3113,8 @@ lbl_index_field_compound: {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
             DISPATCH();
         }
-        int slot; unsigned int foffset; ValueType ftype;
-        if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &ftype)) DISPATCH();
+        int slot; unsigned int foffset; ValueType ftype; bool narrow;
+        if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &ftype, &narrow)) DISPATCH();
         unsigned int element_size = pa->shape->field_count * 8;
         unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
         AerVal lhs = vm_packed_slot_read(elem, ftype);
@@ -3094,9 +3137,9 @@ lbl_index_field_compound: {
         DISPATCH();
     }
     AerStruct* oa = aer_as_struct(tmp);
-    int slot; unsigned int foffset; ValueType ftype;
-    if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot, &foffset, &ftype)) DISPATCH();
-    AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype);
+    int slot; unsigned int foffset; ValueType ftype; bool narrow;
+    if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot, &foffset, &ftype, &narrow)) DISPATCH();
+    AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype, narrow);
     ValueType ta = aer_type(lhs), tb = aer_type(*rhs);
     bool handled;
     AerVal result = vm_binary_fast(lhs, *rhs, bin_op, ta, tb, &handled);
@@ -3106,8 +3149,9 @@ lbl_index_field_compound: {
               aer_as_string(c->pool[field_idx])->data);
         DISPATCH();
     }
+    if (!vm_check_narrow_field_write(ftype, narrow, result)) DISPATCH();
     gc_barrier_struct(vm, oa, result);
-    vm_struct_field_write_at(oa, foffset, ftype, result);
+    vm_struct_field_write_at(oa, foffset, ftype, narrow, result);
     DISPATCH();
 }
 
