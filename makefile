@@ -46,6 +46,7 @@ TESTS := tests/test_core.aer \
          tests/test_primitive_pass.aer \
          tests/test_dict_pool_stress.aer \
          tests/test_packed_arrays.aer \
+         tests/test_shape_specialization.aer \
          tests/test_net.aer \
          tests/test_regex.aer \
          tests/test_actor.aer \
@@ -72,6 +73,14 @@ test-smoke: $(LIBOBJECT)
 	gcc $(FLAGS) -c tests/smoke_test.c -o object/smoke_test.o
 	gcc $(FLAGS) -o binary/smoke_test$(EXE) $(LIBOBJECT) object/smoke_test.o -lm $(WINLIBS)
 	./binary/smoke_test$(EXE)
+
+# Exhaustive per-opcode encoding round-trip check — see tests/opcode_roundtrip_test.c's own comment
+# for why this needs direct coverage the ordinary .aer suite doesn't provide.
+test-roundtrip: $(LIBOBJECT)
+	@mkdir -p binary object
+	gcc $(FLAGS) -c tests/opcode_roundtrip_test.c -o object/opcode_roundtrip_test.o
+	gcc $(FLAGS) -o binary/opcode_roundtrip_test$(EXE) $(LIBOBJECT) object/opcode_roundtrip_test.o -lm $(WINLIBS)
+	./binary/opcode_roundtrip_test$(EXE)
 
 # The short, readable embedding example (examples/embedding_example.c) -- see tests/embed_smoke_test.c
 # for the exhaustive version this project's own test suite actually relies on.

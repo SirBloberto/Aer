@@ -113,19 +113,19 @@ int main(void) {
         int rk_2 = (int)chunk_add_pool(&c, aer_int(2)) | RK_CONST_FLAG;
         int rk_3 = (int)chunk_add_pool(&c, aer_int(3)) | RK_CONST_FLAG;
         int reg_add_l = reg_alloc();
-        chunk_emit(&c, PACK_BINARY(OP_ADD, reg_add_l, rk_2, rk_3));
+        chunk_emit(&c, PACK3(OP_ADD, reg_add_l, pack_rk8(rk_2), pack_rk8(rk_3)));
 
         int rk_4 = (int)chunk_add_pool(&c, aer_int(4)) | RK_CONST_FLAG;
         int rk_5 = (int)chunk_add_pool(&c, aer_int(5)) | RK_CONST_FLAG;
         int reg_add_r = reg_alloc();
-        chunk_emit(&c, PACK_BINARY(OP_ADD, reg_add_r, rk_4, rk_5));
+        chunk_emit(&c, PACK3(OP_ADD, reg_add_r, pack_rk8(rk_4), pack_rk8(rk_5)));
 
         /* Free both temps before allocating the result's register, matching Lua's own
            free-then-allocate discipline (lcode.c) — this is what keeps register usage compact
            across a deep expression tree instead of growing linearly with tree size. */
         reg_free(2);
         int result_reg = reg_alloc();
-        chunk_emit(&c, PACK_BINARY(OP_MUL, result_reg, reg_add_l, reg_add_r));
+        chunk_emit(&c, PACK3(OP_MUL, result_reg, pack_rk8(reg_add_l), pack_rk8(reg_add_r)));
         chunk_emit(&c, OP_HALT);
 
         VM vm;
@@ -149,18 +149,18 @@ int main(void) {
 
         unsigned int pool_a = chunk_add_pool(&c, aer_int(3));
         unsigned int pool_b = chunk_add_pool(&c, aer_int(4));
-        chunk_emit(&c, PACK1(OP_LOADK, 0)); chunk_emit(&c, (int)pool_a);  /* reg 0 = 3 */
-        chunk_emit(&c, PACK1(OP_LOADK, 1)); chunk_emit(&c, (int)pool_b);  /* reg 1 = 4 */
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 0, pool_a));  /* reg 0 = 3 */
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 1, pool_b));  /* reg 1 = 4 */
         reg_reserve(2);   /* registers 0,1 are now "locals" — never freed/reallocated below */
 
         int reg_a_sq = reg_alloc();
-        chunk_emit(&c, PACK_BINARY(OP_MUL, reg_a_sq, 0, 0));   /* a*a — reg 0 is the reserved "local" a, never freed */
+        chunk_emit(&c, PACK3(OP_MUL, reg_a_sq, pack_rk8(0), pack_rk8(0)));   /* a*a — reg 0 is the reserved "local" a, never freed */
         int reg_b_sq = reg_alloc();
-        chunk_emit(&c, PACK_BINARY(OP_MUL, reg_b_sq, 1, 1));   /* b*b — reg 1 is the reserved "local" b */
+        chunk_emit(&c, PACK3(OP_MUL, reg_b_sq, pack_rk8(1), pack_rk8(1)));   /* b*b — reg 1 is the reserved "local" b */
 
         reg_free(2);   /* both squared results were temps — free before the final add's allocation */
         int result_reg = reg_alloc();
-        chunk_emit(&c, PACK_BINARY(OP_ADD, result_reg, reg_a_sq, reg_b_sq));
+        chunk_emit(&c, PACK3(OP_ADD, result_reg, pack_rk8(reg_a_sq), pack_rk8(reg_b_sq)));
         chunk_emit(&c, OP_HALT);
 
         VM vm;
@@ -184,7 +184,7 @@ int main(void) {
 
         int rk_1 = (int)chunk_add_pool(&c, aer_int(1)) | RK_CONST_FLAG;
         int rk_0 = (int)chunk_add_pool(&c, aer_int(0)) | RK_CONST_FLAG;
-        chunk_emit(&c, PACK_BINARY(OP_DIV, reg_alloc(), rk_1, rk_0));
+        chunk_emit(&c, PACK3(OP_DIV, reg_alloc(), pack_rk8(rk_1), pack_rk8(rk_0)));
         chunk_emit(&c, OP_HALT);
 
         VM vm;
@@ -208,19 +208,19 @@ int main(void) {
         unsigned int pool_one  = chunk_add_pool(&c, aer_int(1));
         unsigned int pool_five = chunk_add_pool(&c, aer_int(5));
 
-        chunk_emit(&c, PACK1(OP_LOADK, 0)); chunk_emit(&c, (int)pool_zero);  /* sum = 0 */
-        chunk_emit(&c, PACK1(OP_LOADK, 1)); chunk_emit(&c, (int)pool_zero);  /* i = 0 */
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 0, pool_zero));  /* sum = 0 */
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 1, pool_zero));  /* i = 0 */
         reg_reserve(2);   /* registers 0 (sum), 1 (i) are now "locals" */
 
         unsigned int loop_start = c.count;
-        chunk_emit(&c, PACK_BINARY(OP_LT, 2, 1, (int)pool_five | RK_CONST_FLAG));   /* r2 = i < 5 */
+        chunk_emit(&c, PACK3(OP_LT, 2, pack_rk8(1), pack_rk8((int)pool_five | RK_CONST_FLAG)));   /* r2 = i < 5 */
         unsigned int exit_patch = emit_jump_if_false_reg(&c, 2);
 
         /* sum = sum + i — writes directly into register 0, no new allocation. */
-        chunk_emit(&c, PACK_BINARY(OP_ADD, 0, 0, 1));
+        chunk_emit(&c, PACK3(OP_ADD, 0, pack_rk8(0), pack_rk8(1)));
 
         /* i = i + 1 — writes directly into register 1, no new allocation. */
-        chunk_emit(&c, PACK_BINARY(OP_ADD, 1, 1, (int)pool_one | RK_CONST_FLAG));
+        chunk_emit(&c, PACK3(OP_ADD, 1, pack_rk8(1), pack_rk8((int)pool_one | RK_CONST_FLAG)));
 
         chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
 
@@ -264,8 +264,17 @@ int main(void) {
 
         unsigned int callee_offset = c.count;
         int result_reg = reg_alloc();
-        chunk_emit(&c, PACK_BINARY(OP_MUL, result_reg, 0, 0));   /* x*x — reg 0 is the callee's own "x" argument */
+        chunk_emit(&c, PACK3(OP_MUL, result_reg, pack_rk8(0), pack_rk8(0)));   /* x*x — reg 0 is the callee's own "x" argument */
         emit_return(&c, result_reg);
+
+        /* Real code always goes through chunk_add_function (parse_function patches max_registers/
+           max_raw_ints/max_raw_reals in after the body compiles) -- lbl_call now indexes
+           c->functions[func_index] unconditionally to size the callee's frame, so a hand-built
+           chunk bypassing the parser must still register one. Registers 0 ("x") and 1 (result_reg)
+           are the callee's whole footprint -- max_registers=2, no raw locals here. */
+        char* square_name = xmalloc(7); memcpy(square_name, "square", 7);
+        chunk_add_function(&c, chunk_add_pool(&c, aer_make_string(square_name, 6)), callee_offset, 1, 1, NULL);
+        c.functions[0].max_registers = 2;
 
         patch_jump(&c, skip_callee_patch, c.count);   /* caller code starts right here */
 
@@ -274,8 +283,8 @@ int main(void) {
         reg_reserve(1);   /* register 0 holds the argument being passed */
 
         unsigned int pool_six = chunk_add_pool(&c, aer_int(6));
-        chunk_emit(&c, PACK1(OP_LOADK, 0)); chunk_emit(&c, (int)pool_six);
-        emit_call(&c, /*dest_reg=*/1, callee_offset, /*arg_reg_base=*/0, /*arg_count=*/1);
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 0, pool_six));
+        emit_call(&c, /*dest_reg=*/1, callee_offset, /*arg_reg_base=*/0, /*arg_count=*/1, /*func_index=*/0);
         chunk_emit(&c, OP_HALT);
 
         VM vm;
@@ -308,23 +317,33 @@ int main(void) {
 
         unsigned int callee_offset = c.count;
 
+        /* Registered before the body compiles, same ordering as the real parse_function/
+           func_register, so the recursive call inside factorial's own body below can resolve
+           func_index=0 immediately. max_registers is patched in below once the real peak (5:
+           registers 0-4) is known -- same two-step "placeholder then patch" shape as the real
+           compiler's own max_registers handling. */
+        char* factorial_name = xmalloc(10); memcpy(factorial_name, "factorial", 10);
+        chunk_add_function(&c, chunk_add_pool(&c, aer_make_string(factorial_name, 9)), callee_offset, 1, 1, NULL);
+
         /* if !(n > 1) goto base_case: return 1 */
-        chunk_emit(&c, PACK_BINARY(OP_GT, 1, 0, (int)pool_1 | RK_CONST_FLAG));   /* r1 = n > 1 */
+        chunk_emit(&c, PACK3(OP_GT, 1, pack_rk8(0), pack_rk8((int)pool_1 | RK_CONST_FLAG)));   /* r1 = n > 1 */
         unsigned int base_case_patch = emit_jump_if_false_reg(&c, 1);
 
         /* Recursive case (n > 1): reg1 = n - 1; reg2 = factorial(reg1); reg3 = n * reg2; return reg3 */
-        chunk_emit(&c, PACK_BINARY(OP_SUB, 1, 0, (int)pool_1 | RK_CONST_FLAG));
+        chunk_emit(&c, PACK3(OP_SUB, 1, pack_rk8(0), pack_rk8((int)pool_1 | RK_CONST_FLAG)));
 
-        emit_call(&c, /*dest_reg=*/2, callee_offset, /*arg_reg_base=*/1, /*arg_count=*/1);
+        emit_call(&c, /*dest_reg=*/2, callee_offset, /*arg_reg_base=*/1, /*arg_count=*/1, /*func_index=*/0);
 
-        chunk_emit(&c, PACK_BINARY(OP_MUL, 3, 0, 2));
+        chunk_emit(&c, PACK3(OP_MUL, 3, pack_rk8(0), pack_rk8(2)));
         emit_return(&c, 3);
 
         /* Base case (n <= 1): return 1. OP_RETURN above jumps away, so this is only ever
            reached via the patched branch, never by fall-through. */
         patch_jump(&c, base_case_patch, c.count);
-        chunk_emit(&c, PACK1(OP_LOADK, 4)); chunk_emit(&c, (int)pool_1);
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 4, pool_1));
         emit_return(&c, 4);
+
+        c.functions[0].max_registers = 5;   /* registers 0-4, the callee's whole footprint -- no raw locals here */
 
         patch_jump(&c, skip_callee_patch, c.count);   /* caller code starts right here */
 
@@ -333,8 +352,8 @@ int main(void) {
         reg_reserve(1);
 
         unsigned int pool_5 = chunk_add_pool(&c, aer_int(5));
-        chunk_emit(&c, PACK1(OP_LOADK, 0)); chunk_emit(&c, (int)pool_5);
-        emit_call(&c, /*dest_reg=*/1, callee_offset, /*arg_reg_base=*/0, /*arg_count=*/1);
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 0, pool_5));
+        emit_call(&c, /*dest_reg=*/1, callee_offset, /*arg_reg_base=*/0, /*arg_count=*/1, /*func_index=*/0);
         chunk_emit(&c, OP_HALT);
 
         VM vm;
@@ -360,7 +379,11 @@ int main(void) {
         reg_reserve(1);
 
         unsigned int callee_offset = c.count;
-        emit_call(&c, /*dest_reg=*/1, callee_offset, /*arg_reg_base=*/0, /*arg_count=*/1);
+        /* Registered before the body (self-recursive), same as Test 9's factorial above. */
+        char* infinite_name = xmalloc(9); memcpy(infinite_name, "infinite", 9);
+        chunk_add_function(&c, chunk_add_pool(&c, aer_make_string(infinite_name, 8)), callee_offset, 1, 1, NULL);
+        c.functions[0].max_registers = 2;   /* register 0 (arg) + register 1 (recursive call's dest) */
+        emit_call(&c, /*dest_reg=*/1, callee_offset, /*arg_reg_base=*/0, /*arg_count=*/1, /*func_index=*/0);
         emit_return(&c, 1);   /* never reached — the call above never returns before overflowing */
 
         patch_jump(&c, skip_callee_patch, c.count);
@@ -368,8 +391,8 @@ int main(void) {
         reg_reset();
         reg_reserve(1);
         unsigned int pool_zero = chunk_add_pool(&c, aer_int(0));
-        chunk_emit(&c, PACK1(OP_LOADK, 0)); chunk_emit(&c, (int)pool_zero);
-        emit_call(&c, /*dest_reg=*/1, callee_offset, /*arg_reg_base=*/0, /*arg_count=*/1);
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 0, pool_zero));
+        emit_call(&c, /*dest_reg=*/1, callee_offset, /*arg_reg_base=*/0, /*arg_count=*/1, /*func_index=*/0);
         chunk_emit(&c, OP_HALT);
 
         VM vm;
@@ -401,19 +424,19 @@ int main(void) {
         unsigned int pool_200  = chunk_add_pool(&c, aer_int(200));
         unsigned int pool_99   = chunk_add_pool(&c, aer_int(99));
 
-        chunk_emit(&c, PACK1(OP_LOADK, 0)); chunk_emit(&c, (int)pool_10);
-        chunk_emit(&c, PACK1(OP_LOADK, 1)); chunk_emit(&c, (int)pool_20);
-        chunk_emit(&c, PACK1(OP_LOADK, 2)); chunk_emit(&c, (int)pool_30);
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 0, pool_10));
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 1, pool_20));
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 2, pool_30));
         reg_reserve(3);   /* regs 0-2: source items, read by both arrays below */
 
         emit_array_new(&c, /*dest=*/3, /*item_reg_base=*/0, /*item_count=*/3);
         reg_reserve(1);   /* reg 3: the array whose survival across GC pressure this test proves */
 
-        chunk_emit(&c, PACK1(OP_LOADK, 4)); chunk_emit(&c, (int)pool_zero);  /* i = 0 */
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 4, pool_zero));  /* i = 0 */
         reg_reserve(1);   /* reg 4: loop counter */
 
         unsigned int loop_start = c.count;
-        chunk_emit(&c, PACK_BINARY(OP_LT, 6, 4, (int)pool_200 | RK_CONST_FLAG));   /* r6 = i < 200 */
+        chunk_emit(&c, PACK3(OP_LT, 6, pack_rk8(4), pack_rk8((int)pool_200 | RK_CONST_FLAG)));   /* r6 = i < 200 */
         unsigned int exit_patch = emit_jump_if_false_reg(&c, 6);
 
         /* Throwaway array, rebuilt fresh into reg 5 every iteration — each pass's array_pool cell +
@@ -423,7 +446,7 @@ int main(void) {
         emit_array_new(&c, /*dest=*/5, /*item_reg_base=*/0, /*item_count=*/3);
 
         /* i = i + 1 */
-        chunk_emit(&c, PACK_BINARY(OP_ADD, 4, 4, (int)pool_one | RK_CONST_FLAG));
+        chunk_emit(&c, PACK3(OP_ADD, 4, pack_rk8(4), pack_rk8((int)pool_one | RK_CONST_FLAG)));
 
         chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
         patch_jump(&c, exit_patch, c.count);
@@ -485,10 +508,10 @@ int main(void) {
         unsigned int pool_99    = chunk_add_pool(&c, aer_int(99));
 
         /* reg0/reg1 = key "a", val 10; reg2/reg3 = key "b", val 20 */
-        chunk_emit(&c, PACK1(OP_LOADK, 0)); chunk_emit(&c, (int)pool_key_a);
-        chunk_emit(&c, PACK1(OP_LOADK, 1)); chunk_emit(&c, (int)pool_10);
-        chunk_emit(&c, PACK1(OP_LOADK, 2)); chunk_emit(&c, (int)pool_key_b);
-        chunk_emit(&c, PACK1(OP_LOADK, 3)); chunk_emit(&c, (int)pool_20);
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 0, pool_key_a));
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 1, pool_10));
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 2, pool_key_b));
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 3, pool_20));
         reg_reserve(4);
 
         emit_dict_new(&c, /*dest=*/4, /*pair_reg_base=*/0, /*pair_count=*/2);
@@ -526,16 +549,16 @@ int main(void) {
         unsigned int pool_30   = chunk_add_pool(&c, aer_int(30));
         unsigned int pool_zero = chunk_add_pool(&c, aer_int(0));
 
-        chunk_emit(&c, PACK1(OP_LOADK, 0)); chunk_emit(&c, (int)pool_10);
-        chunk_emit(&c, PACK1(OP_LOADK, 1)); chunk_emit(&c, (int)pool_20);
-        chunk_emit(&c, PACK1(OP_LOADK, 2)); chunk_emit(&c, (int)pool_30);
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 0, pool_10));
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 1, pool_20));
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 2, pool_30));
         reg_reserve(3);   /* regs 0-2: the array's source items */
 
         emit_array_new(&c, /*dest=*/3, /*item_reg_base=*/0, /*item_count=*/3);
         reg_reserve(1);   /* reg 3: the collection being iterated */
 
-        chunk_emit(&c, PACK1(OP_LOADK, 4)); chunk_emit(&c, (int)pool_zero);  /* idx = 0 */
-        chunk_emit(&c, PACK1(OP_LOADK, 5)); chunk_emit(&c, (int)pool_zero);  /* sum = 0 */
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 4, pool_zero));  /* idx = 0 */
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 5, pool_zero));  /* sum = 0 */
         reg_reserve(2);   /* regs 4-5: iterator index, running sum */
 
         unsigned int loop_start = c.count;   /* the iterate opcode is its own back-edge target */
@@ -543,7 +566,7 @@ int main(void) {
                                                             /*item_dest_reg=*/6);
 
         /* sum = sum + item */
-        chunk_emit(&c, PACK_BINARY(OP_ADD, 5, 5, 6));
+        chunk_emit(&c, PACK3(OP_ADD, 5, pack_rk8(5), pack_rk8(6)));
 
         chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
         patch_jump(&c, exit_patch, c.count);
@@ -1812,6 +1835,63 @@ int main(void) {
         check(nul_out_len == 2 && memcmp(nul_k, "ab", 2) == 0 && nul_k[2] == '\0',
               "hashtable_key_dup truncates at the first embedded NUL byte, matching hash_match's own strlen-based comparison");
         hashtable_key_free(&test_pools, nul_k, nul_out_len);
+    }
+
+    /* Test 75 (shape-specializing compilation, groundwork) — shape_sensitive_mask/source_span are
+       still write-only (nothing consumes them yet, see OP_CALL_SPEC's own comment in vm.h), but
+       this is the riskiest new mechanism to get subtly wrong (an off-by-one on the span boundary
+       is silent corruption, not a compile error, once the recompile step is built on top of it) —
+       worth verifying directly, in isolation, before anything else depends on it. */
+    {
+        Chunk c;
+        chunk_init(&c);
+        VM vm;
+        /* run_source() parses BEFORE calling vm_init() (matching every other test in this file),
+           which means parsing relies on current_heap already being valid -- ordinarily left behind
+           by whichever earlier test's own vm_init() ran last. Test 74 immediately above uses its own
+           HashPools, not a VM at all, so nothing left current_heap pointing at anything still-good
+           by the time this test runs (a real, pre-existing fragility in this test file's harness,
+           not something specific to this test -- found the hard way via a real segfault in
+           pool_alloc when this test happened to land right after 74). Seeding a real heap here
+           first, independent of what any other test left behind, makes this test self-sufficient. */
+        vm_init(&vm, &c);
+        bool ok = run_source(&c, &vm,
+            "struct Vec:\n"
+            "    x = 0.0\n"
+            "function get_x(p):\n"
+            "    return p.x\n"
+            "function not_sensitive(n):\n"
+            "    return n + 1\n"
+            "v = Vec(5.0)\n"
+            "r = get_x(v)\n"
+            "s = not_sensitive(3)\n");
+        check(ok, "a struct-field-accessing function and a plain one both compile and run without error");
+
+        ChunkFunction* get_x = chunk_find_function(&c, "get_x");
+        check(get_x != NULL, "get_x is registered in the function table");
+        if (get_x) {
+            check((get_x->shape_sensitive_mask & 1u) != 0,
+                  "get_x's parameter 0 ('p') is correctly marked shape-sensitive -- it's used as the base of a '.field' access");
+            check(get_x->source_span != NULL && get_x->source_span_len > 0,
+                  "a shape-sensitive function retains an owned source span");
+            check(get_x->source_span != NULL && get_x->source_span[0] == '(',
+                  "the retained span starts exactly at '(' -- not at the function name, and not mid-parameter-list");
+            check(get_x->source_span != NULL && strstr(get_x->source_span, "get_x") == NULL,
+                  "the retained span does not include the function's own name (confirms the start boundary, since 'get_x' appears nowhere else in this source)");
+            check(get_x->source_span != NULL && strstr(get_x->source_span, "return p.x") != NULL,
+                  "the retained span fully includes the function body, not truncated before it");
+        }
+
+        ChunkFunction* not_sensitive = chunk_find_function(&c, "not_sensitive");
+        check(not_sensitive != NULL, "not_sensitive is registered in the function table");
+        if (not_sensitive) {
+            check(not_sensitive->shape_sensitive_mask == 0,
+                  "not_sensitive's parameter is never used for field access, so its mask stays 0");
+            check(not_sensitive->source_span == NULL && not_sensitive->source_span_len == 0,
+                  "a non-shape-sensitive function retains no source span at all -- no cost paid for the common case");
+        }
+
+        chunk_free(&c);
     }
 
     if (failures == 0) printf("\nAll v3 smoke tests passed.\n");

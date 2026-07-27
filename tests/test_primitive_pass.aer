@@ -235,4 +235,109 @@ function many_raw_locals():
 
 assert(many_raw_locals() == 630, "a function with 36 int locals (over the 32 raw-int-slot budget) still computes correctly via graceful fallback to boxed for the overflow")
 
+# ------------------------------------------------------------------ #
+# Deep recursion with raw int/real locals live in every stacked frame  #
+# -- raw_ints[]/raw_reals[] moved from a fixed per-frame array to a    #
+# shared bump-pointer bank (mirroring registers[]/register_stack).     #
+# Each recursive activation's own raw slots must stay isolated from    #
+# every other still-live activation's, or this would silently corrupt  #
+# a sibling frame's accumulator instead of crashing outright.          #
+# ------------------------------------------------------------------ #
+
+function recursive_raw_sum(n):
+    total = 0        # raw int, live across the whole recursive descent
+    scale = 1.5       # raw real, live across the whole recursive descent
+    i = 0
+    for i < n:
+        total += i
+        i += 1
+    if n <= 1:
+        return (total as float) * scale
+    return (total as float) * scale + recursive_raw_sum(n - 1)
+
+# 50 levels deep (VM_CALL_MAX is 64) -- deep enough to stress many simultaneously-live raw
+# frames sharing one backing array, shallow enough to stay well clear of a real stack overflow.
+expected = 0.0
+tlx_k = 1
+for tlx_k <= 50:
+    tlx_partial = 0
+    tlx_j = 0
+    for tlx_j < tlx_k:
+        tlx_partial += tlx_j
+        tlx_j += 1
+    expected += (tlx_partial as float) * 1.5
+    tlx_k += 1
+assert(recursive_raw_sum(50) == expected, "50 levels of recursion, each with its own live raw int + raw real local, all isolated correctly via the shared bump-pointer raw stack")
+
+# ------------------------------------------------------------------ #
+# Raw locals live across an OP_CALL_VALUE boundary (call through a     #
+# variable, not a direct named call like recursive_raw_sum above) --   #
+# a third frame-push path (alongside OP_CALL and setup_call above)     #
+# that must agree on the same raw_ints/raw_reals bump-pointer sizing.  #
+# ------------------------------------------------------------------ #
+
+function raw_callee(m):
+    inner_total = 0
+    j = 0
+    for j < m:
+        inner_total += j
+        j += 1
+    return inner_total
+
+function raw_caller_via_value(fn, n):
+    outer_total = 0        # raw int, live in THIS frame across the call-through-value below
+    outer_scale = 2.0        # raw real, same
+    i = 0
+    for i < n:
+        outer_total += fn(i)          # fn is a parameter (boxed) holding a function value -> OP_CALL_VALUE
+        i += 1
+    return (outer_total as float) * outer_scale
+
+expected_via_value = 0.0
+tlx_n2 = 0
+for tlx_n2 < 6:
+    tlx_inner = 0
+    tlx_j2 = 0
+    for tlx_j2 < tlx_n2:
+        tlx_inner += tlx_j2
+        tlx_j2 += 1
+    expected_via_value += (tlx_inner as float)
+    tlx_n2 += 1
+expected_via_value = expected_via_value * 2.0
+assert(raw_caller_via_value(raw_callee, 6) == expected_via_value, "the caller's own raw locals survive an OP_CALL_VALUE call (function-through-a-variable) to another function with its own independent raw locals")
+
+# ------------------------------------------------------------------ #
+# A raw real value composed with a BOXED value whose runtime type is  #
+# integer, not real -- must promote (matching the fully-boxed path's  #
+# own int/real mixing rule), not reject as a type error. Found via a  #
+# real bug: `i * 0.10` inside a range-for loop (`i` an ordinary boxed  #
+# ORiter value at the point it composes here, 0.10 a raw real literal) #
+# raised "Cannot apply '*=' to float and integer" before this fix --   #
+# the OP_RAW_*_REAL_BOXED opcodes required an exact TYPE_REAL match    #
+# with no promotion, unlike every other numeric path in the language.  #
+# ------------------------------------------------------------------ #
+
+function scale_by_index(n):
+    total = 0.0
+    for i in 0..n:
+        total += i * 0.10          # raw-real-literal * boxed-int(i), general expression, not compound-assign
+    return total
+
+st = scale_by_index(5)
+assert(st == 0.0 + 0.10 + 0.20 + 0.30 + 0.40, "i * 0.10 (boxed int times a raw real literal) promotes correctly inside a general expression")
+
+function accumulate_int_into_real(n):
+    total = 0.0
+    i = 0
+    for i < n:
+        total += get_int(i)        # a genuinely boxed int (function return, never raw) accumulated into a raw real local
+        i += 1
+    return total
+
+function get_int(x):
+    return x
+
+ai = accumulate_int_into_real(4)
+assert(ai == 0.0 + 1.0 + 2.0 + 3.0, "a raw real local's own compound assignment ('+=') also promotes a boxed integer rhs correctly")
+
 print("test_primitive_pass.aer: all assertions passed.")

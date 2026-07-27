@@ -1,0 +1,102 @@
+#!/usr/bin/env aer
+# AER test suite — shape-specializing compilation (ChunkFunction.shape_sensitive_mask/
+# specializations, source/core/vm.c's lbl_call dispatch, parser.c's parser_specialize_function).
+# A packed-array parameter's '.field' accesses inside a function get lazily recompiled into a
+# specialized body using raw (unboxed) field opcodes once the actual runtime shape is observed at
+# a real call site — this is a pure internal optimization: every result here must match exactly
+# what the always-generic (boxed) path would have produced.
+# Machine-checked via assert(): a clean run exits 0; any failure prints "ASSERT FAILED: ..." and
+# the process exits nonzero (see main.c/error.c).
+
+struct Body:
+    x = 0.0
+    y = 0.0
+    mass = 0.0
+
+# Reads two raw-real fields and accumulates -- exercises OP_INDEX_FIELD_GET_RAW_REAL + OP_RAW_ADD_REAL.
+function sum_fields(bodies, n):
+    total = 0.0
+    for i in 0..n:
+        total += bodies[i].x + bodies[i].y
+    return total
+
+# Writes a field from a value that depends on a BOXED parameter (factor) -- the raw field read must
+# still work, composing with the boxed value via the ordinary (box-first) path, then writing back
+# through the generic (non-raw) SET since the computed value isn't raw.
+function scale_masses(bodies, n, factor):
+    for i in 0..n:
+        bodies[i].mass = bodies[i].mass * factor
+
+# A pure raw compound assignment on a field -- exercises the GET+raw-arithmetic+SET decomposition
+# for '+=' (OP_INDEX_FIELD_GET_RAW_REAL, OP_RAW_ADD_REAL, OP_INDEX_FIELD_SET_RAW_REAL).
+function nudge_x(bodies, n, dx):
+    for i in 0..n:
+        bodies[i].x += dx
+
+bodies = Body[5]
+bodies[0].x = 1.0
+bodies[0].y = 2.0
+bodies[0].mass = 10.0
+bodies[1].x = 3.0
+bodies[1].y = 4.0
+bodies[1].mass = 20.0
+bodies[2].x = 5.0
+bodies[2].y = 6.0
+bodies[2].mass = 30.0
+bodies[3].x = 7.0
+bodies[3].y = 8.0
+bodies[3].mass = 40.0
+bodies[4].x = 9.0
+bodies[4].y = 10.0
+bodies[4].mass = 50.0
+
+result = sum_fields(bodies, 5)
+assert(result == 1.0+2.0+3.0+4.0+5.0+6.0+7.0+8.0+9.0+10.0, "sum_fields via specialized packed-array raw field reads")
+
+scale_masses(bodies, 5, 2.0)
+assert(bodies[0].mass == 20.0, "bodies[0].mass scaled correctly via a raw field read composed with a boxed value")
+assert(bodies[1].mass == 40.0, "bodies[1].mass scaled correctly")
+assert(bodies[4].mass == 100.0, "bodies[4].mass scaled correctly")
+
+nudge_x(bodies, 5, 100.0)
+assert(bodies[0].x == 101.0, "bodies[0].x nudged via the raw GET+arithmetic+SET compound-assignment decomposition")
+assert(bodies[4].x == 109.0, "bodies[4].x nudged correctly")
+
+# Same shape, called again after other specializations already exist for OTHER functions -- proves
+# the per-function specialization table and per-call-site cache don't cross-contaminate. x changed
+# by +100 per body (nudge_x above), so the sum increases by exactly 100*5 -- y and the rest of the
+# computation are unaffected.
+result2 = sum_fields(bodies, 5)
+assert(result2 == result + 500.0, "sum_fields still correct on a second call after other functions specialized in between")
+
+# A struct passed as a bare (non-packed-array) argument -- exercises OP_FIELD_GET_RAW_REAL/
+# OP_FIELD_SET_RAW_REAL (the bare-struct opcode family, not the packed-array index-fused one).
+function double_mass(b):
+    b.mass = b.mass + b.mass
+
+lone = Body(0.0, 0.0, 7.0)
+double_mass(lone)
+assert(lone.mass == 14.0, "a bare struct parameter's field access specializes through OP_FIELD_GET_RAW_REAL/OP_FIELD_SET_RAW_REAL, not the packed-array family")
+
+# A parameter that's shape-sensitive but ALSO reassigned mid-body to a DIFFERENT struct type --
+# the reassignment must invalidate the specialization hint (reg_known_shape[reg] = NULL, parser.c),
+# so the second access re-resolves the field against the NEW value's own real shape instead of
+# trusting a stale byte offset. `mass` deliberately sits at a DIFFERENT offset in Wrong than in
+# Body (offset 8 vs 16) specifically so a stale hint would read the wrong bytes entirely, not just
+# happen to still work -- this is the exact scenario a real (Windows heap-corruption) crash was
+# found and fixed through during this feature's own development.
+struct Wrong:
+    pad = 999.0
+    mass = 42.0
+
+function reassign_then_read(b, other):
+    first = b.mass
+    b = other
+    second = b.mass
+    return [first, second]
+
+reassigned = reassign_then_read(Body(0.0, 0.0, 3.0), Wrong(0.0, 42.0))
+assert(reassigned[0] == 3.0, "the field read BEFORE reassignment used the original parameter's shape correctly")
+assert(reassigned[1] == 42.0, "the field read AFTER reassignment correctly re-resolved against Wrong's own shape (42.0 at offset 8) -- a stale Body-shape hint would have read offset 16 instead, wrong entirely")
+
+print("test_shape_specialization.aer: all assertions passed.")

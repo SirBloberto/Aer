@@ -3,3 +3,14 @@ function boom():
 
 function good(n):
     return n * 10
+
+# Reached through setup_call (aer_module_call's own frame-push path, distinct from lbl_call's),
+# with real raw int locals live inside -- exercises setup_call's raw_ints/raw_reals bump-pointer
+# sizing (fn->max_raw_ints/max_raw_reals), not just its registers/frame_size sizing.
+function raw_calc(n):
+    total = 0
+    i = 0
+    for i < n:
+        total += i
+        i += 1
+    return total
