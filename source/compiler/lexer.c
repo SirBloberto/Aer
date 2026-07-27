@@ -10,6 +10,11 @@ typedef struct File {
     char* name;
     char* start;   /* immutable pointer to beginning of buffer */
     char* buffer;  /* advances as we lex */
+    /* Absolute source line where this File's buffer begins -- 0 for a real file or REPL line
+       (current_source_line's own newline-count already gives the right absolute number there). A
+       span (lexer_begin_span) starts its OWN buffer at line 1 relative to itself, so this is the
+       offset needed to recover the TRUE absolute line in the original file the span was cut from. */
+    unsigned int line_base;
 } File;
 
 /* Array of File* (not File values) — nested imports save a raw File* across their own lex/parse/run cycle via lexer_save_state, so growing this array must never move an already-issued File's address. */
@@ -48,7 +53,7 @@ unsigned int current_source_line() {
     unsigned int line = 1;
     for (const char* p = current->start; p < current->buffer; p++)
         if (*p == '\n') line++;
-    return line;
+    return current->line_base + line;
 }
 
 struct LexerState {
@@ -125,6 +130,7 @@ void read_file(char* filename) {
     file->name    = filename;
     file->start   = buf;
     file->buffer  = buf;
+    file->line_base = 0;
     files_storage[file_index++] = file;
     current = file;
     indent_reset();
@@ -149,9 +155,17 @@ void shell(char* line) {
     indent_reset();
 }
 
-/* Fresh, independent text span (string interpolation's `{expr}` body). Caller must bracket
-   with lexer_save_state()/lexer_restore_state(). Uses its own heap File, freed on restore. */
-void lexer_begin_span(const char* text, unsigned int len) {
+/* Fresh, independent text span (string interpolation's `{expr}` body, or a shape-specialization
+   recompile's retained function source). Caller must bracket with lexer_save_state()/
+   lexer_restore_state(). Uses its own heap File, freed on restore.
+
+   start_line is the ABSOLUTE line (in whatever file the span was cut from) that the span's own
+   first character sits on -- stored as line_base = start_line - 1 so current_source_line()'s
+   existing "starts counting at 1" formula lands on start_line at span position 0, instead of
+   reporting 1 (relative to the span's own start) the way it did before this parameter existed.
+   That was a real bug: a specialization recompile's error/debug line numbers were off by however
+   many lines precede the function in its source file. */
+void lexer_begin_span(const char* text, unsigned int len, unsigned int start_line) {
     char* buf = xmalloc((size_t)len + 1);
     memcpy(buf, text, len);
     buf[len] = '\0';
@@ -164,6 +178,7 @@ void lexer_begin_span(const char* text, unsigned int len) {
     file->name    = "<interpolation>";
     file->start   = buf;
     file->buffer  = buf;
+    file->line_base = start_line - 1;
     files_storage[file_index++] = file;
     current = file;
     indent_reset();

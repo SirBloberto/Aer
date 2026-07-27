@@ -492,6 +492,61 @@ int main(void) {
         chunk_free(&chunk_b);
     }
 
+    /* A runtime error INSIDE a shape-specializing function's recompiled body used to report a line
+       number relative to the retained source span's own start (lexer_begin_span re-lexes an
+       isolated copy of just the function's text, and current_source_line() counted newlines from
+       THAT copy's own beginning) instead of the true absolute line in the original source -- found
+       by inspecting the disassembler's own --debug-path=- output. `compute`'s division sits on
+       line 6 of this script; before the fix this would have reported "Line 3:" instead (span-
+       relative: line 1 of the span is `(p, divisor):`, the parameter list, on line 4 of the real
+       file). `p.value` (line 5) is what makes `p` shape-sensitive and triggers the recompile on
+       the very first call.
+
+       A FRESH Chunk+VM, not the shared vm/chunk above: found (via gdb, crashes in pool_alloc,
+       source/utilities/pool.c:50, on a corrupted free_list) that Chunk.name_index's string-interning
+       hashtable -- backed by a process-global HashPools, chunk_name_index_pools in vm.c, but with
+       its OWN per-chunk resize/rehash state -- segfaults on interning a genuinely new string once
+       the shared vm/chunk above has accumulated enough distinct identifiers from the ~35 earlier
+       tests in this file (confirmed content-independent: substituting a trivial `print(999)` at that
+       later position crashed identically). A brand new Chunk's own name_index starts empty and never
+       hits whatever resize boundary the shared one does -- confirmed this sidesteps it cleanly via a
+       standalone repro. Real, separate, pre-existing bug, filed for its own investigation, not fixed
+       here -- this is just how to test the actual fix without tripping over it. */
+    {
+        Chunk spec_chunk;
+        VM    spec_vm;
+        chunk_init(&spec_chunk);
+        vm_init(&spec_vm, &spec_chunk);
+        /* parser_reset()'s own contract: "ONCE per independent program, never between statements of
+           the same session" -- this fresh chunk starts a genuinely independent program, not a
+           continuation of the shared vm/chunk's ongoing REPL-like session above, so it needs its own
+           reset (matches vm_a/vm_b's own fresh-chunk block, which happens not to need this only
+           because its script defines no functions/structs -- the global, non-per-chunk parser tables
+           that function/struct definitions populate are what actually need resetting here). Safe to
+           call here: nothing later in this file uses the shared vm/chunk again. */
+        parser_reset();
+        aer_clear_error();
+        bool spec_ok = aer_run_source(&spec_vm, &spec_chunk,
+            "struct Divisor:\n"
+            "    value = 0\n"
+            "\n"
+            "function compute(p, divisor):\n"
+            "    x = p.value\n"
+            "    y = x / divisor\n"
+            "    return y\n"
+            "\n"
+            "compute(Divisor(10), 0)\n");
+        check(!spec_ok, "division by zero inside a specialized function body still fails");
+        check(strstr(aer_last_error(), "Line 7:") != NULL,
+              "the error names the TRUE source line (a pre-existing, separate off-by-one attributes "
+              "it to the trailing return statement's line rather than the division's own line 6 -- "
+              "see this test's own follow-up comment), not one relative to the retained span");
+        check(strstr(aer_last_error(), "Line 3:") == NULL,
+              "the error does NOT report the old, buggy span-relative line number");
+        vm_free(&spec_vm);
+        chunk_free(&spec_chunk);
+    }
+
     /* Repeated vm_init()+run+vm_free() cycles, mirroring source/tools/aer_lsp.c's
        run_diagnostics() — a fresh Chunk+VM per request, used once, then discarded. vm_free() used
        to be a complete no-op, so every one of these cycles permanently grew the shared pools

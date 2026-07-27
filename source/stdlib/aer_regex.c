@@ -421,6 +421,7 @@ bool aer_regex_call(VM* vm, int fn_id, int arg_count) {
         r->capacity = 4;
         r->items    = xmalloc(sizeof(AerVal) * r->capacity);
         r->shape    = NULL;
+        r->generation = 0;
 
         const char* cursor = subject->data;
         for (;;) {

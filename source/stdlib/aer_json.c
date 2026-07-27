@@ -226,6 +226,7 @@ static AerVal json_parse_array(JsonParser* p) {
     r->capacity = 4;
     r->items    = xmalloc(sizeof(AerVal) * r->capacity);
     r->shape    = NULL;
+    r->generation = 0;
 
     json_skip_ws(p);
     if (p->pos < p->len && p->s[p->pos] == ']') { p->pos++; return aer_array_val(r); }

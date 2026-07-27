@@ -128,7 +128,10 @@ LexerState* lexer_save_state(void);
 void        lexer_restore_state(LexerState* state);
 
 /* Begins lexing a fresh, independent text span (e.g. a string interpolation's `{expr}` body) —
-   see this function's own comment in lexer.c for the save/restore contract callers must follow. */
-void lexer_begin_span(const char* text, unsigned int len);
+   see this function's own comment in lexer.c for the save/restore contract callers must follow.
+   start_line is the absolute source line the span's first character sits on, in whatever file it
+   was cut from -- needed so line numbers attached to bytecode compiled from the span (chunk_mark_line)
+   report the true original line, not one relative to the span's own start. */
+void lexer_begin_span(const char* text, unsigned int len, unsigned int start_line);
 
 #endif

@@ -1117,8 +1117,14 @@ static int parse_interpolated_expr(Chunk* c, const char* text, unsigned int len)
     char* decoded = xmalloc((size_t)len + 1);
     unsigned int decoded_len = decode_string_escapes(text, len, decoded);
 
+    /* Captured on the OUTER file before switching into the span -- current_source_line() would
+       otherwise report a line relative to the span's own start once inside it. Harmless in
+       practice today (chunk_mark_line is only called at statement boundaries, never mid-expression,
+       so this value is never actually read), but keeping this call site honest rather than leaving
+       it silently correct by coincidence. */
+    unsigned int outer_line = current_source_line();
     LexerState* saved = lexer_save_state();
-    lexer_begin_span(decoded, decoded_len);
+    lexer_begin_span(decoded, decoded_len, outer_line);
     free(decoded);   /* lexer_begin_span copies it into its own owned buffer */
     lex();
     int rk = parse_binary(c, 0);
@@ -3439,6 +3445,7 @@ static void parse_function(Chunk* c) {
        so the cursor sits exactly at '(' now; capturing after lex() would already be past '(' (it
        would then hold the position past '(' itself, i.e. mid-parameter-list). */
     const char* span_start = current_source_cursor();
+    unsigned int span_start_line = current_source_line();
     lex();
 
     unsigned int param_names[FRAME_REGISTERS];
@@ -3486,8 +3493,9 @@ static void parse_function(Chunk* c) {
         char* span_copy = xmalloc((size_t)span_len + 1);
         memcpy(span_copy, span_start, span_len);
         span_copy[span_len] = '\0';
-        c->functions[this_func_idx].source_span     = span_copy;
-        c->functions[this_func_idx].source_span_len = span_len;
+        c->functions[this_func_idx].source_span      = span_copy;
+        c->functions[this_func_idx].source_span_len  = span_len;
+        c->functions[this_func_idx].source_span_line = span_start_line;
     }
 
     c->functions[this_func_idx].max_registers = captured_max_registers;
@@ -3524,7 +3532,7 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
 
     ParserState* saved_parser = parser_save_state();
     LexerState*  saved_lexer  = lexer_save_state();
-    lexer_begin_span(target_f->source_span, target_f->source_span_len);
+    lexer_begin_span(target_f->source_span, target_f->source_span_len, target_f->source_span_line);
     lex();
 
     unsigned int param_names[FRAME_REGISTERS];
@@ -3588,6 +3596,7 @@ static bool parse_literal_default(Chunk* c, AerVal* out) {
         a->count = a->capacity = 0;
         a->items = NULL;
         a->shape = NULL;
+        a->generation = 0;
         *out = aer_array_val(a);
     } else if (token.type == TOKEN_OPEN_BRACE) {
         lex();

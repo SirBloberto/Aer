@@ -27,6 +27,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         }
         gc_barrier_array(vm, a, val);
         a->items[a->count++] = val;
+        a->generation++;   /* see AerArray.generation's own comment, value.h */
         vm_stack_push(vm, arr); return true;
     }
     if (fn_id == FN_COLLECTION_DELETE && arg_count == 2) {
@@ -51,6 +52,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(key), a->count); vm_stack_push(vm, aer_null()); return true; }
             memmove(&a->items[i], &a->items[i + 1], (size_t)(a->count - (uint64_t)i - 1) * sizeof(AerVal));
             a->count--;
+            a->generation++;   /* see AerArray.generation's own comment, value.h */
             vm_stack_push(vm, obj); return true;
         }
         error("delete() requires a hashtable or array");
@@ -65,6 +67,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             r->capacity = a->count ? a->count : 4;
             r->items    = xmalloc(sizeof(AerVal) * r->capacity);
             r->shape    = NULL;
+            r->generation = 0;
             memcpy(r->items, a->items, sizeof(AerVal) * a->count);
             vm_stack_push(vm, aer_array_val(r)); return true;
         }
@@ -104,6 +107,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         memmove(&a->items[i + 1], &a->items[i], (size_t)(a->count - (uint64_t)i) * sizeof(AerVal));
         a->items[i] = val;
         a->count++;
+        a->generation++;   /* see AerArray.generation's own comment, value.h */
         vm_stack_push(vm, arr); return true;
     }
     if (fn_id == FN_COLLECTION_INDEX_OF && arg_count == 2) {
@@ -124,6 +128,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         r->capacity = d->map.count ? d->map.count : 4;
         r->items    = xmalloc(sizeof(AerVal) * r->capacity);
         r->shape    = NULL;
+        r->generation = 0;
         for (unsigned int i = 0; i < d->map.count; i++) {
             unsigned int n = d->map.dense[i].length;
             char* buf = xmalloc(n + 1);

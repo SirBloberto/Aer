@@ -566,6 +566,11 @@ typedef struct {
        a second such call happens -- exactly when a lazy specialization might fire. */
     char*        source_span;
     unsigned int source_span_len;
+    /* Absolute source line the span's first character ('(') sits on -- passed to lexer_begin_span
+       so a specialization recompile's bytecode gets tagged with true source line numbers instead
+       of ones relative to the span's own start (a real bug: an error inside a specialized body used
+       to report a line number offset by however many lines precede the function in its file). */
+    unsigned int source_span_line;
     /* Small, bounded table of already-compiled specialized bodies, keyed by the shape observed for
        this function's shape-sensitive parameter(s). Checked (via the call site's own
        CallSpecCacheEntry first, then this table on a miss) before recompiling for a never-before-seen
@@ -606,6 +611,16 @@ typedef struct {
     unsigned int last_max_registers;
     unsigned int last_max_raw_ints;
     unsigned int last_max_raw_reals;
+    /* SPEC_KIND_ARRAY_OF_STRUCTS only: the last plain-array argument (by identity) and its
+       AerArray.generation at the moment lbl_call's O(n) homogeneity scan last confirmed every
+       element matched last_shape. A later call at this same site with the SAME array pointer AND
+       the SAME generation (i.e. items[] hasn't been restructured since -- see AerArray.generation's
+       own comment, value.h) can trust that verification and skip re-scanning entirely. NULL/0 means
+       never verified; only ever set on a scan that fully SUCCEEDED, never on a failed/heterogeneous
+       one, so a later genuinely-uniform call still gets a fresh, correct scan rather than trusting a
+       stale negative result. */
+    AerArray*    last_verified_array;
+    unsigned int last_verified_generation;
 } CallSpecCacheEntry;
 
 typedef struct {

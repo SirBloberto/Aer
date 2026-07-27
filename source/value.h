@@ -58,6 +58,13 @@ struct AerArray {
     unsigned int count;
     unsigned int capacity;
     Shape*       shape;   /* NULL for ordinary arrays; set for struct instances */
+    /* Bumped on every mutation that can change which shapes occupy items[] -- index-assignment
+       replacing an element (OP_INDEX_SET), and collection.append/delete/insert (aer_collection.c).
+       NOT bumped by collection.sort (reorders, never replaces -- homogeneity is a set property,
+       unaffected by order). Lets lbl_call's SPEC_KIND_ARRAY_OF_STRUCTS per-call-site cache (vm.c)
+       skip its O(n) homogeneity re-scan when the same array at the same generation was already
+       verified against the same shape on a previous call. */
+    unsigned int generation;
 };
 _Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 

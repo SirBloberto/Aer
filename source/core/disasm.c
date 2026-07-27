@@ -273,7 +273,11 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     /* Full 8-bit mask must match DISPATCH()'s exactly -- opcode is unambiguously its own byte now. */
     Opcode op = (Opcode)(op_word & 0xFF);
     const OpInfo* info = &op_info[op];
-    fprintf(out, "%6u  %-28s  %s", offset, opcode_name(op), info->desc);
+    /* %-36s must stay >= the longest Opcode enum member's name (currently
+       OP_INDEX_FIELD_COMPOUND_RAW_REAL, 32 chars) -- a shorter width doesn't truncate, it just lets
+       that one line's description column start later than every other line's, since printf only
+       pads a short name, never cuts a long one. Bump this if a future opcode name exceeds it. */
+    fprintf(out, "%6u  %-36s  %s", offset, opcode_name(op), info->desc);
 
     unsigned int pos = offset + 1;
     if (info->variable) {
@@ -588,6 +592,11 @@ static int cmp_line_count_desc(const void* a, const void* b) {
 
 void aer_disassemble(Chunk* c, FILE* out) {
     fprintf(out, "--- disassembly (%u words) ---\n", c->count);
+    /* The leading number on each line below is that instruction's own WORD offset into this
+       Chunk's flat code[] array -- not a meaningless address: it's the exact same numbering space
+       every jump target ("-> N") refers to, so it can be used directly to follow a jump to the
+       instruction it lands on. */
+    fprintf(out, "(leading number = word offset into code[]; jump targets \"-> N\" refer to this same offset)\n");
     unsigned int offset = 0;
     while (offset < c->count) offset = disassemble_one(c, offset, out);
 
@@ -617,7 +626,7 @@ void aer_disassemble(Chunk* c, FILE* out) {
 
     fprintf(out, "\n--- per-opcode summary ---\n");
     for (int i = 0; i < by_op_count; i++)
-        fprintf(out, "  %-28s %llu\n", by_op[i].name, by_op[i].hits);
+        fprintf(out, "  %-36s %llu\n", by_op[i].name, by_op[i].hits);   /* keep in sync with disassemble_one's own %-36s */
 
     /* Per-line rollup: bucket by the source line each hit instruction belongs to. */
     LineCount* by_line = xmalloc(sizeof(LineCount) * c->debug_hits_cap);

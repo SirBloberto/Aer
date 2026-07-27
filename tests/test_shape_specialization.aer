@@ -99,4 +99,59 @@ reassigned = reassign_then_read(Body(0.0, 0.0, 3.0), Wrong(0.0, 42.0))
 assert(reassigned[0] == 3.0, "the field read BEFORE reassignment used the original parameter's shape correctly")
 assert(reassigned[1] == 42.0, "the field read AFTER reassignment correctly re-resolved against Wrong's own shape (42.0 at offset 8) -- a stale Body-shape hint would have read offset 16 instead, wrong entirely")
 
+# SPEC_KIND_ARRAY_OF_STRUCTS's per-call-site cache (CallSpecCacheEntry.last_verified_array/
+# last_verified_generation, vm.c's lbl_call) -- skips the O(n) homogeneity re-scan when the same
+# plain-array argument (by pointer) is passed again at the SAME AerArray.generation, and correctly
+# re-scans (never trusting a stale positive OR negative result) the instant that generation changes.
+import collection
+
+struct Particle2:
+    x = 0.0
+    vx = 0.0
+
+struct WrongShape2:
+    pad = 0.0
+    vx = 0.0
+    x = 0.0
+
+function advance_particles(particles, n, dt):
+    i = 0
+    for i < n:
+        pi = particles[i]
+        vx = pi.vx
+        pi.x += vx * dt
+        i += 1
+
+particles2 = []
+i = 0
+for i < 5:
+    p2 = Particle2()
+    p2.x = (i as float)
+    p2.vx = 1.0
+    collection.append(particles2, p2)
+    i += 1
+
+# 3 calls, same array + generation throughout -- the 2nd and 3rd must hit the verified-cache path
+# (not re-scanned), and still compute correctly if they do.
+advance_particles(particles2, 5, 1.0)
+advance_particles(particles2, 5, 1.0)
+advance_particles(particles2, 5, 1.0)
+assert(particles2[0].x == 3.0, "3 same-generation calls accumulate correctly via the (possibly cached) specialized path")
+
+# Mutate via index-assignment to a different shape -- bumps generation, so the stale
+# (array, old_generation, Particle2-shape) cache entry must NOT be trusted on the next call; the
+# scan must re-run, detect the heterogeneity, and fall back to the generic body for that call only.
+particles2[2] = WrongShape2(0.0, 100.0, 0.0)
+advance_particles(particles2, 5, 1.0)
+assert(particles2[0].x == 4.0, "element 0 (still Particle2) advances correctly via the generic fallback")
+assert(particles2[2].x == 100.0, "element 2 (now WrongShape2, vx=100.0) advances correctly too in the same fallback call")
+
+# Restore homogeneity -- proves one bad generation doesn't permanently poison this call site; a
+# later uniform call must be able to specialize (and cache) again.
+particles2[2] = Particle2(0.0, 1.0)
+advance_particles(particles2, 5, 1.0)
+advance_particles(particles2, 5, 1.0)
+assert(particles2[0].x == 6.0, "post-restoration calls accumulate correctly again")
+assert(particles2[2].x == 2.0, "restored element 2 accumulates correctly across its own 2 post-restore calls")
+
 print("test_shape_specialization.aer: all assertions passed.")

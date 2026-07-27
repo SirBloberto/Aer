@@ -845,6 +845,7 @@ void chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offse
     f->shape_sensitive_mask = 0;
     f->source_span          = NULL;
     f->source_span_len      = 0;
+    f->source_span_line     = 0;
     f->specialization_count = 0;
     f->megamorphic          = false;
 }
@@ -1479,6 +1480,7 @@ static AerVal vm_default_value(VM* vm, AerVal dflt) {
         a->count = a->capacity = 0;
         a->items = NULL;
         a->shape = NULL;
+        a->generation = 0;
         return aer_array_val(a);
     }
     if (aer_type(dflt) == TYPE_DICT) {
@@ -1895,6 +1897,10 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count); return; }
         gc_barrier_array(vm, a, val);
         a->items[i] = val;
+        /* Replacing an element can change whether this array is uniformly one struct shape --
+           invalidates lbl_call's SPEC_KIND_ARRAY_OF_STRUCTS "already verified homogeneous"
+           per-call-site cache (vm.c), which is keyed on (array pointer, generation, shape). */
+        a->generation++;
     } else if (aer_type(obj) == TYPE_DICT) {
         if (aer_type(idx) != TYPE_STRING) { error("Hashtable key must be a string"); return; }
         AerString* is = aer_as_string(idx);
@@ -2444,14 +2450,34 @@ lbl_call: {
            case (see linear-rolling-dream.md's Part B). A single mismatched element silently falls
            back to the generic body for THIS call only -- observed is left in place conceptually,
            but the cache/table are simply never touched below, so a later, uniform call still
-           specializes normally. */
+           specializes normally.
+
+           The scan itself is skippable, though: if THIS call site already fully verified this EXACT
+           array (by pointer) at its CURRENT AerArray.generation against this same shape on some
+           earlier call, items[] provably hasn't been restructured since (generation only changes on
+           index-assignment/append/delete/insert -- see its own comment, value.h) -- trusting that
+           prior verification is exactly as safe as the structural guarantee the other two kinds get
+           for free, just re-derived per generation instead of assumed forever. This is what turns
+           struct_array_scan.aer's real pattern (same 2M-particle array, 50 calls, only field VALUES
+           change between calls) from paying the O(n) scan on every one of the 50 into paying it once. */
         if (kind == SPEC_KIND_ARRAY_OF_STRUCTS) {
             AerArray* arr = aer_as_array(arg);
-            for (unsigned int idx = 0; idx < arr->count; idx++) {
-                AerVal item = arr->items[idx];
-                if (aer_type(item) != TYPE_STRUCT || aer_as_struct(item)->shape != observed) {
-                    observed = NULL;
-                    break;
+            chunk_ensure_call_spec_cache(c);
+            CallSpecCacheEntry* site_entry = &c->call_spec_cache[site];
+            bool already_verified = site_entry->last_verified_array == arr &&
+                                        site_entry->last_verified_generation == arr->generation &&
+                                        site_entry->last_shape == observed;
+            if (!already_verified) {
+                for (unsigned int idx = 0; idx < arr->count; idx++) {
+                    AerVal item = arr->items[idx];
+                    if (aer_type(item) != TYPE_STRUCT || aer_as_struct(item)->shape != observed) {
+                        observed = NULL;
+                        break;
+                    }
+                }
+                if (observed) {
+                    site_entry->last_verified_array      = arr;
+                    site_entry->last_verified_generation  = arr->generation;
                 }
             }
         }
@@ -2653,6 +2679,7 @@ lbl_array_new: {
     a->count    = (unsigned int)item_count;
     a->items    = xmalloc(sizeof(AerVal) * a->capacity);
     a->shape    = NULL;
+    a->generation = 0;
     for (int i = 0; i < item_count; i++)
         a->items[i] = vm->registers[item_reg_base + i];
     vm->registers[dest_reg] = aer_array_val(a);
@@ -2711,6 +2738,7 @@ lbl_slice_get: {
         r->capacity = n > 0 ? n : 4;
         r->items    = xmalloc(sizeof(AerVal) * r->capacity);
         r->shape    = NULL;   /* a slice is always a plain array, even of a struct */
+        r->generation = 0;
         for (unsigned int i = 0; i < n; i++) r->items[i] = a->items[start + i];
         vm->registers[dest_reg] = aer_array_val(r);
     } else if (aer_type(obj) == TYPE_STRING) {

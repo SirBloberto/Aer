@@ -139,6 +139,7 @@ static AerVal io_args(VM* vm, int arg_count, AerVal* args, void* userdata) {
     r->capacity = io_argc > 0 ? (unsigned int)io_argc : 4;
     r->items    = xmalloc(sizeof(AerVal) * r->capacity);
     r->shape    = NULL;
+    r->generation = 0;
     for (int i = 0; i < io_argc; i++) {
         size_t n   = strlen(io_argv[i]);
         char*  buf = xmalloc(n + 1);
