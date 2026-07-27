@@ -502,16 +502,16 @@ int main(void) {
        file). `p.value` (line 5) is what makes `p` shape-sensitive and triggers the recompile on
        the very first call.
 
-       A FRESH Chunk+VM, not the shared vm/chunk above: found (via gdb, crashes in pool_alloc,
-       source/utilities/pool.c:50, on a corrupted free_list) that Chunk.name_index's string-interning
-       hashtable -- backed by a process-global HashPools, chunk_name_index_pools in vm.c, but with
-       its OWN per-chunk resize/rehash state -- segfaults on interning a genuinely new string once
-       the shared vm/chunk above has accumulated enough distinct identifiers from the ~35 earlier
-       tests in this file (confirmed content-independent: substituting a trivial `print(999)` at that
-       later position crashed identically). A brand new Chunk's own name_index starts empty and never
-       hits whatever resize boundary the shared one does -- confirmed this sidesteps it cleanly via a
-       standalone repro. Real, separate, pre-existing bug, filed for its own investigation, not fixed
-       here -- this is just how to test the actual fix without tripping over it. */
+       A FRESH Chunk+VM, not the shared vm/chunk above -- the shared pair is torn down for good
+       several tests up (vm_free(&vm); chunk_free(&chunk);, proving aer_module_free_all() actually
+       clears the module registry) and never touched again after that point; this test needs its
+       own independent, still-live pair, same as vm_a/vm_b and the 500-cycle block just below. (An
+       earlier version of this comment blamed a "pool corruption" bug in Chunk.name_index's
+       string-interning pool for a segfault at this exact spot -- confirmed via a gdb watchpoint on
+       chunk.name_index.pools that the real cause was simpler: an earlier draft of this test
+       mistakenly reused the ALREADY-FREED shared vm/chunk here, so chunk_add_pool's string-
+       interning dereferenced a HashPools pointer that chunk_free had already zeroed. No library bug
+       at all -- ordinary use-after-free in this test file, fixed by using a fresh pair like this.) */
     {
         Chunk spec_chunk;
         VM    spec_vm;

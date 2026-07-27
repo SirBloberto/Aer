@@ -86,7 +86,11 @@ make
 Output is written to `binary/aer` (`binary/aer.exe` on Windows — the Makefile handles the suffix).
 One build for everything — it carries debug symbols and is the same binary the test suite runs.
 (PGO (`-fprofile-generate`, run against a representative `.aer` workload, rebuild with
-`-fprofile-use`) measures ~6-9% faster but isn't wired into the makefile, to keep it small.)
+`-fprofile-use`) was measured again on this VM's current opcode set: a few percent faster on
+`nbody.aer`, but ~35-40% SLOWER on `struct_array_scan.aer` — reproducible even when the profile is
+trained on that exact benchmark alone, so it's a real GCC hot/cold layout decision going wrong for
+that loop, not a training-mix artifact. Given a flagship benchmark regresses this badly, it isn't
+wired into the makefile.)
 
 To clean:
 
