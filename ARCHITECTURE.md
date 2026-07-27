@@ -620,6 +620,30 @@ default build, to keep the makefile small.
   bug above (that's about *how often* the array gets rescanned once old, not the reallocation cost),
   but is a real, complementary, and much cheaper win for the same "build a huge array via many
   appends" pattern. Not built yet.
+- **TODO: opt-in 32-bit (`int32`/`float32`) fields for structs and packed arrays.** Distinct from —
+  and a much better-grounded idea than — shrinking the general `AerVal` (see below): a struct/
+  packed-array field's type is already known statically at compile time via `Shape.field_types[]`,
+  and every access already goes through a fixed byte offset with zero runtime type-tag recovery (e.g.
+  `OP_FIELD_GET_RAW_REAL`, `off=24`) — so narrowing a field from 8 to 4 bytes doesn't reintroduce the
+  per-access unpacking cost that made NaN-boxing a measured regression (see below); it's a direct
+  continuation of the already-validated principle behind the existing typed-struct-fields work
+  (raw 8-byte fields over full 16-byte boxed `AerVal`, chosen for exactly this reason). Confirmed
+  feasible with no infrastructure redesign: `Shape.field_offsets[]` (vm.c, `OP_DEFINE_STRUCT`'s
+  handler) is already a genuine per-field cumulative sum (`offset += field_types[i] == TYPE_ANY ?
+  sizeof(AerVal) : 8`), not a fixed stride — a third, 4-byte case slots directly into that existing
+  loop. Real costs: (1) needs new opt-in syntax (`int32`/`float32` as distinct declared field types,
+  not silently narrowing the existing `integer`/`float`, which must stay 64-bit everywhere else in
+  the language); (2) doubles the raw-field-access opcode surface for structs/packed arrays
+  specifically (32-bit counterparts of `OP_FIELD_GET_RAW_REAL`/`OP_FIELD_SET`/
+  `OP_FIELD_COMPOUND_RAW_REAL`/etc.); (3) real precision-loss risk needing validation against a
+  correctness oracle, not just assumed fine — `nbody.aer`'s own energy-conservation check (already
+  used elsewhere this session to catch other regressions) is the natural test, since accumulated
+  float32 rounding error over many iterations could plausibly drift further than float64 does today.
+  Expected payoff shape: for an array already far larger than any cache (`struct_array_scan.aer`'s
+  2,000,000 × 56 bytes = 112MB, already streaming from main memory every pass regardless of field
+  width), halving field width mainly cuts memory *bandwidth* consumed per pass, not miss *rate* —
+  consistent with that benchmark's own existing design comment, which already reasons about "total
+  byte footprint... determines how much survives in cache between passes." Not scoped in detail yet.
 
 ---
 
