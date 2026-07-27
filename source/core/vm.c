@@ -2202,6 +2202,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_FIELD_COMPOUND_RAW_REAL]        = &&lbl_field_compound_raw_real,
         [OP_INDEX_FIELD_COMPOUND_RAW_INT]  = &&lbl_index_field_compound_raw_int,
         [OP_INDEX_FIELD_COMPOUND_RAW_REAL] = &&lbl_index_field_compound_raw_real,
+        [OP_UNBOX_PARAM_INT]  = &&lbl_unbox_param_int,
+        [OP_UNBOX_PARAM_REAL] = &&lbl_unbox_param_real,
     };
 
     DISPATCH();
@@ -2485,18 +2487,20 @@ lbl_call: {
         if (observed) {
             chunk_ensure_call_spec_cache(c);
             CallSpecCacheEntry* site_entry = &c->call_spec_cache[site];
+            SpecEntry* entry = NULL;
             if (site_entry->last_shape == observed) {
                 chosen_offset        = site_entry->last_code_offset;
                 chosen_max_registers = site_entry->last_max_registers;
                 chosen_max_raw_ints  = site_entry->last_max_raw_ints;
                 chosen_max_raw_reals = site_entry->last_max_raw_reals;
+                entry = site_entry->last_entry;
             } else {
                 SpecEntry* found = NULL;
                 for (int i = 0; i < target_f->specialization_count; i++)
                     if (target_f->specializations[i].shape == observed) { found = &target_f->specializations[i]; break; }
                 if (!found && target_f->specialization_count < SPEC_MAX) {
                     SpecEntry fresh;
-                    if (parser_specialize_function(c, target_f, observed, kind, param_index, &fresh)) {
+                    if (parser_specialize_function(c, target_f, observed, kind, param_index, &fresh, NULL, NULL, 0)) {
                         /* The recompile just appended new code to THIS running chunk -- every
                            per-word cache must cover the new size before any of its sites dispatch.
                            debug_hits[] is the same idiom (chunk_ensure_debug_hits) but debug-tools-
@@ -2526,10 +2530,95 @@ lbl_call: {
                     site_entry->last_max_registers  = found->max_registers;
                     site_entry->last_max_raw_ints   = found->max_raw_ints;
                     site_entry->last_max_raw_reals  = found->max_raw_reals;
+                    site_entry->last_entry          = found;
                     chosen_offset        = found->code_offset;
                     chosen_max_registers = found->max_registers;
                     chosen_max_raw_ints  = found->max_raw_ints;
                     chosen_max_raw_reals = found->max_raw_reals;
+                    entry = found;
+                }
+            }
+
+            /* Raw-numeric-variant check -- an independent axis from the shape cache/table lookup
+               above, re-derived fresh every call (cheap: at most SPEC_MAX_RAW_PARAMS aer_type()
+               reads, nowhere near the cost of a shape/homogeneity miss) rather than mirrored into
+               its own site-cache fields, since `entry` (from either the cache hit or the table
+               lookup just above) already gives direct access to whichever SpecEntry's own
+               raw_variant_* fields are relevant. See SpecEntry's own comment, vm.h, for why this is
+               a SEPARATE per-entry variant rather than folding raw-param-kind into the shape axis
+               itself. */
+            /* SPEC_KIND_ARRAY_OF_STRUCTS excluded: measured (interleaved, same-session A/B against
+               the pre-raw-numeric-variant build) as a real, consistent ~20% REGRESSION on
+               struct_array_scan.aer specifically, despite dispatch-count evidence showing fewer
+               boxed ops overall (OP_RAW_MUL_REAL replacing OP_RAW_MUL_REAL_BOXED_TO, no repeated
+               recompilation -- OP_UNBOX_PARAM_INT/REAL each fire exactly once per call, confirming
+               the cache itself works correctly). Root cause not fully isolated -- excluding this
+               one SpecKind recovers full step-4 performance (in fact slightly better), so gated
+               off rather than shipped as a net loss for this case while the actual mechanism (some
+               interaction between the raw-numeric variant and the one-hop alias/homogeneity-check
+               machinery specific to ARRAY_OF_STRUCTS) stays unexplained. STRUCT/PACKED_ARRAY are
+               unaffected (confirmed: nbody.aer, PACKED_ARRAY, keeps its full ~24-26% win). */
+            if (entry && entry->raw_param_count >= 0 && kind != SPEC_KIND_ARRAY_OF_STRUCTS) {
+                int cand_regs[SPEC_MAX_RAW_PARAMS];
+                ValueType cand_types[SPEC_MAX_RAW_PARAMS];
+                int cand_count = 0;
+                for (unsigned int pi = 0; pi < target_f->arity && cand_count < SPEC_MAX_RAW_PARAMS; pi++) {
+                    if ((int)pi == param_index) continue;
+                    AerVal pv = vm->registers[arg_reg_base + pi];
+                    ValueType pt = aer_type(pv);
+                    if (pt != TYPE_INTEGER && pt != TYPE_REAL) { cand_count = 0; break; }   /* not all-numeric -- no raw variant applies this call */
+                    cand_regs[cand_count]  = (int)pi;
+                    cand_types[cand_count] = pt;
+                    cand_count++;
+                }
+
+                if (cand_count > 0) {
+                    bool matches_existing = entry->raw_param_count == cand_count;
+                    if (matches_existing) {
+                        for (int k = 0; k < cand_count; k++)
+                            if (entry->raw_param_regs[k] != cand_regs[k] || entry->raw_param_types[k] != cand_types[k]) { matches_existing = false; break; }
+                    }
+                    if (matches_existing) {
+                        chosen_offset        = entry->raw_variant_code_offset;
+                        chosen_max_registers = entry->raw_variant_max_registers;
+                        chosen_max_raw_ints  = entry->raw_variant_max_raw_ints;
+                        chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
+                    } else if (entry->raw_param_count == 0) {
+                        /* Never attempted for THIS entry -- try to compile it now. A failure here
+                           (raw_ints/raw_reals budget exhausted -- realistic, since this shape's own
+                           raw field usage already competes for the same 32-slot budget) sets
+                           raw_param_count to -1, a PERMANENT bailout for this one SpecEntry only --
+                           never retried every call, but also never affecting `megamorphic` or the
+                           shape table, since this axis is fully decoupled from those. */
+                        SpecEntry variant;
+                        if (parser_specialize_function(c, target_f, observed, kind, param_index, &variant,
+                                                            cand_regs, cand_types, cand_count)) {
+#ifdef AER_DEBUG_TOOLS
+                            chunk_ensure_debug_hits(c);
+#endif
+                            chunk_ensure_field_cache(c);
+                            chunk_ensure_call_spec_cache(c);
+                            entry->raw_variant_code_offset     = variant.code_offset;
+                            entry->raw_variant_max_registers   = variant.max_registers;
+                            entry->raw_variant_max_raw_ints    = variant.max_raw_ints;
+                            entry->raw_variant_max_raw_reals   = variant.max_raw_reals;
+                            for (int k = 0; k < cand_count; k++) {
+                                entry->raw_param_regs[k]  = cand_regs[k];
+                                entry->raw_param_types[k] = cand_types[k];
+                            }
+                            entry->raw_param_count = cand_count;
+                            chosen_offset        = entry->raw_variant_code_offset;
+                            chosen_max_registers = entry->raw_variant_max_registers;
+                            chosen_max_raw_ints  = entry->raw_variant_max_raw_ints;
+                            chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
+                        } else {
+                            entry->raw_param_count = -1;
+                        }
+                    }
+                    /* else: entry already has a DIFFERENT raw-numeric variant than this call's
+                       observed types -- don't attempt a second one, just use the baseline
+                       offset/sizes already chosen above (still fully correct, just boxed dt again
+                       for this one call). */
                 }
             }
         }
@@ -3361,6 +3450,24 @@ lbl_index_field_compound_raw_real: {
         default: error("internal error: unsupported raw compound-assign op"); DISPATCH();
     }
     memcpy(elem, &result, 8);
+    DISPATCH();
+}
+
+/* Unconditional, untagged unbox -- see this opcode's own comment, vm.h. Only ever appears once per
+   raw-bound parameter, at the very start of a specialized body's "raw-numeric variant"; lbl_call
+   already proved the argument's runtime type before choosing to jump here, so there's nothing left
+   to check. */
+lbl_unbox_param_int: {
+    int slot   = (int)UNPACK_A(op_word);
+    int reg    = (int)UNPACK_B(op_word);
+    vm->raw_ints[slot] = aer_as_int(vm->registers[reg]);
+    DISPATCH();
+}
+
+lbl_unbox_param_real: {
+    int slot   = (int)UNPACK_A(op_word);
+    int reg    = (int)UNPACK_B(op_word);
+    vm->raw_reals[slot] = aer_as_real(vm->registers[reg]);
     DISPATCH();
 }
 

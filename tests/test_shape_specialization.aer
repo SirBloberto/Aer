@@ -154,4 +154,68 @@ advance_particles(particles2, 5, 1.0)
 assert(particles2[0].x == 6.0, "post-restoration calls accumulate correctly again")
 assert(particles2[2].x == 2.0, "restored element 2 accumulates correctly across its own 2 post-restore calls")
 
+# Raw-numeric-parameter specialization (SpecEntry.raw_variant_*, vm.h/vm.c's lbl_call) -- a second,
+# OPTIONAL specialized body for a PACKED_ARRAY/STRUCT shape that ADDITIONALLY binds other numeric
+# parameters (like nbody's `dt`) as raw locals via OP_UNBOX_PARAM_INT/REAL, instead of boxed.
+# SPEC_KIND_ARRAY_OF_STRUCTS is deliberately excluded (measured regression, see lbl_call's own
+# comment) -- these tests all use a packed array, the case this mechanism actually targets.
+struct Mover:
+    x = 0.0
+    vx = 0.0
+
+function scale_move(ms, cnt, scale, extra):
+    idx = 0
+    for idx < cnt:
+        ms[idx].x += ms[idx].vx * scale
+        idx += 1
+    return extra
+
+movers = Mover[3]
+movers[0].vx = 1.0
+movers[1].vx = 2.0
+movers[2].vx = 3.0
+
+# Differential correctness: a REAL scale argument (triggers the raw-numeric variant once observed).
+r1 = scale_move(movers, 3, 2.0, 99)
+assert(movers[0].x == 2.0, "real scale: movers[0].x advanced by vx(1.0)*scale(2.0)")
+assert(movers[1].x == 4.0, "real scale: movers[1].x advanced by vx(2.0)*scale(2.0)")
+assert(movers[2].x == 6.0, "real scale: movers[2].x advanced by vx(3.0)*scale(2.0)")
+assert(r1 == 99, "register-contiguity check: `extra` (parameter AFTER the raw-bound `scale`) still reads back correctly -- a raw-bound parameter not properly burning its own boxed register slot would misattribute `extra`'s register to something else")
+
+# Polymorphic scale: an INT argument at the SAME call site on the very next call. Must NOT crash,
+# must fall back correctly (this entry's raw variant was compiled assuming TYPE_REAL, so a TYPE_
+# INTEGER observation this call can't reuse it) or build its own INT-typed variant -- either way,
+# the result must be correct, and no megamorphic bailout should be triggered by this axis at all
+# (shape stays the same the whole time, only the OTHER parameter's type changes).
+r2 = scale_move(movers, 3, 1, 7)
+assert(movers[0].x == 3.0, "int scale: movers[0].x further advanced by vx(1.0)*scale(1)")
+assert(movers[1].x == 6.0, "int scale: movers[1].x further advanced by vx(2.0)*scale(1)")
+assert(movers[2].x == 9.0, "int scale: movers[2].x further advanced by vx(3.0)*scale(1)")
+assert(r2 == 7, "register-contiguity check still holds on the int-scale call")
+
+# Back to real -- proves the polymorphic call above didn't corrupt this call site's own caches.
+r3 = scale_move(movers, 3, 0.5, 1)
+assert(movers[0].x == 3.5, "back to real scale: movers[0].x advanced by vx(1.0)*scale(0.5)")
+assert(r3 == 1, "register-contiguity check still holds after returning to real scale")
+
+# A local declared AFTER the raw-bound parameter, inside the loop -- exercises that ordinary locals
+# still allocate correctly-numbered registers once a parameter's own boxed slot is claimed-but-
+# unused (the specific hazard the register-contiguity comment in parse_function_body warns about).
+function scale_with_local(ms, cnt, scale):
+    idx = 0
+    total = 0.0
+    for idx < cnt:
+        ms[idx].x += ms[idx].vx * scale
+        total += ms[idx].x
+        idx += 1
+    return total
+
+movers2 = Mover[2]
+movers2[0].vx = 1.0
+movers2[1].vx = 1.0
+total = scale_with_local(movers2, 2, 3.0)
+assert(movers2[0].x == 3.0, "scale_with_local: element 0 advanced correctly")
+assert(movers2[1].x == 3.0, "scale_with_local: element 1 advanced correctly")
+assert(total == 6.0, "scale_with_local: local declared after the raw-bound parameter accumulates correctly, proving no register-identity confusion")
+
 print("test_shape_specialization.aer: all assertions passed.")

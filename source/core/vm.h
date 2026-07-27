@@ -221,6 +221,18 @@ typedef enum {
     OP_FIELD_COMPOUND_RAW_INT,       OP_FIELD_COMPOUND_RAW_REAL,
     OP_INDEX_FIELD_COMPOUND_RAW_INT, OP_INDEX_FIELD_COMPOUND_RAW_REAL,
 
+    /* Only ever emitted at the very start of a specialized body's "raw-numeric variant" (see
+       SpecEntry below), once per raw-bound parameter -- unconditionally reads the boxed AerVal the
+       caller already placed in that parameter's own register (the calling convention never
+       changes; every argument is always copied in boxed) and copies its payload into a raw_ints/
+       raw_reals slot, ONE time, at function entry. Safe to do WITHOUT a tag check (unlike every
+       other raw-vs-boxed opcode in this file): lbl_call already verified this exact argument's
+       runtime type is int/real before ever choosing to jump into this variant's code_offset, so by
+       the time this opcode runs, the tag is already a proven fact, not an assumption. Every
+       reference to that parameter for the rest of the body then goes through the ordinary raw-local
+       machinery (var_kind/var_lookup_rk), completely unaware this value ever arrived boxed. */
+    OP_UNBOX_PARAM_INT, OP_UNBOX_PARAM_REAL,
+
     OP_OPCODE_COUNT_MARKER   /* not a real opcode — sizes the static assert below */
 } Opcode;
 _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — widen the opcode field");
@@ -526,6 +538,8 @@ typedef enum {
    the point specialization was triggered. Each specialized body has its OWN max_registers/
    max_raw_ints/max_raw_reals peaks, independent of the generic body's (typically fewer boxed
    registers, more raw slots, since that's the whole point). */
+#define SPEC_MAX_RAW_PARAMS 3
+
 typedef struct {
     Shape*       shape;
     SpecKind     kind;
@@ -533,6 +547,35 @@ typedef struct {
     unsigned int max_registers;
     unsigned int max_raw_ints;
     unsigned int max_raw_reals;
+
+    /* An additional, OPTIONAL specialized body for this SAME shape, additionally assuming up to
+       SPEC_MAX_RAW_PARAMS other (non-shape-sensitive) parameters are numeric (int/real) and binding
+       them as raw locals instead of boxed -- e.g. nbody's `advance(bodies, dt)`/struct_array_scan's
+       `advance_pass(particles, n, dt)`, where `dt` composes with raw struct-field reads in the hot
+       loop every call, but arrives boxed like every AER parameter (no exceptions, no parameter type
+       syntax exists). A SEPARATE variant rather than folding raw-param-kind into the SAME
+       Shape-keyed SPEC_MAX table above: doing that would let a fluctuating parameter type (unlikely
+       here, but not impossible in AER's fully dynamic typing) starve the shape axis's own small
+       budget and reach `megamorphic` sooner for no good reason. This axis is intentionally
+       decoupled and just silently declines to apply (falling back to this SpecEntry's OWN baseline
+       code_offset above, still fully correct) whenever it doesn't fit -- it never touches
+       `megamorphic` or the shape table at all.
+
+       raw_param_count: 0 = never attempted (the common case, checked first, free). -1 = attempted
+       once and failed (raw_ints/raw_reals budget exhausted for this shape's already-considerable
+       raw-field usage) -- a permanent-for-this-SpecEntry bailout so a full recompile isn't retried
+       every single call. >0 = successfully compiled for exactly these parameter registers/types;
+       reused on a later call only if the CURRENTLY observed types for those same registers still
+       match raw_param_types exactly -- a call observing a different type for one of them just falls
+       back to this entry's baseline body for that one call, same non-invasive-fallback spirit as
+       the shape axis's own homogeneity check. */
+    int          raw_param_count;
+    int          raw_param_regs[SPEC_MAX_RAW_PARAMS];
+    ValueType    raw_param_types[SPEC_MAX_RAW_PARAMS];
+    unsigned int raw_variant_code_offset;
+    unsigned int raw_variant_max_registers;
+    unsigned int raw_variant_max_raw_ints;
+    unsigned int raw_variant_max_raw_reals;
 } SpecEntry;
 #define SPEC_MAX 4
 
@@ -621,6 +664,13 @@ typedef struct {
        stale negative result. */
     AerArray*    last_verified_array;
     unsigned int last_verified_generation;
+    /* Direct pointer into target_f->specializations[] for whichever SpecEntry last_shape matched --
+       lets a site-cache HIT still reach that entry's raw-numeric-variant fields (raw_param_regs/
+       types, raw_variant_code_offset, ...) without needing its own full duplicate of them here.
+       Stable for the chunk's life once set: SpecEntry lives inside a FIXED-SIZE array
+       (ChunkFunction.specializations[SPEC_MAX], never reallocated/grown), the same stability
+       assumption lbl_call already relies on for target_f itself across a specialization recompile. */
+    SpecEntry*   last_entry;
 } CallSpecCacheEntry;
 
 typedef struct {

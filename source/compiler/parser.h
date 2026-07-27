@@ -77,6 +77,8 @@ void parse(Chunk* c);
    a real call site -- see vm.c's lbl_call_spec (the only caller) and this function's own comment
    in parser.c for the full contract. */
 bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape, SpecKind kind,
-                                    int param_index, SpecEntry* out_entry);
+                                    int param_index, SpecEntry* out_entry,
+                                    const int* raw_param_regs, const ValueType* raw_param_types,
+                                    int raw_param_count);
 
 #endif

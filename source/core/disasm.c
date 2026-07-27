@@ -34,8 +34,8 @@ typedef struct {
     int packed;
 } OpInfo;
 
-/* OP_INDEX_FIELD_COMPOUND_RAW_REAL is the last member of the Opcode enum (vm.h). */
-#define OP_INFO_MAX OP_INDEX_FIELD_COMPOUND_RAW_REAL
+/* OP_UNBOX_PARAM_REAL is the last member of the Opcode enum (vm.h). */
+#define OP_INFO_MAX OP_UNBOX_PARAM_REAL
 
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* OP_ADD..OP_IN: one opcode per operator, whole instruction in one word (PACK3 + RK8 pair) —
@@ -179,6 +179,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_FIELD_COMPOUND_RAW_REAL]       = { "OP_FIELD_COMPOUND_RAW_REAL",       "specialized: struct.field OP= rawr", {0}, false, 2, 0 },
     [OP_INDEX_FIELD_COMPOUND_RAW_INT]  = { "OP_INDEX_FIELD_COMPOUND_RAW_INT",  "specialized: packed_arr[rk].field OP= rawi", {0}, false, 2, 0 },
     [OP_INDEX_FIELD_COMPOUND_RAW_REAL] = { "OP_INDEX_FIELD_COMPOUND_RAW_REAL", "specialized: packed_arr[rk].field OP= rawr", {0}, false, 2, 0 },
+    [OP_UNBOX_PARAM_INT]  = { "OP_UNBOX_PARAM_INT",  "specialized: rawi = unbox(reg) [untagged]" },
+    [OP_UNBOX_PARAM_REAL] = { "OP_UNBOX_PARAM_REAL", "specialized: rawr = unbox(reg) [untagged]" },
     [OP_RAW_LT_INT_BOXED]   = { "OP_RAW_LT_INT_BOXED",   "reg = rawi < reg (tag-checked)" },
     [OP_RAW_GT_INT_BOXED]   = { "OP_RAW_GT_INT_BOXED",   "reg = rawi > reg (tag-checked)" },
     [OP_RAW_LTE_INT_BOXED]  = { "OP_RAW_LTE_INT_BOXED",  "reg = rawi <= reg (tag-checked)" },
@@ -506,6 +508,12 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     } else if (op == OP_BOX_REAL) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
+    } else if (op == OP_UNBOX_PARAM_INT) {
+        print_rawi(out, (int)UNPACK_A(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
+    } else if (op == OP_UNBOX_PARAM_REAL) {
+        print_rawr(out, (int)UNPACK_A(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
     } else if (op == OP_RAW_MOVE_INT) {
         print_rawi(out, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));

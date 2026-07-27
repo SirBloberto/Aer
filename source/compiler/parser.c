@@ -327,6 +327,8 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
                                          int* out_param_count, int* out_min_param_count);
 static void parse_function_body(Chunk* c, unsigned int* param_names, int param_count,
                                     int hint_param_reg, Shape* hint_shape, bool hint_is_element_shape,
+                                    const int* raw_param_regs, const ValueType* raw_param_types,
+                                    int raw_param_count,
                                     unsigned int* out_max_registers,
                                     unsigned int* out_max_raw_ints,
                                     unsigned int* out_max_raw_reals);
@@ -1343,6 +1345,14 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                constant. */
             bool has_start = !equal(TOKEN_COLON);
             int rk_start = has_start ? parse_binary(c, 0) : 0;
+            /* Same fix/reasoning as parse_chain_assignment's fused index-field write side (see its
+               own comment): rk_start feeds directly into pack_rk16 below for the fused `[index].
+               field` read, a 16-bit RK slot with no "raw" state -- a genuinely raw-flagged index
+               (e.g. a manually promoted `for i < n:` counter) would corrupt that encoding, caught
+               here only as an incorrect "expression too large" error rather than silent corruption,
+               since rk16_fits doesn't mask out the raw flag bits either. No-op if rk_start isn't
+               raw-flagged (the overwhelmingly common case, a plain register or const already). */
+            rk_start = box_if_raw(c, rk_start);
 
             if (!consume(TOKEN_COLON)) {
                 require(TOKEN_CLOSE_BRACKET, "expected ']' after index");
@@ -2209,6 +2219,18 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
 
     if (first_is_index) {
         pending_rk_idx = parse_binary(c, 0);
+        /* Boxed unconditionally, right here, regardless of which path (fused index-field or the
+           general emit_index_get/emit_index_set fallback) ends up consuming it below: the fused
+           opcodes pack it directly into a 16-bit RK slot with no third "raw" state (only a plain
+           register or a const-pool index ever fit there), so a genuinely raw-flagged index (e.g. a
+           manually promoted `for i < n:` counter, as opposed to a `for i in a..b:` range-for's
+           loop variable, which is always boxed already) would corrupt that encoding outright --
+           rk16_fits/rk8_fits only mask out RK_CONST_FLAG, not RK_RAW_INT_FLAG/RK_RAW_REAL_FLAG, so
+           it manifested as an incorrect "expression too large" compile error instead, rather than
+           silent corruption, but still a real bug (found via a genuinely raw loop-counter index
+           into a fused `arr[i].field += x`). A no-op for the general path -- emit_index_get/
+           emit_index_set already box their own index argument internally. */
+        pending_rk_idx = box_if_raw(c, pending_rk_idx);
         require(TOKEN_CLOSE_BRACKET, "expected ']' after index");
     } else {
         if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected field name after '.'"); return; }
@@ -2364,6 +2386,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         if (consume(TOKEN_OPEN_BRACKET)) {
             pending_is_field = false;
             pending_rk_idx = parse_binary(c, 0);
+            /* Same fix as the first index step's own -- see that site's comment. */
+            pending_rk_idx = box_if_raw(c, pending_rk_idx);
             require(TOKEN_CLOSE_BRACKET, "expected ']' after index");
         } else {
             consume(TOKEN_DOT);
@@ -3269,7 +3293,7 @@ static int parse_function_expr(Chunk* c) {
     unsigned int func_start = c->count;
 
     unsigned int captured_max_registers, captured_max_raw_ints, captured_max_raw_reals;
-    parse_function_body(c, param_names, param_count, -1, NULL, false,
+    parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0,
                             &captured_max_registers, &captured_max_raw_ints, &captured_max_raw_reals);
 
     patch_jump(c, patch, c->count);
@@ -3349,9 +3373,19 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
    instead -- the parameter is a plain TYPE_ARRAY, never itself struct-shaped, so hint_shape
    describes what `param[idx]` produces, not `param` itself; the plain index-get site in
    parse_postfix_chain propagates it onto a one-hop local alias's own register (`pi = particles[i]`)
-   at the point parse_assignment binds it. */
+   at the point parse_assignment binds it.
+
+   raw_param_regs/raw_param_types/raw_param_count: additionally bind these OTHER parameters (by
+   register index, each already known -- by the caller, lbl_call -- to be int/real at the ACTUAL
+   call site this recompile was triggered from) as raw locals instead of boxed, right at binding
+   time -- see the per-parameter loop below for how, and OP_UNBOX_PARAM_INT/REAL's own comment
+   (vm.h) for why doing this unconditionally (no runtime tag check) is safe here specifically. Pass
+   NULL/NULL/0 outside a raw-numeric-variant recompile (parser_specialize_function's own contract),
+   which leaves every parameter binding exactly as before -- always boxed via var_slot alone. */
 static void parse_function_body(Chunk* c, unsigned int* param_names, int param_count,
                                     int hint_param_reg, Shape* hint_shape, bool hint_is_element_shape,
+                                    const int* raw_param_regs, const ValueType* raw_param_types,
+                                    int raw_param_count,
                                     unsigned int* out_max_registers,
                                     unsigned int* out_max_raw_ints,
                                     unsigned int* out_max_raw_reals) {
@@ -3393,10 +3427,37 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     for (int i = 0; i < param_count; i++) {
         var_slot(c, param_names[i]);
         /* Parameter i is always register i (var_slot binds parameters first, in order, right
-           after the allocator resets to 0 above) -- no need to inspect var_slot's return value. */
+           after the allocator resets to 0 above) -- no need to inspect var_slot's return value.
+           Deliberately called even for a parameter about to be rebound raw below: it still needs to
+           burn its boxed register slot (advance reserved_floor) so `mark_shape_sensitive`/
+           `alias_source_param`'s assumption that parameter i always occupies register i
+           contiguously keeps holding for every OTHER parameter -- skipping it here (the way an
+           ordinary local's raw promotion skips var_slot entirely) would let a later parameter or
+           local collide into this "freed" register number and be misattributed as a parameter. */
         if (i == hint_param_reg) {
             if (hint_is_element_shape) reg_known_element_shape[i] = hint_shape;
             else                       reg_known_shape[i]         = hint_shape;
+        }
+        for (int k = 0; k < raw_param_count; k++) {
+            if (raw_param_regs[k] != i) continue;
+            bool is_int = raw_param_types[k] == TYPE_INTEGER;
+            int slot = is_int ? raw_int_reserve_one() : raw_real_reserve_one();
+            if (slot >= 0) {
+                /* var_slot just appended var_count-1 as this parameter's own (boxed) entry --
+                   rebind THAT SAME entry to the raw slot instead, exactly as an ordinary local's
+                   first raw-eligible assignment would, just applied after the fact rather than at
+                   the point of declaration (a parameter has no "first assignment" of its own to
+                   hook -- binding time IS its first assignment, conceptually). */
+                Opcode unbox_op = is_int ? OP_UNBOX_PARAM_INT : OP_UNBOX_PARAM_REAL;
+                chunk_emit(c, PACK2(unbox_op, slot, i));
+                var_regs[var_count - 1] = slot;
+                var_kind[var_count - 1] = is_int ? VAR_RAW_INT : VAR_RAW_REAL;
+            }
+            /* slot < 0: raw_ints/raw_reals budget exhausted (realistic -- this shape's own raw
+               field usage already competes for the same 32-slot budget). Leave THIS ONE parameter
+               boxed (var_slot's binding above already stands, untouched) and fall through to the
+               other candidates in raw_param_regs -- one exhausted budget doesn't block the rest. */
+            break;
         }
     }
 
@@ -3475,7 +3536,7 @@ static void parse_function(Chunk* c) {
     unsigned int this_func_idx = c->function_count - 1;
 
     unsigned int captured_max_registers, captured_max_raw_ints, captured_max_raw_reals;
-    parse_function_body(c, param_names, param_count, -1, NULL, false,
+    parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0,
                             &captured_max_registers, &captured_max_raw_ints, &captured_max_raw_reals);
 
     /* Fold shape_sensitive_param[] into one bitmask; retain the source span (owned copy, see
@@ -3522,9 +3583,23 @@ static void parse_function(Chunk* c) {
    hint changes the grammar) means the caller must fall back to the generic body, same as it would
    for a shape it doesn't recognize at all. parser_had_error and every allocator/variable-table
    global this touches are fully saved and restored either way, so a failed recompile can't corrupt
-   whatever the VM does next (including a later, unrelated aer_run_source call in the same process). */
+   whatever the VM does next (including a later, unrelated aer_run_source call in the same process).
+
+   raw_param_regs/raw_param_types/raw_param_count (pass NULL/NULL/0 for the ordinary shape-only
+   compile): additionally bind these OTHER parameters -- by register index, each with its already-
+   OBSERVED runtime type (TYPE_INTEGER or TYPE_REAL; the caller, lbl_call, only ever calls this with
+   raw_param_count > 0 after confirming exactly that) -- as raw locals instead of boxed, emitting
+   one OP_UNBOX_PARAM_INT/REAL per one right at function entry. This is what lets a parameter like
+   `dt` (nbody's `advance(bodies, dt)`) compose with raw struct-field reads with zero per-use
+   tag-checking, the tag having already been proven once by lbl_call before ever choosing to jump
+   here. When raw_param_count > 0, *out_entry's shape/kind/raw_* fields are left untouched -- the
+   caller is building a raw-numeric VARIANT of an existing SpecEntry in that case, and only reads
+   code_offset/max_registers/max_raw_ints/max_raw_reals back out to copy into that entry's own
+   raw_variant_* fields itself. */
 bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape, SpecKind kind,
-                                    int param_index, SpecEntry* out_entry) {
+                                    int param_index, SpecEntry* out_entry,
+                                    const int* raw_param_regs, const ValueType* raw_param_types,
+                                    int raw_param_count) {
     if (!target_f->source_span) return false;   /* defensive -- shouldn't happen alongside a nonzero shape_sensitive_mask */
 
     bool saved_had_error = parse_had_error;
@@ -3545,6 +3620,7 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     if (!parse_had_error) {
         parse_function_body(c, param_names, param_count, param_index, shape,
                                 kind == SPEC_KIND_ARRAY_OF_STRUCTS,
+                                raw_param_regs, raw_param_types, raw_param_count,
                                 &max_registers, &max_raw_ints, &max_raw_reals);
     }
     bool ok = !parse_had_error;
@@ -3555,12 +3631,18 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
 
     if (!ok) return false;
 
-    out_entry->shape         = shape;
-    out_entry->kind          = kind;
     out_entry->code_offset   = new_offset;
     out_entry->max_registers = max_registers;
     out_entry->max_raw_ints  = max_raw_ints;
     out_entry->max_raw_reals = max_raw_reals;
+    if (raw_param_count == 0) {
+        /* Ordinary shape-only compile -- a freshly-created SpecEntry (see lbl_call, vm.c) needs its
+           OWN raw-variant bookkeeping starting from a well-defined "never attempted" state (0),
+           not whatever garbage sat in the caller's uninitialized stack SpecEntry otherwise. */
+        out_entry->shape           = shape;
+        out_entry->kind            = kind;
+        out_entry->raw_param_count = 0;
+    }
     return true;
 }
 
