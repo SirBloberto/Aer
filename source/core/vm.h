@@ -965,6 +965,20 @@ void gc_barrier_array(VM* vm, AerArray* a, AerVal new_value);
    shape-ternary dispatch. */
 void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value);
 
+/* Same contract, for a dict entry (update-in-place and new-entry paths) -- vm.c's vm_call_builtin
+   is the only caller outside gc.c itself. */
+void gc_barrier_dict(VM* vm, AerDict* d, AerVal new_value);
+
+/* Both defined in gc.c; called from vm.c's gc_maybe_collect (the tiny, always_inline gatekeeper
+   checked once per DISPATCH()) once the rare threshold-crossing case actually happens, and from
+   aer_gc_stats (embedding-facing introspection) respectively. */
+unsigned int gc_count_live_cells(VmHeap* heap);
+void gc_run_collection_cycle(VM* vm);
+
+/* Frees every live cell's own separately-owned payload across all 7 pools, regardless of mark/
+   generation state -- vm_free's one call site, whole-heap teardown (not a normal sweep). */
+void gc_finalize_all_pools(VmHeap* heap);
+
 /* Structural/reference equality with no error path (see its comment in vm.c) — exposed for
    aer_collection.c's index_of, the same scan OP_IN's array case uses. */
 bool values_equal(AerVal a, AerVal b);
