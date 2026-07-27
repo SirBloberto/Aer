@@ -808,12 +808,18 @@ static AerVal vm_default_value(VM* vm, AerVal dflt) {
         a->items = NULL;
         a->shape = NULL;
         a->generation = 0;
+        a->dirty_cards = NULL;
+        a->dirty_cards_bytes = 0;
+        a->dirty_all = false;
         return aer_array_val(a);
     }
     if (aer_type(dflt) == TYPE_DICT) {
         AerDict* d = heap_alloc(&vm->heap, &vm->heap.dict_pool);
         memset(&d->map, 0, sizeof(d->map));
         d->map.pools = &vm->heap.dict_hash_pools;
+        d->dirty_cards = NULL;
+        d->dirty_cards_bytes = 0;
+        d->dirty_all = false;
         return aer_dict_val(d);
     }
     return dflt;
@@ -1126,7 +1132,17 @@ static bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
 
 AerArray* vm_new_array(void) {
     VmHeap* heap = require_current_heap();
-    return heap_alloc(heap, &heap->array_pool);
+    AerArray* a = heap_alloc(heap, &heap->array_pool);
+    /* pool_alloc only zeroes gc_state (byte 0) -- a reused cell's previous occupant's dirty_cards
+       pointer would otherwise survive as garbage. Every OTHER field (count/capacity/items/shape/
+       generation) is still the individual caller's own responsibility, unchanged -- these three are
+       centralized here since vm_new_array is the one common entry point almost every caller already
+       goes through, and getting a stale dirty_cards pointer wrong is a real memory-safety bug, not
+       just a correctness nit. */
+    a->dirty_cards = NULL;
+    a->dirty_cards_bytes = 0;
+    a->dirty_all = false;
+    return a;
 }
 
 AerDict* vm_new_dict(void) {
@@ -1137,6 +1153,11 @@ AerDict* vm_new_dict(void) {
        zeroing running afterward. */
     memset(&d->map, 0, sizeof(d->map));
     d->map.pools = &heap->dict_hash_pools;
+    /* pool_alloc only zeroes gc_state (byte 0) -- a reused cell's previous occupant's dirty_cards
+       pointer would otherwise survive as garbage; see vm_new_array's identical reasoning. */
+    d->dirty_cards = NULL;
+    d->dirty_cards_bytes = 0;
+    d->dirty_all = false;
     return d;
 }
 
@@ -1320,7 +1341,7 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         int64_t i = aer_as_int(idx);
         if (i < 0) i += (int64_t)a->count;
         if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count); return; }
-        gc_barrier_array(vm, a, val);
+        gc_barrier_array(vm, a, (unsigned int)i, val);
         a->items[i] = val;
         /* Replacing an element can change whether this array is uniformly one struct shape --
            invalidates lbl_call's SPEC_KIND_ARRAY_OF_STRUCTS "already verified homogeneous"
@@ -1335,13 +1356,17 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         char kbuf[VM_KEY_MAX + 1];
         memcpy(kbuf, is->data, klen);
         kbuf[klen] = '\0';
-        gc_barrier_dict(vm, aer_as_dict(obj), val);
-        AerVal* existing = hashtable_get_hashed(&aer_as_dict(obj)->map, kbuf, klen, khash);
-        if (existing) {
-            *existing = val;   /* update in place — no allocation */
+        AerDict* d = aer_as_dict(obj);
+        /* Resolved BEFORE the write, not after -- an update reuses this exact dense index, a fresh
+           key always lands at d->map.count (see gc_barrier_dict's own comment, gc.c). */
+        int existing_idx = hashtable_get_index_hashed(&d->map, kbuf, klen, khash);
+        unsigned int write_idx = existing_idx >= 0 ? (unsigned int)existing_idx : d->map.count;
+        gc_barrier_dict(vm, d, write_idx, val);
+        if (existing_idx >= 0) {
+            d->map.dense[existing_idx].payload = val;   /* update in place — no allocation */
         } else {
-            char* k = hashtable_key_dup(aer_as_dict(obj)->map.pools, is->data, klen, NULL);   /* klen already true length */
-            hashtable_put_hashed(&aer_as_dict(obj)->map, k, klen, khash, val);
+            char* k = hashtable_key_dup(d->map.pools, is->data, klen, NULL);   /* klen already true length */
+            hashtable_put_hashed(&d->map, k, klen, khash, val);
         }
     } else if (aer_type(obj) == TYPE_STRING) {
         error("Strings are immutable — cannot assign to an index");
@@ -2208,6 +2233,9 @@ lbl_array_new: {
     a->items    = xmalloc(sizeof(AerVal) * a->capacity);
     a->shape    = NULL;
     a->generation = 0;
+    a->dirty_cards = NULL;
+    a->dirty_cards_bytes = 0;
+    a->dirty_all = false;
     for (int i = 0; i < item_count; i++)
         a->items[i] = vm->registers[item_reg_base + i];
     vm->registers[dest_reg] = aer_array_val(a);
@@ -2267,6 +2295,9 @@ lbl_slice_get: {
         r->items    = xmalloc(sizeof(AerVal) * r->capacity);
         r->shape    = NULL;   /* a slice is always a plain array, even of a struct */
         r->generation = 0;
+        r->dirty_cards = NULL;
+        r->dirty_cards_bytes = 0;
+        r->dirty_all = false;
         for (unsigned int i = 0; i < n; i++) r->items[i] = a->items[start + i];
         vm->registers[dest_reg] = aer_array_val(r);
     } else if (aer_type(obj) == TYPE_STRING) {
@@ -2295,6 +2326,9 @@ lbl_dict_new: {
     AerDict* d = heap_alloc(&vm->heap, &vm->heap.dict_pool);
     memset(&d->map, 0, sizeof(d->map));
     d->map.pools = &vm->heap.dict_hash_pools;
+    d->dirty_cards = NULL;
+    d->dirty_cards_bytes = 0;
+    d->dirty_all = false;
     if (pair_count > 0) hashtable_reserve(&d->map, (unsigned int)pair_count);
     for (int i = 0; i < pair_count; i++) {
         AerVal key = vm->registers[pair_reg_base + 2 * i];

@@ -150,6 +150,20 @@ AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length,
     return NULL;
 }
 
+/* Same probe as hashtable_get_hashed, but returns the entry's DENSE index instead of a payload
+   pointer -- the GC's dict write barrier (gc_barrier_dict, gc.c) needs to know exactly which dense
+   slot a write will land in BEFORE the write happens (an update reuses an existing slot; a fresh
+   key always lands at the current t->count, appended). -1 if not found. */
+int hashtable_get_index_hashed(HashTable* t, const char* key, unsigned int length, uint64_t hash) {
+    if (!t->sparse) return -1;
+    for (unsigned int i = 0; i < t->capacity; i++) {
+        unsigned int slot = t->sparse[(hash + i) & (t->capacity - 1)];
+        if (slot == SPARSE_EMPTY) return -1;
+        if (hash_match(&t->dense[slot], key, length)) return (int)slot;
+    }
+    return -1;
+}
+
 /* Places a dense-array index into the (already-allocated, already-sized) sparse array using its
    entry's own cached hash -- no key comparison needed, since a fresh sparse array being rebuilt
    from scratch can never already contain the index being placed. Never rehashes itself. */

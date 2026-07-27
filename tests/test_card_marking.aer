@@ -1,0 +1,139 @@
+#!/usr/bin/env aer
+import collection
+# AER test suite — card-marking write barrier (gc_barrier_array/gc_barrier_dict, gc.c):
+# fixes the O(n^2) minor-GC cost of rescanning an ENTIRE remembered array/dict on every cycle by
+# tracking exactly which indices were dirtied since the last rescan (AerArray/AerDict.dirty_cards),
+# falling back to a full rescan (dirty_all) only for operations that shift element-to-index
+# correspondence (collection.delete/insert/sort). Machine-checked via assert(): a clean run exits 0;
+# any failure prints "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
+#
+# There's no introspection hook into dirty_cards/dirty_all from AER script level (deliberately --
+# it's a pure internal optimization), so every test here is purely behavioral: build a large,
+# promoted-to-old container, write young references into SCATTERED indices, force further GC
+# pressure, and verify both the written AND the untouched slots are exactly correct. A missed dirty
+# bit would show up as a written value going missing (prematurely collected); a wrongly-set bit on
+# the wrong slot would show up as an untouched slot's value changing.
+
+# ------------------------------------------------------------------ #
+# Array: scattered writes into a promoted-to-old array, across two     #
+# separate rounds of further GC pressure (proves dirty bits get        #
+# cleared and correctly rebuilt each cycle, not just once).            #
+# ------------------------------------------------------------------ #
+
+card_arr = []
+for i in 0..2000:
+    collection.append(card_arr, i)
+
+# Allocation pressure to promote card_arr to old.
+churn_a = []
+for i in 0..3000:
+    collection.append(churn_a, [i, "a" + string(i)])
+
+# Round 1: scattered writes of fresh (young) string values into card_arr, now old.
+card_arr[0] = "scattered-0"
+card_arr[500] = "scattered-500"
+card_arr[999] = "scattered-999"
+card_arr[1500] = "scattered-1500"
+card_arr[1999] = "scattered-1999"
+
+churn_b = []
+for i in 0..3000:
+    collection.append(churn_b, [i, "b" + string(i)])
+
+assert(card_arr[0] == "scattered-0" and card_arr[500] == "scattered-500" and card_arr[999] == "scattered-999" and card_arr[1500] == "scattered-1500" and card_arr[1999] == "scattered-1999",
+       "round 1: scattered writes into a promoted-to-old array survive further GC pressure")
+assert(card_arr[1] == 1 and card_arr[501] == 501 and card_arr[1998] == 1998,
+       "round 1: untouched slots next to a dirtied one are unaffected")
+
+# Round 2: a SECOND set of scattered writes at DIFFERENT indices, proving the dirty-card state from
+# round 1 was cleared after its own rescan (not stale-carried-forward in a way that would either
+# double-report round 1's slots as still dirty, or fail to track round 2's new ones).
+card_arr[250] = "scattered-250-round2"
+card_arr[1250] = "scattered-1250-round2"
+
+churn_c = []
+for i in 0..3000:
+    collection.append(churn_c, [i, "c" + string(i)])
+
+assert(card_arr[250] == "scattered-250-round2" and card_arr[1250] == "scattered-1250-round2",
+       "round 2: a second, different set of scattered writes also survives further GC pressure")
+assert(card_arr[0] == "scattered-0" and card_arr[1999] == "scattered-1999",
+       "round 2: round 1's writes are still intact (not corrupted by round 2's own dirty-card cycle)")
+assert(card_arr[2] == 2 and card_arr[1001] == 1001,
+       "round 2: slots untouched by either round are still their original values")
+
+# ------------------------------------------------------------------ #
+# Dict: scattered writes (both fresh keys and updates to existing      #
+# keys) into a promoted-to-old dict.                                   #
+# ------------------------------------------------------------------ #
+
+card_dict = {}
+for i in 0..500:
+    card_dict["k" + string(i)] = i
+
+churn_d = []
+for i in 0..3000:
+    collection.append(churn_d, [i, "d" + string(i)])
+
+# A fresh key (append path) and an update to an existing key (in-place path) -- both need their
+# own correct dense index resolved before the write (see gc_barrier_dict's own comment, gc.c).
+card_dict["fresh_key"] = "fresh-value"
+card_dict["k100"] = "updated-value"
+
+churn_e = []
+for i in 0..3000:
+    collection.append(churn_e, [i, "e" + string(i)])
+
+assert(card_dict["fresh_key"] == "fresh-value", "a fresh key written into a promoted-to-old dict survives further GC pressure")
+assert(card_dict["k100"] == "updated-value", "an update to an existing key in a promoted-to-old dict survives further GC pressure")
+assert(card_dict["k0"] == 0 and card_dict["k499"] == 499, "untouched dict entries are unaffected")
+
+# ------------------------------------------------------------------ #
+# dirty_all fallback: collection.delete/insert/sort on a promoted-to-  #
+# old array shift element-to-index correspondence -- must still be     #
+# correct (via the coarser full-rescan fallback), not just fast.       #
+# ------------------------------------------------------------------ #
+
+reorder_arr = []
+for i in 0..1000:
+    collection.append(reorder_arr, i)
+
+churn_f = []
+for i in 0..3000:
+    collection.append(churn_f, [i, "f" + string(i)])
+
+# A young reference written in, then immediately shifted by insert/delete -- if dirty_all's
+# fallback weren't applied, the stale per-index dirty bit from the write below could point at the
+# WRONG post-shift slot, missing the real one and prematurely collecting it.
+reorder_arr[500] = "before-shift"
+collection.insert(reorder_arr, 0, "inserted-at-front")   # shifts everything from 0 onward up by one
+collection.delete(reorder_arr, 999)                       # shifts everything after 999 down by one
+
+churn_g = []
+for i in 0..3000:
+    collection.append(churn_g, [i, "g" + string(i)])
+
+assert(reorder_arr[0] == "inserted-at-front", "insert() at the front is intact after further GC pressure")
+assert(reorder_arr[501] == "before-shift", "a value written before a shifting insert/delete lands at its new (shifted) index and survives")
+
+# Same for a dict: delete() swap-compacts the dense array, which must force a full rescan (dirty_all)
+# rather than trust a now-stale per-entry dirty bit.
+reorder_dict = {}
+for i in 0..200:
+    reorder_dict["r" + string(i)] = "value" + string(i)
+
+churn_h = []
+for i in 0..3000:
+    collection.append(churn_h, [i, "h" + string(i)])
+
+reorder_dict["r150"] = "written-before-delete"
+collection.delete(reorder_dict, "r0")   # swap-compacts: the last entry moves into r0's old dense slot
+
+churn_i = []
+for i in 0..3000:
+    collection.append(churn_i, [i, "i" + string(i)])
+
+assert(reorder_dict["r150"] == "written-before-delete", "a value written into a dict before a delete() (which swap-compacts the dense array) survives further GC pressure")
+assert(reorder_dict["r199"] == "value199" and not ("r0" in reorder_dict), "the swap-compacted entry moved correctly, and the deleted key is really gone")
+
+print("test_card_marking.aer: all assertions passed.")

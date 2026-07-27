@@ -71,6 +71,10 @@ void    hashtable_reserve(HashTable* t, unsigned int expected_count);
 void    hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value);
 AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length, uint64_t hash);
 
+/* Same probe as hashtable_get_hashed, but returns the entry's dense-array index (or -1) instead of
+   a payload pointer -- see its own comment, hashtable.c, for why the GC's write barrier needs this. */
+int hashtable_get_index_hashed(HashTable* t, const char* key, unsigned int length, uint64_t hash);
+
 /* The exact hash function every HashTable in this codebase uses -- exposed so a caller can
    precompute (and cache) a hash to pass to the _hashed calls above, using the identical algorithm
    this file's own internal hash_key() already used before this existed. */

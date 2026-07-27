@@ -71,6 +71,16 @@ struct AerArray {
        skip its O(n) homogeneity re-scan when the same array at the same generation was already
        verified against the same shape on a previous call. */
     unsigned int generation;
+    /* Card marking for the O(n) minor-GC rescan fix -- see gc_barrier_array's own comment (gc.c).
+       dirty_cards is NULL until this array is actually remembered (its first old-array-holding-a-
+       young-value write), so the common case (never promoted to old) pays nothing extra; one bit
+       per element once allocated. dirty_all is a coarser fallback set by any operation that shifts
+       element-to-index correspondence (collection.delete/insert/sort) -- rather than shift every
+       affected bit for a rare path, the next minor GC just rescans the whole array that one cycle
+       and clears dirty_all again. */
+    unsigned char* dirty_cards;
+    unsigned int   dirty_cards_bytes;
+    bool           dirty_all;
 };
 _Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 

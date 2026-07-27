@@ -25,7 +25,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             a->capacity = a->capacity ? a->capacity * 2 : 4;
             a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
         }
-        gc_barrier_array(vm, a, val);
+        gc_barrier_array(vm, a, a->count, val);
         a->items[a->count++] = val;
         a->generation++;   /* see AerArray.generation's own comment, value.h */
         vm_stack_push(vm, arr); return true;
@@ -59,6 +59,12 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             char kbuf[VM_KEY_MAX + 1];
             memcpy(kbuf, ks->data, klen);
             kbuf[klen] = '\0';
+            /* hashtable_remove swap-compacts the dense array (moves the last entry into the
+               vacated slot), which invalidates any existing per-index dirty-card state -- rather
+               than fix up the one moved entry's card (real complexity for a rare path), dirty_all
+               just forces a full rescan next cycle if this dict is remembered (harmless, cheap,
+               no-op otherwise). See AerDict.dirty_cards's own comment, vm.h. */
+            aer_as_dict(obj)->dirty_all = true;
             hashtable_remove(&aer_as_dict(obj)->map, kbuf, klen);
             vm_stack_push(vm, obj); return true;
         }
@@ -69,6 +75,9 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             int64_t i = aer_as_int(key);
             if (i < 0) i += (int64_t)a->count;
             if (i < 0 || (uint64_t)i >= a->count) { error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(key), a->count); vm_stack_push(vm, aer_null()); return true; }
+            /* Shifts every element after i down by one -- same dirty_all reasoning as the dict
+               branch above (see AerArray.dirty_cards's own comment, value.h). */
+            a->dirty_all = true;
             memmove(&a->items[i], &a->items[i + 1], (size_t)(a->count - (uint64_t)i - 1) * sizeof(AerVal));
             a->count--;
             a->generation++;   /* see AerArray.generation's own comment, value.h */
@@ -122,7 +131,11 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             a->capacity = a->capacity ? a->capacity * 2 : 4;
             a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
         }
-        gc_barrier_array(vm, a, val);
+        /* Shifts every element from i onward up by one -- same dirty_all reasoning as delete's own
+           (see AerArray.dirty_cards's own comment, value.h); gc_barrier_array's own per-index card
+           for the new value at i is harmless but redundant once dirty_all forces a full rescan. */
+        a->dirty_all = true;
+        gc_barrier_array(vm, a, (unsigned int)i, val);
         memmove(&a->items[i + 1], &a->items[i], (size_t)(a->count - (uint64_t)i) * sizeof(AerVal));
         a->items[i] = val;
         a->count++;
@@ -172,6 +185,10 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             error("sort() requires all elements to be numbers, or all to be strings");
             vm_stack_push(vm, aer_null()); return true;
         }
+        /* Arbitrary reorder -- same dirty_all reasoning as delete/insert above (see
+           AerArray.dirty_cards's own comment, value.h); a string element is a real heap reference
+           (unlike a number), so this matters even though sort() never replaces a value. */
+        a->dirty_all = true;
         qsort(a->items, a->count, sizeof(AerVal), sort_cmp);
         vm_stack_push(vm, arr); return true;
     }

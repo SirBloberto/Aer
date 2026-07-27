@@ -52,12 +52,32 @@ static void gc_remember(VmHeap* heap, void* ptr, RememberedKind kind) {
     heap->remembered_count++;
 }
 
-/* Array write barrier (index-assign, append). */
-void gc_barrier_array(VM* vm, AerArray* a, AerVal new_value) {
+/* Card marking: grows *dirty_cards (if needed) to cover `index`, then sets that bit. Shared by
+   gc_barrier_array/gc_barrier_dict -- AerArray and AerDict aren't a common type in C, so the two
+   relevant fields are passed by pointer instead of duplicating this logic twice. Called on EVERY
+   qualifying write, not just the one that first adds the container to remembered_set (gc_remember's
+   own dedup only governs remembered_set membership, not which indices need rescanning). */
+static void mark_card_dirty(unsigned char** dirty_cards, unsigned int* dirty_cards_bytes, unsigned int index) {
+    unsigned int needed_bytes = index / 8 + 1;
+    if (needed_bytes > *dirty_cards_bytes) {
+        *dirty_cards = xrealloc(*dirty_cards, needed_bytes);
+        memset(*dirty_cards + *dirty_cards_bytes, 0, needed_bytes - *dirty_cards_bytes);
+        *dirty_cards_bytes = needed_bytes;
+    }
+    (*dirty_cards)[index / 8] |= (unsigned char)(1u << (index % 8));
+}
+
+/* Array write barrier (index-assign, append, insert) -- `index` is the exact slot new_value lands
+   in, so the next minor GC's REMEMBERED_ARRAY rescan (gc_collect below) only has to revisit that
+   one slot instead of the whole array. See AerArray.dirty_cards's own comment (value.h) for the
+   dirty_all fallback collection.delete/insert/sort use instead, when a write also shifts OTHER
+   elements' indices. */
+void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value) {
     VmHeap* heap = &vm->heap;
     if (!heap->gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
     if (pool_is_young(&heap->array_pool, a)) return;   /* young containers are re-traced normally next cycle */
     if (!value_is_young(heap, new_value)) return;
+    mark_card_dirty(&a->dirty_cards, &a->dirty_cards_bytes, index);
     gc_remember(heap, a, REMEMBERED_ARRAY);
 }
 
@@ -65,7 +85,9 @@ void gc_barrier_array(VM* vm, AerArray* a, AerVal new_value) {
    it needs its own barrier instead of gc_barrier_array's old shape-ternary dispatch. Only ever
    needs to consider TYPE_ANY fields in practice (a raw typed field can never hold a reference the
    GC must trace), but the caller doesn't need to know that -- value_is_young already returns false
-   for a primitive regardless. */
+   for a primitive regardless. No card marking here -- a struct's field count is small and fixed
+   (MAX_STRUCT_FIELDS), so a full per-struct rescan is already bounded, unlike an unboundedly
+   growing array/dict; the O(n^2) problem this fixes is specific to unbounded containers. */
 void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value) {
     VmHeap* heap = &vm->heap;
     if (!heap->gc_ever_collected) return;
@@ -74,12 +96,18 @@ void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value) {
     gc_remember(heap, s, REMEMBERED_STRUCT);
 }
 
-/* Dict entry write barrier (update-in-place and new-entry paths). */
-void gc_barrier_dict(VM* vm, AerDict* d, AerVal new_value) {
+/* Dict entry write barrier (update-in-place and new-entry paths) -- `index` is the entry's DENSE
+   index (map.dense[index]), which the caller must resolve BEFORE the actual hashtable_get_hashed/
+   hashtable_put_hashed call: an update reuses an existing entry's stable dense index, while a fresh
+   key always lands at the table's current count (hashtable_get_index_hashed, hashtable.c). Stable
+   across ordinary insert/update; hashtable_remove's swap-compaction invalidates it, which is why
+   collection.delete sets dirty_all instead (see AerDict.dirty_cards's own comment, vm.h). */
+void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value) {
     VmHeap* heap = &vm->heap;
     if (!heap->gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
     if (pool_is_young(&heap->dict_pool, d)) return;
     if (!value_is_young(heap, new_value)) return;
+    mark_card_dirty(&d->dirty_cards, &d->dirty_cards_bytes, index);
     gc_remember(heap, d, REMEMBERED_DICT);
 }
 
@@ -212,8 +240,8 @@ static void mark_chunk_roots(VmHeap* heap, Chunk* chunk) {
 /* ------------------------------------------------------------------ */
 
 static void free_string(void* cell)   { free(((AerString*)cell)->data); }
-static void free_array(void* cell)    { free(((AerArray*)cell)->items); }
-static void free_dict(void* cell)     { hashtable_free(&((AerDict*)cell)->map); }   /* already frees every entry's key */
+static void free_array(void* cell)    { AerArray* a = (AerArray*)cell; free(a->items); free(a->dirty_cards); }
+static void free_dict(void* cell)     { AerDict* d = (AerDict*)cell; hashtable_free(&d->map); free(d->dirty_cards); }   /* hashtable_free already frees every entry's key */
 static void free_function(void* cell) { (void)cell; }   /* nothing to free — no closure upvalues array anymore */
 static void free_struct(void* cell)   { (void)cell; }   /* items lives inline in this same cell — nothing separate to free */
 static void free_packed_array(void* cell) { free(((AerPackedArray*)cell)->data); }
@@ -276,13 +304,37 @@ static void gc_collect(VM* vm, bool minor) {
 
             switch (e->kind) {
                 case REMEMBERED_ARRAY: {
+                    /* Card-marked: only the indices actually dirtied since the last rescan get
+                       revisited (turning a pure-growth "build a huge array via many appends"
+                       pattern into true O(n) total instead of O(n^2)) -- dirty_all is the fallback
+                       for an operation that shifts element-to-index correspondence instead
+                       (collection.delete/insert/sort, aer_collection.c), and !dirty_cards is a
+                       defensive fallback that should never actually trigger (every write reaching
+                       this array via gc_barrier_array already dirties a card before remembering
+                       it), kept anyway rather than assumed. */
                     AerArray* a = (AerArray*)e->ptr;
-                    for (unsigned int j = 0; j < a->count; j++) worklist_push(heap, a->items[j]);
+                    if (a->dirty_all || !a->dirty_cards) {
+                        for (unsigned int j = 0; j < a->count; j++) worklist_push(heap, a->items[j]);
+                    } else {
+                        for (unsigned int byte_i = 0; byte_i < a->dirty_cards_bytes; byte_i++) {
+                            unsigned char byte = a->dirty_cards[byte_i];
+                            if (!byte) continue;
+                            for (unsigned int bit = 0; bit < 8; bit++) {
+                                if (!(byte & (1u << bit))) continue;
+                                unsigned int idx = byte_i * 8 + bit;
+                                if (idx < a->count) worklist_push(heap, a->items[idx]);
+                            }
+                        }
+                    }
+                    if (a->dirty_cards) memset(a->dirty_cards, 0, a->dirty_cards_bytes);
+                    a->dirty_all = false;
                     break;
                 }
                 case REMEMBERED_STRUCT: {
                     /* Only TYPE_ANY fields -- see mark_value's TYPE_STRUCT case for why a raw
-                       field must never be pushed as if it were a tagged AerVal. */
+                       field must never be pushed as if it were a tagged AerVal. No card marking
+                       here -- see gc_barrier_struct's own comment for why a struct's small, fixed
+                       field count doesn't need it. */
                     AerStruct* s = (AerStruct*)e->ptr;
                     for (unsigned int j = 0; j < s->shape->field_count; j++)
                         if (s->shape->field_types[j] == TYPE_ANY)
@@ -290,9 +342,25 @@ static void gc_collect(VM* vm, bool minor) {
                     break;
                 }
                 case REMEMBERED_DICT: {
-                    HashTable* map = &((AerDict*)e->ptr)->map;
-                    for (unsigned int j = 0; j < map->count; j++)
-                        worklist_push(heap, map->dense[j].payload);
+                    /* Same card-marked scan as REMEMBERED_ARRAY above, indexed by dense slot. */
+                    AerDict* d = (AerDict*)e->ptr;
+                    HashTable* map = &d->map;
+                    if (d->dirty_all || !d->dirty_cards) {
+                        for (unsigned int j = 0; j < map->count; j++)
+                            worklist_push(heap, map->dense[j].payload);
+                    } else {
+                        for (unsigned int byte_i = 0; byte_i < d->dirty_cards_bytes; byte_i++) {
+                            unsigned char byte = d->dirty_cards[byte_i];
+                            if (!byte) continue;
+                            for (unsigned int bit = 0; bit < 8; bit++) {
+                                if (!(byte & (1u << bit))) continue;
+                                unsigned int idx = byte_i * 8 + bit;
+                                if (idx < map->count) worklist_push(heap, map->dense[idx].payload);
+                            }
+                        }
+                    }
+                    if (d->dirty_cards) memset(d->dirty_cards, 0, d->dirty_cards_bytes);
+                    d->dirty_all = false;
                     break;
                 }
             }

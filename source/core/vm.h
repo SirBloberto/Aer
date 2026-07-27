@@ -11,6 +11,13 @@
 struct AerDict {
     unsigned char gc_state;
     HashTable     map;
+    /* Card marking for the O(n) minor-GC rescan fix -- same fields, same reasoning, as AerArray's
+       own (value.h). dirty_cards indexes map.dense[] by its DENSE index (stable across ordinary
+       insert/update; hashtable_remove's swap-compaction invalidates it, which is why
+       collection.delete sets dirty_all rather than trying to shift the affected bit). */
+    unsigned char* dirty_cards;
+    unsigned int   dirty_cards_bytes;
+    bool           dirty_all;
 };
 _Static_assert(offsetof(struct AerDict, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
@@ -981,18 +988,23 @@ AerArray* vm_new_array(void);
 AerDict* vm_new_dict(void);
 
 /* Generational-GC write barrier — any store of `new_value` into an already-existing array must go
-   through this (see gc_barrier_array's own comment, vm.c). Exposed for aer_collection.c's
-   append/insert; a freshly built, not-yet-returned array needs no barrier. */
-void gc_barrier_array(VM* vm, AerArray* a, AerVal new_value);
+   through this (see gc_barrier_array's own comment, gc.c). `index` is the exact slot being written
+   -- it feeds card marking, so a later minor GC only has to rescan indices actually dirtied since
+   the last cycle rather than the whole array. Exposed for aer_collection.c's append/insert; a
+   freshly built, not-yet-returned array needs no barrier. */
+void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value);
 
 /* Same contract as gc_barrier_array, for a struct field-set -- AerStruct is its own type/pool now,
    not a shaped AerArray, so it needs its own barrier rather than gc_barrier_array's old
-   shape-ternary dispatch. */
+   shape-ternary dispatch. No index/card-marking parameter -- see gc_barrier_struct's own comment
+   (gc.c) for why a struct's small, fixed field count doesn't need it. */
 void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value);
 
 /* Same contract, for a dict entry (update-in-place and new-entry paths) -- vm.c's vm_call_builtin
-   is the only caller outside gc.c itself. */
-void gc_barrier_dict(VM* vm, AerDict* d, AerVal new_value);
+   is the only caller outside gc.c itself. `index` is the entry's DENSE index (map.dense[index]) --
+   see gc_barrier_dict's own comment (gc.c) for how the caller resolves this before the actual
+   hashtable write. */
+void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value);
 
 /* Both defined in gc.c; called from vm.c's gc_maybe_collect (the tiny, always_inline gatekeeper
    checked once per DISPATCH()) once the rare threshold-crossing case actually happens, and from
