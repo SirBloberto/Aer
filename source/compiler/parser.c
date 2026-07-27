@@ -15,13 +15,6 @@ static int reserved_floor     = 0;
 static int max_register_used = 0;
 static void track_peak(int v) { if (v > max_register_used) max_register_used = v; }
 
-/* Same idea as max_register_used/track_peak, for raw_int_next_temp/raw_real_next_temp -- the real
-   peak raw-slot need per function, captured into ChunkFunction/AerFunction's max_raw_ints/reals
-   right alongside max_registers (parse_function/parse_function_expr). */
-static int max_raw_int_used = 0, max_raw_real_used = 0;
-static void track_raw_int_peak(int v)  { if (v > max_raw_int_used)  max_raw_int_used  = v; }
-static void track_raw_real_peak(int v) { if (v > max_raw_real_used) max_raw_real_used = v; }
-
 /* Raw-slot allocators, mirroring reg_alloc/reg_free/reg_reserve's shape -- except overflow:
    raw_int_alloc/raw_real_alloc return -1 instead of erroring, and every caller falls back to
    ordinary boxed storage for that one value. */
@@ -30,7 +23,6 @@ static int raw_real_next_temp = 0, raw_real_reserved_floor = 0;
 
 static int raw_int_alloc(void) {
     if (raw_int_next_temp >= RAW_REGISTERS_INT) return -1;
-    track_raw_int_peak(raw_int_next_temp + 1);
     return raw_int_next_temp++;
 }
 static void raw_int_free(int count) {
@@ -39,7 +31,6 @@ static void raw_int_free(int count) {
 }
 static int raw_real_alloc(void) {
     if (raw_real_next_temp >= RAW_REGISTERS_REAL) return -1;
-    track_raw_real_peak(raw_real_next_temp + 1);
     return raw_real_next_temp++;
 }
 static void raw_real_free(int count) {
@@ -54,7 +45,6 @@ static int raw_int_reserve_one(void) {
     int slot = raw_int_reserved_floor;
     raw_int_reserved_floor++;
     raw_int_next_temp = raw_int_reserved_floor;
-    track_raw_int_peak(raw_int_reserved_floor);
     return slot;
 }
 static int raw_real_reserve_one(void) {
@@ -62,7 +52,6 @@ static int raw_real_reserve_one(void) {
     int slot = raw_real_reserved_floor;
     raw_real_reserved_floor++;
     raw_real_next_temp = raw_real_reserved_floor;
-    track_raw_real_peak(raw_real_reserved_floor);
     return slot;
 }
 
@@ -70,8 +59,6 @@ void reg_reset(void) {
     next_temp_register = 0;
     reserved_floor     = 0;
     max_register_used  = 0;
-    max_raw_int_used   = 0;
-    max_raw_real_used  = 0;
     raw_int_next_temp = 0;  raw_int_reserved_floor = 0;
     raw_real_next_temp = 0; raw_real_reserved_floor = 0;
 }
@@ -105,22 +92,27 @@ void reg_free(int count) {
     if (next_temp_register < reserved_floor) next_temp_register = reserved_floor;
 }
 
-/* Guard for RK16-wire opcodes: 32767 registers-or-constants is far beyond any real program, but
-   silent truncation would corrupt the instruction rather than refuse to compile. */
-static bool rk16_fits(int rk) {
-    return (rk & ~RK_CONST_FLAG) <= RK16_MAX_INDEX;
+/* Guard for PACK_RK20 opcodes: 524288 registers-or-constants is far beyond any real program,
+   but silent truncation would corrupt the instruction rather than refuse to compile. */
+static bool rk20_fits(int rk) {
+    return (rk & ~RK_CONST_FLAG) <= RK20_MAX_INDEX;
 }
 
-/* Same guard, narrower (128), for opcodes needing two RK operands in one packed word -- see
-   RK8's own comment in vm.h. */
-static bool rk8_fits(int rk) {
-    return (rk & ~RK_CONST_FLAG) <= RK8_MAX_INDEX;
+/* Same guard, narrower (256), for OP_BINARY's own family -- see PACK_BINARY's 9-bit RK field. */
+static bool rk9_fits(int rk) {
+    return (rk & ~RK_CONST_FLAG) <= RK9_MAX_INDEX;
+}
+
+/* Guard for OP_CALL_MODULE's module/fn indices (17 bits) and the field-fusion opcodes'
+   field_idx (14 bits) -- tighter budgets since those words are already full. */
+static bool pool_idx_fits(unsigned int idx, unsigned int max) {
+    return idx <= max;
 }
 
 /* Forward-declared so emit_binary (which needs it) can come before it. */
 static int box_if_raw(Chunk* c, int rk);
 
-/* Every OP_BINARY-family emission funnels through here. Boxes any raw-flagged operand first
+/* Every OP_BINARY emission funnels through here. Boxes any raw-flagged operand first
    (a no-op for a plain register or constant) -- only parse_binary_ops's own raw-composing path
    (try_emit_binary_raw) tries the native route before reaching here. */
 static int materialize(Chunk* c, int rk);
@@ -128,13 +120,12 @@ static int materialize(Chunk* c, int rk);
 static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
     rk_lhs = box_if_raw(c, rk_lhs);
     rk_rhs = box_if_raw(c, rk_rhs);
-    /* A constant past RK8's budget is spilled into a scratch register instead of refusing to
-       compile, freed immediately after the emit -- same materialize()/OP_LOADK hoist the old
-       RK9 scheme used for its own, narrower overflow. */
+    /* A constant past RK9's budget is spilled into a scratch register instead of refusing to
+       compile, freed immediately after the emit. */
     int spilled = 0;
-    if (!rk8_fits(rk_lhs)) { rk_lhs = materialize(c, rk_lhs); spilled++; }
-    if (!rk8_fits(rk_rhs)) { rk_rhs = materialize(c, rk_rhs); spilled++; }
-    chunk_emit(c, PACK3(op, dest, pack_rk8(rk_lhs), pack_rk8(rk_rhs)));
+    if (!rk9_fits(rk_lhs)) { rk_lhs = materialize(c, rk_lhs); spilled++; }
+    if (!rk9_fits(rk_rhs)) { rk_rhs = materialize(c, rk_rhs); spilled++; }
+    chunk_emit(c, PACK_BINARY(op, dest, rk_lhs, rk_rhs));
     if (spilled) reg_free(spilled);
 }
 
@@ -146,20 +137,15 @@ unsigned int emit_jump_if_false_reg(Chunk* c, int reg) {
 }
 
 void patch_jump(Chunk* c, unsigned int patch_offset, unsigned int target) {
-    c->code[patch_offset] = (uint32_t)target;
+    c->code[patch_offset] = (int)target;
 }
 
 /* Returns the callee_offset word's offset for a forward-referencing call to patch later
-   (pending_call_add); an already-resolved call ignores the return value. func_index is the
-   target's index into chunk->functions[] -- lbl_call reads it to size the callee's frame from its
-   real max_registers/max_raw_ints/max_raw_reals peaks instead of a flat, function-agnostic
-   ceiling. */
-unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count,
-                           unsigned int func_index) {
+   (pending_call_add); an already-resolved call ignores the return value. */
+unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count) {
     chunk_emit(c, PACK3(OP_CALL, dest_reg, arg_reg_base, arg_count));
     unsigned int patch_offset = c->count;
-    chunk_emit(c, (uint32_t)callee_offset);
-    chunk_emit(c, (uint32_t)func_index);
+    chunk_emit(c, (int)callee_offset);
     return patch_offset;
 }
 
@@ -168,11 +154,9 @@ void emit_return(Chunk* c, int src_reg) {
 }
 
 /* Functions as values -- callee_reg is always a plain register (already materialized), so no
-   patching is ever needed here. 3 registers fit word0 (PACK3); callee_reg is the 4th and gets
-   its own trailing word (no room left in a 32-bit word0 for a 4th 8-bit field). */
+   patching is ever needed here. */
 void emit_call_value(Chunk* c, int dest_reg, int arg_reg_base, int arg_count, int callee_reg) {
-    chunk_emit(c, PACK3(OP_CALL_VALUE, dest_reg, arg_reg_base, arg_count));
-    chunk_emit(c, (uint32_t)callee_reg);
+    chunk_emit(c, PACK_REG4(OP_CALL_VALUE, dest_reg, arg_reg_base, arg_count, callee_reg));
 }
 
 void emit_print_repl(Chunk* c, int src_reg) {
@@ -186,37 +170,35 @@ void emit_array_new(Chunk* c, int dest_reg, int item_reg_base, int item_count) {
 void emit_index_get(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
     rk_idx = box_if_raw(c, rk_idx);
     /* Same spill-to-register fallback as emit_binary. */
-    if (!rk8_fits(rk_idx)) {
+    if (!rk9_fits(rk_idx)) {
         rk_idx = materialize(c, rk_idx);
-        chunk_emit(c, PACK3(OP_INDEX_GET, dest_reg, arr_reg, pack_rk8(rk_idx)));
+        chunk_emit(c, PACK_INDEX_GET(dest_reg, arr_reg, rk_idx));
         reg_free(1);
         return;
     }
-    chunk_emit(c, PACK3(OP_INDEX_GET, dest_reg, arr_reg, pack_rk8(rk_idx)));
+    chunk_emit(c, PACK_INDEX_GET(dest_reg, arr_reg, rk_idx));
 }
 
 void emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val) {
     rk_idx = box_if_raw(c, rk_idx);
     rk_val = box_if_raw(c, rk_val);
-    int spilled = 0;
-    if (!rk8_fits(rk_idx)) { rk_idx = materialize(c, rk_idx); spilled++; }
-    if (!rk8_fits(rk_val)) { rk_val = materialize(c, rk_val); spilled++; }
-    chunk_emit(c, PACK3(OP_INDEX_SET, arr_reg, pack_rk8(rk_idx), pack_rk8(rk_val)));
-    if (spilled) reg_free(spilled);
+    if (!rk20_fits(rk_idx) || !rk20_fits(rk_val)) {
+        error_at("Expression too large to compile (register/constant index exceeds the index-set encoding's range)");
+        return;
+    }
+    chunk_emit(c, PACK_INDEX_SET(arr_reg, rk_idx, rk_val));
 }
 
 /* rk_start/rk_end are RK-encoded like any value operand; a missing bound is an RK-encoded
-   null constant built by the caller. RK16 (32767 direct) is generous enough that no hoist is
-   needed here in practice, but guard anyway rather than silently corrupt. */
+   null constant built by the caller. */
 void emit_slice_get(Chunk* c, int dest_reg, int arr_reg, int rk_start, int rk_end) {
     rk_start = box_if_raw(c, rk_start);
     rk_end   = box_if_raw(c, rk_end);
-    if (!rk16_fits(rk_start) || !rk16_fits(rk_end)) {
+    if (!rk20_fits(rk_start) || !rk20_fits(rk_end)) {
         error_at("Expression too large to compile (register/constant index exceeds the slice-get encoding's range)");
         return;
     }
-    chunk_emit(c, PACK3(OP_SLICE_GET, dest_reg, arr_reg, 0));
-    chunk_emit(c, PACK_2X16(pack_rk16(rk_start), pack_rk16(rk_end)));
+    chunk_emit(c, PACK_SLICE_GET(dest_reg, arr_reg, rk_start, rk_end));
 }
 
 void emit_dict_new(Chunk* c, int dest_reg, int pair_reg_base, int pair_count) {
@@ -231,11 +213,9 @@ unsigned int emit_iter_next_array(Chunk* c, int col_reg, int idx_reg, int item_d
 }
 
 unsigned int emit_iter_next_pair(Chunk* c, int col_reg, int idx_reg, int key_dest_reg, int val_dest_reg) {
-    /* 3 registers fit word0 (PACK3); the 4th (val_dest_reg) gets its own trailing word since a
-       32-bit word0 has no room left for it alongside the opcode; end_target stays its own word
-       too, uniformly, so patch_jump stays a blind overwrite. */
-    chunk_emit(c, PACK3(OP_ITER_NEXT_PAIR, col_reg, idx_reg, key_dest_reg));
-    chunk_emit(c, (uint32_t)val_dest_reg);
+    /* All 4 registers fit in one packed word (PACK_REG4); end_target stays its own word, since a
+   patchable jump target is never packed alongside anything else. */
+    chunk_emit(c, PACK_REG4(OP_ITER_NEXT_PAIR, col_reg, idx_reg, key_dest_reg, val_dest_reg));
     unsigned int patch_offset = c->count;
     chunk_emit(c, 0);   /* placeholder — patched by patch_jump once the loop-exit target is known */
     return patch_offset;
@@ -243,45 +223,38 @@ unsigned int emit_iter_next_pair(Chunk* c, int col_reg, int idx_reg, int key_des
 
 /* Loop-rotated range-for pair, used only by parse_for_in's `for i in a..b..step:` form. */
 unsigned int emit_iter_range_prep(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg) {
-    chunk_emit(c, PACK3(OP_ITER_RANGE_PREP, cur_reg, end_reg, step_reg));
-    chunk_emit(c, (uint32_t)item_dest_reg);
+    chunk_emit(c, PACK_REG4(OP_ITER_RANGE_PREP, cur_reg, end_reg, step_reg, item_dest_reg));
     unsigned int patch_offset = c->count;
     chunk_emit(c, 0);   /* placeholder — patched once the loop's overall exit address is known */
     return patch_offset;
 }
 
 /* body_target is always already resolved -- unlike every other loop jump, never a patch
-   placeholder -- but still gets its own dedicated word, uniformly with PREP, rather than
-   packing tighter for one opcode as a special case. */
+   placeholder. */
 void emit_iter_range_loop(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg, unsigned int body_target) {
-    chunk_emit(c, PACK3(OP_ITER_RANGE_LOOP, cur_reg, end_reg, step_reg));
-    chunk_emit(c, (uint32_t)item_dest_reg);
-    chunk_emit(c, (uint32_t)body_target);
+    chunk_emit(c, PACK_REG4(OP_ITER_RANGE_LOOP, cur_reg, end_reg, step_reg, item_dest_reg));
+    chunk_emit(c, (int)body_target);
 }
 
 void emit_struct_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int arg_reg_base, int arg_count) {
-    chunk_emit(c, PACK3(OP_STRUCT_NEW, dest_reg, arg_reg_base, arg_count));
-    chunk_emit(c, (uint32_t)type_name_pool_idx);
+    chunk_emit(c, PACK_STRUCT_NEW(dest_reg, arg_reg_base, arg_count, type_name_pool_idx));
 }
 
 void emit_packed_array_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int rk_count) {
-    chunk_emit(c, PACK_OP_A_W16(OP_PACKED_ARRAY_NEW, dest_reg, pack_rk16(rk_count)));
-    chunk_emit(c, (uint32_t)type_name_pool_idx);
+    chunk_emit(c, PACK_PACKED_ARRAY_NEW(dest_reg, type_name_pool_idx, rk_count));
 }
 
 void emit_field_get(Chunk* c, int dest_reg, int struct_reg, unsigned int field_name_pool_idx) {
-    chunk_emit(c, PACK3(OP_FIELD_GET, dest_reg, struct_reg, 0));
-    chunk_emit(c, (uint32_t)field_name_pool_idx);
+    chunk_emit(c, PACK_FIELD_GET(dest_reg, struct_reg, field_name_pool_idx));
 }
 
 void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, int rk_val) {
     rk_val = box_if_raw(c, rk_val);
-    if (!rk16_fits(rk_val)) {
+    if (!rk9_fits(rk_val) || field_name_pool_idx > RK9_MAX_INDEX) {
         error_at("Expression too large to compile (register/constant index exceeds the field-set encoding's range)");
         return;
     }
-    chunk_emit(c, PACK_OP_A_W16(OP_FIELD_SET, struct_reg, pack_rk16(rk_val)));
-    chunk_emit(c, (uint32_t)field_name_pool_idx);
+    chunk_emit(c, PACK_FIELD_SET(struct_reg, field_name_pool_idx, rk_val));
 }
 
 /* ------------------------------------------------------------------ */
@@ -323,13 +296,6 @@ static void parse_import(Chunk* c);
 static bool is_builtin_name(Chunk* c, unsigned int name_idx);
 static int  parse_builtin_call(Chunk* c, unsigned int name_idx);
 static int  parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base);
-static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal* param_defaults,
-                                         int* out_param_count, int* out_min_param_count);
-static void parse_function_body(Chunk* c, unsigned int* param_names, int param_count,
-                                    int hint_param_reg, Shape* hint_shape, bool hint_is_element_shape,
-                                    unsigned int* out_max_registers,
-                                    unsigned int* out_max_raw_ints,
-                                    unsigned int* out_max_raw_reals);
 
 /* name_idx -> register. No global/local distinction (this slice has no function defs, so
    every register is effectively local). */
@@ -345,82 +311,6 @@ static int          var_count = 0;
    VAR_BOXED on a mismatch; VAR_BOXED never promotes to RAW_*. */
 typedef enum { VAR_BOXED, VAR_RAW_INT, VAR_RAW_REAL } VarKind;
 static VarKind var_kind[FRAME_REGISTERS];
-
-/* Shape-specializing compilation (see OP_CALL_SPEC, vm.c) -- tracks which of the CURRENT
-   function's parameters have been used as the base of a struct-field access, directly or through
-   a one-hop plain-local alias (`pi = particles[i]; ...; pi.field`, alias_source_param[pi's own
-   register] = the parameter index). Parameter i is always register i (var_slot binds parameters
-   first, in order, right after the allocator resets to 0), so a register index doubles as a
-   parameter index for the first current_param_count entries -- no separate mapping needed. Folded
-   into ChunkFunction.shape_sensitive_mask at function exit, same moment as max_registers/
-   max_raw_ints/max_raw_reals. */
-static bool shape_sensitive_param[FRAME_REGISTERS];
-static int  current_param_count = 0;
-static int  alias_source_param[FRAME_REGISTERS];   /* -1 = no known alias */
-
-/* Populated ONLY during a specialization recompile (parse_function_body's hint_param_reg/
-   hint_shape params) -- NULL for every register during an ordinary compile, always. Consulted at
-   the same '.field'/'[idx].field' emission sites mark_shape_sensitive is (parse_postfix_chain,
-   parse_chain_assignment): when set for the access's base register, the field's byte offset/type
-   is resolved directly from this Shape at COMPILE time (no vm_resolve_field_by_shape call, ever),
-   and the raw specialized opcode variants (OP_FIELD_GET_RAW_INT etc., vm.h) are emitted instead of
-   the generic ones. Only ever holds a register's OWN shape (a struct instance, or a packed array)
-   -- for a plain-array parameter, see reg_known_element_shape below instead. */
-static Shape* reg_known_shape[FRAME_REGISTERS];
-
-/* Same idea as reg_known_shape, but for a plain-array parameter's ELEMENT shape (SPEC_KIND_
-   ARRAY_OF_STRUCTS) -- `particles` itself is never struct-shaped (it's a TYPE_ARRAY), so seeding
-   reg_known_shape[particles' reg] directly would be meaningless; this table instead seeds the
-   shape that `particles[i]` is known to produce. Consulted ONLY at the plain (non-fused) index-get
-   site in parse_postfix_chain, which propagates it onto the alias's own PERMANENT register (never a
-   temp -- see that site's comment for why temps are unsafe here) at the exact point parse_assignment
-   binds a new local name to it (`pi = particles[i]`). */
-static Shape* reg_known_element_shape[FRAME_REGISTERS];
-
-/* Side-channel from the plain index-get site (parse_postfix_chain) to parse_assignment's plain '='
-   handler, letting it recognize an RHS that's EXACTLY `some_param[idx]` (nothing else composed) so
-   it can propagate alias_source_param/reg_known_element_shape onto the new local's own permanent
-   register. Deliberately keyed on exact register-number equality against the temp the index-get
-   itself produced (last_plain_index_dest_reg) rather than a syntactic flag, and consumed (reset to
-   -1) the instant it's read -- so a later, unrelated assignment whose RHS temp happens to reuse the
-   same now-freed register number never sees a stale match. Never propagated onto a temp register
-   itself (only onto the named variable's permanent one): unlike a parameter's register, a temp
-   register routinely gets freed and reused for a completely unrelated value within the very same
-   compile, and reg_known_shape has no per-write invalidation for that churn -- only for the
-   deliberate few sites (parameter/permanent-register reassignment) that already clear it. */
-static int    last_plain_index_dest_reg         = -1;
-static int    last_plain_index_src_param        = -1;
-static Shape* last_plain_index_known_elem_shape = NULL;
-
-/* reg is the parameter's own register (0..current_param_count-1) OR a register whose value is
-   known (via alias_source_param) to have come from indexing that parameter -- either way, marks
-   that parameter shape-sensitive. Safe to call with any register (out-of-range/no-alias is a
-   silent no-op), matching var_lookup_rk's own "harmless on a miss" convention. */
-static void mark_shape_sensitive(int reg) {
-    if (reg < 0 || reg >= FRAME_REGISTERS) return;
-    if (reg < current_param_count) { shape_sensitive_param[reg] = true; return; }
-    int src = alias_source_param[reg];
-    if (src >= 0) shape_sensitive_param[src] = true;
-}
-
-/* Compile-time field lookup against a KNOWN Shape (only ever reached via reg_known_shape[], so
-   only during a specialization recompile) -- resolves the field's byte offset/type directly from
-   the Shape's own arrays, skipping vm_resolve_field_by_shape's runtime lookup and inline cache
-   entirely, since the shape is already a compile-time fact here. False means the field doesn't
-   exist on this shape -- callers fall back to the generic (runtime-checked, correctly-erroring)
-   opcode path rather than treating this as an internal error, since a genuinely missing field is
-   a normal source-level mistake the generic path already reports correctly. */
-static bool shape_find_field(Shape* shape, unsigned int field_name_idx,
-                                 unsigned int* out_offset, ValueType* out_type) {
-    for (unsigned int i = 0; i < shape->field_count; i++) {
-        if (shape->field_names[i] == field_name_idx) {
-            *out_offset = shape->field_offsets[i];
-            *out_type   = shape->field_types[i];
-            return true;
-        }
-    }
-    return false;
-}
 
 /* Nonzero while compiling an if/else branch -- disqualifies raw storage (see var_kind). A
    real counter since if/else nests. */
@@ -521,14 +411,14 @@ static int box_if_raw(Chunk* c, int rk) {
     if (rk & RK_RAW_INT_FLAG) {
         int slot = rk & RK_RAW_SLOT_MASK;
         int dest = reg_alloc();
-        chunk_emit(c, PACK3(OP_BOX_INT, dest, slot, 0));
+        chunk_emit(c, PACK_BOX(OP_BOX_INT, dest, slot));
         if (slot >= raw_int_reserved_floor) raw_int_free(1);
         return dest;
     }
     if (rk & RK_RAW_REAL_FLAG) {
         int slot = rk & RK_RAW_SLOT_MASK;
         int dest = reg_alloc();
-        chunk_emit(c, PACK3(OP_BOX_REAL, dest, slot, 0));
+        chunk_emit(c, PACK_BOX(OP_BOX_REAL, dest, slot));
         if (slot >= raw_real_reserved_floor) raw_real_free(1);
         return dest;
     }
@@ -549,7 +439,7 @@ static void ensure_boxed(Chunk* c, unsigned int name_idx) {
     int new_reg = reserved_floor;
     reserved_floor++;
     next_temp_register = reserved_floor;
-    chunk_emit(c, PACK3(box_op, new_reg, old_slot, 0));
+    chunk_emit(c, PACK_BOX(box_op, new_reg, old_slot));
     var_regs[existing_idx] = new_reg;
     var_kind[existing_idx] = VAR_BOXED;
     /* No global_regs update needed -- this path only runs on a currently-raw name. */
@@ -561,8 +451,7 @@ static int materialize(Chunk* c, int rk) {
     rk = box_if_raw(c, rk);
     if (!(rk & RK_CONST_FLAG)) return rk;
     int reg = reg_alloc();
-    /* dest+pool_idx both fit word0 now (op(8)+dest(8)+pool_idx(16)) -- no trailing word. */
-    chunk_emit(c, PACK_OP_A_W16(OP_LOADK, reg, (unsigned int)(rk & ~RK_CONST_FLAG)));
+    chunk_emit(c, PACK1(OP_LOADK, reg)); chunk_emit(c, rk & ~RK_CONST_FLAG);
     return reg;
 }
 
@@ -606,16 +495,12 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
         int64_t v = aer_as_int(c->pool[pool_idx]);
         int slot = raw_int_alloc();
         if (slot < 0) return -1;
-        /* A literal outside the signed 32-bit range must go through the pool instead -- OP_RAW_LOAD_INT's
-           immediate is a full int32 now (the old 20-bit immediate's truncation bug -- `i < 20000000`
-           silently becoming 77056 -- is closed outright, not just widened again), but AER integers are
-           64-bit, so a value beyond INT32_MAX/MIN still needs the pool fallback. */
-        if (v >= INT32_MIN && v <= INT32_MAX) {
-            chunk_emit(c, PACK1(OP_RAW_LOAD_INT, slot));
-            chunk_emit(c, (uint32_t)(int32_t)v);
+        /* A literal outside the signed 20-bit range must go through the pool -- real bug found this
+           way: `i < 20000000` silently truncated to 77056. */
+        if (v >= -524288 && v <= 524287) {
+            chunk_emit(c, PACK_RAW_LOAD_INT(slot, (int)v));
         } else {
-            chunk_emit(c, PACK1(OP_RAW_LOAD_INT_POOL, slot));
-            chunk_emit(c, (uint32_t)pool_idx);
+            chunk_emit(c, PACK_RAW_LOAD_INT_POOL(slot, pool_idx));
         }
         return slot;
     } else {
@@ -623,75 +508,9 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
         unsigned int pool_idx = rk & ~RK_CONST_FLAG;   /* real literal already lives in the pool as a full double */
         int slot = raw_real_alloc();
         if (slot < 0) return -1;
-        chunk_emit(c, PACK1(OP_RAW_LOAD_REAL, slot));
-        chunk_emit(c, (uint32_t)pool_idx);
+        chunk_emit(c, PACK_RAW_LOAD_REAL(slot, pool_idx));
         return slot;
     }
-}
-
-/* Raw-vs-boxed ADD/MUL, REAL only (commutative only -- SUB/DIV are order-sensitive and the common
-   real case, `boxed / raw_expr`, has the raw operand on the side this trick can't help anyway, so
-   they're left to the fully-boxed fallback). Found necessary once struct-field specialization
-   started producing raw values that frequently compose with a boxed parameter-derived value (e.g.
-   nbody's `bodies[j].mass * mag`, mag boxed because it derives from the function's own boxed `dt`
-   parameter) -- without this, every such raw field read was immediately boxed right back, erasing
-   the specialization's own benefit. Reuses the EXISTING OP_RAW_*_REAL_BOXED opcodes (already built
-   for compound assignment's `raw_local += boxed_expr`), which now promote an integer boxed operand
-   to real (matching vm_promote_real's own boxed-path semantics -- a real fix, needed regardless of
-   this function, since `real_raw_local += some_boxed_int` was already reachable and already wrong).
-
-   REAL only, deliberately -- the INT variants (OP_RAW_ADD_INT_BOXED etc.) can't be given the same
-   promotion fix: if the boxed operand turns out to be a real at runtime, the boxed path's own rule
-   is that int+real ALWAYS promotes the WHOLE result to real, which is impossible to do in place
-   into an existing raw INT slot (different underlying array, raw_ints[] vs raw_reals[]) -- there's
-   no way to know at compile time whether a given boxed operand might be a real, so this only ever
-   attempts the fusion where NOT knowing is provably safe (real accumulates real-or-int; there's no
-   "wrong" promotion direction left to guess). An int raw value composing with a boxed operand
-   always falls through to the ordinary, always-correct boxed path below. */
-static bool try_emit_arith_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind_lhs,
-                                         int rk_rhs, RawKind kind_rhs, int* out_rk) {
-    if (op != OP_ADD && op != OP_MUL) return false;
-    bool lhs_raw   = (kind_lhs != RAWK_NONE);
-    int  raw_rk    = lhs_raw ? rk_lhs : rk_rhs;
-    RawKind kind   = lhs_raw ? kind_lhs : kind_rhs;
-    int  boxed_rk  = lhs_raw ? rk_rhs : rk_lhs;
-    if (kind != RAWK_REAL) return false;
-    /* A literal boxed operand or (impossible here, defensive) a raw one: simpler to let the fully
-       boxed fallback handle it than special-case materializing a literal into a register first. */
-    if (boxed_rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG | RK_CONST_FLAG)) return false;
-
-    int slot = raw_materialize(c, raw_rk, kind);
-    if (slot < 0) return false;   /* raw-slot budget exhausted: fall back to boxed */
-
-    /* If raw_rk was already a temp (a freshly materialized literal, or an existing raw TEMP like a
-       specialized field-read result about to be freed anyway), computing in place is safe --
-       nothing else will read that slot again, so it can double as dest with zero new allocation,
-       via the ordinary in-place _BOXED opcode. If it aliases a NAMED raw local's own permanent
-       slot, mutating it in place would corrupt that local for any later use in the function --
-       the non-destructive _TO opcode variant handles that case by reading slot without touching
-       it and writing into a freshly allocated dest instead, avoiding the defensive
-       OP_RAW_MOVE_REAL the naive fix would otherwise need here (measured as a real, avoidable
-       extra dispatch on every fusion against a permanent local, e.g.
-       struct_array_scan.aer's `pi.x += vx * dt`, where vx is a permanent raw-real local). */
-    int dest;
-    Opcode raw_op;
-    if (slot >= raw_real_reserved_floor) {
-        dest = slot;
-        raw_op = (op == OP_ADD) ? OP_RAW_ADD_REAL_BOXED : OP_RAW_MUL_REAL_BOXED;
-        chunk_emit(c, PACK3(raw_op, dest, boxed_rk, 0));
-    } else {
-        dest = raw_real_alloc();
-        if (dest < 0) return false;
-        raw_op = (op == OP_ADD) ? OP_RAW_ADD_REAL_BOXED_TO : OP_RAW_MUL_REAL_BOXED_TO;
-        chunk_emit(c, PACK3(raw_op, dest, slot, boxed_rk));
-    }
-    /* boxed_rk is confirmed a plain register above (no RAW/CONST flag) -- nothing to materialize.
-       Both opcode families promote an integer boxed operand to real (see this function's own
-       comment) -- no runtime type restriction beyond what the boxed path itself already allows. */
-    if (is_temp(boxed_rk)) reg_free(1);
-
-    *out_rk = RK_RAW_REAL_FLAG | dest;
-    return true;
 }
 
 /* Raw-vs-boxed ordering comparisons only (vm.h) -- a raw loop counter almost always compares
@@ -748,7 +567,7 @@ static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind
     if (is_temp(boxed_rk)) reg_free(1);
 
     int dest = reg_alloc();
-    chunk_emit(c, PACK3(raw_op, dest, slot, boxed_rk));
+    chunk_emit(c, PACK_RAW_CMP_BOXED(raw_op, dest, slot, boxed_rk));
     *out_rk = dest;
     return true;
 }
@@ -759,10 +578,8 @@ static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind
 static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int* out_rk) {
     RawKind kind_lhs = rk_raw_kind(c, rk_lhs);
     RawKind kind_rhs = rk_raw_kind(c, rk_rhs);
-    if ((kind_lhs == RAWK_NONE) != (kind_rhs == RAWK_NONE)) {
-        if (try_emit_arith_raw_boxed(c, op, rk_lhs, kind_lhs, rk_rhs, kind_rhs, out_rk)) return true;
+    if ((kind_lhs == RAWK_NONE) != (kind_rhs == RAWK_NONE))
         return try_emit_cmp_raw_boxed(c, op, rk_lhs, kind_lhs, rk_rhs, kind_rhs, out_rk);
-    }
     if (kind_lhs == RAWK_NONE || kind_rhs == RAWK_NONE || kind_lhs != kind_rhs) return false;
     bool int_kind = (kind_lhs == RAWK_INT);
 
@@ -808,31 +625,30 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
 
     if (is_cmp) {
         int dest = reg_alloc();
-        chunk_emit(c, PACK3(raw_op, dest, slot_lhs, slot_rhs));
+        chunk_emit(c, PACK_RAW_CMP(raw_op, dest, slot_lhs, slot_rhs));
         *out_rk = dest;
         return true;
     }
     if (div_int_promotes_to_real) {
         int dest = raw_real_alloc();
         if (dest < 0) return false;   /* extremely unlikely right after freeing 2 int slots, but stay safe */
-        chunk_emit(c, PACK3(raw_op, dest, slot_lhs, slot_rhs));
+        chunk_emit(c, PACK_RAW_ARITH_RR(raw_op, dest, slot_lhs, slot_rhs));
         *out_rk = RK_RAW_REAL_FLAG | dest;
         return true;
     }
     int dest = int_kind ? raw_int_alloc() : raw_real_alloc();
     if (dest < 0) return false;
-    chunk_emit(c, PACK3(raw_op, dest, slot_lhs, slot_rhs));
+    chunk_emit(c, PACK_RAW_ARITH_RR(raw_op, dest, slot_lhs, slot_rhs));
     *out_rk = (int_kind ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest;
     return true;
 }
 
 /* Reads Chunk.functions directly -- the registry chunk_add_function already maintains is the
    single source of truth; the parser keeps no parallel copy. */
-static bool func_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offset, unsigned int* out_func_index) {
+static bool func_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offset) {
     ChunkFunction* f = chunk_find_function_by_name_idx(c, name_idx);
     if (!f) return false;
-    *out_offset     = f->code_offset;
-    *out_func_index = (unsigned int)(f - c->functions);
+    *out_offset = f->code_offset;
     return true;
 }
 
@@ -840,8 +656,7 @@ static bool func_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offse
    real AerFunction, not just the offset. */
 static bool func_full_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offset, unsigned int* out_arity,
                                  unsigned int* out_min_arity, AerVal** out_defaults,
-                                 unsigned int* out_max_registers, unsigned int* out_max_raw_ints,
-                                 unsigned int* out_max_raw_reals, unsigned int* out_func_index) {
+                                 unsigned int* out_max_registers) {
     ChunkFunction* f = chunk_find_function_by_name_idx(c, name_idx);
     if (!f) return false;
     *out_offset        = f->code_offset;
@@ -849,25 +664,19 @@ static bool func_full_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_
     *out_min_arity     = f->min_arity;
     *out_defaults      = f->defaults;
     *out_max_registers = f->max_registers;
-    *out_max_raw_ints  = f->max_raw_ints;
-    *out_max_raw_reals = f->max_raw_reals;
-    *out_func_index    = (unsigned int)(f - c->functions);
     return true;
 }
 
 /* Builds a real runtime AerFunction, reusing the existing constructor. `defaults` is used
    as-is, not copied. */
 static AerVal build_function_value(unsigned int func_offset, unsigned int arity, unsigned int min_arity,
-                                       AerVal* defaults, unsigned int max_registers,
-                                       unsigned int max_raw_ints, unsigned int max_raw_reals) {
+                                       AerVal* defaults, unsigned int max_registers) {
     AerFunction* fn = vm_new_function();
     fn->code_offset   = func_offset;
     fn->arity         = (uint16_t)arity;
     fn->min_arity     = (uint16_t)min_arity;
     fn->defaults      = defaults;
     fn->max_registers = max_registers;
-    fn->max_raw_ints  = max_raw_ints;
-    fn->max_raw_reals = max_raw_reals;
     return aer_function_val(fn);
 }
 
@@ -901,17 +710,11 @@ static void pending_call_add(unsigned int name_idx, unsigned int patch_offset, c
 static void func_register(Chunk* c, unsigned int name_idx, unsigned int offset, unsigned int arity,
                               unsigned int min_arity, AerVal* defaults) {
     chunk_add_function(c, name_idx, offset, arity, min_arity, defaults);
-    unsigned int new_func_index = c->function_count - 1;
 
-    /* Swap-remove each match (order doesn't matter), leaving only genuinely unresolved entries.
-       Patches both the callee_offset word (emit_call's returned patch_offset) and the func_index
-       word immediately after it (emit_call always emits them back-to-back) -- a forward-referenced
-       call can't know its target's function index at emission time any more than it can know its
-       code offset. */
+    /* Swap-remove each match (order doesn't matter), leaving only genuinely unresolved entries. */
     for (int i = 0; i < pending_count; ) {
         if (pending_calls[i].name_idx == name_idx) {
             patch_jump(c, pending_calls[i].patch_offset, offset);
-            c->code[pending_calls[i].patch_offset + 1] = new_func_index;
             pending_calls[i] = pending_calls[--pending_count];
         } else {
             i++;
@@ -1014,7 +817,7 @@ static int arg_materialize(Chunk* c, int rk) {
     }
     int target = reg_alloc();
     if (rk & RK_CONST_FLAG) {
-        chunk_emit(c, PACK_OP_A_W16(OP_LOADK, target, (unsigned int)(rk & ~RK_CONST_FLAG)));
+        chunk_emit(c, PACK1(OP_LOADK, target)); chunk_emit(c, rk & ~RK_CONST_FLAG);
     } else {
         chunk_emit(c, PACK2(OP_MOVE, target, rk));
     }
@@ -1191,7 +994,7 @@ static int parse_string_literal(Chunk* c) {
         /* Reuses expr_reg as the OP_TO_STR destination when it's already a temp, avoiding a stranded
            dead temp (reg_free is LIFO). A non-temp expr_reg still gets a fresh destination. */
         int str_dest = is_temp(expr_reg) ? expr_reg : reg_alloc();
-        chunk_emit(c, PACK3(OP_UNARY, str_dest, OP_TO_STR, pack_rk8(expr_reg)));
+        chunk_emit(c, PACK_UNARY(str_dest, OP_TO_STR, expr_reg));
 
         if (result < 0) {
             result = str_dest;
@@ -1295,13 +1098,12 @@ static int parse_primary_inner(Chunk* c) {
 
         /* A known function referenced without a following '(' is a reference to the function itself
            as a value -- built once per reference as a deduped pool constant. */
-        unsigned int func_offset, func_arity, func_min_arity, func_max_registers, func_max_raw_ints, func_max_raw_reals;
-        unsigned int func_index_unused;   /* AerFunction carries its own peaks directly -- no func_index needed for OP_CALL_VALUE */
+        unsigned int func_offset, func_arity, func_min_arity, func_max_registers;
         AerVal* func_defaults;
         if (func_full_lookup(c, name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
-                                 &func_max_registers, &func_max_raw_ints, &func_max_raw_reals, &func_index_unused)) {
+                                 &func_max_registers)) {
             AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
-                                                 func_max_registers, func_max_raw_ints, func_max_raw_reals);
+                                                 func_max_registers);
             return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
         }
 
@@ -1355,36 +1157,12 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                     if (is_temp(rk_start)) reg_free(1);
                     if (is_temp(arr_reg))  reg_free(1);
 
-                    if (!rk16_fits(rk_start)) {
-                        error_at("Expression too large to compile (register/constant index exceeds the fused index-field-op encoding's range)");
+                    if (!rk20_fits(rk_start) || !pool_idx_fits(field_idx, FUSED_FIELD_NAME_MAX)) {
+                        error_at("Expression too large to compile (register/constant/field index exceeds the fused index-field-op encoding's range)");
                         return rk;
                     }
-                    mark_shape_sensitive(arr_reg);
-                    /* Specialized path: arr_reg's shape is a compile-time-known fact (only ever
-                       true during a specialization recompile) -- resolve the field directly and
-                       route the result through a raw slot instead of a boxed register, so it
-                       composes into further arithmetic via the SAME raw machinery a literal or
-                       raw local already uses (rk_raw_kind/box_if_raw), no new consumer-side logic
-                       needed. Falls back to the generic opcode below if the field isn't int/real,
-                       or if the raw-slot budget is exhausted (raw_int_alloc/raw_real_alloc return
-                       -1) -- same graceful-overflow convention raw locals already use. */
-                    Shape* known = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? reg_known_shape[arr_reg] : NULL;
-                    unsigned int foffset; ValueType ftype;
-                    if (known && shape_find_field(known, field_idx, &foffset, &ftype) &&
-                        (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
-                        bool is_int = (ftype == TYPE_INTEGER);
-                        int slot = is_int ? raw_int_alloc() : raw_real_alloc();
-                        if (slot >= 0) {
-                            Opcode op = is_int ? OP_INDEX_FIELD_GET_RAW_INT : OP_INDEX_FIELD_GET_RAW_REAL;
-                            chunk_emit(c, PACK3(op, slot, arr_reg, 0));
-                            chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(rk_start)));
-                            rk = is_int ? (RK_RAW_INT_FLAG | slot) : (RK_RAW_REAL_FLAG | slot);
-                            continue;
-                        }
-                    }
                     int dest = reg_alloc();
-                    chunk_emit(c, PACK3(OP_INDEX_FIELD_GET, dest, arr_reg, 0));
-                    chunk_emit(c, PACK_2X16(field_idx, pack_rk16(rk_start)));
+                    chunk_emit(c, PACK_INDEX_FIELD_GET(dest, arr_reg, field_idx, rk_start));
                     rk = dest;
                     continue;
                 }
@@ -1395,18 +1173,6 @@ static int parse_postfix_chain(Chunk* c, int rk) {
 
                 int dest = reg_alloc();
                 emit_index_get(c, dest, arr_reg, rk_start);
-                /* One-hop alias tracking for shape specialization (SPEC_KIND_ARRAY_OF_STRUCTS) --
-                   see last_plain_index_dest_reg's own comment. Recorded unconditionally (not just
-                   during a specialization recompile): last_plain_index_src_param only needs
-                   arr_reg's identity, which is available during the ordinary detection-phase
-                   compile too and is exactly what populates alias_source_param for
-                   shape_sensitive_mask. last_plain_index_known_elem_shape stays NULL outside an
-                   active specialization recompile, since reg_known_element_shape is only ever
-                   seeded there. */
-                last_plain_index_dest_reg  = dest;
-                last_plain_index_src_param = (arr_reg >= 0 && arr_reg < current_param_count) ? arr_reg : -1;
-                last_plain_index_known_elem_shape =
-                    (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? reg_known_element_shape[arr_reg] : NULL;
                 rk = dest;
                 continue;
             }
@@ -1438,23 +1204,6 @@ static int parse_postfix_chain(Chunk* c, int rk) {
             int struct_reg = materialize(c, rk);
             if (is_temp(struct_reg)) reg_free(1);
 
-            mark_shape_sensitive(struct_reg);
-            {
-                Shape* known = (struct_reg >= 0 && struct_reg < FRAME_REGISTERS) ? reg_known_shape[struct_reg] : NULL;
-                unsigned int foffset; ValueType ftype;
-                if (known && shape_find_field(known, field_idx, &foffset, &ftype) &&
-                    (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
-                    bool is_int = (ftype == TYPE_INTEGER);
-                    int slot = is_int ? raw_int_alloc() : raw_real_alloc();
-                    if (slot >= 0) {
-                        Opcode op = is_int ? OP_FIELD_GET_RAW_INT : OP_FIELD_GET_RAW_REAL;
-                        chunk_emit(c, PACK3(op, slot, struct_reg, 0));
-                        chunk_emit(c, foffset);
-                        rk = is_int ? (RK_RAW_INT_FLAG | slot) : (RK_RAW_REAL_FLAG | slot);
-                        continue;
-                    }
-                }
-            }
             int dest = reg_alloc();
             emit_field_get(c, dest, struct_reg, field_idx);
             rk = dest;
@@ -1481,10 +1230,11 @@ static int parse_not(Chunk* c) {
     rk = box_if_raw(c, rk);
     if (is_temp(rk)) reg_free(1);
     int dest = reg_alloc();
-    bool spilled = false;
-    if (!rk8_fits(rk)) { rk = materialize(c, rk); spilled = true; }
-    chunk_emit(c, PACK3(OP_UNARY, dest, OP_NOT, pack_rk8(rk)));
-    if (spilled) reg_free(1);
+    if (!rk9_fits(rk)) {
+        error_at("Expression too large to compile (register/constant index exceeds the unary-op encoding's range)");
+        return dest;
+    }
+    chunk_emit(c, PACK_UNARY(dest, OP_NOT, rk));
     return dest;
 }
 
@@ -1501,10 +1251,11 @@ static int parse_unary_inner(Chunk* c) {
     rk = box_if_raw(c, rk);   /* No raw-native unary form -- box first, or a raw slot index gets misread as a register. */
     if (is_temp(rk)) reg_free(1);   /* free-then-allocate, matching every other site */
     int dest = reg_alloc();
-    bool spilled = false;
-    if (!rk8_fits(rk)) { rk = materialize(c, rk); spilled = true; }
-    chunk_emit(c, PACK3(OP_UNARY, dest, unary_op, pack_rk8(rk)));
-    if (spilled) reg_free(1);
+    if (!rk9_fits(rk)) {
+        error_at("Expression too large to compile (register/constant index exceeds the unary-op encoding's range)");
+        return dest;
+    }
+    chunk_emit(c, PACK_UNARY(dest, unary_op, rk));
     return dest;
 }
 
@@ -1633,10 +1384,13 @@ static int compile_pipe(Chunk* c, int lhs) {
         if (parse_had_error) return lhs;
 
         if (arg_count > 1) reg_free(arg_count - 1);
-        chunk_emit(c, PACK3(OP_CALL_MODULE, dest, arg_reg_base, arg_count));
-        chunk_emit(c, (uint32_t)module_idx);
-        chunk_emit(c, (uint32_t)fn_idx);
-        chunk_emit(c, PACK_2X16((uint16_t)module_id, (uint16_t)fn_id));
+        if (!pool_idx_fits(module_idx, CALL_MODULE_NAME_MAX) || !pool_idx_fits(fn_idx, CALL_MODULE_NAME_MAX)) {
+            error_at("Expression too large to compile (module/function name index exceeds the module-call encoding's range)");
+            return dest;
+        }
+        chunk_emit(c, PACK_CALL_MODULE(dest, arg_reg_base, arg_count, module_idx, fn_idx));
+        chunk_emit(c, module_id);
+        chunk_emit(c, fn_id);
         compile_pipe_guard_end(c, patch_skip_call);
         return dest;
     }
@@ -1650,8 +1404,8 @@ static int compile_pipe(Chunk* c, int lhs) {
     }
 
     bool is_struct = is_struct_name(name_idx);
-    unsigned int func_offset = 0, func_index = 0;
-    if (!is_struct && !func_lookup(c, name_idx, &func_offset, &func_index)) {
+    unsigned int func_offset = 0;
+    if (!is_struct && !func_lookup(c, name_idx, &func_offset)) {
         error_at("Unknown function or struct type (must be defined before use)");
         return lhs;
     }
@@ -1680,7 +1434,7 @@ static int compile_pipe(Chunk* c, int lhs) {
     if (is_struct) {
         emit_struct_new(c, dest, name_idx, arg_reg_base, arg_count);
     } else {
-        emit_call(c, dest, func_offset, arg_reg_base, arg_count, func_index);
+        emit_call(c, dest, func_offset, arg_reg_base, arg_count);
         compile_pipe_guard_end(c, patch_skip_call);
     }
     return dest;
@@ -1722,14 +1476,14 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
                 unsigned int type_len = aer_as_string(token.value)->length;
                 lex();
                 if (is_struct_name(type_name_idx)) {
-                    /* lhs is always a plain register here -- no guard needed. */
-                    chunk_emit(c, PACK3(OP_CHECK_SHAPE, dest, lhs, 0));
-                    chunk_emit(c, (uint32_t)type_name_idx);
+                    /* lhs is always a plain register here -- no rk20_fits guard needed. */
+                    chunk_emit(c, PACK_CHECK_SHAPE(dest, lhs, type_name_idx));
                 } else if (type_len == 6 && strncmp(type_name, "string", 6) == 0) {
-                    bool spilled = false;
-                    if (!rk8_fits(lhs)) { lhs = materialize(c, lhs); spilled = true; }
-                    chunk_emit(c, PACK3(OP_UNARY, dest, OP_TO_STR, pack_rk8(lhs)));
-                    if (spilled) reg_free(1);
+                    if (!rk9_fits(lhs)) {
+                        error_at("Expression too large to compile (register/constant index exceeds the cast encoding's range)");
+                        return dest;
+                    }
+                    chunk_emit(c, PACK_UNARY(dest, OP_TO_STR, lhs));
                 } else {
                     error_at("Unknown type '%.*s' in 'as' cast (must be string/integer/float/boolean/array/hashtable, or a known struct type)",
                              (int)type_len, type_name);
@@ -1748,10 +1502,11 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
                     return dest;
                 }
                 lex();
-                bool spilled = false;
-                if (!rk8_fits(lhs)) { lhs = materialize(c, lhs); spilled = true; }
-                chunk_emit(c, PACK3(OP_CAST, dest, cast_type, pack_rk8(lhs)));
-                if (spilled) reg_free(1);
+                if (!rk9_fits(lhs)) {
+                    error_at("Expression too large to compile (register/constant index exceeds the cast encoding's range)");
+                    return dest;
+                }
+                chunk_emit(c, PACK_CAST(dest, cast_type, lhs));
             }
             lhs = dest;
             lhs_start = c->count;
@@ -1759,14 +1514,13 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
         }
 
         /* Checked before parsing the RHS, while lhs's bytecode is still the tail of the chunk --
-           excising bytecode from the middle would risk invalidating an RHS jump target.
-           OP_FIELD_GET is now a fixed 2-word shape (word0: op+dest+struct_reg, word1: field_idx). */
-        bool lhs_is_field = (c->count - lhs_start == 2 && (c->code[lhs_start] & 0xFF) == OP_FIELD_GET);
+           excising bytecode from the middle would risk invalidating an RHS jump target. */
+        bool lhs_is_field = (c->count - lhs_start == 1 && (c->code[lhs_start] & 0xFF) == OP_FIELD_GET);
         int lhs_struct_reg = 0;
         unsigned int lhs_field_idx = 0;
         if (lhs_is_field) {
-            lhs_struct_reg = (int)UNPACK_B(c->code[lhs_start]);
-            lhs_field_idx  = c->code[lhs_start + 1];
+            lhs_struct_reg = (int)UNPACK_FIELD_GET_STRUCT(c->code[lhs_start]);
+            lhs_field_idx  = (unsigned int)UNPACK_FIELD_GET_FIELD(c->code[lhs_start]);
             c->count = lhs_start;   /* discard lhs's OP_FIELD_GET, never executed */
         }
 
@@ -1780,12 +1534,11 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             if (is_temp(lhs)) reg_free(1);
 
             int dest = reg_alloc();
-            if (!rk16_fits(rhs)) {
-                error_at("Expression too large to compile (register/constant index exceeds the fused field-op encoding's range)");
+            if (!rk20_fits(rhs) || !pool_idx_fits(lhs_field_idx, FUSED_FIELD_NAME_MAX)) {
+                error_at("Expression too large to compile (register/constant/field index exceeds the fused field-op encoding's range)");
                 return lhs;
             }
-            chunk_emit(c, PACK3(OP_FIELD_BINARY, dest, lhs_struct_reg, op));
-            chunk_emit(c, PACK_2X16(lhs_field_idx, pack_rk16(rhs)));
+            chunk_emit(c, PACK_FIELD_BINARY(dest, lhs_struct_reg, op, lhs_field_idx, rhs));
             lhs = dest;
             lhs_start = c->count;
             continue;
@@ -1793,10 +1546,10 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
 
         /* Found via a per-opcode dispatch audit: `x OP y.field` compiled as OP_FIELD_GET immediately
            followed by OP_BINARY reading it back -- two dispatches for one operation. Recognized
-           by checking whether the RHS was exactly one bare field read (now 2 words). */
-        if (c->count - rhs_start == 2 && (c->code[rhs_start] & 0xFF) == OP_FIELD_GET) {
-            int struct_reg = (int)UNPACK_B(c->code[rhs_start]);
-            unsigned int field_idx = c->code[rhs_start + 1];
+           by checking whether the RHS was exactly one bare field read. */
+        if (c->count - rhs_start == 1 && (c->code[rhs_start] & 0xFF) == OP_FIELD_GET) {
+            int struct_reg = (int)UNPACK_FIELD_GET_STRUCT(c->code[rhs_start]);
+            int field_idx  = (int)UNPACK_FIELD_GET_FIELD(c->code[rhs_start]);
             c->count = rhs_start;   /* discard the OP_FIELD_GET just emitted, never executed */
 
             /* rhs is always the OP_FIELD_GET result (never raw); lhs could be raw -- box it. */
@@ -1805,12 +1558,11 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             if (is_temp(lhs)) reg_free(1);
 
             int dest = reg_alloc();
-            if (!rk16_fits(lhs)) {
-                error_at("Expression too large to compile (register/constant index exceeds the fused field-op encoding's range)");
+            if (!rk20_fits(lhs) || !pool_idx_fits((unsigned int)field_idx, FUSED_FIELD_NAME_MAX)) {
+                error_at("Expression too large to compile (register/constant/field index exceeds the fused field-op encoding's range)");
                 return lhs;
             }
-            chunk_emit(c, PACK3(OP_BINARY_FIELD, dest, struct_reg, op));
-            chunk_emit(c, PACK_2X16(field_idx, pack_rk16(lhs)));
+            chunk_emit(c, PACK_BINARY_FIELD(dest, struct_reg, op, lhs, field_idx));
             lhs = dest;
             lhs_start = c->count;
             continue;
@@ -1902,7 +1654,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
 
         /* 2 targets, 1 source: the (value, err) convention, tolerant of a bare non-Result value. */
         if (count == 2 && rhs_count == 1) {
-            chunk_emit(c, PACK3(OP_DESTRUCTURE, target_regs[0], target_regs[1], arr_reg));
+            chunk_emit(c, PACK_DESTRUCTURE(target_regs[0], target_regs[1], arr_reg));
         } else {
             for (unsigned int i = 0; i < count; i++) {
                 unsigned int pool_i = chunk_add_pool(c, aer_int((int64_t)i));
@@ -1949,7 +1701,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                         if (src_slot != slot) {
                             /* Direct analog of the boxed path's "reg != rk_val -> MOVE" case. */
                             Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
-                            chunk_emit(c, PACK3(move_op, slot, src_slot, 0));
+                            chunk_emit(c, PACK_RAW_MOVE(move_op, slot, src_slot));
                             int floor_now = (rhs_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
                             if (src_slot >= floor_now) { if (rhs_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
                         }
@@ -1976,7 +1728,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                 if (src_slot >= 0) {
                     if (src_slot != dest_slot) {
                         Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
-                        chunk_emit(c, PACK3(move_op, dest_slot, src_slot, 0));
+                        chunk_emit(c, PACK_RAW_MOVE(move_op, dest_slot, src_slot));
                         int floor_now = (rhs_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
                         if (src_slot >= floor_now) { if (rhs_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
                     }
@@ -2007,7 +1759,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             /* No global_regs update needed — see ensure_boxed's identical reasoning: this path
                only runs on a currently-raw-tracked name, which can never be in global_names. */
             if (rk_val & RK_CONST_FLAG) {
-                chunk_emit(c, PACK_OP_A_W16(OP_LOADK, new_reg, (unsigned int)(rk_val & ~RK_CONST_FLAG)));
+                chunk_emit(c, PACK1(OP_LOADK, new_reg)); chunk_emit(c, rk_val & ~RK_CONST_FLAG);
             } else if (new_reg != rk_val) {
                 chunk_emit(c, PACK2(OP_MOVE, new_reg, rk_val));
                 if (is_temp(rk_val)) reg_free(1);
@@ -2019,30 +1771,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         rk_val = box_if_raw(c, rk_val);
         int reg = var_slot(c, name_idx);
         if (reg < 0) return;   /* error_at already called */
-        /* A shape-sensitive parameter reassigned to some other value (only reachable during a
-           specialization recompile, where hint_param_reg's own register was seeded with a known
-           Shape -- see parse_function_body) must lose that hint here: the register's VALUE just
-           changed, but var_slot returns the SAME register number for an already-declared name, so
-           reg_known_shape[reg] would otherwise keep trusting a shape that may no longer be true.
-           A later '.field' access on this register must fall back to the generic, runtime-checked
-           opcode, not a raw one that would trust a stale offset against whatever this reg holds
-           now. Default to clearing it -- always safe (NULL outside an active specialization
-           anyway) -- UNLESS the RHS was exactly `some_param[idx]` (last_plain_index_dest_reg),
-           the one-hop alias pattern SPEC_KIND_ARRAY_OF_STRUCTS needs (`pi = particles[i]`):
-           there, propagate the parameter's known ELEMENT shape onto this alias's own permanent
-           register instead, so a later `pi.field` can also take the raw-opcode path. Consumed
-           (reset to -1) immediately so a later, unrelated assignment can never see a stale match
-           against a since-freed-and-reused temp register number. */
-        if (rk_val == last_plain_index_dest_reg && last_plain_index_dest_reg >= 0) {
-            reg_known_shape[reg] = last_plain_index_known_elem_shape;
-            alias_source_param[reg] = last_plain_index_src_param;
-        } else {
-            reg_known_shape[reg] = NULL;
-            alias_source_param[reg] = -1;
-        }
-        last_plain_index_dest_reg = -1;
         if (rk_val & RK_CONST_FLAG) {
-            chunk_emit(c, PACK_OP_A_W16(OP_LOADK, reg, (unsigned int)(rk_val & ~RK_CONST_FLAG)));
+            chunk_emit(c, PACK1(OP_LOADK, reg)); chunk_emit(c, rk_val & ~RK_CONST_FLAG);
         } else if (reg != rk_val) {
             chunk_emit(c, PACK2(OP_MOVE, reg, rk_val));
             /* Checked after var_slot (which may have just raised the floor), so this correctly recognizes
@@ -2079,7 +1809,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                     Opcode raw_op;
                     if (cur_kind == RAWK_INT) raw_op = (boxed_op == OP_ADD) ? OP_RAW_ADD_INT : (boxed_op == OP_SUB) ? OP_RAW_SUB_INT : OP_RAW_MUL_INT;
                     else                       raw_op = (boxed_op == OP_ADD) ? OP_RAW_ADD_REAL : (boxed_op == OP_SUB) ? OP_RAW_SUB_REAL : OP_RAW_MUL_REAL;
-                    chunk_emit(c, PACK3(raw_op, dest_slot, dest_slot, rhs_slot));
+                    chunk_emit(c, PACK_RAW_ARITH_RR(raw_op, dest_slot, dest_slot, rhs_slot));
                     int floor_now = (cur_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
                     if (rhs_slot >= floor_now) { if (cur_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
                     return;
@@ -2097,7 +1827,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                 Opcode raw_op;
                 if (cur_kind == RAWK_INT) raw_op = (boxed_op == OP_ADD) ? OP_RAW_ADD_INT_BOXED : (boxed_op == OP_SUB) ? OP_RAW_SUB_INT_BOXED : OP_RAW_MUL_INT_BOXED;
                 else                       raw_op = (boxed_op == OP_ADD) ? OP_RAW_ADD_REAL_BOXED : (boxed_op == OP_SUB) ? OP_RAW_SUB_REAL_BOXED : OP_RAW_MUL_REAL_BOXED;
-                chunk_emit(c, PACK3(raw_op, dest_slot, boxed_reg, 0));
+                chunk_emit(c, PACK_RAW_ARITH_BOXED(raw_op, dest_slot, boxed_reg));
                 if (is_temp(boxed_reg)) reg_free(1);
                 return;
             }
@@ -2117,7 +1847,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             int new_reg = reserved_floor;
             reserved_floor++;
             next_temp_register = reserved_floor;
-            chunk_emit(c, PACK3(box_op, new_reg, old_slot, 0));
+            chunk_emit(c, PACK_BOX(box_op, new_reg, old_slot));
             var_regs[existing_idx] = new_reg;
             var_kind[existing_idx] = VAR_BOXED;
             /* No global_regs update needed — see ensure_boxed's identical reasoning. */
@@ -2143,10 +1873,6 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
 
         int rk_rhs = parse_binary(c, 0);
         if (parse_had_error) return;
-        /* Same reg_known_shape invalidation as the plain-assignment tail above -- `reg`'s value
-           is about to change (e.g. `bodies += extra_bodies`), so any shape hint on it is no longer
-           trustworthy. */
-        reg_known_shape[reg] = NULL;
         emit_binary(c, reg, compound_assign_ops[i].op, reg, rk_rhs);
         if (is_temp(rk_rhs)) reg_free(1);
         return;
@@ -2230,89 +1956,32 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         }
 
         if (no_more_chaining && (is_plain_assign || compound_i >= 0)) {
-            if (!rk16_fits(pending_rk_idx)) {
-                error_at("Expression too large to compile (register/constant index exceeds the fused index-field-op encoding's range)");
+            if (!rk9_fits(pending_rk_idx) || !pool_idx_fits(fused_field_idx, FUSED_FIELD_NAME_MAX)) {
+                error_at("Expression too large to compile (register/constant/field index exceeds the fused index-field-op encoding's range)");
                 return;
-            }
-            /* obj_reg is still obj's own register here (obj_is_base) -- this is the very first
-               postfix step on the name, no chaining happened before it. */
-            mark_shape_sensitive(obj_reg);
-            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
-            unsigned int foffset = 0; ValueType ftype = TYPE_ANY;
-            RawKind field_kind = RAWK_NONE;
-            if (known && shape_find_field(known, fused_field_idx, &foffset, &ftype)) {
-                if (ftype == TYPE_INTEGER) field_kind = RAWK_INT;
-                else if (ftype == TYPE_REAL) field_kind = RAWK_REAL;
             }
             if (is_plain_assign) {
                 lex();
                 int rk_val = parse_binary(c, 0);
                 if (parse_had_error) return;
-                /* Specialized path: the field's byte offset/type is a compile-time-known fact
-                   here (see reg_known_shape's own comment) -- write straight into it from a raw
-                   slot, no boxing, when rk_val is already the matching raw kind (an already-raw
-                   value, or a matching literal -- raw_materialize's own contract). Falls back to
-                   the generic (boxing) path otherwise, same graceful-overflow convention raw
-                   locals already use. */
-                if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
-                    int slot = raw_materialize(c, rk_val, field_kind);
-                    if (slot >= 0) {
-                        Opcode op = (field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT : OP_INDEX_FIELD_SET_RAW_REAL;
-                        chunk_emit(c, PACK_OP_A_W16(op, obj_reg, pack_rk16(pending_rk_idx)));
-                        chunk_emit(c, PACK_2X16((uint16_t)foffset, (uint16_t)slot));
-                        int floor_now = (field_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
-                        if (slot >= floor_now) { if (field_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
-                        if (is_temp(pending_rk_idx)) reg_free(1);
-                        if (!obj_is_base) reg_free(1);
-                        return;
-                    }
-                }
                 rk_val = box_if_raw(c, rk_val);
-                if (!rk16_fits(rk_val)) {
+                if (!rk9_fits(rk_val)) {
                     error_at("Expression too large to compile (value exceeds the fused index-field-set encoding's range)");
                     return;
                 }
-                chunk_emit(c, PACK_OP_A_W16(OP_INDEX_FIELD_SET, obj_reg, pack_rk16(pending_rk_idx)));
-                chunk_emit(c, PACK_2X16(fused_field_idx, pack_rk16(rk_val)));
+                chunk_emit(c, PACK_INDEX_FIELD_SET(obj_reg, fused_field_idx, pending_rk_idx, rk_val));
                 if (is_temp(rk_val)) reg_free(1);
             } else {
                 lex();
                 int rk_rhs = parse_binary(c, 0);
                 if (parse_had_error) return;
-                Opcode bin_op = compound_assign_ops[compound_i].op;
-                /* Decomposing this into separate raw GET + arithmetic + SET opcodes was tried and
-                   measured WORSE on nbody.aer whenever the rhs needed BOXING first -- the generic
-                   OP_INDEX_FIELD_COMPOUND already resolves+reads+computes+writes in one dispatch
-                   with no boxed AerVal for the field's own value, so decomposing just to box the
-                   rhs anyway added two dispatches for nothing. But when the rhs is ALREADY raw at
-                   this point (a raw local, or try_emit_arith_raw_boxed's fusion result -- common
-                   now that raw field reads compose with boxed values), there's no boxing to avoid
-                   paying for: OP_INDEX_FIELD_COMPOUND_RAW_INT/REAL reads/computes/writes the field
-                   raw AND takes rk_rhs raw directly, so this case has no downside, only upside
-                   (skips the box_if_raw the generic opcode would otherwise force on the rhs). */
-                bool native_op_exists = (bin_op == OP_ADD || bin_op == OP_SUB || bin_op == OP_MUL);
-                if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
-                    int slot = raw_materialize(c, rk_rhs, field_kind);
-                    if (slot >= 0) {
-                        Opcode op = (field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT : OP_INDEX_FIELD_COMPOUND_RAW_REAL;
-                        chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
-                        chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(pending_rk_idx)));
-                        chunk_emit(c, (uint32_t)slot);
-                        int floor_now = (field_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
-                        if (slot >= floor_now) { if (field_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
-                        if (is_temp(pending_rk_idx)) reg_free(1);
-                        if (!obj_is_base) reg_free(1);
-                        return;
-                    }
-                }
                 rk_rhs = box_if_raw(c, rk_rhs);
-                if (!rk16_fits(rk_rhs)) {
+                if (!rk9_fits(rk_rhs)) {
                     error_at("Expression too large to compile (value exceeds the fused index-field-compound encoding's range)");
                     return;
                 }
-                chunk_emit(c, PACK3(OP_INDEX_FIELD_COMPOUND, obj_reg, bin_op, 0));
-                chunk_emit(c, PACK_2X16(fused_field_idx, pack_rk16(pending_rk_idx)));
-                chunk_emit(c, PACK_2X16(0, pack_rk16(rk_rhs)));
+                chunk_emit(c, PACK_INDEX_FIELD_COMPOUND(obj_reg, fused_field_idx, pending_rk_idx,
+                                                         compound_assign_ops[compound_i].op, rk_rhs));
                 if (is_temp(rk_rhs)) reg_free(1);
             }
             if (is_temp(pending_rk_idx)) reg_free(1);
@@ -2373,30 +2042,6 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         int rk_val = parse_binary(c, 0);
         if (parse_had_error) return;
 
-        /* Only a direct `param.field = ...` (obj_is_base, no preceding chain step) marks the
-           parameter shape-sensitive -- an intermediate chain register (`a.b.c = ...`) isn't a
-           parameter itself, and its own provenance isn't tracked (only the one-hop alias case,
-           `local = param[idx]`, is -- see alias_source_param). */
-        if (pending_is_field && obj_is_base) {
-            mark_shape_sensitive(obj_reg);
-            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
-            unsigned int foffset; ValueType ftype;
-            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype)) {
-                RawKind field_kind = (ftype == TYPE_INTEGER) ? RAWK_INT : (ftype == TYPE_REAL) ? RAWK_REAL : RAWK_NONE;
-                if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
-                    int slot = raw_materialize(c, rk_val, field_kind);
-                    if (slot >= 0) {
-                        Opcode op = (field_kind == RAWK_INT) ? OP_FIELD_SET_RAW_INT : OP_FIELD_SET_RAW_REAL;
-                        chunk_emit(c, PACK3(op, obj_reg, 0, 0));
-                        chunk_emit(c, foffset);
-                        chunk_emit(c, (uint32_t)slot);
-                        int floor_now = (field_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
-                        if (slot >= floor_now) { if (field_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
-                        return;   /* obj_is_base is always true here, so no reg_free(1) for it needed */
-                    }
-                }
-            }
-        }
         if (pending_is_field) emit_field_set(c, obj_reg, pending_field_idx, rk_val);
         else                   emit_index_set(c, obj_reg, pending_rk_idx, rk_val);
 
@@ -2412,57 +2057,19 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         if (!consume(compound_assign_ops[i].tok)) continue;
 
         if (pending_is_field) {
-            if (obj_is_base) mark_shape_sensitive(obj_reg);
-
-            /* Same compile-time field lookup the plain '=' branch above uses -- only meaningful
-               when obj_is_base (this register really is the shape-sensitive parameter/alias, not
-               an intermediate chain link -- reg_known_shape is never seeded for those). */
-            Shape* known = (obj_is_base && obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
-            unsigned int foffset = 0; ValueType ftype = TYPE_ANY;
-            RawKind field_kind = RAWK_NONE;
-            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype)) {
-                if (ftype == TYPE_INTEGER) field_kind = RAWK_INT;
-                else if (ftype == TYPE_REAL) field_kind = RAWK_REAL;
-            }
-
+            /* One fused OP_FIELD_COMPOUND -- read, compute, and write back in a single dispatch,
+               a single vm_resolve_field call. No temp register needed: the result writes straight
+               back into the same field, never through a register at all. */
             int rk_rhs = parse_binary(c, 0);
             if (parse_had_error) return;
+            rk_rhs = box_if_raw(c, rk_rhs);   /* no raw-native fused field-op form exists */
 
-            Opcode bin_op = compound_assign_ops[i].op;
-            /* Decomposing into raw GET + arithmetic + SET was tried and measured WORSE on
-               nbody.aer whenever the rhs needed boxing first -- see the fused index-field-compound
-               site's identical reasoning above. But when the rhs is ALREADY raw at this point (a
-               raw local, or try_emit_arith_raw_boxed's fusion result), OP_FIELD_COMPOUND_RAW_INT/
-               REAL reads/computes/writes the field raw AND takes rk_rhs raw directly -- no boxing
-               to avoid paying for, only upside. */
-            bool native_op_exists = (bin_op == OP_ADD || bin_op == OP_SUB || bin_op == OP_MUL);
-            bool specialized = false;
-            if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
-                int slot = raw_materialize(c, rk_rhs, field_kind);
-                if (slot >= 0) {
-                    Opcode op = (field_kind == RAWK_INT) ? OP_FIELD_COMPOUND_RAW_INT : OP_FIELD_COMPOUND_RAW_REAL;
-                    chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
-                    chunk_emit(c, foffset);
-                    chunk_emit(c, (uint32_t)slot);
-                    int floor_now = (field_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
-                    if (slot >= floor_now) { if (field_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
-                    specialized = true;
-                }
+            if (!rk20_fits(rk_rhs) || !pool_idx_fits(pending_field_idx, FUSED_FIELD_NAME_MAX)) {
+                error_at("Expression too large to compile (register/constant/field index exceeds the fused field-op encoding's range)");
+                return;
             }
-            if (!specialized) {
-                /* One fused OP_FIELD_COMPOUND -- read, compute, and write back in a single
-                   dispatch, a single vm_resolve_field call. No temp register needed: the result
-                   writes straight back into the same field, never through a register at all. */
-                rk_rhs = box_if_raw(c, rk_rhs);
-
-                if (!rk16_fits(rk_rhs)) {
-                    error_at("Expression too large to compile (register/constant index exceeds the fused field-op encoding's range)");
-                    return;
-                }
-                chunk_emit(c, PACK3(OP_FIELD_COMPOUND, obj_reg, bin_op, 0));
-                chunk_emit(c, PACK_2X16(pending_field_idx, pack_rk16(rk_rhs)));
-                if (is_temp(rk_rhs)) reg_free(1);
-            }
+            chunk_emit(c, PACK_FIELD_COMPOUND(obj_reg, compound_assign_ops[i].op, pending_field_idx, rk_rhs));
+            if (is_temp(rk_rhs)) reg_free(1);
         } else {
             int item_reg = reg_alloc();
             emit_index_get(c, item_reg, obj_reg, pending_rk_idx);
@@ -2700,7 +2307,7 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
 
     int idx_reg = reg_alloc();
     unsigned int pool_zero = chunk_add_pool(c, aer_int(0));
-    chunk_emit(c, PACK_OP_A_W16(OP_LOADK, idx_reg, pool_zero));
+    chunk_emit(c, PACK1(OP_LOADK, idx_reg)); chunk_emit(c, (int)pool_zero);
 
     /* idx_reg/col_reg must stay valid across the whole body, so they're protected before the body
        compiles, same as the range branch. */
@@ -2734,7 +2341,7 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
 
     int idx_reg = reg_alloc();
     unsigned int pool_zero = chunk_add_pool(c, aer_int(0));
-    chunk_emit(c, PACK_OP_A_W16(OP_LOADK, idx_reg, pool_zero));
+    chunk_emit(c, PACK1(OP_LOADK, idx_reg)); chunk_emit(c, (int)pool_zero);
 
     int saved_reserved_floor = reserved_floor;
     reserved_floor = next_temp_register;
@@ -2935,10 +2542,13 @@ static int parse_module_call(Chunk* c) {
     int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
     if (arg_count > 1) reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
-    chunk_emit(c, PACK3(OP_CALL_MODULE, dest, base, arg_count));
-    chunk_emit(c, (uint32_t)module_idx);
-    chunk_emit(c, (uint32_t)fn_idx);
-    chunk_emit(c, PACK_2X16((uint16_t)module_id, (uint16_t)fn_id));
+    if (!pool_idx_fits(module_idx, CALL_MODULE_NAME_MAX) || !pool_idx_fits(fn_idx, CALL_MODULE_NAME_MAX)) {
+        error_at("Expression too large to compile (module/function name index exceeds the module-call encoding's range)");
+        return dest;
+    }
+    chunk_emit(c, PACK_CALL_MODULE(dest, base, arg_count, module_idx, fn_idx));
+    chunk_emit(c, module_id);
+    chunk_emit(c, fn_id);
     return dest;
 }
 
@@ -3040,9 +2650,8 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
     int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
     if (arg_count > 1) reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
-    chunk_emit(c, PACK3(OP_CALL_BUILTIN, dest, base, arg_count));
-    chunk_emit(c, (uint32_t)name_idx);
-    chunk_emit(c, (uint32_t)builtin_call_id(aer_as_string(c->pool[name_idx])));
+    chunk_emit(c, PACK_CALL_BUILTIN(dest, base, arg_count, name_idx));
+    chunk_emit(c, (uint64_t)builtin_call_id(aer_as_string(c->pool[name_idx])));
     return dest;
 }
 
@@ -3050,10 +2659,8 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
    instantiation (is_struct_name), with global builtins as a third fallback. */
 /* Set right after a bare call emits, checked by parse_return to detect a true tail call --
    c->count only grows, so last_bare_call_end == c->count proves the whole return expression is
-   exactly one bare call. last_bare_call_start is captured directly (OP_CALL and OP_CALL_VALUE are
-   both 2 words now, but for different reasons -- OP_CALL's 2nd word is callee_offset, OP_CALL_VALUE's
-   is callee_reg -- so a fixed backward offset would still be fragile; explicit capture stays the
-   simplest correct approach regardless). */
+   exactly one bare call. last_bare_call_start is captured directly (OP_CALL is 2 words, OP_CALL_VALUE
+   is 1, so no single fixed backward offset covers both). */
 static unsigned int last_bare_call_end   = (unsigned int)-1;
 static unsigned int last_bare_call_start = (unsigned int)-1;
 
@@ -3065,7 +2672,7 @@ static int parse_packed_array_new(Chunk* c, unsigned int name_idx) {
     require(TOKEN_CLOSE_BRACKET, "expected ']' after packed array count");
     if (parse_had_error) return 0;
     rk_count = box_if_raw(c, rk_count);   /* no raw-native form of this opcode exists */
-    if (!rk16_fits(rk_count)) {
+    if (!rk9_fits(rk_count)) {
         error_at("Expression too large to compile (register/constant exceeds the packed-array-count encoding's range)");
         return 0;
     }
@@ -3096,11 +2703,10 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
 
     bool is_struct = !is_var && is_struct_name(name_idx);
     unsigned int func_offset = 0, func_arity = 0, func_min_arity = 0, func_max_registers = 0;
-    unsigned int func_max_raw_ints = 0, func_max_raw_reals = 0, func_index = 0;
     AerVal* func_defaults = NULL;
     bool is_func = !is_var && !is_struct &&
                    func_full_lookup(c, name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
-                                        &func_max_registers, &func_max_raw_ints, &func_max_raw_reals, &func_index);
+                                        &func_max_registers);
     /* Optimistically assumed to be a function defined later in this same parse() call -- caught
        and reported once parse()'s top-level loop ends if it never actually is. Builtins are already
        handled unconditionally at the top of this function, so reaching here with none of
@@ -3142,9 +2748,9 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     int callee_reg = -1;
     if (needs_call_value) {
         AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
-                                             func_max_registers, func_max_raw_ints, func_max_raw_reals);
+                                             func_max_registers);
         callee_reg = reg_alloc();
-        chunk_emit(c, PACK_OP_A_W16(OP_LOADK, callee_reg, chunk_add_pool(c, fv)));
+        chunk_emit(c, PACK1(OP_LOADK, callee_reg)); chunk_emit(c, (int)chunk_add_pool(c, fv));
     }
 
     if (is_var) {
@@ -3156,11 +2762,11 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     } else if (is_func) {
         last_bare_call_start = c->count;
         if (needs_call_value) emit_call_value(c, dest, base, arg_count, callee_reg);
-        else                   emit_call(c, dest, func_offset, base, arg_count, func_index);   /* exact arity — no forward-ref patching needed, is_func means already resolved */
+        else                   emit_call(c, dest, func_offset, base, arg_count);   /* exact arity — no forward-ref patching needed, is_func means already resolved */
         last_bare_call_end = c->count;
     } else {
         last_bare_call_start = c->count;
-        unsigned int patch_offset = emit_call(c, dest, func_offset, base, arg_count, func_index);
+        unsigned int patch_offset = emit_call(c, dest, func_offset, base, arg_count);
         if (is_forward_ref) pending_call_add(name_idx, patch_offset, call_site_cursor);
         last_bare_call_end = c->count;
     }
@@ -3180,9 +2786,8 @@ static void emit_result_call_and_return(Chunk* c, int reg_base) {
     char* name_buf = xmalloc(7);
     memcpy(name_buf, "Result", 7);
     unsigned int name_idx = chunk_add_pool(c, aer_make_string(name_buf, 6));
-    chunk_emit(c, PACK3(OP_CALL_BUILTIN, reg_base, reg_base, 2));
-    chunk_emit(c, (uint32_t)name_idx);
-    chunk_emit(c, (uint32_t)CALL_BUILTIN_RESULT);
+    chunk_emit(c, PACK_CALL_BUILTIN(reg_base, reg_base, 2, name_idx));
+    chunk_emit(c, (uint64_t)CALL_BUILTIN_RESULT);
     emit_return(c, reg_base);
 }
 
@@ -3216,10 +2821,10 @@ static void parse_return(Chunk* c) {
 
         if (last_bare_call_end == c->count) {
             int op_slot = (int)last_bare_call_start;
-            int orig_op = c->code[op_slot] & 0xFF;
+            int orig_op = c->code[op_slot] & 0x7F;
             if (orig_op == OP_CALL || orig_op == OP_CALL_VALUE) {
                 int tail_op = (orig_op == OP_CALL) ? OP_TAIL_CALL : OP_TAIL_CALL_VALUE;
-                c->code[op_slot] = (c->code[op_slot] & ~0xFFU) | (uint32_t)tail_op;
+                c->code[op_slot] = (c->code[op_slot] & ~0x7F) | tail_op;
                 return;
             }
         }
@@ -3245,16 +2850,44 @@ static void parse_raise(Chunk* c) {
     emit_result_call_and_return(c, reg_base);
 }
 
-/* A function value in expression position -- an anonymous function has no name to self-reference
-   by, so parse_function's registration-before-body ordering simply doesn't apply. Not a
-   specialization target either way: OP_CALL_SPEC only targets named, ChunkFunction-registered
-   calls (func_index indexes chunk->functions[]), and AerFunction (what this compiles into) has no
-   specialization table -- always compiles with no shape hint (-1/NULL). */
+/* A function value in expression position, near-duplicate of parse_function's logic rather
+   than a shared helper -- an anonymous function has no name to self-reference by, so
+   parse_function's registration-before-body ordering simply doesn't apply. */
 static int parse_function_expr(Chunk* c) {
+    require(TOKEN_OPEN_PARENTHESE, "expected '(' after 'function'");
+    if (parse_had_error) return 0;
+
     unsigned int param_names[FRAME_REGISTERS];
     AerVal       param_defaults[FRAME_REGISTERS];
-    int param_count, min_param_count;
-    parse_function_signature(c, param_names, param_defaults, &param_count, &min_param_count);
+    int param_count     = 0;
+    int min_param_count = 0;
+    bool seen_default   = false;
+    if (!equal(TOKEN_CLOSE_PARENTHESE)) {
+        do {
+            if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected parameter name"); return 0; }
+            if (param_count >= FRAME_REGISTERS) {
+                error_at("Too many parameters (max %d)", FRAME_REGISTERS);
+                return 0;
+            }
+            param_names[param_count] = chunk_add_pool(c, token.value);
+            lex();
+            if (consume(TOKEN_ASSIGN)) {
+                if (!parse_literal_default(c, &param_defaults[param_count])) {
+                    error_at("Parameter defaults must be a literal value");
+                    return 0;
+                }
+                seen_default = true;
+            } else if (seen_default) {
+                error_at("A parameter without a default cannot follow one that has a default");
+                return 0;
+            } else {
+                min_param_count++;
+            }
+            param_count++;
+        } while (consume(TOKEN_COMMA));
+    }
+    require(TOKEN_CLOSE_PARENTHESE, "expected ')' after parameters");
+    require(TOKEN_COLON,            "expected ':' after function signature");
     if (parse_had_error) return 0;
 
     chunk_emit(c, OP_JUMP);
@@ -3262,9 +2895,50 @@ static int parse_function_expr(Chunk* c) {
     chunk_emit(c, 0);
     unsigned int func_start = c->count;
 
-    unsigned int captured_max_registers, captured_max_raw_ints, captured_max_raw_reals;
-    parse_function_body(c, param_names, param_count, -1, NULL, false,
-                            &captured_max_registers, &captured_max_raw_ints, &captured_max_raw_reals);
+    unsigned int saved_var_names[FRAME_REGISTERS];
+    int          saved_var_regs[FRAME_REGISTERS];
+    VarKind      saved_var_kind[FRAME_REGISTERS];
+    int saved_var_count      = var_count;
+    int saved_next_temp      = next_temp_register;
+    int saved_reserved_floor = reserved_floor;
+    int saved_max_register_used = max_register_used;
+    int saved_raw_int_next_temp      = raw_int_next_temp;
+    int saved_raw_int_reserved_floor = raw_int_reserved_floor;
+    int saved_raw_real_next_temp      = raw_real_next_temp;
+    int saved_raw_real_reserved_floor = raw_real_reserved_floor;
+    memcpy(saved_var_names, var_names, sizeof(unsigned int) * (size_t)var_count);
+    memcpy(saved_var_regs,  var_regs,  sizeof(int) * (size_t)var_count);
+    memcpy(saved_var_kind,  var_kind,  sizeof(VarKind) * (size_t)var_count);
+    var_count          = 0;
+    next_temp_register = 0;
+    reserved_floor     = 0;
+    max_register_used  = 0;
+    raw_int_next_temp = 0;  raw_int_reserved_floor = 0;
+    raw_real_next_temp = 0; raw_real_reserved_floor = 0;
+
+    function_depth++;
+    for (int i = 0; i < param_count; i++) var_slot(c, param_names[i]);
+
+    parse_block(c);
+    function_depth--;
+
+    if (!parse_had_error) {
+        int rk_null  = (int)chunk_add_pool(c, aer_null()) | RK_CONST_FLAG;
+        int reg_null = materialize(c, rk_null);
+        emit_return(c, reg_null);
+    }
+
+    unsigned int captured_max_registers = (unsigned int)max_register_used;
+
+    var_count = saved_var_count;
+    memcpy(var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
+    memcpy(var_regs,  saved_var_regs,  sizeof(int) * (size_t)saved_var_count);
+    memcpy(var_kind,  saved_var_kind,  sizeof(VarKind) * (size_t)saved_var_count);
+    next_temp_register = saved_next_temp;
+    reserved_floor     = saved_reserved_floor;
+    max_register_used  = saved_max_register_used;
+    raw_int_next_temp = saved_raw_int_next_temp;   raw_int_reserved_floor = saved_raw_int_reserved_floor;
+    raw_real_next_temp = saved_raw_real_next_temp; raw_real_reserved_floor = saved_raw_real_reserved_floor;
 
     patch_jump(c, patch, c->count);
 
@@ -3275,20 +2949,27 @@ static int parse_function_expr(Chunk* c) {
         for (unsigned int i = 0; i < default_count; i++) defaults[i] = param_defaults[(unsigned int)min_param_count + i];
     }
     AerVal fv = build_function_value(func_start, (unsigned int)param_count, (unsigned int)min_param_count,
-                                         defaults, captured_max_registers, captured_max_raw_ints,
-                                         captured_max_raw_reals);
+                                         defaults, captured_max_registers);
     return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
 }
 
-/* Parses `(params...):' -- shared by the original top-level function compile and a later
-   specialization recompile (vm.c's lbl_call_spec, re-lexing a retained source span, see
-   ChunkFunction.source_span). Caller must already be positioned right at '('. Once one parameter
-   has a default, every parameter after it must too. */
-static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal* param_defaults,
-                                         int* out_param_count, int* out_min_param_count) {
+/* Named functions can't nest. Once one parameter has a default, every parameter after it must
+   too. */
+static void parse_function(Chunk* c) {
+    if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected function name"); return; }
+    unsigned int name_idx = chunk_add_pool(c, token.value);
+    if (is_builtin_name(c, name_idx)) {
+        error_at("'%s' is a reserved builtin name and can't be redefined as a function",
+                 aer_as_string(token.value)->data);
+        return;
+    }
+    lex();
+
     require(TOKEN_OPEN_PARENTHESE, "expected '(' after function name");
     if (parse_had_error) return;
 
+    unsigned int param_names[FRAME_REGISTERS];
+    AerVal       param_defaults[FRAME_REGISTERS];   /* only [min_param_count, param_count) are meaningful */
     int param_count     = 0;
     int min_param_count = 0;
     bool seen_default   = false;
@@ -3318,37 +2999,15 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
     }
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after parameters");
     require(TOKEN_COLON,            "expected ':' after function signature");
-    *out_param_count     = param_count;
-    *out_min_param_count = min_param_count;
-}
+    if (parse_had_error) return;
 
-/* Compiles a function's body (parameter binding + parse_block + implicit-return-null +
-   peak-register capture), shared by the original top-level compile and a later specialization
-   recompile. Caller has already parsed the signature (parse_function_signature above) and must
-   save/restore the allocator/variable-table state itself if needed for its OWN purposes beyond
-   what this function restores -- this function saves and restores everything it touches, so it
-   never leaks state to the caller regardless of which of the two call sites it's used from.
+    chunk_emit(c, OP_JUMP);
+    unsigned int patch = c->count;
+    chunk_emit(c, 0);
+    unsigned int func_start = c->count;
 
-   hint_param_reg/hint_shape: when hint_param_reg >= 0 (always == that parameter's own register,
-   since parameters bind in order starting at 0), that parameter gets seeded with hint_shape for
-   this compile only -- lets '.field'/'[idx].field' accesses compile through the raw specialized
-   opcodes (parse_postfix_chain/parse_chain_assignment) instead of the generic ones. Pass -1/NULL
-   for an ordinary (non-specialized) compile, the overwhelmingly common case, which leaves both
-   shape tables below entirely NULL and so never takes the new codegen branches at all -- the
-   generic body is unaffected by this mechanism's mere existence.
-
-   hint_is_element_shape distinguishes WHICH table gets seeded: false (SPEC_KIND_STRUCT/
-   PACKED_ARRAY) seeds reg_known_shape[hint_param_reg] directly -- the parameter's own register IS
-   the struct/packed-array value. true (SPEC_KIND_ARRAY_OF_STRUCTS) seeds reg_known_element_shape
-   instead -- the parameter is a plain TYPE_ARRAY, never itself struct-shaped, so hint_shape
-   describes what `param[idx]` produces, not `param` itself; the plain index-get site in
-   parse_postfix_chain propagates it onto a one-hop local alias's own register (`pi = particles[i]`)
-   at the point parse_assignment binds it. */
-static void parse_function_body(Chunk* c, unsigned int* param_names, int param_count,
-                                    int hint_param_reg, Shape* hint_shape, bool hint_is_element_shape,
-                                    unsigned int* out_max_registers,
-                                    unsigned int* out_max_raw_ints,
-                                    unsigned int* out_max_raw_reals) {
+    /* Saves the allocator/variable-table state, resets both fresh, restores after -- no stack
+       needed since named functions can't nest. */
     unsigned int saved_var_names[FRAME_REGISTERS];
     int          saved_var_regs[FRAME_REGISTERS];
     VarKind      saved_var_kind[FRAME_REGISTERS];
@@ -3356,8 +3015,6 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     int saved_next_temp      = next_temp_register;
     int saved_reserved_floor = reserved_floor;
     int saved_max_register_used = max_register_used;
-    int saved_max_raw_int_used  = max_raw_int_used;
-    int saved_max_raw_real_used = max_raw_real_used;
     int saved_raw_int_next_temp      = raw_int_next_temp;
     int saved_raw_int_reserved_floor = raw_int_reserved_floor;
     int saved_raw_real_next_temp      = raw_real_next_temp;
@@ -3369,88 +3026,8 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     next_temp_register = 0;
     reserved_floor     = 0;
     max_register_used  = 0;
-    max_raw_int_used   = 0;
-    max_raw_real_used  = 0;
     raw_int_next_temp = 0;  raw_int_reserved_floor = 0;
     raw_real_next_temp = 0; raw_real_reserved_floor = 0;
-
-    memset(shape_sensitive_param, 0, sizeof(shape_sensitive_param));
-    for (int i = 0; i < FRAME_REGISTERS; i++) alias_source_param[i] = -1;
-    memset(reg_known_shape, 0, sizeof(reg_known_shape));
-    memset(reg_known_element_shape, 0, sizeof(reg_known_element_shape));
-    last_plain_index_dest_reg         = -1;
-    last_plain_index_src_param        = -1;
-    last_plain_index_known_elem_shape = NULL;
-    current_param_count = param_count;
-
-    function_depth++;
-    for (int i = 0; i < param_count; i++) {
-        var_slot(c, param_names[i]);
-        /* Parameter i is always register i (var_slot binds parameters first, in order, right
-           after the allocator resets to 0 above) -- no need to inspect var_slot's return value. */
-        if (i == hint_param_reg) {
-            if (hint_is_element_shape) reg_known_element_shape[i] = hint_shape;
-            else                       reg_known_shape[i]         = hint_shape;
-        }
-    }
-
-    parse_block(c);
-    function_depth--;
-
-    if (!parse_had_error) {
-        /* Implicit 'return null' if control falls off the end. */
-        int rk_null  = (int)chunk_add_pool(c, aer_null()) | RK_CONST_FLAG;
-        int reg_null = materialize(c, rk_null);
-        emit_return(c, reg_null);
-    }
-
-    *out_max_registers = (unsigned int)max_register_used;
-    *out_max_raw_ints  = (unsigned int)max_raw_int_used;
-    *out_max_raw_reals = (unsigned int)max_raw_real_used;
-
-    var_count = saved_var_count;
-    memcpy(var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
-    memcpy(var_regs,  saved_var_regs,  sizeof(int) * (size_t)saved_var_count);
-    memcpy(var_kind,  saved_var_kind,  sizeof(VarKind) * (size_t)saved_var_count);
-    next_temp_register = saved_next_temp;
-    reserved_floor     = saved_reserved_floor;
-    max_register_used  = saved_max_register_used;
-    max_raw_int_used   = saved_max_raw_int_used;
-    max_raw_real_used  = saved_max_raw_real_used;
-    raw_int_next_temp = saved_raw_int_next_temp;   raw_int_reserved_floor = saved_raw_int_reserved_floor;
-    raw_real_next_temp = saved_raw_real_next_temp; raw_real_reserved_floor = saved_raw_real_reserved_floor;
-}
-
-/* Named functions can't nest. Once one parameter has a default, every parameter after it must
-   too. */
-static void parse_function(Chunk* c) {
-    if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected function name"); return; }
-    unsigned int name_idx = chunk_add_pool(c, token.value);
-    if (is_builtin_name(c, name_idx)) {
-        error_at("'%s' is a reserved builtin name and can't be redefined as a function",
-                 aer_as_string(token.value)->data);
-        return;
-    }
-    /* Captured unconditionally (cheap -- a pointer, not a copy) so the source span from '(' through
-       the end of the body is available to retain later IF this function turns out to be shape-
-       sensitive (see the source_span capture after the body compiles, below). Must be captured
-       BEFORE the lex() just below, not after -- current_source_cursor() reflects the position past
-       whatever token was JUST scanned, and token here is still the function's name (not yet '('),
-       so the cursor sits exactly at '(' now; capturing after lex() would already be past '(' (it
-       would then hold the position past '(' itself, i.e. mid-parameter-list). */
-    const char* span_start = current_source_cursor();
-    lex();
-
-    unsigned int param_names[FRAME_REGISTERS];
-    AerVal       param_defaults[FRAME_REGISTERS];   /* only [min_param_count, param_count) are meaningful */
-    int param_count, min_param_count;
-    parse_function_signature(c, param_names, param_defaults, &param_count, &min_param_count);
-    if (parse_had_error) return;
-
-    chunk_emit(c, OP_JUMP);
-    unsigned int patch = c->count;
-    chunk_emit(c, 0);
-    unsigned int func_start = c->count;
 
     /* Registered before the body so a self-recursive call inside resolves -- any other
        not-yet-defined function's call just needs to resolve somewhere else in this parse() call
@@ -3467,93 +3044,34 @@ static void parse_function(Chunk* c) {
        chunk_add_function call can land between here and the patch. */
     unsigned int this_func_idx = c->function_count - 1;
 
-    unsigned int captured_max_registers, captured_max_raw_ints, captured_max_raw_reals;
-    parse_function_body(c, param_names, param_count, -1, NULL, false,
-                            &captured_max_registers, &captured_max_raw_ints, &captured_max_raw_reals);
+    /* Incremented before registering parameters -- var_slot only skips recording a global when
+       function_depth > 0, and a parameter is never a global. */
+    function_depth++;
+    for (int i = 0; i < param_count; i++) var_slot(c, param_names[i]);
 
-    /* Fold shape_sensitive_param[] into one bitmask; retain the source span (owned copy, see
-       ChunkFunction.source_span's own comment) only when it's actually needed -- the common case
-       (not shape-sensitive) pays nothing beyond the mask computation itself. parse_function_body
-       already restored shape_sensitive_param/current_param_count's OWN inputs, but not the fold-in
-       -- reads them here, right after the call, before anything else can touch them. */
-    unsigned int shape_mask = 0;
-    for (int i = 0; i < param_count && i < 32; i++)
-        if (shape_sensitive_param[i]) shape_mask |= (1u << i);
-    c->functions[this_func_idx].shape_sensitive_mask = shape_mask;
-    if (shape_mask != 0) {
-        const char* span_end = current_source_cursor();
-        unsigned int span_len = (unsigned int)(span_end - span_start);
-        char* span_copy = xmalloc((size_t)span_len + 1);
-        memcpy(span_copy, span_start, span_len);
-        span_copy[span_len] = '\0';
-        c->functions[this_func_idx].source_span     = span_copy;
-        c->functions[this_func_idx].source_span_len = span_len;
+    parse_block(c);
+    function_depth--;
+
+    if (!parse_had_error) {
+        /* Implicit 'return null' if control falls off the end. */
+        int rk_null  = (int)chunk_add_pool(c, aer_null()) | RK_CONST_FLAG;
+        int reg_null = materialize(c, rk_null);
+        emit_return(c, reg_null);
     }
 
-    c->functions[this_func_idx].max_registers = captured_max_registers;
-    c->functions[this_func_idx].max_raw_ints  = captured_max_raw_ints;
-    c->functions[this_func_idx].max_raw_reals = captured_max_raw_reals;
+    c->functions[this_func_idx].max_registers = (unsigned int)max_register_used;
+
+    var_count = saved_var_count;
+    memcpy(var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
+    memcpy(var_regs,  saved_var_regs,  sizeof(int) * (size_t)saved_var_count);
+    memcpy(var_kind,  saved_var_kind,  sizeof(VarKind) * (size_t)saved_var_count);
+    next_temp_register = saved_next_temp;
+    reserved_floor     = saved_reserved_floor;
+    max_register_used  = saved_max_register_used;
+    raw_int_next_temp = saved_raw_int_next_temp;   raw_int_reserved_floor = saved_raw_int_reserved_floor;
+    raw_real_next_temp = saved_raw_real_next_temp; raw_real_reserved_floor = saved_raw_real_reserved_floor;
 
     patch_jump(c, patch, c->count);
-}
-
-/* Lazily compiles a specialized body for target_f's shape-sensitive parameter, keyed by a Shape
-   actually observed at a real call site -- see vm.c's lbl_call_spec, the only caller. Re-lexes the
-   retained source span (ChunkFunction.source_span) in its own isolated span (same mechanism
-   parse_interpolated_expr already uses for a string interpolation's `{expr}` body), re-parses the
-   signature to re-derive param_names (never persisted from the original compile -- only arity/
-   defaults survive on target_f), then compiles the body with param_index's register seeded as
-   known-shape via parse_function_body's hint. Appends to c (the SAME chunk currently executing --
-   safe: every growable Chunk array is dereferenced through c-> at every use site, never a cached
-   raw pointer held across this call, and the caller is responsible for re-running
-   chunk_ensure_field_cache/chunk_ensure_call_spec_cache afterward so the newly-appended code's own
-   sites get valid cache slots before they're ever dispatched).
-
-   Returns true and fills *out_entry on success. False (should not happen in correct operation --
-   the exact same source already compiled once successfully; nothing about substituting a shape
-   hint changes the grammar) means the caller must fall back to the generic body, same as it would
-   for a shape it doesn't recognize at all. parser_had_error and every allocator/variable-table
-   global this touches are fully saved and restored either way, so a failed recompile can't corrupt
-   whatever the VM does next (including a later, unrelated aer_run_source call in the same process). */
-bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape, SpecKind kind,
-                                    int param_index, SpecEntry* out_entry) {
-    if (!target_f->source_span) return false;   /* defensive -- shouldn't happen alongside a nonzero shape_sensitive_mask */
-
-    bool saved_had_error = parse_had_error;
-    parse_had_error = false;
-
-    ParserState* saved_parser = parser_save_state();
-    LexerState*  saved_lexer  = lexer_save_state();
-    lexer_begin_span(target_f->source_span, target_f->source_span_len);
-    lex();
-
-    unsigned int param_names[FRAME_REGISTERS];
-    AerVal       param_defaults[FRAME_REGISTERS];
-    int param_count, min_param_count;
-    parse_function_signature(c, param_names, param_defaults, &param_count, &min_param_count);
-
-    unsigned int new_offset = c->count;
-    unsigned int max_registers = 0, max_raw_ints = 0, max_raw_reals = 0;
-    if (!parse_had_error) {
-        parse_function_body(c, param_names, param_count, param_index, shape,
-                                kind == SPEC_KIND_ARRAY_OF_STRUCTS,
-                                &max_registers, &max_raw_ints, &max_raw_reals);
-    }
-    bool ok = !parse_had_error;
-
-    lexer_restore_state(saved_lexer);
-    parser_restore_state(saved_parser);
-    parse_had_error = saved_had_error;
-
-    if (!ok) return false;
-
-    out_entry->shape         = shape;
-    out_entry->kind          = kind;
-    out_entry->code_offset   = new_offset;
-    out_entry->max_registers = max_registers;
-    out_entry->max_raw_ints  = max_raw_ints;
-    out_entry->max_raw_reals = max_raw_reals;
-    return true;
 }
 
 /* Includes a `[]`/`{}` empty-container template special case -- vm_default_value allocates a
@@ -3653,11 +3171,13 @@ static void parse_struct(Chunk* c) {
 
     if (field_count == 0) { error_at("Struct must have at least one field"); return; }
 
-    chunk_emit(c, PACK_STRUCT_HEADER(name_idx, field_count));
+    chunk_emit(c, OP_DEFINE_STRUCT);
+    chunk_emit(c, (int)name_idx);
+    chunk_emit(c, (int)field_count);
     for (unsigned int i = 0; i < field_count; i++) {
-        unsigned int default_idx = chunk_add_pool(c, field_defaults[i]);
-        chunk_emit(c, PACK_2X16(field_names[i], default_idx));
-        chunk_emit(c, (uint32_t)field_types[i]);
+        chunk_emit(c, (int)field_names[i]);
+        chunk_emit(c, (int)chunk_add_pool(c, field_defaults[i]));
+        chunk_emit(c, (int)field_types[i]);
     }
 
     struct_register(name_idx);

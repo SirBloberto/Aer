@@ -18,8 +18,7 @@ unsigned int emit_jump_if_false_reg(Chunk* c, int reg);
 void patch_jump(Chunk* c, unsigned int patch_offset, unsigned int target);
 
 /* callee_offset must be known at the call site (no patch step) — lay out the callee first. */
-unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count,
-                           unsigned int func_index);
+unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count);
 void emit_return(Chunk* c, int src_reg);
 
 /* Functions as values (see OP_CALL_VALUE's comment in vm.h). */
@@ -72,11 +71,5 @@ void           parser_restore_state(ParserState* saved);
 /* Compile lexed source into bytecode. Safe to call repeatedly on the same chunk (REPL):
    per-statement recovery rolls back a failed statement and resumes. */
 void parse(Chunk* c);
-
-/* Lazily compiles a specialized body for a shape-sensitive function, keyed by a Shape observed at
-   a real call site -- see vm.c's lbl_call_spec (the only caller) and this function's own comment
-   in parser.c for the full contract. */
-bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape, SpecKind kind,
-                                    int param_index, SpecEntry* out_entry);
 
 #endif

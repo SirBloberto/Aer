@@ -78,8 +78,6 @@ struct AerFunction {
     AerVal*      defaults;        /* NULL if min_arity == arity; else (arity - min_arity) compile-time-literal values */
     unsigned int code_offset;
     unsigned int max_registers;   /* this function's real peak register need — see ChunkFunction's own comment, vm.h */
-    unsigned int max_raw_ints;    /* this function's real peak raw_ints[] slot need -- see ChunkFunction's own comment, vm.h */
-    unsigned int max_raw_reals;   /* same, for raw_reals[] */
     uint16_t     arity;
     uint16_t     min_arity;       /* params [0, min_arity) are required; [min_arity, arity) use defaults[] below, in order */
 };
