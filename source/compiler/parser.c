@@ -2910,6 +2910,7 @@ static int module_fn_id(int module_id, AerString* name) {
             if (NAME_IS("index_of")) return FN_COLLECTION_INDEX_OF;
             if (NAME_IS("keys"))     return FN_COLLECTION_KEYS;
             if (NAME_IS("sort"))     return FN_COLLECTION_SORT;
+            if (NAME_IS("reserve"))  return FN_COLLECTION_RESERVE;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_NET:
             if (NAME_IS("connect")) return FN_NET_CONNECT;

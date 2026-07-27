@@ -30,6 +30,25 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         a->generation++;   /* see AerArray.generation's own comment, value.h */
         vm_stack_push(vm, arr); return true;
     }
+    if (fn_id == FN_COLLECTION_RESERVE && arg_count == 2) {
+        AerVal n_v = vm_stack_pop(vm); AerVal arr = vm_stack_pop(vm);
+        if (aer_type(arr) != TYPE_ARRAY) { error("reserve() requires an array"); vm_stack_push(vm, aer_null()); return true; }
+        AerArray* a = aer_as_array(arr);
+        if (a->shape) { error("reserve() cannot resize a struct instance — structs have a fixed shape"); vm_stack_push(vm, aer_null()); return true; }
+        if (aer_type(n_v) != TYPE_INTEGER) { error("reserve() count must be an integer"); vm_stack_push(vm, aer_null()); return true; }
+        int64_t n = aer_as_int(n_v);
+        if (n < 0) { error("reserve() count cannot be negative"); vm_stack_push(vm, aer_null()); return true; }
+        /* Pre-sizes items[] once, up front, to skip append()'s incremental double-on-overflow
+           growth for the common "build a huge array via many appends" pattern -- mirrors
+           hashtable_reserve's own contract (hashtable.c): never shrinks, a no-op if already big
+           enough. Doesn't touch count -- unlike a packed array's fixed-size construction, this is
+           purely a capacity hint; elements still only exist once actually appended/assigned. */
+        if ((unsigned int)n > a->capacity) {
+            a->capacity = (unsigned int)n;
+            a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
+        }
+        vm_stack_push(vm, arr); return true;
+    }
     if (fn_id == FN_COLLECTION_DELETE && arg_count == 2) {
         AerVal key = vm_stack_pop(vm); AerVal obj = vm_stack_pop(vm);
         if (aer_type(obj) == TYPE_DICT) {

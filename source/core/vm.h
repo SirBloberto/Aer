@@ -447,6 +447,7 @@ static inline uint16_t pack_rk16(int rk) {
 #define FN_COLLECTION_INDEX_OF 4
 #define FN_COLLECTION_KEYS     5
 #define FN_COLLECTION_SORT     6
+#define FN_COLLECTION_RESERVE  7
 
 #define FN_NET_CONNECT 0
 #define FN_NET_SEND    1
