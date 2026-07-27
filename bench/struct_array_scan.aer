@@ -1,0 +1,53 @@
+import collection
+import time
+
+# Isolates the ONE mechanism the raw-fields change actually targets: field-size / cache density.
+# nbody's O(n^2) inner loop keeps revisiting the same small (57-114KB) working set, which stays
+# cache-resident regardless of struct size -- there's nothing for a smaller struct to save there.
+# This is the opposite shape on purpose: a large 1D array, one cheap pass per iteration, so the
+# array's total byte footprint (which raw fields directly shrink) actually determines how much of
+# it survives in cache between passes.
+struct Particle:
+    x = 0.0
+    y = 0.0
+    z = 0.0
+    vx = 0.0
+    vy = 0.0
+    vz = 0.0
+    mass = 0.0
+
+N = 2000000
+PASSES = 50
+
+function make_particles(n):
+    particles = []
+    i = 0
+    for i < n:
+        p = Particle()
+        p.x = (i as float)
+        p.vx = 0.0001
+        p.mass = 1.0
+        collection.append(particles, p)
+        i += 1
+    return particles
+
+function advance_pass(particles, n, dt):
+    i = 0
+    for i < n:
+        pi = particles[i]
+        vx = pi.vx
+        vy = pi.vy
+        vz = pi.vz
+        pi.x += vx * dt
+        pi.y += vy * dt
+        pi.z += vz * dt
+        i += 1
+
+particles = make_particles(N)
+start = time.now()
+p = 0
+for p < PASSES:
+    advance_pass(particles, N, 0.01)
+    p += 1
+dur = time.now() - start
+print("struct_array_scan: {N} particles x {PASSES} passes in {dur}s, x[0]={particles[0].x}")
