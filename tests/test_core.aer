@@ -44,7 +44,7 @@ assert(1 + 2.5 == 3.5, "integer promoted to float when mixed")
 # 42.0 as bare "42", indistinguishable from an integer once round-tripped through print()/
 # interpolation/json.encode() (see test_stdlib_modules.aer for the json.encode/decode round-trip
 # side of this same fix).
-assert("{42 as float}" == "42.0", "a whole-number float shows its decimal point when interpolated")
+assert("{float(42)}" == "42.0", "a whole-number float shows its decimal point when interpolated")
 assert("{3.5}" == "3.5", "a fractional float is untouched by the same formatting fix")
 
 # ------------------------------------------------------------------ #
@@ -224,19 +224,19 @@ bw = bw >> 1
 assert(bw == 60, "bitwise update chain spelled out")
 
 # ------------------------------------------------------------------ #
-# 6. `as` — type casting                                               #
+# 6. Primitive casts — integer()/float()/boolean()/string()             #
 # ------------------------------------------------------------------ #
 
-assert(("42" as integer) == 42, "string to integer cast")
-assert((42 as float) == 42, "integer to float cast (compares equal via promotion)")
-assert((42 as string) == "42", "integer to string cast")
-assert((3.7 as integer) == 3, "float to integer cast truncates, does not round")
-assert((0 as boolean) == false, "0 casts to false")
-assert((1 as boolean) == true, "nonzero casts to true")
-assert(("" as boolean) == false, "empty string casts to false")
+assert(integer("42") == 42, "string to integer cast")
+assert(float(42) == 42, "integer to float cast (compares equal via promotion)")
+assert(string(42) == "42", "integer to string cast")
+assert(integer(3.7) == 3, "float to integer cast truncates, does not round")
+assert(boolean(0) == false, "0 casts to false")
+assert(boolean(1) == true, "nonzero casts to true")
+assert(boolean("") == false, "empty string casts to false")
 
-# `as` binds tighter than arithmetic — reads as (x as integer) + 1
-assert("10" as integer + 1 == 11, "'as' binds tighter than +")
+# Ordinary call-then-operator precedence, no special-cased "cast operator" tier to remember
+assert(integer("10") + 1 == 11, "cast result composes with arithmetic like any other call's return value")
 
 # ------------------------------------------------------------------ #
 # 7. If / else — block form, plus the inline if-EXPRESSION              #

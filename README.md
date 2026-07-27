@@ -162,7 +162,7 @@ lookup), then the grammar and semantics organized by topic.
 
 ## Keywords
 
-AER has **21 reserved words**, plus the two boolean literals. That's the entire list — nothing else
+AER has **20 reserved words**, plus the two boolean literals. That's the entire list — nothing else
 in the language is reserved:
 
 | Keyword | Role |
@@ -171,7 +171,6 @@ in the language is reserved:
 | `for` | the single iteration keyword — while, for-each, and ranges all use it |
 | `in` | membership test, and the `for x in ...` iteration form |
 | `and` / `or` / `not` | logical operators (see [Operators](#operators) for precedence) |
-| `as` | cast to a primitive type, or shape-check against a struct type |
 | `struct` | declare a fixed-shape record type |
 | `function` | declare a named function, or start an anonymous function value |
 | `return` | return from a function, optionally with a value (or several) |
@@ -180,14 +179,14 @@ in the language is reserved:
 | `null` | the absence-of-a-value literal |
 | `import` | bring a native or file-based module into scope |
 | `true` / `false` | boolean literals |
-| `integer` / `float` / `boolean` | primitive type names — only meaningful after `as`, but reserved everywhere so they can never be shadowed |
-| `array` / `hashtable` | collection type names — not valid `as` cast targets themselves (there's no generic value-to-collection conversion), but reserved for the same reason |
+| `integer` / `float` / `boolean` | primitive type names — only meaningful as a cast call (`integer(x)`), but reserved everywhere so they can never be shadowed |
+| `array` / `hashtable` | collection type names — not valid cast targets themselves (there's no generic value-to-collection conversion), but reserved for the same reason |
 
-`string` is deliberately **not** on this list, even though it's a valid `as` cast target
-(`x as string`) — it collides with the stdlib `string` module (`import string`), so it stays an
-ordinary identifier like every other module name, matched by text rather than reserved. This costs
-nothing in practice: `as string`'s grammar is a fixed, non-lookup production regardless (same as
-every other cast target), so it was never shadowable to begin with.
+`string` is deliberately **not** on this list, even though it's a valid cast call (`string(x)`) — it
+collides with the stdlib `string` module (`import string`), so it stays an ordinary identifier like
+every other module name, matched by text rather than reserved. This costs nothing in practice:
+`string(x)` used as a cast and `string.upper(s)` used as a module call are both recognized by the
+parser from context, so `string` was never shadowable to begin with.
 
 **Everything else is an ordinary identifier**, including every stdlib module name
 (`math`, `random`, `string`, `time`, `collection`, `net`, `regex`, `json`, `io`) — none of these are
@@ -221,18 +220,20 @@ Binary operators are looked up by one precedence table, from lowest to highest:
 | 8 | `<`  `>`  `<=`  `>=`  `in` | comparison · membership |
 | 9 | `<<`  `>>` | bit shift |
 | 10 | `+`  `-` | add · subtract |
-| 11 | `*`  `/`  `%`  `//` | multiply · true-divide · modulo · floor-divide |
-| 12 (highest) | `as` | cast / shape-check |
+| 11 (highest) | `*`  `/`  `%`  `//` | multiply · true-divide · modulo · floor-divide |
 
-`as` binding tighter than everything else means `x as integer + 1` reads as `(x as integer) + 1`,
-matching Rust's `as` precedence convention. `in` sits at comparison precedence, not its own tier —
-`a == b in list` parses as `a == (b in list)`.
+`in` sits at comparison precedence, not its own tier — `a == b in list` parses as `a == (b in list)`.
+
+There is no cast/shape-check operator in this table at all — `integer(x)`/`float(x)`/`boolean(x)`/
+`string(x)` and struct shape-checks (`type(x) == "Point"`) are ordinary calls and comparisons, so
+their "precedence" is just a call's parens and `==`'s own tier; there's no separate precedence rule
+to learn for casting the way Rust's `as` needs one.
 
 `not` sits between `and`/`or` and everything else — tighter than `and`/`or`, looser than
-comparison/`in`/arithmetic/`as` — matching Python. This is why `not "age" in person` reads as
+comparison/`in`/arithmetic — matching Python. This is why `not "age" in person` reads as
 `not ("age" in person)` rather than `(not "age") in person`: `not`'s operand grabs the whole `in`
 expression before `not` itself is applied. `-`/`~` don't share this: they bind tighter than any
-binary operator, same as `x as integer + 1`'s `as`.
+binary operator.
 
 **Unary** (bind tighter than any binary operator): `-x` (negate), `~x` (bitwise not). `not` is
 unary too but sits at its own, looser precedence — see above, not this list.
@@ -427,32 +428,36 @@ an interpolated expression still needs the same `\"` escaping any other embedded
 `"{greet(\"world\")}"`. To include a literal `{` (not an interpolation), escape it: `"\{name}"`
 prints `{name}`.
 
-### Casting and Shape-Checking — `as`
+### Casting and Shape-Checking
 
-`x as T` has two meanings depending on `T`:
-
-- If `T` is `integer`, `float`, `string`, or `boolean`, it **coerces** `x` to that primitive type.
-- Otherwise `T` is treated as a struct type name and it becomes a **runtime shape check**: `x`
-  passes through unchanged if it's exactly a struct instance of type `T`, otherwise it errors. It
-  never converts one struct shape into another — there's no single well-defined way to do that.
+Primitive casts are ordinary function calls — `integer(x)`, `float(x)`, `boolean(x)`, `string(x)` —
+each **coercing** `x` to that primitive type:
 
 ```
-print("42" as integer)     # 42
-print(42 as float)         # 42.0
-print(42 as string)        # "42"
-print(3.7 as integer)      # 3   (truncates toward zero, does not round)
-print(0 as boolean)        # false — numeric/string coercion to boolean uses the same truthiness rule as `if`
-
-p = Point(1.0, 2.0)
-checked = p as Point       # passes through unchanged
-# e as Point                # errors if e isn't exactly a Point
+print(integer("42"))     # 42
+print(float(42))         # 42.0
+print(string(42))        # "42"
+print(integer(3.7))      # 3   (truncates toward zero, does not round)
+print(boolean(0))        # false — numeric/string coercion to boolean uses the same truthiness rule as `if`
 ```
 
-`"abc" as integer`/`as float` is a runtime error, not a silent `0` — the whole string (leading/
+`integer("abc")`/`float("abc")` is a runtime error, not a silent `0` — the whole string (leading/
 trailing whitespace aside) must be a valid number, or it's rejected rather than fabricating a
 plausible-looking wrong value.
 
-`as` is also used to declare a struct-typed function parameter — see [Structs](#structs).
+Checking a struct's shape is an ordinary comparison against `type(x)`, the same builtin that reports
+any value's type name (see [Built-in Functions](#built-in-functions)):
+
+```
+p = Point(1.0, 2.0)
+print(type(p) == "Point")     # true
+if type(e) != "Point":
+    panic("expected a Point")  # write the "assert or crash" behaviour explicitly when you want it
+```
+
+This is a genuine query, not an assertion — unlike a cast, a shape check never errors on a mismatch
+by itself; you decide what to do with the `false`. There's still no way to convert one struct shape
+into another — build the target explicitly: `Point(some_table["x"], ...)`.
 
 ## Variables
 
@@ -864,8 +869,8 @@ function point_translate(p, dx, dy):
 point_translate(p1, 1.0, 1.0)
 ```
 
-`x as Point` is a standalone runtime shape check, not part of a function signature — see
-[Casting and Shape-Checking](#casting-and-shape-checking--as).
+`type(p) == "Point"` is a standalone runtime shape check, not part of a function signature — see
+[Casting and Shape-Checking](#casting-and-shape-checking).
 
 ### Packed Arrays
 
@@ -1143,6 +1148,18 @@ module still binds under its own bare filename, `mid`:
 import sub.mid
 print(mid.some_function())    # not sub.mid.some_function() — the dots only picked the file
 ```
+
+A quoted string form also exists, for paths the dotted form can't express (explicit relative
+components, an absolute path) — used exactly as written, never dot-converted:
+
+```
+import "../shared/helpers.aer"          # binds as helpers, derived from the path's own last segment
+import shared "../shared/helpers.aer"   # binds as shared instead — the alias, name-before-string,
+                                         # matching Go's own import-alias convention
+```
+
+The alias form is also the way to bind a name the path can't derive on its own (an extensionless
+path, or one whose last segment isn't a valid identifier).
 
 There's no cap on how many distinct files a program imports — the module registry, the "currently
 loading" cycle-detection stack, and the lexer's own open-file table all grow as needed.
@@ -1595,7 +1612,7 @@ what a real permission system would still need on top of this.
 | Missing hashtable key returns `null` | No error, silent | Use `key in hashtable` before access |
 | `collection.append()`/`delete()`/`sort()`/`shuffle()` mutate in place and also return the container | `arr = collection.append(arr, v)` works but is redundant — the mutation already happened | Call them as statements |
 | Repeated `s += x` in a loop is quadratic | Strings are immutable — every `+=` allocates a fresh buffer and copies the whole thing so far, not just the addition | Build a list with `collection.append()` and join once: `parts = []; for ...: collection.append(parts, x); s = string.join(parts, "")` |
-| `as Type` never converts | `some_table as Point` errors rather than reshaping the hashtable into a Point | Build the struct explicitly: `Point(some_table["x"], ...)` |
+| No struct-to-struct conversion | There's no built-in way to reshape a hashtable or another struct into a Point | Build the struct explicitly: `Point(some_table["x"], ...)` |
 | Struct instances are still `AerArray` under the hood | `length(p)` works and returns the field count (not blocked) | Harmless but not the intended API — use dot access |
 | Pipe rejects nested calls in target args | `x \|> f(g(1))` is a parse error, at any depth | Assign the inner call to a variable first: `t = g(1); x \|> f(t)` |
 
@@ -1675,9 +1692,11 @@ recognises constructs — no AST is built. Control flow uses **backpatching**: a
 emitted for jump targets and overwritten once the target address is known.
 
 Binary expressions use **precedence climbing**: one function with a table (see
-[Operators](#operators)) handles all binary operators — including `in`, the pipe operator `|>`, and
-the cast/shape-check operator `as` (both of which special-case their RHS parsing since it isn't a
-general expression) — without a chain of separate grammar rules.
+[Operators](#operators)) handles all binary operators — including `in` and the pipe operator `|>`
+(which special-cases its RHS parsing since it isn't a general expression) — without a chain of
+separate grammar rules. Primitive casts and shape-checks aren't part of this table at all — they're
+ordinary calls (`integer(x)`) and comparisons (`type(x) == "Point"`), ordinary primary/call
+expressions rather than a dedicated binary operator.
 
 String interpolation is resolved at compile time: each `{expr}` is sub-parsed via its own
 independent lexer span (saved/restored around the outer string's own raw byte scan) into ordinary
@@ -1852,9 +1871,8 @@ and short-circuit operator uses this pattern.
 ### Precedence climbing
 
 One function with a table handles all binary operators (see [Operators](#operators)). To add a new
-operator, add one row to the table — `in`, `|>`, and `as` all went in this way, the latter two
-needing a small special-case branch in the climbing loop only because their right-hand side isn't a
-general expression.
+operator, add one row to the table — `in` and `|>` both went in this way, `|>` needing a small
+special-case branch in the climbing loop because its right-hand side isn't a general expression.
 
 ### Iterator state lives in ordinary registers
 
@@ -1925,12 +1943,15 @@ applies for free. The tradeoff is that structs need explicit guards to stay conc
 from plain arrays (see [Structs](#structs) — bracket/slice/append/delete are rejected on a shaped
 array precisely because the representation would otherwise let them through silently.
 
-### `as` unifies casting and shape-checking under one operator
+### No dedicated cast/shape-check operator, by design
 
-Rather than a separate keyword or syntax for "verify this is a Player," `as` was extended to cover
-it: for primitive targets it coerces, for struct targets it verifies (never converts, since
-struct-to-struct conversion has no single well-defined rule). One operator, one consistent
-question — "produce or confirm a value of type T" — answered differently depending on what T is.
+An earlier design used a single `as` operator for both jobs (`x as integer` to coerce, `x as Point`
+to verify a shape). It was removed: `as` was the only keyword whose entire purpose was being a cast
+target, and an optional convenience like this has to earn its place in the grammar rather than just
+being "a fine word" for the job. Primitive casts are ordinary function calls (`integer(x)`), and
+shape-checking reuses the `type()` builtin that already existed for other reasons
+(`type(x) == "Point"`) — zero new grammar, and a strictly more general shape check in the bargain
+(a query that returns a boolean, rather than an operator that could only ever assert-or-crash).
 
 ### Pipe enforces no nested calls in its target's arguments
 

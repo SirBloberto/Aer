@@ -252,8 +252,8 @@ function recursive_raw_sum(n):
         total += i
         i += 1
     if n <= 1:
-        return (total as float) * scale
-    return (total as float) * scale + recursive_raw_sum(n - 1)
+        return float(total) * scale
+    return float(total) * scale + recursive_raw_sum(n - 1)
 
 # 50 levels deep (VM_CALL_MAX is 64) -- deep enough to stress many simultaneously-live raw
 # frames sharing one backing array, shallow enough to stay well clear of a real stack overflow.
@@ -265,7 +265,7 @@ for tlx_k <= 50:
     for tlx_j < tlx_k:
         tlx_partial += tlx_j
         tlx_j += 1
-    expected += (tlx_partial as float) * 1.5
+    expected += float(tlx_partial) * 1.5
     tlx_k += 1
 assert(recursive_raw_sum(50) == expected, "50 levels of recursion, each with its own live raw int + raw real local, all isolated correctly via the shared bump-pointer raw stack")
 
@@ -291,7 +291,7 @@ function raw_caller_via_value(fn, n):
     for i < n:
         outer_total += fn(i)          # fn is a parameter (boxed) holding a function value -> OP_CALL_VALUE
         i += 1
-    return (outer_total as float) * outer_scale
+    return float(outer_total) * outer_scale
 
 expected_via_value = 0.0
 tlx_n2 = 0
@@ -301,7 +301,7 @@ for tlx_n2 < 6:
     for tlx_j2 < tlx_n2:
         tlx_inner += tlx_j2
         tlx_j2 += 1
-    expected_via_value += (tlx_inner as float)
+    expected_via_value += float(tlx_inner)
     tlx_n2 += 1
 expected_via_value = expected_via_value * 2.0
 assert(raw_caller_via_value(raw_callee, 6) == expected_via_value, "the caller's own raw locals survive an OP_CALL_VALUE call (function-through-a-variable) to another function with its own independent raw locals")

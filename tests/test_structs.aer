@@ -1,7 +1,7 @@
 #!/usr/bin/env aer
 import collection
 # AER test suite — structs: fixed-shape records, dot-access, and
-# shape-checking via `as`.
+# shape-checking via type(x) == "Name".
 # Machine-checked via assert(): a clean run exits 0; any failure prints
 # "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
 #
@@ -64,12 +64,10 @@ assert(p1.x == 15, "mutation through a passed-in struct reference via compound a
 
 e = Enemy()
 
-# `as StructName` is a standalone runtime shape check — it verifies, it
-# never converts (there's no single well-defined way to reshape one
-# struct into another).
-checked = p1 as Point
-assert(checked.x == 15, "'as StructName' passes a matching instance through unchanged")
-# bad = e as Point        # would error: Expected a 'Point', got a 'Enemy'
+# type(x) == "Name" is a standalone runtime shape check — a plain boolean query, not a
+# conversion (there's no single well-defined way to reshape one struct into another).
+assert(type(p1) == "Point", "type(x) == \"StructName\" reports true for a matching instance")
+assert(type(e) != "Point", "type(x) == \"StructName\" reports false for a mismatched instance, no error")
 
 # ------------------------------------------------------------------ #
 # 37. Compound assignment through a field/index chain (p.x += 1)      #

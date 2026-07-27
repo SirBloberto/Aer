@@ -1101,14 +1101,14 @@ int main(void) {
         chunk_free(&c);
     }
 
-    /* Test 39 (M5 slice 8): 'as' casting — string (via OP_UNARY's OP_TO_STR case) and the
-       three OP_CAST primitives. */
+    /* Test 39: primitive casts — string(x) (via OP_UNARY's OP_TO_STR case) and the three
+       OP_CAST primitives, all as ordinary call syntax (replacing the old 'x as T' operator). */
     {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "x = 5\ny = x as string\n");
-        check(ok, "real source 'x as string' ran without error");
+        bool ok = run_source(&c, &vm, "x = 5\ny = string(x)\n");
+        check(ok, "real source 'string(x)' ran without error");
         check(string_eq(register_get(&vm, 1), "5"), "y == \"5\"");
         chunk_free(&c);
     }
@@ -1116,8 +1116,8 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "x = \"42\"\ny = x as integer\n");
-        check(ok, "real source 'x as integer' ran without error");
+        bool ok = run_source(&c, &vm, "x = \"42\"\ny = integer(x)\n");
+        check(ok, "real source 'integer(x)' ran without error");
         check(aer_as_int(register_get(&vm, 1)) == 42, "y == 42");
         chunk_free(&c);
     }
@@ -1125,8 +1125,8 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "x = 3\ny = x as float\n");
-        check(ok, "real source 'x as float' ran without error");
+        bool ok = run_source(&c, &vm, "x = 3\ny = float(x)\n");
+        check(ok, "real source 'float(x)' ran without error");
         check(aer_as_real(register_get(&vm, 1)) == 3.0, "y == 3.0");
         chunk_free(&c);
     }
@@ -1134,20 +1134,26 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "x = 1\ny = x as boolean\n");
-        check(ok, "real source 'x as boolean' ran without error");
+        bool ok = run_source(&c, &vm, "x = 1\ny = boolean(x)\n");
+        check(ok, "real source 'boolean(x)' ran without error");
         check(aer_as_bool(register_get(&vm, 1)) == true, "y == true");
         chunk_free(&c);
     }
 
-    /* Test 40 (M5 slice 8): casting to an unknown/struct type name is a clean compile-time error
-       in v3 (no OP_CHECK_SHAPE equivalent exists yet — see OP_CAST's comment in vm.h). */
+    /* Test 40: struct shape-checking is type(x) == "Name" now (replacing the old 'x as T' runtime
+       assertion) — a plain boolean query, so a mismatch is 'false', not a runtime error. */
     {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "x = 5\ny = x as SomeStruct\n");
-        check(!ok, "'as' to an unknown type name reports a clean parse error, not a crash");
+        bool ok = run_source(&c, &vm,
+            "struct Point:\n    x = 0.0\n    y = 0.0\n"
+            "p = Point(1.0, 2.0)\n"
+            "y = type(p) == \"Point\"\n"
+            "z = type(p) == \"SomeOtherStruct\"\n");
+        check(ok, "real source 'type(p) == \"Name\"' ran without error");
+        check(aer_as_bool(register_get(&vm, 1)) == true,  "y == true — p really is a Point");
+        check(aer_as_bool(register_get(&vm, 2)) == false, "z == false — p is not a SomeOtherStruct, no error");
         chunk_free(&c);
     }
 

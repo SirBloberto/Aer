@@ -117,7 +117,7 @@ survivor[3].v = 12345
 gc_churn = []
 for i in 0..5000:
     collection.append(gc_churn, GcPoint[4])
-    collection.append(gc_churn, [i, i * 2, "u" + (i as string)])
+    collection.append(gc_churn, [i, i * 2, "u" + string(i)])
 
 assert(survivor[3].v == 12345, "a packed array held in a still-live variable survives GC pressure from unrelated allocations")
 assert(length(gc_churn) == 10000, "all the churn allocations (including throwaway packed arrays) completed without corrupting anything")

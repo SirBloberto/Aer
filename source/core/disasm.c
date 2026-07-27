@@ -96,8 +96,6 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_DESTRUCTURE] = { "OP_DESTRUCTURE", "reg, reg = destructure(reg)" },
     /* word0: dest+arr_reg. word1: rk_start16+rk_end16. */
     [OP_SLICE_GET] = { "OP_SLICE_GET", "reg = reg[rk:rk]", {0}, false, 1, 0 },
-    /* word0: dest+src. word1: type_name_idx. */
-    [OP_CHECK_SHAPE] = { "OP_CHECK_SHAPE", "reg = check_shape(reg, type)", {0}, false, 1, 0 },
     [OP_DICT_NEW]  = { "OP_DICT_NEW",  "reg = new dict from contiguous key/value reg pairs", {FLD_REG, FLD_REG, FLD_COUNT}, false, 0, 3 },
     /* word0: col+idx+item_dest. word1: end_target (dedicated). */
     [OP_ITER_NEXT_ARRAY] = { "OP_ITER_NEXT_ARRAY", "for-each step, array or dict-keys", {FLD_REG, FLD_REG, FLD_REG, FLD_JUMP}, false, 1, 3 },
@@ -416,11 +414,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG,  (int)UNPACK_A(op_word));
         print_field(out, c, FLD_CAST, (int)UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
-    } else if (op == OP_CHECK_SHAPE) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        int name_idx = (int)c->code[pos++];
-        print_field(out, c, FLD_NAME, name_idx);
     } else if (op == OP_STRUCT_NEW) {
         print_field(out, c, FLD_REG,   (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG,   (int)UNPACK_B(op_word));

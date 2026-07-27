@@ -90,9 +90,6 @@ typedef enum {
     /* Slicing (array or string); a missing bound compiles to an RK null constant. */
     OP_SLICE_GET,  /* dest_reg, arr_reg, rk_start, rk_end */
 
-    /* `x as Point` for a struct type — shape check only, never converts. */
-    OP_CHECK_SHAPE, /* dest_reg, src_reg, type_name_pool_idx */
-
     /* OP_ARRAY_NEW's bulk-copy applied to (key,val) register pairs; same key validation and
        owned-key discipline as stack dict construction. */
     OP_DICT_NEW,   /* dest_reg, pair_reg_base, pair_count — key at base+2*i, val at +2*i+1 */
@@ -141,8 +138,9 @@ typedef enum {
     /* unary_op reuses OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR as its tag, like bin_op. */
     OP_UNARY, /* dest_reg, unary_op, rk_operand — also folds OP_TO_STR (interpolation) via vm_to_str */
 
-    /* `x as integer/float/boolean` via vm_cast; `as string` is OP_UNARY's TO_STR, `as Struct`
-       is OP_CHECK_SHAPE. */
+    /* integer(x)/float(x)/boolean(x) via vm_cast; string(x) is OP_UNARY's TO_STR instead (see
+       emit_primitive_cast, parser.c) -- struct shape-checking is type(x) == "Name" now, no opcode
+       of its own (OP_CHECK_SHAPE, which used to back `x as Struct`, has been removed). */
     OP_CAST, /* dest_reg, cast_type, rk_operand */
 
     /* Fusion of `x OP y.field` — parse_binary_ops truncates the just-emitted OP_FIELD_GET and

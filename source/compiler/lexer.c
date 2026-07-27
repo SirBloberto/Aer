@@ -299,7 +299,6 @@ static bool lex_keyword(unsigned int length) {
         { "else",     sizeof("else")     - 1, TOKEN_ELSE     },
         { "for",      sizeof("for")      - 1, TOKEN_FOR      },
         { "in",       sizeof("in")       - 1, TOKEN_IN       },
-        { "as",       sizeof("as")       - 1, TOKEN_AS       },
         { "struct",   sizeof("struct")   - 1, TOKEN_STRUCT   },
         { "function", sizeof("function") - 1, TOKEN_FUNCTION },
         { "return",   sizeof("return")   - 1, TOKEN_RETURN   },

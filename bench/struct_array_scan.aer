@@ -24,7 +24,7 @@ function make_particles(n):
     i = 0
     for i < n:
         p = Particle()
-        p.x = (i as float)
+        p.x = float(i)
         p.vx = 0.0001
         p.mass = 1.0
         collection.append(particles, p)

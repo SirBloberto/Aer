@@ -28,7 +28,6 @@ typedef enum TokenType {
     TOKEN_DIVIDE,           /* /  */
     TOKEN_MODULO,           /* %  */
     TOKEN_FLOOR_DIVIDE,     /* // */
-    TOKEN_AS,               /* as — type cast: x as integer/float/string/boolean */
 
     /* Assignment operators */
     TOKEN_ASSIGN,           /* =   */

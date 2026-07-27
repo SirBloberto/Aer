@@ -24,8 +24,9 @@ function is simultaneously the grammar rule and the code generator.
 
 **Precedence climbing.** One function and a table (see README's [Operators](README.md#operators))
 replace the traditional cascade of `parse_addition`, `parse_multiplication`, `parse_unary`, etc.
-Adding an operator is one line — plus, for the handful whose right-hand side isn't a general
-expression (`in` is; `as` and `|>` aren't), one small special case.
+Adding an operator is one line — plus, for the one whose right-hand side isn't a general expression
+(`in` is; `|>` isn't), one small special case. Casts and shape-checks aren't in this table at all —
+they're ordinary calls and comparisons, not a dedicated operator.
 
 **The VM is a computed-goto dispatch loop over integers.** No virtual dispatch, no pointer chasing,
 no heap allocation in the hot loop. Direct-threaded dispatch lets the CPU's branch predictor learn
@@ -690,7 +691,7 @@ Two entirely separate allocation lifetimes exist in this codebase. Don't conflat
 Every one of these calls `aer_make_string`, which itself calls `pool_alloc(&string_pool)`:
 
 - String concatenation (`OP_ADD`/`vm_binary_*` on two `TYPE_STRING` operands).
-- `x as string` / string interpolation (`vm_to_str`, via `OP_UNARY`'s `OP_TO_STR` case).
+- `string(x)` / string interpolation (`vm_to_str`, via `OP_UNARY`'s `OP_TO_STR` case).
 - `type(x)` (a fresh copy of the type-name string, never a pointer into static/pool data).
 - `OP_SLICE_GET`, string branch (`s[a:b]`).
 - Single-character indexing/iteration (`s[i]`, `for ch in some_string:`) — each character is its own fresh one-byte string.

@@ -126,7 +126,7 @@ particles2 = []
 i = 0
 for i < 5:
     p2 = Particle2()
-    p2.x = (i as float)
+    p2.x = float(i)
     p2.vx = 1.0
     collection.append(particles2, p2)
     i += 1

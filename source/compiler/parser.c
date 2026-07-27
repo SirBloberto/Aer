@@ -1107,7 +1107,10 @@ static bool binary_op_info(TokenType t, unsigned int* prec, Opcode* op) {
         case TOKEN_DIVIDE:        *prec = 10; *op = OP_DIV;       return true;
         case TOKEN_MODULO:        *prec = 10; *op = OP_MOD;       return true;
         case TOKEN_FLOOR_DIVIDE:  *prec = 10; *op = OP_FLOOR_DIV; return true;
-        case TOKEN_AS:            *prec = 11; *op = OP_CAST;      return true;
+        /* `as` no longer exists at all -- primitive casts are integer(x)/float(x)/boolean(x)/
+           string(x) now, struct shape-checks are type(x) == "Name" (both replacing what `x as T`
+           used to emit), and import aliasing is the positional `import alias "path"` (replacing
+           `import "path" as alias`). TOKEN_AS itself has been removed from the lexer. */
         default: return false;
     }
 }
@@ -1225,8 +1228,46 @@ static int parse_string_literal(Chunk* c) {
 }
 
 /* Unary operators sit above this in the precedence chain (parse_unary). */
+/* Shared by integer(x)/float(x)/boolean(x)/string(x), replacing what `x as T` used to emit directly
+   (`as` has been removed from the language entirely). Identical codegen either way: box a
+   raw-tracked lhs first (no raw-native cast form exists), then OP_CAST (integer/float/boolean) or
+   OP_UNARY/OP_TO_STR (string, cast_type < 0 --
+   there's no CAST_STRING id since OP_TO_STR already existed as its own opcode before casting did). */
+static int emit_primitive_cast(Chunk* c, int cast_type, int lhs) {
+    lhs = box_if_raw(c, lhs);
+    if (is_temp(lhs)) reg_free(1);
+    int dest = reg_alloc();
+    bool spilled = false;
+    if (!rk8_fits(lhs)) { lhs = materialize(c, lhs); spilled = true; }
+    if (cast_type < 0) chunk_emit(c, PACK3(OP_UNARY, dest, OP_TO_STR, pack_rk8(lhs)));
+    else                 chunk_emit(c, PACK3(OP_CAST, dest, cast_type, pack_rk8(lhs)));
+    if (spilled) reg_free(1);
+    return dest;
+}
+
+/* integer(x)/float(x)/boolean(x) -- TOKEN_TYPE_INTEGER/FLOAT/BOOLEAN are reserved tokens, never
+   identifiers, so they can't go through parse_call's name-based resolution at all; this is the
+   direct equivalent for a primary expression starting with one of them followed by '('. Exactly one
+   argument, enforced by the grammar itself (parse_binary parses one expression, not a list -- a
+   second argument or zero arguments both fall through to a natural "expected ')'"/"expected an
+   expression" error with no extra arity-checking code needed). */
+static int parse_primitive_cast_call(Chunk* c, int cast_type) {
+    lex();   /* consume the type token itself */
+    require(TOKEN_OPEN_PARENTHESE, "expected '(' after type name");
+    int lhs = parse_binary(c, 0);
+    require(TOKEN_CLOSE_PARENTHESE, "expected ')' after cast argument");
+    if (parse_had_error) return 0;
+    return emit_primitive_cast(c, cast_type, lhs);
+}
+
 static int parse_primary_inner(Chunk* c) {
     if (consume(TOKEN_FUNCTION)) return parse_function_expr(c);
+    /* These 3 reserved tokens have no other valid meaning in primary-expression position now that
+       'as' is gone -- parse_primitive_cast_call's own require(TOKEN_OPEN_PARENTHESE, ...) produces a
+       clear error if '(' doesn't follow, so no 2-token lookahead is needed here. */
+    if (equal(TOKEN_TYPE_INTEGER)) return parse_primitive_cast_call(c, CAST_INTEGER);
+    if (equal(TOKEN_TYPE_FLOAT))   return parse_primitive_cast_call(c, CAST_FLOAT);
+    if (equal(TOKEN_TYPE_BOOLEAN)) return parse_primitive_cast_call(c, CAST_BOOLEAN);
     if (consume(TOKEN_OPEN_PARENTHESE)) {
         int rk = parse_binary(c, 0);
         require(TOKEN_CLOSE_PARENTHESE, "expected ')' after expression");
@@ -1714,65 +1755,6 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
         if (op == OP_AND)  { lhs = compile_and(c, lhs, prec); lhs_start = c->count; continue; }
         if (op == OP_OR)   { lhs = compile_or(c, lhs, prec);  lhs_start = c->count; continue; }
         if (op == OP_PIPE) { lhs = compile_pipe(c, lhs);      lhs_start = c->count; continue; }
-
-        /* T is a bare type name. `x as Point` routes to OP_CHECK_SHAPE, checked via is_struct_name
-           before the primitive-name checks (the two tables are disjoint). integer/float/boolean/
-           array/hashtable are reserved keywords, dispatched by token type directly so they can't
-           be shadowed. `string` stays an ordinary identifier (matched by text, like a struct name)
-           since it collides with the stdlib `string` module -- already immune to shadowing either
-           way, since this whole cast grammar is a fixed production, never a name lookup. */
-        if (op == OP_CAST) {
-            bool is_reserved_type = equal(TOKEN_TYPE_INTEGER) || equal(TOKEN_TYPE_FLOAT) ||
-                                     equal(TOKEN_TYPE_BOOLEAN) || equal(TOKEN_TYPE_ARRAY) || equal(TOKEN_TYPE_HASHTABLE);
-            if (!equal(TOKEN_IDENTIFIER) && !is_reserved_type) { error_at("Expected a type name after 'as'"); return lhs; }
-
-            /* A raw-tracked lhs has no raw-native cast form -- box it first. */
-            lhs = box_if_raw(c, lhs);
-
-            if (is_temp(lhs)) reg_free(1);
-            int dest = reg_alloc();
-
-            if (equal(TOKEN_IDENTIFIER)) {
-                unsigned int type_name_idx = chunk_add_pool(c, token.value);
-                const char* type_name = aer_as_string(token.value)->data;
-                unsigned int type_len = aer_as_string(token.value)->length;
-                lex();
-                if (is_struct_name(type_name_idx)) {
-                    /* lhs is always a plain register here -- no guard needed. */
-                    chunk_emit(c, PACK3(OP_CHECK_SHAPE, dest, lhs, 0));
-                    chunk_emit(c, (uint32_t)type_name_idx);
-                } else if (type_len == 6 && strncmp(type_name, "string", 6) == 0) {
-                    bool spilled = false;
-                    if (!rk8_fits(lhs)) { lhs = materialize(c, lhs); spilled = true; }
-                    chunk_emit(c, PACK3(OP_UNARY, dest, OP_TO_STR, pack_rk8(lhs)));
-                    if (spilled) reg_free(1);
-                } else {
-                    error_at("Unknown type '%.*s' in 'as' cast (must be string/integer/float/boolean/array/hashtable, or a known struct type)",
-                             (int)type_len, type_name);
-                    return dest;
-                }
-            } else {
-                int cast_type;
-                if      (equal(TOKEN_TYPE_INTEGER)) cast_type = CAST_INTEGER;
-                else if (equal(TOKEN_TYPE_FLOAT))    cast_type = CAST_FLOAT;
-                else if (equal(TOKEN_TYPE_BOOLEAN)) cast_type = CAST_BOOLEAN;
-                else if (equal(TOKEN_TYPE_ARRAY)) {
-                    error_at("Cannot cast to 'array' -- casting only supports integer/float/string/boolean, or a struct type for a shape check");
-                    return dest;
-                } else {
-                    error_at("Cannot cast to 'hashtable' -- casting only supports integer/float/string/boolean, or a struct type for a shape check");
-                    return dest;
-                }
-                lex();
-                bool spilled = false;
-                if (!rk8_fits(lhs)) { lhs = materialize(c, lhs); spilled = true; }
-                chunk_emit(c, PACK3(OP_CAST, dest, cast_type, pack_rk8(lhs)));
-                if (spilled) reg_free(1);
-            }
-            lhs = dest;
-            lhs_start = c->count;
-            continue;
-        }
 
         /* Checked before parsing the RHS, while lhs's bytecode is still the tail of the chunk --
            excising bytecode from the middle would risk invalidating an RHS jump target.
@@ -2975,8 +2957,11 @@ static int parse_module_call(Chunk* c) {
 
 /* The quoted form, for paths the dotted form can't express (explicit relative components, an
    absolute path). Used exactly as written, never dot-converted. Bare native module names aren't
-   reachable this way -- a quoted path always means "look on disk". */
-static void parse_import_path(Chunk* c) {
+   reachable this way -- a quoted path always means "look on disk". `alias`/`alias_len` are already
+   known (from the identifier `parse_import` found immediately before this string -- `import alias
+   "path"`, Go's own import-alias convention, replacing the old `import "path" as alias`) if
+   `alias_len > 0`; otherwise the bound name is derived from the path's own last segment. */
+static void parse_import_path(Chunk* c, const char* alias, unsigned int alias_len) {
     AerString* path_str = aer_as_string(token.value);
     unsigned int path_len = path_str->length;
     char path_buf[256];
@@ -2984,16 +2969,8 @@ static void parse_import_path(Chunk* c) {
     memcpy(path_buf, path_str->data, path_len);
     lex();
 
-    char alias_buf[64];
-    unsigned int alias_len;
-    if (consume(TOKEN_AS)) {
-        if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a name after 'as'"); return; }
-        AerString* alias = aer_as_string(token.value);
-        alias_len = alias->length;
-        if (alias_len == 0 || alias_len >= sizeof(alias_buf)) { error_at("Import alias too long"); return; }
-        memcpy(alias_buf, alias->data, alias_len);
-        lex();
-    } else {
+    char derived_buf[64];
+    if (alias_len == 0) {
         /* Derive the bound name from the last path segment, stripping a trailing ".aer". */
         unsigned int end = path_len;
         if (end > 4 && strncmp(path_buf + end - 4, ".aer", 4) == 0) end -= 4;
@@ -3001,13 +2978,14 @@ static void parse_import_path(Chunk* c) {
         for (unsigned int i = 0; i < end; i++)
             if (path_buf[i] == '/' || path_buf[i] == '\\') start = i + 1;
         alias_len = end - start;
-        if (alias_len == 0 || alias_len >= sizeof(alias_buf)) {
-            error_at("Cannot derive a module name from this path; add 'as name'");
+        if (alias_len == 0 || alias_len >= sizeof(derived_buf)) {
+            error_at("Cannot derive a module name from this path; give it an alias: import name \"path\"");
             return;
         }
-        memcpy(alias_buf, path_buf + start, alias_len);
+        memcpy(derived_buf, path_buf + start, alias_len);
+        alias = derived_buf;
     }
-    chunk_add_import(c, alias_buf, alias_len, path_buf, path_len);
+    chunk_add_import(c, alias, alias_len, path_buf, path_len);
 }
 
 /* Top level only (a known narrow gap: an import inside an if/for at top level is accepted).
@@ -3017,23 +2995,37 @@ static void parse_import(Chunk* c) {
         error_at("'import' is only allowed at the top level of a file, not inside a function");
         return;
     }
-    if (token.type == TOKEN_STRING) { parse_import_path(c); return; }
+    if (token.type == TOKEN_STRING) { parse_import_path(c, NULL, 0); return; }
     if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a module name or a quoted path after 'import'"); return; }
 
+    /* The first identifier is ambiguous until we see what follows it: an alias immediately before a
+       quoted path (`import myalias "some/path.aer"`), or the first segment of a dotted
+       native-module name (`import math`, `import a.b.c`). Read it once, then decide -- both
+       branches need it, so it's captured before either. */
     char path_buf[256];
-    unsigned int path_len = 0, bind_start = 0, bind_len = 0;
-    while (true) {
+    unsigned int path_len, bind_start = 0, bind_len;
+    {
         const char* seg      = aer_as_string(token.value)->data;
         unsigned int seg_len = aer_as_string(token.value)->length;
-        if (path_len > 0) path_buf[path_len++] = '/';
+        if (seg_len >= sizeof(path_buf)) { error_at("Import name too long"); return; }
+        memcpy(path_buf, seg, seg_len);
+        bind_len = seg_len;
+        path_len = seg_len;
+        lex();
+    }
+    if (token.type == TOKEN_STRING) { parse_import_path(c, path_buf, bind_len); return; }
+
+    while (consume(TOKEN_DOT)) {
+        if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a module name segment after '.'"); return; }
+        const char* seg      = aer_as_string(token.value)->data;
+        unsigned int seg_len = aer_as_string(token.value)->length;
+        path_buf[path_len++] = '/';
         if (path_len + seg_len >= sizeof(path_buf)) { error_at("Import path too long"); return; }
         bind_start = path_len;
         memcpy(path_buf + path_len, seg, seg_len);
         path_len += seg_len;
         bind_len = seg_len;
         lex();
-        if (!consume(TOKEN_DOT)) break;
-        if (!equal(TOKEN_IDENTIFIER)) { error_at("Expected a module name segment after '.'"); return; }
     }
     chunk_add_import(c, path_buf + bind_start, bind_len, path_buf, path_len);
 }
@@ -3107,6 +3099,19 @@ static int parse_packed_array_new(Chunk* c, unsigned int name_idx) {
 }
 
 static int parse_call(Chunk* c, unsigned int name_idx) {
+    /* string(x) is a cast (TO_STR), checked before anything else -- matching the exact "immune to
+       shadowing, fixed production, never a name lookup" property `x as string` always had (see
+       emit_primitive_cast's own comment). Not a reserved token like integer/float/boolean (it
+       collides with the stdlib `string` module, so it stayed an ordinary identifier even before),
+       but the parse-time behavior carries over unchanged: exactly one argument, no comma list. */
+    AerString* callee_name = aer_as_string(c->pool[name_idx]);
+    if (callee_name->length == 6 && strncmp(callee_name->data, "string", 6) == 0) {
+        int lhs = parse_binary(c, 0);
+        require(TOKEN_CLOSE_PARENTHESE, "expected ')' after cast argument");
+        if (parse_had_error) return 0;
+        return emit_primitive_cast(c, -1, lhs);
+    }
+
     /* Builtins win unconditionally -- length/print/type/assert/panic/Result can never be shadowed. */
     if (is_builtin_name(c, name_idx)) return parse_builtin_call(c, name_idx);
 

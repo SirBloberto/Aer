@@ -30,7 +30,7 @@ assert(slab_arrays[299][0] == 299 and slab_arrays[299][1] == 598, "the last arra
 
 slab_strings = []
 for i in 0..300:
-    collection.append(slab_strings, "s" + (i as string))
+    collection.append(slab_strings, "s" + string(i))
 
 assert(length(slab_strings) == 300, "300 strings created — crosses string_pool's 256-per-slab boundary")
 assert(slab_strings[0] == "s0" and slab_strings[255] == "s255" and slab_strings[256] == "s256" and slab_strings[299] == "s299",
@@ -52,7 +52,7 @@ gc_old_dict = {}
 
 gc_churn = []
 for i in 0..3000:
-    collection.append(gc_churn, [i, i * 2, "s" + (i as string)])
+    collection.append(gc_churn, [i, i * 2, "s" + string(i)])
 
 collection.append(gc_old_container, "written after promotion")
 gc_old_dict["fresh_key"] = {"nested": "written after promotion"}
@@ -61,7 +61,7 @@ gc_old_dict["fresh_key"] = {"nested": "written after promotion"}
 # checking the written values are still intact.
 gc_churn2 = []
 for i in 0..3000:
-    collection.append(gc_churn2, [i, i * 2, "t" + (i as string)])
+    collection.append(gc_churn2, [i, i * 2, "t" + string(i)])
 
 assert(length(gc_old_container) == 1 and gc_old_container[0] == "written after promotion",
        "a value written into an old (promoted) array survives further collections — the write barrier protected it")
@@ -168,13 +168,13 @@ gc_old_struct = OldStruct(null)
 
 gc_churn3 = []
 for i in 0..3000:
-    collection.append(gc_churn3, [i, i * 2, "u" + (i as string)])
+    collection.append(gc_churn3, [i, i * 2, "u" + string(i)])
 
 gc_old_struct.payload = "written after promotion"
 
 gc_churn4 = []
 for i in 0..3000:
-    collection.append(gc_churn4, [i, i * 2, "v" + (i as string)])
+    collection.append(gc_churn4, [i, i * 2, "v" + string(i)])
 
 assert(gc_old_struct.payload == "written after promotion",
        "a value written into an old (promoted) struct's field survives further collections — the write barrier protected it")
@@ -211,7 +211,7 @@ gc_ref_holder = RefHolder("holder", [1, 2, 3])
 
 gc_churn5 = []
 for i in 0..30000:
-    collection.append(gc_churn5, [i, "w" + (i as string)])
+    collection.append(gc_churn5, [i, "w" + string(i)])
 
 assert(gc_ref_holder.ref[0] == 1 and gc_ref_holder.ref[1] == 2 and gc_ref_holder.ref[2] == 3,
        "a struct's TYPE_ANY field holding an array reference survives enough collections to include at least one major cycle")

@@ -31,8 +31,8 @@ py = 0
 for py < SIZE:
     px = 0
     for px < SIZE:
-        cx = (px as float) / (SIZE as float) * 3.5 - 2.5
-        cy = (py as float) / (SIZE as float) * 2.0 - 1.0
+        cx = float(px) / float(SIZE) * 3.5 - 2.5
+        cy = float(py) / float(SIZE) * 2.0 - 1.0
         if mandelbrot_point(cx, cy, MAX_ITER) == MAX_ITER:
             inside_count += 1
         px += 1

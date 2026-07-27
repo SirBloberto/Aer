@@ -476,7 +476,12 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
 /* Type helpers                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Struct instances report their declared name (e.g. "Player") instead of "array" — used by type() and OP_CHECK_SHAPE's error message. A packed array reports "Player[]" — distinct from a single instance's own "Player". type_names[] is indexed directly by ValueType, so it must stay exactly as long as the enum's non-specially-handled entries (value.h) — TYPE_STRUCT/TYPE_PACKED_ARRAY/TYPE_RESULT are all handled specially, so none of them is ever used to index this array. */
+/* Struct instances report their declared name (e.g. "Player") instead of "array" — used by type(),
+   the one way to check a struct's shape now (type(x) == "Player") since OP_CHECK_SHAPE was removed.
+   A packed array reports "Player[]" — distinct from a single instance's own "Player". type_names[]
+   is indexed directly by ValueType, so it must stay exactly as long as the enum's non-specially-
+   handled entries (value.h) — TYPE_STRUCT/TYPE_PACKED_ARRAY/TYPE_RESULT are all handled specially,
+   so none of them is ever used to index this array. */
 static const char* vm_type_name(Chunk* c, AerVal v) {
     static const char* type_names[] = {
         "null", "boolean", "integer", "float", "string", "function", "array", "hashtable"
@@ -1239,7 +1244,7 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
     }
 }
 
-/* `x as integer/float/boolean/string` conversion rules, shared by OP_CAST's handler below. */
+/* integer(x)/float(x)/boolean(x)/string(x) conversion rules, shared by OP_CAST's handler below. */
 static AerVal vm_cast(AerVal v, int cast_type) {
     AerVal r = aer_null();
     /* atoll()/atof() only consume a leading sign/digits(/./exponent), so truncating to a fixed buffer (instead of a length-sized VLA) can't change the parsed value for a real number. */
@@ -1261,7 +1266,7 @@ static AerVal vm_cast(AerVal v, int cast_type) {
                     long long parsed = strtoll(buf, &end, 10);
                     while (*end == ' ' || *end == '\t') end++;   /* tolerate trailing whitespace, same as leading */
                     if (end == buf || *end != '\0') {
-                        error("'%.*s' as integer: not a valid integer", (int)n, buf);
+                        error("integer('%.*s'): not a valid integer", (int)n, buf);
                         r = aer_int(0);
                         break;
                     }
@@ -1286,7 +1291,7 @@ static AerVal vm_cast(AerVal v, int cast_type) {
                     double parsed = strtod(buf, &end);
                     while (*end == ' ' || *end == '\t') end++;
                     if (end == buf || *end != '\0') {
-                        error("'%.*s' as float: not a valid number", (int)n, buf);
+                        error("float('%.*s'): not a valid number", (int)n, buf);
                         r = aer_real(0.0);
                         break;
                     }
@@ -1440,7 +1445,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INDEX_SET]         = &&lbl_index_set,
         [OP_DESTRUCTURE]       = &&lbl_destructure,
         [OP_SLICE_GET]         = &&lbl_slice_get,
-        [OP_CHECK_SHAPE]       = &&lbl_check_shape,
         [OP_DICT_NEW]          = &&lbl_dict_new,
         [OP_ITER_NEXT_ARRAY]   = &&lbl_iter_next_array,
         [OP_ITER_NEXT_PAIR]    = &&lbl_iter_next_pair,
@@ -2164,20 +2168,6 @@ lbl_slice_get: {
 }
 
 /* Errors unless src_reg holds exactly that struct type; never converts. */
-lbl_check_shape: {
-    int dest_reg = (int)UNPACK_A(op_word);
-    int src_reg  = (int)UNPACK_B(op_word);
-    int name_idx = (int)READ();
-    AerVal v = vm->registers[src_reg];
-    if (aer_type(v) != TYPE_STRUCT || aer_as_struct(v)->shape->name != (unsigned int)name_idx) {
-        error("Expected a '%s', got a '%s'", aer_as_string(c->pool[name_idx])->data, vm_type_name(c, v));
-        vm->registers[dest_reg] = aer_null();
-        DISPATCH();
-    }
-    vm->registers[dest_reg] = v;
-    DISPATCH();
-}
-
 /* Dict literal -- each key stored as an owned copy, never an alias into the source string. */
 lbl_dict_new: {
     int dest_reg      = (int)UNPACK_A(op_word);
