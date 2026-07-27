@@ -341,4 +341,44 @@ assert("ell" in "hello", "in finds a substring")
 assert(not ("xyz" in "hello"), "in correctly reports a non-substring as absent")
 assert("" in "hello", "an empty needle is trivially in any string")
 
+# ------------------------------------------------------------------ #
+# Tail call from a small-footprint function into a much larger one    #
+# (OP_TAIL_CALL reuses the CURRENT frame rather than pushing a new     #
+# one -- the reused frame's own register/raw-slot reservation must be  #
+# refreshed to the NEW target's real peak, not left at the ORIGINAL    #
+# occupant's smaller one. Left stale, a later real (non-tail) call     #
+# made from inside the tail-called function would compute its own     #
+# child frame's base from the wrong, too-small reservation, silently   #
+# overlapping and corrupting the tail-called function's own still-live #
+# registers instead of crashing outright.                              #
+# ------------------------------------------------------------------ #
+
+function id(x):
+    return x
+
+function helper_small(x):
+    return x * 2
+
+# a..h2 are call RESULTS (never raw -- rk_raw_kind excludes call results), so each is a genuine,
+# permanent boxed register -- 8 of them, registers 1-8 (register 0 is n). helper_small(5)'s own
+# call needs a temp register beyond those 8 -- if the reused frame's own reservation were still
+# sized for tiny_footprint's tiny footprint below (2 registers), helper_small's own frame would
+# land on top of b..h2's still-live registers instead of past all of them.
+function big_footprint(n):
+    bfa = id(n)
+    bfb = id(n)
+    bfc = id(n)
+    bfd = id(n)
+    bfe = id(n)
+    bff = id(n)
+    bfg = id(n)
+    bfh2 = id(n)
+    h = helper_small(5)
+    return bfa + bfb + bfc + bfd + bfe + bff + bfg + bfh2 + h
+
+function tiny_footprint(n):
+    return big_footprint(n)   # tail call: tiny_footprint's own (small) frame is reused for big_footprint
+
+assert(tiny_footprint(1) == 18, "tail-calling from a small-footprint function into a much larger one refreshes the reused frame's own register/raw-slot reservation, so the larger function's later real call doesn't corrupt its own still-live locals (1*8 + helper_small(5)=10 == 18; confirmed this exact scenario returns 31 -- silent corruption, no crash -- if the reused frame's reservation is left stale)")
+
 print("test_functions.aer: all assertions passed.")

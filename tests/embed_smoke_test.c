@@ -194,6 +194,16 @@ int main(void) {
     check(aer_assert_failure_count() == 0,
           "good(5) returns 50, not null or any other stale value left over from boom()'s failed call");
 
+    /* setup_call (aer_module_call's own frame-push path, separate from lbl_call's OP_CALL) sizes
+       raw_ints/raw_reals from fn->max_raw_ints/max_raw_reals -- a bump-pointer bug there (wrong
+       offset, overlapping a sibling frame's raw slots) would corrupt raw_calc's own accumulator
+       silently rather than crash, since raw storage is never GC-scanned or otherwise validated. */
+    aer_clear_error();
+    ok = aer_run_source(&vm, &chunk,
+        "assert(module_call_helper.raw_calc(5) == 10, \"raw locals inside a module-called function (setup_call's frame-push path) compute correctly\")\n");
+    check(ok && !aer_had_error(), "a module function using raw int locals runs without error through setup_call");
+    check(aer_assert_failure_count() == 0, "raw_calc(5) == 10 (0+1+2+3+4), proving setup_call's raw_ints/raw_reals bump-pointer sizing is correct");
+
     /* Generational GC — aer_gc_stats() introspection. Allocates far more
        short-lived arrays than MINOR_GC_THRESHOLD (2048, vm.c) — each loop
        iteration overwrites `temp`, so only the last one stays reachable,

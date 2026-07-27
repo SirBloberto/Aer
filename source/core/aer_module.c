@@ -147,6 +147,11 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
        this whole compile+run cycle. Without this, every allocation the CALLER makes after this
        function returns would keep landing in mvm's heap instead of its own. */
     VmHeap* saved_heap = vm_current_heap();
+    /* Same reasoning as saved_heap just above, for the OTHER file-scope global vm_init() clobbers
+       unconditionally: active_vm_for_errors. Without this, a failed nested compile (ok == false
+       below) frees mvm while active_vm_for_errors still points at it -- the next error() call
+       anywhere in the caller's context then dereferences a freed VM. */
+    VM* saved_active_vm = vm_active_error_vm();
 
     Chunk* mchunk = xmalloc(sizeof(Chunk));
     VM*    mvm    = xmalloc(sizeof(VM));
@@ -194,6 +199,7 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
        correctly on its own); this only fixes where allocations land in the CALLER's own code from
        here on. */
     vm_set_current_heap(saved_heap);
+    vm_set_active_error_vm(saved_active_vm);
 
     if (!ok) {
         /* Never handed back to the caller, so nothing else can reach these — free here. */
