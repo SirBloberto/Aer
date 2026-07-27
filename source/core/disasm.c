@@ -177,6 +177,22 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_FIELD_COMPOUND_RAW_REAL]       = { "OP_FIELD_COMPOUND_RAW_REAL",       "specialized: struct.field OP= rawr", {0}, false, 2, 0 },
     [OP_INDEX_FIELD_COMPOUND_RAW_INT]  = { "OP_INDEX_FIELD_COMPOUND_RAW_INT",  "specialized: packed_arr[rk].field OP= rawi", {0}, false, 2, 0 },
     [OP_INDEX_FIELD_COMPOUND_RAW_REAL] = { "OP_INDEX_FIELD_COMPOUND_RAW_REAL", "specialized: packed_arr[rk].field OP= rawr", {0}, false, 2, 0 },
+
+    /* Narrow (int32/float32) counterparts of the whole family above -- same word layouts, just a
+       4-byte field instead of 8. See vm.h's own comment on this opcode family. */
+    [OP_INDEX_FIELD_GET_RAW_INT32]   = { "OP_INDEX_FIELD_GET_RAW_INT32",   "specialized: rawi = packed_arr[rk].field (narrow)", {0}, false, 1, 0 },
+    [OP_INDEX_FIELD_GET_RAW_FLOAT32] = { "OP_INDEX_FIELD_GET_RAW_FLOAT32", "specialized: rawr = packed_arr[rk].field (narrow)", {0}, false, 1, 0 },
+    [OP_FIELD_GET_RAW_INT32]         = { "OP_FIELD_GET_RAW_INT32",         "specialized: rawi = struct.field (narrow)",         {0}, false, 1, 0 },
+    [OP_FIELD_GET_RAW_FLOAT32]       = { "OP_FIELD_GET_RAW_FLOAT32",       "specialized: rawr = struct.field (narrow)",         {0}, false, 1, 0 },
+    [OP_INDEX_FIELD_SET_RAW_INT32]   = { "OP_INDEX_FIELD_SET_RAW_INT32",   "specialized: packed_arr[rk].field = rawi (narrow)", {0}, false, 1, 0 },
+    [OP_INDEX_FIELD_SET_RAW_FLOAT32] = { "OP_INDEX_FIELD_SET_RAW_FLOAT32", "specialized: packed_arr[rk].field = rawr (narrow)", {0}, false, 1, 0 },
+    [OP_FIELD_SET_RAW_INT32]         = { "OP_FIELD_SET_RAW_INT32",         "specialized: struct.field = rawi (narrow)",         {0}, false, 2, 0 },
+    [OP_FIELD_SET_RAW_FLOAT32]       = { "OP_FIELD_SET_RAW_FLOAT32",       "specialized: struct.field = rawr (narrow)",         {0}, false, 2, 0 },
+    [OP_FIELD_COMPOUND_RAW_INT32]         = { "OP_FIELD_COMPOUND_RAW_INT32",         "specialized: struct.field OP= rawi (narrow)", {0}, false, 2, 0 },
+    [OP_FIELD_COMPOUND_RAW_FLOAT32]       = { "OP_FIELD_COMPOUND_RAW_FLOAT32",       "specialized: struct.field OP= rawr (narrow)", {0}, false, 2, 0 },
+    [OP_INDEX_FIELD_COMPOUND_RAW_INT32]   = { "OP_INDEX_FIELD_COMPOUND_RAW_INT32",   "specialized: packed_arr[rk].field OP= rawi (narrow)", {0}, false, 2, 0 },
+    [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32] = { "OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32", "specialized: packed_arr[rk].field OP= rawr (narrow)", {0}, false, 2, 0 },
+
     [OP_UNBOX_PARAM_INT]  = { "OP_UNBOX_PARAM_INT",  "specialized: rawi = unbox(reg) [untagged]" },
     [OP_UNBOX_PARAM_REAL] = { "OP_UNBOX_PARAM_REAL", "specialized: rawr = unbox(reg) [untagged]" },
     [OP_RAW_LT_INT_BOXED]   = { "OP_RAW_LT_INT_BOXED",   "reg = rawi < reg (tag-checked)" },
@@ -292,10 +308,17 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
             uint32_t name_default_word = c->code[pos++];
             int fname_idx    = (int)UNPACK_2X16_HI(name_default_word);
             int fdefault_idx = (int)UNPACK_2X16_LO(name_default_word);
-            int ftype        = (int)c->code[pos++];
+            /* Low byte is the ValueType tag, bit 0x100 is the narrow (`i`/`f`-suffixed-literal)
+               marker -- see OP_DEFINE_STRUCT's real decode (vm.c) and parse_struct's own emission
+               (parser.c). Masking this out is required, not cosmetic: indexing field_type_names[]
+               with the raw (un-masked) word is an out-of-bounds read the moment a narrow field's
+               0x100 bit is set. */
+            uint32_t ftype_word = (uint32_t)c->code[pos++];
+            int  ftype  = (int)(ftype_word & 0xFF);
+            bool narrow = (ftype_word & 0x100) != 0;
             if (i > 0) fprintf(out, ", ");
             fprintf(out, "%s", aer_as_string(c->pool[fname_idx])->data);
-            if (ftype != TYPE_ANY) fprintf(out, ": %s", field_type_names[ftype]);
+            if (ftype != TYPE_ANY) fprintf(out, ": %s%s", field_type_names[ftype], narrow ? " (narrow)" : "");
             fprintf(out, "=");
             print_pool_value(out, c->pool[fdefault_idx]);
         }
@@ -350,28 +373,32 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         uint32_t field_val_word = c->code[pos++];
         print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_val_word));
         print_rk16(out, c, UNPACK_2X16_LO(field_val_word));
-    } else if (op == OP_INDEX_FIELD_GET_RAW_INT || op == OP_INDEX_FIELD_GET_RAW_REAL) {
-        bool is_int = (op == OP_INDEX_FIELD_GET_RAW_INT);
+    } else if (op == OP_INDEX_FIELD_GET_RAW_INT || op == OP_INDEX_FIELD_GET_RAW_REAL
+            || op == OP_INDEX_FIELD_GET_RAW_INT32 || op == OP_INDEX_FIELD_GET_RAW_FLOAT32) {
+        bool is_int = (op == OP_INDEX_FIELD_GET_RAW_INT || op == OP_INDEX_FIELD_GET_RAW_INT32);
         if (is_int) print_rawi(out, (int)UNPACK_A(op_word)); else print_rawr(out, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         uint32_t field_rk_word = c->code[pos++];
         fprintf(out, "  off=%u", UNPACK_2X16_HI(field_rk_word));
         print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
-    } else if (op == OP_FIELD_GET_RAW_INT || op == OP_FIELD_GET_RAW_REAL) {
-        bool is_int = (op == OP_FIELD_GET_RAW_INT);
+    } else if (op == OP_FIELD_GET_RAW_INT || op == OP_FIELD_GET_RAW_REAL
+            || op == OP_FIELD_GET_RAW_INT32 || op == OP_FIELD_GET_RAW_FLOAT32) {
+        bool is_int = (op == OP_FIELD_GET_RAW_INT || op == OP_FIELD_GET_RAW_INT32);
         if (is_int) print_rawi(out, (int)UNPACK_A(op_word)); else print_rawr(out, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         unsigned int foffset = c->code[pos++];
         fprintf(out, "  off=%u", foffset);
-    } else if (op == OP_INDEX_FIELD_SET_RAW_INT || op == OP_INDEX_FIELD_SET_RAW_REAL) {
-        bool is_int = (op == OP_INDEX_FIELD_SET_RAW_INT);
+    } else if (op == OP_INDEX_FIELD_SET_RAW_INT || op == OP_INDEX_FIELD_SET_RAW_REAL
+            || op == OP_INDEX_FIELD_SET_RAW_INT32 || op == OP_INDEX_FIELD_SET_RAW_FLOAT32) {
+        bool is_int = (op == OP_INDEX_FIELD_SET_RAW_INT || op == OP_INDEX_FIELD_SET_RAW_INT32);
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rk16(out, c, UNPACK_W16(op_word));
         uint32_t off_slot_word = c->code[pos++];
         fprintf(out, "  off=%u", UNPACK_2X16_HI(off_slot_word));
         if (is_int) print_rawi(out, (int)UNPACK_2X16_LO(off_slot_word)); else print_rawr(out, (int)UNPACK_2X16_LO(off_slot_word));
-    } else if (op == OP_FIELD_SET_RAW_INT || op == OP_FIELD_SET_RAW_REAL) {
-        bool is_int = (op == OP_FIELD_SET_RAW_INT);
+    } else if (op == OP_FIELD_SET_RAW_INT || op == OP_FIELD_SET_RAW_REAL
+            || op == OP_FIELD_SET_RAW_INT32 || op == OP_FIELD_SET_RAW_FLOAT32) {
+        bool is_int = (op == OP_FIELD_SET_RAW_INT || op == OP_FIELD_SET_RAW_INT32);
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         unsigned int foffset = c->code[pos++];
         fprintf(out, "  off=%u", foffset);
@@ -524,16 +551,18 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
-    } else if (op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_REAL) {
-        bool is_int = (op == OP_FIELD_COMPOUND_RAW_INT);
+    } else if (op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_REAL
+            || op == OP_FIELD_COMPOUND_RAW_INT32 || op == OP_FIELD_COMPOUND_RAW_FLOAT32) {
+        bool is_int = (op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_INT32);
         print_field(out, c, FLD_REG,   (int)UNPACK_A(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
         unsigned int foffset = c->code[pos++];
         fprintf(out, "  off=%u", foffset);
         int slot = (int)c->code[pos++];
         if (is_int) print_rawi(out, slot); else print_rawr(out, slot);
-    } else if (op == OP_INDEX_FIELD_COMPOUND_RAW_INT || op == OP_INDEX_FIELD_COMPOUND_RAW_REAL) {
-        bool is_int = (op == OP_INDEX_FIELD_COMPOUND_RAW_INT);
+    } else if (op == OP_INDEX_FIELD_COMPOUND_RAW_INT || op == OP_INDEX_FIELD_COMPOUND_RAW_REAL
+            || op == OP_INDEX_FIELD_COMPOUND_RAW_INT32 || op == OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32) {
+        bool is_int = (op == OP_INDEX_FIELD_COMPOUND_RAW_INT || op == OP_INDEX_FIELD_COMPOUND_RAW_INT32);
         print_field(out, c, FLD_REG,   (int)UNPACK_A(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
         uint32_t field_rk_word = c->code[pos++];

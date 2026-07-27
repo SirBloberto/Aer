@@ -1,13 +1,15 @@
 #!/usr/bin/env aer
 import collection
 # AER test suite — narrow (int32/float32) struct fields via the `i`/`f` literal suffix on a
-# field's default value (`x = 42i`, `y = 0.0f`). A correctness-focused first pass: narrow fields
-# get the memory-density win (4 bytes instead of 8 in the struct layout) via the same
-# generic FIELD_GET/FIELD_SET path every field already uses, but deliberately do NOT participate in
-# shape specialization's raw-opcode fast path (OP_FIELD_GET_RAW_REAL and friends) -- that fast path
-# assumes a uniform 8-byte raw slot, so a narrow field always falls back to the ordinary (still
-# correct, just not raw-unboxed) opcodes instead. Machine-checked via assert(): a clean run exits 0;
-# any failure prints "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
+# field's default value (`x = 42i`, `y = 0.0f`). Narrow fields get the memory-density win (4 bytes
+# instead of 8 in the struct/packed-array layout) AND participate in shape specialization's
+# raw-opcode fast path (OP_FIELD_GET_RAW_INT32/FLOAT32 and the rest of that family, vm.h) exactly
+# like a wide field does -- the field's own 4-byte storage is widened into the same int64_t/double
+# raw_ints[]/raw_reals[] slots every raw arithmetic opcode already uses, and narrowed back on
+# write. A narrow field also packs into a packed array fine (`[Point(); n]`), using
+# shape->instance_bytes as the real per-element stride rather than a hardcoded 8-bytes-per-field
+# assumption. Machine-checked via assert(): a clean run exits 0; any failure prints
+# "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
 
 # ------------------------------------------------------------------ #
 # 1. Construction, defaults, read/write for both narrow kinds,        #
@@ -81,17 +83,52 @@ nudge_all_y(pts, 3, 0.5)
 assert(pts[0].y == 1.5 and pts[1].y == 2.5 and pts[2].y == 3.5, "compound assignment on a narrow float32 field through a function parameter and loop")
 
 # ------------------------------------------------------------------ #
-# 5. Out-of-range/type-mismatch/packed-array-rejection errors         #
-#    (documented, not run -- same convention as every other error-    #
-#    path example in this suite: a real runtime error aborts the      #
-#    whole script, so these can't be exercised inline in a script     #
-#    that must exit 0).                                                #
+# 5. Packed-array construction with narrow fields, plus shape          #
+#    specialization's raw-opcode fast path -- the exact nbody.aer-      #
+#    shaped pattern (packed array + a function reading/writing its     #
+#    fields in a loop) this whole feature exists for.                  #
+# ------------------------------------------------------------------ #
+
+struct Body:
+    x = 0.0f
+    y = 0.0f
+    vx = 0.0f
+    vy = 0.0f
+    mass = 0i
+
+bodies = [Body(1.0, 3.0, 2.0, 4.0, 10); 5]
+assert(bodies[0].x == 1.0 and bodies[0].vx == 2.0, "a narrow-field struct packs fine, with explicit starting values (not just declared defaults)")
+assert(bodies[1].x == 1.0 and bodies[1].mass == 10, "every packed element is an independent copy, not aliased")
+
+# advance's inner loop is exactly the shape lbl_call's specialization targets: a packed-array
+# parameter accessed via arr[i].field inside a loop -- narrow fields now specialize into
+# OP_INDEX_FIELD_GET_RAW_FLOAT32/OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32 just like a wide field would
+# specialize into the _REAL family, confirmed via the debug disassembler during development.
+function advance(bs, n, dt):
+    i = 0
+    for i < n:
+        bs[i].x += bs[i].vx * dt
+        bs[i].y += bs[i].vy * dt
+        i += 1
+
+advance(bodies, 5, 0.5)
+advance(bodies, 5, 0.5)
+advance(bodies, 5, 0.5)
+assert(bodies[0].x == 1.0 + 3.0 * (2.0 * 0.5), "narrow float32 packed-array field, compound-assigned across repeated specialized calls")
+assert(bodies[0].y == 3.0 + 3.0 * (4.0 * 0.5), "a second narrow float32 field on the same struct, same pattern")
+assert(bodies[0].mass == 10, "a narrow int32 field on the same struct is untouched by unrelated updates")
+assert(bodies[2].x == bodies[0].x, "every packed element started identical and advance() loops over all of them -- element 2 tracks element 0 exactly")
+
+# ------------------------------------------------------------------ #
+# 6. Out-of-range/type-mismatch errors (documented, not run -- same    #
+#    convention as every other error-path example in this suite: a    #
+#    real runtime error aborts the whole script, so these can't be    #
+#    exercised inline in a script that must exit 0).                   #
 # ------------------------------------------------------------------ #
 
 # struct Bad:
 #     n = 5000000000i    # would error at struct definition: default out of range for a narrow (int32) field
 # p1.x = 5000000000       # would error: Value 5000000000 out of range for a narrow (int32) field
 # bad = Point(5000000000, 1.0, "x")   # would error the same way, at construction
-# packed = [Point(); 3]   # would error: 'Point' cannot be packed into an array -- narrow fields not yet supported there
 
 print("test_narrow_fields.aer: all assertions passed.")

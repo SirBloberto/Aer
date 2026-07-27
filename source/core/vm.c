@@ -1096,6 +1096,16 @@ static bool vm_check_narrow_field_write(ValueType ftype, bool narrow, AerVal val
     return true;
 }
 
+/* Narrow (4-byte) counterparts of the raw-slot memcpy's the wide RAW opcode family (vm_run_slice's
+   own OP_FIELD_GET_RAW_INT/REAL etc. handlers) uses -- widen into an ordinary int64_t/double
+   raw_ints[]/raw_reals[] slot on read, narrow back on write. No range check on the int32 write side
+   -- see the narrow RAW opcode family's own comment (vm.h) for why that's the intentional,
+   consistent-with-every-other-raw-opcode tradeoff here. */
+static inline int64_t vm_raw_read_int32(unsigned char* p)  { int32_t v; memcpy(&v, p, 4); return (int64_t)v; }
+static inline void    vm_raw_write_int32(unsigned char* p, int64_t v) { int32_t iv = (int32_t)v; memcpy(p, &iv, 4); }
+static inline double  vm_raw_read_float32(unsigned char* p) { float v; memcpy(&v, p, 4); return (double)v; }
+static inline void    vm_raw_write_float32(unsigned char* p, double v) { float fv = (float)v; memcpy(p, &fv, 4); }
+
 /* Same contract as vm_struct_field_read/write above, but offset/ftype/narrow are already in hand
    (from vm_resolve_field's cache output) instead of being re-derived from s->shape here -- every
    opcode call site uses these, not the by-slot versions above. The `ftype == TYPE_ANY`/`narrow`
@@ -1660,6 +1670,20 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_FIELD_COMPOUND_RAW_REAL]        = &&lbl_field_compound_raw_real,
         [OP_INDEX_FIELD_COMPOUND_RAW_INT]  = &&lbl_index_field_compound_raw_int,
         [OP_INDEX_FIELD_COMPOUND_RAW_REAL] = &&lbl_index_field_compound_raw_real,
+
+        [OP_INDEX_FIELD_GET_RAW_INT32]  = &&lbl_index_field_get_raw_int32,
+        [OP_INDEX_FIELD_GET_RAW_FLOAT32] = &&lbl_index_field_get_raw_float32,
+        [OP_FIELD_GET_RAW_INT32]        = &&lbl_field_get_raw_int32,
+        [OP_FIELD_GET_RAW_FLOAT32]      = &&lbl_field_get_raw_float32,
+        [OP_INDEX_FIELD_SET_RAW_INT32]  = &&lbl_index_field_set_raw_int32,
+        [OP_INDEX_FIELD_SET_RAW_FLOAT32] = &&lbl_index_field_set_raw_float32,
+        [OP_FIELD_SET_RAW_INT32]        = &&lbl_field_set_raw_int32,
+        [OP_FIELD_SET_RAW_FLOAT32]      = &&lbl_field_set_raw_float32,
+        [OP_FIELD_COMPOUND_RAW_INT32]        = &&lbl_field_compound_raw_int32,
+        [OP_FIELD_COMPOUND_RAW_FLOAT32]      = &&lbl_field_compound_raw_float32,
+        [OP_INDEX_FIELD_COMPOUND_RAW_INT32]  = &&lbl_index_field_compound_raw_int32,
+        [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32] = &&lbl_index_field_compound_raw_float32,
+
         [OP_UNBOX_PARAM_INT]  = &&lbl_unbox_param_int,
         [OP_UNBOX_PARAM_REAL] = &&lbl_unbox_param_real,
     };
@@ -2698,7 +2722,7 @@ lbl_index_field_get_raw_int: {
         error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
         DISPATCH();
     }
-    unsigned int element_size = pa->shape->field_count * 8;
+    unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
     memcpy(&vm->raw_ints[dest_slot], elem, 8);
     DISPATCH();
@@ -2720,7 +2744,7 @@ lbl_index_field_get_raw_real: {
         error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
         DISPATCH();
     }
-    unsigned int element_size = pa->shape->field_count * 8;
+    unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
     memcpy(&vm->raw_reals[dest_slot], elem, 8);
     DISPATCH();
@@ -2748,6 +2772,73 @@ lbl_field_get_raw_real: {
     DISPATCH();
 }
 
+/* Narrow (int32/float32) counterparts of the 4 GET opcodes above -- same contract, but the field's
+   storage is 4 bytes, widened into the same int64_t/double raw_ints[]/raw_reals[] slots the wide
+   opcodes and every raw arithmetic opcode already use. */
+lbl_index_field_get_raw_int32: {
+    int dest_slot = (int)UNPACK_A(op_word);
+    int arr_reg   = (int)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal obj = vm->registers[arr_reg];
+    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
+    int64_t i = aer_as_int(*idx);
+    if (i < 0) i += (int64_t)pa->count;
+    if (i < 0 || (uint64_t)i >= pa->count) {
+        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+        DISPATCH();
+    }
+    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    vm->raw_ints[dest_slot] = vm_raw_read_int32(elem);
+    DISPATCH();
+}
+
+lbl_index_field_get_raw_float32: {
+    int dest_slot = (int)UNPACK_A(op_word);
+    int arr_reg   = (int)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal obj = vm->registers[arr_reg];
+    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
+    int64_t i = aer_as_int(*idx);
+    if (i < 0) i += (int64_t)pa->count;
+    if (i < 0 || (uint64_t)i >= pa->count) {
+        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+        DISPATCH();
+    }
+    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    vm->raw_reals[dest_slot] = vm_raw_read_float32(elem);
+    DISPATCH();
+}
+
+lbl_field_get_raw_int32: {
+    int dest_slot  = (int)UNPACK_A(op_word);
+    int struct_reg = (int)UNPACK_B(op_word);
+    unsigned int foffset = READ();
+    AerVal obj = vm->registers[struct_reg];
+    if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
+    AerStruct* oa = aer_as_struct(obj);
+    vm->raw_ints[dest_slot] = vm_raw_read_int32(oa->fields + foffset);
+    DISPATCH();
+}
+
+lbl_field_get_raw_float32: {
+    int dest_slot  = (int)UNPACK_A(op_word);
+    int struct_reg = (int)UNPACK_B(op_word);
+    unsigned int foffset = READ();
+    AerVal obj = vm->registers[struct_reg];
+    if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
+    AerStruct* oa = aer_as_struct(obj);
+    vm->raw_reals[dest_slot] = vm_raw_read_float32(oa->fields + foffset);
+    DISPATCH();
+}
+
 lbl_index_field_set_raw_int: {
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
@@ -2764,7 +2855,7 @@ lbl_index_field_set_raw_int: {
         error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
         DISPATCH();
     }
-    unsigned int element_size = pa->shape->field_count * 8;
+    unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
     memcpy(elem, &vm->raw_ints[src_slot], 8);
     DISPATCH();
@@ -2786,7 +2877,7 @@ lbl_index_field_set_raw_real: {
         error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
         DISPATCH();
     }
-    unsigned int element_size = pa->shape->field_count * 8;
+    unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
     memcpy(elem, &vm->raw_reals[src_slot], 8);
     DISPATCH();
@@ -2811,6 +2902,73 @@ lbl_field_set_raw_real: {
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
     memcpy(oa->fields + foffset, &vm->raw_reals[src_slot], 8);
+    DISPATCH();
+}
+
+/* Narrow (int32/float32) counterparts of the 4 SET opcodes above -- narrows the raw_ints[]/
+   raw_reals[] slot's int64_t/double value back down to 4 bytes on write. No range check on the
+   int32 side -- see the narrow RAW opcode family's own comment (vm.h) for why. */
+lbl_index_field_set_raw_int32: {
+    int obj_reg = (int)UNPACK_A(op_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    uint32_t off_slot_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
+    int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
+    AerVal obj = vm->registers[obj_reg];
+    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
+    int64_t i = aer_as_int(*idx);
+    if (i < 0) i += (int64_t)pa->count;
+    if (i < 0 || (uint64_t)i >= pa->count) {
+        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+        DISPATCH();
+    }
+    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    vm_raw_write_int32(elem, vm->raw_ints[src_slot]);
+    DISPATCH();
+}
+
+lbl_index_field_set_raw_float32: {
+    int obj_reg = (int)UNPACK_A(op_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    uint32_t off_slot_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
+    int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
+    AerVal obj = vm->registers[obj_reg];
+    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
+    int64_t i = aer_as_int(*idx);
+    if (i < 0) i += (int64_t)pa->count;
+    if (i < 0 || (uint64_t)i >= pa->count) {
+        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+        DISPATCH();
+    }
+    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    vm_raw_write_float32(elem, vm->raw_reals[src_slot]);
+    DISPATCH();
+}
+
+lbl_field_set_raw_int32: {
+    int struct_reg = (int)UNPACK_A(op_word);
+    unsigned int foffset = READ();
+    int src_slot = (int)READ();
+    AerVal obj = vm->registers[struct_reg];
+    if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
+    AerStruct* oa = aer_as_struct(obj);
+    vm_raw_write_int32(oa->fields + foffset, vm->raw_ints[src_slot]);
+    DISPATCH();
+}
+
+lbl_field_set_raw_float32: {
+    int struct_reg = (int)UNPACK_A(op_word);
+    unsigned int foffset = READ();
+    int src_slot = (int)READ();
+    AerVal obj = vm->registers[struct_reg];
+    if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
+    AerStruct* oa = aer_as_struct(obj);
+    vm_raw_write_float32(oa->fields + foffset, vm->raw_reals[src_slot]);
     DISPATCH();
 }
 
@@ -2882,7 +3040,7 @@ lbl_index_field_compound_raw_int: {
         error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
         DISPATCH();
     }
-    unsigned int element_size = pa->shape->field_count * 8;
+    unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
     int64_t lhs; memcpy(&lhs, elem, 8);
     int64_t rhs = vm->raw_ints[rhs_slot];
@@ -2914,7 +3072,7 @@ lbl_index_field_compound_raw_real: {
         error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
         DISPATCH();
     }
-    unsigned int element_size = pa->shape->field_count * 8;
+    unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
     double lhs; memcpy(&lhs, elem, 8);
     double rhs = vm->raw_reals[rhs_slot];
@@ -2926,6 +3084,114 @@ lbl_index_field_compound_raw_real: {
         default: error("internal error: unsupported raw compound-assign op"); DISPATCH();
     }
     memcpy(elem, &result, 8);
+    DISPATCH();
+}
+
+/* Narrow (int32/float32) counterparts of the 4 COMPOUND opcodes above -- widen the field's own
+   4-byte storage into the compute-side int64_t/double, apply the op, narrow the RESULT back down
+   on write. No range check on the int32 side -- see the narrow RAW opcode family's own comment
+   (vm.h) for why. */
+lbl_field_compound_raw_int32: {
+    int struct_reg = (int)UNPACK_A(op_word);
+    Opcode bin_op  = (Opcode)UNPACK_B(op_word);
+    unsigned int foffset = READ();
+    int rhs_slot = (int)READ();
+    AerVal obj = vm->registers[struct_reg];
+    if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
+    AerStruct* oa = aer_as_struct(obj);
+    int64_t lhs = vm_raw_read_int32(oa->fields + foffset);
+    int64_t rhs = vm->raw_ints[rhs_slot];
+    int64_t result;
+    switch (bin_op) {
+        case OP_ADD: result = lhs + rhs; break;
+        case OP_SUB: result = lhs - rhs; break;
+        case OP_MUL: result = lhs * rhs; break;
+        default: error("internal error: unsupported raw compound-assign op"); DISPATCH();
+    }
+    vm_raw_write_int32(oa->fields + foffset, result);
+    DISPATCH();
+}
+
+lbl_field_compound_raw_float32: {
+    int struct_reg = (int)UNPACK_A(op_word);
+    Opcode bin_op  = (Opcode)UNPACK_B(op_word);
+    unsigned int foffset = READ();
+    int rhs_slot = (int)READ();
+    AerVal obj = vm->registers[struct_reg];
+    if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
+    AerStruct* oa = aer_as_struct(obj);
+    double lhs = vm_raw_read_float32(oa->fields + foffset);
+    double rhs = vm->raw_reals[rhs_slot];
+    double result;
+    switch (bin_op) {
+        case OP_ADD: result = lhs + rhs; break;
+        case OP_SUB: result = lhs - rhs; break;
+        case OP_MUL: result = lhs * rhs; break;
+        default: error("internal error: unsupported raw compound-assign op"); DISPATCH();
+    }
+    vm_raw_write_float32(oa->fields + foffset, result);
+    DISPATCH();
+}
+
+lbl_index_field_compound_raw_int32: {
+    int arr_reg   = (int)UNPACK_A(op_word);
+    Opcode bin_op = (Opcode)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    int rhs_slot = (int)READ();
+    AerVal obj = vm->registers[arr_reg];
+    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
+    int64_t i = aer_as_int(*idx);
+    if (i < 0) i += (int64_t)pa->count;
+    if (i < 0 || (uint64_t)i >= pa->count) {
+        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+        DISPATCH();
+    }
+    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    int64_t lhs = vm_raw_read_int32(elem);
+    int64_t rhs = vm->raw_ints[rhs_slot];
+    int64_t result;
+    switch (bin_op) {
+        case OP_ADD: result = lhs + rhs; break;
+        case OP_SUB: result = lhs - rhs; break;
+        case OP_MUL: result = lhs * rhs; break;
+        default: error("internal error: unsupported raw compound-assign op"); DISPATCH();
+    }
+    vm_raw_write_int32(elem, result);
+    DISPATCH();
+}
+
+lbl_index_field_compound_raw_float32: {
+    int arr_reg   = (int)UNPACK_A(op_word);
+    Opcode bin_op = (Opcode)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    int rhs_slot = (int)READ();
+    AerVal obj = vm->registers[arr_reg];
+    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
+    int64_t i = aer_as_int(*idx);
+    if (i < 0) i += (int64_t)pa->count;
+    if (i < 0 || (uint64_t)i >= pa->count) {
+        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+        DISPATCH();
+    }
+    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    double lhs = vm_raw_read_float32(elem);
+    double rhs = vm->raw_reals[rhs_slot];
+    double result;
+    switch (bin_op) {
+        case OP_ADD: result = lhs + rhs; break;
+        case OP_SUB: result = lhs - rhs; break;
+        case OP_MUL: result = lhs * rhs; break;
+        default: error("internal error: unsupported raw compound-assign op"); DISPATCH();
+    }
+    vm_raw_write_float32(elem, result);
     DISPATCH();
 }
 
@@ -2976,32 +3242,24 @@ lbl_array_repeat: {
                       aer_as_string(c->pool[shape->field_names[i]])->data, got);
                 DISPATCH();
             }
-            /* Not yet supported: every packed-array element read/write (this handler and
-               OP_INDEX_FIELD_GET/SET/COMPOUND's packed branches) assumes a uniform 8-bytes-per-field
-               stride (field_count * 8) -- correct today because every packable field type above is
-               always exactly 8 bytes. A narrow field would silently break that invariant, so it's
-               rejected here rather than corrupting element layout; the fix (using shape->
-               instance_bytes as the real per-element stride everywhere) is deferred until narrow
-               fields need to compose with packed arrays. */
-            if (shape->field_narrow[i]) {
-                error("'%s' cannot be packed into an array: field '%s' is a narrow (int32/float32) field, not yet supported in a packed array",
-                      aer_as_string(c->pool[shape->name])->data,
-                      aer_as_string(c->pool[shape->field_names[i]])->data);
-                DISPATCH();
-            }
         }
-        unsigned int element_size = shape->field_count * 8;
+        /* A narrow (int32/float32) field packs fine here -- every packed-array element read/write
+           (this handler and OP_INDEX_FIELD_GET/SET/COMPOUND's packed branches) uses
+           shape->instance_bytes as the real per-element stride, not a hardcoded 8-bytes-per-field
+           assumption, so a mix of narrow and wide fields lays out correctly either way. */
+        unsigned int element_size = shape->instance_bytes;
         AerPackedArray* pa = heap_alloc(&vm->heap, &vm->heap.packed_array_pool);
         pa->count = (unsigned int)count;
         pa->shape = shape;
         /* malloc(0) is implementation-defined -- skip it for a zero-count array; bounds checks
            reject every later access anyway. */
         pa->data  = count > 0 ? xmalloc((size_t)count * (size_t)element_size) : NULL;
-        /* Every eligible field is raw 8 bytes (TYPE_ANY, the only wider field kind, was already
-           rejected above), so src->fields IS one element's worth of bytes, laid out identically --
-           a straight memcpy per element, not a field-by-field copy. This is also the real capability
-           gain over the old opcode: src's OWN field values are replicated, not the Shape's static
-           defaults, so `[Particle(1.0, 2.0); n]` now differs from `[Particle(); n]`. */
+        /* Every eligible field is raw -- 8 bytes, or 4 if narrow (TYPE_ANY, the only field kind
+           needing a full boxed AerVal, was already rejected above) -- so src->fields IS one
+           element's worth of bytes at exactly instance_bytes, laid out identically to a packed
+           element: a straight memcpy per element, not a field-by-field copy. This is also the real
+           capability gain over the old opcode: src's OWN field values are replicated, not the
+           Shape's static defaults, so `[Particle(1.0, 2.0); n]` now differs from `[Particle(); n]`. */
         for (int64_t e = 0; e < count; e++)
             memcpy(pa->data + (size_t)e * element_size, src->fields, element_size);
         vm->registers[dest_reg] = aer_packed_array_val(pa);
@@ -3052,9 +3310,10 @@ lbl_index_field_get: {
         }
         int slot; unsigned int foffset; ValueType ftype; bool narrow;
         if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &ftype, &narrow)) DISPATCH();
-        unsigned int element_size = pa->shape->field_count * 8;
+        unsigned int element_size = pa->shape->instance_bytes;
         unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
-        vm->registers[dest_reg] = vm_packed_slot_read(elem, ftype);
+        vm->registers[dest_reg] = narrow ? vm_typed_elem_read(elem, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32)
+                                          : vm_packed_slot_read(elem, ftype);
         DISPATCH();
     }
     AerVal tmp;
@@ -3096,9 +3355,11 @@ lbl_index_field_set: {
                   aer_as_string(c->pool[field_idx])->data);
             DISPATCH();
         }
-        unsigned int element_size = pa->shape->field_count * 8;
+        if (!vm_check_narrow_field_write(declared, narrow, *val)) DISPATCH();
+        unsigned int element_size = pa->shape->instance_bytes;
         unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
-        vm_packed_slot_write(elem, declared, *val);
+        if (narrow) vm_typed_elem_write(elem, declared == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32, *val);
+        else        vm_packed_slot_write(elem, declared, *val);
         DISPATCH();
     }
     AerVal tmp;
@@ -3149,9 +3410,10 @@ lbl_index_field_compound: {
         }
         int slot; unsigned int foffset; ValueType ftype; bool narrow;
         if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &ftype, &narrow)) DISPATCH();
-        unsigned int element_size = pa->shape->field_count * 8;
+        unsigned int element_size = pa->shape->instance_bytes;
         unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
-        AerVal lhs = vm_packed_slot_read(elem, ftype);
+        AerVal lhs = narrow ? vm_typed_elem_read(elem, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32)
+                             : vm_packed_slot_read(elem, ftype);
         bool handled;
         AerVal result = vm_binary_fast(lhs, *rhs, bin_op, ftype, aer_type(*rhs), &handled);
         if (!handled) { result = vm_binary_cold(c, lhs, *rhs, bin_op, ftype, aer_type(*rhs)); gc_maybe_collect(vm); }
@@ -3160,7 +3422,9 @@ lbl_index_field_compound: {
                   aer_as_string(c->pool[field_idx])->data);
             DISPATCH();
         }
-        vm_packed_slot_write(elem, ftype, result);
+        if (!vm_check_narrow_field_write(ftype, narrow, result)) DISPATCH();
+        if (narrow) vm_typed_elem_write(elem, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32, result);
+        else        vm_packed_slot_write(elem, ftype, result);
         DISPATCH();
     }
     AerVal tmp;

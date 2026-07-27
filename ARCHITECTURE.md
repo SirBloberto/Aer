@@ -621,29 +621,31 @@ default build, to keep the makefile small.
   bug above (that's about *how often* the array gets rescanned once old, not the reallocation cost),
   but is a real, complementary, and much cheaper win for the same "build a huge array via many
   appends" pattern. Not built yet.
-- **DONE (correctness-only pass): opt-in 32-bit (`int32`/`float32`) fields for structs**, via the
-  same `i`/`f` literal-suffix convention as narrow typed arrays (`x = 42i`, `y = 0.0f` inside a
-  `struct` body — see [Narrow Struct Fields](README.md#narrow-struct-fields)). `Shape.field_offsets[]`
-  (vm.c, `OP_DEFINE_STRUCT`'s handler) already was a genuine per-field cumulative sum, not a fixed
-  stride, so a third (4-byte) case slotted in directly; `Shape.field_narrow[]` records which fields
-  are narrow, threaded through the field-access inline cache (`FieldCacheEntry.narrow`) so
-  `vm_struct_field_read_at`/`write_at` — the one path every ordinary (non-specialized) `.field`
-  opcode uses — can dispatch correctly. **Deliberately excluded from this pass, a real remaining
-  TODO**: shape specialization's raw-unboxed-local fast path (`OP_FIELD_GET_RAW_REAL` and the whole
-  `_RAW_INT`/`_RAW_REAL` family) still assumes an unconditional 8-byte slot — `shape_find_field`
-  (parser.c) now reports a field's narrowness precisely so every one of that family's 5 eligibility
-  checks can exclude a narrow field, forcing it through the generic (still fully correct, just not
-  raw-unboxed) path instead. This means a narrow field gets today's whole memory-density win but not
-  yet the matching per-access speed win a wide field gets once a function specializes around it —
-  that would need 32-bit counterparts of the whole raw-opcode family (`OP_FIELD_GET_RAW_REAL`'s
-  int32/float32 equivalents, etc.), deferred until real `perf stat` numbers justify doubling that
-  opcode surface, mirroring how packed arrays themselves were only fast-pathed after benchmark
-  evidence existed. **Also deliberately excluded**: packed-array construction of a struct with any
-  narrow field (`[Point(); n]` where `Point` has a narrow field) is a compile-clean *runtime* error —
-  every packed-array element access (10 call sites across `lbl_index_field_get/set/compound` and
-  `lbl_array_repeat`) assumes a uniform 8-bytes-per-field stride (`field_count * 8`, not
-  `shape->instance_bytes`), and generalizing all 10 was judged out of scope for a first pass focused
-  on plain (non-packed) struct instances.
+- **DONE: opt-in 32-bit (`int32`/`float32`) fields for structs**, via the same `i`/`f` literal-suffix
+  convention as narrow typed arrays (`x = 42i`, `y = 0.0f` inside a `struct` body — see
+  [Narrow Struct Fields](README.md#narrow-struct-fields)). Landed in two passes. First
+  (correctness-only): `Shape.field_offsets[]` (vm.c, `OP_DEFINE_STRUCT`'s handler) already was a
+  genuine per-field cumulative sum, not a fixed stride, so a third (4-byte) case slotted in
+  directly; `Shape.field_narrow[]` records which fields are narrow, threaded through the
+  field-access inline cache (`FieldCacheEntry.narrow`) so `vm_struct_field_read_at`/`write_at` --
+  the one path every ordinary (non-specialized) `.field` opcode uses -- can dispatch correctly.
+  Second (the raw-opcode fast path + packed-array support, landed once real interest in measuring
+  nbody.aer's narrow-field performance justified the work): every `field_count * 8` packed-array
+  element-size computation (10 call sites across `lbl_index_field_get/set/compound` and
+  `lbl_array_repeat`) became `shape->instance_bytes`, the real per-element stride, so a struct with
+  a narrow field packs fine now (`[Point(); n]`); and shape specialization's raw-unboxed-local fast
+  path gained 12 narrow counterparts of the whole `OP_FIELD_GET_RAW_INT/REAL` family
+  (`OP_FIELD_GET_RAW_INT32/FLOAT32` etc.) -- these widen a field's 4-byte storage into the same
+  int64_t/double `raw_ints[]`/`raw_reals[]` slots every raw arithmetic opcode already uses, and
+  narrow the result back down on write, so a narrow field specializes exactly like a wide one would.
+  `shape_find_field` (parser.c) reports a field's narrowness precisely so all 5 specialization
+  call sites can select the right opcode variant. One real bug found and fixed along the way: the
+  debug-tools disassembler's `OP_DEFINE_STRUCT` decode indexed a type-name array with the RAW
+  (un-masked) field-type word, an out-of-bounds read/crash the moment a narrow field's `0x100`
+  marker bit was set -- masking it out (mirroring the real VM decode) fixed it. The narrow int32
+  raw-opcode SET/COMPOUND family does not range-check on overflow (silently truncates), matching
+  every other raw arithmetic opcode's existing "raw means unchecked, for speed" convention -- unlike
+  the boxed path's own `vm_check_narrow_field_write`, which does check.
 
 ---
 

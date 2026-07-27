@@ -237,6 +237,23 @@ typedef enum {
     OP_FIELD_COMPOUND_RAW_INT,       OP_FIELD_COMPOUND_RAW_REAL,
     OP_INDEX_FIELD_COMPOUND_RAW_INT, OP_INDEX_FIELD_COMPOUND_RAW_REAL,
 
+    /* Narrow (int32/float32) counterparts of the entire RAW field-access family above -- same
+       specialized-body-only contract, same compile-time-constant offset, but the field's own
+       STORAGE is 4 bytes (Shape.field_narrow, vm.h), not 8. The COMPUTE side is unchanged: a
+       narrow value is widened into an ordinary raw_ints[]/raw_reals[] slot (int64_t/double) on
+       read, narrowed back on write -- every raw ARITHMETIC opcode (OP_RAW_ADD_INT, etc.) stays
+       completely untouched, operating on the same slots regardless of a field's storage width.
+       Unlike the boxed path's int32 write (vm_check_narrow_field_write, gc.c), the narrow SET/
+       COMPOUND opcodes here do NOT range-check on overflow -- silently truncating instead, the
+       same "raw means unchecked, for speed" tradeoff every other raw arithmetic opcode in this
+       file already makes (e.g. OP_RAW_ADD_INT's own int64 wraparound is never checked either). */
+    OP_INDEX_FIELD_GET_RAW_INT32, OP_INDEX_FIELD_GET_RAW_FLOAT32,
+    OP_FIELD_GET_RAW_INT32,       OP_FIELD_GET_RAW_FLOAT32,
+    OP_INDEX_FIELD_SET_RAW_INT32, OP_INDEX_FIELD_SET_RAW_FLOAT32,
+    OP_FIELD_SET_RAW_INT32,       OP_FIELD_SET_RAW_FLOAT32,
+    OP_FIELD_COMPOUND_RAW_INT32,       OP_FIELD_COMPOUND_RAW_FLOAT32,
+    OP_INDEX_FIELD_COMPOUND_RAW_INT32, OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32,
+
     /* Only ever emitted at the very start of a specialized body's "raw-numeric variant" (see
        SpecEntry below), once per raw-bound parameter -- unconditionally reads the boxed AerVal the
        caller already placed in that parameter's own register (the calling convention never
@@ -507,12 +524,12 @@ struct Shape {
     ValueType    field_types[MAX_STRUCT_FIELDS];
     /* True for a TYPE_INTEGER/TYPE_REAL field whose default was written with an `i`/`f` literal
        suffix (`x = 42i`, `x = 0.0f`) -- selects narrow (4-byte int32/float32) storage instead of the
-       usual 8-byte int64/float64, on a plain (non-packed) struct instance only: a struct with any
-       narrow field is NOT eligible for packed-array construction (see lbl_array_repeat, vm.c) --
-       every packed-array element read/write assumes a uniform 8-bytes-per-field stride
-      (field_count * 8), and preserving that invariant unchanged was chosen over auditing/generalizing
-       every one of those call sites for a first, correctness-focused pass. False (meaningless) for
-       any other field kind. */
+       usual 8-byte int64/float64. Works identically on a plain struct instance or as a packed-array
+       element (every element read/write uses shape->instance_bytes as the real per-element stride,
+       not a hardcoded 8-bytes-per-field assumption) -- see lbl_array_repeat, vm.c. Shape
+       specialization's raw-unboxed fast path also has narrow counterparts of its own opcode family
+       (OP_FIELD_GET_RAW_INT32/FLOAT32 etc.) selected via shape_find_field's own narrow output,
+       parser.c. False (meaningless) for any other field kind. */
     bool         field_narrow[MAX_STRUCT_FIELDS];
     /* Byte offset of each field within an instance's fields buffer (AerStruct.fields) -- a typed
        field (TYPE_ANY excluded) is stored RAW in 8 bytes (no tag; the type is this Shape's own

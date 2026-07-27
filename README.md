@@ -894,14 +894,13 @@ A narrow field reads back as an ordinary `integer`/`float` value — nothing abo
 different from a normal field. `p.x = 5000000000` (or a construction argument, or the field's own
 default) is a runtime error if it doesn't fit an `int32`, rather than silently wrapping.
 
-This is a correctness/memory-focused first step, not (yet) a speed one: a narrow field always goes
-through the same field-access opcodes an ordinary field does — it does not (yet) participate in the
-VM's shape-specialization raw-unboxed-local fast path, so a tight loop reading a narrow field gets
-the memory-density win but not (yet) the same per-access speed a wide field gets once a function
-specializes around it. **Not yet supported**: a struct with any narrow field cannot be used as the
-fill value of a [repeat-literal](#repeat-literal-arrays)'s packed-array construction (`[Point(); n]`)
-— every packed array assumes a uniform 8-bytes-per-field element stride today, an invariant a narrow
-field would break.
+Narrow fields get both the memory-density win (4 bytes instead of 8, in a plain struct instance or
+as a packed-array element alike — `[Point(); n]` works fine with narrow fields) and the same
+per-access speed a wide field gets: the VM's shape-specialization fast path has its own narrow
+counterparts of every raw field-access opcode, widening a field's 4-byte storage into an ordinary
+64-bit register for computation and narrowing the result back down on write — so a tight loop
+reading/writing a narrow field specializes exactly like a wide one would, just with a smaller
+memory footprint to stream through.
 
 ### Repeat-Literal Arrays
 

@@ -415,13 +415,11 @@ static void mark_shape_sensitive(int reg) {
    exist on this shape -- callers fall back to the generic (runtime-checked, correctly-erroring)
    opcode path rather than treating this as an internal error, since a genuinely missing field is
    a normal source-level mistake the generic path already reports correctly.
-   *out_narrow is true for a narrow (int32/float32) field -- every caller of this function treats
-   that the same way as "not int/real" (falls back to the generic, non-raw-opcode path): the
-   existing raw-field opcode family (OP_FIELD_GET_RAW_INT/REAL, OP_INDEX_FIELD_GET_RAW_INT/REAL,
-   and the RAW_INT/RAW_REAL compound-assignment variants) all assume an unconditional 8-byte raw
-   slot, so a narrow field is deliberately kept out of shape specialization's raw fast path
-   entirely for now -- see Shape.field_narrow's own comment (vm.h) for why this was chosen over
-   also doubling that opcode family. */
+   *out_narrow is true for a narrow (int32/float32) field -- every caller uses it to pick between
+   the wide RAW opcode family (OP_FIELD_GET_RAW_INT/REAL etc.) and its narrow counterpart
+   (OP_FIELD_GET_RAW_INT32/FLOAT32 etc., vm.h), which widens/narrows at the field's own 4-byte
+   storage boundary while still computing through the same int64_t/double raw_ints[]/raw_reals[]
+   slots every raw arithmetic opcode uses regardless of a field's storage width. */
 static bool shape_find_field(Shape* shape, unsigned int field_name_idx,
                                  unsigned int* out_offset, ValueType* out_type, bool* out_narrow) {
     for (unsigned int i = 0; i < shape->field_count; i++) {
@@ -1478,11 +1476,12 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                     Shape* known = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? reg_known_shape[arr_reg] : NULL;
                     unsigned int foffset; ValueType ftype; bool narrow;
                     if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
-                        !narrow && (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
+                        (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
                         bool is_int = (ftype == TYPE_INTEGER);
                         int slot = is_int ? raw_int_alloc() : raw_real_alloc();
                         if (slot >= 0) {
-                            Opcode op = is_int ? OP_INDEX_FIELD_GET_RAW_INT : OP_INDEX_FIELD_GET_RAW_REAL;
+                            Opcode op = narrow ? (is_int ? OP_INDEX_FIELD_GET_RAW_INT32 : OP_INDEX_FIELD_GET_RAW_FLOAT32)
+                                               : (is_int ? OP_INDEX_FIELD_GET_RAW_INT   : OP_INDEX_FIELD_GET_RAW_REAL);
                             chunk_emit(c, PACK3(op, slot, arr_reg, 0));
                             chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(rk_start)));
                             rk = is_int ? (RK_RAW_INT_FLAG | slot) : (RK_RAW_REAL_FLAG | slot);
@@ -1550,11 +1549,12 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                 Shape* known = (struct_reg >= 0 && struct_reg < FRAME_REGISTERS) ? reg_known_shape[struct_reg] : NULL;
                 unsigned int foffset; ValueType ftype; bool narrow;
                 if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
-                    !narrow && (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
+                    (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
                     bool is_int = (ftype == TYPE_INTEGER);
                     int slot = is_int ? raw_int_alloc() : raw_real_alloc();
                     if (slot >= 0) {
-                        Opcode op = is_int ? OP_FIELD_GET_RAW_INT : OP_FIELD_GET_RAW_REAL;
+                        Opcode op = narrow ? (is_int ? OP_FIELD_GET_RAW_INT32 : OP_FIELD_GET_RAW_FLOAT32)
+                                           : (is_int ? OP_FIELD_GET_RAW_INT   : OP_FIELD_GET_RAW_REAL);
                         chunk_emit(c, PACK3(op, slot, struct_reg, 0));
                         chunk_emit(c, foffset);
                         rk = is_int ? (RK_RAW_INT_FLAG | slot) : (RK_RAW_REAL_FLAG | slot);
@@ -2300,7 +2300,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
             unsigned int foffset = 0; ValueType ftype = TYPE_ANY; bool field_narrow_bit = false;
             RawKind field_kind = RAWK_NONE;
-            if (known && shape_find_field(known, fused_field_idx, &foffset, &ftype, &field_narrow_bit) && !field_narrow_bit) {
+            if (known && shape_find_field(known, fused_field_idx, &foffset, &ftype, &field_narrow_bit)) {
                 if (ftype == TYPE_INTEGER) field_kind = RAWK_INT;
                 else if (ftype == TYPE_REAL) field_kind = RAWK_REAL;
             }
@@ -2317,7 +2317,9 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
                     int slot = raw_materialize(c, rk_val, field_kind);
                     if (slot >= 0) {
-                        Opcode op = (field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT : OP_INDEX_FIELD_SET_RAW_REAL;
+                        Opcode op = field_narrow_bit
+                            ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT32 : OP_INDEX_FIELD_SET_RAW_FLOAT32)
+                            : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT   : OP_INDEX_FIELD_SET_RAW_REAL);
                         chunk_emit(c, PACK_OP_A_W16(op, obj_reg, pack_rk16(pending_rk_idx)));
                         chunk_emit(c, PACK_2X16((uint16_t)foffset, (uint16_t)slot));
                         int floor_now = (field_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
@@ -2354,7 +2356,9 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
                     int slot = raw_materialize(c, rk_rhs, field_kind);
                     if (slot >= 0) {
-                        Opcode op = (field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT : OP_INDEX_FIELD_COMPOUND_RAW_REAL;
+                        Opcode op = field_narrow_bit
+                            ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT32 : OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32)
+                            : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT   : OP_INDEX_FIELD_COMPOUND_RAW_REAL);
                         chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
                         chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(pending_rk_idx)));
                         chunk_emit(c, (uint32_t)slot);
@@ -2443,12 +2447,14 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             mark_shape_sensitive(obj_reg);
             Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
             unsigned int foffset; ValueType ftype; bool field_narrow_bit;
-            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit) && !field_narrow_bit) {
+            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit)) {
                 RawKind field_kind = (ftype == TYPE_INTEGER) ? RAWK_INT : (ftype == TYPE_REAL) ? RAWK_REAL : RAWK_NONE;
                 if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
                     int slot = raw_materialize(c, rk_val, field_kind);
                     if (slot >= 0) {
-                        Opcode op = (field_kind == RAWK_INT) ? OP_FIELD_SET_RAW_INT : OP_FIELD_SET_RAW_REAL;
+                        Opcode op = field_narrow_bit
+                            ? ((field_kind == RAWK_INT) ? OP_FIELD_SET_RAW_INT32 : OP_FIELD_SET_RAW_FLOAT32)
+                            : ((field_kind == RAWK_INT) ? OP_FIELD_SET_RAW_INT   : OP_FIELD_SET_RAW_REAL);
                         chunk_emit(c, PACK3(op, obj_reg, 0, 0));
                         chunk_emit(c, foffset);
                         chunk_emit(c, (uint32_t)slot);
@@ -2482,7 +2488,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             Shape* known = (obj_is_base && obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
             unsigned int foffset = 0; ValueType ftype = TYPE_ANY; bool field_narrow_bit = false;
             RawKind field_kind = RAWK_NONE;
-            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit) && !field_narrow_bit) {
+            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit)) {
                 if (ftype == TYPE_INTEGER) field_kind = RAWK_INT;
                 else if (ftype == TYPE_REAL) field_kind = RAWK_REAL;
             }
@@ -2502,7 +2508,9 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
                 int slot = raw_materialize(c, rk_rhs, field_kind);
                 if (slot >= 0) {
-                    Opcode op = (field_kind == RAWK_INT) ? OP_FIELD_COMPOUND_RAW_INT : OP_FIELD_COMPOUND_RAW_REAL;
+                    Opcode op = field_narrow_bit
+                        ? ((field_kind == RAWK_INT) ? OP_FIELD_COMPOUND_RAW_INT32 : OP_FIELD_COMPOUND_RAW_FLOAT32)
+                        : ((field_kind == RAWK_INT) ? OP_FIELD_COMPOUND_RAW_INT   : OP_FIELD_COMPOUND_RAW_REAL);
                     chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
                     chunk_emit(c, foffset);
                     chunk_emit(c, (uint32_t)slot);
