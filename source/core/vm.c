@@ -2547,18 +2547,20 @@ lbl_call: {
                raw_variant_* fields are relevant. See SpecEntry's own comment, vm.h, for why this is
                a SEPARATE per-entry variant rather than folding raw-param-kind into the shape axis
                itself. */
-            /* SPEC_KIND_ARRAY_OF_STRUCTS excluded: measured (interleaved, same-session A/B against
-               the pre-raw-numeric-variant build) as a real, consistent ~20% REGRESSION on
-               struct_array_scan.aer specifically, despite dispatch-count evidence showing fewer
-               boxed ops overall (OP_RAW_MUL_REAL replacing OP_RAW_MUL_REAL_BOXED_TO, no repeated
-               recompilation -- OP_UNBOX_PARAM_INT/REAL each fire exactly once per call, confirming
-               the cache itself works correctly). Root cause not fully isolated -- excluding this
-               one SpecKind recovers full step-4 performance (in fact slightly better), so gated
-               off rather than shipped as a net loss for this case while the actual mechanism (some
-               interaction between the raw-numeric variant and the one-hop alias/homogeneity-check
-               machinery specific to ARRAY_OF_STRUCTS) stays unexplained. STRUCT/PACKED_ARRAY are
-               unaffected (confirmed: nbody.aer, PACKED_ARRAY, keeps its full ~24-26% win). */
-            if (entry && entry->raw_param_count >= 0 && kind != SPEC_KIND_ARRAY_OF_STRUCTS) {
+            /* SPEC_KIND_ARRAY_OF_STRUCTS was previously excluded here, based on an apparent ~20%
+               regression on struct_array_scan.aer. Re-investigated with real hardware performance
+               counters (perf stat, Raspberry Pi 4) rather than wall-clock alone: dispatch counts and
+               GC stats were already known to be identical or better with the variant enabled: this
+               time cycles, instructions, AND branch-misses were all lower too (branch-misses ~18-40x
+               lower: 289-292K vs 5.3-11.8M across repeated runs) -- and the ORIGINAL guarded build's
+               own branch-misses varied more than 2x between two back-to-back runs of the identical
+               binary, meaning that build was unstable on its own before any comparison even started.
+               That instability is consistent with the original "~20% regression" having been a noisy
+               single-sample wall-clock artifact, not a real effect. Confirmed at both a reduced scale
+               (N=100,000, isolated from an unrelated O(n^2) GC bug in unrelated benchmark setup code)
+               and the real N=2,000,000 scale (19.01s enabled vs 20.32s excluded, ~6.4% faster,
+               consistent with the reduced-scale ~7% figure) -- guard removed. */
+            if (entry && entry->raw_param_count >= 0) {
                 int cand_regs[SPEC_MAX_RAW_PARAMS];
                 ValueType cand_types[SPEC_MAX_RAW_PARAMS];
                 int cand_count = 0;

@@ -517,11 +517,29 @@ default build, to keep the makefile small.
   under profiling). An RR-opcode-split (separate register-register and register-constant opcode
   variants, eliminating the runtime branch entirely) and a "unified addressing" alternative were
   both scoped and explicitly set aside — real complexity/opcode-surface cost for an unproven payoff.
-- **No SIMD/vectorization, no JIT.** This is a pure bytecode interpreter; every optimization above
-  works within that ceiling. A hypothetical fixed-size, uniformly-typed array feature (discussed,
-  not built) could enable contiguous typed storage and bounds-check elision, but real vectorization
-  would need the interpreter to recognize vectorizable access patterns at compile time — a
-  substantially larger undertaking than anything landed so far.
+- **No SIMD/vectorization, no JIT.** Confirmed concretely, not just assumed: GCC's own
+  `-fopt-info-vec` diagnostics produce zero output — not even a "missed" message — for `vm_run_slice`
+  at any optimization level, because the dispatch loop isn't a shape the vectorizer analyzes at all
+  (a computed-goto loop over heterogeneous opcode handlers, not a fixed-body countable-trip loop).
+  This is fundamental to being an interpreter, not something a flag fixes. Separately, on the
+  Raspberry Pi 4 build specifically: this GCC target's default (`-mfpu=auto` on `armv7-a+fp`) doesn't
+  even enable NEON, so *no* loop anywhere in the codebase auto-vectorizes right now, dispatch loop or
+  otherwise (confirmed with a trivial textbook-vectorizable loop: `no vectype for stmt` without
+  `-mfpu=neon`). Adding `-mfpu=neon -mfloat-abi=hard` gets past that, but float vectorization then
+  additionally requires `-ffast-math` (NEON's FP unit isn't fully IEEE-754 compliant — GCC won't
+  auto-vectorize float loops without permission to relax that) — a flag with real behavioral risk for
+  a language runtime (relaxed NaN/Inf/signed-zero semantics) that should never be applied globally,
+  only scoped to a specific, deliberately-audited function if ever used. Even then: NEON (32- or
+  64-bit) has no gather/scatter — confirmed for this exact chip (Cortex-A72/BCM2711) — so a
+  hypothetical bulk-vectorized opcode over the CURRENT AoS-packed struct-array layout would need
+  manual scalar de-interleaving before vectorizing, likely eating most of the gain; the current AoS
+  choice (over SoA, made earlier for dynamic-typing/aliasing reasons — see the flat-typed-arrays
+  design discussion) is also the one layout choice that makes gather-free SIMD hard on this hardware.
+  Net: real vectorization would need (a) a new bulk-operation opcode family with its own tight,
+  auditable C loop — the interpreter's normal per-element dispatch can't get this for free — and (b)
+  probably reopening AoS vs. SoA for at least that opcode family's storage. Not attempted; the
+  cost/risk (relaxed float semantics, a settled layout decision, real implementation size) hasn't yet
+  been weighed against a confirmed payoff on the actual target hardware.
 - **No OS-thread parallelism at the language level, by design.** A `VM`'s registers/call-stack are
   per-instance (proven by file-based `import`, which already runs each imported file in its own),
   but the GC-managed heap (`string_pool`/`array_pool`/etc., `vm.c`) is one set of pools shared by
@@ -541,6 +559,67 @@ default build, to keep the makefile small.
   tasks through this in small slices until each finishes or errors. True OS-thread parallelism
   would additionally require moving the pools from process-global statics into per-`VM` fields, a
   real but separable, larger refactor — not attempted.
+- **TODO: O(n²) minor-GC rescan of a large, repeatedly-grown array OR dict (found, not yet fixed).**
+  A remembered array or dict (promoted old, holding a young reference — `gc_barrier_array`/
+  `gc_barrier_dict`, vm.c) is scanned in full on *every subsequent minor GC*, for as long as it stays
+  remembered (entries are never proactively removed): `REMEMBERED_ARRAY` does
+  `for (j = 0; j < a->count; j++) worklist_push(...)`, `REMEMBERED_DICT` does the identical
+  `for (j = 0; j < map->count; j++) worklist_push(map->dense[j].payload)` (vm.c:355-390) — this is a
+  property of the general remembered-set mechanism, not specific to arrays. (`REMEMBERED_STRUCT` is
+  naturally immune: field count is fixed at struct definition, small, bounded by `MAX_STRUCT_FIELDS`.)
+  For a container built via many incremental insertions (`append()`, or repeated `dict[key] = value`
+  with new keys), each of the ~(N / minor_gc_threshold) minor GCs across construction rescans the
+  *entire current* contents, not just what's new since the last scan — total cost degrades to
+  roughly O(n²/threshold). Confirmed via `perf stat` on real hardware (a Raspberry Pi 4):
+  `bench/struct_array_scan.aer`'s own `make_particles(2_000_000)` setup phase — which runs *before*
+  the benchmark's own internal timer starts, so this was invisible to every prior session's own
+  "Took: Xs" comparisons — takes ~307 seconds alone, with IPC pinned at 0.45 (heavy, repetitive,
+  memory-bound rescanning), matching the predicted mechanism closely. (The dict case is unconfirmed
+  by a benchmark — every dict in the current bench suite is small/bounded — but the code path is
+  identical, so it's presumably exposed to the same risk at large-N.) The standard fix (delta-scan:
+  track a `last_scanned_count` per remembered container, push only the entries added since the last
+  scan, update after each scan) turns the pure-growth case from O(n²) to O(n) for both container
+  kinds, but needs care: `gc_barrier_array`/`gc_barrier_dict` are also the write barrier for
+  overwriting an *existing* entry with a new young value (`arr[i] = x`, or updating an existing dict
+  key) — a naive high-water-mark delta-scan would miss that case, so the real fix needs to distinguish
+  "grew via append/new-key" from "mutated an existing slot" (or track dirty ranges rather than just a
+  count), for both `AerArray` and `AerDict`. Deliberately not fixed yet — deferred pending a careful
+  design pass, given generational-GC correctness here has bitten this project more than once before.
+- **TODO: no small-string optimization — every `AerString` is a separate heap allocation.** Real
+  `perf stat` hardware counters on a Raspberry Pi 4 (`bench/log_processing.aer`, string-interpolation-
+  and `string.split`-heavy) showed data-cache misses outnumbering instruction-cache misses **140:1**
+  (17.8 vs 0.127 per 1000 instructions); the same ratio on a numeric-array-heavy workload
+  (`bench/nbody.aer`) was only 16.5:1. `aer_make_string` (vm.c) always allocates a fresh owned buffer
+  via `heap_alloc(heap, &heap->string_pool)` for the cell *and* a separate `xmalloc` for `data` (see
+  §2.2) — every interpolated string, every `split()` result, is two separate allocations plus a
+  pointer-chase to reach the bytes. Confirmed precisely by reading `FN_STRING_SPLIT`
+  (aer_string.c): splitting one `log_processing.aer` line ("`{i} GET {path} {status} {n}`", 5 fields)
+  costs 5 `xmalloc`s (one per field's byte buffer) + 5 `AerString` pool cells + 1 array-pool cell + 1
+  more `xmalloc` for the result array's `items` buffer — **11 separate heap events per line**, almost
+  all of them tiny (3-15 byte) strings that die within a few instructions of being read. `HashTable`
+  keys (`hashtable.c`) have the identical shape — `HashTableEntry.key` is a pointer into its own
+  size-classed pool allocation, not inline bytes — so `status_counts`/`path_counts`'s dict lookups pay
+  the same extra indirection on top. This is the likely dominant cause of the 140:1 ratio above, and
+  it isn't a case of AER missing something already fixed elsewhere: §2.2 documents the variable-payload
+  split as a deliberate design choice for genuinely variable-length data, and this is the natural
+  complementary case — the overwhelming majority of these strings are short enough that inlining
+  would apply. Small-string optimization (inlining short strings' bytes directly into the value
+  representation instead of a separate heap cell, avoiding both the allocation and the pointer
+  dereference for anything under some small length threshold) is the
+  standard, well-proven fix for exactly this access pattern — used by V8, LuaJIT, and Swift, among
+  others, for the same reason. Not scoped yet: this would touch `AerString`'s representation
+  (value.h) and every site that reads string data, a larger change than anything else on this list.
+- **TODO: no array-reserve builtin — `collection` module has no `hashtable_reserve`-equivalent.**
+  `hashtable_reserve` (hashtable.h) already exists specifically to pre-size a dict's sparse/dense
+  arrays once, up front, skipping the incremental one-entry-at-a-time growth `hashtable_put` would
+  otherwise do. `AerArray` has no equivalent — every `append()`-built array (e.g. `struct_array_scan.
+  aer`'s `make_particles`) pays the same incremental-growth cost `hashtable_reserve` was built to
+  avoid for dicts, with no way to opt out. A `collection.reserve(arr, n)` mirroring the existing dict
+  mechanism (pre-size `items`/`capacity` once, `xrealloc` immediately to `n` rather than doubling on
+  every overflow) would be small, additive, and low-risk — it doesn't fix the O(n²) minor-GC rescan
+  bug above (that's about *how often* the array gets rescanned once old, not the reallocation cost),
+  but is a real, complementary, and much cheaper win for the same "build a huge array via many
+  appends" pattern. Not built yet.
 
 ---
 
