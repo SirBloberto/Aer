@@ -1637,6 +1637,18 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
        touch. Synced at the end of every DISPATCH() and around vm_call_value (the only other
        write to this VM's ip). */
     unsigned int ip = vm->ip;
+    /* Same hoisting idea as ip above, applied to the other three pointers that are stable for the
+       whole current call and only change at the 3 call/return sites below (lbl_call, lbl_call_value
+       via vm_call_value, lbl_return) -- confirmed via instruction-level profiling (perf annotate on
+       nbody.aer) that raw_reals[...]'s own pointer reload (vm->raw_reals is a field read fresh
+       from the VM struct, not cached) was among the single hottest instructions in the whole
+       dispatch loop. register_stack/raw_int_stack/raw_real_stack (vm.h) are fixed-size inline VM
+       arrays, never reallocated, so these pointers are safe to cache in registers across dispatches
+       -- they only need refreshing at the same 3 sites vm->registers/raw_ints/raw_reals themselves
+       get reassigned. */
+    AerVal*  registers = vm->registers;
+    int64_t* raw_ints  = vm->raw_ints;
+    double*  raw_reals = vm->raw_reals;
     /* Only ever read/decremented at the handful of yield-checkpoints below; never touched when
        max_instructions is 0. */
     unsigned int slice_budget = max_instructions;
@@ -1846,21 +1858,21 @@ lbl_define_struct: {
 lbl_loadk: {
     int dest = (int)UNPACK_A(op_word);
     unsigned int pool_idx = UNPACK_W16(op_word);
-    vm->registers[dest] = c->pool[pool_idx];
+    registers[dest] = c->pool[pool_idx];
     DISPATCH();
 }
 
 lbl_move: {
     int dest = (int)UNPACK_A(op_word);
     int src  = (int)UNPACK_B(op_word);
-    vm->registers[dest] = vm->registers[src];
+    registers[dest] = registers[src];
     DISPATCH();
 }
 
 lbl_is_result: {
     int dest = (int)UNPACK_A(op_word);
     int src  = (int)UNPACK_B(op_word);
-    vm->registers[dest] = aer_bool(aer_type(vm->registers[src]) == TYPE_RESULT);
+    registers[dest] = aer_bool(aer_type(registers[src]) == TYPE_RESULT);
     DISPATCH();
 }
 
@@ -1879,7 +1891,7 @@ lbl_##NAME: { \
     AerVal* ra = vm_rk_ptr8(vm, const_pool, UNPACK_B(op_word)); \
     AerVal* rb = vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word)); \
     ValueType ta = ra->tag, tb = rb->tag; \
-    AerVal* result = &vm->registers[dest]; \
+    AerVal* result = &registers[dest]; \
     if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) { \
         int64_t l = ra->as.i, rv = rb->as.i; \
         INT_STMT \
@@ -1899,7 +1911,7 @@ lbl_##NAME: { \
     AerVal* ra = vm_rk_ptr8(vm, const_pool, UNPACK_B(op_word)); \
     AerVal* rb = vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word)); \
     ValueType ta = ra->tag, tb = rb->tag; \
-    AerVal* result = &vm->registers[dest]; \
+    AerVal* result = &registers[dest]; \
     if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) { \
         int64_t l = ra->as.i, rv = rb->as.i; \
         INT_STMT \
@@ -1941,7 +1953,7 @@ lbl_in: {
     int dest = (int)UNPACK_A(op_word);
     AerVal a = *vm_rk_ptr8(vm, const_pool, UNPACK_B(op_word));
     AerVal b = *vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
-    vm->registers[dest] = vm_in(a, b);
+    registers[dest] = vm_in(a, b);
     DISPATCH();
 }
 
@@ -1949,7 +1961,7 @@ lbl_in: {
 lbl_jump_if_false_reg: {
     int reg    = (int)UNPACK_A(op_word);
     int target = READ();
-    if (!vm_truthy(vm->registers[reg])) ip = (unsigned int)target;
+    if (!vm_truthy(registers[reg])) ip = (unsigned int)target;
     DISPATCH();
 }
 
@@ -1971,7 +1983,7 @@ lbl_call: {
        special-casing is needed. */
     if (cur_op == OP_TAIL_CALL) {
         for (int i = 0; i < arg_count; i++)
-            vm->registers[i] = vm->registers[arg_reg_base + i];
+            registers[i] = registers[arg_reg_base + i];
         ip = (unsigned int)callee_offset;
         CallFrame* reused = &vm->call_stack[vm->call_depth];
         reused->code_offset = (unsigned int)callee_offset;   /* reused frame now runs a different function */
@@ -2014,7 +2026,7 @@ lbl_call: {
            one parameter for field access still compiles and runs correctly, it just never
            specializes on the others. */
         int param_index = __builtin_ctz(target_f->shape_sensitive_mask);
-        AerVal arg = vm->registers[arg_reg_base + param_index];
+        AerVal arg = registers[arg_reg_base + param_index];
         Shape* observed = NULL;
         SpecKind kind = SPEC_KIND_STRUCT;
         if (aer_type(arg) == TYPE_PACKED_ARRAY) {
@@ -2158,7 +2170,7 @@ lbl_call: {
                 int cand_count = 0;
                 for (unsigned int pi = 0; pi < target_f->arity && cand_count < SPEC_MAX_RAW_PARAMS; pi++) {
                     if ((int)pi == param_index) continue;
-                    AerVal pv = vm->registers[arg_reg_base + pi];
+                    AerVal pv = registers[arg_reg_base + pi];
                     ValueType pt = aer_type(pv);
                     if (pt != TYPE_INTEGER && pt != TYPE_REAL) { cand_count = 0; break; }   /* not all-numeric -- no raw variant applies this call */
                     cand_regs[cand_count]  = (int)pi;
@@ -2237,6 +2249,9 @@ lbl_call: {
     vm->registers = vm->call_stack[vm->call_depth].registers;
     vm->raw_ints  = vm->call_stack[vm->call_depth].raw_ints;
     vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
+    registers = vm->registers;   /* refresh the hoisted locals -- see their own comment above */
+    raw_ints  = vm->raw_ints;
+    raw_reals = vm->raw_reals;
     ip = chosen_offset;
     if (max_instructions && --slice_budget == 0) { vm->ip = ip; return VM_SLICE_YIELDED; }
     DISPATCH();
@@ -2252,9 +2267,14 @@ lbl_call_value: {
     int callee_reg   = (int)READ();
     /* vm_call_value writes vm->ip on success (or leaves it untouched on error) -- reload before
        the next READ(). ip is already past callee_reg's word, the correct resume address. */
-    vm_call_value(vm, vm->registers[callee_reg], dest_reg, arg_reg_base, arg_count,
+    vm_call_value(vm, registers[callee_reg], dest_reg, arg_reg_base, arg_count,
                       cur_op == OP_TAIL_CALL_VALUE, ip);
     ip = vm->ip;
+    /* vm_call_value also reassigns vm->registers/raw_ints/raw_reals for a non-tail call (unchanged
+       for a tail call) -- refresh the hoisted locals either way, see their own comment above. */
+    registers = vm->registers;
+    raw_ints  = vm->raw_ints;
+    raw_reals = vm->raw_reals;
     DISPATCH();
 }
 
@@ -2271,7 +2291,14 @@ lbl_return: {
     vm->registers = vm->call_stack[vm->call_depth].registers;
     vm->raw_ints  = vm->call_stack[vm->call_depth].raw_ints;
     vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
-    vm->registers[dest_reg] = result;
+    /* Must refresh the hoisted locals (see their own comment above) BEFORE the write below --
+       registers still pointed at the callee's (now-popped) frame otherwise, corrupting whichever
+       register of the CALLER's frame happens to share dest_reg's index instead of writing the
+       return value where the caller actually expects it. */
+    registers = vm->registers;
+    raw_ints  = vm->raw_ints;
+    raw_reals = vm->raw_reals;
+    registers[dest_reg] = result;
     ip = return_ip;
     DISPATCH();
 }
@@ -2286,7 +2313,7 @@ lbl_call_module: {
     uint32_t ids_word = READ();
     int module_id    = (int)UNPACK_2X16_HI(ids_word);
     int fn_id        = (int16_t)UNPACK_2X16_LO(ids_word);   /* sign-extend -- FN_ID_UNKNOWN is -1 */
-    for (int i = 0; i < arg_count; i++) PUSH(vm->registers[arg_reg_base + i]);
+    for (int i = 0; i < arg_count; i++) PUSH(registers[arg_reg_base + i]);
     bool handled = false;
     /* module_id/fn_id resolved at parse time -- a switch on two ints instead of a strcmp chain.
        CALL_MODULE_DYNAMIC (host/file module) still resolves by name at runtime. */
@@ -2322,10 +2349,10 @@ lbl_call_module: {
             break;
         }
     }
-    if (handled) { vm->registers[dest_reg] = POP(); gc_maybe_collect(vm); DISPATCH(); }   /* stdlib/module functions routinely allocate (new strings/arrays/etc.) */
+    if (handled) { registers[dest_reg] = POP(); gc_maybe_collect(vm); DISPATCH(); }   /* stdlib/module functions routinely allocate (new strings/arrays/etc.) */
     error("'%s' has no function '%s'", aer_as_string(c->pool[module_idx])->data, aer_as_string(c->pool[fn_idx])->data);
     for (int i = 0; i < arg_count; i++) POP();
-    vm->registers[dest_reg] = aer_null();
+    registers[dest_reg] = aer_null();
     DISPATCH();
 }
 
@@ -2339,12 +2366,12 @@ lbl_call_builtin: {
     /* name is only resolved on the error paths — the happy path never needs it. */
     if (arg_count > 4) {
         error("Too many arguments to '%s'", aer_as_string(c->pool[name_idx])->data);
-        vm->registers[dest_reg] = aer_null();
+        registers[dest_reg] = aer_null();
         DISPATCH();
     }
     AerVal args[4];
-    for (int i = 0; i < arg_count; i++) args[i] = vm->registers[arg_reg_base + i];
-    bool handled = vm_call_builtin(c, builtin_id, args, arg_count, &vm->registers[dest_reg]);
+    for (int i = 0; i < arg_count; i++) args[i] = registers[arg_reg_base + i];
+    bool handled = vm_call_builtin(c, builtin_id, args, arg_count, &registers[dest_reg]);
     if (!handled) error("'%s' is not defined, or was called with the wrong number of arguments",
                         aer_as_string(c->pool[name_idx])->data);
     gc_maybe_collect(vm);   /* vm_call_builtin: struct_pool site + aer_make_string (type()) */
@@ -2367,8 +2394,8 @@ lbl_array_new: {
     a->dirty_cards_bytes = 0;
     a->dirty_all = false;
     for (int i = 0; i < item_count; i++)
-        a->items[i] = vm->registers[item_reg_base + i];
-    vm->registers[dest_reg] = aer_array_val(a);
+        a->items[i] = registers[item_reg_base + i];
+    registers[dest_reg] = aer_array_val(a);
     gc_maybe_collect(vm);   /* pool_alloc(&array_pool) above; result already rooted */
     DISPATCH();
 }
@@ -2378,8 +2405,8 @@ lbl_index_get: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arr_reg  = (int)UNPACK_B(op_word);
     AerVal* idx = vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
-    AerVal obj = vm->registers[arr_reg];
-    vm_index_get_compute(obj, *idx, &vm->registers[dest_reg]);
+    AerVal obj = registers[arr_reg];
+    vm_index_get_compute(obj, *idx, &registers[dest_reg]);
     /* Only single-char string indexing allocates -- array/dict indexing never touches the heap, so
        skip the check for the dominant common case. */
     if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);
@@ -2392,7 +2419,7 @@ lbl_destructure: {
     int t0      = (int)UNPACK_A(op_word);
     int t1      = (int)UNPACK_B(op_word);
     int src_reg = (int)UNPACK_C(op_word);
-    vm_destructure_compute(vm->registers[src_reg], &vm->registers[t0], &vm->registers[t1]);
+    vm_destructure_compute(registers[src_reg], &registers[t0], &registers[t1]);
     DISPATCH();
 }
 
@@ -2401,7 +2428,7 @@ lbl_index_set: {
     int arr_reg = (int)UNPACK_A(op_word);
     AerVal idx = *vm_rk_ptr8(vm, const_pool, UNPACK_B(op_word));
     AerVal val = *vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
-    vm_index_set_compute(vm, vm->registers[arr_reg], idx, val);
+    vm_index_set_compute(vm, registers[arr_reg], idx, val);
     DISPATCH();
 }
 
@@ -2412,12 +2439,12 @@ lbl_slice_get: {
     uint32_t bounds_word = READ();
     AerVal start_v = *vm_rk_ptr16(vm, const_pool, UNPACK_2X16_HI(bounds_word));
     AerVal end_v   = *vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(bounds_word));
-    AerVal obj = vm->registers[arr_reg];
+    AerVal obj = registers[arr_reg];
     if (aer_type(obj) == TYPE_ARRAY) {
         AerArray* a = aer_as_array(obj);
-        if (a->shape) { error("Structs cannot be sliced"); vm->registers[dest_reg] = aer_null(); DISPATCH(); }
+        if (a->shape) { error("Structs cannot be sliced"); registers[dest_reg] = aer_null(); DISPATCH(); }
         int64_t start, end;
-        if (!vm_slice_bounds(start_v, end_v, (int64_t)a->count, &start, &end)) { vm->registers[dest_reg] = aer_null(); DISPATCH(); }
+        if (!vm_slice_bounds(start_v, end_v, (int64_t)a->count, &start, &end)) { registers[dest_reg] = aer_null(); DISPATCH(); }
         unsigned int n = (unsigned int)(end - start);
         AerArray* r = heap_alloc(&vm->heap, &vm->heap.array_pool);
         r->count    = n;
@@ -2429,19 +2456,19 @@ lbl_slice_get: {
         r->dirty_cards_bytes = 0;
         r->dirty_all = false;
         for (unsigned int i = 0; i < n; i++) r->items[i] = a->items[start + i];
-        vm->registers[dest_reg] = aer_array_val(r);
+        registers[dest_reg] = aer_array_val(r);
     } else if (aer_type(obj) == TYPE_STRING) {
         AerString* os = aer_as_string(obj);
         int64_t start, end;
-        if (!vm_slice_bounds(start_v, end_v, (int64_t)os->length, &start, &end)) { vm->registers[dest_reg] = aer_null(); DISPATCH(); }
+        if (!vm_slice_bounds(start_v, end_v, (int64_t)os->length, &start, &end)) { registers[dest_reg] = aer_null(); DISPATCH(); }
         unsigned int sub_len = (unsigned int)(end - start);
         char* sub_buf = xmalloc(sub_len + 1);
         memcpy(sub_buf, os->data + start, sub_len);
         sub_buf[sub_len] = '\0';
-        vm->registers[dest_reg] = aer_make_string(sub_buf, sub_len);   /* no chunk_add_pool interning — see vm_to_str's comment */
+        registers[dest_reg] = aer_make_string(sub_buf, sub_len);   /* no chunk_add_pool interning — see vm_to_str's comment */
     } else {
         error("Cannot slice this type");
-        vm->registers[dest_reg] = aer_null();
+        registers[dest_reg] = aer_null();
     }
     gc_maybe_collect(vm);   /* array branch: pool_alloc(&array_pool); string branch: aer_make_string; the null-result branches above are harmless no-ops here too */
     DISPATCH();
@@ -2461,8 +2488,8 @@ lbl_dict_new: {
     d->dirty_all = false;
     if (pair_count > 0) hashtable_reserve(&d->map, (unsigned int)pair_count);
     for (int i = 0; i < pair_count; i++) {
-        AerVal key = vm->registers[pair_reg_base + 2 * i];
-        AerVal val = vm->registers[pair_reg_base + 2 * i + 1];
+        AerVal key = registers[pair_reg_base + 2 * i];
+        AerVal val = registers[pair_reg_base + 2 * i + 1];
         if (aer_type(key) != TYPE_STRING) { error("Hashtable keys must be strings"); continue; }
         AerString* ks = aer_as_string(key);
         unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
@@ -2470,7 +2497,7 @@ lbl_dict_new: {
         char* k = hashtable_key_dup(d->map.pools, ks->data, klen, NULL);
         hashtable_put_hashed(&d->map, k, klen, khash, val);
     }
-    vm->registers[dest_reg] = aer_dict_val(d);
+    registers[dest_reg] = aer_dict_val(d);
     gc_maybe_collect(vm);   /* pool_alloc(&dict_pool) above; result already rooted */
     DISPATCH();
 }
@@ -2481,8 +2508,8 @@ lbl_iter_next_array: {
     int idx_reg       = (int)UNPACK_B(op_word);
     int item_dest_reg = (int)UNPACK_C(op_word);
     int end_target    = READ();
-    AerVal col = vm->registers[col_reg];
-    int64_t idx = aer_as_int(vm->registers[idx_reg]);
+    AerVal col = registers[col_reg];
+    int64_t idx = aer_as_int(registers[idx_reg]);
     if (aer_type(col) == TYPE_DICT) {
         /* Single-variable `for k in dict:` yields keys. */
         AerVal key;
@@ -2490,8 +2517,8 @@ lbl_iter_next_array: {
             ip = (unsigned int)end_target;
             DISPATCH();
         }
-        vm->registers[item_dest_reg] = key;
-        vm->registers[idx_reg]       = aer_int(idx + 1);
+        registers[item_dest_reg] = key;
+        registers[idx_reg]       = aer_int(idx + 1);
         gc_maybe_collect(vm);   /* vm_dict_next_key's owned-copy key string allocates */
         DISPATCH();
     }
@@ -2505,8 +2532,8 @@ lbl_iter_next_array: {
         char* ch_buf = xmalloc(2);
         ch_buf[0] = cs->data[idx];
         ch_buf[1] = '\0';
-        vm->registers[item_dest_reg] = aer_make_string(ch_buf, 1);   /* no chunk_add_pool interning — see vm_to_str's comment */
-        vm->registers[idx_reg]       = aer_int(idx + 1);
+        registers[item_dest_reg] = aer_make_string(ch_buf, 1);   /* no chunk_add_pool interning — see vm_to_str's comment */
+        registers[idx_reg]       = aer_int(idx + 1);
         gc_maybe_collect(vm);
         DISPATCH();
     }
@@ -2520,8 +2547,8 @@ lbl_iter_next_array: {
             DISPATCH();
         }
         unsigned int width = vm_typed_elem_width(ta->elem_kind);
-        vm->registers[item_dest_reg] = vm_typed_elem_read(ta->data + (size_t)idx * width, ta->elem_kind);
-        vm->registers[idx_reg]       = aer_int(idx + 1);
+        registers[item_dest_reg] = vm_typed_elem_read(ta->data + (size_t)idx * width, ta->elem_kind);
+        registers[idx_reg]       = aer_int(idx + 1);
         DISPATCH();
     }
     if (aer_type(col) != TYPE_ARRAY) {
@@ -2533,8 +2560,8 @@ lbl_iter_next_array: {
         ip = (unsigned int)end_target;
         DISPATCH();
     }
-    vm->registers[item_dest_reg] = a->items[idx];
-    vm->registers[idx_reg]       = aer_int(idx + 1);
+    registers[item_dest_reg] = a->items[idx];
+    registers[idx_reg]       = aer_int(idx + 1);
     DISPATCH();
 }
 
@@ -2545,22 +2572,22 @@ lbl_iter_next_pair: {
     int key_dest_reg  = (int)UNPACK_C(op_word);
     int val_dest_reg  = (int)READ();
     int end_target    = READ();
-    AerVal col = vm->registers[col_reg];
+    AerVal col = registers[col_reg];
     if (aer_type(col) != TYPE_DICT) {
         error("for k, v requires a hashtable");
         ip = (unsigned int)end_target;
         DISPATCH();
     }
     AerDict* d = aer_as_dict(col);
-    int64_t idx = aer_as_int(vm->registers[idx_reg]);
+    int64_t idx = aer_as_int(registers[idx_reg]);
     AerVal key;
     if (!vm_dict_next_key(d, &idx, &key)) {
         ip = (unsigned int)end_target;
         DISPATCH();
     }
-    vm->registers[key_dest_reg] = key;
-    vm->registers[val_dest_reg] = d->map.dense[idx].payload;
-    vm->registers[idx_reg]      = aer_int(idx + 1);
+    registers[key_dest_reg] = key;
+    registers[val_dest_reg] = d->map.dense[idx].payload;
+    registers[idx_reg]      = aer_int(idx + 1);
     gc_maybe_collect(vm);   /* vm_dict_next_key's owned-copy key string allocates */
     DISPATCH();
 }
@@ -2573,9 +2600,9 @@ lbl_iter_range_prep: {
     int step_reg      = (int)UNPACK_C(op_word);
     int item_dest_reg = (int)READ();
     int empty_target  = READ();
-    AerVal cur_v  = vm->registers[cur_reg];
-    AerVal end_v  = vm->registers[end_reg];
-    AerVal step_v = vm->registers[step_reg];
+    AerVal cur_v  = registers[cur_reg];
+    AerVal end_v  = registers[end_reg];
+    AerVal step_v = registers[step_reg];
     if (aer_type(cur_v) != TYPE_INTEGER || aer_type(end_v) != TYPE_INTEGER || aer_type(step_v) != TYPE_INTEGER) {
         error("Range bounds and step must be integers");
         ip = (unsigned int)empty_target;
@@ -2600,9 +2627,9 @@ lbl_iter_range_prep: {
     }
     /* end_reg/step_reg repurposed for this loop's life -- arg_materialize's snapshot guarantees
        they're fresh, loop-owned registers nothing else reads. */
-    vm->registers[end_reg]       = aer_int(count - 1);                 /* iterations remaining AFTER this one */
-    vm->registers[step_reg]      = aer_int(ascending ? step : -step);  /* direction baked in once, not re-inferred every iteration */
-    vm->registers[item_dest_reg] = cur_v;
+    registers[end_reg]       = aer_int(count - 1);                 /* iterations remaining AFTER this one */
+    registers[step_reg]      = aer_int(ascending ? step : -step);  /* direction baked in once, not re-inferred every iteration */
+    registers[item_dest_reg] = cur_v;
     DISPATCH();
 }
 
@@ -2618,16 +2645,16 @@ lbl_iter_range_loop: {
     int signed_step_reg = (int)UNPACK_C(op_word);
     int item_dest_reg   = (int)READ();
     int body_target     = READ();
-    int64_t remaining = aer_as_int(vm->registers[remaining_reg]);
+    int64_t remaining = aer_as_int(registers[remaining_reg]);
     if (remaining == 0) {
         DISPATCH();   /* exhausted — fall through to the exit code, cur_reg/item_dest_reg untouched */
     }
-    int64_t signed_step = aer_as_int(vm->registers[signed_step_reg]);
-    int64_t new_cur      = aer_as_int(vm->registers[cur_reg]) + signed_step;
+    int64_t signed_step = aer_as_int(registers[signed_step_reg]);
+    int64_t new_cur      = aer_as_int(registers[cur_reg]) + signed_step;
     AerVal new_cur_v = aer_int(new_cur);
-    vm->registers[cur_reg]       = new_cur_v;
-    vm->registers[item_dest_reg] = new_cur_v;
-    vm->registers[remaining_reg] = aer_int(remaining - 1);
+    registers[cur_reg]       = new_cur_v;
+    registers[item_dest_reg] = new_cur_v;
+    registers[remaining_reg] = aer_int(remaining - 1);
     ip = (unsigned int)body_target;
     /* range-for's own dedicated back-edge -- lbl_jump's check doesn't cover this loop shape since
        it never goes through a plain OP_JUMP. */
@@ -2654,21 +2681,21 @@ lbl_struct_new: {
        every field unconditionally, not just ones set via `.field =`. Checked before allocating. */
     for (int i = 0; i < arg_count; i++) {
         ValueType declared = shape->field_types[i];
-        if (declared != TYPE_ANY && vm->registers[arg_reg_base + i].tag != declared) {
+        if (declared != TYPE_ANY && registers[arg_reg_base + i].tag != declared) {
             error("'%s' field '%s' is declared as a fixed type and cannot be constructed with a different type",
                   name, aer_as_string(c->pool[shape->field_names[i]])->data);
             DISPATCH();
         }
-        if (!vm_check_narrow_field_write(declared, shape->field_narrow[i], vm->registers[arg_reg_base + i])) DISPATCH();
+        if (!vm_check_narrow_field_write(declared, shape->field_narrow[i], registers[arg_reg_base + i])) DISPATCH();
     }
     AerStruct* s = heap_alloc(&vm->heap, &vm->heap.struct_pool);
     s->shape  = shape;
     s->fields = (unsigned char*)s + sizeof(AerStruct);
     for (int i = 0; i < arg_count; i++)
-        vm_struct_field_write(s, (unsigned int)i, vm->registers[arg_reg_base + i]);
+        vm_struct_field_write(s, (unsigned int)i, registers[arg_reg_base + i]);
     for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
         vm_struct_field_write(s, i, vm_default_value(vm, shape->field_defaults[i]));
-    vm->registers[dest_reg] = aer_struct_val(s);
+    registers[dest_reg] = aer_struct_val(s);
     gc_maybe_collect(vm);   /* pool_alloc(&struct_pool) above, plus any vm_default_value array/dict defaults — all rooted now that the struct itself is stored */
     DISPATCH();
 }
@@ -2681,7 +2708,7 @@ lbl_field_get: {
     int field_idx  = (int)READ();
     AerStruct* oa; int slot; unsigned int foffset; ValueType ftype; bool narrow;
     if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype, &narrow)) DISPATCH();
-    vm->registers[dest_reg] = vm_struct_field_read_at(oa, foffset, ftype, narrow);
+    registers[dest_reg] = vm_struct_field_read_at(oa, foffset, ftype, narrow);
     DISPATCH();
 }
 
@@ -2701,10 +2728,10 @@ lbl_binary_field: {
     AerVal rhs = vm_struct_field_read_at(oa, foffset, ftype, narrow);
     ValueType ta = aer_type(*lhs), tb = aer_type(rhs);
     bool handled;
-    vm->registers[dest_reg] = vm_binary_fast(*lhs, rhs, bin_op, ta, tb, &handled);
+    registers[dest_reg] = vm_binary_fast(*lhs, rhs, bin_op, ta, tb, &handled);
     /* Only needed on the cold path (string concat) -- the fast path never allocates. */
     if (!handled) {
-        vm->registers[dest_reg] = vm_binary_cold(c, *lhs, rhs, bin_op, ta, tb);
+        registers[dest_reg] = vm_binary_cold(c, *lhs, rhs, bin_op, ta, tb);
         gc_maybe_collect(vm);
     }
     DISPATCH();
@@ -2724,9 +2751,9 @@ lbl_field_binary: {
     AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype, narrow);
     ValueType ta = aer_type(lhs), tb = aer_type(*rhs);
     bool handled;
-    vm->registers[dest_reg] = vm_binary_fast(lhs, *rhs, bin_op, ta, tb, &handled);
+    registers[dest_reg] = vm_binary_fast(lhs, *rhs, bin_op, ta, tb, &handled);
     if (!handled) {
-        vm->registers[dest_reg] = vm_binary_cold(c, lhs, *rhs, bin_op, ta, tb);
+        registers[dest_reg] = vm_binary_cold(c, lhs, *rhs, bin_op, ta, tb);
         gc_maybe_collect(vm);
     }
     DISPATCH();
@@ -2767,7 +2794,7 @@ lbl_field_compound: {
 /* Shell mode auto-print: a bare statement's result is printed unless null. */
 lbl_print_repl: {
     int src_reg = (int)UNPACK_A(op_word);
-    AerVal v = vm->registers[src_reg];
+    AerVal v = registers[src_reg];
     if (aer_type(v) != TYPE_NULL) {
         vm_print_value(c, v, false);
         printf("\n");
@@ -2818,7 +2845,7 @@ lbl_index_field_get_raw_int: {
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerVal obj = vm->registers[arr_reg];
+    AerVal obj = registers[arr_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -2830,7 +2857,7 @@ lbl_index_field_get_raw_int: {
     }
     unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
-    memcpy(&vm->raw_ints[dest_slot], elem, 8);
+    memcpy(&raw_ints[dest_slot], elem, 8);
     DISPATCH();
 }
 
@@ -2840,7 +2867,7 @@ lbl_index_field_get_raw_real: {
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerVal obj = vm->registers[arr_reg];
+    AerVal obj = registers[arr_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -2852,7 +2879,7 @@ lbl_index_field_get_raw_real: {
     }
     unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
-    memcpy(&vm->raw_reals[dest_slot], elem, 8);
+    memcpy(&raw_reals[dest_slot], elem, 8);
     DISPATCH();
 }
 
@@ -2860,10 +2887,10 @@ lbl_field_get_raw_int: {
     int dest_slot  = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
     unsigned int foffset = READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
-    memcpy(&vm->raw_ints[dest_slot], oa->fields + foffset, 8);
+    memcpy(&raw_ints[dest_slot], oa->fields + foffset, 8);
     DISPATCH();
 }
 
@@ -2871,10 +2898,10 @@ lbl_field_get_raw_real: {
     int dest_slot  = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
     unsigned int foffset = READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
-    memcpy(&vm->raw_reals[dest_slot], oa->fields + foffset, 8);
+    memcpy(&raw_reals[dest_slot], oa->fields + foffset, 8);
     DISPATCH();
 }
 
@@ -2887,7 +2914,7 @@ lbl_index_field_get_raw_int32: {
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerVal obj = vm->registers[arr_reg];
+    AerVal obj = registers[arr_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -2898,7 +2925,7 @@ lbl_index_field_get_raw_int32: {
         DISPATCH();
     }
     unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
-    vm->raw_ints[dest_slot] = vm_raw_read_int32(elem);
+    raw_ints[dest_slot] = vm_raw_read_int32(elem);
     DISPATCH();
 }
 
@@ -2908,7 +2935,7 @@ lbl_index_field_get_raw_float32: {
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerVal obj = vm->registers[arr_reg];
+    AerVal obj = registers[arr_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -2919,7 +2946,7 @@ lbl_index_field_get_raw_float32: {
         DISPATCH();
     }
     unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
-    vm->raw_reals[dest_slot] = vm_raw_read_float32(elem);
+    raw_reals[dest_slot] = vm_raw_read_float32(elem);
     DISPATCH();
 }
 
@@ -2927,10 +2954,10 @@ lbl_field_get_raw_int32: {
     int dest_slot  = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
     unsigned int foffset = READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
-    vm->raw_ints[dest_slot] = vm_raw_read_int32(oa->fields + foffset);
+    raw_ints[dest_slot] = vm_raw_read_int32(oa->fields + foffset);
     DISPATCH();
 }
 
@@ -2938,10 +2965,10 @@ lbl_field_get_raw_float32: {
     int dest_slot  = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
     unsigned int foffset = READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
-    vm->raw_reals[dest_slot] = vm_raw_read_float32(oa->fields + foffset);
+    raw_reals[dest_slot] = vm_raw_read_float32(oa->fields + foffset);
     DISPATCH();
 }
 
@@ -2951,7 +2978,7 @@ lbl_index_field_set_raw_int: {
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
-    AerVal obj = vm->registers[obj_reg];
+    AerVal obj = registers[obj_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -2963,7 +2990,7 @@ lbl_index_field_set_raw_int: {
     }
     unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
-    memcpy(elem, &vm->raw_ints[src_slot], 8);
+    memcpy(elem, &raw_ints[src_slot], 8);
     DISPATCH();
 }
 
@@ -2973,7 +3000,7 @@ lbl_index_field_set_raw_real: {
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
-    AerVal obj = vm->registers[obj_reg];
+    AerVal obj = registers[obj_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -2985,7 +3012,7 @@ lbl_index_field_set_raw_real: {
     }
     unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
-    memcpy(elem, &vm->raw_reals[src_slot], 8);
+    memcpy(elem, &raw_reals[src_slot], 8);
     DISPATCH();
 }
 
@@ -2993,10 +3020,10 @@ lbl_field_set_raw_int: {
     int struct_reg = (int)UNPACK_A(op_word);
     unsigned int foffset = READ();
     int src_slot = (int)READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
-    memcpy(oa->fields + foffset, &vm->raw_ints[src_slot], 8);
+    memcpy(oa->fields + foffset, &raw_ints[src_slot], 8);
     DISPATCH();
 }
 
@@ -3004,10 +3031,10 @@ lbl_field_set_raw_real: {
     int struct_reg = (int)UNPACK_A(op_word);
     unsigned int foffset = READ();
     int src_slot = (int)READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
-    memcpy(oa->fields + foffset, &vm->raw_reals[src_slot], 8);
+    memcpy(oa->fields + foffset, &raw_reals[src_slot], 8);
     DISPATCH();
 }
 
@@ -3020,7 +3047,7 @@ lbl_index_field_set_raw_int32: {
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
-    AerVal obj = vm->registers[obj_reg];
+    AerVal obj = registers[obj_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -3031,7 +3058,7 @@ lbl_index_field_set_raw_int32: {
         DISPATCH();
     }
     unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
-    vm_raw_write_int32(elem, vm->raw_ints[src_slot]);
+    vm_raw_write_int32(elem, raw_ints[src_slot]);
     DISPATCH();
 }
 
@@ -3041,7 +3068,7 @@ lbl_index_field_set_raw_float32: {
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
-    AerVal obj = vm->registers[obj_reg];
+    AerVal obj = registers[obj_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -3052,7 +3079,7 @@ lbl_index_field_set_raw_float32: {
         DISPATCH();
     }
     unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
-    vm_raw_write_float32(elem, vm->raw_reals[src_slot]);
+    vm_raw_write_float32(elem, raw_reals[src_slot]);
     DISPATCH();
 }
 
@@ -3060,10 +3087,10 @@ lbl_field_set_raw_int32: {
     int struct_reg = (int)UNPACK_A(op_word);
     unsigned int foffset = READ();
     int src_slot = (int)READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
-    vm_raw_write_int32(oa->fields + foffset, vm->raw_ints[src_slot]);
+    vm_raw_write_int32(oa->fields + foffset, raw_ints[src_slot]);
     DISPATCH();
 }
 
@@ -3071,10 +3098,10 @@ lbl_field_set_raw_float32: {
     int struct_reg = (int)UNPACK_A(op_word);
     unsigned int foffset = READ();
     int src_slot = (int)READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
-    vm_raw_write_float32(oa->fields + foffset, vm->raw_reals[src_slot]);
+    vm_raw_write_float32(oa->fields + foffset, raw_reals[src_slot]);
     DISPATCH();
 }
 
@@ -3092,11 +3119,11 @@ lbl_field_compound_raw_int: {
     Opcode bin_op  = (Opcode)UNPACK_B(op_word);
     unsigned int foffset = READ();
     int rhs_slot = (int)READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
     int64_t lhs; memcpy(&lhs, oa->fields + foffset, 8);
-    int64_t rhs = vm->raw_ints[rhs_slot];
+    int64_t rhs = raw_ints[rhs_slot];
     int64_t result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -3113,11 +3140,11 @@ lbl_field_compound_raw_real: {
     Opcode bin_op  = (Opcode)UNPACK_B(op_word);
     unsigned int foffset = READ();
     int rhs_slot = (int)READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
     double lhs; memcpy(&lhs, oa->fields + foffset, 8);
-    double rhs = vm->raw_reals[rhs_slot];
+    double rhs = raw_reals[rhs_slot];
     double result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -3136,7 +3163,7 @@ lbl_index_field_compound_raw_int: {
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
-    AerVal obj = vm->registers[arr_reg];
+    AerVal obj = registers[arr_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -3149,7 +3176,7 @@ lbl_index_field_compound_raw_int: {
     unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
     int64_t lhs; memcpy(&lhs, elem, 8);
-    int64_t rhs = vm->raw_ints[rhs_slot];
+    int64_t rhs = raw_ints[rhs_slot];
     int64_t result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -3168,7 +3195,7 @@ lbl_index_field_compound_raw_real: {
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
-    AerVal obj = vm->registers[arr_reg];
+    AerVal obj = registers[arr_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -3181,7 +3208,7 @@ lbl_index_field_compound_raw_real: {
     unsigned int element_size = pa->shape->instance_bytes;
     unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
     double lhs; memcpy(&lhs, elem, 8);
-    double rhs = vm->raw_reals[rhs_slot];
+    double rhs = raw_reals[rhs_slot];
     double result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -3202,11 +3229,11 @@ lbl_field_compound_raw_int32: {
     Opcode bin_op  = (Opcode)UNPACK_B(op_word);
     unsigned int foffset = READ();
     int rhs_slot = (int)READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
     int64_t lhs = vm_raw_read_int32(oa->fields + foffset);
-    int64_t rhs = vm->raw_ints[rhs_slot];
+    int64_t rhs = raw_ints[rhs_slot];
     int64_t result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -3223,11 +3250,11 @@ lbl_field_compound_raw_float32: {
     Opcode bin_op  = (Opcode)UNPACK_B(op_word);
     unsigned int foffset = READ();
     int rhs_slot = (int)READ();
-    AerVal obj = vm->registers[struct_reg];
+    AerVal obj = registers[struct_reg];
     if (aer_type(obj) != TYPE_STRUCT) { error("internal error: specialized struct field access on a non-struct value"); DISPATCH(); }
     AerStruct* oa = aer_as_struct(obj);
     double lhs = vm_raw_read_float32(oa->fields + foffset);
-    double rhs = vm->raw_reals[rhs_slot];
+    double rhs = raw_reals[rhs_slot];
     double result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -3246,7 +3273,7 @@ lbl_index_field_compound_raw_int32: {
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
-    AerVal obj = vm->registers[arr_reg];
+    AerVal obj = registers[arr_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -3258,7 +3285,7 @@ lbl_index_field_compound_raw_int32: {
     }
     unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
     int64_t lhs = vm_raw_read_int32(elem);
-    int64_t rhs = vm->raw_ints[rhs_slot];
+    int64_t rhs = raw_ints[rhs_slot];
     int64_t result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -3277,7 +3304,7 @@ lbl_index_field_compound_raw_float32: {
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
-    AerVal obj = vm->registers[arr_reg];
+    AerVal obj = registers[arr_reg];
     if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
     AerPackedArray* pa = aer_as_packed_array(obj);
     if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -3289,7 +3316,7 @@ lbl_index_field_compound_raw_float32: {
     }
     unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
     double lhs = vm_raw_read_float32(elem);
-    double rhs = vm->raw_reals[rhs_slot];
+    double rhs = raw_reals[rhs_slot];
     double result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -3308,14 +3335,14 @@ lbl_index_field_compound_raw_float32: {
 lbl_unbox_param_int: {
     int slot   = (int)UNPACK_A(op_word);
     int reg    = (int)UNPACK_B(op_word);
-    vm->raw_ints[slot] = aer_as_int(vm->registers[reg]);
+    raw_ints[slot] = aer_as_int(registers[reg]);
     DISPATCH();
 }
 
 lbl_unbox_param_real: {
     int slot   = (int)UNPACK_A(op_word);
     int reg    = (int)UNPACK_B(op_word);
-    vm->raw_reals[slot] = aer_as_real(vm->registers[reg]);
+    raw_reals[slot] = aer_as_real(registers[reg]);
     DISPATCH();
 }
 
@@ -3333,7 +3360,7 @@ lbl_array_repeat: {
     int64_t count = aer_as_int(*count_v);
     if (count < 0) { error("Repeat-literal array count must not be negative"); DISPATCH(); }
 
-    AerVal fill = vm->registers[fill_reg];
+    AerVal fill = registers[fill_reg];
     if (aer_type(fill) == TYPE_STRUCT) {
         AerStruct* src = aer_as_struct(fill);
         Shape* shape = src->shape;
@@ -3368,7 +3395,7 @@ lbl_array_repeat: {
            Shape's static defaults, so `[Particle(1.0, 2.0); n]` now differs from `[Particle(); n]`. */
         for (int64_t e = 0; e < count; e++)
             memcpy(pa->data + (size_t)e * element_size, src->fields, element_size);
-        vm->registers[dest_reg] = aer_packed_array_val(pa);
+        registers[dest_reg] = aer_packed_array_val(pa);
     } else if (aer_type(fill) == TYPE_INTEGER || aer_type(fill) == TYPE_REAL) {
         /* narrow_flag is a pure parse-time decision (was the fill expression written as an
            `i`/`f`-suffixed literal directly in this position?) -- by construction, that always
@@ -3385,7 +3412,7 @@ lbl_array_repeat: {
         ta->data      = count > 0 ? xmalloc((size_t)count * width) : NULL;
         for (int64_t e = 0; e < count; e++)
             vm_typed_elem_write(ta->data + (size_t)e * width, kind, fill);
-        vm->registers[dest_reg] = aer_typed_array_val(ta);
+        registers[dest_reg] = aer_typed_array_val(ta);
     } else {
         error("Cannot build a repeat-literal array from a %s value -- the fill value must be a struct instance or a number", vm_type_name(c, fill));
         DISPATCH();
@@ -3404,7 +3431,7 @@ lbl_index_field_get: {
     uint32_t field_rk_word = READ();
     int field_idx = (int)UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerVal obj = vm->registers[obj_reg];
+    AerVal obj = registers[obj_reg];
     if (aer_type(obj) == TYPE_PACKED_ARRAY) {
         AerPackedArray* pa = aer_as_packed_array(obj);
         if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -3418,7 +3445,7 @@ lbl_index_field_get: {
         if (!vm_resolve_field_by_shape(c, site, pa->shape, field_idx, &slot, &foffset, &ftype, &narrow)) DISPATCH();
         unsigned int element_size = pa->shape->instance_bytes;
         unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
-        vm->registers[dest_reg] = narrow ? vm_typed_elem_read(elem, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32)
+        registers[dest_reg] = narrow ? vm_typed_elem_read(elem, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32)
                                           : vm_packed_slot_read(elem, ftype);
         DISPATCH();
     }
@@ -3432,7 +3459,7 @@ lbl_index_field_get: {
     AerStruct* oa = aer_as_struct(tmp);
     int slot; unsigned int foffset; ValueType ftype; bool narrow;
     if (!vm_resolve_field_by_shape(c, site, oa->shape, field_idx, &slot, &foffset, &ftype, &narrow)) DISPATCH();
-    vm->registers[dest_reg] = vm_struct_field_read_at(oa, foffset, ftype, narrow);
+    registers[dest_reg] = vm_struct_field_read_at(oa, foffset, ftype, narrow);
     DISPATCH();
 }
 
@@ -3444,7 +3471,7 @@ lbl_index_field_set: {
     uint32_t field_val_word = READ();
     int field_idx       = (int)UNPACK_2X16_HI(field_val_word);
     AerVal* val = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_val_word));
-    AerVal obj = vm->registers[obj_reg];
+    AerVal obj = registers[obj_reg];
     if (aer_type(obj) == TYPE_PACKED_ARRAY) {
         AerPackedArray* pa = aer_as_packed_array(obj);
         if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -3504,7 +3531,7 @@ lbl_index_field_compound: {
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_idx_word));
     uint32_t rhs_word = READ();
     AerVal* rhs = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(rhs_word));
-    AerVal obj = vm->registers[obj_reg];
+    AerVal obj = registers[obj_reg];
     if (aer_type(obj) == TYPE_PACKED_ARRAY) {
         AerPackedArray* pa = aer_as_packed_array(obj);
         if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
@@ -3565,7 +3592,7 @@ lbl_unary: {
     int dest        = (int)UNPACK_A(op_word);
     Opcode unary_op = (Opcode)UNPACK_B(op_word);
     AerVal v = *vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
-    AerVal* result = &vm->registers[dest];
+    AerVal* result = &registers[dest];
     switch (unary_op) {
         case OP_NEGATE:
             if      (aer_type(v) == TYPE_INTEGER) *result = aer_int(-aer_as_int(v));
@@ -3598,7 +3625,7 @@ lbl_cast: {
     int dest      = (int)UNPACK_A(op_word);
     int cast_type = (int)UNPACK_B(op_word);
     AerVal v = *vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
-    vm->registers[dest] = vm_cast(v, cast_type);
+    registers[dest] = vm_cast(v, cast_type);
     DISPATCH();
 }
 
@@ -3609,14 +3636,14 @@ lbl_raw_load_int: {
     /* Full 32-bit signed immediate, its own dedicated word -- closes the old 20-bit-immediate
        truncation bug outright (a 20M-iteration bound once silently became 77056) rather than
        just widening it again. */
-    vm->raw_ints[dest] = (int32_t)READ();
+    raw_ints[dest] = (int32_t)READ();
     DISPATCH();
 }
 
 lbl_raw_load_real: {
     int dest = (int)UNPACK_A(op_word);
     unsigned int pool_idx = (unsigned int)READ();
-    vm->raw_reals[dest] = const_pool[pool_idx].as.d;
+    raw_reals[dest] = const_pool[pool_idx].as.d;
     DISPATCH();
 }
 
@@ -3631,7 +3658,7 @@ lbl_raw_##name##_int: { \
     int dest = (int)UNPACK_A(op_word); \
     int a    = (int)UNPACK_B(op_word); \
     int b    = (int)UNPACK_C(op_word); \
-    vm->raw_ints[dest] = vm->raw_ints[a] op vm->raw_ints[b]; \
+    raw_ints[dest] = raw_ints[a] op raw_ints[b]; \
     DISPATCH(); \
 }
 #define RAW_ARITH_REAL(name, op) \
@@ -3639,7 +3666,7 @@ lbl_raw_##name##_real: { \
     int dest = (int)UNPACK_A(op_word); \
     int a    = (int)UNPACK_B(op_word); \
     int b    = (int)UNPACK_C(op_word); \
-    vm->raw_reals[dest] = vm->raw_reals[a] op vm->raw_reals[b]; \
+    raw_reals[dest] = raw_reals[a] op raw_reals[b]; \
     DISPATCH(); \
 }
 #define RAW_CMP_INT(name, op) \
@@ -3647,7 +3674,7 @@ lbl_raw_##name##_int: { \
     int dest = (int)UNPACK_A(op_word); \
     int a    = (int)UNPACK_B(op_word); \
     int b    = (int)UNPACK_C(op_word); \
-    vm->registers[dest] = aer_bool(vm->raw_ints[a] op vm->raw_ints[b]); \
+    registers[dest] = aer_bool(raw_ints[a] op raw_ints[b]); \
     DISPATCH(); \
 }
 #define RAW_CMP_REAL(name, op) \
@@ -3655,7 +3682,7 @@ lbl_raw_##name##_real: { \
     int dest = (int)UNPACK_A(op_word); \
     int a    = (int)UNPACK_B(op_word); \
     int b    = (int)UNPACK_C(op_word); \
-    vm->registers[dest] = aer_bool(vm->raw_reals[a] op vm->raw_reals[b]); \
+    registers[dest] = aer_bool(raw_reals[a] op raw_reals[b]); \
     DISPATCH(); \
 }
 /* A runtime tag check decides: matching type accumulates in place (safe every iteration, the
@@ -3664,9 +3691,9 @@ lbl_raw_##name##_real: { \
 lbl_raw_##name##_int_boxed: { \
     int slot = (int)UNPACK_A(op_word); \
     int reg  = (int)UNPACK_B(op_word); \
-    AerVal* rhs = &vm->registers[reg]; \
+    AerVal* rhs = &registers[reg]; \
     if (rhs->tag != TYPE_INTEGER) { error("Cannot apply '" opstr "' to integer and %s", vm_type_name(c, *rhs)); DISPATCH(); } \
-    vm->raw_ints[slot] op##= rhs->as.i; \
+    raw_ints[slot] op##= rhs->as.i; \
     DISPATCH(); \
 }
 /* An integer rhs promotes to real here (vm_promote_real's own rule) instead of erroring -- matches
@@ -3679,9 +3706,9 @@ lbl_raw_##name##_int_boxed: { \
 lbl_raw_##name##_real_boxed: { \
     int slot = (int)UNPACK_A(op_word); \
     int reg  = (int)UNPACK_B(op_word); \
-    AerVal* rhs = &vm->registers[reg]; \
-    if (rhs->tag == TYPE_REAL) vm->raw_reals[slot] op##= rhs->as.d; \
-    else if (rhs->tag == TYPE_INTEGER) vm->raw_reals[slot] op##= (double)rhs->as.i; \
+    AerVal* rhs = &registers[reg]; \
+    if (rhs->tag == TYPE_REAL) raw_reals[slot] op##= rhs->as.d; \
+    else if (rhs->tag == TYPE_INTEGER) raw_reals[slot] op##= (double)rhs->as.i; \
     else error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs)); \
     DISPATCH(); \
 }
@@ -3696,9 +3723,9 @@ lbl_raw_##name##_real_boxed_to: { \
     int dest = (int)UNPACK_A(op_word); \
     int src  = (int)UNPACK_B(op_word); \
     int reg  = (int)UNPACK_C(op_word); \
-    AerVal* rhs = &vm->registers[reg]; \
-    if (rhs->tag == TYPE_REAL) vm->raw_reals[dest] = vm->raw_reals[src] op rhs->as.d; \
-    else if (rhs->tag == TYPE_INTEGER) vm->raw_reals[dest] = vm->raw_reals[src] op (double)rhs->as.i; \
+    AerVal* rhs = &registers[reg]; \
+    if (rhs->tag == TYPE_REAL) raw_reals[dest] = raw_reals[src] op rhs->as.d; \
+    else if (rhs->tag == TYPE_INTEGER) raw_reals[dest] = raw_reals[src] op (double)rhs->as.i; \
     else error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs)); \
     DISPATCH(); \
 }
@@ -3713,9 +3740,9 @@ lbl_raw_div_int: {
     int dest = (int)UNPACK_A(op_word);
     int a    = (int)UNPACK_B(op_word);
     int b    = (int)UNPACK_C(op_word);
-    int64_t rv = vm->raw_ints[b];
-    if (rv == 0) { error("Division by zero"); vm->raw_reals[dest] = 0.0; }
-    else vm->raw_reals[dest] = (double)vm->raw_ints[a] / (double)rv;
+    int64_t rv = raw_ints[b];
+    if (rv == 0) { error("Division by zero"); raw_reals[dest] = 0.0; }
+    else raw_reals[dest] = (double)raw_ints[a] / (double)rv;
     DISPATCH();
 }
 
@@ -3723,9 +3750,9 @@ lbl_raw_mod_int: {
     int dest = (int)UNPACK_A(op_word);
     int a    = (int)UNPACK_B(op_word);
     int b    = (int)UNPACK_C(op_word);
-    int64_t rv = vm->raw_ints[b];
-    if (rv == 0) { error("Modulo by zero"); vm->raw_ints[dest] = 0; }
-    else vm->raw_ints[dest] = vm->raw_ints[a] % rv;
+    int64_t rv = raw_ints[b];
+    if (rv == 0) { error("Modulo by zero"); raw_ints[dest] = 0; }
+    else raw_ints[dest] = raw_ints[a] % rv;
     DISPATCH();
 }
 
@@ -3733,9 +3760,9 @@ lbl_raw_floor_div_int: {
     int dest = (int)UNPACK_A(op_word);
     int a    = (int)UNPACK_B(op_word);
     int b    = (int)UNPACK_C(op_word);
-    int64_t rv = vm->raw_ints[b];
-    if (rv == 0) { error("Division by zero"); vm->raw_ints[dest] = 0; }
-    else vm->raw_ints[dest] = (int64_t)floor((double)vm->raw_ints[a] / (double)rv);
+    int64_t rv = raw_ints[b];
+    if (rv == 0) { error("Division by zero"); raw_ints[dest] = 0; }
+    else raw_ints[dest] = (int64_t)floor((double)raw_ints[a] / (double)rv);
     DISPATCH();
 }
 
@@ -3747,9 +3774,9 @@ lbl_raw_div_real: {
     int dest = (int)UNPACK_A(op_word);
     int a    = (int)UNPACK_B(op_word);
     int b    = (int)UNPACK_C(op_word);
-    double rv = vm->raw_reals[b];
-    if (rv == 0.0) { error("Division by zero"); vm->raw_reals[dest] = 0.0; }
-    else vm->raw_reals[dest] = vm->raw_reals[a] / rv;
+    double rv = raw_reals[b];
+    if (rv == 0.0) { error("Division by zero"); raw_reals[dest] = 0.0; }
+    else raw_reals[dest] = raw_reals[a] / rv;
     DISPATCH();
 }
 
@@ -3767,28 +3794,28 @@ RAW_CMP_REAL(gte, >=)
 lbl_box_int: {
     int dest = (int)UNPACK_A(op_word);
     int src  = (int)UNPACK_B(op_word);
-    vm->registers[dest] = aer_int(vm->raw_ints[src]);
+    registers[dest] = aer_int(raw_ints[src]);
     DISPATCH();
 }
 
 lbl_box_real: {
     int dest = (int)UNPACK_A(op_word);
     int src  = (int)UNPACK_B(op_word);
-    vm->registers[dest] = aer_real(vm->raw_reals[src]);
+    registers[dest] = aer_real(raw_reals[src]);
     DISPATCH();
 }
 
 lbl_raw_move_int: {
     int dest = (int)UNPACK_A(op_word);
     int src  = (int)UNPACK_B(op_word);
-    vm->raw_ints[dest] = vm->raw_ints[src];
+    raw_ints[dest] = raw_ints[src];
     DISPATCH();
 }
 
 lbl_raw_move_real: {
     int dest = (int)UNPACK_A(op_word);
     int src  = (int)UNPACK_B(op_word);
-    vm->raw_reals[dest] = vm->raw_reals[src];
+    raw_reals[dest] = raw_reals[src];
     DISPATCH();
 }
 
@@ -3814,7 +3841,7 @@ RAW_ARITH_REAL_BOXED_TO(mul, *, "*")
 lbl_raw_load_int_pool: {
     int dest = (int)UNPACK_A(op_word);
     unsigned int pool_idx = (unsigned int)READ();
-    vm->raw_ints[dest] = const_pool[pool_idx].as.i;
+    raw_ints[dest] = const_pool[pool_idx].as.i;
     DISPATCH();
 }
 
@@ -3825,9 +3852,9 @@ lbl_raw_lt_int_boxed: {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
     int reg  = (int)UNPACK_C(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_ints[slot] < rhs->as.i);
-    else if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool((double)vm->raw_ints[slot] < rhs->as.d);
+    AerVal* rhs = &registers[reg];
+    if (rhs->tag == TYPE_INTEGER) registers[dest] = aer_bool(raw_ints[slot] < rhs->as.i);
+    else if (rhs->tag == TYPE_REAL) registers[dest] = aer_bool((double)raw_ints[slot] < rhs->as.d);
     else error("Cannot apply '<' to integer and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
@@ -3836,9 +3863,9 @@ lbl_raw_gt_int_boxed: {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
     int reg  = (int)UNPACK_C(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_ints[slot] > rhs->as.i);
-    else if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool((double)vm->raw_ints[slot] > rhs->as.d);
+    AerVal* rhs = &registers[reg];
+    if (rhs->tag == TYPE_INTEGER) registers[dest] = aer_bool(raw_ints[slot] > rhs->as.i);
+    else if (rhs->tag == TYPE_REAL) registers[dest] = aer_bool((double)raw_ints[slot] > rhs->as.d);
     else error("Cannot apply '>' to integer and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
@@ -3847,9 +3874,9 @@ lbl_raw_lte_int_boxed: {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
     int reg  = (int)UNPACK_C(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_ints[slot] <= rhs->as.i);
-    else if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool((double)vm->raw_ints[slot] <= rhs->as.d);
+    AerVal* rhs = &registers[reg];
+    if (rhs->tag == TYPE_INTEGER) registers[dest] = aer_bool(raw_ints[slot] <= rhs->as.i);
+    else if (rhs->tag == TYPE_REAL) registers[dest] = aer_bool((double)raw_ints[slot] <= rhs->as.d);
     else error("Cannot apply '<=' to integer and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
@@ -3858,9 +3885,9 @@ lbl_raw_gte_int_boxed: {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
     int reg  = (int)UNPACK_C(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_ints[slot] >= rhs->as.i);
-    else if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool((double)vm->raw_ints[slot] >= rhs->as.d);
+    AerVal* rhs = &registers[reg];
+    if (rhs->tag == TYPE_INTEGER) registers[dest] = aer_bool(raw_ints[slot] >= rhs->as.i);
+    else if (rhs->tag == TYPE_REAL) registers[dest] = aer_bool((double)raw_ints[slot] >= rhs->as.d);
     else error("Cannot apply '>=' to integer and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
@@ -3869,9 +3896,9 @@ lbl_raw_lt_real_boxed: {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
     int reg  = (int)UNPACK_C(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool(vm->raw_reals[slot] < rhs->as.d);
-    else if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_reals[slot] < (double)rhs->as.i);
+    AerVal* rhs = &registers[reg];
+    if (rhs->tag == TYPE_REAL) registers[dest] = aer_bool(raw_reals[slot] < rhs->as.d);
+    else if (rhs->tag == TYPE_INTEGER) registers[dest] = aer_bool(raw_reals[slot] < (double)rhs->as.i);
     else error("Cannot apply '<' to float and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
@@ -3880,9 +3907,9 @@ lbl_raw_gt_real_boxed: {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
     int reg  = (int)UNPACK_C(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool(vm->raw_reals[slot] > rhs->as.d);
-    else if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_reals[slot] > (double)rhs->as.i);
+    AerVal* rhs = &registers[reg];
+    if (rhs->tag == TYPE_REAL) registers[dest] = aer_bool(raw_reals[slot] > rhs->as.d);
+    else if (rhs->tag == TYPE_INTEGER) registers[dest] = aer_bool(raw_reals[slot] > (double)rhs->as.i);
     else error("Cannot apply '>' to float and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
@@ -3891,9 +3918,9 @@ lbl_raw_lte_real_boxed: {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
     int reg  = (int)UNPACK_C(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool(vm->raw_reals[slot] <= rhs->as.d);
-    else if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_reals[slot] <= (double)rhs->as.i);
+    AerVal* rhs = &registers[reg];
+    if (rhs->tag == TYPE_REAL) registers[dest] = aer_bool(raw_reals[slot] <= rhs->as.d);
+    else if (rhs->tag == TYPE_INTEGER) registers[dest] = aer_bool(raw_reals[slot] <= (double)rhs->as.i);
     else error("Cannot apply '<=' to float and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
@@ -3902,9 +3929,9 @@ lbl_raw_gte_real_boxed: {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
     int reg  = (int)UNPACK_C(op_word);
-    AerVal* rhs = &vm->registers[reg];
-    if (rhs->tag == TYPE_REAL) vm->registers[dest] = aer_bool(vm->raw_reals[slot] >= rhs->as.d);
-    else if (rhs->tag == TYPE_INTEGER) vm->registers[dest] = aer_bool(vm->raw_reals[slot] >= (double)rhs->as.i);
+    AerVal* rhs = &registers[reg];
+    if (rhs->tag == TYPE_REAL) registers[dest] = aer_bool(raw_reals[slot] >= rhs->as.d);
+    else if (rhs->tag == TYPE_INTEGER) registers[dest] = aer_bool(raw_reals[slot] >= (double)rhs->as.i);
     else error("Cannot apply '>=' to float and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
