@@ -594,6 +594,14 @@ default build, to keep the makefile small.
   get-field-and-subtract opcode were also identified as real, evidence-backed opportunities in this
   same hot loop, worth ~4-5x and ~2x their own dispatch cost respectively, but set aside for now in
   favor of tuning what already exists rather than growing the opcode surface).
+- **Checked: icache is not a real bottleneck anywhere in this project's own benchmark suite.**
+  Explicitly re-examined (not just assumed from the `nbody.aer` finding above) via a `perf stat`
+  sweep of every benchmark in `bench/` with `L1-icache-load-misses`/`L1-icache-loads`: every single
+  one is under 0.15% miss rate (`dict_bench`/`lookup_table_bench` highest at ~0.11-0.12%, most others
+  at 0.01-0.06%). This is consistent with, and helps explain, the small-string-optimization TODO's
+  own 140:1 *dcache*:icache ratio finding above — the imbalance there is data-cache pressure from
+  scattered small heap allocations, not instruction-cache pressure; icache itself was never the
+  problem in either case. Nothing to fix here.
 - **No OS-thread parallelism at the language level, by design.** A `VM`'s registers/call-stack are
   per-instance (proven by file-based `import`, which already runs each imported file in its own),
   but the GC-managed heap (`string_pool`/`array_pool`/etc., `vm.c`) is one set of pools shared by
@@ -726,17 +734,21 @@ default build, to keep the makefile small.
   mechanism) actually help high-churn pools, not just growth-only ones, before a bigger `AerString`
   cell stops being a pure liability. Not attempted — a separate, nontrivial GC design question, not
   a quick follow-up to the SSO work itself.
-- **TODO: no array-reserve builtin — `collection` module has no `hashtable_reserve`-equivalent.**
-  `hashtable_reserve` (hashtable.h) already exists specifically to pre-size a dict's sparse/dense
-  arrays once, up front, skipping the incremental one-entry-at-a-time growth `hashtable_put` would
-  otherwise do. `AerArray` has no equivalent — every `append()`-built array (e.g. `struct_array_scan.
-  aer`'s `make_particles`) pays the same incremental-growth cost `hashtable_reserve` was built to
-  avoid for dicts, with no way to opt out. A `collection.reserve(arr, n)` mirroring the existing dict
-  mechanism (pre-size `items`/`capacity` once, `xrealloc` immediately to `n` rather than doubling on
-  every overflow) would be small, additive, and low-risk — it doesn't fix the O(n²) minor-GC rescan
-  bug above (that's about *how often* the array gets rescanned once old, not the reallocation cost),
-  but is a real, complementary, and much cheaper win for the same "build a huge array via many
-  appends" pattern. Not built yet.
+
+  **Independent confirmation the high-churn-pool gap is real and not string-specific**: a broad
+  `perf stat` sweep across every benchmark in `bench/` (prompted by "are there other benchmarks
+  where we're lacking") found `bench/binary_trees.aer` — "the one benchmark in this suite that's
+  actually about the GC" per its own comment, building and discarding many `TreeNode` structs, most
+  dying young — has by far the worst IPC in the suite (0.45, versus 1.4-1.9 everywhere else) and the
+  identical `pool_clear_marks`+`pool_sweep`-dominated profile (~75% of cycles) `struct_array_scan.aer`
+  had *before* the per-slab-skip fix. `struct_pool`'s constant churn here permanently disables that
+  skip the same way `string_pool` did for SSO — confirming this is a general high-churn-pool
+  limitation, not something specific to strings. Not fixed; same prerequisite as above.
+- **DONE: array-reserve builtin — `collection.reserve(arr, n)`.** Mirrors `hashtable_reserve`'s
+  existing dict contract: pre-sizes `items`/`capacity` once, `xrealloc` immediately to `n` rather
+  than doubling on every overflow, a no-op if already big enough, never shrinks. Verified with a
+  differential test against plain `append()`-only construction. Complementary to, not a fix for, the
+  O(n²) minor-GC rescan work above (this is about reallocation cost, not rescan frequency).
 - **DONE: opt-in 32-bit (`int32`/`float32`) fields for structs**, via the same `i`/`f` literal-suffix
   convention as narrow typed arrays (`x = 42i`, `y = 0.0f` inside a `struct` body — see
   [Narrow Struct Fields](README.md#narrow-struct-fields)). Landed in two passes. First
