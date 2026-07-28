@@ -607,6 +607,31 @@ default build, to keep the makefile small.
     gets its own independent write-barrier trigger after both are promoted — the case this specific
     change makes newly relevant, since an old object's own children are no longer re-traced by the
     ordinary mark phase at all.
+  - **Pass 3 — per-slab skip in `pool_clear_marks`/`pool_sweep` (pool.c/pool.h).** Pass 2 stopped the
+    mark phase from *recursing into* an old object's contents, but `pool_clear_marks`/`pool_sweep`
+    still touched every individual cell's state byte every minor cycle just to confirm it was old —
+    for `struct_array_scan.aer` specifically, `make_particles(2_000_000)` means 2,000,000 separate
+    `AerStruct` cells in `struct_pool` (one per `Particle()` call, all held live in one array), and
+    that flat per-cycle scan cost was the residual ~90%-GC profile pass 2 left behind. Fixed with a
+    per-slab live-young-cell count (`Pool.slab_young_count`, parallel to `slabs[]`): once every cell
+    in a slab is old or free, `pool_clear_marks`/`pool_sweep` skip that slab's cells entirely in O(1)
+    instead of visiting each one. Deliberately does not try to track which slab a free-list-*reused*
+    cell lands in (would need either per-cell metadata — a real memory-density cost on every object in
+    every pool — or an address-range search on the hot `pool_alloc` path, for exactly the churny,
+    reuse-heavy pools this session's earlier segregated-bitmap experiment already found not worth
+    it, per this same header's comment): the first reuse in a pool just permanently disables the skip
+    for that pool (`Pool.reused`), falling back to today's full scan — safe (never wrong, only leaves
+    the optimization on the table for mixed grow/free/reuse workloads), and free of cost for churny
+    pools since they never engage the skip logic beyond the one-time flag check. Re-profiling the same
+    workload after this fix: total cycles dropped again, ~225 billion → ~92 billion (another ~59%),
+    and total wall-clock (construction + benchmark) fell from ~124s to ~52s. `vm_run_slice` — the
+    actual interpreter — is now the single largest symbol in the profile (35.6%), with
+    `gc_collect`+`pool_clear_marks`+`pool_sweep` together at ~53.6% (still the majority on this
+    specific worst-case benchmark, but no longer ~90%). Combined effect of all three passes on the
+    original ~506-billion-cycle / ~307-second-construction baseline: **~82% fewer cycles, ~5.9x faster
+    wall-clock**. Verified with the full four-suite regression on both Windows and the Pi after each
+    pass, including `tests/test_dict_pool_stress.aer` specifically (the churny, free-list-reuse-heavy
+    case this change is designed to leave untouched).
 - **TODO: no small-string optimization — every `AerString` is a separate heap allocation.** Real
   `perf stat` hardware counters on a Raspberry Pi 4 (`bench/log_processing.aer`, string-interpolation-
   and `string.split`-heavy) showed data-cache misses outnumbering instruction-cache misses **140:1**
