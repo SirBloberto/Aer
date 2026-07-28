@@ -167,14 +167,6 @@ _Static_assert(offsetof(struct AerResult, gc_state) == 0, "pool.c assumes gc_sta
 /* Boxes an exclusively-owned buffer as a TYPE_STRING — takes ownership, never copies. */
 AerVal aer_make_string(char* data, unsigned int length);
 
-/* Copies from ANY source (stack buffer, source-text slice, string literal) -- never takes
-   ownership, unlike aer_make_string above. This is the real small-string-optimization entry point:
-   aer_make_string alone can't avoid a heap allocation for a short string, since by the time a
-   caller has an owned buffer to hand it, that caller has already paid for one. A caller that
-   already has the bytes sitting in a stack buffer or borrowed slice should call this instead of
-   xmalloc+memcpy-ing its own owned copy first. */
-AerVal aer_make_string_copy(const char* src, unsigned int length);
-
 /* Builds a Result from a (value, err) pair — exactly one of the two should be null. */
 AerVal aer_make_result(AerVal value, AerVal err);
 

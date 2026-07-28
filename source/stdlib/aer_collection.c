@@ -161,8 +161,13 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         r->items    = xmalloc(sizeof(AerVal) * r->capacity);
         r->shape    = NULL;
         r->generation = 0;
-        for (unsigned int i = 0; i < d->map.count; i++)
-            r->items[r->count++] = aer_make_string_copy(d->map.dense[i].key, d->map.dense[i].length);
+        for (unsigned int i = 0; i < d->map.count; i++) {
+            unsigned int n = d->map.dense[i].length;
+            char* buf = xmalloc(n + 1);
+            memcpy(buf, d->map.dense[i].key, n);
+            buf[n] = '\0';
+            r->items[r->count++] = aer_make_string(buf, n);
+        }
         vm_stack_push(vm, aer_array_val(r)); return true;
     }
     if (fn_id == FN_COLLECTION_SORT && arg_count == 1) {
