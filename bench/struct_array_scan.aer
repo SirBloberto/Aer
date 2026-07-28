@@ -8,13 +8,13 @@ import time
 # array's total byte footprint (which raw fields directly shrink) actually determines how much of
 # it survives in cache between passes.
 struct Particle:
-    x = 0.0
-    y = 0.0
-    z = 0.0
-    vx = 0.0
-    vy = 0.0
-    vz = 0.0
-    mass = 0.0
+    x = 0.0f
+    y = 0.0f
+    z = 0.0f
+    vx = 0.0f
+    vy = 0.0f
+    vz = 0.0f
+    mass = 0.0f
 
 N = 2000000
 PASSES = 50

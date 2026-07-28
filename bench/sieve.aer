@@ -1,19 +1,17 @@
-import collection
+# is_composite is an int32 typed array (0/1 standing in for false/true) instead of a boxed
+# array of individually-allocated booleans -- denser storage (4 bytes/flag vs. a full AerVal
+# each) and the repeat-literal builds it in one op instead of `limit+1` incremental appends.
 function sieve(limit):
-    is_composite = []
-    i = 0
-    for i <= limit:
-        collection.append(is_composite, false)
-        i += 1
+    is_composite = [0i; limit + 1]
 
     count = 0
     p = 2
     for p <= limit:
-        if not is_composite[p]:
+        if is_composite[p] == 0:
             count += 1
             multiple = p * p
             for multiple <= limit:
-                is_composite[multiple] = true
+                is_composite[multiple] = 1
                 multiple += p
         p += 1
     return count
