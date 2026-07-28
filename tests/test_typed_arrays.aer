@@ -83,7 +83,50 @@ empty_typed = [0; 0]
 assert(length(empty_typed) == 0, "a zero-count typed array constructs cleanly and reports length 0")
 
 # ------------------------------------------------------------------ #
-# 6. Out-of-range/type-mismatch errors (documented, not run -- same    #
+# 6. Elementwise +/-/*: real per-index computation over a whole typed  #
+#    array at once, auto-vectorized where the target/build allow it   #
+#    (see vm_typed_array_binary_op's own comment, vm.c) -- correctness #
+#    doesn't depend on whether vectorization actually kicks in.       #
+# ------------------------------------------------------------------ #
+
+xs32 = [1i; 4]
+ys32 = [1i; 4]
+i = 0
+for i < 4:
+    xs32[i] = i
+    ys32[i] = i * 10
+    i += 1
+sum32 = xs32 + ys32
+assert(sum32[0] == 0 and sum32[1] == 11 and sum32[2] == 22 and sum32[3] == 33,
+       "int32[] elementwise add is truly per-index, not a broadcast")
+assert(xs32[1] == 1 and ys32[1] == 10, "elementwise add leaves both operands unmodified, produces a new array")
+assert((xs32 - ys32)[3] == 3 - 30, "int32[] elementwise sub correct")
+assert((xs32 * ys32)[3] == 3 * 30, "int32[] elementwise mul correct")
+
+xs64 = [1; 4]
+ys64 = [1; 4]
+i = 0
+for i < 4:
+    xs64[i] = i
+    ys64[i] = i * 10
+    i += 1
+assert((xs64 + ys64)[2] == 22, "int64[] (wide) elementwise add correct")
+assert((xs64 - ys64)[2] == 2 - 20, "int64[] (wide) elementwise sub correct")
+
+xf32 = [1.5f; 3]
+yf32 = [2.5f; 3]
+assert((xf32 + yf32)[0] == 4.0, "float32[] elementwise add correct")
+assert((xf32 * yf32)[0] == 3.75, "float32[] elementwise mul correct")
+
+xf64 = [1.5; 3]
+yf64 = [2.5; 3]
+assert((xf64 + yf64)[0] == 4.0, "float64[] (wide) elementwise add correct")
+
+assert(xs32 == xs32, "== on typed arrays is reference identity, matching plain arrays' own convention")
+assert(xs32 != ys32, "!= is true for two distinct typed array objects, even with related content")
+
+# ------------------------------------------------------------------ #
+# 7. Out-of-range/type-mismatch errors (documented, not run -- same    #
 #    convention as test_packed_arrays.aer: a real runtime error aborts #
 #    the whole script, so these can't be exercised inline in a script  #
 #    that must exit 0).                                                #
@@ -94,5 +137,7 @@ assert(length(empty_typed) == 0, "a zero-count typed array constructs cleanly an
 # ints[0] = "not a number"        # would error: Cannot assign a string into an integer[] array
 # bad = ints[100]                 # would error: Array index 100 out of bounds (len 5)
 # bad = [Point(); 3][0]           # would error handled by test_packed_arrays.aer instead -- struct half
+# bad = [1i; 3] + [1i; 5]         # would error: Typed arrays must have the same length (got 3 and 5)
+# bad = [1i; 3] + [1.0; 3]        # would error: Cannot combine typed arrays of different element kinds
 
 print("test_typed_arrays.aer: all assertions passed.")
