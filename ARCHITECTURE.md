@@ -650,12 +650,29 @@ default build, to keep the makefile small.
   it isn't a case of AER missing something already fixed elsewhere: §2.2 documents the variable-payload
   split as a deliberate design choice for genuinely variable-length data, and this is the natural
   complementary case — the overwhelming majority of these strings are short enough that inlining
-  would apply. Small-string optimization (inlining short strings' bytes directly into the value
-  representation instead of a separate heap cell, avoiding both the allocation and the pointer
-  dereference for anything under some small length threshold) is the
-  standard, well-proven fix for exactly this access pattern — used by V8, LuaJIT, and Swift, among
-  others, for the same reason. Not scoped yet: this would touch `AerString`'s representation
-  (value.h) and every site that reads string data, a larger change than anything else on this list.
+  would apply.
+
+  **Tried and reverted.** Small-string optimization (inlining short strings' bytes directly into
+  `AerString` instead of a separate heap cell) is the standard, well-proven fix for this access
+  pattern elsewhere (V8, LuaJIT, Swift) — but a real implementation and honest `perf stat`
+  measurement on the Pi found it a **~30% regression** on `log_processing.aer` (10.8B → 14.0B
+  cycles), not a win, so it was reverted rather than kept as a paper improvement. Root cause: it
+  isn't the string logic itself (the allocation-avoiding path was ~0.6% of cycles) — it's an
+  interaction with the per-slab GC skip above. `string_pool` is a *high-churn* pool for this
+  workload (every line's `split()` results die and get reused every iteration), and the per-slab
+  skip explicitly, permanently disables itself the moment any cell in a pool is reused from the
+  free list (see pass 3's own `Pool.reused` comment) — so `string_pool` never benefits from it,
+  full-scans every cycle regardless. Adding inline storage to every `AerString` (even at a
+  deliberately small 15-byte threshold, and even after fixing a real design flaw where the first
+  attempt didn't avoid an allocation at all — every `aer_make_string` call site already pre-allocates
+  a buffer before calling it, so a second constructor, `aer_make_string_copy`, was needed to actually
+  copy from a stack/borrowed source instead) made every cell in that always-fully-scanned pool
+  bigger, for no offsetting benefit. `struct_array_scan.aer` (no strings) was confirmed unaffected —
+  this is specific to string-churn-heavy code, which is exactly the workload SSO was meant to help.
+  A real fix would need to attack the underlying issue first: make the per-slab skip (or some other
+  mechanism) actually help high-churn pools, not just growth-only ones, before a bigger `AerString`
+  cell stops being a pure liability. Not attempted — a separate, nontrivial GC design question, not
+  a quick follow-up to the SSO work itself.
 - **TODO: no array-reserve builtin — `collection` module has no `hashtable_reserve`-equivalent.**
   `hashtable_reserve` (hashtable.h) already exists specifically to pre-size a dict's sparse/dense
   arrays once, up front, skipping the incremental one-entry-at-a-time growth `hashtable_put` would
