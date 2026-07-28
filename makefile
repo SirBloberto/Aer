@@ -9,7 +9,17 @@ else
 endif
 
 # -flto is load-bearing: pool.c's tiny hot helpers are called constantly from vm.c cross-TU.
-FLAGS := -O2 -g -flto -Wall -Wextra -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities
+#
+# ARCH_FLAGS is deliberately empty by default -- this build must run on whatever ARM/x86 machine
+# it's copied to, not just the one it was built on. On x86-64 that costs nothing: SSE2 (128-bit
+# SIMD) is part of the baseline x86-64 ABI, so typed-array elementwise ops (vm.c) auto-vectorize
+# with no extra flags at all. On ARM, NEON is NOT guaranteed present for the generic
+# arm-linux-gnueabihf target this compiles for by default, so the compiler conservatively won't
+# vectorize those same loops without an explicit opt-in -- confirmed on a Raspberry Pi 4: the exact
+# same source vectorizes with `make ARCH_FLAGS=-mcpu=native` (or -mcpu=cortex-a72, etc.) and doesn't
+# without it. Set ARCH_FLAGS yourself if you're building specifically for one known machine and
+# want that win; leave it unset for a build that has to run anywhere.
+FLAGS := -O2 -g -flto -Wall -Wextra $(ARCH_FLAGS) -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities
 
 SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/stdlib/*.c source/utilities/*.c)
 OBJECT := $(patsubst source/%.c,object/%.o,$(SOURCE))
