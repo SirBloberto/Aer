@@ -569,6 +569,31 @@ default build, to keep the makefile small.
     much bigger than cache, confirmed separately) elementwise work relative to the fixed per-call
     interpreter overhead, not for many small operations. No JIT: unchanged, out of scope for this
     session's work.
+- **DONE: `vm->registers`/`raw_ints`/`raw_reals` hoisted to locals in `vm_run_slice`, same treatment
+  `vm->ip`/`c->pool` already got.** Found via instruction-level profiling (`perf annotate` on
+  `bench/nbody.aer`, the canonical 5-body/500,000-timestep shootout benchmark — asked for
+  specifically to answer "how many CPU instructions does each opcode actually take, not how many
+  opcodes get dispatched"): `vm->raw_reals`'s own pointer reload (a field read fresh from the `VM`
+  struct on every dispatch that touches a raw register, rather than cached once per call the way
+  `ip` already is) was among the single hottest instructions in the whole hot loop. `nbody.aer`
+  itself is a useful contrast to `struct_array_scan.aer`'s GC-bound profile — confirmed via
+  `perf stat` (99.15% in `vm_run_slice`, near-zero L1-icache miss rate, no GC/allocation at all) that
+  this benchmark's cost is pure scalar dispatch/arithmetic, not memory or GC, so none of this
+  session's other GC work could have moved it. `register_stack`/`raw_int_stack`/`raw_real_stack`
+  (`vm.h`) are fixed-size inline `VM` arrays, never reallocated, so caching these three pointers in
+  registers across the whole dispatch loop is safe as long as the locals get refreshed at the exact
+  3 sites the fields themselves get reassigned (`lbl_call`, `lbl_call_value` via `vm_call_value`,
+  `lbl_return`) — confirmed by checking each site individually rather than assuming. Caught one real
+  ordering bug of its own while wiring this up: a mechanical find-replace initially left `lbl_return`
+  writing the callee's result into the *stale* (still-callee-pointing) local instead of the
+  just-reassigned caller's, which would have corrupted whichever register of the caller's frame
+  happened to share the destination index. Fixed by refreshing the locals before that write, not
+  after. Measured on the Pi, 3 runs each way: baseline 3.33-3.42s → 2.92-3.10s, a consistent
+  **~11% wall-clock win** from a single, targeted, zero-new-opcode fix — deliberately the shape of
+  change favored here over adding opcode-fusion surface (a raw `sqrt` opcode and a fused
+  get-field-and-subtract opcode were also identified as real, evidence-backed opportunities in this
+  same hot loop, worth ~4-5x and ~2x their own dispatch cost respectively, but set aside for now in
+  favor of tuning what already exists rather than growing the opcode surface).
 - **No OS-thread parallelism at the language level, by design.** A `VM`'s registers/call-stack are
   per-instance (proven by file-based `import`, which already runs each imported file in its own),
   but the GC-managed heap (`string_pool`/`array_pool`/etc., `vm.c`) is one set of pools shared by
