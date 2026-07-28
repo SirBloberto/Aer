@@ -743,7 +743,57 @@ default build, to keep the makefile small.
   identical `pool_clear_marks`+`pool_sweep`-dominated profile (~75% of cycles) `struct_array_scan.aer`
   had *before* the per-slab-skip fix. `struct_pool`'s constant churn here permanently disables that
   skip the same way `string_pool` did for SSO — confirming this is a general high-churn-pool
-  limitation, not something specific to strings. Not fixed; same prerequisite as above.
+  limitation, not something specific to strings.
+
+  **DONE: the prerequisite itself — per-slab free lists, matching Luau's actual GC design.** The
+  user pushed back on patching around the shared-free-list limitation (tagging a slab index onto
+  reused cells while keeping one free list per pool) and asked specifically how Lua/Luau handle
+  this. Verified from source rather than assumption: stock Lua 5.x embeds `next` (pointer) + `tt` +
+  `marked` in every object (`CommonHeader`) and sweeps via an intrusive linked list. Luau —
+  considered the more efficient of the two — does *not* avoid an embedded GC byte; its
+  `CommonHeader` is `tt + marked + memcat`, three bytes, *more* than AER's one. What Luau actually
+  did was remove Lua's linked list and move to page-based scanning (`sweepgcopage()`), much closer
+  to AER's own slab/pool design than to stock Lua — and critically, `lua_Page` has its own per-page
+  free list (plus a `busyBlocks` live-count), not one shared across pages, so a reused block's page
+  is never ambiguous by construction. That's the actual mechanism AER's pools were missing: one
+  shared free list per pool, not per slab, which is exactly why a reused cell's slab was unknowable
+  without a search.
+
+  Implemented directly (not the smaller tag-based patch): every `Pool` now has per-slab free lists
+  (`slab_free_list[]`, parallel to `slabs[]`) plus an O(1) "which slabs currently have a free cell"
+  thread (`free_slab_head`/`slab_free_next[]`), mirroring `lua_Page`'s own free list + `prev`/`next`
+  page-linking. Confirmed (via two independent design reviews, one for an earlier tag-based draft
+  and one for this design) that `pool_free()` is called from exactly 3 sites in the whole codebase:
+  internally inside `pool_sweep`'s own loop (where the slab index is already the loop variable, free
+  to use) and externally from `hashtable.c`'s own key/sparse-array pools, which `gc_collect` never
+  passes through `pool_clear_marks`/`pool_sweep` with `young_only` at all — so those two pool kinds
+  are provably unaffected and needed zero changes. Since AER has no manual/explicit object
+  destruction (cells only die via a GC sweep finding them unreachable), *every* GC-tracked pool's
+  frees now flow through the new per-slab path, making `slab_young_count[]` always exact — the old
+  `Pool.reused` "give up forever" fallback and its skip-check guards were removed entirely as dead
+  code, nothing sets it anymore.
+
+  Verified with the full four-suite regression (Windows + Pi), a new differential test
+  (`tests/test_pool_churn.aer` — a `binary_trees`-shaped build-and-discard pattern across structs,
+  arrays, and dicts, plus a reuse-correctness check that every reused cell holds exactly its own
+  fresh value, not a stale leftover), and a clean ASAN run on the Pi (this touches raw pointer-offset
+  math in the allocator hot path).
+
+  **Real numbers, both directions.** `binary_trees.aer` on the Pi: `pool_clear_marks`+`pool_sweep`+
+  `gc_collect`'s combined share dropped from ~77% of cycles to ~34%, total cycles from 9.49B to
+  3.30B, wall-clock from 5.26s to 1.79s — **a ~2.95x speedup that flips the 3-language comparison
+  from a loss to a decisive win** (0.67x → ~2.0x over Python, 0.62x → ~1.96x over Lua).
+  `log_processing.aer`: wall-clock 6.06s → 3.27s (~1.85x), and the 3-language ratio improved
+  substantially (0.17x → 0.34x vs. Python, 0.41x → 0.80x vs. Lua, nearly a tie with Lua now) but
+  **remains a loss against both** — its profile still shows `gc_collect`+`pool_clear_marks`+
+  `pool_sweep` at a combined ~52% of cycles, plus real `malloc`/`free` overhead from actual string
+  *payload* allocations (`_int_malloc`/`_int_free`/`cfree` visibly in the profile). That's the
+  separate, already-documented no-SSO limitation just above, not this fix's target — `log_processing`
+  simply allocates strings at a far higher *rate* than `binary_trees` allocates structs, so it still
+  spends more absolute time in GC bookkeeping even with per-slab scanning now fully efficient. Worth
+  revisiting SSO now that its own blocking prerequisite is resolved, but not re-attempted in this
+  pass — a fresh measurement, not an assumption it would win this time, would still be warranted
+  given this project's history with that specific idea.
 - **DONE: array-reserve builtin — `collection.reserve(arr, n)`.** Mirrors `hashtable_reserve`'s
   existing dict contract: pre-sizes `items`/`capacity` once, `xrealloc` immediately to `n` rather
   than doubling on every overflow, a no-op if already big enough, never shrinks. Verified with a
