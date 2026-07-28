@@ -130,27 +130,16 @@ struct AerFunction {
 };
 _Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* Small-string optimization: any string of length <= AER_STRING_INLINE_MAX lives entirely inside
-   inline_buf, no separate heap allocation at all. Chosen so `data` is ALWAYS a valid pointer to
-   dereference, whether it points at inline_buf (short) or a separate xmalloc'd buffer (long) --
-   every existing read site (`s->data`/`s->length`) keeps working completely unchanged; only
-   aer_make_string (the sole construction site) and free_string (gc.c, the sole finalizer) know the
-   difference, by comparing `length` against AER_STRING_INLINE_MAX (never a separate flag -- length
-   already determines it unambiguously). This is the real fix for the "11 separate heap events per
-   log_processing.aer line" finding (ARCHITECTURE.md) -- almost all of those strings are well under
-   this threshold. `data` is still always exclusively owned, never a borrowed view, for the long
-   case: the GC sweep frees it unconditionally (unless it's pointing at this same cell's own
-   inline_buf), so a borrowed pointer would double-free or dangle. No dict-key hash cache here
+/* `data` is always exclusively owned, never a borrowed view — the GC sweep frees it
+   unconditionally, so a borrowed pointer would double-free or dangle. No dict-key hash cache here
    (tried as cached_hash/hash_valid fields, then again as a side array keyed off an aligned-slab
    pool redesign) -- both were removed: the first for coupling a leaf value type to hashtable.c's
    hashing details for a narrow win, the second measured as a net regression across most real
    workloads (see pool.h). */
-#define AER_STRING_INLINE_MAX 15
 struct AerString {
     unsigned char gc_state;
     char*        data;
     unsigned int length;
-    char         inline_buf[AER_STRING_INLINE_MAX + 1];   /* NUL-terminated, like data always is */
 };
 _Static_assert(offsetof(struct AerString, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 

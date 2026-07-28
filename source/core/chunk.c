@@ -106,22 +106,15 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
         if (existing) { free(key); return (unsigned int)aer_as_int(*existing); }
 
         /* vs->data was already owned at every call site -- free before replacing, or it's orphaned
-           (confirmed real leak via ASAN). Skipped for an inline (SSO) string: its bytes already live
-           inside this very cell (vs->inline_buf, value.h) at no extra allocation cost, so there's
-           nothing to reclaim, and repointing it at `key` would only throw away the SSO win for no
-           reason -- `key`'s content is a redundant copy in that case (freed below instead, once
-           name_index has made its own independent copy of it). */
-        bool inline_string = (vs->data == vs->inline_buf);
-        if (!inline_string) {
-            free(vs->data);
-            vs->data = key;   /* pool entry takes ownership of `key` */
-        }
+           (confirmed real leak via ASAN). */
+        char* old_data = vs->data;
+        vs->data = key;   /* pool entry takes ownership of `key` */
+        free(old_data);
         unsigned int idx = chunk_pool_append(c, v);
 
         /* Independent copy, not an alias of c->pool[idx]'s, so both can be freed independently without a double-free. */
         char* index_key = hashtable_key_dup(c->name_index.pools, key, key_len, NULL);
         hashtable_put(&c->name_index, index_key, key_len, aer_int((int64_t)idx));
-        if (inline_string) free(key);   /* not adopted above -- name_index took its own independent copy instead */
         return idx;
     }
 

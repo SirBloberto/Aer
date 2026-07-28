@@ -346,19 +346,8 @@ AerVal aer_make_string(char* data, unsigned int length) {
     VmHeap* heap = require_current_heap();
     vm_heap_init(heap);
     AerString* s = heap_alloc(heap, &heap->string_pool);
+    s->data = data;
     s->length = length;
-    if (length <= AER_STRING_INLINE_MAX) {
-        /* Small-string optimization (see AerString's own comment, value.h): copy into this cell's
-           own inline_buf and drop the caller's separately-allocated buffer -- every caller already
-           hands over an owned, freeable buffer (this function's own contract), so freeing it here
-           instead of keeping it is safe and call-site-transparent. */
-        memcpy(s->inline_buf, data, length);
-        s->inline_buf[length] = '\0';
-        s->data = s->inline_buf;
-        free(data);
-    } else {
-        s->data = data;
-    }
     return aer_string_val(s);
 }
 

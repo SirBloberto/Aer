@@ -248,10 +248,7 @@ static void mark_chunk_roots(VmHeap* heap, Chunk* chunk, bool minor) {
 /* Generational GC — sweep finalizers                                  */
 /* ------------------------------------------------------------------ */
 
-static void free_string(void* cell)   {
-    AerString* s = (AerString*)cell;
-    if (s->data != s->inline_buf) free(s->data);   /* an inline (SSO) string owns nothing separate -- see AerString's own comment, value.h */
-}
+static void free_string(void* cell)   { free(((AerString*)cell)->data); }
 static void free_array(void* cell)    { AerArray* a = (AerArray*)cell; free(a->items); free(a->dirty_cards); }
 static void free_dict(void* cell)     { AerDict* d = (AerDict*)cell; hashtable_free(&d->map); free(d->dirty_cards); }   /* hashtable_free already frees every entry's key */
 static void free_function(void* cell) { (void)cell; }   /* nothing to free — no closure upvalues array anymore */
