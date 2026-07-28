@@ -53,6 +53,7 @@ TESTS := tests/test_core.aer \
          tests/test_stdlib_modules.aer \
          tests/test_memory_gc.aer \
          tests/test_card_marking.aer \
+         tests/test_pool_churn.aer \
          tests/test_perf_fusion.aer \
          tests/test_primitive_pass.aer \
          tests/test_dict_pool_stress.aer \

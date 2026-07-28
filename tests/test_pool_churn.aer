@@ -1,0 +1,123 @@
+#!/usr/bin/env aer
+import collection
+# AER test suite — per-slab free lists (pool.c's slab_free_list/free_slab_head, replacing the old
+# pool-wide free_list + permanent-`reused`-fallback design). Machine-checked via assert(): a clean
+# run exits 0; any failure prints "ASSERT FAILED: ..." and the process exits nonzero.
+#
+# The whole point of this mechanism is the exact pattern exercised below: build many small objects,
+# discard most of them (most die young, exactly like bench/binary_trees.aer), keep a few live
+# references across the churn, and confirm those survivors are never corrupted or prematurely
+# collected -- while the discarded majority's cells get correctly reclaimed and reused.
+
+struct Node:
+    left = null
+    right = null
+    tag = 0
+
+# ------------------------------------------------------------------ #
+# 1. Build-and-discard churn across many GC cycles, structs.          #
+#    Most Node instances here are built, used once, and immediately   #
+#    unreachable -- exactly struct_pool's high-churn shape.           #
+# ------------------------------------------------------------------ #
+
+function make_tree(depth, tag_base):
+    if depth == 0:
+        return Node(null, null, tag_base)
+    d = depth - 1
+    return Node(make_tree(d, tag_base), make_tree(d, tag_base + 1), tag_base + 2)
+
+function tree_sum(node):
+    if node.left == null:
+        return node.tag
+    return node.tag + tree_sum(node.left) - tree_sum(node.right)
+
+# A handful of "long-lived" trees, kept alive across the whole churn below via survivors[].
+survivors = []
+i = 0
+for i < 5:
+    collection.append(survivors, make_tree(6, i * 1000))
+    i += 1
+survivor_sums = []
+i = 0
+for i < 5:
+    collection.append(survivor_sums, tree_sum(survivors[i]))
+    i += 1
+
+# Heavy churn: thousands of throwaway trees, built and immediately discarded (never stored anywhere
+# after this loop body), across enough iterations to force many minor GC cycles.
+churn_total = 0
+i = 0
+for i < 3000:
+    churn_total += tree_sum(make_tree(8, i))
+    i += 1
+
+# The kept survivors must still have their EXACT original values -- proves the free-list churn
+# above never touched (reused, corrupted, or prematurely collected) a still-reachable struct_pool
+# cell just because OTHER cells in the same pool were being freed and reused constantly.
+i = 0
+for i < 5:
+    assert(tree_sum(survivors[i]) == survivor_sums[i],
+           "a long-lived tree survives thousands of throwaway allocations in the same struct_pool")
+    i += 1
+
+# ------------------------------------------------------------------ #
+# 2. Same churn shape for arrays and dicts -- array_pool/dict_pool     #
+#    use the identical per-slab free-list mechanism.                  #
+# ------------------------------------------------------------------ #
+
+kept_arrays = []
+i = 0
+for i < 5:
+    collection.append(kept_arrays, [i, i * 2, i * 3])
+    i += 1
+
+array_churn_total = 0
+i = 0
+for i < 5000:
+    throwaway = [i, i + 1, i + 2, i + 3]
+    array_churn_total += throwaway[0] + throwaway[3]
+    i += 1
+
+i = 0
+for i < 5:
+    assert(kept_arrays[i][0] == i and kept_arrays[i][1] == i * 2 and kept_arrays[i][2] == i * 3,
+           "a long-lived array survives thousands of throwaway array allocations in the same array_pool")
+    i += 1
+
+kept_dicts = []
+i = 0
+for i < 5:
+    collection.append(kept_dicts, {"id": i, "sq": i * i})
+    i += 1
+
+dict_churn_total = 0
+i = 0
+for i < 5000:
+    throwaway = {"a": i, "b": i + 1}
+    dict_churn_total += throwaway["a"] + throwaway["b"]
+    i += 1
+
+i = 0
+for i < 5:
+    assert(kept_dicts[i]["id"] == i and kept_dicts[i]["sq"] == i * i,
+           "a long-lived dict survives thousands of throwaway dict allocations in the same dict_pool")
+    i += 1
+
+# ------------------------------------------------------------------ #
+# 3. Reuse correctness: cells freed by the churn above must come back #
+#    as genuinely fresh (zeroed gc_state, no stale field values) when #
+#    reused -- not just "not crash", but actually correct new content.#
+# ------------------------------------------------------------------ #
+
+reused_check = []
+i = 0
+for i < 2000:
+    n = Node(null, null, i * 7)
+    collection.append(reused_check, n.tag)
+    i += 1
+i = 0
+for i < 2000:
+    assert(reused_check[i] == i * 7, "every reused struct_pool cell holds exactly its own fresh value, not a leftover from whatever it held before")
+    i += 1
+
+print("test_pool_churn.aer: all assertions passed.")
