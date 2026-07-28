@@ -28,6 +28,27 @@ typedef struct {
     size_t          stride;          /* elem_size 8-aligned, 16-byte floor for the free-list pointer */
     unsigned int    elems_per_slab;
     void*           free_list;       /* linked through freed cells' bytes [8,16) — offset 0 would clobber gc_state */
+
+    /* Per-slab live-young-cell count, parallel to slabs[] (grown alongside it in pool_grow). Lets
+       pool_clear_marks/pool_sweep skip an entire slab in O(1) once every cell in it is old or free
+       -- the common shape for a large, incrementally-built, never-freed collection (the exact
+       pattern struct_array_scan.aer's construction phase hit: pool_clear_marks+pool_sweep were ~90%
+       of cycles even after old cells stopped being individually re-traced, because every minor
+       cycle still touched every cell's state byte just to confirm it's old).
+
+       Deliberately does NOT track which slab a free-list-reused cell lands in -- doing so needs
+       either extra per-cell metadata (a real memory-density regression, felt by every object in
+       every pool) or an address-range search over slabs on every reuse (a cost on the hot alloc
+       path, for the very case -- churny, reuse-heavy pools like sieve/dict-stress -- this session's
+       prior segregated-bitmap experiment already found not worth it, per this file's own comment
+       above). Instead, `reused` goes true the first time ANY cell in the pool is reused from the
+       free list, and permanently disables the skip for the whole pool from then on (falls back to
+       exactly today's full scan) -- safe (never wrong, just leaves the optimization on the table for
+       mixed grow/free/reuse workloads), and costs nothing beyond one branch on the already-slower
+       free-list path. Pools that only ever grow (the case this was built for) never pay that cost
+       at all. */
+    unsigned int*   slab_young_count;
+    bool            reused;
 } Pool;
 
 void  pool_init(Pool* p, size_t elem_size, unsigned int elems_per_slab);

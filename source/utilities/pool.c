@@ -17,14 +17,18 @@ void pool_init(Pool* p, size_t elem_size, unsigned int elems_per_slab) {
     p->elems_per_slab = elems_per_slab;
     p->next_index     = elems_per_slab;   /* forces the first pool_alloc to grab a slab */
     p->free_list      = NULL;
+    p->slab_young_count = NULL;
+    p->reused           = false;
 }
 
 static void pool_grow(Pool* p) {
     if (p->slab_count >= p->slab_cap) {
         p->slab_cap = p->slab_cap ? p->slab_cap * 2 : POOL_INITIAL_SLABS;
         p->slabs    = xrealloc(p->slabs, sizeof(char*) * p->slab_cap);
+        p->slab_young_count = xrealloc(p->slab_young_count, sizeof(unsigned int) * p->slab_cap);
     }
     p->slabs[p->slab_count] = xmalloc(p->stride * p->elems_per_slab);
+    p->slab_young_count[p->slab_count] = 0;
     p->slab_count++;
     p->next_index = 0;
 }
@@ -43,6 +47,7 @@ void pool_finalize_all(Pool* p, void (*on_free)(void* cell)) {
 void pool_destroy(Pool* p) {
     for (unsigned int i = 0; i < p->slab_count; i++) free(p->slabs[i]);
     free(p->slabs);
+    free(p->slab_young_count);
     *p = (Pool){0};
 }
 
@@ -52,12 +57,16 @@ void* pool_alloc(Pool* p) {
         /* Next-pointer lives at [sizeof(void*), 2*sizeof(void*)), not [0, sizeof(void*)) — see pool.h. */
         p->free_list = *(void**)((char*)cell + sizeof(void*));
         *(unsigned char*)cell = 0;   /* always born young, regardless of which physical cell was reused — see pool.h */
+        /* Which slab this cell lives in is unknown without a search -- see slab_young_count's own
+           comment. Rather than guess, permanently give up on the per-slab skip for this pool. */
+        p->reused = true;
         return cell;
     }
     if (p->next_index >= p->elems_per_slab) pool_grow(p);
     char* cell = p->slabs[p->slab_count - 1] + (size_t)p->next_index * p->stride;
     *(unsigned char*)cell = 0;
     p->next_index++;
+    p->slab_young_count[p->slab_count - 1]++;
     return cell;
 }
 
@@ -98,24 +107,32 @@ void pool_mark_remembered(Pool* p, void* cell) {
 
 void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell)) {
     for (unsigned int i = 0; i < p->slab_count; i++) {
+        /* Nothing in this slab needs a minor pass at all -- every cell is already old or free. See
+           slab_young_count's own comment, pool.h. */
+        if (young_only && !p->reused && p->slab_young_count[i] == 0) continue;
         unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
         for (unsigned int j = 0; j < count; j++) {
             char* cell = p->slabs[i] + (size_t)j * p->stride;
             unsigned char* state = (unsigned char*)cell;
             if (*state & POOL_FREE) continue;                  /* already free-listed; nothing marks a free cell, so don't re-free it */
-            if (young_only && (*state & POOL_OLD)) continue;    /* old cells are presumed live during a minor pass */
+            bool was_young = (*state & POOL_OLD) == 0;
+            if (young_only && !was_young) continue;             /* old cells are presumed live during a minor pass */
             if (*state & POOL_MARKED) {
                 *state = (unsigned char)((*state & ~POOL_MARKED) | POOL_OLD);   /* survived -> promote */
             } else {
                 on_free(cell);
                 pool_free(p, cell);   /* sets *state = POOL_FREE internally */
             }
+            if (was_young) p->slab_young_count[i]--;   /* resolved either way (promoted or freed) -- no longer young */
         }
     }
 }
 
 void pool_clear_marks(Pool* p, bool young_only) {
     for (unsigned int i = 0; i < p->slab_count; i++) {
+        /* Same per-slab skip as pool_sweep -- nothing young in this slab means nothing to clear
+           either, so skip touching any of its cells at all. See slab_young_count's own comment, pool.h. */
+        if (young_only && !p->reused && p->slab_young_count[i] == 0) continue;
         unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
         for (unsigned int j = 0; j < count; j++) {
             char* cell = p->slabs[i] + (size_t)j * p->stride;
