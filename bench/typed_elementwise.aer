@@ -1,0 +1,31 @@
+import time
+
+# Elementwise +/-/* on typed arrays (vm.c's vm_typed_array_binary_op) -- deliberately sized to stay
+# cache-resident (see that function's own comment: the auto-vectorization win measured on real
+# hardware only shows up when the loop is compute-bound, not memory-bandwidth-bound), then run many
+# times to get a measurable duration, mirroring a real workload that repeatedly transforms the same
+# moderately-sized buffers (e.g. a per-frame physics/signal-processing step).
+
+N = 16384
+PASSES = 5000
+
+a = [1.0f; N]
+b = [0.5f; N]
+half = [0.5f; N]
+i = 0
+for i < N:
+    a[i] = float(i % 97)
+    b[i] = float((N - i) % 97)
+    i += 1
+
+# Averaging toward b each pass is a contraction (a stays bounded, converging toward b) -- keeps
+# the values well away from overflow across many thousands of passes, while still doing a real
+# add and a real mul over the whole array every single pass.
+start = time.now()
+p = 0
+for p < PASSES:
+    c = a + b
+    a = c * half
+    p += 1
+dur = time.now() - start
+print("typed_elementwise: {N} elems x {PASSES} passes in {dur}s, a[0]={a[0]}")

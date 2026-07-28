@@ -518,29 +518,57 @@ default build, to keep the makefile small.
   under profiling). An RR-opcode-split (separate register-register and register-constant opcode
   variants, eliminating the runtime branch entirely) and a "unified addressing" alternative were
   both scoped and explicitly set aside — real complexity/opcode-surface cost for an unproven payoff.
-- **No SIMD/vectorization, no JIT.** Confirmed concretely, not just assumed: GCC's own
-  `-fopt-info-vec` diagnostics produce zero output — not even a "missed" message — for `vm_run_slice`
-  at any optimization level, because the dispatch loop isn't a shape the vectorizer analyzes at all
-  (a computed-goto loop over heterogeneous opcode handlers, not a fixed-body countable-trip loop).
-  This is fundamental to being an interpreter, not something a flag fixes. Separately, on the
-  Raspberry Pi 4 build specifically: this GCC target's default (`-mfpu=auto` on `armv7-a+fp`) doesn't
-  even enable NEON, so *no* loop anywhere in the codebase auto-vectorizes right now, dispatch loop or
-  otherwise (confirmed with a trivial textbook-vectorizable loop: `no vectype for stmt` without
-  `-mfpu=neon`). Adding `-mfpu=neon -mfloat-abi=hard` gets past that, but float vectorization then
-  additionally requires `-ffast-math` (NEON's FP unit isn't fully IEEE-754 compliant — GCC won't
-  auto-vectorize float loops without permission to relax that) — a flag with real behavioral risk for
-  a language runtime (relaxed NaN/Inf/signed-zero semantics) that should never be applied globally,
-  only scoped to a specific, deliberately-audited function if ever used. Even then: NEON (32- or
-  64-bit) has no gather/scatter — confirmed for this exact chip (Cortex-A72/BCM2711) — so a
-  hypothetical bulk-vectorized opcode over the CURRENT AoS-packed struct-array layout would need
-  manual scalar de-interleaving before vectorizing, likely eating most of the gain; the current AoS
-  choice (over SoA, made earlier for dynamic-typing/aliasing reasons — see the flat-typed-arrays
-  design discussion) is also the one layout choice that makes gather-free SIMD hard on this hardware.
-  Net: real vectorization would need (a) a new bulk-operation opcode family with its own tight,
-  auditable C loop — the interpreter's normal per-element dispatch can't get this for free — and (b)
-  probably reopening AoS vs. SoA for at least that opcode family's storage. Not attempted; the
-  cost/risk (relaxed float semantics, a settled layout decision, real implementation size) hasn't yet
-  been weighed against a confirmed payoff on the actual target hardware.
+- **DONE: SIMD/vectorization for typed arrays; no JIT.** The dispatch loop itself remains
+  unvectorizable and always will be — confirmed concretely: GCC's own `-fopt-info-vec` diagnostics
+  produce zero output, not even a "missed" message, for `vm_run_slice` at any optimization level,
+  because a computed-goto loop over heterogeneous opcode handlers isn't a shape the vectorizer
+  analyzes at all. That's fundamental to being an interpreter, not something a flag fixes. But the
+  earlier assumption that gather/scatter-free SIMD was blocked by the AoS packed-struct-array layout
+  turned out to be the wrong target entirely: `TYPE_TYPED_ARRAY` (added earlier for the repeat-literal
+  numeric case) is *already* a flat, contiguous, uniformly-typed buffer — exactly the shape auto-
+  vectorization wants, no de-interleaving needed, sidestepping the AoS/gather problem completely
+  rather than needing to resolve it. Landed: elementwise `+`/`-`/`*` on two same-kind, same-length
+  typed arrays (`vm_typed_array_binary_op`, vm.c), each `(kind, op)` pair its own tight, branch-free C
+  loop with zero hand-written intrinsics.
+  - **The float/fast-math problem was real, exactly as this entry originally predicted**, and solved
+    the way it recommended: fast-math is required to vectorize the float32 pair specifically (NEON's
+    float unit isn't strictly IEEE-754-compliant), applied via a *per-function* GCC `optimize`
+    attribute — confirmed to work standalone, with no global `-ffast-math` build flag — so every
+    other float operation in the language keeps strict IEEE 754 semantics untouched.
+  - **A subtlety this entry missed going in**: a per-function `optimize` attribute requesting only
+    `"fast-math"` is not enough by itself on a build using this project's own `-O2` flag — plain `-O2`
+    vectorizes nothing at all here, integer or float; the tree vectorizer itself only engages under
+    `-O3`. Each of the six functions (not just the float32 pair) carries its own
+    `optimize("O3","tree-vectorize")` (plus `"fast-math"` for float32), confirmed to override the
+    file's global `-O2` standalone, so the six loops vectorize even though the rest of vm.c stays at
+    `-O2`.
+  - **A second target-portability subtlety, found only by testing the actual shipped binary, not an
+    isolated snippet**: NEON is not part of the guaranteed baseline for the generic
+    `arm-linux-gnueabihf` target this project's default (flagless) build compiles for — so even with
+    the attributes above, the exact same source does **not** vectorize in the real `binary/aer`
+    on the Pi without an explicit `-mcpu`. Confirmed by disassembling the actual compiled function:
+    plain scalar `ldr`/`str` by default, real `vld1`/`vadd.f32 q8, q8, q9`/`vst1` NEON instructions
+    with `make ARCH_FLAGS=-mcpu=native`. x86-64 has no such gap — SSE2 (128-bit SIMD) is part of the
+    baseline x86-64 ABI itself, so the identical source vectorizes on the Windows/MinGW build with no
+    flags at all (confirmed via disassembly: `movdqu`/`paddd %xmm0`). Rather than force a
+    hardware-specific flag into the default build (which must run on whatever ARM/x86 machine it's
+    copied to — a NEON-less older ARM board would `SIGILL` on a binary built assuming NEON), added an
+    empty-by-default `ARCH_FLAGS` makefile variable so a builder targeting one known machine can opt
+    in (`make ARCH_FLAGS=-mcpu=native`) without changing what the portable default build guarantees.
+  - **Honest end-to-end numbers, not just the isolated loop's own speedup.** The raw elementwise C
+    loop itself measures ~2.2-2.4x faster with vectorization on cache-resident arrays (confirmed via a
+    standalone microbenchmark with dead-code-elimination carefully ruled out — an early version of
+    that benchmark showed a bogus ~20x from the compiler hoisting repeated identical calls entirely
+    out of the loop, caught by checking the disassembly for the function's actual presence). But
+    `bench/typed_elementwise.aer`'s *interpreted, end-to-end* run (16,384 elements × 5,000 passes,
+    each pass allocating two fresh result arrays) showed only a ~2% difference between the portable
+    default build and `ARCH_FLAGS=-mcpu=native` on the Pi — VM dispatch and per-call array
+    allocation/GC pressure dominate the total cost at this scale, diluting the vectorized loop's own
+    contribution to a small fraction of each call. The win is real but workload-shaped: it matters
+    most for larger, compute-bound (not memory-bandwidth-bound — the benefit also vanishes for arrays
+    much bigger than cache, confirmed separately) elementwise work relative to the fixed per-call
+    interpreter overhead, not for many small operations. No JIT: unchanged, out of scope for this
+    session's work.
 - **No OS-thread parallelism at the language level, by design.** A `VM`'s registers/call-stack are
   per-instance (proven by file-based `import`, which already runs each imported file in its own),
   but the GC-managed heap (`string_pool`/`array_pool`/etc., `vm.c`) is one set of pools shared by
