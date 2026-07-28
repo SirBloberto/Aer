@@ -560,32 +560,53 @@ default build, to keep the makefile small.
   tasks through this in small slices until each finishes or errors. True OS-thread parallelism
   would additionally require moving the pools from process-global statics into per-`VM` fields, a
   real but separable, larger refactor — not attempted.
-- **TODO: O(n²) minor-GC rescan of a large, repeatedly-grown array OR dict (found, not yet fixed).**
-  A remembered array or dict (promoted old, holding a young reference — `gc_barrier_array`/
-  `gc_barrier_dict`, vm.c) is scanned in full on *every subsequent minor GC*, for as long as it stays
-  remembered (entries are never proactively removed): `REMEMBERED_ARRAY` does
-  `for (j = 0; j < a->count; j++) worklist_push(...)`, `REMEMBERED_DICT` does the identical
-  `for (j = 0; j < map->count; j++) worklist_push(map->dense[j].payload)` (vm.c:355-390) — this is a
-  property of the general remembered-set mechanism, not specific to arrays. (`REMEMBERED_STRUCT` is
-  naturally immune: field count is fixed at struct definition, small, bounded by `MAX_STRUCT_FIELDS`.)
-  For a container built via many incremental insertions (`append()`, or repeated `dict[key] = value`
-  with new keys), each of the ~(N / minor_gc_threshold) minor GCs across construction rescans the
-  *entire current* contents, not just what's new since the last scan — total cost degrades to
-  roughly O(n²/threshold). Confirmed via `perf stat` on real hardware (a Raspberry Pi 4):
-  `bench/struct_array_scan.aer`'s own `make_particles(2_000_000)` setup phase — which runs *before*
-  the benchmark's own internal timer starts, so this was invisible to every prior session's own
-  "Took: Xs" comparisons — takes ~307 seconds alone, with IPC pinned at 0.45 (heavy, repetitive,
-  memory-bound rescanning), matching the predicted mechanism closely. (The dict case is unconfirmed
-  by a benchmark — every dict in the current bench suite is small/bounded — but the code path is
-  identical, so it's presumably exposed to the same risk at large-N.) The standard fix (delta-scan:
-  track a `last_scanned_count` per remembered container, push only the entries added since the last
-  scan, update after each scan) turns the pure-growth case from O(n²) to O(n) for both container
-  kinds, but needs care: `gc_barrier_array`/`gc_barrier_dict` are also the write barrier for
-  overwriting an *existing* entry with a new young value (`arr[i] = x`, or updating an existing dict
-  key) — a naive high-water-mark delta-scan would miss that case, so the real fix needs to distinguish
-  "grew via append/new-key" from "mutated an existing slot" (or track dirty ranges rather than just a
-  count), for both `AerArray` and `AerDict`. Deliberately not fixed yet — deferred pending a careful
-  design pass, given generational-GC correctness here has bitten this project more than once before.
+- **DONE: O(n²) minor-GC rescan of a large, repeatedly-grown array OR dict.** Fixed in two
+  separate, additive passes, since real profiling on the Pi found two distinct causes stacked on top
+  of each other, not one.
+  - **Pass 1 — card marking (`gc_barrier_array`/`gc_barrier_dict`, gc.c).** The remembered-set
+    replay for a promoted-old array/dict holding a young reference used to rescan its *entire*
+    current contents on every subsequent minor GC, for as long as it stayed remembered (entries are
+    never proactively removed) — `for (j = 0; j < a->count; j++) worklist_push(...)` regardless of
+    which indices actually changed. For a container built via many incremental insertions
+    (`append()`, or repeated `dict[key] = value` with new keys), each of the ~(N / minor_gc_threshold)
+    minor GCs across construction rescanned everything built so far, not just what's new — total cost
+    degraded to roughly O(n²/threshold). Fixed with a JVM/.NET-style write barrier: `AerArray`/
+    `AerDict` gained a lazily-allocated per-index dirty-bit array (`dirty_cards`), set only for the
+    exact index written; the remembered-set replay walks only dirty bits, then clears them.
+    `collection.insert`/`delete`/`sort` (which shift element-to-index correspondence) fall back to a
+    coarser `dirty_all` flag instead of tracking per-index state through a reorder. `REMEMBERED_STRUCT`
+    was never affected — field count is fixed at struct definition, small, bounded by
+    `MAX_STRUCT_FIELDS`. Verified via `tests/test_card_marking.aer` (scattered writes across two
+    separate rounds of further GC pressure, plus the `dirty_all` fallback paths).
+  - **Pass 2 — freeze the old generation during a minor mark phase (gc.c).** Card marking alone
+    didn't close the gap: a `perf record` flat profile of `bench/struct_array_scan.aer`'s
+    `make_particles(2_000_000)` setup phase, taken *after* card marking landed, still showed
+    `gc_collect` (38.24%) + `pool_clear_marks` (35.14%) + `pool_sweep` (15.94%) ≈ 90% of all cycles,
+    with the actual interpreter (`vm_run_slice`) at only 6.36%. Root cause: `mark_vm_roots`/
+    `mark_value` re-descended into every already-old object's full contents on *every* minor cycle,
+    regardless of card marking — card marking only sped up the *remembered-set replay*, not this
+    separate, unconditional root-tracing path, so a live old array reachable from a register was
+    still walked element-by-element every cycle. Fixed by threading a `minor` flag through
+    `worklist_push`: when tracing a minor cycle, an already-old cell is never pushed for recursion at
+    all — correct because the *only* legitimate old→young edge is a write that went through the
+    barrier, and that's exactly what the remembered-set replay (pass 1, above) already covers
+    separately. This in turn made it safe for `pool_clear_marks` to also skip old cells on a minor
+    cycle (their mark bit is never set or read there anymore), closing the loop. Re-profiling the
+    identical workload after this fix: total cycles for the same 2,000,000-particle/50-pass run
+    dropped from ~506 billion to ~225 billion (`perf record`'s own event count, same hardware, same
+    command) — a ~55% reduction — and total wall-clock (construction + benchmark) fell from the
+    original ~307-second construction-phase baseline to ~105 seconds of construction (~124s total
+    including the benchmark's own ~19s internal timer). GC-related symbols (`pool_clear_marks` +
+    `pool_sweep` + `gc_collect`) still account for the large majority of cycles on this specific
+    *worst-case* benchmark (a huge array of long-lived structs, repeatedly promoted and never
+    reclaimed) — `vm_run_slice`'s own share only grew because the *denominator* shrank, not because
+    GC work vanished. `bench/nbody.aer`, by contrast, shows 98%+ in `vm_run_slice` with no GC
+    symbols in the profile at all — the remaining GC cost here is real but workload-specific, not a
+    universal tax. Verified via a differential test (`tests/test_memory_gc.aer`, section 37): a value
+    written into an old container reachable *only* through another old container, where the inner one
+    gets its own independent write-barrier trigger after both are promoted — the case this specific
+    change makes newly relevant, since an old object's own children are no longer re-traced by the
+    ordinary mark phase at all.
 - **TODO: no small-string optimization — every `AerString` is a separate heap allocation.** Real
   `perf stat` hardware counters on a Raspberry Pi 4 (`bench/log_processing.aer`, string-interpolation-
   and `string.split`-heavy) showed data-cache misses outnumbering instruction-cache misses **140:1**
