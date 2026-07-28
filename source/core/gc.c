@@ -130,8 +130,17 @@ static bool value_has_cell(AerVal v) {
     }
 }
 
-static void worklist_push(VmHeap* heap, AerVal v) {
+static void worklist_push(VmHeap* heap, AerVal v, bool minor) {
     if (!value_has_cell(v)) return;
+    /* An old cell is frozen during a minor cycle: pool_sweep's young_only skip already presumes it
+       alive regardless of mark state, and the only legitimate old -> young edge (a write reaching it
+       through gc_barrier_array/struct/dict) is captured by the remembered set and replayed
+       separately in gc_collect's own `if (minor)` block below -- so there is nothing left for the
+       ordinary mark phase to find by recursing into an old object's own children here. This is what
+       makes it safe for pool_clear_marks/pool_sweep to also skip old cells during a minor cycle (see
+       their own comments, pool.c/pool.h): if nothing ever marks an old cell here, nothing needs to
+       unmark or sweep-check it either. */
+    if (minor && !value_is_young(heap, v)) return;
     MarkWorklist* wl = &heap->gc_worklist;
     if (wl->count >= wl->cap) {
         wl->cap   = wl->cap ? wl->cap * 2 : 256;
@@ -145,7 +154,7 @@ static void mark_function(VmHeap* heap, AerFunction* f) {
     pool_mark(&heap->function_pool, f);
 }
 
-static void mark_value(VmHeap* heap, AerVal v) {
+static void mark_value(VmHeap* heap, AerVal v, bool minor) {
     switch (aer_type(v)) {
         case TYPE_STRING:
             pool_mark(&heap->string_pool, aer_as_string(v));   /* a leaf — data owns no other Values */
@@ -154,7 +163,7 @@ static void mark_value(VmHeap* heap, AerVal v) {
             AerArray* a = aer_as_array(v);
             if (!pool_mark(&heap->array_pool, a)) {
                 for (unsigned int i = 0; i < a->count; i++)
-                    worklist_push(heap, a->items[i]);
+                    worklist_push(heap, a->items[i], minor);
             }
             break;
         }
@@ -167,7 +176,7 @@ static void mark_value(VmHeap* heap, AerVal v) {
             if (!pool_mark(&heap->struct_pool, s)) {
                 for (unsigned int i = 0; i < s->shape->field_count; i++)
                     if (s->shape->field_types[i] == TYPE_ANY)
-                        worklist_push(heap, vm_struct_field_read(s, i));
+                        worklist_push(heap, vm_struct_field_read(s, i), minor);
             }
             break;
         }
@@ -175,7 +184,7 @@ static void mark_value(VmHeap* heap, AerVal v) {
             if (!pool_mark(&heap->dict_pool, aer_as_dict(v))) {
                 HashTable* map = &aer_as_dict(v)->map;
                 for (unsigned int i = 0; i < map->count; i++)
-                    worklist_push(heap, map->dense[i].payload);
+                    worklist_push(heap, map->dense[i].payload, minor);
                 /* Keys are plain owned char*, not Values — nothing to push. */
             }
             break;
@@ -194,8 +203,8 @@ static void mark_value(VmHeap* heap, AerVal v) {
         case TYPE_RESULT: {
             AerResult* r = aer_as_result(v);
             if (!pool_mark(&heap->result_pool, r)) {
-                worklist_push(heap, r->value);
-                worklist_push(heap, r->err);
+                worklist_push(heap, r->value, minor);
+                worklist_push(heap, r->err, minor);
             }
             break;
         }
@@ -204,34 +213,34 @@ static void mark_value(VmHeap* heap, AerVal v) {
     }
 }
 
-static void mark_drain(VmHeap* heap) {
+static void mark_drain(VmHeap* heap, bool minor) {
     MarkWorklist* wl = &heap->gc_worklist;
     while (wl->count > 0)
-        mark_value(heap, wl->items[--wl->count]);
+        mark_value(heap, wl->items[--wl->count], minor);
 }
 
 /* Pushes every live root in vm's own heap -- vm's stack/call-frame registers only, now that each
    VM collects only itself (no more cross-VM fan-out, see gc_collect). */
-static void mark_vm_roots(VmHeap* heap, VM* vm) {
+static void mark_vm_roots(VmHeap* heap, VM* vm, bool minor) {
     for (int i = 0; i < vm->stack_top; i++)
-        worklist_push(heap, vm->stack[i]);
+        worklist_push(heap, vm->stack[i], minor);
 
     /* Scanned unconditionally (zero-init decodes as harmless TYPE_NULL), bounded to the live call
        chain (0..call_depth, by each frame's real frame_size) -- a blanket scan over every frame was
        a measured cache-miss hotspot, and frames past call_depth are already dead. */
     for (int f = 0; f <= vm->call_depth; f++)
         for (unsigned int i = 0; i < vm->call_stack[f].frame_size; i++)
-            worklist_push(heap, vm->call_stack[f].registers[i]);
+            worklist_push(heap, vm->call_stack[f].registers[i], minor);
 }
 
 /* Chunk.pool and every Shape's field_defaults are permanent roots, walked fresh every cycle since mark bits are cleared each sweep. */
-static void mark_chunk_roots(VmHeap* heap, Chunk* chunk) {
+static void mark_chunk_roots(VmHeap* heap, Chunk* chunk, bool minor) {
     for (unsigned int i = 0; i < chunk->pool_count; i++)
-        worklist_push(heap, chunk->pool[i]);
+        worklist_push(heap, chunk->pool[i], minor);
     for (unsigned int s = 0; s < chunk->shape_count; s++) {
         Shape* shape = chunk->shapes[s];
         for (unsigned int i = 0; i < shape->field_count; i++)
-            worklist_push(heap, shape->field_defaults[i]);
+            worklist_push(heap, shape->field_defaults[i], minor);
     }
 }
 
@@ -273,18 +282,20 @@ void gc_finalize_all_pools(VmHeap* heap) {
    OWN gc_maybe_collect fires). */
 static void gc_collect(VM* vm, bool minor) {
     VmHeap* heap = &vm->heap;
-    /* Must run before marking every cycle: a minor sweep never visits old cells, so without this an old cell's mark bit would stay set forever and never be re-traced. */
-    pool_clear_marks(&heap->string_pool);
-    pool_clear_marks(&heap->array_pool);
-    pool_clear_marks(&heap->dict_pool);
-    pool_clear_marks(&heap->function_pool);
-    pool_clear_marks(&heap->struct_pool);
-    pool_clear_marks(&heap->packed_array_pool);
-    pool_clear_marks(&heap->typed_array_pool);
-    pool_clear_marks(&heap->result_pool);
+    /* Must run before marking every cycle. With young_only (minor), old cells are skipped entirely --
+       correct because the mark phase itself now never sets an old cell's mark bit during a minor
+       cycle either (worklist_push's own skip, above), so there is nothing to clear for them. */
+    pool_clear_marks(&heap->string_pool, minor);
+    pool_clear_marks(&heap->array_pool, minor);
+    pool_clear_marks(&heap->dict_pool, minor);
+    pool_clear_marks(&heap->function_pool, minor);
+    pool_clear_marks(&heap->struct_pool, minor);
+    pool_clear_marks(&heap->packed_array_pool, minor);
+    pool_clear_marks(&heap->typed_array_pool, minor);
+    pool_clear_marks(&heap->result_pool, minor);
 
-    mark_vm_roots(heap, vm);
-    mark_chunk_roots(heap, vm->chunk);
+    mark_vm_roots(heap, vm, minor);
+    mark_chunk_roots(heap, vm->chunk, minor);
 
     if (minor) {
         /* Remembered old objects, traced as extra roots (a minor pass skips old cells otherwise). A
@@ -314,7 +325,7 @@ static void gc_collect(VM* vm, bool minor) {
                        it), kept anyway rather than assumed. */
                     AerArray* a = (AerArray*)e->ptr;
                     if (a->dirty_all || !a->dirty_cards) {
-                        for (unsigned int j = 0; j < a->count; j++) worklist_push(heap, a->items[j]);
+                        for (unsigned int j = 0; j < a->count; j++) worklist_push(heap, a->items[j], minor);
                     } else {
                         for (unsigned int byte_i = 0; byte_i < a->dirty_cards_bytes; byte_i++) {
                             unsigned char byte = a->dirty_cards[byte_i];
@@ -322,7 +333,7 @@ static void gc_collect(VM* vm, bool minor) {
                             for (unsigned int bit = 0; bit < 8; bit++) {
                                 if (!(byte & (1u << bit))) continue;
                                 unsigned int idx = byte_i * 8 + bit;
-                                if (idx < a->count) worklist_push(heap, a->items[idx]);
+                                if (idx < a->count) worklist_push(heap, a->items[idx], minor);
                             }
                         }
                     }
@@ -338,7 +349,7 @@ static void gc_collect(VM* vm, bool minor) {
                     AerStruct* s = (AerStruct*)e->ptr;
                     for (unsigned int j = 0; j < s->shape->field_count; j++)
                         if (s->shape->field_types[j] == TYPE_ANY)
-                            worklist_push(heap, vm_struct_field_read(s, j));
+                            worklist_push(heap, vm_struct_field_read(s, j), minor);
                     break;
                 }
                 case REMEMBERED_DICT: {
@@ -347,7 +358,7 @@ static void gc_collect(VM* vm, bool minor) {
                     HashTable* map = &d->map;
                     if (d->dirty_all || !d->dirty_cards) {
                         for (unsigned int j = 0; j < map->count; j++)
-                            worklist_push(heap, map->dense[j].payload);
+                            worklist_push(heap, map->dense[j].payload, minor);
                     } else {
                         for (unsigned int byte_i = 0; byte_i < d->dirty_cards_bytes; byte_i++) {
                             unsigned char byte = d->dirty_cards[byte_i];
@@ -355,7 +366,7 @@ static void gc_collect(VM* vm, bool minor) {
                             for (unsigned int bit = 0; bit < 8; bit++) {
                                 if (!(byte & (1u << bit))) continue;
                                 unsigned int idx = byte_i * 8 + bit;
-                                if (idx < map->count) worklist_push(heap, map->dense[idx].payload);
+                                if (idx < map->count) worklist_push(heap, map->dense[idx].payload, minor);
                             }
                         }
                     }
@@ -369,7 +380,7 @@ static void gc_collect(VM* vm, bool minor) {
         heap->remembered_count = kept;
     }
 
-    mark_drain(heap);
+    mark_drain(heap, minor);
 
     pool_sweep(&heap->string_pool,   minor, free_string);
     pool_sweep(&heap->array_pool,    minor, free_array);

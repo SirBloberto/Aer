@@ -218,4 +218,42 @@ assert(gc_ref_holder.ref[0] == 1 and gc_ref_holder.ref[1] == 2 and gc_ref_holder
 assert(gc_ref_holder.tag == "holder",
        "the same struct's typed (raw) field is untouched by the same collections")
 
+# ------------------------------------------------------------------ #
+# 37. Old-generation-frozen minor mark phase — a two-level old->old->young #
+#     chain, where only the INNER container ever gets its own write        #
+#     barrier trigger                                                      #
+# ------------------------------------------------------------------ #
+
+# A minor cycle's mark phase now skips recursing into an already-old
+# object entirely (worklist_push, gc.c) rather than re-tracing its full
+# contents every cycle -- relying completely on the remembered set for any
+# old->young edge. The one case that change could get wrong: an old
+# container (gc_outer) reachable from a live root, holding a reference to
+# a SECOND old container (gc_inner) that is never itself directly reachable
+# from a root except through gc_outer. If gc_inner later gets its own
+# write-barrier trigger (a young value written into it after ITS OWN
+# promotion), that value must still be found via gc_inner's own remembered-
+# set entry -- gc_outer being "frozen" (never recursed into by the ordinary
+# mark phase) must not prevent gc_inner's independent barrier from working.
+gc_inner = []
+gc_outer = [gc_inner]
+
+gc_churn6 = []
+for i in 0..3000:
+    collection.append(gc_churn6, [i, "x" + string(i)])
+
+# Both gc_inner and gc_outer are old by now. Write into gc_inner (through
+# gc_outer's own reference to it, not the original local) -- this is
+# gc_inner's OWN write barrier firing, independent of gc_outer's.
+collection.append(gc_outer[0], "written into inner after both promoted")
+
+gc_churn7 = []
+for i in 0..3000:
+    collection.append(gc_churn7, [i, "y" + string(i)])
+
+assert(length(gc_outer[0]) == 1 and gc_outer[0][0] == "written into inner after both promoted",
+       "a value written into an old container two levels deep (reachable only through another old container) survives further collections")
+assert(gc_inner[0] == "written into inner after both promoted",
+       "the original gc_inner reference sees the same write, confirming gc_outer[0] and gc_inner are still the same array")
+
 print("test_memory_gc.aer: all assertions passed.")

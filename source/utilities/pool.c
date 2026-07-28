@@ -114,12 +114,21 @@ void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell)) {
     }
 }
 
-void pool_clear_marks(Pool* p) {
+void pool_clear_marks(Pool* p, bool young_only) {
     for (unsigned int i = 0; i < p->slab_count; i++) {
         unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
         for (unsigned int j = 0; j < count; j++) {
             char* cell = p->slabs[i] + (size_t)j * p->stride;
-            *(unsigned char*)cell &= (unsigned char)~POOL_MARKED;
+            unsigned char* state = (unsigned char*)cell;
+            /* An old cell's mark bit is never set OR read during a minor cycle in the first place
+               (the mark phase itself now skips descending into old objects at all, see
+               worklist_push's own comment, gc.c; pool_sweep's young_only path never consults an old
+               cell's mark bit either) -- so a minor clear_marks has nothing to do for old cells,
+               and large old pools (the common case for anything long-lived) stop costing anything
+               here at all. Only a major cycle's full trace can set an old cell's mark bit, so only
+               a major clear_marks needs to clear it. */
+            if (young_only && (*state & POOL_OLD)) continue;
+            *state &= (unsigned char)~POOL_MARKED;
         }
     }
 }

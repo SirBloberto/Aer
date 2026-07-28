@@ -64,7 +64,11 @@ void  pool_mark_remembered(Pool* p, void* cell);
 /* Walks every carved-out cell; free-listed cells are always skipped, and if young_only, old cells too (a minor collection assumes old cells are live). Unmarked cells go to on_free then the free-list; marked cells are promoted with their mark bit cleared for next cycle. */
 void  pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell));
 
-/* Clears every cell's mark bit, young and old alike, with no other side effect — must run before every mark phase, since a minor sweep skips old cells and would otherwise leave their mark bit stuck forever. */
-void  pool_clear_marks(Pool* p);
+/* Clears every cell's mark bit -- with young_only, skips old cells entirely (their mark bit is
+   never set OR read during a minor cycle in the new mark-phase design, see worklist_push's own
+   comment, gc.c, so a minor cycle has nothing to clear for them); without it (a major cycle),
+   clears everything, since a major trace can mark an old cell and its sweep needs to see a clean
+   slate. Must run before every mark phase either way. */
+void  pool_clear_marks(Pool* p, bool young_only);
 
 #endif
