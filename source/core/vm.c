@@ -1039,26 +1039,26 @@ static inline void vm_typed_elem_write(unsigned char* slot, TypedArrayElemKind k
    auto-vectorizer can turn into real SIMD (NEON on ARM, SSE/AVX on x86) with zero hand-written
    intrinsics, portable to whatever the build target supports. Confirmed on real hardware (Pi 4,
    armhf) before writing this: plain -O2 (this project's normal build flag) does NOT vectorize any
-   of these regardless of kind; -O3 alone vectorizes the two integer kinds but not the float ones
-   (NEON's float SIMD isn't strictly IEEE-754-compliant, so GCC won't use it without an explicit
-   opt-in); adding fast-math (scoped to just the float32 functions below via a per-function
-   attribute, not a global build flag -- see the attribute's own comment) then vectorizes those too.
-   Measured ~2.2-2.4x on cache-resident arrays; the win vanishes for arrays much larger than cache
-   (the loop becomes memory-bandwidth-bound, where no amount of extra ALU throughput helps) --
-   still correct at any size, just not accelerated. float64 does not vectorize on this specific
-   32-bit ARM target at all (no double-precision NEON lanes) even with fast-math; kept as a plain
+   of these regardless of kind, and -O3 alone only vectorizes the two integer kinds, not the float
+   ones (NEON's float SIMD isn't strictly IEEE-754-compliant, so GCC won't use it without an
+   explicit opt-in). Both problems are solved the same way: a per-function `optimize` attribute
+   (confirmed to work standalone, overriding the file's own global -O2, with no global build-flag
+   change at all) requesting O3-level vectorization on every one of these functions specifically,
+   plus fast-math on top for the two float32 ones only. fast-math changes rounding/NaN/associativity
+   guarantees, so scoping it to exactly these two functions keeps every other float operation in the
+   language under strict IEEE 754 semantics, exactly as before this feature existed. Measured
+   ~2.2-2.4x on cache-resident arrays; the win vanishes for arrays much larger than cache (the loop
+   becomes memory-bandwidth-bound, where no amount of extra ALU throughput helps) -- still correct
+   at any size, just not accelerated. float64 does not vectorize on this specific 32-bit ARM target
+   at all (no double-precision NEON lanes) even with fast-math; kept as a plain (still O3-attributed)
    loop since other targets (x86-64, AArch64) may still auto-vectorize it, and it's no worse than
    before either way. */
 #define AER_TYPED_ELEMENTWISE(name, ctype, op_expr) \
-    static void name(ctype* restrict c, const ctype* restrict a, const ctype* restrict b, unsigned int n) { \
+    static __attribute__((optimize("O3","tree-vectorize"))) void name(ctype* restrict c, const ctype* restrict a, const ctype* restrict b, unsigned int n) { \
         for (unsigned int i = 0; i < n; i++) c[i] = op_expr; \
     }
-/* fast-math changes rounding/NaN/associativity guarantees -- scoping it to only these two
-   functions (via GCC's per-function optimize attribute, confirmed to work standalone without any
-   global -ffast-math flag) keeps every other float operation in the language under strict IEEE 754
-   semantics, exactly as before this feature existed. */
 #define AER_TYPED_ELEMENTWISE_FASTMATH(name, ctype, op_expr) \
-    static __attribute__((optimize("fast-math"))) void name(ctype* restrict c, const ctype* restrict a, const ctype* restrict b, unsigned int n) { \
+    static __attribute__((optimize("O3","tree-vectorize","fast-math"))) void name(ctype* restrict c, const ctype* restrict a, const ctype* restrict b, unsigned int n) { \
         for (unsigned int i = 0; i < n; i++) c[i] = op_expr; \
     }
 
