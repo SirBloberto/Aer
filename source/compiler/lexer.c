@@ -209,11 +209,9 @@ static void emit_real(double real, unsigned int length) {
 }
 
 static void emit_string_token(TokenType type, unsigned int length) {
-    /* Copies into owned memory (AerString always owns its data) — shell() (REPL mode) frees the previous line's buffer on every call, which would otherwise dangle earlier tokens. */
-    char* buf = xmalloc(length + 1);
-    memcpy(buf, current->buffer, length);
-    buf[length] = '\0';
-    token.value = aer_make_string(buf, length);
+    /* Must copy, not alias current->buffer -- shell() (REPL mode) frees the previous line's buffer
+       on every call, which would otherwise dangle earlier tokens. */
+    token.value = aer_make_string_copy(current->buffer, length);
     emit(type, length);
 }
 
@@ -364,11 +362,7 @@ static void lex_string() {
     }
     if (*current->buffer != '"') { error_at("Unterminated string"); return; }
     unsigned int length = (unsigned int)(current->buffer - start);
-    /* Copies — see emit_string_token's comment on why AerString always owns its data. */
-    char* buf = xmalloc(length + 1);
-    memcpy(buf, start, length);
-    buf[length] = '\0';
-    token.value = aer_make_string(buf, length);
+    token.value = aer_make_string_copy(start, length);
     token.type = TOKEN_STRING;
     current->buffer++; /* skip closing " */
 }
@@ -382,11 +376,7 @@ static void lex_multiline_string() {
         current->buffer++;
     if (*current->buffer != '"') { error_at("Unterminated multi-line string"); return; }
     unsigned int length = (unsigned int)(current->buffer - start);
-    /* Copies — see emit_string_token's comment on why AerString always owns its data. */
-    char* buf = xmalloc(length + 1);
-    memcpy(buf, start, length);
-    buf[length] = '\0';
-    token.value = aer_make_string(buf, length);
+    token.value = aer_make_string_copy(start, length);
     token.type = TOKEN_STRING;
     current->buffer += 3; /* skip closing """ */
 }

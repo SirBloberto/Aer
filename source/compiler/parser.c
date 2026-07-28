@@ -1082,10 +1082,7 @@ static unsigned int pool_escaped_string(Chunk* c, const char* s, unsigned int le
         len = 0;
     }
     unsigned int out = decode_string_escapes(s, len, buf);
-    char* owned = xmalloc((size_t)out + 1);
-    memcpy(owned, buf, out);
-    owned[out] = '\0';
-    AerVal sv = aer_make_string(owned, out);
+    AerVal sv = aer_make_string_copy(buf, out);
     return chunk_add_pool(c, sv);
 }
 
@@ -1226,10 +1223,7 @@ static int parse_string_literal(Chunk* c) {
     }
 
     if (result < 0) {
-        /* A fresh, owned empty buffer, not a static literal. */
-        char* empty_buf = xmalloc(1);
-        empty_buf[0] = '\0';
-        result = (int)chunk_add_pool(c, aer_make_string(empty_buf, 0)) | RK_CONST_FLAG;
+        result = (int)chunk_add_pool(c, aer_make_string_copy("", 0)) | RK_CONST_FLAG;
     }
 
     lex();
@@ -3253,9 +3247,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
    validation rather than duplicating it. Shared by `raise`'s own Result construction. */
 static void emit_result_call_and_return(Chunk* c, int reg_base) {
     reg_free(1);   /* the err register — only dest (== reg_base) stays live past the call, same convention parse_builtin_call's own arg_count>1 case follows */
-    char* name_buf = xmalloc(7);
-    memcpy(name_buf, "Result", 7);
-    unsigned int name_idx = chunk_add_pool(c, aer_make_string(name_buf, 6));
+    unsigned int name_idx = chunk_add_pool(c, aer_make_string_copy("Result", 6));
     chunk_emit(c, PACK3(OP_CALL_BUILTIN, reg_base, reg_base, 2));
     chunk_emit(c, (uint32_t)name_idx);
     chunk_emit(c, (uint32_t)CALL_BUILTIN_RESULT);

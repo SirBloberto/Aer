@@ -9,6 +9,11 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
         if (aer_type(a) != TYPE_STRING) { error("string.upper() requires a string"); vm_stack_push(vm, aer_null()); return true; }
         AerString* as = aer_as_string(a);
         unsigned int len = as->length;
+        if (len <= AER_STRING_INLINE_MAX) {
+            char stackbuf[AER_STRING_INLINE_MAX + 1];
+            for (unsigned int i = 0; i < len; i++) stackbuf[i] = (char)toupper((unsigned char)as->data[i]);
+            vm_stack_push(vm, aer_make_string_copy(stackbuf, len)); return true;
+        }
         char* buf = xmalloc(len + 1);
         for (unsigned int i = 0; i < len; i++) buf[i] = (char)toupper((unsigned char)as->data[i]);
         buf[len] = '\0';
@@ -19,6 +24,11 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
         if (aer_type(a) != TYPE_STRING) { error("string.lower() requires a string"); vm_stack_push(vm, aer_null()); return true; }
         AerString* as = aer_as_string(a);
         unsigned int len = as->length;
+        if (len <= AER_STRING_INLINE_MAX) {
+            char stackbuf[AER_STRING_INLINE_MAX + 1];
+            for (unsigned int i = 0; i < len; i++) stackbuf[i] = (char)tolower((unsigned char)as->data[i]);
+            vm_stack_push(vm, aer_make_string_copy(stackbuf, len)); return true;
+        }
         char* buf = xmalloc(len + 1);
         for (unsigned int i = 0; i < len; i++) buf[i] = (char)tolower((unsigned char)as->data[i]);
         buf[len] = '\0';
@@ -32,11 +42,7 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
         unsigned int start = 0, end = as->length;
         while (start < end && isspace((unsigned char)data[start]))     start++;
         while (end > start && isspace((unsigned char)data[end - 1]))   end--;
-        unsigned int n = end - start;
-        char* buf = xmalloc(n + 1);
-        memcpy(buf, data + start, n);
-        buf[n] = '\0';
-        vm_stack_push(vm, aer_make_string(buf, n)); return true;
+        vm_stack_push(vm, aer_make_string_copy(data + start, end - start)); return true;
     }
     if (fn_id == FN_STRING_CONTAINS && arg_count == 2) {
         AerVal needle = vm_stack_pop(vm); AerVal hay = vm_stack_pop(vm);
@@ -70,14 +76,11 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
             bool at_sep = i + seplen <= slen && memcmp(s + i, sep, seplen) == 0;
             if (at_sep || i == slen) {
                 unsigned int n = i - seg_start;
-                char* buf = xmalloc(n + 1);
-                memcpy(buf, s + seg_start, n);
-                buf[n] = '\0';
                 if (r->count >= r->capacity) {
                     r->capacity *= 2;
                     r->items = xrealloc(r->items, sizeof(AerVal) * r->capacity);
                 }
-                r->items[r->count++] = aer_make_string(buf, n);
+                r->items[r->count++] = aer_make_string_copy(s + seg_start, n);
                 if (i == slen) break;
                 i += seplen;
                 seg_start = i;
