@@ -1034,6 +1034,26 @@ static inline void vm_typed_elem_write(unsigned char* slot, TypedArrayElemKind k
     }
 }
 
+/* Shared by every specialized packed-array raw field opcode below (GET/SET/COMPOUND x int/real/
+   int32/float32, 12 handlers in all) -- each one only differs in which raw slot array it reads/
+   writes and at what width, never in how the element's address is resolved. always_inline: this is
+   dispatch-loop code, not a real call boundary -- confirmed codegen-equivalent to the prior
+   hand-inlined form via before/after benchmarks (see ARCHITECTURE.md). Returns NULL, having already
+   reported the error, on any failure -- every call site's existing `if (!elem) DISPATCH();` matches
+   the unfused form's own `error(...); DISPATCH();` contract exactly. */
+static inline __attribute__((always_inline)) unsigned char* vm_packed_raw_elem(AerVal obj, AerVal* idx, unsigned int foffset) {
+    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); return NULL; }
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); return NULL; }
+    int64_t i = aer_as_int(*idx);
+    if (i < 0) i += (int64_t)pa->count;
+    if (i < 0 || (uint64_t)i >= pa->count) {
+        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+        return NULL;
+    }
+    return pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+}
+
 /* Elementwise add/sub/mul on two same-kind, same-length typed arrays. Each (kind, op) pair is its own
    tight, branch-free loop over flat, contiguous, uniformly-typed memory -- exactly the shape GCC's
    auto-vectorizer can turn into real SIMD (NEON on ARM, SSE/AVX on x86) with zero hand-written
@@ -2845,18 +2865,8 @@ lbl_index_field_get_raw_int: {
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerVal obj = registers[arr_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned int element_size = pa->shape->instance_bytes;
-    unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
     memcpy(&raw_ints[dest_slot], elem, 8);
     DISPATCH();
 }
@@ -2867,18 +2877,8 @@ lbl_index_field_get_raw_real: {
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerVal obj = registers[arr_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned int element_size = pa->shape->instance_bytes;
-    unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
     memcpy(&raw_reals[dest_slot], elem, 8);
     DISPATCH();
 }
@@ -2914,17 +2914,8 @@ lbl_index_field_get_raw_int32: {
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerVal obj = registers[arr_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
     raw_ints[dest_slot] = vm_raw_read_int32(elem);
     DISPATCH();
 }
@@ -2935,17 +2926,8 @@ lbl_index_field_get_raw_float32: {
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerVal obj = registers[arr_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
     raw_reals[dest_slot] = vm_raw_read_float32(elem);
     DISPATCH();
 }
@@ -2978,18 +2960,8 @@ lbl_index_field_set_raw_int: {
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
-    AerVal obj = registers[obj_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned int element_size = pa->shape->instance_bytes;
-    unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
+    if (!elem) DISPATCH();
     memcpy(elem, &raw_ints[src_slot], 8);
     DISPATCH();
 }
@@ -3000,18 +2972,8 @@ lbl_index_field_set_raw_real: {
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
-    AerVal obj = registers[obj_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned int element_size = pa->shape->instance_bytes;
-    unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
+    if (!elem) DISPATCH();
     memcpy(elem, &raw_reals[src_slot], 8);
     DISPATCH();
 }
@@ -3047,17 +3009,8 @@ lbl_index_field_set_raw_int32: {
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
-    AerVal obj = registers[obj_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
+    if (!elem) DISPATCH();
     vm_raw_write_int32(elem, raw_ints[src_slot]);
     DISPATCH();
 }
@@ -3068,17 +3021,8 @@ lbl_index_field_set_raw_float32: {
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
-    AerVal obj = registers[obj_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
+    if (!elem) DISPATCH();
     vm_raw_write_float32(elem, raw_reals[src_slot]);
     DISPATCH();
 }
@@ -3163,18 +3107,8 @@ lbl_index_field_compound_raw_int: {
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
-    AerVal obj = registers[arr_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned int element_size = pa->shape->instance_bytes;
-    unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
     int64_t lhs; memcpy(&lhs, elem, 8);
     int64_t rhs = raw_ints[rhs_slot];
     int64_t result;
@@ -3195,18 +3129,8 @@ lbl_index_field_compound_raw_real: {
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
-    AerVal obj = registers[arr_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned int element_size = pa->shape->instance_bytes;
-    unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
     double lhs; memcpy(&lhs, elem, 8);
     double rhs = raw_reals[rhs_slot];
     double result;
@@ -3273,17 +3197,8 @@ lbl_index_field_compound_raw_int32: {
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
-    AerVal obj = registers[arr_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
     int64_t lhs = vm_raw_read_int32(elem);
     int64_t rhs = raw_ints[rhs_slot];
     int64_t result;
@@ -3304,17 +3219,8 @@ lbl_index_field_compound_raw_float32: {
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
-    AerVal obj = registers[arr_reg];
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); DISPATCH(); }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) { error("Array index must be an integer"); DISPATCH(); }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        DISPATCH();
-    }
-    unsigned char* elem = pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+    unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
     double lhs = vm_raw_read_float32(elem);
     double rhs = raw_reals[rhs_slot];
     double result;

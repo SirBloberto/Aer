@@ -580,6 +580,33 @@ footprint for cache locality on structures already small enough that the differe
 a cache-line boundary in practice; the byte savings matter most for GC scan cost at scale (more live
 cells fit in cache per pass) rather than any single access.
 
+### 5.10 De-duplicating the specialized packed-array field opcodes
+
+The 12 packed-array handlers among the shape-specialization opcode family (`OP_INDEX_FIELD_GET_RAW_
+INT`/`REAL`/`INT32`/`FLOAT32`, their `SET` and `COMPOUND` counterparts) each independently
+re-derived the same element address: type-check the container, type-check the index, resolve a
+negative index, bounds-check it, then `pa->data + i * pa->shape->instance_bytes + foffset`. Measured
+at ~90% pairwise-identical between the `{int,real}` and `{int32,float32}` variants of each -- the
+same shape §5's `RAW_ARITH_*` macro family (`vm.c`) already deduplicates for the arithmetic opcodes,
+just never extended to this specific family.
+
+Factored into one `static inline __attribute__((always_inline))` helper, `vm_packed_raw_elem`,
+returning the resolved element pointer (or `NULL`, having already reported the error, matching every
+call site's existing `error(...); DISPATCH();` contract). `always_inline` rather than a macro because
+the 12 call sites decode their opcode words differently from each other (GET/SET/COMPOUND each pack
+their fields into different word layouts) -- only the address-resolution tail is identical, so a
+shared inline function reads more clearly here than threading that variation through macro
+parameters. Confirmed this doesn't reintroduce the real per-dispatch call cost §5.6's `vm_binary`
+split explicitly measured against: `objdump -d` shows zero `call`/`bl` instructions to
+`vm_packed_raw_elem` in either the x86-64 or ARM binary -- fully inlined at every site, as
+`always_inline` requires.
+
+~108 lines removed from `vm.c` (3948 → 3854), the single largest concentration of duplicated code in
+the file. Verified: full four-suite regression + ASAN clean on both targets (`test_packed_arrays.aer`
+specifically). Wall-clock on `nbody_large_packed.aer` (the heaviest user of this opcode family)
+measured statistically indistinguishable before/after (~4.2-4.3s either way, 3 runs each) — expected
+for a change verified codegen-identical rather than assumed to be.
+
 ---
 
 ## 6. Known architectural limitations (current, unresolved)
