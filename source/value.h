@@ -84,6 +84,14 @@ struct AerArray {
     Shape*       shape;   /* NULL for ordinary arrays; set for struct instances */
     unsigned char* dirty_cards;
     unsigned int   dirty_cards_bytes;
+    /* [dirty_min_byte, dirty_max_byte) bounds the actual range of set bits since the last clear --
+       mark_card_dirty (gc.c) maintains this on every write. Without it, gc_collect's card-scan (and
+       its post-scan memset) has to walk all of dirty_cards_bytes every cycle regardless of how few
+       bits are actually set, which is exactly as O(current size) as the whole-array fallback it was
+       meant to replace: a pure-growth "build a huge array via many appends" pattern still pays
+       O(n^2) total, just with a cheaper per-byte constant. dirty_min_byte == (unsigned int)-1 means
+       "nothing dirty" (dirty_max_byte stays a harmless 0, making the scan's < bound naturally empty). */
+    unsigned int   dirty_min_byte, dirty_max_byte;
 };
 _Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 

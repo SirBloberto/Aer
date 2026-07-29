@@ -20,6 +20,9 @@ struct AerDict {
     unsigned int   dirty_cards_bytes;
     HashTable      map;
     unsigned char* dirty_cards;
+    /* Bounds the actual set-bit range since the last clear -- see AerArray's own comment (value.h)
+       for why this is needed on top of dirty_cards itself. */
+    unsigned int   dirty_min_byte, dirty_max_byte;
 };
 _Static_assert(offsetof(struct AerDict, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 

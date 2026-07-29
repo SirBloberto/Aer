@@ -712,10 +712,57 @@ Measured on the Pi, 5 runs each side: `dict_bench.aer` — **~17% fewer instruct
 `mandelbrot`, `fib_bench`, `struct_array_scan`) measured flat, as expected — this path is never on
 their hot loop. Full four-suite regression passed on both Windows and the Pi.
 
+### 5.14 Bounding the remembered-set card scan to the actually-dirtied range
+
+`gc_collect`'s minor-cycle replay of `REMEMBERED_ARRAY`/`REMEMBERED_DICT` entries (§ card marking,
+`gc_barrier_array`/`gc_barrier_dict`, `gc.c`) is documented as turning "a pure-growth 'build a huge
+array via many appends' pattern into true O(n) total instead of O(n^2)" — true for which *values*
+get pushed to the mark worklist, but not for the scan that finds them: the loop walked
+`[0, dirty_cards_bytes)` every single cycle, and the post-scan clear `memset`'d the same full range,
+both regardless of how few bits had actually been set since the last clear. That's still O(current
+container size) of pure bit-checking per minor cycle even when exactly one new element was appended
+since the last one — the same shape of bug the card scheme was built to eliminate, just with a
+cheaper per-byte constant than the original whole-array rescan.
+
+Fixed by tracking `[dirty_min_byte, dirty_max_byte)` alongside the existing bitmap (`AerArray`/
+`AerDict`, both structs) — `mark_card_dirty` (`gc.c`) widens the bound on every write, the scan and
+the clear both use it instead of `[0, dirty_cards_bytes)`, and it resets to empty
+(`dirty_min_byte = (unsigned int)-1, dirty_max_byte = 0`) after every replay. Verified against
+`test_card_marking.aer` and the full four-suite regression on Windows and the Pi.
+
+Measured impact on current benchmarks is **negligible** — `dict_bench.aer` (200k inserts) and
+`struct_array_scan.aer` (2M appends) both measured flat to within noise. Root-caused why:
+`struct_array_scan.aer`'s construction phase (`perf report`, ~79% of cycles in `gc_collect`) turns
+out to be dominated by a *different*, unfixed O(n)-per-cycle cost one layer down — see §6's new
+entry. `dict_bench.aer`'s single dict tops out at 200k entries, too small for the now-fixed
+per-cycle card-scan cost to have been a visible fraction of its total even before this fix. Kept
+anyway: the code's own comment claimed this was already O(n) total, and it wasn't -- a container
+with sustained post-promotion append/update churn at larger scale, or with a smaller minor-GC
+threshold triggering more frequent cycles, would have hit the same quadratic wall this closes.
+
 ---
 
 ## 6. Known architectural limitations (current, unresolved)
 
+- **`pool_sweep`'s own slab loop is still O(total slab count) per minor cycle, not O(changed
+  slabs).** Root-caused via `perf annotate` on `struct_array_scan.aer` (2M-particle build, ~79% of
+  all cycles inside `gc_collect`): the hot instructions are `pool_sweep`'s `if (*state & POOL_FREE)`
+  and `pool_mark`'s `if (*state & POOL_MARKED)` — both inlined into `gc_collect` under `-flto`
+  (the third instance this session of that specific LTO-inlining surprise, after §5.12's frame-bloat
+  finding). `slab_young_count[i] == 0` already lets `pool_sweep` (`pool.c`) skip the expensive
+  per-cell scan for a fully-old slab in O(1) — but the *outer* `for (i = 0; i < p->slab_count; i++)`
+  loop still visits every slab index just to read that one flag, every single minor cycle, exactly
+  the same shape of bug §5.14 fixed for the remembered-set card scan. With slab count growing
+  alongside a pure-append workload, this is O(n) of pure flag-checking per cycle — confirmed
+  independently of §5.14's fix (measured before *and* after, no change, since this is a different
+  loop one layer down). Diagnosed, not fixed: the correct general fix needs the same kind of
+  per-slab linked-list threading `slab_free_list`/`free_slab_head` already do for free cells (a
+  "slabs with young_count > 0" thread), which is more involved than it sounds — a slab's young count
+  can go from 0 back above 0 (a cell freed by `pool_sweep` gets reused by a later `pool_alloc`, which
+  always allocates "born young" — see `pool_alloc`'s own comment, pool.h), so it needs the same
+  bidirectional add/remove care as the existing free-list thread, not a simpler one-directional
+  watermark. Left for a dedicated pass rather than rushed alongside this session's other fixes,
+  given the correctness stakes of getting a core sweep-loop invariant wrong.
 - **RK9-decode cost is real and not eliminated.** The register-vs-constant flag test inside
   `vm_rk_ptr9` remains a measurable cost even after PGO (shrunk, not eliminated — same code shape
   under profiling). An RR-opcode-split (separate register-register and register-constant opcode

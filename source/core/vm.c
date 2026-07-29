@@ -823,6 +823,8 @@ static AerVal vm_default_value(VM* vm, AerVal dflt) {
         a->generation = 0;
         a->dirty_cards = NULL;
         a->dirty_cards_bytes = 0;
+        a->dirty_min_byte = (unsigned int)-1;
+        a->dirty_max_byte = 0;
         a->dirty_all = false;
         return aer_array_val(a);
     }
@@ -832,6 +834,8 @@ static AerVal vm_default_value(VM* vm, AerVal dflt) {
         d->map.pools = &vm->heap.dict_hash_pools;
         d->dirty_cards = NULL;
         d->dirty_cards_bytes = 0;
+        d->dirty_min_byte = (unsigned int)-1;
+        d->dirty_max_byte = 0;
         d->dirty_all = false;
         return aer_dict_val(d);
     }
@@ -1277,6 +1281,8 @@ AerArray* vm_new_array(void) {
        just a correctness nit. */
     a->dirty_cards = NULL;
     a->dirty_cards_bytes = 0;
+    a->dirty_min_byte = (unsigned int)-1;
+    a->dirty_max_byte = 0;
     a->dirty_all = false;
     return a;
 }
@@ -1292,6 +1298,8 @@ AerDict* vm_new_dict(void) {
        pointer would otherwise survive as garbage; see vm_new_array's identical reasoning. */
     d->dirty_cards = NULL;
     d->dirty_cards_bytes = 0;
+    d->dirty_min_byte = (unsigned int)-1;
+    d->dirty_max_byte = 0;
     d->dirty_all = false;
     return d;
 }
@@ -2411,6 +2419,8 @@ lbl_array_new: {
     a->generation = 0;
     a->dirty_cards = NULL;
     a->dirty_cards_bytes = 0;
+    a->dirty_min_byte = (unsigned int)-1;
+    a->dirty_max_byte = 0;
     a->dirty_all = false;
     for (int i = 0; i < item_count; i++)
         a->items[i] = registers[item_reg_base + i];
@@ -2473,6 +2483,8 @@ lbl_slice_get: {
         r->generation = 0;
         r->dirty_cards = NULL;
         r->dirty_cards_bytes = 0;
+        r->dirty_min_byte = (unsigned int)-1;
+        r->dirty_max_byte = 0;
         r->dirty_all = false;
         for (unsigned int i = 0; i < n; i++) r->items[i] = a->items[start + i];
         registers[dest_reg] = aer_array_val(r);
@@ -2504,6 +2516,8 @@ lbl_dict_new: {
     d->map.pools = &vm->heap.dict_hash_pools;
     d->dirty_cards = NULL;
     d->dirty_cards_bytes = 0;
+    d->dirty_min_byte = (unsigned int)-1;
+    d->dirty_max_byte = 0;
     d->dirty_all = false;
     if (pair_count > 0) hashtable_reserve(&d->map, (unsigned int)pair_count);
     for (int i = 0; i < pair_count; i++) {
