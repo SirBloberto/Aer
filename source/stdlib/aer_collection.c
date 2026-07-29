@@ -4,7 +4,7 @@
 #include "error.h"
 #include "hashtable.h"
 
-/* qsort() comparator for sort() — only called once the caller has verified every element is TYPE_STRING or every element is numeric, so no type-mismatch case needs handling here. */
+/* qsort() comparator for sort() -- only called once the caller has verified every element is TYPE_STRING or every element is numeric, so no type-mismatch case needs handling here. */
 static int sort_cmp(const void* pa, const void* pb) {
     const AerVal* a = (const AerVal*)pa;
     const AerVal* b = (const AerVal*)pb;
@@ -113,7 +113,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             }
             vm_stack_push(vm, aer_dict_val(r)); return true;
         }
-        /* A struct instance is deliberately excluded — construct a fresh one instead (a shaped
+        /* A struct instance is deliberately excluded -- construct a fresh one instead (a shaped
            copy would also land in the wrong GC pool, see gc_barrier_array's pool split, vm.c). */
         error("copy() requires an array or dict");
         vm_stack_push(vm, aer_null()); return true;

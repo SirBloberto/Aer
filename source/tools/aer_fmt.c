@@ -1,14 +1,14 @@
-/* aer_fmt.c — a standalone AER source formatter. Deliberately its own tokenizer, not a reuse of
+/* aer_fmt.c -- a standalone AER source formatter. Deliberately its own tokenizer, not a reuse of
    source/compiler/lexer.c: the real lexer discards comments and exact whitespace entirely
-   (skip_whitespace_and_comments) since the compiler never needs them past the point of skipping —
+   (skip_whitespace_and_comments) since the compiler never needs them past the point of skipping --
    a formatter needs exactly what the compiler throws away. The only piece of logic duplicated from
    the real lexer on purpose is the indent-stack algorithm (compare each line's leading-whitespace
-   column against a stack of prior levels) — small, well-isolated, and orthogonal to the
+   column against a stack of prior levels) -- small, well-isolated, and orthogonal to the
    comment/whitespace handling that made sharing the real lexer impractical.
 
    Canonical style: 4 spaces per indent level, single space around binary operators, no space
    inside brackets or around '.'/'..' , comments and string literals reproduced byte-for-byte.
-   Reformatting never changes token content, only whitespace — the formatted output is always
+   Reformatting never changes token content, only whitespace -- the formatted output is always
    semantically identical AER code, whatever spacing choices it makes.
 
    Usage: aer-fmt <file.aer>       prints formatted output to stdout

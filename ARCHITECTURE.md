@@ -103,18 +103,19 @@ functions, `include/aer.h`) as everywhere else internally — a host reads/write
 ### 2.1 Slab pools, not malloc-per-object
 
 Every heap type — `AerString`, `AerArray`, `AerDict`, `AerFunction`, struct instances,
-`AerPackedArray`, and `AerResult` — is allocated from one of seven fixed-size **slab (arena)
-pools** (`pool.c`), not individual `malloc` calls. `pool_init(pool, elem_size, elems_per_slab)`
-sets one up; `pool_alloc(pool)` hands back memory sized for exactly one cell:
+`AerPackedArray`, `AerTypedArray`, and `AerResult` — is allocated from one of eight fixed-size
+**slab (arena) pools** (`pool.c`), not individual `malloc` calls. `pool_init(pool, elem_size,
+elems_per_slab)` sets one up; `pool_alloc(pool)` hands back memory sized for exactly one cell:
 
-- **Free-list first**: if a previous cell was freed, `pool_alloc` reuses it (an intrusive
-  singly-linked list threaded through the first `sizeof(void*)` bytes of each freed cell).
+- **Free-list first**: if a previous cell was freed, `pool_alloc` reuses it — per-slab, not
+  pool-wide (each slab threads its own freed cells; see §5.8), so a reused cell's slab is always
+  known without a search.
 - **Bump allocation otherwise**: hands out the next cell in the current slab; when a slab is
   exhausted, one `xmalloc` grows a whole new slab (`POOL_INITIAL_SLABS = 4`, doubling), not one
   allocation per object.
 - Returned memory is **uninitialized**, like `malloc` — the caller fills it in.
 
-Seven pools exist (`vm_pools_init_once`, `vm.c`):
+Eight pools exist (`vm_heap_init`, `vm.c`):
 
 | Pool | Cell size | Elems/slab |
 |---|---|---|
@@ -122,8 +123,9 @@ Seven pools exist (`vm_pools_init_once`, `vm.c`):
 | `array_pool` | `sizeof(AerArray)` | 256 |
 | `dict_pool` | `sizeof(AerDict)` | 64 |
 | `function_pool` | `sizeof(AerFunction)` | 64 |
-| `struct_pool` | `sizeof(AerArray) + MAX_STRUCT_FIELDS * sizeof(AerVal)` | 64 |
+| `struct_pool` | `sizeof(AerStruct) + MAX_STRUCT_FIELDS * sizeof(AerVal)` | 64 |
 | `packed_array_pool` | `sizeof(AerPackedArray)` | 64 |
+| `typed_array_pool` | `sizeof(AerTypedArray)` | 64 |
 | `result_pool` | `sizeof(AerResult)` | 64 |
 
 `struct_pool` is the one deliberate exception to "header separate from payload": a struct
@@ -185,18 +187,16 @@ reference-counted, not incremental.
 - Every register of every **live** call frame — bounded to `0..call_depth`, not all `VM_CALL_MAX`
   frames regardless of depth. (A blanket scan over every frame slot was a measured cache-miss
   hotspot: even shallow recursion walked every frame's worth of cold, mostly-zeroed memory on every
-  GC pass. Frames beyond `call_depth` are dead — already returned, defers already drained by
-  `lbl_return` before unwind — so bounding the scan can't under-collect.)
-- Each live frame's pending `defer` call arguments (`CallFrame.defers[]`, stored outside
-  `registers[]`).
+  GC pass. Frames beyond `call_depth` are dead — already returned, unwound by `lbl_return` — so
+  bounding the scan can't under-collect.)
 - The chunk's own constant pool (`Chunk.pool[]`) and every registered struct `Shape`'s field
   defaults — permanent roots, since a bytecode constant or a struct's declared default must never
   be collected out from under a later reference to it.
-- If file-based `import`s are active, every imported module's *own* VM/Chunk gets its roots walked
-  too (`aer_module_get` iterates the whole file-module registry); every spawned actor's VM/Chunk
-  likewise (`aer_actor_get`, `vm.c`'s `gc_collect`, mirroring `aer_module_get`'s own enumeration) —
-  the seven pools are one shared heap fed by N independent root sets (the main VM plus one per
-  imported file plus one per live actor), not N separate collectors.
+
+Each VM now collects only its own independent heap, against only its own roots — an imported
+file-module or a spawned actor gets its own separate VM/Chunk/heap entirely, collected whenever
+*its own* allocation count crosses *its own* threshold, not fanned out to from some other VM's
+cycle. `gc_collect` (`vm.c`) takes exactly one `VM*` and never reaches into another one's state.
 
 **Mark phase**: an explicit growable worklist (`MarkWorklist`), not C call-stack recursion — user
 data structures (deeply nested arrays/hashtables) have no depth limit, so recursion would risk a native
@@ -226,7 +226,7 @@ payload, e.g. `AerString.data`) and pushed onto the free-list.
 **Trigger** (`gc_maybe_collect`, `vm.c`): checked from inside individual allocating opcode
 handlers, **not** from `DISPATCH()` on every single instruction (see §5.1 for why this placement
 itself was a real, measured win). A minor collection runs once `pool_total_alloc_count` (a single
-shared counter across all 7 pools) crosses `minor_gc_threshold` (default 2048, `aer_gc_configure`);
+shared counter across all 8 pools) crosses `minor_gc_threshold` (default 2048, `aer_gc_configure`);
 a major collection runs after every `major_gc_every_n_minor` (default 10) minor ones. An optional
 live-cell **ceiling** (`aer_gc_set_ceiling`, 0 = unlimited) is checked once per opcode after the
 normal rhythm — if exceeded, an extra major collection is forced before the process gives up and
@@ -253,67 +253,70 @@ insurance, not a real leak risk.
 
 ### 3.1 Bytecode format
 
-`Chunk.code` is a flat array of `uint64_t` words (widened from 32-bit specifically so the hottest
-opcode family, `OP_BINARY`, could pack dest + both RK operands into **one** word — see §3.2).
-Every instruction is one *descriptor* word (opcode + whichever small operands fit alongside it),
-optionally followed by one or more *wide* operand words (jump targets, pool indices, RK-encoded
-values too large for the packed scheme). Jump targets are **never** packed alongside anything
-else, on purpose: `patch_jump` does a blind word-overwrite at the target offset from dozens of call
-sites, and keeping every patchable field in its own dedicated word is what lets that stay a blind
-overwrite instead of a read-modify-write.
+`Chunk.code` is a flat array of `uint32_t` words — **word-granular, not bit-packed to a wider
+word**: every instruction is one or more 32-bit words, fixed at compile time per opcode (1-word,
+2-word, ...), never a variable byte count. This replaced an earlier `uint64_t`-based bit-packed
+scheme (dest + both RK operands crammed into one 64-bit word for the hottest opcodes) after
+measurement on the Pi (32-bit ARM) found a real regression: a `uint64_t` is fetched as two 32-bit
+register halves there, and any packed field straddling that boundary needs a shift-and-OR
+reconstruction across both halves before it's usable — direct disassembly of `lbl_add` found
+roughly 30 of its ~71 instructions were exactly this reconstruction tax. Word granularity fixes
+this by construction: the prefetcher only ever sees one of a small, fixed set of strides (4, 8, or
+12 bytes per instruction), the same class of mixed-width stream ARM's own Thumb2 and RISC-V's
+compressed extension use without this problem.
 
-### 3.2 Instruction packing — several tiers, chosen per opcode's actual heat
+Jump targets are **never** packed alongside anything else, uniformly, whether or not a particular
+site is ever patched later: `patch_jump` does a blind word-overwrite at the target offset from
+dozens of call sites, and keeping every patchable field in its own dedicated word is what lets that
+stay a blind overwrite instead of a read-modify-write.
 
-All of this exists because of one finding: on a 32-bit ARM target, a `uint64_t` is fetched as two
-32-bit register halves, and a packed field that straddles that boundary needs a shift-and-OR
-reconstruction across both registers before it's usable. Direct disassembly of `lbl_add` found
-roughly 30 of its ~71 instructions were exactly this reconstruction tax. The fix, applied
-opcode-by-opcode in order of measured heat, not all at once:
+### 3.2 Instruction packing — a small, fixed field vocabulary
 
-- **`PACK3`/`PACK2`/`PACK1`** — the original, general scheme: `[opcode:8][a:8][b:8][cc:8]`, one full
-  byte per field, still used by opcodes that never got individually tuned.
-- **`PACK_REG4`** — four plain register indices (7 bits each, exactly `FRAME_REGISTERS`) packed with
-  the opcode, for calls-through-a-register-value.
-- **`PACK_BINARY`** (`OP_ADD`/`OP_SUB`/.../`OP_IN` — over a third of all dispatches on `nbody.aer`) —
-  the tightest, most bespoke encoding: `opcode(7) + dest(7) + rk_b(9) + rk_c(9)` = 32 bits, entirely
-  in the **low** word, so the upper 32 bits of the 64-bit code word are never touched at all for
-  these opcodes. This is also why `RK9` (a narrower RK sub-encoding, 1 flag + 8 index bits — smaller
-  than the general `RK20`) exists: fitting the *whole* instruction in 32 bits required a smaller RK
-  budget, guarded at compile time (`emit_binary`'s `rk9_fits`, `parser.c`) so a program that would
-  overflow it reports a clean compile error instead of silently corrupting the encoding.
-- **`PACK_FIELD_SET`/`PACK_INDEX_GET`** — the next-hottest opcodes (measured 30M and 22.5M hits
-  respectively on `nbody.aer`), narrowed the same way once `OP_BINARY` proved the technique worked.
-- Every packing macro takes an explicit `(uint32_t)` cast before shifting, not just a mask
-  afterward — disassembly showed the reconstruction tax could still occur even after a field was
-  logically confined to the low 32 bits, until the compiler was *told* the upper bits didn't matter
-  via an explicit narrowing cast.
-
-Two RK operand-encoding widths coexist on purpose: **RK9** (`OP_BINARY`'s family — flag bit 8, 8
-index bits, 256 slots) and **RK20** (everything else still using the wider scheme — flag bit 19, 19
-index bits, ~524k slots). RK9 is deliberately smaller because it had to fit inside `OP_BINARY`'s
-32-bit budget; RK20 is "far beyond any real program" headroom for opcodes with room to spare. Both
-report a clean compile error, never silent truncation, if a real program's resolved operand
-actually exceeds the budget.
+- **`PACK3`/`PACK2`/`PACK1`** (`op(8) | A(8) | B(8) | C(8)`, low byte first) — the general scheme:
+  up to 3 plain 8-bit fields (register index, small count/tag) pack into one word alongside the
+  8-bit opcode. A 4th small field, when unavoidable, spills into its own word.
+- **`RK8`** (1 flag bit + 7 index bits, 128 registers/constants direct) — used only where two RK
+  operands must share one word alongside a dest register (the `OP_ADD`..`OP_RSHIFT`/`OP_IN` family,
+  over a third of all dispatches on `nbody.aer`, plus `OP_INDEX_GET`/`SET`, `OP_UNARY`, `OP_CAST`).
+  `FRAME_REGISTERS = 128` means a register index fits RK8's 7 bits with zero headroom, by
+  construction, not luck; a constant-pool index past 127 is spilled to a scratch register at
+  compile time (`materialize()`/`OP_LOADK`, `parser.c`) rather than overflowing the encoding.
+- **`RK16`** (1 flag + 15 index bits, 32767 direct) — used wherever an RK operand gets a whole word
+  to itself or shares one with just one other 16-bit field; generous enough that no overflow/hoist
+  path is needed in practice.
+- **`PACK_2X16`** — two independent 16-bit fields in one word (e.g. a field's byte offset + an RK16
+  operand sharing a word).
+- **NAME/pool-index fields** — 16 bits when paired with one other 16-bit field, otherwise a full
+  dedicated 32-bit word.
+- **Every packing macro takes an explicit `(uint32_t)` cast before shifting**, not just a mask
+  afterward — this was a real, separate bug found while narrowing an earlier scheme: a shift on a
+  wider integer type is a genuine wide operation regardless of whether the useful bits fit
+  narrower, and the compiler has no way to know the upper bits are always zero without an explicit
+  narrowing cast telling it so.
 
 ### 3.3 The dispatch loop
 
-Computed-goto dispatch (`vm_run`, a `static void* dt[] = { [OP_ADD] = &&lbl_add, ... }` table +
-`goto *dt[cur_op]`), the standard technique for beating a `switch`-based bytecode loop (no bounds
+Computed-goto dispatch (`vm_run_slice`, a `static void* dt[] = { [OP_ADD] = &&lbl_add, ... }` table
++ `goto *dt[cur_op]`), the standard technique for beating a `switch`-based bytecode loop (no bounds
 check, no jump-table-then-branch — each opcode handler jumps directly to the next). The opcode
-itself is masked out of the low **7** bits of the descriptor word (`0x7F`, not `0x8F`) — 62 real
-opcode values fit with 66 to spare, deliberate headroom for e.g. future concurrency primitives
-without a second encoding redesign.
+itself is masked out of the low 8 bits of the word (`& 0xFF`) — matching `PACK3`'s own 8-bit opcode
+field.
 
 `DISPATCH()` itself (the per-opcode macro) does the absolute minimum: read the next word, split
 out the opcode, jump — no per-instruction GC check and no per-instruction error-flag check (see
 §5.1 for how both stay off this path entirely).
 
-**`CallFrame`** (`vm.h`) is the unit of call isolation: `registers[FRAME_REGISTERS]` (128 slots),
-plus (for the primitive pass, §4.3) `raw_ints[32]`/`raw_reals[32]`, plus `return_ip`/`dest_reg` and
-a small fixed-size deferred-call list. `VM.call_stack` is a flat array of these
-(`VM_CALL_MAX = 64` frames); `vm->registers`/`raw_ints`/`raw_reals` are **pointers repointed at the
-current frame** on every call/return (not re-derived from `call_depth` on every access) — a tail
-call reuses the current frame in place, so it's the one case that needs *no* repointing.
+**`CallFrame`** (`vm.h`) is the unit of call isolation: `registers`/`raw_ints`/`raw_reals` are
+**bump-pointer bases into a shared, VM-level register stack** (not fixed inline per-frame arrays —
+that was tried and reverted: it cost every single frame `RAW_REGISTERS_INT`+`REAL` slots regardless
+of whether that function used any raw locals at all, `CallFrame` growing past a
+`_Static_assert(sizeof(CallFrame) <= 96, ...)` regression guard left specifically to catch this
+coming back), plus `frame_size`/`raw_int_frame_size`/`raw_real_frame_size` (this callee's own
+compile-time peak), `return_ip`/`dest_reg`, `code_offset` (for stack traces), and
+`tail_calls_collapsed`. `VM.call_stack` is a flat array of these (`VM_CALL_MAX = 64` frames);
+`vm->registers`/`raw_ints`/`raw_reals` are **pointers repointed at the current frame** on every
+call/return (not re-derived from `call_depth` on every access) — a tail call reuses the current
+frame in place, so it's the one case that needs *no* repointing.
 
 `VM.stack` (256 slots) is a **separate**, genuinely stack-based array — not used by any
 register-native opcode. It exists purely as a bridge for calls that cross out of the register
@@ -337,10 +340,9 @@ calls safe), bump `call_depth`, repoint `registers`/`raw_ints`/`raw_reals`, jump
 **Tail-call reuse**: when `return f(args)` is the *entire* return expression (checked at compile
 time — nothing wraps the call), the already-emitted `OP_CALL`/`OP_CALL_VALUE` opcode word is
 patched *in place* to `OP_TAIL_CALL`/`OP_TAIL_CALL_VALUE` (same operand layout — only the opcode
-byte changes, a blind mask-and-OR, no re-encoding). At dispatch time, if the *current* frame has no
-pending `defer`s (a deferred call must still run before this frame's storage is reused for someone
-else's locals), the new arguments simply overwrite the current frame's own registers 0..arg_count
-and `ip` jumps straight to the callee — `call_depth`, `dest_reg`, and `return_ip` are untouched, so
+byte changes, a blind mask-and-OR, no re-encoding). At dispatch time the new arguments simply
+overwrite the current frame's own registers 0..arg_count and `ip` jumps straight to the callee —
+`call_depth`, `dest_reg`, and `return_ip` are untouched, so
 however many tail calls chain, the *original* (non-tail) caller still gets its result in the right
 place once the chain finally returns via a real `OP_RETURN`. This is what makes deep tail recursion
 run in **O(1) stack frames** — verified by a dedicated embedding test that a genuinely deep
@@ -1005,7 +1007,7 @@ Two entirely separate allocation lifetimes exist in this codebase. Don't conflat
 - **Compile-time / permanent** — grows a `Chunk`'s own bookkeeping arrays. Lives for the process's
   life (or the importing module's life), never GC-tracked, freed only by `chunk_free` (or, for
   `shapes`/`functions`, not even then — see below).
-- **Runtime / GC-tracked** — a pool cell (one of the 7 pools, §2.1) plus, for variable-length types,
+- **Runtime / GC-tracked** — a pool cell (one of the 8 pools, §2.1) plus, for variable-length types,
   a separate `xmalloc`'d payload. Reclaimed only by the collector (§2.4), never by an explicit
   `free()` call from ordinary VM code.
 
@@ -1023,7 +1025,6 @@ Two entirely separate allocation lifetimes exist in this codebase. Don't conflat
 | `parse_struct`/`OP_DEFINE_STRUCT` handler | `Chunk.shapes[]` (doubling) + one `xmalloc(sizeof(Shape))` per declaration | once per `struct` declaration | **Not freed**, same reasoning |
 | `chunk_add_import` | `Chunk.imported_modules[]` (doubling), each entry an owned `xstrdup` | once per `import` statement | `chunk_free` |
 | `aer_module_load` (`aer_module.c`) | an entire second `Chunk`+`VM` pair (`xmalloc(sizeof(Chunk))`/`xmalloc(sizeof(VM))`) per distinct file-based import | first `import "path"` of a given file (cached — a second import of the same file is a no-op) | `aer_module_free_all()` only — an explicit, host-invoked teardown; not called during normal execution |
-| `CallFrame.defers` (`vm.c`'s `OP_DEFER_PUSH` handler) | one `xmalloc(sizeof(DeferredCall) * MAX_DEFERS_PER_CALL)` **per call-stack depth slot**, lazily on that slot's first-ever `defer` statement | first `defer` executed at a given recursion depth | `vm_free` (frees all `VM_CALL_MAX` slots unconditionally, since a slot's buffer persists across reuse at that depth — not tied to any one call) |
 
 ### B. Runtime, GC-tracked — pool cell allocations (one per construction, always followed by `gc_maybe_collect` once the new value is reachable from a root)
 

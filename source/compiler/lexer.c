@@ -17,19 +17,19 @@ typedef struct File {
     unsigned int line_base;
 } File;
 
-/* Array of File* (not File values) — nested imports save a raw File* across their own lex/parse/run cycle via lexer_save_state, so growing this array must never move an already-issued File's address. */
+/* Array of File* (not File values) -- nested imports save a raw File* across their own lex/parse/run cycle via lexer_save_state, so growing this array must never move an already-issued File's address. */
 static File** files_storage  = NULL;
 static int    file_capacity  = 0;
 static int    file_index     = 0;
 static File*  current;
 
-/* Indentation state — reset before each parse */
+/* Indentation state -- reset before each parse */
 static unsigned int indent_stack[64];
 static int          indent_depth;
 static int          pending_dedents;
 static bool         at_line_start;
 
-/* Nesting depth of unclosed (/[/{ — while > 0, newlines are whitespace instead of statement terminators, letting calls/literals span multiple lines. */
+/* Nesting depth of unclosed (/[/{ -- while > 0, newlines are whitespace instead of statement terminators, letting calls/literals span multiple lines. */
 static int bracket_depth;
 
 static void indent_reset() {
@@ -48,7 +48,7 @@ const char* current_source_name()   { return current->name; }
 /* Narrow escape hatch for reporting a deferred error at a saved position, not a general seek. */
 void lexer_set_cursor(const char* pos) { current->buffer = (char*)pos; }
 
-/* For parser.c to tag bytecode with its source line (Chunk.line_mark_offsets) — same scan as error_at(), just returning the number. */
+/* For parser.c to tag bytecode with its source line (Chunk.line_mark_offsets) -- same scan as error_at(), just returning the number. */
 unsigned int current_source_line() {
     unsigned int line = 1;
     for (const char* p = current->start; p < current->buffer; p++)
@@ -182,7 +182,7 @@ void lexer_begin_span(const char* text, unsigned int len, unsigned int start_lin
     files_storage[file_index++] = file;
     current = file;
     indent_reset();
-    /* A span is one inline expression, never a block — at_line_start's default true would misread
+    /* A span is one inline expression, never a block -- at_line_start's default true would misread
        leading whitespace as an indent level and emit a spurious TOKEN_INDENT. */
     at_line_start = false;
 }
@@ -209,7 +209,7 @@ static void emit_real(double real, unsigned int length) {
 }
 
 static void emit_string_token(TokenType type, unsigned int length) {
-    /* Copies into owned memory (AerString always owns its data) — shell() (REPL mode) frees the previous line's buffer on every call, which would otherwise dangle earlier tokens. */
+    /* Copies into owned memory (AerString always owns its data) -- shell() (REPL mode) frees the previous line's buffer on every call, which would otherwise dangle earlier tokens. */
     char* buf = xmalloc(length + 1);
     memcpy(buf, current->buffer, length);
     buf[length] = '\0';
@@ -239,7 +239,7 @@ static void skip_comment() {
 static void skip_whitespace_and_comments() {
     while (true) {
         skip_whitespace();
-        /* Inside an unclosed bracket a newline is just whitespace — swallow before the indent scan. */
+        /* Inside an unclosed bracket a newline is just whitespace -- swallow before the indent scan. */
         if (*current->buffer == '\n' && bracket_depth > 0) { current->buffer++; continue; }
         if (*current->buffer != '#') return;
         skip_comment();
@@ -253,7 +253,7 @@ static void lex_number() {
     if (buf[0] == '0' && (buf[1] == 'x' || buf[1] == 'X')) {
         if (!isxdigit((unsigned char)buf[2])) {
             error_at("Expected hex digits after '0x'");
-            /* Consume "0x" ourselves — whether strtoll backs off to just "0" here is libc-defined, not something to rely on for forward progress. */
+            /* Consume "0x" ourselves -- whether strtoll backs off to just "0" here is libc-defined, not something to rely on for forward progress. */
             emit(TOKEN_ERROR, 2);
             return;
         }
@@ -266,7 +266,7 @@ static void lex_number() {
         return;
     }
 
-    /* lex() only calls lex_number() on a digit, so int_len is always >= 1 — safe to fall through from error_at() below without an explicit return. */
+    /* lex() only calls lex_number() on a digit, so int_len is always >= 1 -- safe to fall through from error_at() below without an explicit return. */
     char* end; errno = 0;
     int64_t int_val = strtoll(buf, &end, 10);
     if (errno == ERANGE) error_at("Integer literal overflow");
@@ -308,7 +308,7 @@ static void lex_number() {
 static bool lex_keyword(unsigned int length) {
     char* b = current->buffer;
 
-    /* Booleans handled inline — not in the keyword table */
+    /* Booleans handled inline -- not in the keyword table */
     if (length == sizeof("true")  - 1 && strncmp(b, "true",  sizeof("true")  - 1) == 0) { emit_boolean(TOKEN_TRUE);  return true; }
     if (length == sizeof("false") - 1 && strncmp(b, "false", sizeof("false") - 1) == 0) { emit_boolean(TOKEN_FALSE); return true; }
 
@@ -328,8 +328,6 @@ static bool lex_keyword(unsigned int length) {
         { "integer",   sizeof("integer")   - 1, TOKEN_TYPE_INTEGER   },
         { "float",     sizeof("float")     - 1, TOKEN_TYPE_FLOAT     },
         { "boolean",   sizeof("boolean")   - 1, TOKEN_TYPE_BOOLEAN   },
-        { "array",     sizeof("array")     - 1, TOKEN_TYPE_ARRAY     },
-        { "hashtable", sizeof("hashtable") - 1, TOKEN_TYPE_HASHTABLE },
         { "and",       sizeof("and")       - 1, TOKEN_AND            },
         { "or",        sizeof("or")        - 1, TOKEN_OR             },
         { "not",       sizeof("not")       - 1, TOKEN_NOT            },
@@ -364,7 +362,7 @@ static void lex_string() {
     }
     if (*current->buffer != '"') { error_at("Unterminated string"); return; }
     unsigned int length = (unsigned int)(current->buffer - start);
-    /* Copies — see emit_string_token's comment on why AerString always owns its data. */
+    /* Copies -- see emit_string_token's comment on why AerString always owns its data. */
     char* buf = xmalloc(length + 1);
     memcpy(buf, start, length);
     buf[length] = '\0';
@@ -382,7 +380,7 @@ static void lex_multiline_string() {
         current->buffer++;
     if (*current->buffer != '"') { error_at("Unterminated multi-line string"); return; }
     unsigned int length = (unsigned int)(current->buffer - start);
-    /* Copies — see emit_string_token's comment on why AerString always owns its data. */
+    /* Copies -- see emit_string_token's comment on why AerString always owns its data. */
     char* buf = xmalloc(length + 1);
     memcpy(buf, start, length);
     buf[length] = '\0';
@@ -478,7 +476,7 @@ void lex() {
         case ';':  emit(TOKEN_SEMICOLON,          1); return;
         case '\n': at_line_start = true; emit(TOKEN_NEW_LINE, 1); return;
         case '\0':
-            /* No trailing newline — flush remaining indent levels */
+            /* No trailing newline -- flush remaining indent levels */
             if (indent_depth > 1) {
                 indent_depth--;
                 pending_dedents = indent_depth - 1;

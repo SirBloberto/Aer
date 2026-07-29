@@ -63,7 +63,7 @@ bool aer_actor_prepare_call(Actor* actor, const char* fn, int arg_count, AerVal*
 
     VM* mv = actor->vm;
     /* A prior call's error can leave call_depth/stack_top stuck above 0 (same reset
-       aer_module_call needs and for the same reason — see its own comment). */
+       aer_module_call needs and for the same reason -- see its own comment). */
     aer_vm_reset_for_reuse(mv);
 
     return setup_call(mv, fnreg, arg_count, args, actor->halt_addr);
@@ -75,7 +75,7 @@ bool aer_actor_call(Actor* actor, const char* fn, int arg_count, AerVal* args, A
 
     /* Called directly by host (C) code, never from inside another VM's bytecode dispatch, so
        there's no enclosing vm_run() to longjmp back into on failure the way aer_module_call
-       needs — a plain false return is enough. */
+       needs -- a plain false return is enough. */
     vm_gc_suppress();
     vm_run(mv);
     vm_gc_unsuppress();

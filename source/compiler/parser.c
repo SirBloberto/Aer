@@ -27,7 +27,7 @@ typedef struct {
 #define LOOP_MAX  16
 #define BREAK_MAX 32
 typedef struct {
-    unsigned int top;                     /* continue's target — same value passed to parse_for_body/for_in — meaningless when rotated (see below) */
+    unsigned int top;                     /* continue's target -- same value passed to parse_for_body/for_in -- meaningless when rotated (see below) */
     unsigned int patches[BREAK_MAX];   /* break's OP_JUMP operand offsets, patched once the loop ends */
     int          patch_count;
     /* Rotated range-for only -- also patches deferred continues to OP_ITER_RANGE_LOOP's own
@@ -330,7 +330,7 @@ void emit_dict_new(Chunk* c, int dest_reg, int pair_reg_base, int pair_count) {
 unsigned int emit_iter_next_array(Chunk* c, int col_reg, int idx_reg, int item_dest_reg) {
     chunk_emit(c, PACK3(OP_ITER_NEXT_ARRAY, col_reg, idx_reg, item_dest_reg));
     unsigned int patch_offset = c->count;
-    chunk_emit(c, 0);   /* placeholder — patched by patch_jump once the loop-exit target is known */
+    chunk_emit(c, 0);   /* placeholder -- patched by patch_jump once the loop-exit target is known */
     return patch_offset;
 }
 
@@ -341,7 +341,7 @@ unsigned int emit_iter_next_pair(Chunk* c, int col_reg, int idx_reg, int key_des
     chunk_emit(c, PACK3(OP_ITER_NEXT_PAIR, col_reg, idx_reg, key_dest_reg));
     chunk_emit(c, (uint32_t)val_dest_reg);
     unsigned int patch_offset = c->count;
-    chunk_emit(c, 0);   /* placeholder — patched by patch_jump once the loop-exit target is known */
+    chunk_emit(c, 0);   /* placeholder -- patched by patch_jump once the loop-exit target is known */
     return patch_offset;
 }
 
@@ -350,7 +350,7 @@ unsigned int emit_iter_range_prep(Chunk* c, int cur_reg, int end_reg, int step_r
     chunk_emit(c, PACK3(OP_ITER_RANGE_PREP, cur_reg, end_reg, step_reg));
     chunk_emit(c, (uint32_t)item_dest_reg);
     unsigned int patch_offset = c->count;
-    chunk_emit(c, 0);   /* placeholder — patched once the loop's overall exit address is known */
+    chunk_emit(c, 0);   /* placeholder -- patched once the loop's overall exit address is known */
     return patch_offset;
 }
 
@@ -524,7 +524,7 @@ static int var_slot(Chunk* c, unsigned int name_idx) {
     P.var_kind[P.var_count]  = VAR_BOXED;
     P.var_count++;
     P.reserved_floor++;                        /* permanently protects this register from the temp allocator */
-    P.next_temp_register = P.reserved_floor;   /* resync — see this function's own comment for why that's always safe */
+    P.next_temp_register = P.reserved_floor;   /* resync -- see this function's own comment for why that's always safe */
     track_peak(P.reserved_floor);
     if (P.function_depth == 0) {
         P.global_names[P.global_count] = name_idx;
@@ -751,7 +751,7 @@ static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind
     if (!(raw_rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) return false;
     if (boxed_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
 
-    /* `boxed OP raw` is `raw (flip) OP boxed` — LT/GT and LTE/GTE swap. */
+    /* `boxed OP raw` is `raw (flip) OP boxed` -- LT/GT and LTE/GTE swap. */
     Opcode effective_op = op;
     if (!lhs_raw) {
         switch (op) {
@@ -982,8 +982,8 @@ static void loop_pop_and_patch(Chunk* c, unsigned int exit_target) {
     P.loop_depth--;
 }
 
-/* Rotated range-for only — same as loop_pop_and_patch, plus patches every deferred `continue` to
-   land at continue_target (OP_ITER_RANGE_LOOP's own position, not the loop body's start — continue
+/* Rotated range-for only -- same as loop_pop_and_patch, plus patches every deferred `continue` to
+   land at continue_target (OP_ITER_RANGE_LOOP's own position, not the loop body's start -- continue
    still needs to run the advance-and-check, not just re-enter the body from the top). */
 static void loop_pop_and_patch_rotated(Chunk* c, unsigned int exit_target, unsigned int continue_target) {
     LoopContext* ctx = &P.loop_stack[P.loop_depth - 1];
@@ -1890,7 +1890,7 @@ static int parse_binary(Chunk* c, unsigned int min_prec) {
     return parse_binary_ops(c, min_prec, lhs, lhs_start);
 }
 
-/* The 6 arithmetic compound-assign operators (bitwise OP= forms were deliberately dropped — a
+/* The 6 arithmetic compound-assign operators (bitwise OP= forms were deliberately dropped -- a
    second spelling with no new capability). `x OP= expr` compiles to one OP_BINARY with dest ==
    lhs == x's own register. */
 static const struct { TokenType tok; Opcode op; } compound_assign_ops[] = {
@@ -1956,7 +1956,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                 emit_index_get(c, target_regs[i], arr_reg, (int)pool_i | RK_CONST_FLAG);
             }
         }
-        reg_free(1);   /* arr_reg — always a temp, guaranteed by arg_materialize */
+        reg_free(1);   /* arr_reg -- always a temp, guaranteed by arg_materialize */
         return;
     }
 
@@ -2051,7 +2051,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             P.next_temp_register = P.reserved_floor;
             P.var_regs[existing_idx] = new_reg;
             P.var_kind[existing_idx] = VAR_BOXED;
-            /* No P.global_regs update needed — see ensure_boxed's identical reasoning: this path
+            /* No P.global_regs update needed -- see ensure_boxed's identical reasoning: this path
                only runs on a currently-raw-tracked name, which can never be in P.global_names. */
             if (rk_val & RK_CONST_FLAG) {
                 chunk_emit(c, PACK_OP_A_W16(OP_LOADK, new_reg, (unsigned int)(rk_val & ~RK_CONST_FLAG)));
@@ -2167,7 +2167,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             chunk_emit(c, PACK3(box_op, new_reg, old_slot, 0));
             P.var_regs[existing_idx] = new_reg;
             P.var_kind[existing_idx] = VAR_BOXED;
-            /* No P.global_regs update needed — see ensure_boxed's identical reasoning. */
+            /* No P.global_regs update needed -- see ensure_boxed's identical reasoning. */
             rk_rhs = box_if_raw(c, rk_rhs);
             emit_binary(c, new_reg, boxed_op, new_reg, rk_rhs);
             if (is_temp(rk_rhs)) reg_free(1);
@@ -2233,7 +2233,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
     if (var_lookup(name_idx, &obj_reg)) {
         obj_is_base = true;
     } else if (P.function_depth > 0 && global_lookup(name_idx, &obj_reg)) {
-        /* `name` isn't a local of the current function but IS an existing top-level global —
+        /* `name` isn't a local of the current function but IS an existing top-level global --
            same shadow-ban error var_slot enforces for a bare reference. */
         error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
                  aer_as_string(c->pool[name_idx])->data);
@@ -2809,7 +2809,7 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
     P.next_temp_register = saved_reserved_floor;
 }
 
-/* AER has no separate `while` keyword — `for <condition>:` (no `in`) IS the while form. */
+/* AER has no separate `while` keyword -- `for <condition>:` (no `in`) IS the while form. */
 static void parse_for_while(Chunk* c) {
     if (equal(TOKEN_IDENTIFIER)) {
         unsigned int name_idx = chunk_add_pool(c, token.value);
@@ -3091,7 +3091,7 @@ static bool is_builtin_name(Chunk* c, unsigned int name_idx) {
     return false;
 }
 
-/* Mirrors module_call_id below — only called after is_builtin_name confirms a match. */
+/* Mirrors module_call_id below -- only called after is_builtin_name confirms a match. */
 static int builtin_call_id(AerString* name) {
     if (name->length == 6 && strncmp(name->data, "length", 6) == 0) return CALL_BUILTIN_LENGTH;
     if (name->length == 5 && strncmp(name->data, "print", 5) == 0) return CALL_BUILTIN_PRINT;
@@ -3176,7 +3176,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     const char* call_site_cursor = NULL;
     if (!is_var && !is_struct && !is_func) {
         is_forward_ref = true;
-        call_site_cursor = current_source_cursor();   /* captured NOW — before the arg list below consumes past it */
+        call_site_cursor = current_source_cursor();   /* captured NOW -- before the arg list below consumes past it */
     }
 
     /* Usually a no-op check, not a copy -- see arg_materialize's own comment. */
@@ -3223,7 +3223,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     } else if (is_func) {
         last_bare_call_start = c->count;
         if (needs_call_value) emit_call_value(c, dest, base, arg_count, callee_reg);
-        else                   emit_call(c, dest, func_offset, base, arg_count, func_index);   /* exact arity — no forward-ref patching needed, is_func means already resolved */
+        else                   emit_call(c, dest, func_offset, base, arg_count, func_index);   /* exact arity -- no forward-ref patching needed, is_func means already resolved */
         last_bare_call_end = c->count;
     } else {
         last_bare_call_start = c->count;
@@ -3243,7 +3243,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
 /* Emits exactly what `Result(value, err)` itself would (CALL_BUILTIN_RESULT), reusing its
    validation rather than duplicating it. Shared by `raise`'s own Result construction. */
 static void emit_result_call_and_return(Chunk* c, int reg_base) {
-    reg_free(1);   /* the err register — only dest (== reg_base) stays live past the call, same convention parse_builtin_call's own arg_count>1 case follows */
+    reg_free(1);   /* the err register -- only dest (== reg_base) stays live past the call, same convention parse_builtin_call's own arg_count>1 case follows */
     char* name_buf = xmalloc(7);
     memcpy(name_buf, "Result", 7);
     unsigned int name_idx = chunk_add_pool(c, aer_make_string(name_buf, 6));
@@ -3813,14 +3813,14 @@ static void parse_struct(Chunk* c) {
     struct_register(name_idx);
 }
 
-/* break/continue — no iter_slots POPs needed (see LoopContext's own comment). */
+/* break/continue -- no iter_slots POPs needed (see LoopContext's own comment). */
 static void parse_break(Chunk* c) {
     if (P.loop_depth == 0) { error_at("'break' outside loop"); return; }
     LoopContext* ctx = &P.loop_stack[P.loop_depth - 1];
     if (ctx->patch_count >= BREAK_MAX) { error_at("Too many breaks in one loop (max %d)", BREAK_MAX); return; }
     chunk_emit(c, OP_JUMP);
     ctx->patches[ctx->patch_count++] = c->count;
-    chunk_emit(c, 0);   /* placeholder — patched by loop_pop_and_patch once the loop ends */
+    chunk_emit(c, 0);   /* placeholder -- patched by loop_pop_and_patch once the loop ends */
 }
 
 static void parse_continue(Chunk* c) {
@@ -3830,9 +3830,9 @@ static void parse_continue(Chunk* c) {
     if (ctx->rotated) {
         if (ctx->continue_patch_count >= BREAK_MAX) { error_at("Too many continues in one loop (max %d)", BREAK_MAX); return; }
         ctx->continue_patches[ctx->continue_patch_count++] = c->count;
-        chunk_emit(c, 0);   /* placeholder — patched by loop_pop_and_patch_rotated once OP_ITER_RANGE_LOOP's own position is known */
+        chunk_emit(c, 0);   /* placeholder -- patched by loop_pop_and_patch_rotated once OP_ITER_RANGE_LOOP's own position is known */
     } else {
-        chunk_emit(c, (int)ctx->top);   /* known at compile time — no patch needed */
+        chunk_emit(c, (int)ctx->top);   /* known at compile time -- no patch needed */
     }
 }
 
@@ -3860,8 +3860,6 @@ static void parse_statement(Chunk* c) {
         if      (equal(TOKEN_TYPE_INTEGER))   reserved_word = "integer";
         else if (equal(TOKEN_TYPE_FLOAT))      reserved_word = "float";
         else if (equal(TOKEN_TYPE_BOOLEAN))   reserved_word = "boolean";
-        else if (equal(TOKEN_TYPE_ARRAY))     reserved_word = "array";
-        else if (equal(TOKEN_TYPE_HASHTABLE)) reserved_word = "hashtable";
         if (reserved_word) {
             error_at("'%s' is a reserved type name and can't be used as a variable", reserved_word);
             return;

@@ -20,7 +20,7 @@ static void rehash_sparse(HashTable* t);
    its access pattern is sequential append/scan, not the random-probe pattern pooling helps with.
    Tier layout lives here (not per-HashPools-instance) since every HashPools instance uses the same
    fixed tier sizes -- only the actual Pool state differs per instance. */
-/* 16-byte floor is required, not tuning — pool_free writes its free-list pointer at bytes [8,16). */
+/* 16-byte floor is required, not tuning -- pool_free writes its free-list pointer at bytes [8,16). */
 static const size_t       KEY_TIER_SIZE[HASH_KEY_TIER_COUNT]           = { 16, 32, 64, 128 };
 static const unsigned int KEY_TIER_ELEMS_PER_SLAB[HASH_KEY_TIER_COUNT] = { 256, 128, 64, 32 };
 
@@ -117,7 +117,7 @@ void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t
     for (unsigned int i = 0; i < t->capacity; i++) {
         unsigned int* slot = &t->sparse[(hash + i) & (t->capacity - 1)];
         if (*slot != SPARSE_EMPTY && hash_match(&t->dense[*slot], key, length)) {
-            /* Key already present (e.g. duplicate key in a dict literal) — just overwrite the payload. */
+            /* Key already present (e.g. duplicate key in a dict literal) -- just overwrite the payload. */
             hashtable_key_free(t->pools, key, length);
             t->dense[*slot].payload = value;
             return;

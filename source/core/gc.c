@@ -5,7 +5,7 @@
 #include "vm.h"
 
 /* ------------------------------------------------------------------ */
-/* Generational GC — write barrier and remembered set                   */
+/* Generational GC -- write barrier and remembered set                   */
 /* ------------------------------------------------------------------ */
 
 /* Every pooled cell's gc_state byte lives at the cell itself (offset 0, see pool.h), not in a
@@ -56,7 +56,7 @@ static void mark_card_dirty(unsigned char** dirty_cards, unsigned int* dirty_car
    elements' indices. */
 void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value) {
     VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
+    if (!heap->gc_ever_collected) return;   /* nothing can be old yet -- see gc_ever_collected's own comment */
     if (pool_is_young(a)) return;   /* young containers are re-traced normally next cycle */
     if (!value_is_young(new_value)) return;
     mark_card_dirty(&a->dirty_cards, &a->dirty_cards_bytes, index);
@@ -86,7 +86,7 @@ void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value) {
    collection.delete sets dirty_all instead (see AerDict.dirty_cards's own comment, vm.h). */
 void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value) {
     VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
+    if (!heap->gc_ever_collected) return;   /* nothing can be old yet -- see gc_ever_collected's own comment */
     if (pool_is_young(d)) return;
     if (!value_is_young(new_value)) return;
     mark_card_dirty(&d->dirty_cards, &d->dirty_cards_bytes, index);
@@ -94,7 +94,7 @@ void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Generational GC — mark phase                                        */
+/* Generational GC -- mark phase                                        */
 /* ------------------------------------------------------------------ */
 
 /* null/boolean/integer/float reference no heap cell (integers are never boxed under the tagged
@@ -137,7 +137,7 @@ static void mark_function(AerFunction* f) {
 static void mark_value(VmHeap* heap, AerVal v, bool minor) {
     switch (aer_type(v)) {
         case TYPE_STRING:
-            pool_mark(aer_as_string(v));   /* a leaf — data owns no other Values */
+            pool_mark(aer_as_string(v));   /* a leaf -- data owns no other Values */
             break;
         case TYPE_ARRAY: {
             AerArray* a = aer_as_array(v);
@@ -165,7 +165,7 @@ static void mark_value(VmHeap* heap, AerVal v, bool minor) {
                 HashTable* map = &aer_as_dict(v)->map;
                 for (unsigned int i = 0; i < map->count; i++)
                     worklist_push(heap, map->dense[i].payload, minor);
-                /* Keys are plain owned char*, not Values — nothing to push. */
+                /* Keys are plain owned char*, not Values -- nothing to push. */
             }
             break;
         case TYPE_FUNCTION:
@@ -189,7 +189,7 @@ static void mark_value(VmHeap* heap, AerVal v, bool minor) {
             break;
         }
         default:
-            break;   /* null/boolean/integer/float reference no heap cell — integers are never boxed under the tagged representation */
+            break;   /* null/boolean/integer/float reference no heap cell -- integers are never boxed under the tagged representation */
     }
 }
 
@@ -225,17 +225,17 @@ static void mark_chunk_roots(VmHeap* heap, Chunk* chunk, bool minor) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Generational GC — sweep finalizers                                  */
+/* Generational GC -- sweep finalizers                                  */
 /* ------------------------------------------------------------------ */
 
 static void free_string(void* cell)   { free(((AerString*)cell)->data); }
 static void free_array(void* cell)    { AerArray* a = (AerArray*)cell; free(a->items); free(a->dirty_cards); }
 static void free_dict(void* cell)     { AerDict* d = (AerDict*)cell; hashtable_free(&d->map); free(d->dirty_cards); }   /* hashtable_free already frees every entry's key */
-static void free_function(void* cell) { (void)cell; }   /* nothing to free — no closure upvalues array anymore */
-static void free_struct(void* cell)   { (void)cell; }   /* items lives inline in this same cell — nothing separate to free */
+static void free_function(void* cell) { (void)cell; }   /* nothing to free -- no closure upvalues array anymore */
+static void free_struct(void* cell)   { (void)cell; }   /* items lives inline in this same cell -- nothing separate to free */
 static void free_packed_array(void* cell) { free(((AerPackedArray*)cell)->data); }
 static void free_typed_array(void* cell)  { free(((AerTypedArray*)cell)->data); }
-static void free_result(void* cell)   { (void)cell; }   /* both fields are plain AerVals — nothing separately owned */
+static void free_result(void* cell)   { (void)cell; }   /* both fields are plain AerVals -- nothing separately owned */
 
 /* Every pool a VmHeap owns, by field offset (not a raw Pool* -- these describe VmHeap's shape once,
    generically, rather than one specific instance), paired with its finalizer. The single place all
@@ -266,7 +266,7 @@ void gc_finalize_all_pools(VmHeap* heap) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Generational GC — collection                                        */
+/* Generational GC -- collection                                        */
 /* ------------------------------------------------------------------ */
 
 /* Collects only vm's own heap, against only vm's own roots -- each VM now owns an independent
@@ -362,7 +362,7 @@ static void gc_collect(VM* vm, bool minor) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Generational GC — trigger                                           */
+/* Generational GC -- trigger                                           */
 /* ------------------------------------------------------------------ */
 
 /* Tuning defaults (DEFAULT_MINOR_GC_THRESHOLD/DEFAULT_MAJOR_GC_EVERY_N_MINOR, overridable per-heap
@@ -373,7 +373,7 @@ static void gc_reset_alloc_counts(VmHeap* heap) {
     heap->pool_alloc_count = 0;
 }
 
-/* Shared by aer_gc_stats (vm.c) and gc_run_collection_cycle's own ceiling check below — one place walking all pools' cell state, not two. */
+/* Shared by aer_gc_stats (vm.c) and gc_run_collection_cycle's own ceiling check below -- one place walking all pools' cell state, not two. */
 unsigned int gc_count_live_cells(VmHeap* heap) {
     unsigned int total = 0;
     for (size_t t = 0; t < POOL_TABLE_COUNT; t++) {

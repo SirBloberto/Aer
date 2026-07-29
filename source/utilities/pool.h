@@ -6,7 +6,7 @@
 
 /* Slab allocator for fixed-size objects, extended for generational mark-sweep GC. Each cell's
    one-byte GC state is the owning struct's own first field (pinned to offset 0 by _Static_asserts
-   in value.h) — in the object, not a side table, so barrier checks need no reverse lookup.
+   in value.h) -- in the object, not a side table, so barrier checks need no reverse lookup.
 
    An aligned-slab + per-slab packed side-array alternative (state bytes moved out of the struct
    entirely, addressed by masking a cell pointer) was prototyped and measured against sieve/nbody/
@@ -17,7 +17,7 @@
    case it was aimed at). Reverted; this embedded-byte design stays. */
 #define POOL_MARKED     0x1   /* this collection cycle only */
 #define POOL_OLD        0x2   /* set once a cell survives a collection; cleared on every pool_alloc */
-#define POOL_FREE       0x4   /* on the free-list — stops pool_sweep re-pushing, and lets a stale remembered-set entry be detected */
+#define POOL_FREE       0x4   /* on the free-list -- stops pool_sweep re-pushing, and lets a stale remembered-set entry be detected */
 #define POOL_REMEMBERED 0x8   /* in the GC's remembered set; never cleared (the set is add-only) */
 
 /* Sentinel for Pool.free_slab_head / Pool.slab_free_next: "no slab" (empty list / list terminator). */
@@ -34,7 +34,7 @@ typedef struct {
     /* Pool-wide free list, used ONLY by external (non-GC-scan-path) callers of pool_free -- in
        practice that's exclusively hashtable.c's own key/sparse-array pools, which gc_collect never
        passes through pool_clear_marks/pool_sweep with young_only, so they have no use for (and never
-       populate) the per-slab machinery below. Linked through freed cells' bytes [8,16) — offset 0
+       populate) the per-slab machinery below. Linked through freed cells' bytes [8,16) -- offset 0
        would clobber gc_state. */
     void*           free_list;
 
@@ -76,7 +76,7 @@ void  pool_finalize_all(Pool* p, void (*on_free)(void* cell));
    heap going away), not for freeing one cell (see pool_free). Leaves *p zeroed, safe to reuse. */
 void  pool_destroy(Pool* p);
 
-/* Returns uninitialized memory, like malloc — caller fills it in; always born young, whether reused from the free-list or carved from a fresh slab. */
+/* Returns uninitialized memory, like malloc -- caller fills it in; always born young, whether reused from the free-list or carved from a fresh slab. */
 void* pool_alloc(Pool* p);
 
 void  pool_free(Pool* p, void* cell);
@@ -84,18 +84,18 @@ void  pool_free(Pool* p, void* cell);
 /* All five below read/write only *cell's own state byte -- no Pool* needed, since gc_state lives in
    the object itself, not a side table (see this file's own top comment). */
 
-/* Sets cell's mark bit; returns true if already set — the mark phase's guard against recursing into an already-visited cell. */
+/* Sets cell's mark bit; returns true if already set -- the mark phase's guard against recursing into an already-visited cell. */
 bool  pool_mark(void* cell);
 
 bool  pool_is_young(void* cell);
 
-/* True if cell is already on the free-list — a remembered-set entry can outlive its cell (entries are never removed, see vm.c), so retracing the set must check this before dereferencing. */
+/* True if cell is already on the free-list -- a remembered-set entry can outlive its cell (entries are never removed, see vm.c), so retracing the set must check this before dereferencing. */
 bool  pool_is_freed(void* cell);
 
 /* True if cell's remembered-set bit is already set. */
 bool  pool_is_remembered(void* cell);
 
-/* Sets cell's remembered-set bit. Never cleared — see the comment above. */
+/* Sets cell's remembered-set bit. Never cleared -- see the comment above. */
 void  pool_mark_remembered(void* cell);
 
 /* Walks every carved-out cell; free-listed cells are always skipped, and if young_only, old cells too (a minor collection assumes old cells are live). Unmarked cells go to on_free then the free-list; marked cells are promoted with their mark bit cleared for next cycle. */

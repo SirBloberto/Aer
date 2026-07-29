@@ -22,10 +22,10 @@ bool aer_regex_call(VM* vm, int fn_id, int arg_count);
 bool aer_actor_module_call(VM* vm, int fn_id, int arg_count);
 bool aer_scheduler_module_call(VM* vm, int fn_id, int arg_count);
 
-/* Takes Chunk* unlike the others — encoding a struct instance needs its field names. */
+/* Takes Chunk* unlike the others -- encoding a struct instance needs its field names. */
 bool aer_json_call(VM* vm, Chunk* c, int fn_id, int arg_count);
 
-/* Registers the "io" module via aer_register_function — called once per process by vm_init()
+/* Registers the "io" module via aer_register_function -- called once per process by vm_init()
    (vm.c's ensure_io_registered), the same always-on status every other stdlib module already has.
    Declared here rather than called directly so aer_register_function's generic mechanism stays
    available for a host's own genuinely custom functions. */

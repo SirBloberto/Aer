@@ -24,7 +24,7 @@
 #define BACKSPACE    127
 
 #define ESCAPE_SEQUENCE '\x1b'
-#define ARROW_UP    'A'     /* Esc[A — POSIX-only; see read_key() */
+#define ARROW_UP    'A'     /* Esc[A -- POSIX-only; see read_key() */
 #define ARROW_DOWN  'B'     /* Esc[B */
 #define ARROW_RIGHT 'C'     /* Esc[C */
 #define ARROW_LEFT  'D'     /* Esc[D */
@@ -32,7 +32,7 @@
 #define END         'F'     /* Esc[F */
 #define DELETE_SEQ  '3'     /* named DELETE_SEQ: windows.h already defines DELETE */
 
-/* read_key()'s normalized special-key codes — outside any char/EOF value so a typed character
+/* read_key()'s normalized special-key codes -- outside any char/EOF value so a typed character
    can never collide with one. */
 #define KEY_ARROW_UP    1000
 #define KEY_ARROW_DOWN  1001
@@ -149,7 +149,7 @@ void start_terminal(char* name) {
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
         die("tcsetattr");
 
-    /* Safe signal handler — just sets a flag */
+    /* Safe signal handler -- just sets a flag */
     signal(SIGWINCH, handle_resize);
 
     struct winsize ws;
@@ -171,7 +171,7 @@ void start_terminal(char* name) {
     history_length = (unsigned long)ftell(history);
     unsigned int read_size = MIN(history_length, COMMAND_SIZE);
     fseek(history, -(long)read_size, SEEK_END);
-    /* Place each byte at (logical_start + k) % COMMAND_SIZE — a plain fread misaligns once
+    /* Place each byte at (logical_start + k) % COMMAND_SIZE -- a plain fread misaligns once
        history exceeds COMMAND_SIZE bytes across sessions. */
     char temp[COMMAND_SIZE];
     size_t got = fread(temp, 1, read_size, history);
@@ -232,7 +232,7 @@ char* handle_terminal() {
             if (history_position < 2) continue;  /* underflow guard */
             reset();
             clear();
-            /* Bytes before this floor were overwritten by ring wraparound — scanning past it aliases. */
+            /* Bytes before this floor were overwritten by ring wraparound -- scanning past it aliases. */
             unsigned long floor_pos = (history_length > COMMAND_SIZE) ? (history_length - COMMAND_SIZE) : 0;
             /* Step back past the trailing newline of the previous entry */
             unsigned long pos = history_position - 2;
@@ -288,13 +288,13 @@ char* handle_terminal() {
             length--;
 
         } else if (key == NEW_LINE) {
-            /* length can equal buffer_length exactly — reserve room for newline AND NUL before writing. */
+            /* length can equal buffer_length exactly -- reserve room for newline AND NUL before writing. */
             if (length + 2 > buffer_length) {
                 buffer_length *= 2;
                 buffer = xrealloc(buffer, buffer_length);
             }
             buffer[length] = '\n';
-            /* Backspace leaves stale bytes past `length` — NUL-terminate or strlen reads a longer edit's tail. */
+            /* Backspace leaves stale bytes past `length` -- NUL-terminate or strlen reads a longer edit's tail. */
             buffer[length + 1] = '\0';
             if (length != 0) {
                 /* Persist to history file */
@@ -315,7 +315,7 @@ char* handle_terminal() {
 
         } else if (key == END_OF_TEXT) {   /* Ctrl-C */
             /* Ctrl-C cancels the whole in-progress input (including a multi-line block), not the shell;
-               Ctrl-D exits — say so, there's no other way to discover it. */
+               Ctrl-D exits -- say so, there's no other way to discover it. */
             if (screen_rows > screen_row)
                 printf("\x1b[%dB", screen_rows - screen_row);
             printf("\nKeyboardInterrupt (press Ctrl-D to exit)\n");
@@ -329,7 +329,7 @@ char* handle_terminal() {
             exit(0);
 
         } else if (key == EOF) {
-            /* stdin closed/exhausted — without this, EOF loops forever in the insert branch. */
+            /* stdin closed/exhausted -- without this, EOF loops forever in the insert branch. */
             printf("\n");
             end_terminal();
             exit(0);
@@ -379,7 +379,7 @@ static void refresh() {
     for (int c = (int)prompt_len + length; c > (int)screen_columns; c -= screen_columns)
         screen_rows++;
 
-    /* Text ending exactly at the right margin doesn't auto-scroll — emit the newline manually. */
+    /* Text ending exactly at the right margin doesn't auto-scroll -- emit the newline manually. */
     if (((int)prompt_len + length) % (int)screen_columns == 0
             && position == length
             && (int)prompt_len + position > screen_position) {
@@ -418,7 +418,7 @@ static void check_resize() {
     }
 }
 #else
-/* Signal handler — only sets a flag; async-signal-safe */
+/* Signal handler -- only sets a flag; async-signal-safe */
 static void handle_resize(int sig) {
     (void)sig;
     resize_pending = 1;
@@ -476,7 +476,7 @@ static void reset() {
 
 static void die(const char* message) {
 #ifdef _WIN32
-    /* GetLastError(), not errno — Win32 failures; likely cause is a redirected (non-console) stdin. */
+    /* GetLastError(), not errno -- Win32 failures; likely cause is a redirected (non-console) stdin. */
     DWORD err = GetLastError();
     char* msg = NULL;
     FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,

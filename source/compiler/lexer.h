@@ -5,10 +5,10 @@
 #include "value.h"
 
 typedef enum TokenType {
-    /* Binary ops — precedence is looked up by binary_op_info()'s switch in parser.c, not by enum
+    /* Binary ops -- precedence is looked up by binary_op_info()'s switch in parser.c, not by enum
        order, so nothing here needs to stay contiguous. */
     TOKEN_OR,               /* or */
-    TOKEN_PIPE,             /* |> — x |> f(a) desugars to f(x, a) */
+    TOKEN_PIPE,             /* |> -- x |> f(a) desugars to f(x, a) */
     TOKEN_AND,              /* and */
     TOKEN_BITWISE_OR,       /* |  */
     TOKEN_BITWISE_XOR,      /* ^  */
@@ -19,7 +19,7 @@ typedef enum TokenType {
     TOKEN_GREATER,          /* >  */
     TOKEN_LESS_EQUAL,       /* <= */
     TOKEN_GREATER_EQUAL,    /* >= */
-    TOKEN_IN,               /* in — membership test: `key in dict`, `value in array` */
+    TOKEN_IN,               /* in -- membership test: `key in dict`, `value in array` */
     TOKEN_LEFT_SHIFT,       /* << */
     TOKEN_RIGHT_SHIFT,      /* >> */
     TOKEN_ADD,              /* +  */
@@ -39,7 +39,7 @@ typedef enum TokenType {
     TOKEN_FLOOR_DIVIDE_ASSIGN, /* //= */
 
     /* Unary operators */
-    TOKEN_NOT,              /* not — see binary_op_info's comment: binds tighter than and/or, looser than everything else */
+    TOKEN_NOT,              /* not -- see binary_op_info's comment: binds tighter than and/or, looser than everything else */
     TOKEN_BITWISE_NOT,      /* ~  */
 
     /* Punctuation */
@@ -50,7 +50,7 @@ typedef enum TokenType {
     TOKEN_OPEN_BRACE,       /* {  */
     TOKEN_CLOSE_BRACE,      /* }  */
     TOKEN_COLON,            /* :  */
-    TOKEN_DOT,              /* .  — struct field access: p.x */
+    TOKEN_DOT,              /* .  -- struct field access: p.x */
     TOKEN_DOT_DOT,          /* .. */
 
     /* Literals */
@@ -78,11 +78,9 @@ typedef enum TokenType {
     TOKEN_TYPE_INTEGER,
     TOKEN_TYPE_FLOAT,
     TOKEN_TYPE_BOOLEAN,
-    TOKEN_TYPE_ARRAY,
-    TOKEN_TYPE_HASHTABLE,
 
     TOKEN_COMMA,
-    TOKEN_SEMICOLON,        /* ;  — the repeat-literal separator, `[value; count]`, and nothing else */
+    TOKEN_SEMICOLON,        /* ;  -- the repeat-literal separator, `[value; count]`, and nothing else */
 
     TOKEN_INDENT,
     TOKEN_DEDENT,
@@ -127,12 +125,12 @@ unsigned int current_source_line();
 /* Exposed so a file-based `import` can resolve a sibling .aer path relative to the file currently being lexed. */
 const char* current_source_name();
 
-/* Captures everything read_file()/indent tracking need to resume the CURRENT file's lexing where it left off after a nested read_file()+lex()+parse() cycle for an imported file completes; opaque outside lexer.c — only ever saved and restored, never inspected. */
+/* Captures everything read_file()/indent tracking need to resume the CURRENT file's lexing where it left off after a nested read_file()+lex()+parse() cycle for an imported file completes; opaque outside lexer.c -- only ever saved and restored, never inspected. */
 typedef struct LexerState LexerState;
 LexerState* lexer_save_state(void);
 void        lexer_restore_state(LexerState* state);
 
-/* Begins lexing a fresh, independent text span (e.g. a string interpolation's `{expr}` body) —
+/* Begins lexing a fresh, independent text span (e.g. a string interpolation's `{expr}` body) --
    see this function's own comment in lexer.c for the save/restore contract callers must follow.
    start_line is the absolute source line the span's first character sits on, in whatever file it
    was cut from -- needed so line numbers attached to bytecode compiled from the span (chunk_mark_line)

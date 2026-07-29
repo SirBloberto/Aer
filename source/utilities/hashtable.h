@@ -24,7 +24,7 @@ void hashtable_pools_init(HashPools* pools);
 
 /* Compact hashtable backing Chunk's name_index and AerDict: a small sparse array of probe indices
    (cache-resident even at large table sizes) pointing into a dense array of the actual entries,
-   packed in insertion order with no holes. Growing the table only ever touches the sparse array —
+   packed in insertion order with no holes. Growing the table only ever touches the sparse array --
    the dense array's entries are never moved by a rehash, only appended to. The table owns only the
    key; the AerVal payload's heap cells belong to the GC. `hash` is cached at insertion so a rehash
    or remove's repair walk never recomputes it. */

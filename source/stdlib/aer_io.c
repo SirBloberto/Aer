@@ -6,12 +6,12 @@
 #include "aer_host.h"
 #include "error.h"
 
-/* io is host-registered, not a native module — file access is opt-in per host (see aer_stdlib.h). */
+/* io is host-registered, not a native module -- file access is opt-in per host (see aer_stdlib.h). */
 
-/* io.stdin()'s handle — the only handle in this API; everything else is one-shot and path-based. */
+/* io.stdin()'s handle -- the only handle in this API; everything else is one-shot and path-based. */
 #define STDIN_HANDLE 0
 
-/* Borrowed argv slice for io.args() — see aer_io_set_args (aer_stdlib.h). */
+/* Borrowed argv slice for io.args() -- see aer_io_set_args (aer_stdlib.h). */
 static int    io_argc = 0;
 static char** io_argv = NULL;
 
@@ -102,7 +102,7 @@ static AerVal io_append(VM* vm, int arg_count, AerVal* args, void* userdata) {
     return io_write_mode(args[0], args[1], "a");
 }
 
-/* A plain boolean, not a Result — "no" is an answer here, never an error. */
+/* A plain boolean, not a Result -- "no" is an answer here, never an error. */
 static AerVal io_exists(VM* vm, int arg_count, AerVal* args, void* userdata) {
     (void)vm; (void)userdata;
     if (arg_count != 1 || aer_type(args[0]) != TYPE_STRING) {

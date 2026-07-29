@@ -41,7 +41,7 @@ bool aer_host_call(VM* vm, const char* module, const char* fn_name, int arg_coun
 
     if (vm->stack_top < arg_count) { error("Stack underflow"); return true; }
 
-    /* A copy, not a live pointer into the VM's stack (see aer.h's AerNativeFn contract) —
+    /* A copy, not a live pointer into the VM's stack (see aer.h's AerNativeFn contract) --
        arg_count <= vm->stack_top <= VM_STACK_MAX keeps it in bounds. */
     AerVal args[VM_STACK_MAX];
     memcpy(args, &vm->stack[vm->stack_top - arg_count], sizeof(AerVal) * (size_t)arg_count);

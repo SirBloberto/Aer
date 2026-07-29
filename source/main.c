@@ -45,12 +45,12 @@ static unsigned int parse_memory_size(const char* s) {
 
 int main(int argc, char** argv) {
     chunk_init(&chunk);
-    /* Once per process — parser state persists across parse() calls, which is what makes REPL
+    /* Once per process -- parser state persists across parse() calls, which is what makes REPL
        variable/function persistence work */
     parser_reset();
 
     /* Filter recognized global flags out of argv before the help/version/file dispatch sees them
-       — everything after the script path still reaches the script untouched, via io.args(). Must
+       -- everything after the script path still reaches the script untouched, via io.args(). Must
        run BEFORE vm_init below: vm_init seeds vm.io_enabled/net_enabled from the current
        aer_io_enabled/aer_net_enabled globals once, so --no-io/--no-net need to already be applied
        to those globals by the time it runs, or the flag would silently do nothing for this vm. */
@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
         status = run_file(argv[1]) ? 0 : 1;
     }
 
-    /* Not load-bearing at process exit — exercises the same teardown path an embedding host would use. */
+    /* Not load-bearing at process exit -- exercises the same teardown path an embedding host would use. */
     aer_module_free_all();
     return status;
 }
@@ -107,12 +107,12 @@ int main(int argc, char** argv) {
 /* Parse and run all statements in the current source buffer; resets bytecode each call, but name/constant pools persist so indices stay stable across REPL calls. */
 
 static void run() {
-    /* Append new code after any previous bytecode — preserves function bodies compiled in earlier REPL calls. */
+    /* Append new code after any previous bytecode -- preserves function bodies compiled in earlier REPL calls. */
     aer_vm_reset_for_reuse(&vm);
     vm.ip = chunk.count;
     lex();
     /* parse() never resets its own tables (parser_reset, called once in main() above, already did
-       that) and has its own per-statement rollback/recovery, so it's safe to call repeatedly —
+       that) and has its own per-statement rollback/recovery, so it's safe to call repeatedly --
        once per REPL line, or once for a whole file. */
     parse(&chunk);
     chunk_emit(&chunk, OP_HALT);
@@ -138,7 +138,7 @@ static void run_shell() {
     while (1) {
         char* line = handle_terminal();
         if (!line) {
-            /* Ctrl-C — abandon any in-progress multi-line block, like Python's REPL */
+            /* Ctrl-C -- abandon any in-progress multi-line block, like Python's REPL */
             free(block_buf);
             block_buf  = NULL;
             block_size = 0;
@@ -198,7 +198,7 @@ static bool run_file(char* path) {
     chunk.source_filename = xstrdup(path);
     read_file(path);
     /* read_file() can fail (missing file, unreadable, embedded NUL) without ever setting up the
-       lexer's current file — calling run() anyway would lex/parse a null or stale File*. */
+       lexer's current file -- calling run() anyway would lex/parse a null or stale File*. */
     if (!aer_had_error()) run();
 #ifdef AER_DEBUG_TOOLS
     /* After run() so the dump has both the bytecode and the run's hit counts; "-" means stderr */
@@ -211,7 +211,7 @@ static bool run_file(char* path) {
         if (dump_out != stderr) fclose(dump_out);
     }
 #endif
-    /* A runtime error doesn't terminate the process (see error.c) — the CLI decides to exit nonzero here; a failed assert() doesn't set aer_had_error() on purpose (see error.h), so it's checked separately. */
+    /* A runtime error doesn't terminate the process (see error.c) -- the CLI decides to exit nonzero here; a failed assert() doesn't set aer_had_error() on purpose (see error.h), so it's checked separately. */
     return !aer_had_error() && aer_assert_failure_count() == 0;
 }
 

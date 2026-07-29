@@ -66,10 +66,10 @@ void* pool_alloc(Pool* p) {
     if (p->free_slab_head != POOL_NO_SLAB) {
         unsigned int i = p->free_slab_head;
         void* cell = p->slab_free_list[i];
-        /* Next-pointer lives at [sizeof(void*), 2*sizeof(void*)), not [0, sizeof(void*)) — see pool.h. */
+        /* Next-pointer lives at [sizeof(void*), 2*sizeof(void*)), not [0, sizeof(void*)) -- see pool.h. */
         p->slab_free_list[i] = *(void**)((char*)cell + sizeof(void*));
         if (!p->slab_free_list[i]) p->free_slab_head = p->slab_free_next[i];   /* slab i is empty again -- leave the list */
-        *(unsigned char*)cell = 0;   /* always born young, regardless of which physical cell was reused — see pool.h */
+        *(unsigned char*)cell = 0;   /* always born young, regardless of which physical cell was reused -- see pool.h */
         p->slab_young_count[i]++;    /* exact and unconditional -- this slab is known for certain */
         return cell;
     }
@@ -90,7 +90,7 @@ void* pool_alloc(Pool* p) {
 }
 
 void pool_free(Pool* p, void* cell) {
-    /* Discards whatever mark/generation bits the cell had — neither is consulted on the free-list, and pool_alloc zeroes the byte again on reuse anyway. */
+    /* Discards whatever mark/generation bits the cell had -- neither is consulted on the free-list, and pool_alloc zeroes the byte again on reuse anyway. */
     *(unsigned char*)cell = POOL_FREE;
     *(void**)((char*)cell + sizeof(void*)) = p->free_list;   /* see pool_free's own comment on why not offset 0 */
     p->free_list = cell;

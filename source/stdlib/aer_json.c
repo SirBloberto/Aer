@@ -35,7 +35,7 @@ static void json_encode_string(StrBuf* b, const char* s, unsigned int len) {
     strbuf_append_char(b, '"');
 }
 
-/* Returns false (error() already called) for a function or packed-array value — everything else succeeds. A struct instance encodes as a JSON object keyed by field names, so they survive a round trip via json.decode(). */
+/* Returns false (error() already called) for a function or packed-array value -- everything else succeeds. A struct instance encodes as a JSON object keyed by field names, so they survive a round trip via json.decode(). */
 static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
     char tmp[64];
     switch (aer_type(v)) {
@@ -99,13 +99,13 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
         case TYPE_RESULT:
             error("json.encode() cannot serialize a Result value");
             return false;
-        case TYPE_ANY: break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
+        case TYPE_ANY: break;   /* never a real AerVal's tag -- only Shape.field_types[] uses it */
     }
     return true;
 }
 
 /* ------------------------------------------------------------------ */
-/* decode — small recursive-descent parser                            */
+/* decode -- small recursive-descent parser                            */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -166,7 +166,7 @@ static AerVal json_parse_string_raw(JsonParser* p) {
                 hex[4] = '\0';
                 unsigned int code = (unsigned int)strtoul(hex, NULL, 16);
                 p->pos += 5;
-                /* Encoded straight to UTF-8, basic-plane only — no surrogate pair reconstruction, since nothing here needs anything past the BMP. */
+                /* Encoded straight to UTF-8, basic-plane only -- no surrogate pair reconstruction, since nothing here needs anything past the BMP. */
                 if (code < 0x80) {
                     strbuf_append_char(&b, (char)code);
                 } else if (code < 0x800) {
@@ -216,7 +216,7 @@ static AerVal json_parse_number(JsonParser* p) {
     }
     unsigned int n = p->pos - start;
     char buf[64];
-    if (n >= sizeof(buf)) n = sizeof(buf) - 1;   /* absurd literal — truncate rather than overflow */
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;   /* absurd literal -- truncate rather than overflow */
     memcpy(buf, p->s + start, n);
     buf[n] = '\0';
     return is_real ? aer_real(strtod(buf, NULL)) : aer_int(strtoll(buf, NULL, 10));

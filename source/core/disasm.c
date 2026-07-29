@@ -7,13 +7,13 @@
 /* Kinds of operand word this disassembler knows how to decode/print. */
 typedef enum {
     FLD_END,      /* marks the end of an opcode's operand list */
-    FLD_POOL,     /* pool index — resolve and print the constant's own value */
-    FLD_NAME,     /* pool index known to be a TYPE_STRING name — print just the string, no quotes */
+    FLD_POOL,     /* pool index -- resolve and print the constant's own value */
+    FLD_NAME,     /* pool index known to be a TYPE_STRING name -- print just the string, no quotes */
     FLD_JUMP,     /* absolute code offset this instruction may jump to */
     FLD_COUNT,    /* a raw integer (arg count, item count, arity...) */
     FLD_BINOP,    /* an Opcode value used as an operand (bin_op in a fused op) */
     FLD_CAST,     /* CAST_INTEGER/CAST_FLOAT/CAST_BOOLEAN */
-    FLD_REG,      /* a plain register index (packed or wide — a register number either way) */
+    FLD_REG,      /* a plain register index (packed or wide -- a register number either way) */
     FLD_RK,       /* an RK-encoded operand: RK_CONST_FLAG set = a pool constant, else a register */
 } Field;
 
@@ -23,7 +23,7 @@ typedef struct {
     const char* name;
     const char* desc;
     Field       fields[MAX_FIELDS];
-    bool        variable;   /* true only for OP_DEFINE_STRUCT — see disassemble_one */
+    bool        variable;   /* true only for OP_DEFINE_STRUCT -- see disassemble_one */
     /* Total WORD count beyond word0 (i.e. total instruction word count - 1) -- used only by
        aer_disassemble's per-opcode hit-total pass to skip to the next instruction. Every opcode
        below is either fully special-cased in disassemble_one (this is its only use) or falls
@@ -38,7 +38,7 @@ typedef struct {
 #define OP_INFO_MAX OP_UNBOX_PARAM_REAL
 
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
-    /* OP_ADD..OP_IN: one opcode per operator, whole instruction in one word (PACK3 + RK8 pair) —
+    /* OP_ADD..OP_IN: one opcode per operator, whole instruction in one word (PACK3 + RK8 pair) --
        special-cased in disassemble_one via binary_op_dispatched(). */
     [OP_ADD] = { "OP_ADD", "reg = rk + rk" },
     [OP_SUB] = { "OP_SUB", "reg = rk - rk" },
@@ -74,7 +74,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_LOADK] = { "OP_LOADK", "reg = pool constant", {FLD_REG, FLD_POOL}, false, 0, 2 },
     [OP_MOVE]  = { "OP_MOVE",  "reg = reg", {FLD_REG, FLD_REG}, false, 0, 2 },
     [OP_IS_RESULT] = { "OP_IS_RESULT", "reg = is-result(reg)", {FLD_REG, FLD_REG}, false, 0, 2 },
-    /* Whole instruction in one word (PACK3 + RK8 pair) — special-cased, no trailing wide fields. */
+    /* Whole instruction in one word (PACK3 + RK8 pair) -- special-cased, no trailing wide fields. */
     [OP_BINARY] = { "OP_BINARY", "reg = rk OP rk" },
     /* word0: op+reg. word1: target (dedicated). */
     [OP_JUMP_IF_FALSE_REG] = { "OP_JUMP_IF_FALSE_REG", "jump if !reg, no pop", {FLD_REG, FLD_JUMP}, false, 1, 1 },
@@ -90,7 +90,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* word0: dest+arg_base+arg_count. word1: name_idx. word2: builtin_id. */
     [OP_CALL_BUILTIN] = { "OP_CALL_BUILTIN", "global builtin (length/print/etc.) by name", {0}, false, 2, 0 },
     [OP_ARRAY_NEW] = { "OP_ARRAY_NEW", "reg = new array from a contiguous reg range", {FLD_REG, FLD_REG, FLD_COUNT}, false, 0, 3 },
-    /* Single-word RK8-packed family — special-cased in disassemble_one like OP_BINARY. */
+    /* Single-word RK8-packed family -- special-cased in disassemble_one like OP_BINARY. */
     [OP_INDEX_GET] = { "OP_INDEX_GET", "reg = reg[rk]" },
     [OP_INDEX_SET] = { "OP_INDEX_SET", "reg[rk] = rk" },
     [OP_DESTRUCTURE] = { "OP_DESTRUCTURE", "reg, reg = destructure(reg)" },
@@ -117,7 +117,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_INDEX_FIELD_SET]  = { "OP_INDEX_FIELD_SET",  "fused: reg[rk].field = rk (packed or struct array)", {0}, false, 1, 0 },
     /* word0: obj_reg+bin_op. word1: field_idx16+rk_idx16. word2: rk_rhs16. */
     [OP_INDEX_FIELD_COMPOUND] = { "OP_INDEX_FIELD_COMPOUND", "fused: reg[rk].field OP= rk (resolved once, packed or struct array)", {0}, false, 2, 0 },
-    /* Single-word RK8-packed — special-cased. */
+    /* Single-word RK8-packed -- special-cased. */
     [OP_UNARY] = { "OP_UNARY", "reg = unary_op(rk)" },
     [OP_CAST]  = { "OP_CAST",  "reg = cast(rk)" },
     /* word0: dest+struct_reg+bin_op. word1: field_idx16+rk16. */
@@ -127,7 +127,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_FIELD_COMPOUND] = { "OP_FIELD_COMPOUND", "fused: struct.field OP= rk (resolved once, no dest reg)", {0}, false, 1, 0 },
     [OP_PRINT_REPL] = { "OP_PRINT_REPL", "shell mode: print reg unless null", {FLD_REG}, false, 0, 1 },
 
-    /* Raw-arithmetic family — special-cased below; fields[]/packed/trailing_words kept for
+    /* Raw-arithmetic family -- special-cased below; fields[]/packed/trailing_words kept for
        documentation only except where noted (LOAD_INT/LOAD_REAL/LOAD_INT_POOL are 2 words). */
     [OP_RAW_LOAD_INT]      = { "OP_RAW_LOAD_INT",      "rawi = imm (full int32)", {0}, false, 1, 0 },
     [OP_RAW_LOAD_REAL]     = { "OP_RAW_LOAD_REAL",     "rawr = pool constant", {0}, false, 1, 0 },
@@ -214,7 +214,7 @@ static const char* cast_name(int k) {
     }
 }
 
-/* One-line pool-constant rendering — containers are never pool literals, so no recursion needed. */
+/* One-line pool-constant rendering -- containers are never pool literals, so no recursion needed. */
 static void print_pool_value(FILE* out, AerVal v) {
     switch (aer_type(v)) {
         case TYPE_NULL:     fprintf(out, "null"); break;
@@ -236,7 +236,7 @@ static const char* opcode_name(int op) {
     return (op >= 0 && op <= OP_INFO_MAX && op_info[op].name) ? op_info[op].name : "?";
 }
 
-/* Prints one already-extracted field value — the caller has already pulled it out of whichever
+/* Prints one already-extracted field value -- the caller has already pulled it out of whichever
    word/sub-field it lives in. */
 static void print_field(FILE* out, Chunk* c, Field kind, int word) {
     switch (kind) {
@@ -255,7 +255,7 @@ static void print_field(FILE* out, Chunk* c, Field kind, int word) {
     }
 }
 
-/* RK16's own printer (1 flag + 15 index bits) — the wire form most RK operands use now. */
+/* RK16's own printer (1 flag + 15 index bits) -- the wire form most RK operands use now. */
 static void print_rk16(FILE* out, Chunk* c, uint32_t rk) {
     if (rk & RK16_CONST_FLAG) { fprintf(out, "  rk=const:"); print_pool_value(out, c->pool[rk & RK16_INDEX_MASK]); }
     else                          fprintf(out, "  rk=reg%u", rk & RK16_INDEX_MASK);
@@ -268,11 +268,11 @@ static void print_rk8(FILE* out, Chunk* c, uint32_t rk) {
     else                        fprintf(out, "  rk=reg%u", rk & RK8_INDEX_MASK);
 }
 
-/* Raw-slot printers — kept separate so a dump reader can tell int=/real= from reg=/rk=. */
+/* Raw-slot printers -- kept separate so a dump reader can tell int=/real= from reg=/rk=. */
 static void print_rawi(FILE* out, int slot) { fprintf(out, "  rawi=%d", slot); }
 static void print_rawr(FILE* out, int slot) { fprintf(out, "  rawr=%d", slot); }
 
-/* The per-operator opcodes sharing the one-word iABC+RK8 shape — decoded identically. */
+/* The per-operator opcodes sharing the one-word iABC+RK8 shape -- decoded identically. */
 static bool binary_op_dispatched(Opcode op) {
     switch (op) {
         case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_FLOOR_DIV:
@@ -506,7 +506,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_pool_value(out, c->pool[pool_idx]);
     } else if (op == OP_RAW_ADD_INT || op == OP_RAW_SUB_INT || op == OP_RAW_MUL_INT ||
                op == OP_RAW_DIV_INT || op == OP_RAW_MOD_INT || op == OP_RAW_FLOOR_DIV_INT) {
-        /* OP_RAW_DIV_INT alone writes raw_reals[] (int/int division promotes) — dest printer differs. */
+        /* OP_RAW_DIV_INT alone writes raw_reals[] (int/int division promotes) -- dest printer differs. */
         if (op == OP_RAW_DIV_INT) print_rawr(out, (int)UNPACK_A(op_word));
         else                      print_rawi(out, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
@@ -586,7 +586,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rawr(out, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
     } else {
-        /* Generic path — the handful of opcodes whose fields all fit the plain PACK3 shape
+        /* Generic path -- the handful of opcodes whose fields all fit the plain PACK3 shape
            (op+up to 3 byte fields) with nothing trailing, or nothing at all. */
         int i = 0;
         for (; i < info->packed; i++) {

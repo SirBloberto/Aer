@@ -42,7 +42,7 @@ void chunk_free(Chunk* c) {
     free(c->functions);
     for (unsigned int i = 0; i < c->shape_count; i++) free(c->shapes[i]);
     free(c->shapes);
-    /* Not each entry's shape — every populated slot's Shape* is owned by c->shapes, never separately owned. */
+    /* Not each entry's shape -- every populated slot's Shape* is owned by c->shapes, never separately owned. */
     free(c->field_cache);
     free(c->call_spec_cache);
 #ifdef AER_DEBUG_TOOLS
@@ -95,7 +95,7 @@ static unsigned int chunk_pool_append(Chunk* c, AerVal v) {
 unsigned int chunk_add_pool(Chunk* c, AerVal v) {
     /* Strings dominate call volume and the REPL never resets the pool between lines, so dedup them via name_index (O(1)) instead of the O(n) linear scan below, kept for rarer non-string literals. */
     if (aer_type(v) == TYPE_STRING) {
-        /* Tokens are substrings of the source buffer, not NUL-terminated — build an owned copy first. */
+        /* Tokens are substrings of the source buffer, not NUL-terminated -- build an owned copy first. */
         AerString* vs = aer_as_string(v);
         char* key = xmalloc(vs->length + 1);
         memcpy(key, vs->data, vs->length);

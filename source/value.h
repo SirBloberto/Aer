@@ -6,16 +6,16 @@
 #include <stdint.h>
 #include <string.h>   /* memcmp, for the inline string helpers below */
 
-/* Forward declarations — mutual references between AerVal and collection types */
+/* Forward declarations -- mutual references between AerVal and collection types */
 typedef struct AerArray       AerArray;
 typedef struct AerDict        AerDict;
 typedef struct AerFunction    AerFunction;
 typedef struct AerString      AerString;
-typedef struct AerStruct      AerStruct;   /* full definition in vm.h — needs Shape's real definition, defined there too */
+typedef struct AerStruct      AerStruct;   /* full definition in vm.h -- needs Shape's real definition, defined there too */
 typedef struct AerPackedArray AerPackedArray;
 typedef struct AerTypedArray  AerTypedArray;
 typedef struct AerResult      AerResult;
-typedef struct Shape       Shape;   /* full definition in vm.h — needs pool-index arrays */
+typedef struct Shape       Shape;   /* full definition in vm.h -- needs pool-index arrays */
 
 typedef enum ValueType {
     TYPE_NULL,      /* zero-value; (AerVal){0} is null */
@@ -26,26 +26,26 @@ typedef enum ValueType {
     TYPE_FUNCTION,
     TYPE_ARRAY,
     TYPE_DICT,
-    /* A single struct instance — its own type, not an AerArray with shape set (that was the old
+    /* A single struct instance -- its own type, not an AerArray with shape set (that was the old
        design; see AerStruct's own comment in vm.h for why it was split out). Fields are either raw
        (typed, 8 bytes, no tag) or a full boxed AerVal (TYPE_ANY only) per-field, per Shape.field_offsets. */
     TYPE_STRUCT,
-    /* Struct-typed *arrays* packed inline at 8 bytes/field — fixed-primitive fields only, and no
+    /* Struct-typed *arrays* packed inline at 8 bytes/field -- fixed-primitive fields only, and no
        standalone `arr[i]` reference value (only `arr[i].field`); see AerPackedArray below. */
     TYPE_PACKED_ARRAY,
-    /* A dense, uniformly-typed numeric array (int32/float32/int64/float64) — the numeric half of the
+    /* A dense, uniformly-typed numeric array (int32/float32/int64/float64) -- the numeric half of the
        `[value; count]` repeat-literal (the struct half is TYPE_PACKED_ARRAY above). Unlike
        AerPackedArray this has no Shape at all -- just one fixed element kind for the whole array.
        See AerTypedArray below. */
     TYPE_TYPED_ARRAY,
-    /* Tagged (value, err) pair, exactly one non-null — a real type (not a 2-array) so dispatch
+    /* Tagged (value, err) pair, exactly one non-null -- a real type (not a 2-array) so dispatch
        can recognize a Result on sight. */
     TYPE_RESULT,
-    /* Never a real AerVal tag — only Shape.field_types[]'s "no declared type"; must stay last. */
+    /* Never a real AerVal tag -- only Shape.field_types[]'s "no declared type"; must stay last. */
     TYPE_ANY,
 } ValueType;
 
-/* The one runtime value type everywhere. Zero-init MUST decode as null (TYPE_NULL == 0) —
+/* The one runtime value type everywhere. Zero-init MUST decode as null (TYPE_NULL == 0) --
    mark_vm_roots scans never-written registers unconditionally. */
 typedef struct AerVal {
     ValueType tag;
@@ -57,7 +57,7 @@ typedef struct AerVal {
     } as;
 } AerVal;
 
-/* gc_state must be byte 0 in every pool-managed struct — pool.c reads the leading byte generically.
+/* gc_state must be byte 0 in every pool-managed struct -- pool.c reads the leading byte generically.
    Field order below (here and in every other pool-managed struct in this file) packs small members
    into the padding gap gc_state would otherwise leave before the first pointer, rather than
    size-descending order -- recovers real bytes per cell with no behavior change; see ARCHITECTURE.md. */
@@ -88,7 +88,7 @@ struct AerArray {
 _Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
 /* One raw byte block, 8 bytes per field in declared order: element i's field j is at
-   data + i*(field_count*8) + j*8. A GC leaf — fields are fixed primitives, never heap refs, so no
+   data + i*(field_count*8) + j*8. A GC leaf -- fields are fixed primitives, never heap refs, so no
    write barrier and no mark recursion. */
 struct AerPackedArray {
     unsigned char gc_state;
@@ -127,14 +127,14 @@ struct AerFunction {
     uint16_t     arity;
     uint16_t     min_arity;       /* params [0, min_arity) are required; [min_arity, arity) use defaults[] below, in order */
     unsigned int code_offset;
-    unsigned int max_registers;   /* this function's real peak register need — see ChunkFunction's own comment, vm.h */
+    unsigned int max_registers;   /* this function's real peak register need -- see ChunkFunction's own comment, vm.h */
     unsigned int max_raw_ints;    /* this function's real peak raw_ints[] slot need -- see ChunkFunction's own comment, vm.h */
     unsigned int max_raw_reals;   /* same, for raw_reals[] */
     AerVal*      defaults;        /* NULL if min_arity == arity; else (arity - min_arity) compile-time-literal values */
 };
 _Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* `data` is always exclusively owned, never a borrowed view — the GC sweep frees it
+/* `data` is always exclusively owned, never a borrowed view -- the GC sweep frees it
    unconditionally, so a borrowed pointer would double-free or dangle. No dict-key hash cache here
    (tried as cached_hash/hash_valid fields, then again as a side array keyed off an aligned-slab
    pool redesign) -- both were removed: the first for coupling a leaf value type to hashtable.c's
@@ -147,7 +147,7 @@ struct AerString {
 };
 _Static_assert(offsetof(struct AerString, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* Set once at construction, never mutated — so no write barrier needed, unlike AerArray/AerDict. */
+/* Set once at construction, never mutated -- so no write barrier needed, unlike AerArray/AerDict. */
 struct AerResult {
     unsigned char gc_state;
     AerVal value;
@@ -157,10 +157,10 @@ _Static_assert(offsetof(struct AerResult, gc_state) == 0, "pool.c assumes gc_sta
 
 /* AerDict is defined in vm.h (needs HashTable which is in hashtable.h) */
 
-/* Boxes an exclusively-owned buffer as a TYPE_STRING — takes ownership, never copies. */
+/* Boxes an exclusively-owned buffer as a TYPE_STRING -- takes ownership, never copies. */
 AerVal aer_make_string(char* data, unsigned int length);
 
-/* Builds a Result from a (value, err) pair — exactly one of the two should be null. */
+/* Builds a Result from a (value, err) pair -- exactly one of the two should be null. */
 AerVal aer_make_result(AerVal value, AerVal err);
 
 /* Copies msg into an owned buffer and boxes it as a TYPE_STRING -- the common shape of building a
@@ -176,7 +176,7 @@ static inline AerVal aer_null(void) {
 }
 
 static inline AerVal aer_bool(bool b) {
-    /* as.i = 0 first — vm_packed_slot_write memcpy's the whole 8-byte union, not just byte 0 */
+    /* as.i = 0 first -- vm_packed_slot_write memcpy's the whole 8-byte union, not just byte 0 */
     AerVal v; v.tag = TYPE_BOOLEAN; v.as.i = 0; v.as.b = b; return v;
 }
 
@@ -184,7 +184,7 @@ static inline AerVal aer_real(double d) {
     AerVal v; v.tag = TYPE_REAL; v.as.d = d; return v;
 }
 
-/* A plain `int64_t` fits the value union at any magnitude — no heap-boxed overflow path needed. */
+/* A plain `int64_t` fits the value union at any magnitude -- no heap-boxed overflow path needed. */
 static inline AerVal aer_int(int64_t n) {
     AerVal v; v.tag = TYPE_INTEGER; v.as.i = n; return v;
 }
@@ -224,7 +224,7 @@ static inline int64_t aer_string_find(const AerString* hay, const AerString* nee
     return -1;
 }
 
-/* Lexicographic byte order, length tiebreak — the one ordering behind collection.sort and `<` on strings. */
+/* Lexicographic byte order, length tiebreak -- the one ordering behind collection.sort and `<` on strings. */
 static inline int aer_string_compare(const AerString* a, const AerString* b) {
     unsigned int n = a->length < b->length ? a->length : b->length;
     int c = memcmp(a->data, b->data, n);

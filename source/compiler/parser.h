@@ -17,7 +17,7 @@ void reg_free(int count);
 unsigned int emit_jump_if_false_reg(Chunk* c, int reg);
 void patch_jump(Chunk* c, unsigned int patch_offset, unsigned int target);
 
-/* callee_offset must be known at the call site (no patch step) — lay out the callee first. */
+/* callee_offset must be known at the call site (no patch step) -- lay out the callee first. */
 unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count,
                            unsigned int func_index);
 void emit_return(Chunk* c, int src_reg);
@@ -59,12 +59,12 @@ void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, 
 /* `[value; count]` repeat-literal construction; rk_count is RK-encoded. */
 void emit_array_repeat(Chunk* c, int dest_reg, int fill_reg, int narrow_flag, int rk_count);
 
-/* Reset every persistent compile table — ONCE per independent program, never between
+/* Reset every persistent compile table -- ONCE per independent program, never between
    statements of the same session (REPL persistence depends on it). */
 void parser_reset(void);
 
 /* Snapshot/restore of the parser's file-scope tables, for a nested parse() of an imported
-   file mid-compile — without it the import corrupts the outer compile. */
+   file mid-compile -- without it the import corrupts the outer compile. */
 typedef struct ParserState ParserState;
 ParserState* parser_save_state(void);
 void           parser_restore_state(ParserState* saved);

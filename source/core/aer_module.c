@@ -14,7 +14,7 @@
 #endif
 
 typedef struct {
-    char*        name;    /* the import name, e.g. "helpers" — keyed by this alone, process-wide, not by resolved path; two same-named imports from different dirs collide */
+    char*        name;    /* the import name, e.g. "helpers" -- keyed by this alone, process-wide, not by resolved path; two same-named imports from different dirs collide */
     Chunk*       chunk;
     VM*          vm;
     unsigned int halt_addr;   /* return address for the cross-VM call trampoline in aer_module_call() */
@@ -25,7 +25,7 @@ static FileModule*  modules          = NULL;
 static int          module_count     = 0;
 static int          module_capacity  = 0;
 
-/* "Currently loading" stack — detects A-imports-B-imports-A cycles instead of recursing until the process runs out of file slots or stack space. */
+/* "Currently loading" stack -- detects A-imports-B-imports-A cycles instead of recursing until the process runs out of file slots or stack space. */
 static char** loading_stack    = NULL;
 static int    loading_depth    = 0;
 static int    loading_capacity = 0;
@@ -59,7 +59,7 @@ static bool file_exists(const char* path) {
     return true;
 }
 
-/* Fully qualified (leading '/', '', or drive letter) — never dir-joined or AER_PATH-searched. */
+/* Fully qualified (leading '/', '', or drive letter) -- never dir-joined or AER_PATH-searched. */
 static bool is_absolute_path(const char* p, unsigned int len) {
     if (len == 0) return false;
     if (p[0] == '/' || p[0] == '\\') return true;
@@ -122,7 +122,7 @@ void aer_module_free_all(void) {
     loading_depth = loading_capacity = 0;
 }
 
-/* Pushes a null placeholder onto the CALLING vm's stack — every failure path in aer_module_call reports its error and still needs to leave exactly one result behind, matching the core builtins' convention. */
+/* Pushes a null placeholder onto the CALLING vm's stack -- every failure path in aer_module_call reports its error and still needs to leave exactly one result behind, matching the core builtins' convention. */
 static void push_null_result(VM* vm) {
     if (vm->stack_top < VM_STACK_MAX) vm->stack[vm->stack_top++] = aer_null();
 }
@@ -175,7 +175,7 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
         mvm->ip = 0;
         /* mvm now collects only its own independent heap (see vm.c's VmHeap), so a collection
            triggered by this nested run can no longer reach anything belonging to the caller's
-           heap at all — this suppress/unsuppress pairing predates that split, from when every VM
+           heap at all -- this suppress/unsuppress pairing predates that split, from when every VM
            shared one heap and the caller's own chunk/VM (not yet registered as a root at this
            point) could be swept by mistake. Left in place as a harmless, still-correct no-op
            rather than removed speculatively; see vm_gc_suppress's comment in vm.h. */
@@ -188,7 +188,7 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
         }
     }
     /* Whatever happened during this nested run must not leak into the caller's own later
-       execution — it hasn't even finished parsing yet, let alone started running. */
+       execution -- it hasn't even finished parsing yet, let alone started running. */
     runtime_had_error = false;
 
     lexer_restore_state(saved);
@@ -202,7 +202,7 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
     vm_set_active_error_vm(saved_active_vm);
 
     if (!ok) {
-        /* Never handed back to the caller, so nothing else can reach these — free here. */
+        /* Never handed back to the caller, so nothing else can reach these -- free here. */
         vm_free(mvm);
         chunk_free(mchunk);
         free(mvm);
@@ -259,7 +259,7 @@ bool aer_module_load(const char* name, unsigned int len,
     return true;
 }
 
-/* Chunk-level function registry — the register VM never writes named bindings into any scope. */
+/* Chunk-level function registry -- the register VM never writes named bindings into any scope. */
 static ChunkFunction* find_module_function(FileModule* m, const char* fn) {
     return chunk_find_function(m->chunk, fn);
 }
@@ -278,7 +278,7 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
     AerVal* args = &vm->stack[vm->stack_top - arg_count];
     vm->stack_top -= arg_count;
 
-    /* A prior call's error longjmp can leave mv->call_depth stuck above 0 — left unreset, this
+    /* A prior call's error longjmp can leave mv->call_depth stuck above 0 -- left unreset, this
        call's result would land in the wrong frame's registers (and enough failures overflow the
        call stack). The stack is dead space between calls. */
     aer_vm_reset_for_reuse(mv);
@@ -291,14 +291,14 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
     }
 
     /* mv now collects only its own independent heap (see vm.c's VmHeap), so mv's own GC can no
-       longer reach anything belonging to vm's heap at all — this suppress/unsuppress pairing
+       longer reach anything belonging to vm's heap at all -- this suppress/unsuppress pairing
        predates that split, from when every VM shared one heap and mv's collection had to be kept
        from sweeping vm's not-yet-rooted state. Left in place as a harmless, still-correct no-op
        rather than removed speculatively; see vm_gc_suppress's comment in vm.h. */
     vm_gc_suppress();
     vm_run(mv);
     vm_gc_unsuppress();
-    /* runtime_had_error deliberately stays true on failure here (unlike aer_module_load's parse-time path) — the called module's vm_run(mv) already caught its own error locally (its own catch point, installed and restored inside vm_run itself) and returned cleanly, so nothing automatically aborts the CALLING vm too anymore now that DISPATCH() no longer polls this flag every instruction. Propagate explicitly: longjmp to whatever vm_run() call is now the current unwind target (the calling vm's own, since vm_run(mv)'s return already restored it) — exactly like a same-VM call error, just raised here instead of noticed passively. */
+    /* runtime_had_error deliberately stays true on failure here (unlike aer_module_load's parse-time path) -- the called module's vm_run(mv) already caught its own error locally (its own catch point, installed and restored inside vm_run itself) and returned cleanly, so nothing automatically aborts the CALLING vm too anymore now that DISPATCH() no longer polls this flag every instruction. Propagate explicitly: longjmp to whatever vm_run() call is now the current unwind target (the calling vm's own, since vm_run(mv)'s return already restored it) -- exactly like a same-VM call error, just raised here instead of noticed passively. */
     if (runtime_had_error) {
         push_null_result(vm);
         if (runtime_error_unwind_target) AER_LONGJMP(*runtime_error_unwind_target, 1);

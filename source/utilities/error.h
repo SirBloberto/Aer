@@ -57,10 +57,10 @@ void error_at(const char* format, ...) __attribute__((cold));
 typedef void (*AerDiagnosticCallback)(unsigned int line, unsigned int col, const char* message, void* userdata);
 void aer_set_diagnostic_callback(AerDiagnosticCallback callback, void* userdata);
 
-/* Terminates the process for a condition error recovery doesn't apply to (OOM) — routes through the same sink as error()/error_at() first; the only thing here still allowed to call exit(). */
+/* Terminates the process for a condition error recovery doesn't apply to (OOM) -- routes through the same sink as error()/error_at() first; the only thing here still allowed to call exit(). */
 void aer_report_fatal(const char* msg);
 
-/* malloc/calloc/realloc/strdup, but fatal (via aer_report_fatal) on failure instead of returning NULL — every call site is spared its own check. */
+/* malloc/calloc/realloc/strdup, but fatal (via aer_report_fatal) on failure instead of returning NULL -- every call site is spared its own check. */
 void* xmalloc(size_t size);
 void* xcalloc(size_t count, size_t size);
 void* xrealloc(void* ptr, size_t size);

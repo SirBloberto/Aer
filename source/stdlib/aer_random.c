@@ -2,7 +2,7 @@
 #include "aer_stdlib.h"
 #include "error.h"
 
-/* Own xoshiro256** generator, not C rand() — RAND_MAX is 32767 on MinGW (capping wide randint
+/* Own xoshiro256** generator, not C rand() -- RAND_MAX is 32767 on MinGW (capping wide randint
    spans), and seed() must reproduce the same sequence on every platform. */
 static uint64_t rng_state[4];
 static bool     rng_seeded = false;
@@ -34,7 +34,7 @@ static uint64_t rng_next(void) {
     return result;
 }
 
-/* Uniform in [0, n) without modulo bias — rejects the tail region that doesn't divide evenly. */
+/* Uniform in [0, n) without modulo bias -- rejects the tail region that doesn't divide evenly. */
 static uint64_t rng_below(uint64_t n) {
     uint64_t limit = UINT64_MAX - UINT64_MAX % n;
     uint64_t r;
@@ -44,7 +44,7 @@ static uint64_t rng_below(uint64_t n) {
 
 bool aer_random_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_RANDOM_RANDOM && arg_count == 0) {
-        /* Top 53 bits — the full precision a double's mantissa can hold, uniform in [0, 1). */
+        /* Top 53 bits -- the full precision a double's mantissa can hold, uniform in [0, 1). */
         vm_stack_push(vm, aer_real((double)(rng_next() >> 11) * (1.0 / 9007199254740992.0))); return true;
     }
     if (fn_id == FN_RANDOM_RANDINT && arg_count == 2) {
@@ -53,7 +53,7 @@ bool aer_random_call(VM* vm, int fn_id, int arg_count) {
         int64_t lo_n = aer_as_int(lo), hi_n = aer_as_int(hi);
         if (hi_n < lo_n) { error("randint() requires min <= max"); vm_stack_push(vm, aer_null()); return true; }
         uint64_t span = (uint64_t)(hi_n - lo_n) + 1;
-        /* span 0 means the full 64-bit range (hi-lo overflowed to UINT64_MAX) — rng_next() itself is already uniform there. */
+        /* span 0 means the full 64-bit range (hi-lo overflowed to UINT64_MAX) -- rng_next() itself is already uniform there. */
         uint64_t r = span == 0 ? rng_next() : rng_below(span);
         vm_stack_push(vm, aer_int(lo_n + (int64_t)r)); return true;
     }
@@ -74,7 +74,7 @@ bool aer_random_call(VM* vm, int fn_id, int arg_count) {
         AerVal arr = vm_stack_pop(vm);
         if (aer_type(arr) != TYPE_ARRAY || aer_as_array(arr)->shape) { error("shuffle() requires an array"); vm_stack_push(vm, aer_null()); return true; }
         AerArray* a = aer_as_array(arr);
-        /* Fisher-Yates, in place; swapping within one array never needs a GC write barrier — no value becomes newly reachable from it. */
+        /* Fisher-Yates, in place; swapping within one array never needs a GC write barrier -- no value becomes newly reachable from it. */
         for (unsigned int i = a->count; i > 1; i--) {
             uint64_t j = rng_below(i);
             AerVal tmp = a->items[i - 1];

@@ -46,10 +46,10 @@ VmHeap* vm_current_heap(void)          { return current_heap; }
 void    vm_set_current_heap(VmHeap* h) { current_heap = h; }
 
 /* Tuning defaults every freshly-initialized heap inherits -- process-wide mutable state, not
-   hardcoded constants, specifically so aer_gc_configure()/aer_gc_set_ceiling() keep working when
-   called BEFORE any VM exists yet (a real, previously-supported pattern: configure once, then
-   create VMs that pick it up). aer_gc_configure/set_ceiling update these AND current_heap's own
-   live fields, so both "configure ahead of time" and "reconfigure an already-running VM" work. */
+   hardcoded constants, specifically so aer_gc_configure()/aer_gc_set_ceiling() work when called
+   before any VM exists yet (configure once, then create VMs that pick it up). aer_gc_configure/
+   set_ceiling update these AND current_heap's own live fields, so both "configure ahead of time"
+   and "reconfigure an already-running VM" work. */
 static unsigned int default_minor_gc_threshold     = 2048;
 static unsigned int default_major_gc_every_n_minor = 10;
 static unsigned int default_gc_live_cell_ceiling   = 0;   /* 0 = unlimited */
@@ -73,11 +73,11 @@ static void vm_heap_init(VmHeap* heap) {
     heap->pools_initialized = true;
 }
 
-/* Every allocation from one of a heap's 7 GC-managed pools goes through here instead of calling
+/* Every allocation from one of a heap's 8 GC-managed pools goes through here instead of calling
    pool_alloc directly, so heap->pool_alloc_count (gc_maybe_collect's trigger) stays accurate --
-   this replaces the single process-global counter pool_alloc itself used to keep before pools were
-   per-VM. Centralized here rather than at each of the ~10 call sites so there's exactly one place
-   that can get this wrong, not ten. */
+   per-VM, not a single process-global counter, since each VM owns an independent heap. Centralized
+   here rather than at each of the ~10 call sites so there's exactly one place that can get this
+   wrong, not ten. */
 static void* heap_alloc(VmHeap* heap, Pool* p) {
     heap->pool_alloc_count++;
     return pool_alloc(p);
@@ -118,11 +118,11 @@ static inline AerVal* vm_rk_ptr8(VM* vm, AerVal* const_pool, uint32_t rk8) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Generational GC — write barrier and remembered set                   */
+/* Generational GC -- write barrier and remembered set                   */
 /* ------------------------------------------------------------------ */
 
 /* True if v's own pooled cell is young; null/boolean/real (and inline integers) have no cell, so they're trivially "not young". */
-/* Embedding-facing (vm_gc_suppress/unsuppress here; aer_gc_configure/aer_gc_set_ceiling below) —
+/* Embedding-facing (vm_gc_suppress/unsuppress here; aer_gc_configure/aer_gc_set_ceiling below) --
    none of these gained a VM* parameter: changing their signatures would break every existing
    embedder. Suppress/unsuppress and aer_gc_stats operate on whichever heap is current (there's no
    "before any VM" case that makes sense for a nesting counter or a stats snapshot). configure/
@@ -458,14 +458,14 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
     vm_set_current_heap(&vm->heap);
     /* Re-seeded on every call, not just at vm_init: aer_run_source is the "run more code into an
        already-initialized VM" entry point (REPL, embedding), and the documented capability-toggle
-       pattern is to flip aer_set_io_enabled/net_enabled(false), run one thing, then flip it back —
+       pattern is to flip aer_set_io_enabled/net_enabled(false), run one thing, then flip it back --
        on an existing vm, not a freshly created one (see embed_smoke_test.c). Without this, that
        pattern would silently do nothing once the vm's own fields were seeded once at vm_init. */
     vm->io_enabled  = aer_io_enabled;
     vm->net_enabled = aer_net_enabled;
     aer_vm_reset_for_reuse(vm);
     vm->ip = chunk->count;
-    shell((char*)source);   /* shell() strdup()s its own copy — never mutates through this pointer */
+    shell((char*)source);   /* shell() strdup()s its own copy -- never mutates through this pointer */
     lex();
     parse(chunk);
     chunk_emit(chunk, OP_HALT);
@@ -477,11 +477,11 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
 /* Type helpers                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Struct instances report their declared name (e.g. "Player") instead of "array" — used by type(),
-   the one way to check a struct's shape now (type(x) == "Player") since OP_CHECK_SHAPE was removed.
-   A packed array reports "Player[]" — distinct from a single instance's own "Player". type_names[]
+/* Struct instances report their declared name (e.g. "Player") instead of "array" -- used by type(),
+   the way to check a struct's shape (type(x) == "Player"). A packed array reports "Player[]" --
+   distinct from a single instance's own "Player". type_names[]
    is indexed directly by ValueType, so it must stay exactly as long as the enum's non-specially-
-   handled entries (value.h) — TYPE_STRUCT/TYPE_PACKED_ARRAY/TYPE_TYPED_ARRAY/TYPE_RESULT are all
+   handled entries (value.h) -- TYPE_STRUCT/TYPE_PACKED_ARRAY/TYPE_TYPED_ARRAY/TYPE_RESULT are all
    handled specially, so none of them is ever used to index this array. */
 static const char* vm_type_name(Chunk* c, AerVal v) {
     static const char* type_names[] = {
@@ -523,7 +523,7 @@ static inline __attribute__((always_inline)) bool vm_truthy(AerVal v) {
         case TYPE_TYPED_ARRAY:  return aer_as_typed_array(v)->count > 0;
         /* `if result:` reads like `if err == null:`, without destructuring first. */
         case TYPE_RESULT:   return aer_type(aer_as_result(v)->err) == TYPE_NULL;
-        case TYPE_ANY:      break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
+        case TYPE_ANY:      break;   /* never a real AerVal's tag -- only Shape.field_types[] uses it */
     }
     return false;
 }
@@ -717,7 +717,7 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
             return aer_make_string(buf, len);
         }
         if (op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE) {
-            /* Same total order collection.sort() uses for strings — one shared helper (value.h). */
+            /* Same total order collection.sort() uses for strings -- one shared helper (value.h). */
             int cmp = aer_string_compare(as, bs);
             switch (op) {
                 case OP_LT:  return aer_bool(cmp < 0);
@@ -783,13 +783,13 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
             case TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s",   aer_as_bool(v) ? "true" : "false"); break;
             case TYPE_FUNCTION: snprintf(buf, sizeof(buf), "<function>");                        break;
             case TYPE_ARRAY: case TYPE_DICT: case TYPE_STRUCT: case TYPE_STRING: case TYPE_PACKED_ARRAY: case TYPE_TYPED_ARRAY: case TYPE_RESULT: break;   /* handled above */
-            case TYPE_ANY: break;   /* never a real AerVal's tag — only Shape.field_types[] uses it */
+            case TYPE_ANY: break;   /* never a real AerVal's tag -- only Shape.field_types[] uses it */
         }
         len   = (unsigned int)strlen(buf);
         owned = xmalloc(len + 1);
         memcpy(owned, buf, len + 1);
     }
-    /* No chunk_add_pool interning: this string is used once and never looked up by pool index again. Interning would grow the pool/name_index forever per unique value — measured 7x slower for 100k unique casts vs. 10 distinct ones. */
+    /* No chunk_add_pool interning: this string is used once and never looked up by pool index again. Interning would grow the pool/name_index forever per unique value -- measured 7x slower for 100k unique casts vs. 10 distinct ones. */
     return aer_make_string(owned, len);
 }
 
@@ -869,7 +869,7 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
     callee->code_offset = fn->code_offset;
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = true;
-    target->call_depth++;   /* same rooting rule as vm_call_value's non-tail branch (above) — the defaults loop wrote into callee->registers[] before this point */
+    target->call_depth++;   /* same rooting rule as vm_call_value's non-tail branch (above) -- the defaults loop wrote into callee->registers[] before this point */
     gc_maybe_collect(target);
     target->registers = target->call_stack[target->call_depth].registers;
     target->raw_ints  = target->call_stack[target->call_depth].raw_ints;
@@ -900,7 +900,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
             vm->registers[i] = vm->registers[arg_reg_base + i];
         for (int i = arg_count; i < (int)f->arity; i++)
             vm->registers[i] = vm_default_value(vm, f->defaults[i - f->min_arity]);
-        gc_maybe_collect(vm);   /* defaults just written into the CURRENT frame (tail call, call_depth unchanged) — already rooted */
+        gc_maybe_collect(vm);   /* defaults just written into the CURRENT frame (tail call, call_depth unchanged) -- already rooted */
         vm->ip = f->code_offset;
         CallFrame* reused = &vm->call_stack[vm->call_depth];
         reused->code_offset = f->code_offset;   /* reused frame now runs a different function */
@@ -932,7 +932,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     callee->code_offset = f->code_offset;
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
-    vm->call_depth++;   /* the defaults loop above wrote into callee->registers[] BEFORE this point, when mark_vm_roots's 0..call_depth scan didn't yet cover that frame — gc_maybe_collect() must run AFTER this increment, not before, or a collection could reclaim a fresh default array/dict as unreachable */
+    vm->call_depth++;   /* the defaults loop above wrote into callee->registers[] BEFORE this point, when mark_vm_roots's 0..call_depth scan didn't yet cover that frame -- gc_maybe_collect() must run AFTER this increment, not before, or a collection could reclaim a fresh default array/dict as unreachable */
     gc_maybe_collect(vm);
     vm->registers = vm->call_stack[vm->call_depth].registers;
     vm->raw_ints  = vm->call_stack[vm->call_depth].raw_ints;
@@ -1262,7 +1262,7 @@ static bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
     char* key_buf = xmalloc(key_len + 1);
     memcpy(key_buf, d->map.dense[*idx].key, key_len);
     key_buf[key_len] = '\0';
-    *out_key = aer_make_string(key_buf, key_len);   /* no chunk_add_pool interning — see vm_to_str's comment */
+    *out_key = aer_make_string(key_buf, key_len);   /* no chunk_add_pool interning -- see vm_to_str's comment */
     return true;
 }
 
@@ -1284,9 +1284,8 @@ AerArray* vm_new_array(void) {
 AerDict* vm_new_dict(void) {
     VmHeap* heap = require_current_heap();
     AerDict* d = heap_alloc(heap, &heap->dict_pool);
-    /* Every caller used to memset(&d->map, 0, sizeof(d->map)) itself right after this call --
-       centralized here instead so setting .pools below can't be wiped out by a caller's own
-       zeroing running afterward. */
+    /* Zeroed here, not left to each caller, so setting .pools below can't be wiped out by a
+       caller's own zeroing running afterward. */
     memset(&d->map, 0, sizeof(d->map));
     d->map.pools = &heap->dict_hash_pools;
     /* pool_alloc only zeroes gc_state (byte 0) -- a reused cell's previous occupant's dirty_cards
@@ -1342,11 +1341,11 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
         case CALL_BUILTIN_TYPE: {
             if (arg_count != 1) return false;
             const char* tn = vm_type_name(c, args[0]);
-            /* Copies rather than pointing at a static literal or the chunk's pool data — AerString always owns its data, no exceptions. */
+            /* Copies rather than pointing at a static literal or the chunk's pool data -- AerString always owns its data, no exceptions. */
             unsigned int tn_len = (unsigned int)strlen(tn);
             char* tn_buf = xmalloc(tn_len + 1);
             memcpy(tn_buf, tn, tn_len + 1);
-            *out = aer_make_string(tn_buf, tn_len);   /* no chunk_add_pool interning — see vm_to_str's comment */
+            *out = aer_make_string(tn_buf, tn_len);   /* no chunk_add_pool interning -- see vm_to_str's comment */
             return true;
         }
         case CALL_BUILTIN_ASSERT: {
@@ -1418,7 +1417,7 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         char* ch_buf = xmalloc(2);
         ch_buf[0] = os->data[i];
         ch_buf[1] = '\0';
-        *out = aer_make_string(ch_buf, 1); return;   /* no chunk_add_pool interning — see vm_to_str's comment */
+        *out = aer_make_string(ch_buf, 1); return;   /* no chunk_add_pool interning -- see vm_to_str's comment */
     } else if (aer_type(obj) == TYPE_RESULT) {
         /* result[0] is the value, result[1] is the err -- the same order every stdlib fallible
            function returns. */
@@ -1443,7 +1442,7 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
     }
 }
 
-/* `a, b = expr` — a genuine Result unpacks to (value, err); a plain 2-element array (not a
+/* `a, b = expr` -- a genuine Result unpacks to (value, err); a plain 2-element array (not a
    struct/packed array, both dot-only) unpacks positionally; anything else is treated as (that
    value, null), the same "not a real Result? just a plain value" duck-typing |> already applies on
    its own left operand. Lets a function that can never fail just `return value` without fabricating
@@ -1499,7 +1498,7 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         unsigned int write_idx = existing_idx >= 0 ? (unsigned int)existing_idx : d->map.count;
         gc_barrier_dict(vm, d, write_idx, val);
         if (existing_idx >= 0) {
-            d->map.dense[existing_idx].payload = val;   /* update in place — no allocation */
+            d->map.dense[existing_idx].payload = val;   /* update in place -- no allocation */
         } else {
             char* k = hashtable_key_dup(d->map.pools, is->data, klen, NULL);   /* klen already true length */
             hashtable_put_hashed(&d->map, k, klen, khash, val);
@@ -1584,7 +1583,7 @@ static AerVal vm_cast(AerVal v, int cast_type) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Dispatch loop — computed goto (GCC direct-threaded dispatch); each instruction jumps straight to the next handler, letting the branch predictor learn per-instruction patterns. */
+/* Dispatch loop -- computed goto (GCC direct-threaded dispatch); each instruction jumps straight to the next handler, letting the branch predictor learn per-instruction patterns. */
 /* ------------------------------------------------------------------ */
 
 #ifdef AER_DEBUG_TOOLS
@@ -2131,7 +2130,7 @@ lbl_call: {
                            only -- DISPATCH() increments c->debug_hits[offset] for every opcode word
                            when built with AER_DEBUG_TOOLS, so skipping this resize here is a real,
                            silent out-of-bounds write the moment the specialized body's own code
-                           (now beyond the ORIGINAL debug_hits_cap) executes, in that build only —
+                           (now beyond the ORIGINAL debug_hits_cap) executes, in that build only --
                            found via a real Windows heap-corruption crash inside a LATER, unrelated
                            malloc, exactly the kind of delayed symptom this class of bug produces. */
 #ifdef AER_DEBUG_TOOLS
@@ -2260,7 +2259,7 @@ lbl_call: {
     callee->raw_real_frame_size = chosen_max_raw_reals;
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = caller->registers[arg_reg_base + i];
-    callee->return_ip   = ip;   /* already past this instruction's operands — the correct resume point */
+    callee->return_ip   = ip;   /* already past this instruction's operands -- the correct resume point */
     callee->dest_reg    = dest_reg;
     callee->code_offset = chosen_offset;
     callee->tail_calls_collapsed = 0;
@@ -2383,7 +2382,7 @@ lbl_call_builtin: {
     int arg_count    = (int)UNPACK_C(op_word);
     int name_idx     = (int)READ();
     int builtin_id   = (int)READ();
-    /* name is only resolved on the error paths — the happy path never needs it. */
+    /* name is only resolved on the error paths -- the happy path never needs it. */
     if (arg_count > 4) {
         error("Too many arguments to '%s'", aer_as_string(c->pool[name_idx])->data);
         registers[dest_reg] = aer_null();
@@ -2433,7 +2432,7 @@ lbl_index_get: {
     DISPATCH();
 }
 
-/* a, b = expr — see vm_destructure_compute. Never allocates, unlike lbl_index_get, so no
+/* a, b = expr -- see vm_destructure_compute. Never allocates, unlike lbl_index_get, so no
    gc_maybe_collect needed. */
 lbl_destructure: {
     int t0      = (int)UNPACK_A(op_word);
@@ -2452,7 +2451,7 @@ lbl_index_set: {
     DISPATCH();
 }
 
-/* `arr[a:b]` — vm_slice_bounds() resolves/clamps the bounds; a slice is always a fresh copy. */
+/* `arr[a:b]` -- vm_slice_bounds() resolves/clamps the bounds; a slice is always a fresh copy. */
 lbl_slice_get: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arr_reg  = (int)UNPACK_B(op_word);
@@ -2485,7 +2484,7 @@ lbl_slice_get: {
         char* sub_buf = xmalloc(sub_len + 1);
         memcpy(sub_buf, os->data + start, sub_len);
         sub_buf[sub_len] = '\0';
-        registers[dest_reg] = aer_make_string(sub_buf, sub_len);   /* no chunk_add_pool interning — see vm_to_str's comment */
+        registers[dest_reg] = aer_make_string(sub_buf, sub_len);   /* no chunk_add_pool interning -- see vm_to_str's comment */
     } else {
         error("Cannot slice this type");
         registers[dest_reg] = aer_null();
@@ -2552,7 +2551,7 @@ lbl_iter_next_array: {
         char* ch_buf = xmalloc(2);
         ch_buf[0] = cs->data[idx];
         ch_buf[1] = '\0';
-        registers[item_dest_reg] = aer_make_string(ch_buf, 1);   /* no chunk_add_pool interning — see vm_to_str's comment */
+        registers[item_dest_reg] = aer_make_string(ch_buf, 1);   /* no chunk_add_pool interning -- see vm_to_str's comment */
         registers[idx_reg]       = aer_int(idx + 1);
         gc_maybe_collect(vm);
         DISPATCH();
@@ -2585,7 +2584,7 @@ lbl_iter_next_array: {
     DISPATCH();
 }
 
-/* `for k, v in dict:` — see vm_dict_next_key (above) for the shared bucket-scan/copy-key logic. */
+/* `for k, v in dict:` -- see vm_dict_next_key (above) for the shared bucket-scan/copy-key logic. */
 lbl_iter_next_pair: {
     int col_reg       = (int)UNPACK_A(op_word);
     int idx_reg       = (int)UNPACK_B(op_word);
@@ -2667,7 +2666,7 @@ lbl_iter_range_loop: {
     int body_target     = READ();
     int64_t remaining = aer_as_int(registers[remaining_reg]);
     if (remaining == 0) {
-        DISPATCH();   /* exhausted — fall through to the exit code, cur_reg/item_dest_reg untouched */
+        DISPATCH();   /* exhausted -- fall through to the exit code, cur_reg/item_dest_reg untouched */
     }
     int64_t signed_step = aer_as_int(registers[signed_step_reg]);
     int64_t new_cur      = aer_as_int(registers[cur_reg]) + signed_step;
@@ -2716,7 +2715,7 @@ lbl_struct_new: {
     for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
         vm_struct_field_write(s, i, vm_default_value(vm, shape->field_defaults[i]));
     registers[dest_reg] = aer_struct_val(s);
-    gc_maybe_collect(vm);   /* pool_alloc(&struct_pool) above, plus any vm_default_value array/dict defaults — all rooted now that the struct itself is stored */
+    gc_maybe_collect(vm);   /* pool_alloc(&struct_pool) above, plus any vm_default_value array/dict defaults -- all rooted now that the struct itself is stored */
     DISPATCH();
 }
 

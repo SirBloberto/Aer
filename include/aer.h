@@ -8,7 +8,7 @@
 
 /* Embedding: error reporting. By default every parse/runtime error and fatal condition prints to stderr; a runtime error does not terminate the process (vm_run() returns cleanly). This state is process-global, not per-VM, and not thread-safe. */
 
-/* Registers a sink for every message error()/error_at()/aer_report_fatal() would otherwise print to stderr. `message` is a NUL-terminated, fully formatted string owned by AER — copy it if it must outlive the callback call. Pass NULL to restore the default (stderr), also the behavior with no call at all. */
+/* Registers a sink for every message error()/error_at()/aer_report_fatal() would otherwise print to stderr. `message` is a NUL-terminated, fully formatted string owned by AER -- copy it if it must outlive the callback call. Pass NULL to restore the default (stderr), also the behavior with no call at all. */
 typedef void (*AerErrorCallback)(const char* message, void* userdata);
 void aer_set_error_callback(AerErrorCallback callback, void* userdata);
 
@@ -21,27 +21,27 @@ bool aer_had_error(void);
 /* Resets aer_had_error()/aer_last_error() state. A host driving vm_run() directly on its own VM should call this before each top-level script invocation to get a clean read of that invocation's outcome. */
 void aer_clear_error(void);
 
-/* Embedding: custom native functions. A host registers a C function under a module name; AER scripts reach it like the built-in math/random/string modules, via `import` then dot-call — `import game; game.spawn_enemy(x, y)`. Registration is process-global and must happen before parsing/running any script that references it. */
+/* Embedding: custom native functions. A host registers a C function under a module name; AER scripts reach it like the built-in math/random/string modules, via `import` then dot-call -- `import game; game.spawn_enemy(x, y)`. Registration is process-global and must happen before parsing/running any script that references it. */
 
-/* `args` points at a contiguous block of arg_count AerVal values (value.h — construct/read via aer_int()/aer_as_int() and friends, never raw field access), copied fresh for this one call — valid for the call's duration, not a live pointer into the calling VM's own stack. Return the call's result directly; to report an error, call error() (source/utilities/error.h), the same recoverable error path every other AER error goes through. */
+/* `args` points at a contiguous block of arg_count AerVal values (value.h -- construct/read via aer_int()/aer_as_int() and friends, never raw field access), copied fresh for this one call -- valid for the call's duration, not a live pointer into the calling VM's own stack. Return the call's result directly; to report an error, call error() (source/utilities/error.h), the same recoverable error path every other AER error goes through. */
 typedef AerVal (*AerNativeFn)(VM* vm, int arg_count, AerVal* args, void* userdata);
 
 /* Registers `fn` as `module.name`. Returns false if the registry is full (MAX_HOST_FUNCTIONS, source/core/aer_host.h). */
 bool aer_register_function(const char* module, const char* name, AerNativeFn fn, void* userdata);
 
-/* The number of assert() calls that have failed (reported and continued — see the Language Reference's assert() entry) since the last aer_clear_error() or process start. A script can finish with zero parse/runtime errors (aer_had_error() false) and still have failed assertions; check both when deciding whether a run actually succeeded. */
+/* The number of assert() calls that have failed (reported and continued -- see the Language Reference's assert() entry) since the last aer_clear_error() or process start. A script can finish with zero parse/runtime errors (aer_had_error() false) and still have failed assertions; check both when deciding whether a run actually succeeded. */
 unsigned int aer_assert_failure_count(void);
 
 /* Embedding: garbage collector introspection and tuning. See the README's Memory and Security section for the generational design these report on and configure. */
 
-/* Any of the three out-params may be NULL if that figure isn't wanted. live_cells is a snapshot from the pools' own bookkeeping (not a fresh trace), so it can include cells that are actually garbage but haven't been swept yet — same caveat any generational collector's "live" figure has between collections. Each VM now has its own independent heap (see README's Memory and Security section) — this reports on whichever VM most recently ran (or was vm_init()'d), not a single process-wide figure. */
+/* Any of the three out-params may be NULL if that figure isn't wanted. live_cells is a snapshot from the pools' own bookkeeping (not a fresh trace), so it can include cells that are actually garbage but haven't been swept yet -- same caveat any generational collector's "live" figure has between collections. Each VM now has its own independent heap (see README's Memory and Security section) -- this reports on whichever VM most recently ran (or was vm_init()'d), not a single process-wide figure. */
 void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
                   unsigned int* major_collections);
 
-/* Overrides the collector's tuning constants (defaults: 2048 minor threshold, every 10th minor triggers a major). 0 for either argument leaves that one unchanged, so a host can override just one knob without needing to repeat the other's current value. Safe to call at any time, including before any VM exists yet — every VM created afterward inherits the new defaults, and whichever VM is already current (if any) is updated immediately too. */
+/* Overrides the collector's tuning constants (defaults: 2048 minor threshold, every 10th minor triggers a major). 0 for either argument leaves that one unchanged, so a host can override just one knob without needing to repeat the other's current value. Safe to call at any time, including before any VM exists yet -- every VM created afterward inherits the new defaults, and whichever VM is already current (if any) is updated immediately too. */
 void aer_gc_configure(unsigned int minor_threshold, unsigned int major_every_n_minor);
 
-/* Caps total live cells across one VM's own seven pools (each VM has its own independent heap — see README's Memory and Security section) — a -Xmx-style ceiling; 0 (the default) means unlimited. Like aer_gc_configure, safe to call before any VM exists (every VM created afterward inherits it) or on an already-running one. If a script is still over the ceiling immediately after a forced extra collection, it aborts with a normal, recoverable runtime error (aer_last_error()), the same non-fatal path every other runtime fault takes, not a process exit. */
+/* Caps total live cells across one VM's own seven pools (each VM has its own independent heap -- see README's Memory and Security section) -- a -Xmx-style ceiling; 0 (the default) means unlimited. Like aer_gc_configure, safe to call before any VM exists (every VM created afterward inherits it) or on an already-running one. If a script is still over the ceiling immediately after a forced extra collection, it aborts with a normal, recoverable runtime error (aer_last_error()), the same non-fatal path every other runtime fault takes, not a process exit. */
 void aer_gc_set_ceiling(unsigned int max_live_cells);
 
 /* Embedding: running source text without hand-assembling lex()/parse()/vm_run() yourself -- these

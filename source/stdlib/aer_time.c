@@ -1,7 +1,7 @@
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
-#include <windows.h>   /* Sleep() — MinGW's nanosleep needs winpthreads, which the static CLI build doesn't link */
+#include <windows.h>   /* Sleep() -- MinGW's nanosleep needs winpthreads, which the static CLI build doesn't link */
 #endif
 #include "aer_stdlib.h"
 #include "error.h"

@@ -110,7 +110,7 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
         int64_t n = aer_as_int(n_v);
         if (n < 0) { error("string.repeat() count must not be negative"); vm_stack_push(vm, aer_null()); return true; }
         AerString* ss = aer_as_string(s_v);
-        /* Checked in 64 bits before the 32-bit multiply below — length * n silently wrapping
+        /* Checked in 64 bits before the 32-bit multiply below -- length * n silently wrapping
            would undersize the buffer and the copy loop would write past it. */
         if (ss->length > 0 && (uint64_t)ss->length * (uint64_t)n > 0x7FFFFFFFULL) {
             error("string.repeat() result too large"); vm_stack_push(vm, aer_null()); return true;
