@@ -57,20 +57,12 @@ typedef struct AerVal {
     } as;
 } AerVal;
 
-/* gc_state must be byte 0 in every pool-managed struct — pool.c reads the leading byte generically. */
+/* gc_state must be byte 0 in every pool-managed struct — pool.c reads the leading byte generically.
+   Field order below (here and in every other pool-managed struct in this file) packs small members
+   into the padding gap gc_state would otherwise leave before the first pointer, rather than
+   size-descending order -- recovers real bytes per cell with no behavior change; see ARCHITECTURE.md. */
 struct AerArray {
     unsigned char gc_state;
-    AerVal*      items;
-    unsigned int count;
-    unsigned int capacity;
-    Shape*       shape;   /* NULL for ordinary arrays; set for struct instances */
-    /* Bumped on every mutation that can change which shapes occupy items[] -- index-assignment
-       replacing an element (OP_INDEX_SET), and collection.append/delete/insert (aer_collection.c).
-       NOT bumped by collection.sort (reorders, never replaces -- homogeneity is a set property,
-       unaffected by order). Lets lbl_call's SPEC_KIND_ARRAY_OF_STRUCTS per-call-site cache (vm.c)
-       skip its O(n) homogeneity re-scan when the same array at the same generation was already
-       verified against the same shape on a previous call. */
-    unsigned int generation;
     /* Card marking for the O(n) minor-GC rescan fix -- see gc_barrier_array's own comment (gc.c).
        dirty_cards is NULL until this array is actually remembered (its first old-array-holding-a-
        young-value write), so the common case (never promoted to old) pays nothing extra; one bit
@@ -78,9 +70,20 @@ struct AerArray {
        element-to-index correspondence (collection.delete/insert/sort) -- rather than shift every
        affected bit for a rare path, the next minor GC just rescans the whole array that one cycle
        and clears dirty_all again. */
+    bool           dirty_all;
+    unsigned int count;
+    AerVal*      items;
+    unsigned int capacity;
+    /* Bumped on every mutation that can change which shapes occupy items[] -- index-assignment
+       replacing an element (OP_INDEX_SET), and collection.append/delete/insert (aer_collection.c).
+       NOT bumped by collection.sort (reorders, never replaces -- homogeneity is a set property,
+       unaffected by order). Lets lbl_call's SPEC_KIND_ARRAY_OF_STRUCTS per-call-site cache (vm.c)
+       skip its O(n) homogeneity re-scan when the same array at the same generation was already
+       verified against the same shape on a previous call. */
+    unsigned int generation;
+    Shape*       shape;   /* NULL for ordinary arrays; set for struct instances */
     unsigned char* dirty_cards;
     unsigned int   dirty_cards_bytes;
-    bool           dirty_all;
 };
 _Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
@@ -89,8 +92,8 @@ _Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_stat
    write barrier and no mark recursion. */
 struct AerPackedArray {
     unsigned char gc_state;
-    unsigned char* data;
     unsigned int  count;
+    unsigned char* data;
     Shape*        shape;
 };
 _Static_assert(offsetof(struct AerPackedArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
@@ -117,16 +120,17 @@ struct AerTypedArray {
 };
 _Static_assert(offsetof(struct AerTypedArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* Field order is size-sorted to minimize padding; arity fields fit uint16_t (MAX_PARAMS == 32). */
+/* arity fields fit uint16_t (MAX_PARAMS == 32); ordered to fill gc_state's padding gap before
+   defaults (the sole pointer), not size-descending -- see this file's own top comment. */
 struct AerFunction {
     unsigned char gc_state;
-    AerVal*      defaults;        /* NULL if min_arity == arity; else (arity - min_arity) compile-time-literal values */
+    uint16_t     arity;
+    uint16_t     min_arity;       /* params [0, min_arity) are required; [min_arity, arity) use defaults[] below, in order */
     unsigned int code_offset;
     unsigned int max_registers;   /* this function's real peak register need — see ChunkFunction's own comment, vm.h */
     unsigned int max_raw_ints;    /* this function's real peak raw_ints[] slot need -- see ChunkFunction's own comment, vm.h */
     unsigned int max_raw_reals;   /* same, for raw_reals[] */
-    uint16_t     arity;
-    uint16_t     min_arity;       /* params [0, min_arity) are required; [min_arity, arity) use defaults[] below, in order */
+    AerVal*      defaults;        /* NULL if min_arity == arity; else (arity - min_arity) compile-time-literal values */
 };
 _Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
@@ -138,8 +142,8 @@ _Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_s
    workloads (see pool.h). */
 struct AerString {
     unsigned char gc_state;
-    char*        data;
     unsigned int length;
+    char*        data;
 };
 _Static_assert(offsetof(struct AerString, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 

@@ -7,17 +7,19 @@
 #include "strbuf.h"
 #include "value.h"
 
-/* gc_state first — see pool.h and AerArray's own comment (value.h) for why. */
+/* gc_state first — see pool.h and AerArray's own comment (value.h) for why. Small fields ordered to
+   fill gc_state's padding gap before map (which needs pointer alignment), not declaration-grouped
+   by topic -- see value.h's own top comment. */
 struct AerDict {
     unsigned char gc_state;
-    HashTable     map;
     /* Card marking for the O(n) minor-GC rescan fix -- same fields, same reasoning, as AerArray's
        own (value.h). dirty_cards indexes map.dense[] by its DENSE index (stable across ordinary
        insert/update; hashtable_remove's swap-compaction invalidates it, which is why
        collection.delete sets dirty_all rather than trying to shift the affected bit). */
-    unsigned char* dirty_cards;
-    unsigned int   dirty_cards_bytes;
     bool           dirty_all;
+    unsigned int   dirty_cards_bytes;
+    HashTable      map;
+    unsigned char* dirty_cards;
 };
 _Static_assert(offsetof(struct AerDict, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 

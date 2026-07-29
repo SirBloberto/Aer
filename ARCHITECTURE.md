@@ -548,6 +548,38 @@ Verified: full four-suite regression + ASAN clean on Windows and the Pi (both un
 churn at all), and it still won ~18% — confirming the cost was purely the pointless clearing scan
 itself, not anything churn-related.
 
+### 5.9 Struct field reordering
+
+Every pool-managed value type carries `gc_state` (a 1-byte GC mark/generation byte, §2's per-cell
+design) as its first field, `_Static_assert`'d to stay at offset 0. Left in whatever order the rest
+of a struct's fields were declared, that lone leading byte opens up to 7 bytes of padding before the
+next 8-byte-aligned pointer field — on every single cell, in every pool. Reordering each struct so
+its small (bool/`uint16_t`/`unsigned int`) fields fill that gap instead, with `gc_state` still
+first, recovers the waste at zero behavior cost: every field access still goes through `->name`, and
+nothing in the codebase depends on field order beyond the offset-0 assert already enforcing itself.
+
+Measured directly (`sizeof`, both targets) rather than assumed:
+
+| type | x86-64 before → after | ARM (Pi) before → after |
+|---|---|---|
+| `AerString` | 24 → **16** | 12 → 12 (already optimal — no 8-byte pointer alignment gap on a 4-byte-pointer target) |
+| `AerArray` | 56 → **48** | 40 → **32** |
+| `AerPackedArray` | 32 → **24** | 16 → 16 (already optimal) |
+| `AerFunction` | 40 → **32** | 28 → 28 (already optimal) |
+| `AerDict` | 64 → **56** | 40 → **36** |
+| `AerTypedArray` | 24 → 24 (not touched) | 16 → 16 (not touched) |
+
+`AerTypedArray` isn't reorderable: its payload (1+4+4+8 = 17 bytes) already forces the theoretical
+minimum (24, the next multiple of the pointer's 8-byte alignment) regardless of field order, so it's
+left as-is rather than churned for no reason.
+
+Verified: full four-suite regression + ASAN clean on Windows and the Pi. Wall-clock on
+`log_processing.aer`/`binary_trees.aer`/`struct_array_scan.aer` measured neutral (within noise of
+§5.8's post-`pool_clear_marks`-deletion numbers) on all three — expected, since this trades memory
+footprint for cache locality on structures already small enough that the difference rarely crosses
+a cache-line boundary in practice; the byte savings matter most for GC scan cost at scale (more live
+cells fit in cache per pass) rather than any single access.
+
 ---
 
 ## 6. Known architectural limitations (current, unresolved)
