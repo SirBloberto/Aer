@@ -4,105 +4,209 @@
 #include "error.h"
 #include "lexer.h"
 
-/* The register allocator every compile function shares. next_temp_register tracks the next
-   free temp; registers below reserved_floor are permanent and must never be handed out here. */
-static int next_temp_register = 0;
-static int reserved_floor     = 0;
+/* Per-variable storage kind. VAR_BOXED is an ordinary registers[] index; VAR_RAW_INT/REAL is a
+   raw_ints/raw_reals slot instead, earned only when a name's first assignment is provably
+   int/real (rk_raw_kind), only inside a function body, and only outside any if/else branch
+   (P.branch_depth == 0 -- a name assigned different types down mutually-exclusive branches can't
+   be resolved without real dataflow analysis). Transitions are one-way: RAW_* can shadow to
+   VAR_BOXED on a mismatch; VAR_BOXED never promotes to RAW_*. */
+typedef enum { VAR_BOXED, VAR_RAW_INT, VAR_RAW_REAL } VarKind;
 
-/* Highest watermark reached since the last reset -- the real peak register need, since both
-   counters shrink back down as temps free. Read back after a function body finishes compiling
-   but before its own restore runs (parse_function/parse_function_expr). */
-static int max_register_used = 0;
-static void track_peak(int v) { if (v > max_register_used) max_register_used = v; }
+/* A call to a not-yet-registered name is optimistically assumed to be defined later in this
+   same parse() call -- recorded here with a placeholder already emitted; func_register patches
+   every pending entry once that name registers. Still-pending entries at parse()'s end were
+   never defined anywhere in this call. */
+typedef struct {
+    unsigned int name_idx;
+    unsigned int patch_offset;
+    const char*  call_site_cursor;
+} PendingCall;
 
-/* Same idea as max_register_used/track_peak, for raw_int_next_temp/raw_real_next_temp -- the real
-   peak raw-slot need per function, captured into ChunkFunction/AerFunction's max_raw_ints/reals
-   right alongside max_registers (parse_function/parse_function_expr). */
-static int max_raw_int_used = 0, max_raw_real_used = 0;
-static void track_raw_int_peak(int v)  { if (v > max_raw_int_used)  max_raw_int_used  = v; }
-static void track_raw_real_peak(int v) { if (v > max_raw_real_used) max_raw_real_used = v; }
+/* break/continue loop-context stack. A for-in loop's iterator state lives in ordinary
+   registers the caller already owns, so no stack-balancing pop is needed on an early exit. */
+#define LOOP_MAX  16
+#define BREAK_MAX 32
+typedef struct {
+    unsigned int top;                     /* continue's target — same value passed to parse_for_body/for_in — meaningless when rotated (see below) */
+    unsigned int patches[BREAK_MAX];   /* break's OP_JUMP operand offsets, patched once the loop ends */
+    int          patch_count;
+    /* Rotated range-for only -- also patches deferred continues to OP_ITER_RANGE_LOOP's own
+   position, not the body's start (continue still needs the advance-and-check). */
+    bool         rotated;
+    unsigned int continue_patches[BREAK_MAX];
+    int          continue_patch_count;
+} LoopContext;
+
+/* Every mutable global this file's compile functions share, folded into one struct (was 31+
+   separate file-scope statics plus a hand-mirrored ParserState snapshot struct) -- adding new
+   parser state now means declaring one field here, not three places kept in sync by hand (the
+   exact pattern that already caused real bugs in this codebase: P.var_kind init, P.branch_depth,
+   var_slot bypass). A single static instance (P, below) is the live state; parser_save_state/
+   restore_state (this file, near the bottom) snapshot and restore it wholesale for a nested
+   compile (module import, lazy shape-specialization recompile). */
+typedef struct Parser {
+    /* The register allocator every compile function shares. next_temp_register tracks the next
+       free temp; registers below reserved_floor are permanent and must never be handed out here. */
+    int next_temp_register;
+    int reserved_floor;
+    /* Highest watermark reached since the last reset -- the real peak register need, since both
+       counters shrink back down as temps free. Read back after a function body finishes compiling
+       but before its own restore runs (parse_function/parse_function_expr). */
+    int max_register_used;
+    /* Same idea as max_register_used, for raw_int_next_temp/raw_real_next_temp -- the real peak
+       raw-slot need per function, captured into ChunkFunction/AerFunction's max_raw_ints/reals
+       right alongside max_registers (parse_function/parse_function_expr). */
+    int max_raw_int_used, max_raw_real_used;
+    /* Raw-slot allocators, mirroring reg_alloc/reg_free/reg_reserve's shape -- except overflow:
+       raw_int_alloc/raw_real_alloc return -1 instead of erroring, and every caller falls back to
+       ordinary boxed storage for that one value. */
+    int raw_int_next_temp, raw_int_reserved_floor;
+    int raw_real_next_temp, raw_real_reserved_floor;
+
+    /* Every register's current variable binding (0 registers is effectively local -- see
+       var_kind below for storage-kind tracking). */
+    unsigned int var_names[FRAME_REGISTERS];
+    int          var_regs[FRAME_REGISTERS];
+    int          var_count;
+    /* Per-variable storage kind -- see VarKind's own comment above. */
+    VarKind var_kind[FRAME_REGISTERS];
+
+    /* Shape-specializing compilation (see OP_CALL_SPEC, vm.c) -- tracks which of the CURRENT
+       function's parameters have been used as the base of a struct-field access, directly or
+       through a one-hop plain-local alias. See mark_shape_sensitive's own comment for how these
+       three fields work together. */
+    bool   shape_sensitive_param[FRAME_REGISTERS];
+    int    current_param_count;
+    int    alias_source_param[FRAME_REGISTERS];   /* -1 = no known alias */
+    /* Populated ONLY during a specialization recompile -- see reg_known_shape's original
+       standalone comment (git blame) for the full mechanism; consulted at '.field'/'[idx].field'
+       emission sites to skip the generic runtime field-resolution path entirely. */
+    Shape* reg_known_shape[FRAME_REGISTERS];
+    Shape* reg_known_element_shape[FRAME_REGISTERS];
+    /* Side-channel from the plain index-get site to parse_assignment's plain '=' handler -- see
+       last_plain_index_dest_reg's original standalone comment (git blame) for why this is keyed
+       on exact register-number equality rather than a syntactic flag. */
+    int    last_plain_index_dest_reg;
+    int    last_plain_index_src_param;
+    Shape* last_plain_index_known_elem_shape;
+
+    /* Nonzero while compiling an if/else branch -- disqualifies raw storage (see VarKind). */
+    int branch_depth;
+    /* Nonzero while compiling a function body -- lets parse_return reject a top-level return. */
+    int function_depth;
+
+    /* Top-level variable names, kept solely to detect a function body referencing one -- see
+       var_names's own original comment (git blame) for the shadow-ban mechanism. */
+    unsigned int global_names[FRAME_REGISTERS];
+    int          global_regs[FRAME_REGISTERS];
+    int          global_count;
+
+    /* Forward-referenced calls not yet resolved to a real function -- see PendingCall's own
+       comment above. */
+    PendingCall* pending_calls;
+    int          pending_count, pending_cap;
+
+    /* break/continue loop-context stack -- see LoopContext's own comment above. */
+    LoopContext loop_stack[LOOP_MAX];
+    int         loop_depth;
+
+    /* Struct type names declared so far this compile -- at_module_name/parse_struct_construction
+       use this to distinguish a struct constructor call from an ordinary function call. */
+    unsigned int* struct_names;
+    int           struct_count, struct_cap;
+
+    /* Set just before parse_block returns at a fresh boundary -- lets an outer recovery loop tell
+       "still mid-statement" from "a nested recovery already found this boundary". */
+    bool recovered_at_boundary;
+    /* Sticky across parse_block's own per-statement reset -- without it, an error fully recovered
+       inside a nested block left aer_had_error() silently reporting success. Reset once per
+       parse(). */
+    bool any_compile_error;
+} Parser;
+static Parser P;
+
+static void track_peak(int v) { if (v > P.max_register_used) P.max_register_used = v; }
+static void track_raw_int_peak(int v)  { if (v > P.max_raw_int_used)  P.max_raw_int_used  = v; }
+static void track_raw_real_peak(int v) { if (v > P.max_raw_real_used) P.max_raw_real_used = v; }
 
 /* Raw-slot allocators, mirroring reg_alloc/reg_free/reg_reserve's shape -- except overflow:
    raw_int_alloc/raw_real_alloc return -1 instead of erroring, and every caller falls back to
    ordinary boxed storage for that one value. */
-static int raw_int_next_temp = 0, raw_int_reserved_floor = 0;
-static int raw_real_next_temp = 0, raw_real_reserved_floor = 0;
-
 static int raw_int_alloc(void) {
-    if (raw_int_next_temp >= RAW_REGISTERS_INT) return -1;
-    track_raw_int_peak(raw_int_next_temp + 1);
-    return raw_int_next_temp++;
+    if (P.raw_int_next_temp >= RAW_REGISTERS_INT) return -1;
+    track_raw_int_peak(P.raw_int_next_temp + 1);
+    return P.raw_int_next_temp++;
 }
 static void raw_int_free(int count) {
-    raw_int_next_temp -= count;
-    if (raw_int_next_temp < raw_int_reserved_floor) raw_int_next_temp = raw_int_reserved_floor;
+    P.raw_int_next_temp -= count;
+    if (P.raw_int_next_temp < P.raw_int_reserved_floor) P.raw_int_next_temp = P.raw_int_reserved_floor;
 }
 static int raw_real_alloc(void) {
-    if (raw_real_next_temp >= RAW_REGISTERS_REAL) return -1;
-    track_raw_real_peak(raw_real_next_temp + 1);
-    return raw_real_next_temp++;
+    if (P.raw_real_next_temp >= RAW_REGISTERS_REAL) return -1;
+    track_raw_real_peak(P.raw_real_next_temp + 1);
+    return P.raw_real_next_temp++;
 }
 static void raw_real_free(int count) {
-    raw_real_next_temp -= count;
-    if (raw_real_next_temp < raw_real_reserved_floor) raw_real_next_temp = raw_real_reserved_floor;
+    P.raw_real_next_temp -= count;
+    if (P.raw_real_next_temp < P.raw_real_reserved_floor) P.raw_real_next_temp = P.raw_real_reserved_floor;
 }
 
 /* Reserves a new permanent raw slot for a variable's first assignment -- the raw analog of
-   var_slot claiming reserved_floor. Returns -1 on overflow (caller falls back to boxed). */
+   var_slot claiming P.reserved_floor. Returns -1 on overflow (caller falls back to boxed). */
 static int raw_int_reserve_one(void) {
-    if (raw_int_reserved_floor >= RAW_REGISTERS_INT) return -1;
-    int slot = raw_int_reserved_floor;
-    raw_int_reserved_floor++;
-    raw_int_next_temp = raw_int_reserved_floor;
-    track_raw_int_peak(raw_int_reserved_floor);
+    if (P.raw_int_reserved_floor >= RAW_REGISTERS_INT) return -1;
+    int slot = P.raw_int_reserved_floor;
+    P.raw_int_reserved_floor++;
+    P.raw_int_next_temp = P.raw_int_reserved_floor;
+    track_raw_int_peak(P.raw_int_reserved_floor);
     return slot;
 }
 static int raw_real_reserve_one(void) {
-    if (raw_real_reserved_floor >= RAW_REGISTERS_REAL) return -1;
-    int slot = raw_real_reserved_floor;
-    raw_real_reserved_floor++;
-    raw_real_next_temp = raw_real_reserved_floor;
-    track_raw_real_peak(raw_real_reserved_floor);
+    if (P.raw_real_reserved_floor >= RAW_REGISTERS_REAL) return -1;
+    int slot = P.raw_real_reserved_floor;
+    P.raw_real_reserved_floor++;
+    P.raw_real_next_temp = P.raw_real_reserved_floor;
+    track_raw_real_peak(P.raw_real_reserved_floor);
     return slot;
 }
 
 void reg_reset(void) {
-    next_temp_register = 0;
-    reserved_floor     = 0;
-    max_register_used  = 0;
-    max_raw_int_used   = 0;
-    max_raw_real_used  = 0;
-    raw_int_next_temp = 0;  raw_int_reserved_floor = 0;
-    raw_real_next_temp = 0; raw_real_reserved_floor = 0;
+    P.next_temp_register = 0;
+    P.reserved_floor     = 0;
+    P.max_register_used  = 0;
+    P.max_raw_int_used   = 0;
+    P.max_raw_real_used  = 0;
+    P.raw_int_next_temp = 0;  P.raw_int_reserved_floor = 0;
+    P.raw_real_next_temp = 0; P.raw_real_reserved_floor = 0;
 }
 
 /* Must refuse a register >= FRAME_REGISTERS -- the register_stack bank is sized assuming no
    frame ever needs more. Returns an in-bounds sentinel after erroring. */
 void reg_reserve(int count) {
-    if (reserved_floor + count > FRAME_REGISTERS) {
+    if (P.reserved_floor + count > FRAME_REGISTERS) {
         error_at("Too many live variables/temporaries (max %d registers per call)", FRAME_REGISTERS);
         return;
     }
-    reserved_floor     += count;
-    next_temp_register += count;
-    track_peak(next_temp_register);
+    P.reserved_floor     += count;
+    P.next_temp_register += count;
+    track_peak(P.next_temp_register);
 }
 
 int reg_alloc(void) {
-    if (next_temp_register >= FRAME_REGISTERS) {
+    if (P.next_temp_register >= FRAME_REGISTERS) {
         error_at("Too many live variables/temporaries (max %d registers per call)", FRAME_REGISTERS);
         return FRAME_REGISTERS - 1;
     }
-    int reg = next_temp_register++;
-    track_peak(next_temp_register);
+    int reg = P.next_temp_register++;
+    track_peak(P.next_temp_register);
     return reg;
 }
 
 void reg_free(int count) {
-    next_temp_register -= count;
+    P.next_temp_register -= count;
     /* Never free below the reserved floor -- a bug elsewhere shouldn't hand out a local's own
        register as a free temp. */
-    if (next_temp_register < reserved_floor) next_temp_register = reserved_floor;
+    if (P.next_temp_register < P.reserved_floor) P.next_temp_register = P.reserved_floor;
 }
 
 /* Guard for RK16-wire opcodes: 32767 registers-or-constants is far beyond any real program, but
@@ -336,79 +440,19 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
                                     unsigned int* out_max_raw_ints,
                                     unsigned int* out_max_raw_reals);
 
-/* name_idx -> register. No global/local distinction (this slice has no function defs, so
-   every register is effectively local). */
-static unsigned int var_names[FRAME_REGISTERS];
-static int          var_regs[FRAME_REGISTERS];
-static int          var_count = 0;
-
-/* Per-variable storage kind. VAR_BOXED is an ordinary registers[] index; VAR_RAW_INT/REAL is a
-   raw_ints/raw_reals slot instead, earned only when a name's first assignment is provably
-   int/real (rk_raw_kind), only inside a function body, and only outside any if/else branch
-   (branch_depth == 0 -- a name assigned different types down mutually-exclusive branches can't
-   be resolved without real dataflow analysis). Transitions are one-way: RAW_* can shadow to
-   VAR_BOXED on a mismatch; VAR_BOXED never promotes to RAW_*. */
-typedef enum { VAR_BOXED, VAR_RAW_INT, VAR_RAW_REAL } VarKind;
-static VarKind var_kind[FRAME_REGISTERS];
-
-/* Shape-specializing compilation (see OP_CALL_SPEC, vm.c) -- tracks which of the CURRENT
-   function's parameters have been used as the base of a struct-field access, directly or through
-   a one-hop plain-local alias (`pi = particles[i]; ...; pi.field`, alias_source_param[pi's own
-   register] = the parameter index). Parameter i is always register i (var_slot binds parameters
-   first, in order, right after the allocator resets to 0), so a register index doubles as a
-   parameter index for the first current_param_count entries -- no separate mapping needed. Folded
-   into ChunkFunction.shape_sensitive_mask at function exit, same moment as max_registers/
-   max_raw_ints/max_raw_reals. */
-static bool shape_sensitive_param[FRAME_REGISTERS];
-static int  current_param_count = 0;
-static int  alias_source_param[FRAME_REGISTERS];   /* -1 = no known alias */
-
-/* Populated ONLY during a specialization recompile (parse_function_body's hint_param_reg/
-   hint_shape params) -- NULL for every register during an ordinary compile, always. Consulted at
-   the same '.field'/'[idx].field' emission sites mark_shape_sensitive is (parse_postfix_chain,
-   parse_chain_assignment): when set for the access's base register, the field's byte offset/type
-   is resolved directly from this Shape at COMPILE time (no vm_resolve_field_by_shape call, ever),
-   and the raw specialized opcode variants (OP_FIELD_GET_RAW_INT etc., vm.h) are emitted instead of
-   the generic ones. Only ever holds a register's OWN shape (a struct instance, or a packed array)
-   -- for a plain-array parameter, see reg_known_element_shape below instead. */
-static Shape* reg_known_shape[FRAME_REGISTERS];
-
-/* Same idea as reg_known_shape, but for a plain-array parameter's ELEMENT shape (SPEC_KIND_
-   ARRAY_OF_STRUCTS) -- `particles` itself is never struct-shaped (it's a TYPE_ARRAY), so seeding
-   reg_known_shape[particles' reg] directly would be meaningless; this table instead seeds the
-   shape that `particles[i]` is known to produce. Consulted ONLY at the plain (non-fused) index-get
-   site in parse_postfix_chain, which propagates it onto the alias's own PERMANENT register (never a
-   temp -- see that site's comment for why temps are unsafe here) at the exact point parse_assignment
-   binds a new local name to it (`pi = particles[i]`). */
-static Shape* reg_known_element_shape[FRAME_REGISTERS];
-
-/* Side-channel from the plain index-get site (parse_postfix_chain) to parse_assignment's plain '='
-   handler, letting it recognize an RHS that's EXACTLY `some_param[idx]` (nothing else composed) so
-   it can propagate alias_source_param/reg_known_element_shape onto the new local's own permanent
-   register. Deliberately keyed on exact register-number equality against the temp the index-get
-   itself produced (last_plain_index_dest_reg) rather than a syntactic flag, and consumed (reset to
-   -1) the instant it's read -- so a later, unrelated assignment whose RHS temp happens to reuse the
-   same now-freed register number never sees a stale match. Never propagated onto a temp register
-   itself (only onto the named variable's permanent one): unlike a parameter's register, a temp
-   register routinely gets freed and reused for a completely unrelated value within the very same
-   compile, and reg_known_shape has no per-write invalidation for that churn -- only for the
-   deliberate few sites (parameter/permanent-register reassignment) that already clear it. */
-static int    last_plain_index_dest_reg         = -1;
-static int    last_plain_index_src_param        = -1;
-static Shape* last_plain_index_known_elem_shape = NULL;
-
-/* reg is the parameter's own register (0..current_param_count-1) OR a register whose value is
-   known (via alias_source_param) to have come from indexing that parameter -- either way, marks
+/* reg is the parameter's own register (0..P.current_param_count-1) OR a register whose value is
+   known (via P.alias_source_param) to have come from indexing that parameter -- either way, marks
    that parameter shape-sensitive. Safe to call with any register (out-of-range/no-alias is a
-   silent no-op), matching var_lookup_rk's own "harmless on a miss" convention. */
+   silent no-op), matching var_lookup_rk's own "harmless on a miss" convention. See the Parser
+   struct's own field comments (top of file) for what each of these tables tracks. */
 static void mark_shape_sensitive(int reg) {
     if (reg < 0 || reg >= FRAME_REGISTERS) return;
-    if (reg < current_param_count) { shape_sensitive_param[reg] = true; return; }
-    int src = alias_source_param[reg];
-    if (src >= 0) shape_sensitive_param[src] = true;
+    if (reg < P.current_param_count) { P.shape_sensitive_param[reg] = true; return; }
+    int src = P.alias_source_param[reg];
+    if (src >= 0) P.shape_sensitive_param[src] = true;
 }
 
-/* Compile-time field lookup against a KNOWN Shape (only ever reached via reg_known_shape[], so
+/* Compile-time field lookup against a KNOWN Shape (only ever reached via P.reg_known_shape[], so
    only during a specialization recompile) -- resolves the field's byte offset/type directly from
    the Shape's own arrays, skipping vm_resolve_field_by_shape's runtime lookup and inline cache
    entirely, since the shape is already a compile-time fact here. False means the field doesn't
@@ -433,28 +477,16 @@ static bool shape_find_field(Shape* shape, unsigned int field_name_idx,
     return false;
 }
 
-/* Nonzero while compiling an if/else branch -- disqualifies raw storage (see var_kind). A
+/* Nonzero while compiling an if/else branch -- disqualifies raw storage (see P.var_kind). A
    real counter since if/else nests. */
-static int branch_depth = 0;
-
-/* Nonzero while compiling a function body -- lets parse_return reject a top-level return. No
-   nesting (named functions can't nest), so 0/1 is enough. */
-static int function_depth = 0;
-
-/* Top-level variable names, kept solely to detect a function body referencing one -- entirely
-   off-limits inside a function, enforced by var_slot's shadow-ban check. Updated in lockstep
-   with var_names only while function_depth == 0, so it keeps accumulating across a function
-   def and back out again. */
-static unsigned int global_names[FRAME_REGISTERS];
-static int          global_regs[FRAME_REGISTERS];
-static int          global_count = 0;
 
 /* True (after reporting the error) if name_idx is a top-level variable and the caller is
-   inside a function body. */
+   inside a function body -- see the Parser struct's own field comments (top of file) for how
+   global_names/function_depth track this. */
 static bool report_if_shadowed_global(Chunk* c, unsigned int name_idx) {
-    if (function_depth == 0) return false;
-    for (int i = 0; i < global_count; i++) {
-        if (global_names[i] == name_idx) {
+    if (P.function_depth == 0) return false;
+    for (int i = 0; i < P.global_count; i++) {
+        if (P.global_names[i] == name_idx) {
             error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
                      aer_as_string(c->pool[name_idx])->data);
             return true;
@@ -463,41 +495,41 @@ static bool report_if_shadowed_global(Chunk* c, unsigned int name_idx) {
     return false;
 }
 
-/* A new variable's register is reserved_floor, not var_count -- they diverge when a for-loop
-   promotes reserved_floor for its own iteration registers without registering a name (a fresh
+/* A new variable's register is P.reserved_floor, not P.var_count -- they diverge when a for-loop
+   promotes P.reserved_floor for its own iteration registers without registering a name (a fresh
    variable declared inside that loop's body must land above them, or it silently aliases the
-   loop's own state -- a real bug found this way with nested for-loops). var_regs[] is what makes
+   loop's own state -- a real bug found this way with nested for-loops). P.var_regs[] is what makes
    lookup still resolve correctly once the two diverge. */
 static int var_slot(Chunk* c, unsigned int name_idx) {
-    for (int i = 0; i < var_count; i++)
-        if (var_names[i] == name_idx) return var_regs[i];
+    for (int i = 0; i < P.var_count; i++)
+        if (P.var_names[i] == name_idx) return P.var_regs[i];
     /* Shadowing a top-level name is a compile error, not a silent fresh local -- catches both a
-       fresh local and a parameter with that name. function_depth == 0 (the definition itself)
+       fresh local and a parameter with that name. P.function_depth == 0 (the definition itself)
        and an already-local name are exempt. */
     if (report_if_shadowed_global(c, name_idx)) return -1;
-    /* Checks reserved_floor, not var_count -- var_count can lag behind reserved_floor once a
+    /* Checks P.reserved_floor, not P.var_count -- P.var_count can lag behind P.reserved_floor once a
        for-loop promotes it (see this function's own comment above). */
-    if (reserved_floor >= FRAME_REGISTERS) {
+    if (P.reserved_floor >= FRAME_REGISTERS) {
         error_at("Too many variables (max %d)", FRAME_REGISTERS);
         return -1;
     }
-    int reg = reserved_floor;
-    var_names[var_count] = name_idx;
-    var_regs[var_count]  = reg;
-    /* var_kind[] is a persistent static array shared across every function's compilation -- a
+    int reg = P.reserved_floor;
+    P.var_names[P.var_count] = name_idx;
+    P.var_regs[P.var_count]  = reg;
+    /* P.var_kind[] is a persistent static array shared across every function's compilation -- a
        PAST function's raw-tracked local can leave a stale kind at whatever index this new name
-       lands on (save/restore only shrinks var_count, never zeroes higher indices). Real bug found
+       lands on (save/restore only shrinks P.var_count, never zeroes higher indices). Real bug found
        this way: a fresh top-level var inherited VAR_RAW_INT from an earlier function's local at
        the same index. var_slot resets the kind explicitly here, the one place every name is created. */
-    var_kind[var_count]  = VAR_BOXED;
-    var_count++;
-    reserved_floor++;                        /* permanently protects this register from the temp allocator */
-    next_temp_register = reserved_floor;   /* resync — see this function's own comment for why that's always safe */
-    track_peak(reserved_floor);
-    if (function_depth == 0) {
-        global_names[global_count] = name_idx;
-        global_regs[global_count]  = reg;
-        global_count++;
+    P.var_kind[P.var_count]  = VAR_BOXED;
+    P.var_count++;
+    P.reserved_floor++;                        /* permanently protects this register from the temp allocator */
+    P.next_temp_register = P.reserved_floor;   /* resync — see this function's own comment for why that's always safe */
+    track_peak(P.reserved_floor);
+    if (P.function_depth == 0) {
+        P.global_names[P.global_count] = name_idx;
+        P.global_regs[P.global_count]  = reg;
+        P.global_count++;
     }
     return reg;
 }
@@ -505,25 +537,25 @@ static int var_slot(Chunk* c, unsigned int name_idx) {
 /* Non-creating -- a match here is a top-level variable, grounds for the shadow-ban error, not
    a read/write. */
 static bool global_lookup(unsigned int name_idx, int* out_reg) {
-    for (int i = 0; i < global_count; i++)
-        if (global_names[i] == name_idx) { *out_reg = global_regs[i]; return true; }
+    for (int i = 0; i < P.global_count; i++)
+        if (P.global_names[i] == name_idx) { *out_reg = P.global_regs[i]; return true; }
     return false;
 }
 
 /* Non-creating counterpart to var_slot -- `name += expr` needs an existing value, so it must
    not silently allocate a fresh register on a miss. */
 static bool var_lookup(unsigned int name_idx, int* out_reg) {
-    for (int i = 0; i < var_count; i++)
-        if (var_names[i] == name_idx) { *out_reg = var_regs[i]; return true; }
+    for (int i = 0; i < P.var_count; i++)
+        if (P.var_names[i] == name_idx) { *out_reg = P.var_regs[i]; return true; }
     return false;
 }
 
-/* Works for any RK operand: a temp always lives at/above reserved_floor, a permanent variable
+/* Works for any RK operand: a temp always lives at/above P.reserved_floor, a permanent variable
    below it. A raw-flagged rk must return false FIRST -- its numeric value could otherwise
-   coincidentally compare as >= reserved_floor. */
+   coincidentally compare as >= P.reserved_floor. */
 static bool is_temp(int rk) {
     if (rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
-    return !(rk & RK_CONST_FLAG) && rk >= reserved_floor;
+    return !(rk & RK_CONST_FLAG) && rk >= P.reserved_floor;
 }
 
 /* The one bridge from raw storage to the rest of the compiler -- every function treating rk as
@@ -533,14 +565,14 @@ static int box_if_raw(Chunk* c, int rk) {
         int slot = rk & RK_RAW_SLOT_MASK;
         int dest = reg_alloc();
         chunk_emit(c, PACK3(OP_BOX_INT, dest, slot, 0));
-        if (slot >= raw_int_reserved_floor) raw_int_free(1);
+        if (slot >= P.raw_int_reserved_floor) raw_int_free(1);
         return dest;
     }
     if (rk & RK_RAW_REAL_FLAG) {
         int slot = rk & RK_RAW_SLOT_MASK;
         int dest = reg_alloc();
         chunk_emit(c, PACK3(OP_BOX_REAL, dest, slot, 0));
-        if (slot >= raw_real_reserved_floor) raw_real_free(1);
+        if (slot >= P.raw_real_reserved_floor) raw_real_free(1);
         return dest;
     }
     return rk;
@@ -551,19 +583,19 @@ static int box_if_raw(Chunk* c, int rk) {
    awareness (real bug found this way: reusing a raw-int name as a for-in loop variable). */
 static void ensure_boxed(Chunk* c, unsigned int name_idx) {
     int existing_idx = -1;
-    for (int i = 0; i < var_count; i++) if (var_names[i] == name_idx) { existing_idx = i; break; }
-    if (existing_idx < 0 || var_kind[existing_idx] == VAR_BOXED) return;
+    for (int i = 0; i < P.var_count; i++) if (P.var_names[i] == name_idx) { existing_idx = i; break; }
+    if (existing_idx < 0 || P.var_kind[existing_idx] == VAR_BOXED) return;
 
-    int old_slot = var_regs[existing_idx];
-    Opcode box_op = (var_kind[existing_idx] == VAR_RAW_INT) ? OP_BOX_INT : OP_BOX_REAL;
-    if (reserved_floor >= FRAME_REGISTERS) { error_at("Too many variables (max %d)", FRAME_REGISTERS); return; }
-    int new_reg = reserved_floor;
-    reserved_floor++;
-    next_temp_register = reserved_floor;
+    int old_slot = P.var_regs[existing_idx];
+    Opcode box_op = (P.var_kind[existing_idx] == VAR_RAW_INT) ? OP_BOX_INT : OP_BOX_REAL;
+    if (P.reserved_floor >= FRAME_REGISTERS) { error_at("Too many variables (max %d)", FRAME_REGISTERS); return; }
+    int new_reg = P.reserved_floor;
+    P.reserved_floor++;
+    P.next_temp_register = P.reserved_floor;
     chunk_emit(c, PACK3(box_op, new_reg, old_slot, 0));
-    var_regs[existing_idx] = new_reg;
-    var_kind[existing_idx] = VAR_BOXED;
-    /* No global_regs update needed -- this path only runs on a currently-raw name. */
+    P.var_regs[existing_idx] = new_reg;
+    P.var_kind[existing_idx] = VAR_BOXED;
+    /* No P.global_regs update needed -- this path only runs on a currently-raw name. */
 }
 
 /* Materializes a constant via OP_LOADK, or boxes a raw value -- OP_JUMP_IF_FALSE_REG needs an
@@ -577,15 +609,15 @@ static int materialize(Chunk* c, int rk) {
     return reg;
 }
 
-/* Every reader of a variable's value must go through this, not raw var_regs[i], or a raw slot
+/* Every reader of a variable's value must go through this, not raw P.var_regs[i], or a raw slot
    index gets misread as a plain register (real bug found in string interpolation). */
 static bool var_lookup_rk(unsigned int name_idx, int* out_rk) {
-    for (int i = 0; i < var_count; i++) {
-        if (var_names[i] != name_idx) continue;
-        switch (var_kind[i]) {
-            case VAR_RAW_INT:  *out_rk = RK_RAW_INT_FLAG  | var_regs[i]; break;
-            case VAR_RAW_REAL: *out_rk = RK_RAW_REAL_FLAG | var_regs[i]; break;
-            default:           *out_rk = var_regs[i]; break;
+    for (int i = 0; i < P.var_count; i++) {
+        if (P.var_names[i] != name_idx) continue;
+        switch (P.var_kind[i]) {
+            case VAR_RAW_INT:  *out_rk = RK_RAW_INT_FLAG  | P.var_regs[i]; break;
+            case VAR_RAW_REAL: *out_rk = RK_RAW_REAL_FLAG | P.var_regs[i]; break;
+            default:           *out_rk = P.var_regs[i]; break;
         }
         return true;
     }
@@ -686,7 +718,7 @@ static bool try_emit_arith_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind ki
        struct_array_scan.aer's `pi.x += vx * dt`, where vx is a permanent raw-real local). */
     int dest;
     Opcode raw_op;
-    if (slot >= raw_real_reserved_floor) {
+    if (slot >= P.raw_real_reserved_floor) {
         dest = slot;
         raw_op = (op == OP_ADD) ? OP_RAW_ADD_REAL_BOXED : OP_RAW_MUL_REAL_BOXED;
         chunk_emit(c, PACK3(raw_op, dest, boxed_rk, 0));
@@ -754,7 +786,7 @@ static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind
     int slot = raw_materialize(c, raw_rk, kind);
     if (slot < 0) return false;   /* raw-slot budget exhausted: fall back to boxed */
 
-    int floor_now = int_kind ? raw_int_reserved_floor : raw_real_reserved_floor;
+    int floor_now = int_kind ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
     if (slot >= floor_now) { if (int_kind) raw_int_free(1); else raw_real_free(1); }
     if (is_temp(boxed_rk)) reg_free(1);
 
@@ -813,7 +845,7 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     if (slot_lhs < 0 || slot_rhs < 0) return false;   /* raw-slot budget exhausted: fall back to boxed */
 
     /* Free-then-allocate, RHS then LHS -- only frees a slot that was actually a temp. */
-    int floor_now = int_kind ? raw_int_reserved_floor : raw_real_reserved_floor;
+    int floor_now = int_kind ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
     if (slot_rhs >= floor_now) { if (int_kind) raw_int_free(1); else raw_real_free(1); }
     if (slot_lhs >= floor_now) { if (int_kind) raw_int_free(1); else raw_real_free(1); }
 
@@ -882,30 +914,17 @@ static AerVal build_function_value(unsigned int func_offset, unsigned int arity,
     return aer_function_val(fn);
 }
 
-/* A call to a not-yet-registered name is optimistically assumed to be defined later in this
-   same parse() call -- recorded here with a placeholder already emitted; func_register patches
-   every pending entry once that name registers. Still-pending entries at parse()'s end were
-   never defined anywhere in this call. */
-typedef struct {
-    unsigned int name_idx;
-    unsigned int patch_offset;
-    const char*  call_site_cursor;
-} PendingCall;
-static PendingCall* pending_calls = NULL;
-static int            pending_count = 0;
-static int            pending_cap   = 0;
-
 /* Passed in explicitly, not read internally -- by the time this is called the caller has
    already consumed the argument list, so "now" would point past the actual name. */
 static void pending_call_add(unsigned int name_idx, unsigned int patch_offset, const char* call_site_cursor) {
-    if (pending_count >= pending_cap) {
-        pending_cap    = pending_cap ? pending_cap * 2 : 8;
-        pending_calls  = xrealloc(pending_calls, sizeof(PendingCall) * (size_t)pending_cap);
+    if (P.pending_count >= P.pending_cap) {
+        P.pending_cap    = P.pending_cap ? P.pending_cap * 2 : 8;
+        P.pending_calls  = xrealloc(P.pending_calls, sizeof(PendingCall) * (size_t)P.pending_cap);
     }
-    pending_calls[pending_count].name_idx         = name_idx;
-    pending_calls[pending_count].patch_offset     = patch_offset;
-    pending_calls[pending_count].call_site_cursor = call_site_cursor;
-    pending_count++;
+    P.pending_calls[P.pending_count].name_idx         = name_idx;
+    P.pending_calls[P.pending_count].patch_offset     = patch_offset;
+    P.pending_calls[P.pending_count].call_site_cursor = call_site_cursor;
+    P.pending_count++;
 }
 
 /* `defaults` is taken by ownership, never copied. */
@@ -919,100 +938,80 @@ static void func_register(Chunk* c, unsigned int name_idx, unsigned int offset, 
        word immediately after it (emit_call always emits them back-to-back) -- a forward-referenced
        call can't know its target's function index at emission time any more than it can know its
        code offset. */
-    for (int i = 0; i < pending_count; ) {
-        if (pending_calls[i].name_idx == name_idx) {
-            patch_jump(c, pending_calls[i].patch_offset, offset);
-            c->code[pending_calls[i].patch_offset + 1] = new_func_index;
-            pending_calls[i] = pending_calls[--pending_count];
+    for (int i = 0; i < P.pending_count; ) {
+        if (P.pending_calls[i].name_idx == name_idx) {
+            patch_jump(c, P.pending_calls[i].patch_offset, offset);
+            c->code[P.pending_calls[i].patch_offset + 1] = new_func_index;
+            P.pending_calls[i] = P.pending_calls[--P.pending_count];
         } else {
             i++;
         }
     }
 }
 
-/* break/continue loop-context stack. A for-in loop's iterator state lives in ordinary
-   registers the caller already owns, so no stack-balancing pop is needed on an early exit. */
-#define LOOP_MAX  16
-#define BREAK_MAX 32
-typedef struct {
-    unsigned int top;                     /* continue's target — same value passed to parse_for_body/for_in — meaningless when rotated (see below) */
-    unsigned int patches[BREAK_MAX];   /* break's OP_JUMP operand offsets, patched once the loop ends */
-    int          patch_count;
-    /* Rotated range-for only -- also patches deferred continues to OP_ITER_RANGE_LOOP's own
-   position, not the body's start (continue still needs the advance-and-check). */
-    bool         rotated;
-    unsigned int continue_patches[BREAK_MAX];
-    int          continue_patch_count;
-} LoopContext;
-static LoopContext loop_stack[LOOP_MAX];
-static int           loop_depth = 0;
-
 static bool loop_push(unsigned int top) {
-    if (loop_depth >= LOOP_MAX) {
+    if (P.loop_depth >= LOOP_MAX) {
         error_at("Too many nested loops (max %d)", LOOP_MAX);
         return false;
     }
-    loop_stack[loop_depth].top         = top;
-    loop_stack[loop_depth].patch_count = 0;
-    loop_stack[loop_depth].rotated      = false;
-    loop_depth++;
+    P.loop_stack[P.loop_depth].top         = top;
+    P.loop_stack[P.loop_depth].patch_count = 0;
+    P.loop_stack[P.loop_depth].rotated      = false;
+    P.loop_depth++;
     return true;
 }
 
 /* Rotated range-for only -- `top` is never read here (parse_continue defers instead). */
 static bool loop_push_rotated(void) {
-    if (loop_depth >= LOOP_MAX) {
+    if (P.loop_depth >= LOOP_MAX) {
         error_at("Too many nested loops (max %d)", LOOP_MAX);
         return false;
     }
-    loop_stack[loop_depth].patch_count          = 0;
-    loop_stack[loop_depth].rotated              = true;
-    loop_stack[loop_depth].continue_patch_count = 0;
-    loop_depth++;
+    P.loop_stack[P.loop_depth].patch_count          = 0;
+    P.loop_stack[P.loop_depth].rotated              = true;
+    P.loop_stack[P.loop_depth].continue_patch_count = 0;
+    P.loop_depth++;
     return true;
 }
 
 /* Patches every pending break to exit_target, then pops the loop context. */
 static void loop_pop_and_patch(Chunk* c, unsigned int exit_target) {
-    LoopContext* ctx = &loop_stack[loop_depth - 1];
+    LoopContext* ctx = &P.loop_stack[P.loop_depth - 1];
     for (int i = 0; i < ctx->patch_count; i++)
         patch_jump(c, ctx->patches[i], exit_target);
-    loop_depth--;
+    P.loop_depth--;
 }
 
 /* Rotated range-for only — same as loop_pop_and_patch, plus patches every deferred `continue` to
    land at continue_target (OP_ITER_RANGE_LOOP's own position, not the loop body's start — continue
    still needs to run the advance-and-check, not just re-enter the body from the top). */
 static void loop_pop_and_patch_rotated(Chunk* c, unsigned int exit_target, unsigned int continue_target) {
-    LoopContext* ctx = &loop_stack[loop_depth - 1];
+    LoopContext* ctx = &P.loop_stack[P.loop_depth - 1];
     for (int i = 0; i < ctx->patch_count; i++)
         patch_jump(c, ctx->patches[i], exit_target);
     for (int i = 0; i < ctx->continue_patch_count; i++)
         patch_jump(c, ctx->continue_patches[i], continue_target);
-    loop_depth--;
+    P.loop_depth--;
 }
 
 /* A struct type isn't a callable offset -- OP_STRUCT_NEW just needs to know `Name(...)` means
    construct. Parse-time-only, can't live on the Chunk. */
-static unsigned int* struct_names = NULL;
-static int           struct_count = 0;
-static int           struct_cap   = 0;
 
 /* Max targets in a destructuring assignment (`a, b, c = ...`). */
 #define MAX_DESTRUCT 16
 
 static bool is_struct_name(unsigned int name_idx) {
-    for (int i = 0; i < struct_count; i++)
-        if (struct_names[i] == name_idx) return true;
+    for (int i = 0; i < P.struct_count; i++)
+        if (P.struct_names[i] == name_idx) return true;
     return false;
 }
 
 static void struct_register(unsigned int name_idx) {
-    if (struct_count >= struct_cap) {
-        struct_cap   = struct_cap ? struct_cap * 2 : 16;
-        struct_names = xrealloc(struct_names, sizeof(unsigned int) * (size_t)struct_cap);
+    if (P.struct_count >= P.struct_cap) {
+        P.struct_cap   = P.struct_cap ? P.struct_cap * 2 : 16;
+        P.struct_names = xrealloc(P.struct_names, sizeof(unsigned int) * (size_t)P.struct_cap);
     }
-    struct_names[struct_count++] = name_idx;
+    P.struct_names[P.struct_count++] = name_idx;
 }
 
 /* Forces rk into the current watermark -- OP_CALL's args must be contiguous. A fresh temp
@@ -1020,7 +1019,7 @@ static void struct_register(unsigned int name_idx) {
    instead of allocating past it and leaving a gap that breaks contiguity for a later argument. */
 static int arg_materialize(Chunk* c, int rk) {
     rk = box_if_raw(c, rk);
-    if (!(rk & RK_CONST_FLAG) && is_temp(rk) && rk == next_temp_register - 1) {
+    if (!(rk & RK_CONST_FLAG) && is_temp(rk) && rk == P.next_temp_register - 1) {
         return rk;
     }
     int target = reg_alloc();
@@ -1473,7 +1472,7 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                        needed. Falls back to the generic opcode below if the field isn't int/real,
                        or if the raw-slot budget is exhausted (raw_int_alloc/raw_real_alloc return
                        -1) -- same graceful-overflow convention raw locals already use. */
-                    Shape* known = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? reg_known_shape[arr_reg] : NULL;
+                    Shape* known = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_known_shape[arr_reg] : NULL;
                     unsigned int foffset; ValueType ftype; bool narrow;
                     if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
                         (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
@@ -1502,17 +1501,17 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                 int dest = reg_alloc();
                 emit_index_get(c, dest, arr_reg, rk_start);
                 /* One-hop alias tracking for shape specialization (SPEC_KIND_ARRAY_OF_STRUCTS) --
-                   see last_plain_index_dest_reg's own comment. Recorded unconditionally (not just
-                   during a specialization recompile): last_plain_index_src_param only needs
+                   see P.last_plain_index_dest_reg's own comment. Recorded unconditionally (not just
+                   during a specialization recompile): P.last_plain_index_src_param only needs
                    arr_reg's identity, which is available during the ordinary detection-phase
-                   compile too and is exactly what populates alias_source_param for
-                   shape_sensitive_mask. last_plain_index_known_elem_shape stays NULL outside an
-                   active specialization recompile, since reg_known_element_shape is only ever
+                   compile too and is exactly what populates P.alias_source_param for
+                   shape_sensitive_mask. P.last_plain_index_known_elem_shape stays NULL outside an
+                   active specialization recompile, since P.reg_known_element_shape is only ever
                    seeded there. */
-                last_plain_index_dest_reg  = dest;
-                last_plain_index_src_param = (arr_reg >= 0 && arr_reg < current_param_count) ? arr_reg : -1;
-                last_plain_index_known_elem_shape =
-                    (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? reg_known_element_shape[arr_reg] : NULL;
+                P.last_plain_index_dest_reg  = dest;
+                P.last_plain_index_src_param = (arr_reg >= 0 && arr_reg < P.current_param_count) ? arr_reg : -1;
+                P.last_plain_index_known_elem_shape =
+                    (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_known_element_shape[arr_reg] : NULL;
                 rk = dest;
                 continue;
             }
@@ -1546,7 +1545,7 @@ static int parse_postfix_chain(Chunk* c, int rk) {
 
             mark_shape_sensitive(struct_reg);
             {
-                Shape* known = (struct_reg >= 0 && struct_reg < FRAME_REGISTERS) ? reg_known_shape[struct_reg] : NULL;
+                Shape* known = (struct_reg >= 0 && struct_reg < FRAME_REGISTERS) ? P.reg_known_shape[struct_reg] : NULL;
                 unsigned int foffset; ValueType ftype; bool narrow;
                 if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
                     (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
@@ -1688,7 +1687,7 @@ static unsigned int compile_pipe_guard_begin(Chunk* c, int dest) {
     emit_index_get(c, dest, dest, (int)val_idx | RK_CONST_FLAG);
 
     patch_jump(c, patch_not_result, c->count);
-    reg_free(1);   /* Freed before the next pipe-call argument, restoring next_temp_register to where
+    reg_free(1);   /* Freed before the next pipe-call argument, restoring P.next_temp_register to where
                        arg_materialize would put it regardless. */
     return patch_skip_call;
 }
@@ -1969,14 +1968,14 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
            a side effect of parsing it, always boxed, so checking existence now naturally folds
            that case into the ordinary path. */
         int existing_idx = -1;
-        for (int i = 0; i < var_count; i++) if (var_names[i] == name_idx) { existing_idx = i; break; }
+        for (int i = 0; i < P.var_count; i++) if (P.var_names[i] == name_idx) { existing_idx = i; break; }
 
         if (existing_idx < 0) {
             /* Checked before the raw-eligible fast path could register the name directly, bypassing
                var_slot's own identical check. */
-            if (function_depth > 0) {
-                for (int i = 0; i < global_count; i++) {
-                    if (global_names[i] == name_idx) {
+            if (P.function_depth > 0) {
+                for (int i = 0; i < P.global_count; i++) {
+                    if (P.global_names[i] == name_idx) {
                         error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
                                  aer_as_string(c->pool[name_idx])->data);
                         return;
@@ -1986,7 +1985,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             /* Eligible for raw storage iff: inside a function body, outside any if/else branch, and the
                RHS is provably int/real. */
             RawKind rhs_kind = rk_raw_kind(c, rk_val);
-            if (function_depth > 0 && branch_depth == 0 && rhs_kind != RAWK_NONE) {
+            if (P.function_depth > 0 && P.branch_depth == 0 && rhs_kind != RAWK_NONE) {
                 int slot = (rhs_kind == RAWK_INT) ? raw_int_reserve_one() : raw_real_reserve_one();
                 if (slot >= 0) {
                     int src_slot = raw_materialize(c, rk_val, rhs_kind);
@@ -1998,34 +1997,34 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                             /* Direct analog of the boxed path's "reg != rk_val -> MOVE" case. */
                             Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
                             chunk_emit(c, PACK3(move_op, slot, src_slot, 0));
-                            int floor_now = (rhs_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
+                            int floor_now = (rhs_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
                             if (src_slot >= floor_now) { if (rhs_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
                         }
-                        var_names[var_count] = name_idx;
-                        var_regs[var_count]  = slot;
-                        var_kind[var_count]  = (rhs_kind == RAWK_INT) ? VAR_RAW_INT : VAR_RAW_REAL;
-                        var_count++;
+                        P.var_names[P.var_count] = name_idx;
+                        P.var_regs[P.var_count]  = slot;
+                        P.var_kind[P.var_count]  = (rhs_kind == RAWK_INT) ? VAR_RAW_INT : VAR_RAW_REAL;
+                        P.var_count++;
                         return;
                     }
                 }
             }
-        } else if (var_kind[existing_idx] != VAR_BOXED) {
+        } else if (P.var_kind[existing_idx] != VAR_BOXED) {
             /* Stays raw (writes in place, no shadow) whenever the new value is the same raw kind --
                the slot's identity never changes, so there's no phi/merge ambiguity to avoid.
                Otherwise shadows to a fresh boxed register -- var_slot must never be called here,
                since it would return the stale raw slot index as if it were a plain register. */
             RawKind rhs_kind = rk_raw_kind(c, rk_val);
-            VarKind cur = var_kind[existing_idx];
+            VarKind cur = P.var_kind[existing_idx];
             bool same_kind = (cur == VAR_RAW_INT && rhs_kind == RAWK_INT) ||
                                  (cur == VAR_RAW_REAL && rhs_kind == RAWK_REAL);
             if (same_kind) {
-                int dest_slot = var_regs[existing_idx];
+                int dest_slot = P.var_regs[existing_idx];
                 int src_slot  = raw_materialize(c, rk_val, rhs_kind);
                 if (src_slot >= 0) {
                     if (src_slot != dest_slot) {
                         Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
                         chunk_emit(c, PACK3(move_op, dest_slot, src_slot, 0));
-                        int floor_now = (rhs_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
+                        int floor_now = (rhs_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
                         if (src_slot >= floor_now) { if (rhs_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
                     }
                     return;
@@ -2037,23 +2036,23 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                rather than silently freeze at the pre-loop value -- the RHS bytecode reading the
                old raw value was already emitted before this shadow decision, and re-runs every
                iteration reading a slot nothing writes to anymore (real bug found this way). */
-            if (loop_depth > 0) {
+            if (P.loop_depth > 0) {
                 error_at("This assignment would change '%s' from a fixed numeric type to a different type, but it's inside a loop — not supported. If you're accumulating with +, -, or *, use the compound form ('%s += ...' etc.) instead — it doesn't have this restriction. Otherwise, restructure so the type change happens outside any loop.",
                          aer_as_string(c->pool[name_idx])->data, aer_as_string(c->pool[name_idx])->data);
                 return;
             }
             rk_val = box_if_raw(c, rk_val);
-            if (reserved_floor >= FRAME_REGISTERS) {
+            if (P.reserved_floor >= FRAME_REGISTERS) {
                 error_at("Too many variables (max %d)", FRAME_REGISTERS);
                 return;
             }
-            int new_reg = reserved_floor;
-            reserved_floor++;
-            next_temp_register = reserved_floor;
-            var_regs[existing_idx] = new_reg;
-            var_kind[existing_idx] = VAR_BOXED;
-            /* No global_regs update needed — see ensure_boxed's identical reasoning: this path
-               only runs on a currently-raw-tracked name, which can never be in global_names. */
+            int new_reg = P.reserved_floor;
+            P.reserved_floor++;
+            P.next_temp_register = P.reserved_floor;
+            P.var_regs[existing_idx] = new_reg;
+            P.var_kind[existing_idx] = VAR_BOXED;
+            /* No P.global_regs update needed — see ensure_boxed's identical reasoning: this path
+               only runs on a currently-raw-tracked name, which can never be in P.global_names. */
             if (rk_val & RK_CONST_FLAG) {
                 chunk_emit(c, PACK_OP_A_W16(OP_LOADK, new_reg, (unsigned int)(rk_val & ~RK_CONST_FLAG)));
             } else if (new_reg != rk_val) {
@@ -2071,24 +2070,24 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
            specialization recompile, where hint_param_reg's own register was seeded with a known
            Shape -- see parse_function_body) must lose that hint here: the register's VALUE just
            changed, but var_slot returns the SAME register number for an already-declared name, so
-           reg_known_shape[reg] would otherwise keep trusting a shape that may no longer be true.
+           P.reg_known_shape[reg] would otherwise keep trusting a shape that may no longer be true.
            A later '.field' access on this register must fall back to the generic, runtime-checked
            opcode, not a raw one that would trust a stale offset against whatever this reg holds
            now. Default to clearing it -- always safe (NULL outside an active specialization
-           anyway) -- UNLESS the RHS was exactly `some_param[idx]` (last_plain_index_dest_reg),
+           anyway) -- UNLESS the RHS was exactly `some_param[idx]` (P.last_plain_index_dest_reg),
            the one-hop alias pattern SPEC_KIND_ARRAY_OF_STRUCTS needs (`pi = particles[i]`):
            there, propagate the parameter's known ELEMENT shape onto this alias's own permanent
            register instead, so a later `pi.field` can also take the raw-opcode path. Consumed
            (reset to -1) immediately so a later, unrelated assignment can never see a stale match
            against a since-freed-and-reused temp register number. */
-        if (rk_val == last_plain_index_dest_reg && last_plain_index_dest_reg >= 0) {
-            reg_known_shape[reg] = last_plain_index_known_elem_shape;
-            alias_source_param[reg] = last_plain_index_src_param;
+        if (rk_val == P.last_plain_index_dest_reg && P.last_plain_index_dest_reg >= 0) {
+            P.reg_known_shape[reg] = P.last_plain_index_known_elem_shape;
+            P.alias_source_param[reg] = P.last_plain_index_src_param;
         } else {
-            reg_known_shape[reg] = NULL;
-            alias_source_param[reg] = -1;
+            P.reg_known_shape[reg] = NULL;
+            P.alias_source_param[reg] = -1;
         }
-        last_plain_index_dest_reg = -1;
+        P.last_plain_index_dest_reg = -1;
         if (rk_val & RK_CONST_FLAG) {
             chunk_emit(c, PACK_OP_A_W16(OP_LOADK, reg, (unsigned int)(rk_val & ~RK_CONST_FLAG)));
         } else if (reg != rk_val) {
@@ -2109,10 +2108,10 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
            plain register). Stays raw for +=/-=/x= with a same-kind RHS; /= always shadows (int/int
            division promotes to real). */
         int existing_idx = -1;
-        for (int j = 0; j < var_count; j++) if (var_names[j] == name_idx) { existing_idx = j; break; }
+        for (int j = 0; j < P.var_count; j++) if (P.var_names[j] == name_idx) { existing_idx = j; break; }
 
-        if (existing_idx >= 0 && var_kind[existing_idx] != VAR_BOXED) {
-            RawKind cur_kind = (var_kind[existing_idx] == VAR_RAW_INT) ? RAWK_INT : RAWK_REAL;
+        if (existing_idx >= 0 && P.var_kind[existing_idx] != VAR_BOXED) {
+            RawKind cur_kind = (P.var_kind[existing_idx] == VAR_RAW_INT) ? RAWK_INT : RAWK_REAL;
             Opcode boxed_op = compound_assign_ops[i].op;
             bool native_op_exists = (boxed_op == OP_ADD || boxed_op == OP_SUB || boxed_op == OP_MUL);
 
@@ -2121,14 +2120,14 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             RawKind rhs_kind = rk_raw_kind(c, rk_rhs);
 
             if (native_op_exists && rhs_kind == cur_kind) {
-                int dest_slot = var_regs[existing_idx];
+                int dest_slot = P.var_regs[existing_idx];
                 int rhs_slot  = raw_materialize(c, rk_rhs, rhs_kind);
                 if (rhs_slot >= 0) {
                     Opcode raw_op;
                     if (cur_kind == RAWK_INT) raw_op = (boxed_op == OP_ADD) ? OP_RAW_ADD_INT : (boxed_op == OP_SUB) ? OP_RAW_SUB_INT : OP_RAW_MUL_INT;
                     else                       raw_op = (boxed_op == OP_ADD) ? OP_RAW_ADD_REAL : (boxed_op == OP_SUB) ? OP_RAW_SUB_REAL : OP_RAW_MUL_REAL;
                     chunk_emit(c, PACK3(raw_op, dest_slot, dest_slot, rhs_slot));
-                    int floor_now = (cur_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
+                    int floor_now = (cur_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
                     if (rhs_slot >= floor_now) { if (cur_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
                     return;
                 }
@@ -2140,7 +2139,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                the existing raw slot with a runtime tag check instead of shadowing -- no shadow, no
                allocation, safe every loop iteration. A provably-mismatched kind still shadows. */
             if (native_op_exists && rhs_kind == RAWK_NONE) {
-                int dest_slot = var_regs[existing_idx];
+                int dest_slot = P.var_regs[existing_idx];
                 int boxed_reg = materialize(c, rk_rhs);
                 Opcode raw_op;
                 if (cur_kind == RAWK_INT) raw_op = (boxed_op == OP_ADD) ? OP_RAW_ADD_INT_BOXED : (boxed_op == OP_SUB) ? OP_RAW_SUB_INT_BOXED : OP_RAW_MUL_INT_BOXED;
@@ -2154,21 +2153,21 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                shadow, this genuinely depends on old_slot's value, so a loop re-executing it would
                re-read the stale value every iteration (real bug found this way). No single-pass
                fix exists, so refuse to compile rather than silently corrupt. */
-            if (loop_depth > 0) {
+            if (P.loop_depth > 0) {
                 error_at("This compound assignment would change '%s' from a fixed numeric type to a different type, but it's inside a loop — not supported (restructure so the type change happens outside any loop)",
                          aer_as_string(c->pool[name_idx])->data);
                 return;
             }
-            int old_slot = var_regs[existing_idx];
+            int old_slot = P.var_regs[existing_idx];
             Opcode box_op = (cur_kind == RAWK_INT) ? OP_BOX_INT : OP_BOX_REAL;
-            if (reserved_floor >= FRAME_REGISTERS) { error_at("Too many variables (max %d)", FRAME_REGISTERS); return; }
-            int new_reg = reserved_floor;
-            reserved_floor++;
-            next_temp_register = reserved_floor;
+            if (P.reserved_floor >= FRAME_REGISTERS) { error_at("Too many variables (max %d)", FRAME_REGISTERS); return; }
+            int new_reg = P.reserved_floor;
+            P.reserved_floor++;
+            P.next_temp_register = P.reserved_floor;
             chunk_emit(c, PACK3(box_op, new_reg, old_slot, 0));
-            var_regs[existing_idx] = new_reg;
-            var_kind[existing_idx] = VAR_BOXED;
-            /* No global_regs update needed — see ensure_boxed's identical reasoning. */
+            P.var_regs[existing_idx] = new_reg;
+            P.var_kind[existing_idx] = VAR_BOXED;
+            /* No P.global_regs update needed — see ensure_boxed's identical reasoning. */
             rk_rhs = box_if_raw(c, rk_rhs);
             emit_binary(c, new_reg, boxed_op, new_reg, rk_rhs);
             if (is_temp(rk_rhs)) reg_free(1);
@@ -2180,7 +2179,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         int reg;
         if (!var_lookup(name_idx, &reg)) {
             int dummy_reg;
-            if (function_depth > 0 && global_lookup(name_idx, &dummy_reg)) {
+            if (P.function_depth > 0 && global_lookup(name_idx, &dummy_reg)) {
                 error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
                          aer_as_string(c->pool[name_idx])->data);
                 return;
@@ -2191,10 +2190,10 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
 
         int rk_rhs = parse_binary(c, 0);
         if (parse_had_error) return;
-        /* Same reg_known_shape invalidation as the plain-assignment tail above -- `reg`'s value
+        /* Same P.reg_known_shape invalidation as the plain-assignment tail above -- `reg`'s value
            is about to change (e.g. `bodies += extra_bodies`), so any shape hint on it is no longer
            trustworthy. */
-        reg_known_shape[reg] = NULL;
+        P.reg_known_shape[reg] = NULL;
         emit_binary(c, reg, compound_assign_ops[i].op, reg, rk_rhs);
         if (is_temp(rk_rhs)) reg_free(1);
         return;
@@ -2206,7 +2205,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         unsigned int lhs_start = c->count;
         if (!var_lookup_rk(name_idx, &reg)) {
             int dummy_reg;
-            if (function_depth > 0 && global_lookup(name_idx, &dummy_reg)) {
+            if (P.function_depth > 0 && global_lookup(name_idx, &dummy_reg)) {
                 error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
                          aer_as_string(c->pool[name_idx])->data);
                 return;
@@ -2233,7 +2232,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
     bool obj_is_base;   /* true while obj_reg is still name_idx's own permanent register */
     if (var_lookup(name_idx, &obj_reg)) {
         obj_is_base = true;
-    } else if (function_depth > 0 && global_lookup(name_idx, &obj_reg)) {
+    } else if (P.function_depth > 0 && global_lookup(name_idx, &obj_reg)) {
         /* `name` isn't a local of the current function but IS an existing top-level global —
            same shadow-ban error var_slot enforces for a bare reference. */
         error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
@@ -2297,7 +2296,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             /* obj_reg is still obj's own register here (obj_is_base) -- this is the very first
                postfix step on the name, no chaining happened before it. */
             mark_shape_sensitive(obj_reg);
-            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
+            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.reg_known_shape[obj_reg] : NULL;
             unsigned int foffset = 0; ValueType ftype = TYPE_ANY; bool field_narrow_bit = false;
             RawKind field_kind = RAWK_NONE;
             if (known && shape_find_field(known, fused_field_idx, &foffset, &ftype, &field_narrow_bit)) {
@@ -2309,7 +2308,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 int rk_val = parse_binary(c, 0);
                 if (parse_had_error) return;
                 /* Specialized path: the field's byte offset/type is a compile-time-known fact
-                   here (see reg_known_shape's own comment) -- write straight into it from a raw
+                   here (see P.reg_known_shape's own comment) -- write straight into it from a raw
                    slot, no boxing, when rk_val is already the matching raw kind (an already-raw
                    value, or a matching literal -- raw_materialize's own contract). Falls back to
                    the generic (boxing) path otherwise, same graceful-overflow convention raw
@@ -2322,7 +2321,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                             : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT   : OP_INDEX_FIELD_SET_RAW_REAL);
                         chunk_emit(c, PACK_OP_A_W16(op, obj_reg, pack_rk16(pending_rk_idx)));
                         chunk_emit(c, PACK_2X16((uint16_t)foffset, (uint16_t)slot));
-                        int floor_now = (field_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
+                        int floor_now = (field_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
                         if (slot >= floor_now) { if (field_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
                         if (is_temp(pending_rk_idx)) reg_free(1);
                         if (!obj_is_base) reg_free(1);
@@ -2362,7 +2361,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                         chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
                         chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(pending_rk_idx)));
                         chunk_emit(c, (uint32_t)slot);
-                        int floor_now = (field_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
+                        int floor_now = (field_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
                         if (slot >= floor_now) { if (field_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
                         if (is_temp(pending_rk_idx)) reg_free(1);
                         if (!obj_is_base) reg_free(1);
@@ -2442,10 +2441,10 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         /* Only a direct `param.field = ...` (obj_is_base, no preceding chain step) marks the
            parameter shape-sensitive -- an intermediate chain register (`a.b.c = ...`) isn't a
            parameter itself, and its own provenance isn't tracked (only the one-hop alias case,
-           `local = param[idx]`, is -- see alias_source_param). */
+           `local = param[idx]`, is -- see P.alias_source_param). */
         if (pending_is_field && obj_is_base) {
             mark_shape_sensitive(obj_reg);
-            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
+            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.reg_known_shape[obj_reg] : NULL;
             unsigned int foffset; ValueType ftype; bool field_narrow_bit;
             if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit)) {
                 RawKind field_kind = (ftype == TYPE_INTEGER) ? RAWK_INT : (ftype == TYPE_REAL) ? RAWK_REAL : RAWK_NONE;
@@ -2458,7 +2457,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                         chunk_emit(c, PACK3(op, obj_reg, 0, 0));
                         chunk_emit(c, foffset);
                         chunk_emit(c, (uint32_t)slot);
-                        int floor_now = (field_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
+                        int floor_now = (field_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
                         if (slot >= floor_now) { if (field_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
                         return;   /* obj_is_base is always true here, so no reg_free(1) for it needed */
                     }
@@ -2484,8 +2483,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
 
             /* Same compile-time field lookup the plain '=' branch above uses -- only meaningful
                when obj_is_base (this register really is the shape-sensitive parameter/alias, not
-               an intermediate chain link -- reg_known_shape is never seeded for those). */
-            Shape* known = (obj_is_base && obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? reg_known_shape[obj_reg] : NULL;
+               an intermediate chain link -- P.reg_known_shape is never seeded for those). */
+            Shape* known = (obj_is_base && obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.reg_known_shape[obj_reg] : NULL;
             unsigned int foffset = 0; ValueType ftype = TYPE_ANY; bool field_narrow_bit = false;
             RawKind field_kind = RAWK_NONE;
             if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit)) {
@@ -2514,7 +2513,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                     chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
                     chunk_emit(c, foffset);
                     chunk_emit(c, (uint32_t)slot);
-                    int floor_now = (field_kind == RAWK_INT) ? raw_int_reserved_floor : raw_real_reserved_floor;
+                    int floor_now = (field_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
                     if (slot >= floor_now) { if (field_kind == RAWK_INT) raw_int_free(1); else raw_real_free(1); }
                     specialized = true;
                 }
@@ -2577,14 +2576,6 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
     }
 }
 
-/* Set just before parse_block returns at a fresh boundary -- lets an outer recovery loop tell
-   "still mid-statement" from "a nested recovery already found this boundary". */
-static bool recovered_at_boundary = false;
-
-/* Sticky across parse_block's own per-statement reset -- without it, an error fully recovered
-   inside a nested block left aer_had_error() silently reporting success. Reset once per parse(). */
-static bool any_compile_error = false;
-
 /* Called when the skip-to-boundary loop stops at a plain NEWLINE, not already a boundary -- a
    statement that failed to introduce a block leaves an orphaned indented block otherwise. */
 static void skip_orphaned_block(void) {
@@ -2608,16 +2599,16 @@ static void parse_block(Chunk* c) {
     while (!equal(TOKEN_END_OF_FILE) && !equal(TOKEN_ELSE) && !equal(TOKEN_DEDENT)) {
         if (consume(TOKEN_NEW_LINE)) continue;
         parse_had_error          = false;
-        recovered_at_boundary = false;
+        P.recovered_at_boundary = false;
         unsigned int saved       = c->count;
         unsigned int saved_marks = c->line_mark_count;
         chunk_mark_line(c, saved, current_source_line());
         parse_statement(c);
         if (parse_had_error) {
-            any_compile_error  = true;
+            P.any_compile_error  = true;
             c->count           = saved;
             c->line_mark_count = saved_marks;
-            if (!recovered_at_boundary) {
+            if (!P.recovered_at_boundary) {
                 while (!equal(TOKEN_END_OF_FILE) && !equal(TOKEN_ELSE) &&
                        !equal(TOKEN_DEDENT)       && !equal(TOKEN_NEW_LINE))
                     lex();
@@ -2627,7 +2618,7 @@ static void parse_block(Chunk* c) {
     }
     consume(TOKEN_DEDENT);
     /* However this loop exited, the lexer now sits at a fresh statement boundary. */
-    recovered_at_boundary = true;
+    P.recovered_at_boundary = true;
     /* If the last statement failed and recovered, parse_had_error is left stale true -- every
        caller checks it right after to decide if ITS OWN construct failed. For a function
        definition this is serious: func_register already ran, so a stale flag would roll back the
@@ -2647,12 +2638,12 @@ static void parse_if(Chunk* c) {
     unsigned int patch_jif = emit_jump_if_false_reg(c, reg_cond);
     if (is_temp(reg_cond)) reg_free(1);
 
-    /* branch_depth disqualifies a variable assigned while nonzero from ever being raw-tracked --
+    /* P.branch_depth disqualifies a variable assigned while nonzero from ever being raw-tracked --
        a name assigned different types down mutually-exclusive branches can't be resolved without
        real dataflow analysis. A counter since if/else nests. */
-    branch_depth++;
+    P.branch_depth++;
     parse_block(c);
-    branch_depth--;
+    P.branch_depth--;
     if (parse_had_error) return;
 
     if (consume(TOKEN_ELSE)) {
@@ -2662,9 +2653,9 @@ static void parse_if(Chunk* c) {
         unsigned int patch_jmp = c->count;
         chunk_emit(c, 0);
         patch_jump(c, patch_jif, c->count);
-        branch_depth++;
+        P.branch_depth++;
         parse_block(c);
-        branch_depth--;
+        P.branch_depth--;
         patch_jump(c, patch_jmp, c->count);
     } else {
         patch_jump(c, patch_jif, c->count);
@@ -2672,12 +2663,12 @@ static void parse_if(Chunk* c) {
 }
 
 /* Shared while/for-while tail: require ':', branch-if-false, body, back-edge to loop_top. */
-/* Shared body-and-back-edge tail for every loop form. Callers that promoted reserved_floor can
+/* Shared body-and-back-edge tail for every loop form. Callers that promoted P.reserved_floor can
    safely restore it unconditionally after this returns either way. */
 static void parse_loop_body(Chunk* c, unsigned int loop_top, unsigned int patch_exit) {
     if (!loop_push(loop_top)) return;
     parse_block(c);
-    if (parse_had_error) { loop_depth--; return; }
+    if (parse_had_error) { P.loop_depth--; return; }
 
     chunk_emit(c, OP_JUMP);
     chunk_emit(c, (int)loop_top);
@@ -2730,24 +2721,24 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         /* Promotes temps to permanent status for the loop's duration -- without it, a fresh variable
            inside the body could alias cur_reg/step_reg (real bug with nested ranged loops).
            Restored to the pre-loop watermark once the loop's bytecode is emitted. */
-        int saved_reserved_floor = reserved_floor;
-        reserved_floor = next_temp_register;
+        int saved_reserved_floor = P.reserved_floor;
+        P.reserved_floor = P.next_temp_register;
 
         /* Loop-rotated: PREP once before the loop, LOOP at the bottom of the body -- the one form
            whose continue must defer-patch instead of jumping to a known target. */
         unsigned int patch_empty = emit_iter_range_prep(c, cur_reg, end_reg, step_reg, item_reg);
 
         if (!loop_push_rotated()) {
-            reserved_floor     = saved_reserved_floor;
-            next_temp_register = saved_reserved_floor;
+            P.reserved_floor     = saved_reserved_floor;
+            P.next_temp_register = saved_reserved_floor;
             return;
         }
         unsigned int body_start = c->count;
         parse_block(c);
         if (parse_had_error) {
-            loop_depth--;
-            reserved_floor     = saved_reserved_floor;
-            next_temp_register = saved_reserved_floor;
+            P.loop_depth--;
+            P.reserved_floor     = saved_reserved_floor;
+            P.next_temp_register = saved_reserved_floor;
             return;
         }
 
@@ -2758,8 +2749,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         patch_jump(c, patch_empty, exit_pos);
         loop_pop_and_patch_rotated(c, exit_pos, loop_bottom);
 
-        reserved_floor     = saved_reserved_floor;
-        next_temp_register = saved_reserved_floor;
+        P.reserved_floor     = saved_reserved_floor;
+        P.next_temp_register = saved_reserved_floor;
         return;
     }
 
@@ -2774,16 +2765,16 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
 
     /* idx_reg/col_reg must stay valid across the whole body, so they're protected before the body
        compiles, same as the range branch. */
-    int saved_reserved_floor = reserved_floor;
-    reserved_floor = next_temp_register;
+    int saved_reserved_floor = P.reserved_floor;
+    P.reserved_floor = P.next_temp_register;
 
     unsigned int loop_top = c->count;   /* the iterate opcode is its own back-edge target */
     unsigned int patch_exit = emit_iter_next_array(c, col_reg, idx_reg, item_reg);
 
     parse_loop_body(c, loop_top, patch_exit);
 
-    reserved_floor     = saved_reserved_floor;
-    next_temp_register = saved_reserved_floor;
+    P.reserved_floor     = saved_reserved_floor;
+    P.next_temp_register = saved_reserved_floor;
 }
 
 /* Dict-only at runtime -- reserves both loop variables' registers before compiling the
@@ -2806,16 +2797,16 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
     unsigned int pool_zero = chunk_add_pool(c, aer_int(0));
     chunk_emit(c, PACK_OP_A_W16(OP_LOADK, idx_reg, pool_zero));
 
-    int saved_reserved_floor = reserved_floor;
-    reserved_floor = next_temp_register;
+    int saved_reserved_floor = P.reserved_floor;
+    P.reserved_floor = P.next_temp_register;
 
     unsigned int loop_top = c->count;
     unsigned int patch_exit = emit_iter_next_pair(c, col_reg, idx_reg, key_reg, val_reg);
 
     parse_loop_body(c, loop_top, patch_exit);
 
-    reserved_floor     = saved_reserved_floor;
-    next_temp_register = saved_reserved_floor;
+    P.reserved_floor     = saved_reserved_floor;
+    P.next_temp_register = saved_reserved_floor;
 }
 
 /* AER has no separate `while` keyword — `for <condition>:` (no `in`) IS the while form. */
@@ -3049,7 +3040,7 @@ static void parse_import_path(Chunk* c, const char* alias, unsigned int alias_le
 /* Top level only (a known narrow gap: an import inside an if/for at top level is accepted).
    A failed import is silently not registered. */
 static void parse_import(Chunk* c) {
-    if (function_depth != 0) {
+    if (P.function_depth != 0) {
         error_at("'import' is only allowed at the top level of a file, not inside a function");
         return;
     }
@@ -3160,7 +3151,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
        function -- reported immediately so it isn't mistaken for a forward reference. */
     int  var_reg = -1;
     bool is_local_var = var_lookup(name_idx, &var_reg);
-    if (!is_local_var && function_depth > 0) {
+    if (!is_local_var && P.function_depth > 0) {
         int dummy_reg;
         if (global_lookup(name_idx, &dummy_reg)) {
             error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter (or rename)",
@@ -3269,7 +3260,7 @@ static void emit_result_call_and_return(Chunk* c, int reg_base) {
    plain `return` always means "a success value (or values)" -- signaling failure is `raise`'s job
    alone, so there's no shape ambiguity left for this to detect or reject. */
 static void parse_return(Chunk* c) {
-    if (function_depth == 0) { error_at("'return' outside function"); return; }
+    if (P.function_depth == 0) { error_at("'return' outside function"); return; }
 
     if (!equal(TOKEN_NEW_LINE) && !equal(TOKEN_END_OF_FILE) && !equal(TOKEN_DEDENT)) {
         int rk_first = parse_binary(c, 0);
@@ -3312,7 +3303,7 @@ static void parse_return(Chunk* c) {
 
 /* `raise <expr>` signals a recoverable failure -- builds a Result with the value forced to null. */
 static void parse_raise(Chunk* c) {
-    if (function_depth == 0) { error_at("'raise' outside function"); return; }
+    if (P.function_depth == 0) { error_at("'raise' outside function"); return; }
     unsigned int null_idx = chunk_add_pool(c, aer_null());
     int reg_base = arg_materialize(c, (int)null_idx | RK_CONST_FLAG);
     int rk_err = parse_binary(c, 0);
@@ -3415,8 +3406,8 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
    generic body is unaffected by this mechanism's mere existence.
 
    hint_is_element_shape distinguishes WHICH table gets seeded: false (SPEC_KIND_STRUCT/
-   PACKED_ARRAY) seeds reg_known_shape[hint_param_reg] directly -- the parameter's own register IS
-   the struct/packed-array value. true (SPEC_KIND_ARRAY_OF_STRUCTS) seeds reg_known_element_shape
+   PACKED_ARRAY) seeds P.reg_known_shape[hint_param_reg] directly -- the parameter's own register IS
+   the struct/packed-array value. true (SPEC_KIND_ARRAY_OF_STRUCTS) seeds P.reg_known_element_shape
    instead -- the parameter is a plain TYPE_ARRAY, never itself struct-shaped, so hint_shape
    describes what `param[idx]` produces, not `param` itself; the plain index-get site in
    parse_postfix_chain propagates it onto a one-hop local alias's own register (`pi = particles[i]`)
@@ -3439,66 +3430,66 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     unsigned int saved_var_names[FRAME_REGISTERS];
     int          saved_var_regs[FRAME_REGISTERS];
     VarKind      saved_var_kind[FRAME_REGISTERS];
-    int saved_var_count      = var_count;
-    int saved_next_temp      = next_temp_register;
-    int saved_reserved_floor = reserved_floor;
-    int saved_max_register_used = max_register_used;
-    int saved_max_raw_int_used  = max_raw_int_used;
-    int saved_max_raw_real_used = max_raw_real_used;
-    int saved_raw_int_next_temp      = raw_int_next_temp;
-    int saved_raw_int_reserved_floor = raw_int_reserved_floor;
-    int saved_raw_real_next_temp      = raw_real_next_temp;
-    int saved_raw_real_reserved_floor = raw_real_reserved_floor;
-    memcpy(saved_var_names, var_names, sizeof(unsigned int) * (size_t)var_count);
-    memcpy(saved_var_regs,  var_regs,  sizeof(int) * (size_t)var_count);
-    memcpy(saved_var_kind,  var_kind,  sizeof(VarKind) * (size_t)var_count);
-    var_count          = 0;
-    next_temp_register = 0;
-    reserved_floor     = 0;
-    max_register_used  = 0;
-    max_raw_int_used   = 0;
-    max_raw_real_used  = 0;
-    raw_int_next_temp = 0;  raw_int_reserved_floor = 0;
-    raw_real_next_temp = 0; raw_real_reserved_floor = 0;
+    int saved_var_count      = P.var_count;
+    int saved_next_temp      = P.next_temp_register;
+    int saved_reserved_floor = P.reserved_floor;
+    int saved_max_register_used = P.max_register_used;
+    int saved_max_raw_int_used  = P.max_raw_int_used;
+    int saved_max_raw_real_used = P.max_raw_real_used;
+    int saved_raw_int_next_temp      = P.raw_int_next_temp;
+    int saved_raw_int_reserved_floor = P.raw_int_reserved_floor;
+    int saved_raw_real_next_temp      = P.raw_real_next_temp;
+    int saved_raw_real_reserved_floor = P.raw_real_reserved_floor;
+    memcpy(saved_var_names, P.var_names, sizeof(unsigned int) * (size_t)P.var_count);
+    memcpy(saved_var_regs,  P.var_regs,  sizeof(int) * (size_t)P.var_count);
+    memcpy(saved_var_kind,  P.var_kind,  sizeof(VarKind) * (size_t)P.var_count);
+    P.var_count          = 0;
+    P.next_temp_register = 0;
+    P.reserved_floor     = 0;
+    P.max_register_used  = 0;
+    P.max_raw_int_used   = 0;
+    P.max_raw_real_used  = 0;
+    P.raw_int_next_temp = 0;  P.raw_int_reserved_floor = 0;
+    P.raw_real_next_temp = 0; P.raw_real_reserved_floor = 0;
 
-    memset(shape_sensitive_param, 0, sizeof(shape_sensitive_param));
-    for (int i = 0; i < FRAME_REGISTERS; i++) alias_source_param[i] = -1;
-    memset(reg_known_shape, 0, sizeof(reg_known_shape));
-    memset(reg_known_element_shape, 0, sizeof(reg_known_element_shape));
-    last_plain_index_dest_reg         = -1;
-    last_plain_index_src_param        = -1;
-    last_plain_index_known_elem_shape = NULL;
-    current_param_count = param_count;
+    memset(P.shape_sensitive_param, 0, sizeof(P.shape_sensitive_param));
+    for (int i = 0; i < FRAME_REGISTERS; i++) P.alias_source_param[i] = -1;
+    memset(P.reg_known_shape, 0, sizeof(P.reg_known_shape));
+    memset(P.reg_known_element_shape, 0, sizeof(P.reg_known_element_shape));
+    P.last_plain_index_dest_reg         = -1;
+    P.last_plain_index_src_param        = -1;
+    P.last_plain_index_known_elem_shape = NULL;
+    P.current_param_count = param_count;
 
-    function_depth++;
+    P.function_depth++;
     for (int i = 0; i < param_count; i++) {
         var_slot(c, param_names[i]);
         /* Parameter i is always register i (var_slot binds parameters first, in order, right
            after the allocator resets to 0 above) -- no need to inspect var_slot's return value.
            Deliberately called even for a parameter about to be rebound raw below: it still needs to
-           burn its boxed register slot (advance reserved_floor) so `mark_shape_sensitive`/
-           `alias_source_param`'s assumption that parameter i always occupies register i
+           burn its boxed register slot (advance P.reserved_floor) so `mark_shape_sensitive`/
+           `P.alias_source_param`'s assumption that parameter i always occupies register i
            contiguously keeps holding for every OTHER parameter -- skipping it here (the way an
            ordinary local's raw promotion skips var_slot entirely) would let a later parameter or
            local collide into this "freed" register number and be misattributed as a parameter. */
         if (i == hint_param_reg) {
-            if (hint_is_element_shape) reg_known_element_shape[i] = hint_shape;
-            else                       reg_known_shape[i]         = hint_shape;
+            if (hint_is_element_shape) P.reg_known_element_shape[i] = hint_shape;
+            else                       P.reg_known_shape[i]         = hint_shape;
         }
         for (int k = 0; k < raw_param_count; k++) {
             if (raw_param_regs[k] != i) continue;
             bool is_int = raw_param_types[k] == TYPE_INTEGER;
             int slot = is_int ? raw_int_reserve_one() : raw_real_reserve_one();
             if (slot >= 0) {
-                /* var_slot just appended var_count-1 as this parameter's own (boxed) entry --
+                /* var_slot just appended P.var_count-1 as this parameter's own (boxed) entry --
                    rebind THAT SAME entry to the raw slot instead, exactly as an ordinary local's
                    first raw-eligible assignment would, just applied after the fact rather than at
                    the point of declaration (a parameter has no "first assignment" of its own to
                    hook -- binding time IS its first assignment, conceptually). */
                 Opcode unbox_op = is_int ? OP_UNBOX_PARAM_INT : OP_UNBOX_PARAM_REAL;
                 chunk_emit(c, PACK2(unbox_op, slot, i));
-                var_regs[var_count - 1] = slot;
-                var_kind[var_count - 1] = is_int ? VAR_RAW_INT : VAR_RAW_REAL;
+                P.var_regs[P.var_count - 1] = slot;
+                P.var_kind[P.var_count - 1] = is_int ? VAR_RAW_INT : VAR_RAW_REAL;
             }
             /* slot < 0: raw_ints/raw_reals budget exhausted (realistic -- this shape's own raw
                field usage already competes for the same 32-slot budget). Leave THIS ONE parameter
@@ -3509,7 +3500,7 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     }
 
     parse_block(c);
-    function_depth--;
+    P.function_depth--;
 
     if (!parse_had_error) {
         /* Implicit 'return null' if control falls off the end. */
@@ -3518,21 +3509,21 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
         emit_return(c, reg_null);
     }
 
-    *out_max_registers = (unsigned int)max_register_used;
-    *out_max_raw_ints  = (unsigned int)max_raw_int_used;
-    *out_max_raw_reals = (unsigned int)max_raw_real_used;
+    *out_max_registers = (unsigned int)P.max_register_used;
+    *out_max_raw_ints  = (unsigned int)P.max_raw_int_used;
+    *out_max_raw_reals = (unsigned int)P.max_raw_real_used;
 
-    var_count = saved_var_count;
-    memcpy(var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
-    memcpy(var_regs,  saved_var_regs,  sizeof(int) * (size_t)saved_var_count);
-    memcpy(var_kind,  saved_var_kind,  sizeof(VarKind) * (size_t)saved_var_count);
-    next_temp_register = saved_next_temp;
-    reserved_floor     = saved_reserved_floor;
-    max_register_used  = saved_max_register_used;
-    max_raw_int_used   = saved_max_raw_int_used;
-    max_raw_real_used  = saved_max_raw_real_used;
-    raw_int_next_temp = saved_raw_int_next_temp;   raw_int_reserved_floor = saved_raw_int_reserved_floor;
-    raw_real_next_temp = saved_raw_real_next_temp; raw_real_reserved_floor = saved_raw_real_reserved_floor;
+    P.var_count = saved_var_count;
+    memcpy(P.var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
+    memcpy(P.var_regs,  saved_var_regs,  sizeof(int) * (size_t)saved_var_count);
+    memcpy(P.var_kind,  saved_var_kind,  sizeof(VarKind) * (size_t)saved_var_count);
+    P.next_temp_register = saved_next_temp;
+    P.reserved_floor     = saved_reserved_floor;
+    P.max_register_used  = saved_max_register_used;
+    P.max_raw_int_used   = saved_max_raw_int_used;
+    P.max_raw_real_used  = saved_max_raw_real_used;
+    P.raw_int_next_temp = saved_raw_int_next_temp;   P.raw_int_reserved_floor = saved_raw_int_reserved_floor;
+    P.raw_real_next_temp = saved_raw_real_next_temp; P.raw_real_reserved_floor = saved_raw_real_reserved_floor;
 }
 
 /* Named functions can't nest. Once one parameter has a default, every parameter after it must
@@ -3586,14 +3577,14 @@ static void parse_function(Chunk* c) {
     parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0,
                             &captured_max_registers, &captured_max_raw_ints, &captured_max_raw_reals);
 
-    /* Fold shape_sensitive_param[] into one bitmask; retain the source span (owned copy, see
+    /* Fold P.shape_sensitive_param[] into one bitmask; retain the source span (owned copy, see
        ChunkFunction.source_span's own comment) only when it's actually needed -- the common case
        (not shape-sensitive) pays nothing beyond the mask computation itself. parse_function_body
-       already restored shape_sensitive_param/current_param_count's OWN inputs, but not the fold-in
+       already restored P.shape_sensitive_param/P.current_param_count's OWN inputs, but not the fold-in
        -- reads them here, right after the call, before anything else can touch them. */
     unsigned int shape_mask = 0;
     for (int i = 0; i < param_count && i < 32; i++)
-        if (shape_sensitive_param[i]) shape_mask |= (1u << i);
+        if (P.shape_sensitive_param[i]) shape_mask |= (1u << i);
     c->functions[this_func_idx].shape_sensitive_mask = shape_mask;
     if (shape_mask != 0) {
         const char* span_end = current_source_cursor();
@@ -3824,8 +3815,8 @@ static void parse_struct(Chunk* c) {
 
 /* break/continue — no iter_slots POPs needed (see LoopContext's own comment). */
 static void parse_break(Chunk* c) {
-    if (loop_depth == 0) { error_at("'break' outside loop"); return; }
-    LoopContext* ctx = &loop_stack[loop_depth - 1];
+    if (P.loop_depth == 0) { error_at("'break' outside loop"); return; }
+    LoopContext* ctx = &P.loop_stack[P.loop_depth - 1];
     if (ctx->patch_count >= BREAK_MAX) { error_at("Too many breaks in one loop (max %d)", BREAK_MAX); return; }
     chunk_emit(c, OP_JUMP);
     ctx->patches[ctx->patch_count++] = c->count;
@@ -3833,8 +3824,8 @@ static void parse_break(Chunk* c) {
 }
 
 static void parse_continue(Chunk* c) {
-    if (loop_depth == 0) { error_at("'continue' outside loop"); return; }
-    LoopContext* ctx = &loop_stack[loop_depth - 1];
+    if (P.loop_depth == 0) { error_at("'continue' outside loop"); return; }
+    LoopContext* ctx = &P.loop_stack[P.loop_depth - 1];
     chunk_emit(c, OP_JUMP);
     if (ctx->rotated) {
         if (ctx->continue_patch_count >= BREAK_MAX) { error_at("Too many continues in one loop (max %d)", BREAK_MAX); return; }
@@ -3912,79 +3903,36 @@ static void parse_statement(Chunk* c) {
    the same program. */
 void parser_reset(void) {
     reg_reset();
-    var_count      = 0;
-    global_count   = 0;
-    struct_count   = 0;
-    pending_count  = 0;
-    function_depth = 0;
-    loop_depth     = 0;
+    P.var_count      = 0;
+    P.global_count   = 0;
+    P.struct_count   = 0;
+    P.pending_count  = 0;
+    P.function_depth = 0;
+    P.loop_depth     = 0;
     parse_had_error   = false;
     /* Function registrations live on the Chunk, not parser statics -- isolation follows each
        program's own fresh Chunk. */
 }
 
-/* Every field below mirrors one of this file's persistent statics. */
-struct ParserState {
-    unsigned int  var_names[FRAME_REGISTERS];
-    int           var_regs[FRAME_REGISTERS];
-    VarKind       var_kind[FRAME_REGISTERS];
-    int           var_count;
-    int           next_temp_register;
-    int           reserved_floor;
-    int           raw_int_next_temp,  raw_int_reserved_floor;
-    int           raw_real_next_temp, raw_real_reserved_floor;
-    int           branch_depth;
-    int           function_depth;
-    unsigned int  global_names[FRAME_REGISTERS];
-    int           global_regs[FRAME_REGISTERS];
-    int           global_count;
-    PendingCall* pending_calls;
-    int            pending_count, pending_cap;
-    LoopContext  loop_stack[LOOP_MAX];
-    int            loop_depth;
-    unsigned int*  struct_names;
-    int            struct_count, struct_cap;
-    bool           recovered_at_boundary;
-};
+/* Every parser global lives in one Parser struct now (see its own comment, above) -- a nested
+   compile (module import, lazy shape-specialization recompile) snapshots the whole thing and
+   starts P fresh, then restores it afterward. Safe to do wholesale, including fields that were
+   historically excluded from this snapshot (shape_sensitive_param/current_param_count/
+   alias_source_param/reg_known_shape/reg_known_element_shape/last_plain_index_(fields)/
+   any_compile_error): every one of them is unconditionally reset before its own next real read
+   (parse_function_body resets the whole shape-specialization group at its own entry; parse()
+   resets any_compile_error at its own entry; the nested specialization-recompile path calls
+   neither of those on its way in, so it never observes or depends on whatever this snapshot
+   carries for them either way). */
+/* parser.h already forward-declares `struct ParserState` (an opaque handle for callers outside
+   this file) -- a trivial one-field wrapper around Parser satisfies that without duplicating
+   Parser's own field list a second time. */
+struct ParserState { Parser p; };
 
-/* Transplants each heap array's pointer into the snapshot and nulls the live global -- a plain
-   copy would leave the nested compile writing into the SAME memory this snapshot is meant to
-   preserve, since parser_reset() only zeros counts, never reallocates. Also resets the register
-   allocator directly -- the caller must not also call parser_reset(). */
 ParserState* parser_save_state(void) {
     ParserState* s = xmalloc(sizeof(ParserState));
-
-    memcpy(s->var_names, var_names, sizeof(var_names));
-    memcpy(s->var_regs,  var_regs,  sizeof(var_regs));
-    memcpy(s->var_kind,  var_kind,  sizeof(var_kind));
-    s->var_count = var_count;                 var_count = 0;
-    s->next_temp_register = next_temp_register;
-    s->reserved_floor      = reserved_floor;
-    s->raw_int_next_temp = raw_int_next_temp;
-    s->raw_int_reserved_floor = raw_int_reserved_floor;
-    s->raw_real_next_temp = raw_real_next_temp;
-    s->raw_real_reserved_floor = raw_real_reserved_floor;   /* reg_reset() below zeroes all 4, matching how next_temp_register/reserved_floor are handled */
-    s->branch_depth = branch_depth;           branch_depth = 0;
-    s->function_depth = function_depth;       function_depth = 0;
-
-    memcpy(s->global_names, global_names, sizeof(global_names));
-    memcpy(s->global_regs,  global_regs,  sizeof(global_regs));
-    s->global_count = global_count;           global_count = 0;
-
-    s->pending_calls = pending_calls;          pending_calls = NULL;
-    s->pending_count = pending_count;          pending_count = 0;
-    s->pending_cap   = pending_cap;            pending_cap   = 0;
-
-    memcpy(s->loop_stack, loop_stack, sizeof(loop_stack));
-    s->loop_depth = loop_depth;                loop_depth = 0;
-
-    s->struct_names = struct_names;            struct_names = NULL;
-    s->struct_count = struct_count;             struct_count = 0;
-    s->struct_cap   = struct_cap;               struct_cap   = 0;
-
-    s->recovered_at_boundary = recovered_at_boundary;   recovered_at_boundary = false;
-
-    reg_reset();
+    s->p = P;
+    P = (Parser){0};   /* zeroes everything reg_reset() would, plus every other field -- see this function's own comment above */
     return s;
 }
 
@@ -3992,39 +3940,9 @@ ParserState* parser_save_state(void) {
    only this parser's own scratch bookkeeping, never the runtime data already persisted onto the
    nested file's own Chunk. */
 void parser_restore_state(ParserState* s) {
-    free(pending_calls);
-    free(struct_names);
-
-    memcpy(var_names, s->var_names, sizeof(var_names));
-    memcpy(var_regs,  s->var_regs,  sizeof(var_regs));
-    memcpy(var_kind,  s->var_kind,  sizeof(var_kind));
-    var_count = s->var_count;
-    next_temp_register = s->next_temp_register;
-    reserved_floor     = s->reserved_floor;
-    raw_int_next_temp = s->raw_int_next_temp;
-    raw_int_reserved_floor = s->raw_int_reserved_floor;
-    raw_real_next_temp = s->raw_real_next_temp;
-    raw_real_reserved_floor = s->raw_real_reserved_floor;
-    branch_depth       = s->branch_depth;
-    function_depth     = s->function_depth;
-
-    memcpy(global_names, s->global_names, sizeof(global_names));
-    memcpy(global_regs,  s->global_regs,  sizeof(global_regs));
-    global_count = s->global_count;
-
-    pending_calls = s->pending_calls;
-    pending_count = s->pending_count;
-    pending_cap   = s->pending_cap;
-
-    memcpy(loop_stack, s->loop_stack, sizeof(loop_stack));
-    loop_depth = s->loop_depth;
-
-    struct_names = s->struct_names;
-    struct_count = s->struct_count;
-    struct_cap   = s->struct_cap;
-
-    recovered_at_boundary = s->recovered_at_boundary;
-
+    free(P.pending_calls);
+    free(P.struct_names);
+    P = s->p;
     free(s);
 }
 
@@ -4036,41 +3954,41 @@ void parser_restore_state(ParserState* s) {
    OP_HALT (not just patching the jump target, which would still run the call's own side effects
    first). Drained unconditionally -- forward references only resolve within one call. */
 void parse(Chunk* c) {
-    any_compile_error = false;
+    P.any_compile_error = false;
     while (!equal(TOKEN_END_OF_FILE)) {
         if (consume(TOKEN_NEW_LINE)) continue;
         if (consume(TOKEN_DEDENT))   continue;
         parse_had_error          = false;
-        recovered_at_boundary = false;
+        P.recovered_at_boundary = false;
         unsigned int saved       = c->count;
         unsigned int saved_marks = c->line_mark_count;
         chunk_mark_line(c, saved, current_source_line());
         parse_statement(c);
         if (parse_had_error) {
-            any_compile_error  = true;
+            P.any_compile_error  = true;
             c->count           = saved;
             c->line_mark_count = saved_marks;
-            if (!recovered_at_boundary) {
+            if (!P.recovered_at_boundary) {
                 while (!equal(TOKEN_END_OF_FILE) && !equal(TOKEN_NEW_LINE) && !equal(TOKEN_DEDENT))
                     lex();
                 skip_orphaned_block();
             }
         }
     }
-    if (pending_count > 0) {
+    if (P.pending_count > 0) {
         const char* real_cursor = current_source_cursor();
         bool any_pending_error = false;
-        for (int i = 0; i < pending_count; i++) {
-            unsigned int patch_offset = pending_calls[i].patch_offset;
+        for (int i = 0; i < P.pending_count; i++) {
+            unsigned int patch_offset = P.pending_calls[i].patch_offset;
             c->code[patch_offset - 1] = OP_HALT;
-            lexer_set_cursor(pending_calls[i].call_site_cursor);
+            lexer_set_cursor(P.pending_calls[i].call_site_cursor);
             error_at("Unknown function or struct type '%s' (never defined anywhere in this compile — not a valid forward reference, module call, or struct construction target)",
-                     aer_as_string(c->pool[pending_calls[i].name_idx])->data);
+                     aer_as_string(c->pool[P.pending_calls[i].name_idx])->data);
             any_pending_error = true;
         }
         lexer_set_cursor(real_cursor);
-        pending_count = 0;
-        if (any_pending_error) any_compile_error = true;
+        P.pending_count = 0;
+        if (any_pending_error) P.any_compile_error = true;
     }
-    if (any_compile_error) parse_had_error = true;
+    if (P.any_compile_error) parse_had_error = true;
 }

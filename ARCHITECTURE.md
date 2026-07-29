@@ -607,6 +607,46 @@ specifically). Wall-clock on `nbody_large_packed.aer` (the heaviest user of this
 measured statistically indistinguishable before/after (~4.2-4.3s either way, 3 runs each) — expected
 for a change verified codegen-identical rather than assumed to be.
 
+### 5.11 Folding the parser's 31+ globals into one struct
+
+`parser.c` had 31 separate file-scope mutable statics (the register allocator, variable tables,
+shape-specialization tracking, forward-reference bookkeeping, loop-context stack, ...) plus a
+hand-mirrored `ParserState` struct and ~75 lines of manual field-by-field save/restore, used around
+a nested compile (a module import, or a lazy shape-specialization recompile triggered mid-execution
+by `lbl_call_spec`, vm.c). Adding new parser state meant declaring it in three places kept in sync
+by hand — the exact pattern already responsible for real bugs in this codebase (`var_kind` init,
+`branch_depth`, a `var_slot` bypass, all in the project history).
+
+Folded every one into one `Parser` struct (`static Parser P;`), with `parser_save_state`/
+`parser_restore_state` now a plain struct copy rather than a field-by-field list. This required
+auditing something non-obvious first: several fields (`shape_sensitive_param`, `current_param_count`,
+`alias_source_param`, `reg_known_shape`, `reg_known_element_shape`, the `last_plain_index_*` trio,
+`any_compile_error`) were *not* in the original hand-written `ParserState` — deliberately excluded,
+not an oversight. Verified each is safe to fold into a blanket save/restore anyway: the whole
+shape-specialization group is unconditionally reset at every `parse_function_body` entry
+(confirmed at its own reset block), `any_compile_error` is unconditionally reset at every `parse()`
+entry, and the nested-compile path this snapshot exists for calls neither of those functions in a
+way that would ever observe a stale carry-over value either way. So a full struct copy is
+behaviorally identical to the original selective one, not a silent behavior change.
+
+Mechanical transform, not hand-editing ~35 identifiers across ~600 call sites: scripted the rename
+(python, word-boundary regex per identifier) into a scratch copy, let the compiler catch every
+missed reference (each surfaces as a plain "undeclared identifier" error — a strong safety net for
+this specific class of mistake), fixed the real bugs it found (`Parser`'s own definition needed to
+move before the register-allocator functions that use it, which meant relocating the small,
+self-contained `PendingCall`/`LoopContext` typedefs earlier in the file too; `parser.h`'s existing
+`typedef struct ParserState ParserState;` forward-declaration meant `ParserState` needed to stay a
+real struct tag, not become a bare alias for `Parser`), then manually swept for comments left
+orphaned above their now-removed declarations (several paragraphs that used to precede a
+`static int foo;` line and now duplicated the same explanation already in `Parser`'s own field
+comments).
+
+Verified: full four-suite regression + ASAN clean on Windows and the Pi, `test_shape_specialization.aer`
+and `test_functions.aer` specifically (the two most exercising nested-compile save/restore and
+forward-reference bookkeeping). Wall-clock on `nbody.aer` (heaviest user of specialization
+recompiles) measured unchanged (~3.0-3.3s, matching this benchmark's existing noise band) — expected,
+since this is a compile-time correctness/maintainability change, not a performance one.
+
 ---
 
 ## 6. Known architectural limitations (current, unresolved)
