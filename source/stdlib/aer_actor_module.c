@@ -10,6 +10,10 @@
    reach, so the scheduler (aer_scheduler.c) has a real language feature to schedule instead of only
    a hand-written C test driver. */
 
+/* noinline -- see aer_host_call's own comment (aer_host.c): this function's 4KB `AerVal
+   popped[VM_STACK_MAX]` local was one of three such arrays LTO was folding into vm_run_slice's own
+   frame, since each of the three has exactly one call site. */
+__attribute__((noinline))
 bool aer_actor_module_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_ACTOR_SPAWN && arg_count == 1) {
         AerVal path_v = vm_stack_pop(vm);

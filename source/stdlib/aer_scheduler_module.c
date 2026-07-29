@@ -2,6 +2,9 @@
 #include "aer_stdlib.h"
 #include "error.h"
 
+/* noinline -- see aer_host_call's own comment (aer_host.c): same 4KB VM_STACK_MAX-array,
+   single-call-site shape that was inflating vm_run_slice's stack frame via LTO. */
+__attribute__((noinline))
 bool aer_scheduler_module_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_SCHEDULER_ADD && arg_count >= 2) {
         AerVal popped[VM_STACK_MAX];

@@ -649,6 +649,36 @@ forward-reference bookkeeping). Wall-clock on `nbody.aer` (heaviest user of spec
 recompiles) measured unchanged (~3.0-3.3s, matching this benchmark's existing noise band) — expected,
 since this is a compile-time correctness/maintainability change, not a performance one.
 
+### 5.12 Keeping three cold, single-call-site functions out of `vm_run_slice`'s own frame
+
+`aer_host_call` (`aer_host.c`), `aer_actor_module_call` and `aer_scheduler_module_call` (both
+`stdlib/`) each declare a local `AerVal[VM_STACK_MAX]` (4KB on this build: `VM_STACK_MAX` is 256,
+`AerVal` is 16 bytes) to hold a copy of the popped call arguments. Each is called from exactly one
+site in `vm.c`'s `lbl_call_module` — the single-call-site shape GCC's inliner favors regardless of
+callee size, since inlining a function called from only one place can't increase code size. Under
+`-flto`, it took the bait on all three at once: disassembling `vm_run_slice` showed a ~30KB stack
+frame (`sub sp, sp, #30336` plus a further `#44`), confirmed via `-fstack-usage` to be ~7KB in a
+non-LTO build of the same function alone — the other ~23KB was these three call targets' own
+locals, folded in by the LTO backend at link time.
+
+The dispatch loop's own hot state (`ip`, the `registers`/`raw_ints`/`raw_reals` pointers, `op_word`)
+already lives in real registers, not this frame (see §3.3, §5.4's hoisting work) — but the frame
+still exists as real stack memory the CPU touches on entry, and at ~30KB it's comfortably bigger
+than this target's 32KB L1 dcache, all to serve three opcodes (`io`/`actor`/`scheduler` module
+calls) that are never on `nbody`'s hot path at all.
+
+Marking all three `__attribute__((noinline))` dropped `vm_run_slice`'s frame back to ~17.5KB (the
+three 4KB arrays gone; something smaller still folds in) at the cost of one real `bl` per actual
+`io`/`actor.call`/`scheduler.add` call — none of which are hot paths, each already doing a linear
+host-function scan or a `memcpy` of comparable cost. Measured on the Pi, `nbody_large_packed_narrow.aer`,
+8 runs each side: **identical instruction count** (~12.897B both sides — same work, confirming this
+is purely a locality effect, not a codegen change to the hot loop itself) and **~9-10% fewer cycles**
+(8482M → 7671M average). Swept `binary_trees`, `log_processing`, `dict_bench`, `struct_array_scan`,
+`sieve`, `mandelbrot`, and `fib_bench` for regressions — all within 1-3%, inside this Pi's documented
+per-run cycle-counter noise band, including `log_processing.aer` and `test_actor.aer`/
+`test_scheduler.aer` which actually exercise the now-noinline'd functions. Full four-suite regression
+passed on Windows, including the exact-source-line error assertions in `test-embed`.
+
 ---
 
 ## 6. Known architectural limitations (current, unresolved)
