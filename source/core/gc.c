@@ -8,41 +8,23 @@
 /* Generational GC — write barrier and remembered set                   */
 /* ------------------------------------------------------------------ */
 
+/* Every pooled cell's gc_state byte lives at the cell itself (offset 0, see pool.h), not in a
+   side table -- so unlike a lookup keyed by which pool a value belongs to, checking any of these
+   bits needs nothing beyond the value's own pointer. value_has_cell (below) gates out
+   null/boolean/integer/float, which have no cell to point at all. */
+static bool value_has_cell(AerVal v);
+
 /* True if v's own pooled cell is young; null/boolean/real (and inline integers) have no cell, so they're trivially "not young". */
-static bool value_is_young(VmHeap* heap, AerVal v) {
-    switch (aer_type(v)) {
-        case TYPE_STRING:   return pool_is_young(&heap->string_pool,   aer_as_string(v));
-        case TYPE_ARRAY:    return pool_is_young(&heap->array_pool,    aer_as_array(v));
-        case TYPE_STRUCT:   return pool_is_young(&heap->struct_pool,   aer_as_struct(v));
-        case TYPE_DICT:     return pool_is_young(&heap->dict_pool,     aer_as_dict(v));
-        case TYPE_FUNCTION: return pool_is_young(&heap->function_pool, aer_as_function(v));
-        case TYPE_PACKED_ARRAY: return pool_is_young(&heap->packed_array_pool, aer_as_packed_array(v));
-        case TYPE_TYPED_ARRAY: return pool_is_young(&heap->typed_array_pool, aer_as_typed_array(v));
-        case TYPE_RESULT:   return pool_is_young(&heap->result_pool,   aer_as_result(v));
-        default:            return false;   /* null/boolean/integer/float have no heap cell — integers are never boxed under the tagged representation */
-    }
+static bool value_is_young(AerVal v) {
+    return value_has_cell(v) && pool_is_young(v.as.ptr);
 }
 
-/* Pool for a remembered pointer's kind, so gc_remember can dedup via its cell's REMEMBERED bit (O(1)) instead of scanning remembered_set. */
-static Pool* remembered_pool_for(VmHeap* heap, void* ptr, RememberedKind kind) {
-    (void)ptr;
-    switch (kind) {
-        case REMEMBERED_ARRAY:  return &heap->array_pool;
-        case REMEMBERED_DICT:   return &heap->dict_pool;
-        case REMEMBERED_STRUCT: return &heap->struct_pool;
-    }
-    return NULL;
-}
-
+/* Every RememberedKind (ARRAY/DICT/STRUCT) names a pooled type, so its own gc_state byte's
+   REMEMBERED bit is always available -- no separate scan of remembered_set needed to dedup. */
 static void gc_remember(VmHeap* heap, void* ptr, RememberedKind kind) {
-    Pool* p = remembered_pool_for(heap, ptr, kind);
-    if (p) {
-        if (pool_is_remembered(p, ptr)) return;   /* already remembered */
-        pool_mark_remembered(p, ptr);
-    } else {
-        for (unsigned int i = 0; i < heap->remembered_count; i++)
-            if (heap->remembered_set[i].ptr == ptr) return;   /* already remembered */
-    }
+    (void)kind;
+    if (pool_is_remembered(ptr)) return;   /* already remembered */
+    pool_mark_remembered(ptr);
     if (heap->remembered_count >= heap->remembered_cap) {
         heap->remembered_cap = heap->remembered_cap ? heap->remembered_cap * 2 : 64;
         heap->remembered_set = xrealloc(heap->remembered_set, sizeof(RememberedEntry) * heap->remembered_cap);
@@ -75,8 +57,8 @@ static void mark_card_dirty(unsigned char** dirty_cards, unsigned int* dirty_car
 void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value) {
     VmHeap* heap = &vm->heap;
     if (!heap->gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
-    if (pool_is_young(&heap->array_pool, a)) return;   /* young containers are re-traced normally next cycle */
-    if (!value_is_young(heap, new_value)) return;
+    if (pool_is_young(a)) return;   /* young containers are re-traced normally next cycle */
+    if (!value_is_young(new_value)) return;
     mark_card_dirty(&a->dirty_cards, &a->dirty_cards_bytes, index);
     gc_remember(heap, a, REMEMBERED_ARRAY);
 }
@@ -91,8 +73,8 @@ void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value)
 void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value) {
     VmHeap* heap = &vm->heap;
     if (!heap->gc_ever_collected) return;
-    if (pool_is_young(&heap->struct_pool, s)) return;
-    if (!value_is_young(heap, new_value)) return;
+    if (pool_is_young(s)) return;
+    if (!value_is_young(new_value)) return;
     gc_remember(heap, s, REMEMBERED_STRUCT);
 }
 
@@ -105,8 +87,8 @@ void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value) {
 void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value) {
     VmHeap* heap = &vm->heap;
     if (!heap->gc_ever_collected) return;   /* nothing can be old yet — see gc_ever_collected's own comment */
-    if (pool_is_young(&heap->dict_pool, d)) return;
-    if (!value_is_young(heap, new_value)) return;
+    if (pool_is_young(d)) return;
+    if (!value_is_young(new_value)) return;
     mark_card_dirty(&d->dirty_cards, &d->dirty_cards_bytes, index);
     gc_remember(heap, d, REMEMBERED_DICT);
 }
@@ -136,11 +118,9 @@ static void worklist_push(VmHeap* heap, AerVal v, bool minor) {
        alive regardless of mark state, and the only legitimate old -> young edge (a write reaching it
        through gc_barrier_array/struct/dict) is captured by the remembered set and replayed
        separately in gc_collect's own `if (minor)` block below -- so there is nothing left for the
-       ordinary mark phase to find by recursing into an old object's own children here. This is what
-       makes it safe for pool_clear_marks/pool_sweep to also skip old cells during a minor cycle (see
-       their own comments, pool.c/pool.h): if nothing ever marks an old cell here, nothing needs to
-       unmark or sweep-check it either. */
-    if (minor && !value_is_young(heap, v)) return;
+       ordinary mark phase to find by recursing into an old object's own children here. This is also
+       why no old cell ever carries a mark bit going into a minor sweep (pool.c's pool_sweep). */
+    if (minor && !value_is_young(v)) return;
     MarkWorklist* wl = &heap->gc_worklist;
     if (wl->count >= wl->cap) {
         wl->cap   = wl->cap ? wl->cap * 2 : 256;
@@ -150,18 +130,18 @@ static void worklist_push(VmHeap* heap, AerVal v, bool minor) {
 }
 
 /* Shared by TYPE_FUNCTION marking and CallFrame root marking (a frame's executing function is a raw AerFunction*, not a wrapped AerVal). */
-static void mark_function(VmHeap* heap, AerFunction* f) {
-    pool_mark(&heap->function_pool, f);
+static void mark_function(AerFunction* f) {
+    pool_mark(f);
 }
 
 static void mark_value(VmHeap* heap, AerVal v, bool minor) {
     switch (aer_type(v)) {
         case TYPE_STRING:
-            pool_mark(&heap->string_pool, aer_as_string(v));   /* a leaf — data owns no other Values */
+            pool_mark(aer_as_string(v));   /* a leaf — data owns no other Values */
             break;
         case TYPE_ARRAY: {
             AerArray* a = aer_as_array(v);
-            if (!pool_mark(&heap->array_pool, a)) {
+            if (!pool_mark(a)) {
                 for (unsigned int i = 0; i < a->count; i++)
                     worklist_push(heap, a->items[i], minor);
             }
@@ -173,7 +153,7 @@ static void mark_value(VmHeap* heap, AerVal v, bool minor) {
                has no tag and is never a GC cell, so treating it as an AerVal here would be a real
                memory-safety bug (reading raw bytes as a fake tagged pointer during mark). */
             AerStruct* s = aer_as_struct(v);
-            if (!pool_mark(&heap->struct_pool, s)) {
+            if (!pool_mark(s)) {
                 for (unsigned int i = 0; i < s->shape->field_count; i++)
                     if (s->shape->field_types[i] == TYPE_ANY)
                         worklist_push(heap, vm_struct_field_read(s, i), minor);
@@ -181,7 +161,7 @@ static void mark_value(VmHeap* heap, AerVal v, bool minor) {
             break;
         }
         case TYPE_DICT:
-            if (!pool_mark(&heap->dict_pool, aer_as_dict(v))) {
+            if (!pool_mark(aer_as_dict(v))) {
                 HashTable* map = &aer_as_dict(v)->map;
                 for (unsigned int i = 0; i < map->count; i++)
                     worklist_push(heap, map->dense[i].payload, minor);
@@ -189,20 +169,20 @@ static void mark_value(VmHeap* heap, AerVal v, bool minor) {
             }
             break;
         case TYPE_FUNCTION:
-            mark_function(heap, aer_as_function(v));
+            mark_function(aer_as_function(v));
             break;
         case TYPE_PACKED_ARRAY:
             /* A GC leaf -- every field is a fixed primitive, never a heap reference. */
-            pool_mark(&heap->packed_array_pool, aer_as_packed_array(v));
+            pool_mark(aer_as_packed_array(v));
             break;
         case TYPE_TYPED_ARRAY:
             /* A GC leaf, same reasoning as TYPE_PACKED_ARRAY above -- every element is a fixed
                numeric primitive. */
-            pool_mark(&heap->typed_array_pool, aer_as_typed_array(v));
+            pool_mark(aer_as_typed_array(v));
             break;
         case TYPE_RESULT: {
             AerResult* r = aer_as_result(v);
-            if (!pool_mark(&heap->result_pool, r)) {
+            if (!pool_mark(r)) {
                 worklist_push(heap, r->value, minor);
                 worklist_push(heap, r->err, minor);
             }
@@ -257,19 +237,32 @@ static void free_packed_array(void* cell) { free(((AerPackedArray*)cell)->data);
 static void free_typed_array(void* cell)  { free(((AerTypedArray*)cell)->data); }
 static void free_result(void* cell)   { (void)cell; }   /* both fields are plain AerVals — nothing separately owned */
 
+/* Every pool a VmHeap owns, by field offset (not a raw Pool* -- these describe VmHeap's shape once,
+   generically, rather than one specific instance), paired with its finalizer. The single place all
+   8 pools are listed together; gc_finalize_all_pools, pool_sweep's call in gc_collect below, and
+   gc_count_live_cells all walk this instead of repeating their own hand-written list -- which is
+   exactly how gc_count_live_cells came to silently omit result_pool before. */
+typedef struct { size_t offset; void (*on_free)(void* cell); } PoolEntry;
+static const PoolEntry pool_table[] = {
+    { offsetof(VmHeap, string_pool),       free_string },
+    { offsetof(VmHeap, array_pool),        free_array },
+    { offsetof(VmHeap, dict_pool),         free_dict },
+    { offsetof(VmHeap, function_pool),     free_function },
+    { offsetof(VmHeap, struct_pool),       free_struct },
+    { offsetof(VmHeap, packed_array_pool), free_packed_array },
+    { offsetof(VmHeap, typed_array_pool),  free_typed_array },
+    { offsetof(VmHeap, result_pool),       free_result },
+};
+#define POOL_TABLE_COUNT (sizeof(pool_table) / sizeof(pool_table[0]))
+
+static inline Pool* pool_at(VmHeap* heap, size_t offset) { return (Pool*)((char*)heap + offset); }
+
 /* vm_free's own teardown call (vm.c) -- every cell finalized regardless of mark/generation state,
    since the whole heap is going away, not just the garbage since the last cycle (contrast
-   gc_collect's pool_sweep calls below, which only finalize actual garbage). One cohesive call
-   rather than exposing all 7 individual finalizer functions just for vm_free's one use. */
+   gc_collect's pool_sweep calls below, which only finalize actual garbage). */
 void gc_finalize_all_pools(VmHeap* heap) {
-    pool_finalize_all(&heap->string_pool,       free_string);
-    pool_finalize_all(&heap->array_pool,        free_array);
-    pool_finalize_all(&heap->dict_pool,         free_dict);
-    pool_finalize_all(&heap->function_pool,     free_function);
-    pool_finalize_all(&heap->struct_pool,       free_struct);
-    pool_finalize_all(&heap->packed_array_pool, free_packed_array);
-    pool_finalize_all(&heap->typed_array_pool,  free_typed_array);
-    pool_finalize_all(&heap->result_pool,       free_result);
+    for (size_t i = 0; i < POOL_TABLE_COUNT; i++)
+        pool_finalize_all(pool_at(heap, pool_table[i].offset), pool_table[i].on_free);
 }
 
 /* ------------------------------------------------------------------ */
@@ -282,17 +275,6 @@ void gc_finalize_all_pools(VmHeap* heap) {
    OWN gc_maybe_collect fires). */
 static void gc_collect(VM* vm, bool minor) {
     VmHeap* heap = &vm->heap;
-    /* Must run before marking every cycle. With young_only (minor), old cells are skipped entirely --
-       correct because the mark phase itself now never sets an old cell's mark bit during a minor
-       cycle either (worklist_push's own skip, above), so there is nothing to clear for them. */
-    pool_clear_marks(&heap->string_pool, minor);
-    pool_clear_marks(&heap->array_pool, minor);
-    pool_clear_marks(&heap->dict_pool, minor);
-    pool_clear_marks(&heap->function_pool, minor);
-    pool_clear_marks(&heap->struct_pool, minor);
-    pool_clear_marks(&heap->packed_array_pool, minor);
-    pool_clear_marks(&heap->typed_array_pool, minor);
-    pool_clear_marks(&heap->result_pool, minor);
 
     mark_vm_roots(heap, vm, minor);
     mark_chunk_roots(heap, vm->chunk, minor);
@@ -304,14 +286,7 @@ static void gc_collect(VM* vm, bool minor) {
         unsigned int kept = 0;
         for (unsigned int i = 0; i < heap->remembered_count; i++) {
             RememberedEntry* e = &heap->remembered_set[i];
-            bool alive;
-            switch (e->kind) {
-                case REMEMBERED_ARRAY:  alive = !pool_is_freed(&heap->array_pool,  e->ptr); break;
-                case REMEMBERED_STRUCT: alive = !pool_is_freed(&heap->struct_pool, e->ptr); break;
-                case REMEMBERED_DICT:   alive = !pool_is_freed(&heap->dict_pool,   e->ptr); break;
-                default: alive = false; break;
-            }
-            if (!alive) continue;
+            if (pool_is_freed(e->ptr)) continue;   /* e->kind is irrelevant -- the byte lives on e->ptr's own cell regardless of which pool */
 
             switch (e->kind) {
                 case REMEMBERED_ARRAY: {
@@ -382,14 +357,8 @@ static void gc_collect(VM* vm, bool minor) {
 
     mark_drain(heap, minor);
 
-    pool_sweep(&heap->string_pool,   minor, free_string);
-    pool_sweep(&heap->array_pool,    minor, free_array);
-    pool_sweep(&heap->dict_pool,     minor, free_dict);
-    pool_sweep(&heap->function_pool, minor, free_function);
-    pool_sweep(&heap->struct_pool,   minor, free_struct);
-    pool_sweep(&heap->packed_array_pool, minor, free_packed_array);
-    pool_sweep(&heap->typed_array_pool, minor, free_typed_array);
-    pool_sweep(&heap->result_pool,   minor, free_result);
+    for (size_t i = 0; i < POOL_TABLE_COUNT; i++)
+        pool_sweep(pool_at(heap, pool_table[i].offset), minor, pool_table[i].on_free);
 }
 
 /* ------------------------------------------------------------------ */
@@ -407,10 +376,8 @@ static void gc_reset_alloc_counts(VmHeap* heap) {
 /* Shared by aer_gc_stats (vm.c) and gc_run_collection_cycle's own ceiling check below — one place walking all pools' cell state, not two. */
 unsigned int gc_count_live_cells(VmHeap* heap) {
     unsigned int total = 0;
-    Pool* pools[] = { &heap->string_pool, &heap->array_pool, &heap->dict_pool, &heap->function_pool,
-                      &heap->struct_pool, &heap->packed_array_pool, &heap->typed_array_pool };
-    for (unsigned int p = 0; p < sizeof(pools) / sizeof(pools[0]); p++) {
-        Pool* pool = pools[p];
+    for (size_t t = 0; t < POOL_TABLE_COUNT; t++) {
+        Pool* pool = pool_at(heap, pool_table[t].offset);
         for (unsigned int i = 0; i < pool->slab_count; i++) {
             unsigned int count = (i == pool->slab_count - 1) ? pool->next_index : pool->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {

@@ -110,34 +110,35 @@ static void pool_free_at(Pool* p, void* cell, unsigned int slab_index) {
     }
 }
 
-bool pool_mark(Pool* p, void* cell) {
-    (void)p;
+/* These five all read/write only the cell's own state byte -- a Pool* was never needed, since
+   gc_state lives in the object, not a side table (see pool.h). */
+
+bool pool_mark(void* cell) {
     unsigned char* state = (unsigned char*)cell;
     if (*state & POOL_MARKED) return true;
     *state |= POOL_MARKED;
     return false;
 }
 
-bool pool_is_young(Pool* p, void* cell) {
-    (void)p;
+bool pool_is_young(void* cell) {
     return (*(unsigned char*)cell & POOL_OLD) == 0;
 }
 
-bool pool_is_freed(Pool* p, void* cell) {
-    (void)p;
+bool pool_is_freed(void* cell) {
     return (*(unsigned char*)cell & POOL_FREE) != 0;
 }
 
-bool pool_is_remembered(Pool* p, void* cell) {
-    (void)p;
+bool pool_is_remembered(void* cell) {
     return (*(unsigned char*)cell & POOL_REMEMBERED) != 0;
 }
 
-void pool_mark_remembered(Pool* p, void* cell) {
-    (void)p;
+void pool_mark_remembered(void* cell) {
     *(unsigned char*)cell |= POOL_REMEMBERED;
 }
 
+/* Leaves every surviving cell mark-free (the promote branch clears it), and pool_alloc zeroes the
+   state byte of every cell it hands out -- together that is what makes a separate pre-mark clearing
+   pass unnecessary. Don't add one back: it would be a pure no-op scan of the whole heap. */
 void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell)) {
     for (unsigned int i = 0; i < p->slab_count; i++) {
         /* Nothing in this slab needs a minor pass at all -- every cell is already old or free. See
@@ -158,28 +159,6 @@ void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell)) {
                 pool_free_at(p, cell, i);   /* sets *state = POOL_FREE internally; i is this cell's real slab, known for free here */
             }
             if (was_young) p->slab_young_count[i]--;   /* resolved either way (promoted or freed) -- no longer young */
-        }
-    }
-}
-
-void pool_clear_marks(Pool* p, bool young_only) {
-    for (unsigned int i = 0; i < p->slab_count; i++) {
-        /* Same per-slab skip as pool_sweep -- nothing young in this slab means nothing to clear
-           either, so skip touching any of its cells at all. See slab_young_count's own comment, pool.h. */
-        if (young_only && p->slab_young_count[i] == 0) continue;
-        unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
-        for (unsigned int j = 0; j < count; j++) {
-            char* cell = p->slabs[i] + (size_t)j * p->stride;
-            unsigned char* state = (unsigned char*)cell;
-            /* An old cell's mark bit is never set OR read during a minor cycle in the first place
-               (the mark phase itself now skips descending into old objects at all, see
-               worklist_push's own comment, gc.c; pool_sweep's young_only path never consults an old
-               cell's mark bit either) -- so a minor clear_marks has nothing to do for old cells,
-               and large old pools (the common case for anything long-lived) stop costing anything
-               here at all. Only a major cycle's full trace can set an old cell's mark bit, so only
-               a major clear_marks needs to clear it. */
-            if (young_only && (*state & POOL_OLD)) continue;
-            *state &= (unsigned char)~POOL_MARKED;
         }
     }
 }

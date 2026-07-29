@@ -81,28 +81,24 @@ void* pool_alloc(Pool* p);
 
 void  pool_free(Pool* p, void* cell);
 
-/* Sets cell's mark bit; returns true if already set — the mark phase's guard against recursing into an already-visited cell. */
-bool  pool_mark(Pool* p, void* cell);
+/* All five below read/write only *cell's own state byte -- no Pool* needed, since gc_state lives in
+   the object itself, not a side table (see this file's own top comment). */
 
-bool  pool_is_young(Pool* p, void* cell);
+/* Sets cell's mark bit; returns true if already set — the mark phase's guard against recursing into an already-visited cell. */
+bool  pool_mark(void* cell);
+
+bool  pool_is_young(void* cell);
 
 /* True if cell is already on the free-list — a remembered-set entry can outlive its cell (entries are never removed, see vm.c), so retracing the set must check this before dereferencing. */
-bool  pool_is_freed(Pool* p, void* cell);
+bool  pool_is_freed(void* cell);
 
 /* True if cell's remembered-set bit is already set. */
-bool  pool_is_remembered(Pool* p, void* cell);
+bool  pool_is_remembered(void* cell);
 
 /* Sets cell's remembered-set bit. Never cleared — see the comment above. */
-void  pool_mark_remembered(Pool* p, void* cell);
+void  pool_mark_remembered(void* cell);
 
 /* Walks every carved-out cell; free-listed cells are always skipped, and if young_only, old cells too (a minor collection assumes old cells are live). Unmarked cells go to on_free then the free-list; marked cells are promoted with their mark bit cleared for next cycle. */
 void  pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell));
-
-/* Clears every cell's mark bit -- with young_only, skips old cells entirely (their mark bit is
-   never set OR read during a minor cycle in the new mark-phase design, see worklist_push's own
-   comment, gc.c, so a minor cycle has nothing to clear for them); without it (a major cycle),
-   clears everything, since a major trace can mark an old cell and its sweep needs to see a clean
-   slate. Must run before every mark phase either way. */
-void  pool_clear_marks(Pool* p, bool young_only);
 
 #endif

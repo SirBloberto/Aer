@@ -509,6 +509,45 @@ with it on). PGO (`-fprofile-generate`/`-fprofile-use`, see the README's Buildin
 a further 7–9% wall-clock win with zero source changes, compounding with LTO — not wired into the
 default build, to keep the makefile small.
 
+### 5.8 Deleting a GC phase that did nothing
+
+`pool_clear_marks` walked every live young cell in every pool at the top of every collection cycle,
+clearing `POOL_MARKED`. It was 19.5% of cycles in a `log_processing.aer` profile — and provably a
+no-op: `pool_sweep` already clears the mark bit on every surviving cell as it promotes it, and
+`pool_alloc` zeroes a cell's whole state byte the moment it hands one out (fresh or reused). Between
+those two, no live cell can enter a cycle already marked. Confirmed empirically before deleting it:
+instrumented the clearing loop to count bits it actually flipped, ran all 21 tests, 6 examples, and
+8 GC-heavy benchmarks (`binary_trees`, `log_processing`, `dict_bench`, `test_pool_churn`, ...) —
+**0 stale marks across all 35 programs**. Deleted outright rather than kept as a defensive no-op.
+
+While in the same code, also deleted a second, smaller inefficiency it was hiding: every `pool_*`
+predicate (`pool_mark`, `pool_is_young`, `pool_is_freed`, `pool_is_remembered`,
+`pool_mark_remembered`) took a `Pool*` it never used — the state byte lives in the cell itself, not
+a side table. Every caller still paid to compute that unused pool, though: `value_is_young` ran an
+8-case type switch and `remembered_pool_for` a 3-case one, on the hottest paths in the GC (all three
+write barriers, `worklist_push`). Both switches are gone; the predicates take just `void* cell` now.
+
+Found and fixed in the same pass: `gc_count_live_cells` listed 7 pools where `gc_collect` and
+`gc_finalize_all_pools` listed 8 — `result_pool` was silently excluded from the `--memory-size`
+ceiling check. All three call sites (plus `gc_collect`'s own sweep loop) now iterate one
+`pool_table[]` of `{VmHeap field offset, finalizer}` pairs instead of each hand-listing all 8, so a
+ninth pooled type can't again land in three places but not the fourth.
+
+Verified: full four-suite regression + ASAN clean on Windows and the Pi (both untouched by
+`pool_clear_marks`'s absence, as expected — it never did anything to break). Real wall-clock,
+3+ runs each on the Pi, same benchmarks as the per-slab free-list work above:
+
+| benchmark | before | after | |
+|---|---|---|---|
+| `log_processing.aer` | 3.27s | ~2.77s | ~15% faster |
+| `binary_trees.aer` | 1.79s | ~1.48s | ~17% faster |
+| `struct_array_scan.aer` | ~49.85s | ~40.7s | ~18% faster |
+| `nbody.aer` | ~3.1s (unchanged) | 3.06s | no change (not GC-bound) |
+
+`struct_array_scan.aer` is notable: it's a large, grow-only, low-churn pool (no `binary_trees`-style
+churn at all), and it still won ~18% — confirming the cost was purely the pointless clearing scan
+itself, not anything churn-related.
+
 ---
 
 ## 6. Known architectural limitations (current, unresolved)
@@ -790,10 +829,43 @@ default build, to keep the makefile small.
   *payload* allocations (`_int_malloc`/`_int_free`/`cfree` visibly in the profile). That's the
   separate, already-documented no-SSO limitation just above, not this fix's target — `log_processing`
   simply allocates strings at a far higher *rate* than `binary_trees` allocates structs, so it still
-  spends more absolute time in GC bookkeeping even with per-slab scanning now fully efficient. Worth
-  revisiting SSO now that its own blocking prerequisite is resolved, but not re-attempted in this
-  pass — a fresh measurement, not an assumption it would win this time, would still be warranted
-  given this project's history with that specific idea.
+  spends more absolute time in GC bookkeeping even with per-slab scanning now fully efficient.
+
+  **Take 2: tried again on top of the resolved prerequisite, real measurement, still not landed.**
+  Re-implemented the same way (inline `AerString.inline_buf`, `aer_make_string_copy` for
+  borrowed/stack sources, every hot call site in `vm.c`/`lexer.c`/`parser.c`/`aer_string.c`/
+  `aer_collection.c` converted), with the take-1 `chunk_add_pool` landmine (freeing an inline
+  string's own `inline_buf` address instead of skipping it) fixed proactively this time instead of
+  found via crash. Full four-suite regression + ASAN clean on both Windows and the Pi.
+
+  At the original 15-byte inline threshold, `log_processing.aer` got *worse*, not better: 3.27s →
+  3.79-3.86s. `perf record` showed why — `malloc`/`free` overhead did drop as designed (~14% → ~4%
+  of cycles), but `gc_collect`+`pool_clear_marks`+`pool_sweep` rose from ~59% to ~71%, a net loss.
+  Root cause this time isn't the churn-skip mechanism (that prerequisite really is fixed) but a new
+  one: `AerString` grew from 24 to 40 bytes (adding a 16-byte `inline_buf` on top of `gc_state`+
+  `data`+`length`), and scanning bigger cells costs more per GC cycle than the avoided allocations
+  save, on a workload that's dominated by allocation *rate* in the first place.
+
+  Tuned `AER_STRING_INLINE_MAX` down to stay inside the same struct-alignment bucket as the original
+  (no `inline_buf` at all): at 15 the struct rounds up to 40 bytes; at 11 or 7 it rounds to 32; only
+  at 3 or smaller does it stay at 24 — identical to the original, zero-growth size. Measured all
+  three: 15 → 3.79-3.86s (worse), 7/11 → 3.31-3.47s (still worse than 3.27s baseline), 3 → 3.09-3.12s
+  (a real ~5-6% win, the only setting where growth is actually zero). But at `MAX=3` — still only
+  inlining 3-character-or-shorter strings — `struct_array_scan.aer` (a benchmark with no meaningful
+  string activity in its hot loop) picked up a small, repeatable ~2% regression across three paired
+  runs each side (49.85s → 50.89s average), most likely an icache/code-layout tax from the `vm.c`
+  changes rather than anything string-pool-size-related. `binary_trees`/`dict_bench`/
+  `small_dict_bench`/`fib_bench` showed no measurable change either way.
+
+  **Deferred, not landed.** A ~5-6% win on the one benchmark this exists for, paid for with a ~2%
+  tax on an unrelated one plus the `aer_make_string`/`aer_make_string_copy` dual-API surface and the
+  `chunk_add_pool` landmine risk, is a mixed result, not a clean win — and this is the second time
+  this specific idea has come back marginal after a real prerequisite fix looked like it should have
+  unblocked it. The full take-2 diff (converted call sites, `MAX=3` tuning included) is preserved as
+  a git stash on the `fixed-width-opcodes` worktree, tagged
+  `sso-take2-deferred-mixed-result-2026-07-28`, rather than either landed or discarded, in case a
+  future pass finds the actual source of the `struct_array_scan` tax (which would remove the only
+  thing offsetting the win) or a smaller/different inlining shape that avoids it.
 - **DONE: array-reserve builtin — `collection.reserve(arr, n)`.** Mirrors `hashtable_reserve`'s
   existing dict contract: pre-sizes `items`/`capacity` once, `xrealloc` immediately to `n` rather
   than doubling on every overflow, a no-op if already big enough, never shrinks. Verified with a
