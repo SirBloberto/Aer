@@ -41,7 +41,7 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
     switch (aer_type(v)) {
         case TYPE_NULL:    strbuf_append(b, "null"); break;
         case TYPE_BOOLEAN: strbuf_append(b, aer_as_bool(v) ? "true" : "false"); break;
-        case TYPE_INTEGER: snprintf(tmp, sizeof(tmp), "%lld", (long long)aer_as_int(v));  strbuf_append(b, tmp); break;
+        case TYPE_INTEGER: aer_format_int((long long)aer_as_int(v), tmp, sizeof(tmp));  strbuf_append(b, tmp); break;
         case TYPE_REAL:    aer_format_real(aer_as_real(v), tmp, sizeof(tmp)); strbuf_append(b, tmp); break;
         case TYPE_STRING: {
             AerString* s = aer_as_string(v);

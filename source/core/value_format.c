@@ -14,6 +14,34 @@ void aer_format_real(double d, char* buf, size_t bufsize) {
     }
 }
 
+/* snprintf("%lld", ...) replacement -- integer-to-string is on the hot path for any script doing
+   string interpolation or print() with integers (every dict key format, every "{expr}" with an
+   int), and profiling a dict-heavy benchmark found __vfprintf_internal/_itoa/__vsnprintf_internal
+   at a combined ~14% of cycles, entirely from this one conversion. snprintf's generality (format
+   string parsing, locale handling) is pure overhead for "write these decimal digits" -- a plain
+   digit-extraction loop skips all of it. bufsize isn't checked: every caller passes a >=64-byte
+   buffer, and int64's longest possible rendering ("-9223372036854775808") is 20 bytes + NUL. */
+void aer_format_int(long long v, char* buf, size_t bufsize) {
+    (void)bufsize;
+    char tmp[20];
+    int pos = 0;
+    unsigned long long uv;
+    size_t len = 0;
+    if (v < 0) {
+        buf[len++] = '-';
+        uv = (unsigned long long)(-(v + 1)) + 1ULL;   /* avoids signed overflow negating LLONG_MIN */
+    } else {
+        uv = (unsigned long long)v;
+    }
+    if (uv == 0) {
+        buf[len++] = '0';
+    } else {
+        while (uv > 0) { tmp[pos++] = (char)('0' + (uv % 10)); uv /= 10; }
+        while (pos > 0) buf[len++] = tmp[--pos];
+    }
+    buf[len] = '\0';
+}
+
 /* ------------------------------------------------------------------ */
 /* Value formatting -- shared by print() and vm_to_str() (interpolation, +, etc.) for one consistent recursive rendering, not a terse "<array[3]>" fallback. */
 /* ------------------------------------------------------------------ */
@@ -22,7 +50,7 @@ void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
     char tmp[64];
     switch (aer_type(v)) {
         case TYPE_NULL:     strbuf_append(sb, "null"); break;
-        case TYPE_INTEGER:  snprintf(tmp, sizeof(tmp), "%lld", (long long)aer_as_int(v));  strbuf_append(sb, tmp); break;
+        case TYPE_INTEGER:  aer_format_int((long long)aer_as_int(v), tmp, sizeof(tmp));  strbuf_append(sb, tmp); break;
         case TYPE_REAL:     aer_format_real(aer_as_real(v), tmp, sizeof(tmp)); strbuf_append(sb, tmp); break;
         case TYPE_BOOLEAN:  strbuf_append(sb, aer_as_bool(v) ? "true" : "false"); break;
         case TYPE_FUNCTION: strbuf_append(sb, "<function>"); break;

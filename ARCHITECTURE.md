@@ -679,6 +679,39 @@ per-run cycle-counter noise band, including `log_processing.aer` and `test_actor
 `test_scheduler.aer` which actually exercise the now-noinline'd functions. Full four-suite regression
 passed on Windows, including the exact-source-line error assertions in `test-embed`.
 
+The other 9 single-call-site module-dispatch functions (`aer_math_call`, `aer_string_call`,
+`aer_collection_call`, ...) have the exact same shape and were tried the same way — but this is
+**not** a blanket win, and is deliberately *not* applied further. `aer_math_call` is a genuine
+hot-path callee for any numeric script (`math.sqrt` inside `nbody`'s own inner loop), so forcing it
+out of line regressed `nbody_large_packed_narrow.aer` by ~2-6% instead of improving it, and — more
+notably — partially reverting just that one function did not cleanly restore the prior measurement:
+LTO's whole-program inlining budget is a coupled, non-monotonic decision surface, not a per-function
+switch that composes the way `-O` flags do. The three functions actually committed above were chosen
+specifically because they're cold on *every* current benchmark (nothing here exercises `io`, `actor`,
+or `scheduler` in a loop) — extending this lever further requires checking, per function, whether
+anything actually calls it hot, not applying it uniformly to everything with the same local-array shape.
+
+### 5.13 Fast integer-to-string, replacing `snprintf("%lld", ...)`
+
+`vm_to_str` (string interpolation and `+`-with-a-string) and `vm_format_value` (`print()`, JSON
+encoding) both rendered every `TYPE_INTEGER` via `snprintf(buf, n, "%lld", ...)`. Profiling
+`dict_bench.aer` (200k inserts + 200k lookups, each doing `"key_{i}"`) with `perf report` found
+`__vfprintf_internal`, `_itoa`, `__vsnprintf_internal`, and `_IO_default_xsputn` — glibc's
+format-string parser and locale-aware digit conversion — at a combined **~14% of total cycles**, for
+what is, underneath all that generality, just "write these decimal digits."
+
+Replaced with `aer_format_int` (`value_format.c`): a direct digit-extraction loop, no format-string
+parsing, no locale lookup, `LLONG_MIN` handled via the standard "negate through unsigned" idiom to
+avoid signed overflow. Used at all three call sites (`value_format.c`, `vm.c`'s `vm_to_str`,
+`aer_json.c`'s encoder). Verified against `0`, `-1`, and both `INT64_MIN`/`INT64_MAX` before
+measuring anything.
+
+Measured on the Pi, 5 runs each side: `dict_bench.aer` — **~17% fewer instructions** (1299.9M →
+1078.5M), **~13% fewer cycles** (974.5M → 846.0M); `log_processing.aer` — ~6.5% fewer instructions,
+~6.2% fewer cycles. Every non-string-formatting benchmark (`nbody*`, `binary_trees`, `sieve`,
+`mandelbrot`, `fib_bench`, `struct_array_scan`) measured flat, as expected — this path is never on
+their hot loop. Full four-suite regression passed on both Windows and the Pi.
+
 ---
 
 ## 6. Known architectural limitations (current, unresolved)

@@ -778,7 +778,7 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
         char buf[64];
         switch (aer_type(v)) {
             case TYPE_NULL:     snprintf(buf, sizeof(buf), "null");                              break;
-            case TYPE_INTEGER:  snprintf(buf, sizeof(buf), "%lld", (long long)aer_as_int(v));               break;
+            case TYPE_INTEGER:  aer_format_int((long long)aer_as_int(v), buf, sizeof(buf));               break;
             case TYPE_REAL:     aer_format_real(aer_as_real(v), buf, sizeof(buf));                 break;
             case TYPE_BOOLEAN:  snprintf(buf, sizeof(buf), "%s",   aer_as_bool(v) ? "true" : "false"); break;
             case TYPE_FUNCTION: snprintf(buf, sizeof(buf), "<function>");                        break;
