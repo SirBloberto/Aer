@@ -3,17 +3,16 @@
 # each) and the repeat-literal builds it in one op instead of `limit+1` incremental appends.
 function sieve(limit):
     is_composite = [0i; limit + 1]
+    n = length(is_composite)
 
     count = 0
-    p = 2
-    for p <= limit:
+    for p in 2..n:
         if is_composite[p] == 0:
             count += 1
             multiple = p * p
             for multiple <= limit:
                 is_composite[multiple] = 1
                 multiple += p
-        p += 1
     return count
 
 LIMIT = 10000000

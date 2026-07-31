@@ -2963,8 +2963,13 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         bool start_safe = false;
         if (bound_safe) {
             if (rk_start & RK_CONST_FLAG) {
+                /* Any non-negative literal start is exactly as safe as the 0 case this originally
+                   only recognized -- the produced index sequence is still bounded below by this
+                   same non-negative constant, and bound_safe already proves the upper bound. Not
+                   just the common `for i in 0..n:` shape anymore -- covers `for p in 2..n:` (a
+                   sieve-of-Eratosthenes-shaped loop skipping the first couple of indices) too. */
                 AerVal startv = c->pool[rk_start & ~RK_CONST_FLAG];
-                start_safe = (aer_type(startv) == TYPE_INTEGER && aer_as_int(startv) == 0);
+                start_safe = (aer_type(startv) == TYPE_INTEGER && aer_as_int(startv) >= 0);
             } else if (!(rk_start & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) {
                 for (int si = 0; si < P.safe_loop_depth; si++) {
                     if (P.safe_loop_item_regs[si] == rk_start && P.safe_loop_array_regs[si] == bound_array_reg) { start_safe = true; break; }
@@ -3427,13 +3432,21 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
     chunk_emit(c, (uint32_t)call_id);
 
     /* One-shot side-channel pair to parse_assignment, consumed via exact register equality -- same
-       discipline as P.last_plain_index_dest_reg. Recognizes `length(P)` for ANY parameter P (not
-       just a struct/packed-array specialization's hint_param_reg -- a plain function taking a
-       typed array is just as eligible for the loop-bound-hoisting proof, it just has no shape to
-       specialize on at all). arg_materialize (parse_contiguous_exprs) copies a non-temp register
-       (a parameter always is one) via a fresh OP_MOVE rather than reusing it in place, so the
-       argument's ORIGINAL register only survives as that MOVE's own source operand, not as `base`
-       itself; decoded here since parse_contiguous_exprs has no other way to report it. */
+       discipline as P.last_plain_index_dest_reg. Recognizes `length(P)` for ANY plain-register P,
+       parameter or local (not just a struct/packed-array specialization's hint_param_reg -- a
+       plain function taking, or locally building, a typed array is just as eligible for the
+       loop-bound-hoisting proof, it just has no shape to specialize on at all). Not restricted to
+       P.current_param_count as this originally was: the packed-array-field-access sites still
+       separately gate on `arr_reg == P.hint_param_reg` (a specialized parameter's field offsets
+       are only valid for THAT parameter), so widening this shared, lower-level fact to cover
+       locals can't let a local reach the field-offset-trusting opcodes -- only the typed-array
+       bare-index family, which has no such requirement (see index_safe_unchecked's own comment).
+       Sieve-of-Eratosthenes' `is_composite` (bench/sieve.aer) is the motivating case: a typed
+       array built and indexed entirely within one function, never passed in as a parameter at
+       all. arg_materialize (parse_contiguous_exprs) copies a non-temp register (a parameter or an
+       already-declared local always is one) via a fresh OP_MOVE rather than reusing it in place,
+       so the argument's ORIGINAL register only survives as that MOVE's own source operand, not as
+       `base` itself; decoded here since parse_contiguous_exprs has no other way to report it. */
     P.last_length_call_result_reg = -1;
     P.last_length_call_arg_reg    = -1;
     if (call_id == CALL_BUILTIN_LENGTH && arg_count == 1) {
@@ -3442,7 +3455,7 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
             uint32_t w = c->code[arg_code_begin];
             if ((w & 0xFF) == OP_MOVE && (int)UNPACK_A(w) == base) arg_orig_reg = (int)UNPACK_B(w);
         }
-        if (arg_orig_reg >= 0 && arg_orig_reg < P.current_param_count) {
+        if (arg_orig_reg >= 0) {
             P.last_length_call_result_reg = dest;
             P.last_length_call_arg_reg    = arg_orig_reg;
         }

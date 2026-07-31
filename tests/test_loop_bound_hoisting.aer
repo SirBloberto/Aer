@@ -246,4 +246,52 @@ nps[3].x = 7
 assert(narrow_sum_and_bump(nps) == 3 + 4 + 6 + 8, "narrow (int32) field loop-bound-hoisted GET after a same-kind loop-bound-hoisted COMPOUND (+=)")
 assert(nps[0].y == 0.5 and nps[3].y == 0.5, "narrow (float32) field loop-bound-hoisted COMPOUND (+=), correct per-element result")
 
+# ------------------------------------------------------------------ #
+# 10. length() on a LOCALLY-BUILT array (not a parameter) -- the      #
+#     length()-tracking side-channel (parse_builtin_call, parser.c)   #
+#     used to only fire for length(SOME_PARAMETER); bench/sieve.aer's #
+#     is_composite is built and indexed entirely within one function, #
+#     never passed in, so this must work for a local too.             #
+# ------------------------------------------------------------------ #
+
+function sum_local_typed_array(n_elems):
+    local_xs = [0; n_elems]
+    i = 0
+    for i < n_elems:
+        local_xs[i] = i * 2
+        i += 1
+    n = length(local_xs)
+    total = 0
+    for j in 0..n:
+        total += local_xs[j]
+    return total
+
+assert(sum_local_typed_array(6) == 0 + 2 + 4 + 6 + 8 + 10, "length() tracked on a locally-built array (never a parameter), bound == length(local)")
+
+# ------------------------------------------------------------------ #
+# 11. A range-for start that's a non-zero, non-negative constant --   #
+#     start_safe (parse_for_in, parser.c) used to only accept exactly #
+#     0; bench/sieve.aer's `for p in 2..n:` (skipping indices 0/1)    #
+#     is the motivating shape. A NEGATIVE start must still fail       #
+#     closed (not tested inline -- would either read out of bounds if #
+#     wrongly trusted, or a real runtime bounds error aborts the      #
+#     whole script either way, same "documented, not run inline"      #
+#     convention as this file's other adversarial cases).             #
+# ------------------------------------------------------------------ #
+
+function sieve_shaped(limit):
+    is_composite = [0i; limit + 1]
+    n = length(is_composite)
+    count = 0
+    for p in 2..n:
+        if is_composite[p] == 0:
+            count += 1
+            multiple = p * p
+            for multiple <= limit:
+                is_composite[multiple] = 1
+                multiple += p
+    return count
+
+assert(sieve_shaped(30) == 10, "non-zero constant range-for start (2..n), matching bench/sieve.aer's exact shape -- primes below 30: 2,3,5,7,11,13,17,19,23,29")
+
 print("test_loop_bound_hoisting.aer: all assertions passed.")
