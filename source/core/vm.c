@@ -102,19 +102,25 @@ static inline AerVal vm_rk_value(VM* vm, Chunk* c, int rk) {
 /* RK16 (1 flag + 15 index bits) -- the wire form most RK operands use now (a whole halfword to
    itself, or paired with one other 16-bit field). Returns a pointer into the hoisted
    const_pool/registers, not a copy, so callers dereference once or forward it into an
-   always_inline consumer. */
-static inline AerVal* vm_rk_ptr16(VM* vm, AerVal* const_pool, uint32_t rk16) {
+   always_inline consumer. Takes registers directly (the hoisted local every one of this
+   function's ~50 call sites already has in scope, all inside vm_run_slice's own dispatch loop)
+   rather than a VM* to re-derive vm->registers from -- that re-fetch, through a pointer the
+   compiler can't prove nothing else in this giant computed-goto function could have written,
+   showed up as a real, measured cost (perf annotate, fib_bench): ~4.5% fewer instructions and
+   ~5.2% fewer cycles once passed the already-hoisted pointer directly instead. */
+static inline AerVal* vm_rk_ptr16(AerVal* registers, AerVal* const_pool, uint32_t rk16) {
     if (rk16 & RK16_CONST_FLAG) return &const_pool[rk16 & RK16_INDEX_MASK];
-    return &vm->registers[rk16 & RK16_INDEX_MASK];
+    return &registers[rk16 & RK16_INDEX_MASK];
 }
 
 /* RK8 (1 flag + 7 index bits) -- the narrow wire form used only where two RK operands must share
    one word alongside a dest register (the OP_ADD..OP_RSHIFT/OP_IN family, OP_INDEX_GET/SET,
    OP_UNARY, OP_CAST). A branch-free variant (per-frame pool window) was tried and reverted -- it
-   made calls slower; Lua/V8 accept this branch too and make calls free instead (register_stack). */
-static inline AerVal* vm_rk_ptr8(VM* vm, AerVal* const_pool, uint32_t rk8) {
+   made calls slower; Lua/V8 accept this branch too and make calls free instead (register_stack).
+   Takes registers directly -- see vm_rk_ptr16's own comment just above for why. */
+static inline AerVal* vm_rk_ptr8(AerVal* registers, AerVal* const_pool, uint32_t rk8) {
     if (rk8 & RK8_CONST_FLAG) return &const_pool[rk8 & RK8_INDEX_MASK];
-    return &vm->registers[rk8 & RK8_INDEX_MASK];
+    return &registers[rk8 & RK8_INDEX_MASK];
 }
 
 /* ------------------------------------------------------------------ */
@@ -1945,8 +1951,8 @@ lbl_is_result: {
 #define BINARY_OP_INT_REAL(NAME, OPENUM, INT_STMT, REAL_STMT) \
 lbl_##NAME: { \
     int dest = (int)UNPACK_A(op_word); \
-    AerVal* ra = vm_rk_ptr8(vm, const_pool, UNPACK_B(op_word)); \
-    AerVal* rb = vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word)); \
+    AerVal* ra = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word)); \
+    AerVal* rb = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word)); \
     ValueType ta = ra->tag, tb = rb->tag; \
     AerVal* result = &registers[dest]; \
     if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) { \
@@ -1965,8 +1971,8 @@ lbl_##NAME: { \
 #define BINARY_OP_INT_ONLY(NAME, OPENUM, INT_STMT) \
 lbl_##NAME: { \
     int dest = (int)UNPACK_A(op_word); \
-    AerVal* ra = vm_rk_ptr8(vm, const_pool, UNPACK_B(op_word)); \
-    AerVal* rb = vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word)); \
+    AerVal* ra = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word)); \
+    AerVal* rb = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word)); \
     ValueType ta = ra->tag, tb = rb->tag; \
     AerVal* result = &registers[dest]; \
     if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) { \
@@ -2008,8 +2014,8 @@ BINARY_OP_INT_ONLY(rshift, OP_RSHIFT, { *result = aer_int(l >> rv); })
 /* No int/int or real/real fast path -- dispatches straight to the shared vm_in(). */
 lbl_in: {
     int dest = (int)UNPACK_A(op_word);
-    AerVal a = *vm_rk_ptr8(vm, const_pool, UNPACK_B(op_word));
-    AerVal b = *vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
+    AerVal a = *vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
+    AerVal b = *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     registers[dest] = vm_in(a, b);
     DISPATCH();
 }
@@ -2463,7 +2469,7 @@ lbl_array_new: {
 lbl_index_get: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arr_reg  = (int)UNPACK_B(op_word);
-    AerVal* idx = vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     AerVal obj = registers[arr_reg];
     vm_index_get_compute(obj, *idx, &registers[dest_reg]);
     /* Only single-char string indexing allocates -- array/dict indexing never touches the heap, so
@@ -2485,8 +2491,8 @@ lbl_destructure: {
 /* Includes the internal write barrier, now exercised against a register-held reference. */
 lbl_index_set: {
     int arr_reg = (int)UNPACK_A(op_word);
-    AerVal idx = *vm_rk_ptr8(vm, const_pool, UNPACK_B(op_word));
-    AerVal val = *vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
+    AerVal idx = *vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
+    AerVal val = *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     vm_index_set_compute(vm, registers[arr_reg], idx, val);
     DISPATCH();
 }
@@ -2508,7 +2514,7 @@ lbl_index_set: {
 lbl_typed_index_get_unchecked: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arr_reg  = (int)UNPACK_B(op_word);
-    AerVal* idx = vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     AerVal obj = registers[arr_reg];
     if (aer_type(obj) != TYPE_TYPED_ARRAY) {
         vm_index_get_compute(obj, *idx, &registers[dest_reg]);
@@ -2524,8 +2530,8 @@ lbl_typed_index_get_unchecked: {
 
 lbl_typed_index_set_unchecked: {
     int arr_reg = (int)UNPACK_A(op_word);
-    AerVal* idx = vm_rk_ptr8(vm, const_pool, UNPACK_B(op_word));
-    AerVal* val = vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
+    AerVal* val = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     AerVal obj = registers[arr_reg];
     if (aer_type(obj) != TYPE_TYPED_ARRAY) {
         vm_index_set_compute(vm, obj, *idx, *val);
@@ -2546,8 +2552,8 @@ lbl_slice_get: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arr_reg  = (int)UNPACK_B(op_word);
     uint32_t bounds_word = READ();
-    AerVal start_v = *vm_rk_ptr16(vm, const_pool, UNPACK_2X16_HI(bounds_word));
-    AerVal end_v   = *vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(bounds_word));
+    AerVal start_v = *vm_rk_ptr16(registers, const_pool, UNPACK_2X16_HI(bounds_word));
+    AerVal end_v   = *vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(bounds_word));
     AerVal obj = registers[arr_reg];
     if (aer_type(obj) == TYPE_ARRAY) {
         AerArray* a = aer_as_array(obj);
@@ -2835,7 +2841,7 @@ lbl_binary_field: {
     Opcode bin_op  = (Opcode)UNPACK_C(op_word);
     uint32_t field_rk_word = READ();
     int field_idx  = (int)UNPACK_2X16_HI(field_rk_word);
-    AerVal* lhs = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* lhs = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     AerStruct* oa; int slot; unsigned int foffset; ValueType ftype; bool narrow;
     if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype, &narrow)) DISPATCH();
     AerVal rhs = vm_struct_field_read_at(oa, foffset, ftype, narrow);
@@ -2858,7 +2864,7 @@ lbl_field_binary: {
     Opcode bin_op  = (Opcode)UNPACK_C(op_word);
     uint32_t field_rk_word = READ();
     int field_idx  = (int)UNPACK_2X16_HI(field_rk_word);
-    AerVal* rhs = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* rhs = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     AerStruct* oa; int slot; unsigned int foffset; ValueType ftype; bool narrow;
     if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype, &narrow)) DISPATCH();
     AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype, narrow);
@@ -2881,7 +2887,7 @@ lbl_field_compound: {
     Opcode bin_op  = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     int field_idx  = (int)UNPACK_2X16_HI(field_rk_word);
-    AerVal* rhs = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* rhs = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     AerStruct* oa; int slot; unsigned int foffset; ValueType ftype; bool narrow;
     if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype, &narrow)) DISPATCH();
     AerVal lhs = vm_struct_field_read_at(oa, foffset, ftype, narrow);
@@ -2919,7 +2925,7 @@ lbl_print_repl: {
 lbl_field_set: {
     unsigned int site = ip - 1;
     int struct_reg = (int)UNPACK_A(op_word);
-    AerVal* val = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    AerVal* val = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     int field_idx  = (int)READ();
     AerStruct* oa; int slot; unsigned int foffset; ValueType declared; bool narrow;
     if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &declared, &narrow)) DISPATCH();
@@ -2957,7 +2963,7 @@ lbl_index_field_get_raw_int: {
     int arr_reg   = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
     memcpy(&raw_ints[dest_slot], elem, 8);
@@ -2969,7 +2975,7 @@ lbl_index_field_get_raw_real: {
     int arr_reg   = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
     memcpy(&raw_reals[dest_slot], elem, 8);
@@ -3006,7 +3012,7 @@ lbl_index_field_get_raw_int32: {
     int arr_reg   = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
     raw_ints[dest_slot] = vm_raw_read_int32(elem);
@@ -3018,7 +3024,7 @@ lbl_index_field_get_raw_float32: {
     int arr_reg   = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
     raw_reals[dest_slot] = vm_raw_read_float32(elem);
@@ -3049,7 +3055,7 @@ lbl_field_get_raw_float32: {
 
 lbl_index_field_set_raw_int: {
     int obj_reg = (int)UNPACK_A(op_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
@@ -3061,7 +3067,7 @@ lbl_index_field_set_raw_int: {
 
 lbl_index_field_set_raw_real: {
     int obj_reg = (int)UNPACK_A(op_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
@@ -3098,7 +3104,7 @@ lbl_field_set_raw_real: {
    int32 side -- see the narrow RAW opcode family's own comment (vm.h) for why. */
 lbl_index_field_set_raw_int32: {
     int obj_reg = (int)UNPACK_A(op_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
@@ -3110,7 +3116,7 @@ lbl_index_field_set_raw_int32: {
 
 lbl_index_field_set_raw_float32: {
     int obj_reg = (int)UNPACK_A(op_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
@@ -3198,7 +3204,7 @@ lbl_index_field_compound_raw_int: {
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
@@ -3220,7 +3226,7 @@ lbl_index_field_compound_raw_real: {
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
@@ -3251,7 +3257,7 @@ lbl_index_field_get_raw_int_unchecked: {
     int arr_reg   = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
     memcpy(&raw_ints[dest_slot], elem, 8);
@@ -3263,7 +3269,7 @@ lbl_index_field_get_raw_real_unchecked: {
     int arr_reg   = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
     memcpy(&raw_reals[dest_slot], elem, 8);
@@ -3272,7 +3278,7 @@ lbl_index_field_get_raw_real_unchecked: {
 
 lbl_index_field_set_raw_int_unchecked: {
     int obj_reg = (int)UNPACK_A(op_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
@@ -3284,7 +3290,7 @@ lbl_index_field_set_raw_int_unchecked: {
 
 lbl_index_field_set_raw_real_unchecked: {
     int obj_reg = (int)UNPACK_A(op_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
@@ -3299,7 +3305,7 @@ lbl_index_field_compound_raw_int_unchecked: {
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
@@ -3321,7 +3327,7 @@ lbl_index_field_compound_raw_real_unchecked: {
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
@@ -3389,7 +3395,7 @@ lbl_index_field_compound_raw_int32: {
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
@@ -3411,7 +3417,7 @@ lbl_index_field_compound_raw_float32: {
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
@@ -3438,7 +3444,7 @@ lbl_index_field_get_raw_int32_unchecked: {
     int arr_reg   = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
     raw_ints[dest_slot] = vm_raw_read_int32(elem);
@@ -3450,7 +3456,7 @@ lbl_index_field_get_raw_float32_unchecked: {
     int arr_reg   = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
     raw_reals[dest_slot] = vm_raw_read_float32(elem);
@@ -3459,7 +3465,7 @@ lbl_index_field_get_raw_float32_unchecked: {
 
 lbl_index_field_set_raw_int32_unchecked: {
     int obj_reg = (int)UNPACK_A(op_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
@@ -3471,7 +3477,7 @@ lbl_index_field_set_raw_int32_unchecked: {
 
 lbl_index_field_set_raw_float32_unchecked: {
     int obj_reg = (int)UNPACK_A(op_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
@@ -3486,7 +3492,7 @@ lbl_index_field_compound_raw_int32_unchecked: {
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
@@ -3508,7 +3514,7 @@ lbl_index_field_compound_raw_float32_unchecked: {
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
@@ -3552,7 +3558,7 @@ lbl_array_repeat: {
     int fill_reg    = (int)UNPACK_B(op_word);
     int narrow_flag = (int)UNPACK_C(op_word);
     uint32_t count_word = READ();
-    AerVal* count_v = vm_rk_ptr16(vm, const_pool, (uint16_t)count_word);
+    AerVal* count_v = vm_rk_ptr16(registers, const_pool, (uint16_t)count_word);
     if (aer_type(*count_v) != TYPE_INTEGER) { error("Repeat-literal array count must be an integer"); DISPATCH(); }
     int64_t count = aer_as_int(*count_v);
     if (count < 0) { error("Repeat-literal array count must not be negative"); DISPATCH(); }
@@ -3627,7 +3633,7 @@ lbl_index_field_get: {
     int obj_reg   = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     int field_idx = (int)UNPACK_2X16_HI(field_rk_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     AerVal obj = registers[obj_reg];
     if (aer_type(obj) == TYPE_PACKED_ARRAY) {
         AerPackedArray* pa = aer_as_packed_array(obj);
@@ -3664,10 +3670,10 @@ lbl_index_field_get: {
 lbl_index_field_set: {
     unsigned int site   = ip - 1;
     int obj_reg         = (int)UNPACK_A(op_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t field_val_word = READ();
     int field_idx       = (int)UNPACK_2X16_HI(field_val_word);
-    AerVal* val = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_val_word));
+    AerVal* val = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_val_word));
     AerVal obj = registers[obj_reg];
     if (aer_type(obj) == TYPE_PACKED_ARRAY) {
         AerPackedArray* pa = aer_as_packed_array(obj);
@@ -3725,9 +3731,9 @@ lbl_index_field_compound: {
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_idx_word = READ();
     int field_idx = (int)UNPACK_2X16_HI(field_idx_word);
-    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_idx_word));
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_idx_word));
     uint32_t rhs_word = READ();
-    AerVal* rhs = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(rhs_word));
+    AerVal* rhs = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(rhs_word));
     AerVal obj = registers[obj_reg];
     if (aer_type(obj) == TYPE_PACKED_ARRAY) {
         AerPackedArray* pa = aer_as_packed_array(obj);
@@ -3788,7 +3794,7 @@ lbl_index_field_compound: {
 lbl_unary: {
     int dest        = (int)UNPACK_A(op_word);
     Opcode unary_op = (Opcode)UNPACK_B(op_word);
-    AerVal v = *vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
+    AerVal v = *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     AerVal* result = &registers[dest];
     switch (unary_op) {
         case OP_NEGATE:
@@ -3821,7 +3827,7 @@ lbl_unary: {
 lbl_cast: {
     int dest      = (int)UNPACK_A(op_word);
     int cast_type = (int)UNPACK_B(op_word);
-    AerVal v = *vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
+    AerVal v = *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     registers[dest] = vm_cast(v, cast_type);
     DISPATCH();
 }
