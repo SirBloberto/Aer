@@ -4286,6 +4286,30 @@ ParserState* parser_save_state(void) {
     ParserState* s = xmalloc(sizeof(ParserState));
     s->p = P;
     P = (Parser){0};   /* zeroes everything reg_reset() would, plus every other field -- see this function's own comment above */
+    /* struct_names/struct_count/struct_cap are the one exception to "unconditionally reset before
+       its own next real read": every OTHER field this wholesale zero touches is per-FUNCTION state
+       parse_function_body re-establishes at its own entry, but struct definitions are a global,
+       program-wide fact, fixed once at top-level parse time and never re-derived by a nested
+       recompile. A specialized function body can construct ANY previously-defined struct, not just
+       its own hint_shape's -- is_struct_name(name_idx) (parser.c) with an empty table can't tell
+       `SomeStruct(...)` from a call to an undefined function of that name, silently falling through
+       to is_forward_ref's fallback (func_offset/func_index left at 0) instead of OP_STRUCT_NEW. That
+       compiles a real call to WHATEVER function occupies index 0 -- a genuine, reachable
+       memory-safety-adjacent bug. Found while investigating a since-reverted specialization variant
+       (a plain-numeric-parameter recursive function building a Node/Wrap-style tree structure
+       overflowed the call stack), but the underlying gap is in this shared recompile machinery
+       itself, reachable by any shape-specialized function whose body ALSO constructs an unrelated
+       struct type (see test_shape_specialization.aer's own regression test). Carried over by value
+       (not re-pointing into the outer P's own array) since the nested compile's OWN struct_register
+       calls (a fresh top-level struct definition inside a nested module-import compile, the other
+       parser_save_state caller) must append to its own, separate table without corrupting the
+       outer compile's. */
+    if (s->p.struct_cap > 0) {
+        P.struct_names = xmalloc(sizeof(unsigned int) * (size_t)s->p.struct_cap);
+        memcpy(P.struct_names, s->p.struct_names, sizeof(unsigned int) * (size_t)s->p.struct_count);
+        P.struct_cap = s->p.struct_cap;
+    }
+    P.struct_count = s->p.struct_count;
     return s;
 }
 

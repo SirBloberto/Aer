@@ -247,4 +247,39 @@ pair = alias_after_param_reassign([BigRec(0.0, 0.0, 111.0)], [SmallRec(0.0, 222.
 assert(pair[0] == 111.0, "the alias created BEFORE the parameter reassignment reads BigRec's own val correctly")
 assert(pair[1] == 222.0, "the alias created AFTER reassigning the array parameter to a differently-shaped array reads SmallRec's own val (offset 8) correctly -- a stale BigRec element-shape hint would have read offset 16 instead, wrong entirely")
 
+# ------------------------------------------------------------------ #
+# A shape-specialized function body that ALSO constructs an UNRELATED #
+# struct type -- parser_save_state() (parser.c) used to zero          #
+# P.struct_names/struct_count wholesale before a nested specialization#
+# recompile. Struct definitions are a global, program-wide fact fixed #
+# at top-level parse time, not per-function state to re-derive, but   #
+# the recompile's own is_struct_name lookup saw an EMPTY table         #
+# regardless. A struct-constructing statement inside a recompiled     #
+# body then silently misread as a call to an undefined function of    #
+# that name, falling through to func_offset/func_index left at their  #
+# 0 fallback -- a real call to WHATEVER function occupies index 0,    #
+# not OP_STRUCT_NEW at all. Found while investigating a since-reverted #
+# no-shape specialization path, but the underlying bug lives in the   #
+# recompile machinery every shape-specialized function ALREADY uses --#
+# reproduced here via a function that recurses over a packed-array     #
+# parameter's own field (triggering the ordinary shape-sensitive       #
+# recompile) while separately building a tree of a DIFFERENT struct   #
+# type.                                                                #
+# ------------------------------------------------------------------ #
+
+struct TreeNode:
+    left = null
+    tag  = 0.0
+
+function build_chain_from_bodies(bodies_param, depth, tag_base):
+    if depth == 0:
+        return TreeNode(null, tag_base + bodies_param[0].x)
+    d = depth - 1
+    return TreeNode(build_chain_from_bodies(bodies_param, d, tag_base + 1), tag_base + bodies_param[0].x)
+
+chain = build_chain_from_bodies(bodies, 20, 0)
+assert(chain.tag == bodies[0].x, "build_chain_from_bodies: outermost node's own tag, proving OP_STRUCT_NEW (not a misresolved call) built it, inside a shape-specialized body that also reads bodies[0].x")
+assert(chain.left.tag == 1 + bodies[0].x, "build_chain_from_bodies: one level of TreeNode construction inside a shape-specialized recursive body")
+assert(chain.left.left.tag == 2 + bodies[0].x, "build_chain_from_bodies: two levels deep -- proves this isn't coincidentally correct only at the top")
+
 print("test_shape_specialization.aer: all assertions passed.")
