@@ -1,0 +1,219 @@
+#!/usr/bin/env aer
+# AER test suite — loop-bound-hoisting for packed-array raw field access (OP_INDEX_FIELD_GET/SET/
+# COMPOUND_RAW_INT/REAL_UNCHECKED, vm.c; index_safe_unchecked/parse_for_in, parser.c). When a
+# `for i in 0..n:`-shaped loop's bound `n` is proven, at compile time, to be exactly length() of
+# the same packed-array parameter a specialization already trusts, every `arr[i].field` access in
+# that loop (including a nested `for j in (i+1)..n:`, the exact nbody.aer pairwise-loop shape)
+# skips the per-element index-type/bounds/negative-index checks entirely — this is a pure internal
+# optimization: every result here must match exactly what the always-checked path would have
+# produced. Machine-checked via assert(): a clean run exits 0; any failure prints
+# "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
+
+struct Point:
+    x = 0.0
+    y = 0.0
+
+# ------------------------------------------------------------------ #
+# 1. The base safe pattern: bound = length(param), start = 0.         #
+# ------------------------------------------------------------------ #
+
+function sum_x(points, n):
+    total = 0.0
+    for i in 0..n:
+        total += points[i].x
+    return total
+
+function advance(points, dt):
+    n = length(points)
+    for i in 0..n:
+        points[i].x += points[i].y * dt
+
+pts = [Point(1.0, 2.0); 4]
+pts[1].x = 5.0
+pts[3].x = 9.0
+assert(sum_x(pts, 4) == 1.0 + 5.0 + 1.0 + 9.0, "base safe pattern: bound is a plain parameter, not length()-derived here -- exercises the ordinary checked path unaffected by this feature")
+
+advance(pts, 0.5)
+advance(pts, 0.5)
+advance(pts, 0.5)
+assert(pts[0].x == 1.0 + 3.0 * (2.0 * 0.5), "advance()'s own n = length(points) pattern, repeated across specialized calls")
+assert(pts[2].x == pts[0].x, "every element started identical under this field and advance() loops over all of them")
+
+# ------------------------------------------------------------------ #
+# 2. Nested pairwise loop: `for j in (i+1)..n:` -- nbody.aer's exact   #
+#    inner-loop shape, the dominant case this feature targets.        #
+# ------------------------------------------------------------------ #
+
+function pairwise_sum(points):
+    n = length(points)
+    total = 0.0
+    for i in 0..n:
+        for j in (i+1)..n:
+            total += points[i].x * points[j].x
+    return total
+
+ps = [Point(2.0, 0.0); 4]
+ps[0].x = 2.0
+ps[1].x = 3.0
+ps[2].x = 5.0
+ps[3].x = 7.0
+# Expected: sum over all i<j of ps[i].x * ps[j].x = 2*3 + 2*5 + 2*7 + 3*5 + 3*7 + 5*7
+assert(pairwise_sum(ps) == 2.0*3.0 + 2.0*5.0 + 2.0*7.0 + 3.0*5.0 + 3.0*7.0 + 5.0*7.0, "nested (i+1)..n pairwise loop over a packed array, matching nbody.aer's advance()/energy() shape exactly")
+
+# ------------------------------------------------------------------ #
+# 3. Invalidation: a bound derived from length() but then reassigned  #
+#    to something NOT re-verified against the array must fall back to#
+#    the ordinary checked path, not silently keep trusting the old    #
+#    proof. Using a SMALLER bound here (safe either way) so this stays#
+#    a normal exit-0 assertion -- see ARCHITECTURE.md/memory for the  #
+#    separate manual check confirming a genuinely too-large bound     #
+#    still raises a clean bounds error instead of corrupting memory   #
+#    (can't be exercised inline: a real runtime error aborts the whole#
+#    script, same convention as every other error-path example in     #
+#    this suite, e.g. test_narrow_fields.aer). */
+# ------------------------------------------------------------------ #
+
+function partial_sum(points):
+    n = length(points)
+    n = n - 1
+    total = 0.0
+    for i in 0..n:
+        total += points[i].x
+    return total
+
+assert(partial_sum(ps) == 2.0 + 3.0 + 5.0, "reassigning the length()-derived bound (n = n - 1) must invalidate the proof -- correct (partial) result either way, but this exercises the invalidation path rather than a stale one")
+
+# ------------------------------------------------------------------ #
+# 4. A fresh RE-derivation of the same bound (length() called again)  #
+#    must re-establish the proof, not stay invalidated forever.       #
+# ------------------------------------------------------------------ #
+
+function resum(points):
+    n = length(points)
+    n = length(points)
+    total = 0.0
+    for i in 0..n:
+        total += points[i].x
+    return total
+
+assert(resum(ps) == 2.0 + 3.0 + 5.0 + 7.0, "a fresh length(points) call re-establishes the proof after an intervening (unrelated-looking) reassignment")
+
+# ------------------------------------------------------------------ #
+# 5. Reassigning the LOOP INDEX itself (not the bound) mid-body must  #
+#    also invalidate -- a real out-of-bounds read/write was reachable #
+#    here before invalidate_safe_loop_reg (parser.c) existed, since   #
+#    safe_loop_item_regs only tracked the register NUMBER, not        #
+#    whether it still held what the loop's own PREP/LOOP put there.   #
+#    Reassigning to a DIFFERENT but still in-bounds index here (not   #
+#    an out-of-range one) keeps this a normal exit-0 assertion --     #
+#    see ARCHITECTURE.md/memory for the separate manual check         #
+#    confirming a genuinely out-of-range reassignment (`i = 999999`)  #
+#    still raises a clean bounds error instead of corrupting memory,  #
+#    same "documented, not run inline" convention as section 3 above. #
+# ------------------------------------------------------------------ #
+
+struct Tagged:
+    x = 0.0
+    y = 0.0
+
+function reassign_index_sum(points):
+    n = length(points)
+    total = 0.0
+    for i in 0..n:
+        total += points[i].x
+        i = 0
+        total += points[i].y
+    return total
+
+tg = [Tagged(0.0, 100.0); 4]
+tg[0].x = 2.0
+tg[0].y = 100.0
+tg[1].x = 3.0
+tg[2].x = 5.0
+tg[3].x = 7.0
+# Each iteration adds points[i].x (2,3,5,7 across i=0..3) then reassigns i=0 and adds points[0].y
+# (100.0, four times) -- expected = (2+3+5+7) + 4*100.0. Wrong if a stale index register let the
+# SECOND read skip straight to an unchecked opcode using whatever i held before reassignment.
+assert(reassign_index_sum(tg) == (2.0 + 3.0 + 5.0 + 7.0) + 4.0 * 100.0, "reassigning the loop index itself mid-body (to a still in-bounds value) must invalidate safe_loop_item_regs for that register, not just leave the register NUMBER trusted regardless of what it now holds")
+
+# ------------------------------------------------------------------ #
+# 6. Typed arrays (int/float element arrays, no struct/.field involved#
+#    at all -- OP_TYPED_INDEX_GET/SET_UNCHECKED, vm.c) get the SAME   #
+#    loop-bound-hoisting proof as packed-array struct fields, reusing #
+#    the identical index-safety mechanism with no per-shape           #
+#    specialization step (elem_kind is read at runtime from the array #
+#    object itself, not baked into the opcode at compile time).       #
+# ------------------------------------------------------------------ #
+
+function typed_sum(nums):
+    n = length(nums)
+    total = 0
+    for i in 0..n:
+        total += nums[i]
+    return total
+
+function typed_double(nums):
+    n = length(nums)
+    for i in 0..n:
+        nums[i] = nums[i] * 2
+
+xs = [1, 2, 3, 4, 5]
+assert(typed_sum(xs) == 15, "typed-array (integer[]) loop-bound-hoisted GET, plain (non-struct) elements")
+typed_double(xs)
+assert(typed_sum(xs) == 30, "typed-array loop-bound-hoisted SET, same proof reused for the write side")
+
+fs = [1.5, 2.5, 3.5]
+function typed_fsum(nums):
+    n = length(nums)
+    total = 0.0
+    for i in 0..n:
+        total += nums[i]
+    return total
+assert(typed_fsum(fs) == 1.5 + 2.5 + 3.5, "typed-array (float[]) loop-bound-hoisted GET")
+
+# ------------------------------------------------------------------ #
+# 7. Two DIFFERENT array parameters in the same function -- a bound   #
+#    proven safe for ONE must never be trusted for the OTHER just     #
+#    because they happen to reuse the same loop index register. Both #
+#    arrays are the SAME length here so this stays a normal exit-0    #
+#    assertion regardless of which array the proof actually applies   #
+#    to; see ARCHITECTURE.md/memory for the separate manual check     #
+#    using a SHORTER second array, confirming the mismatched one      #
+#    still raises a clean bounds error rather than being silently     #
+#    (and wrongly) trusted, same "documented, not run inline"         #
+#    convention as sections 3 and 5 above.                            #
+# ------------------------------------------------------------------ #
+
+function cross_sum(a, b):
+    n = length(a)
+    total = 0
+    for i in 0..n:
+        total += a[i] + b[i]
+    return total
+
+assert(cross_sum([1, 2, 3], [10, 20, 30]) == (1+10) + (2+20) + (3+30), "two distinct array parameters, both proven safe against their OWN bound -- exercises safe_loop_array_regs distinguishing them by register, not just accepting any array once one is proven")
+
+# ------------------------------------------------------------------ #
+# 8. Loop-variable NAME reuse across sibling loops -- a range-for's   #
+#    own var_slot has no block scoping, so `for n in ...:` after      #
+#    `n = length(bodies)` reuses n's register for the loop's own      #
+#    counter, whatever length_tracked_valid still claims about it.    #
+#    Chosen bound (3) stays within xs's real length (5) either way,   #
+#    so this is a normal exit-0 correctness check, not a proof the    #
+#    dangerous case is caught -- see ARCHITECTURE.md/memory for the   #
+#    separate manual check using a leftover value LARGER than the     #
+#    array, same "documented, not run inline" convention as above.    #
+# ------------------------------------------------------------------ #
+
+function reused_name_sum(nums):
+    n = length(nums)
+    for n in 0..3:
+        seen = n
+    total = 0
+    for i in 0..n:
+        total += nums[i]
+    return total
+
+assert(reused_name_sum(xs) == xs[0] + xs[1], "a sibling loop reusing the length()-tracked variable's own NAME must invalidate length_tracked_valid, not just its register -- n is left at 2 (the last value the reused-name loop assigned) here, so this only sums indices 0..1")
+
+print("test_loop_bound_hoisting.aer: all assertions passed.")

@@ -1,0 +1,30 @@
+#!/usr/bin/env aer
+import time
+
+# Typed-array loop-bound-hoisting target: a tight `for i in 0..n:` loop over a large float64[]
+# doing a read-modify-write on every element, the same shape OP_TYPED_INDEX_GET/SET_UNCHECKED
+# (vm.c) exists for -- `n = length(xs)` proven once, every xs[i] read/write in the loop skips the
+# per-element container-dispatch chain and bounds check entirely.
+
+N = 200000
+xs = [0.0; N]
+
+k = 0
+for k < N:
+    xs[k] = k * 0.5
+    k += 1
+
+function scale_and_accumulate(nums, factor):
+    n = length(nums)
+    total = 0.0
+    for i in 0..n:
+        nums[i] = nums[i] * factor
+        total += nums[i]
+    return total
+
+start = time.now()
+total = 0.0
+for pass in 0..200:
+    total = scale_and_accumulate(xs, 1.0000001)
+dur = time.now() - start
+print("Took: {dur}s")

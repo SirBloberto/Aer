@@ -61,6 +61,7 @@ TESTS := tests/test_core.aer \
          tests/test_typed_arrays.aer \
          tests/test_narrow_fields.aer \
          tests/test_shape_specialization.aer \
+         tests/test_loop_bound_hoisting.aer \
          tests/test_net.aer \
          tests/test_regex.aer \
          tests/test_actor.aer \

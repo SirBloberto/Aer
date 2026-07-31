@@ -95,6 +95,52 @@ typedef struct Parser {
     /* Nonzero while compiling a function body -- lets parse_return reject a top-level return. */
     int function_depth;
 
+    /* Loop-bound-hoisting safety tracking (index_safe_unchecked, parse_for_in) -- lets a
+       `for i in 0..n:`-shaped loop skip an array's index-side runtime checks entirely
+       (OP_INDEX_FIELD_*_RAW_INT/REAL_UNCHECKED and OP_TYPED_INDEX_GET/SET_UNCHECKED, vm.c) when n
+       is proven == length() of the SAME array the loop indexes. Deliberately NOT keyed to a single
+       "the interesting parameter" (that was this mechanism's original, packed-array-only shape,
+       tied to hint_param_reg below) -- a function can have more than one array-like parameter, and
+       proving a bound safe for ONE of them must never let a DIFFERENT array silently borrow that
+       proof. Every fact here is instead tracked per-array-register explicitly, and re-checked at
+       the point of use, not assumed.
+
+       hint_param_reg: mirrors parse_function_body's own parameter of the same name (only
+       meaningful during a packed-array, non-element-shape specialization recompile); -1 otherwise.
+       Still consulted by index_safe_unchecked's packed-array callers as an ADDITIONAL requirement
+       (the field-offset resolution those opcodes need is only valid for this one specialized
+       parameter) -- but no longer the thing that makes an index "safe" by itself; see
+       safe_loop_array_regs below for what actually does.
+
+       length_tracked_name/valid/source_reg: track which single local variable, if any, currently
+       holds a proven-fresh length(P) result, and which parameter register P was (name-keyed for
+       the variable itself, so this stays correct across raw/boxed storage-kind shadowing;
+       register-keyed for P, since that's what must be compared against the array actually being
+       indexed). last_length_call_result_reg/last_length_call_arg_reg are a one-shot side-channel
+       pair from parse_builtin_call to parse_assignment, consumed via exact register equality --
+       same discipline as last_plain_index_dest_reg above, so a further operation applied to a
+       length() result (which always allocates a new register) naturally fails the equality check
+       rather than needing to be cleared at every possible site.
+
+       safe_loop_item_regs/safe_loop_array_regs: a small stack of currently-active proven-safe
+       (index register, array register) PAIRS, pushed/popped together by parse_for_in exactly
+       around the one loop body each pair was proven safe for -- never a whole-frame table, so
+       there is no register-reuse staleness window on its own. But because array registers (not
+       just index registers) can ALSO be reassigned out from under a still-live entry (the
+       parameter itself pointing somewhere else, or the length()-tracked variable's own name being
+       reused by an unrelated for-loop), invalidate_register (below) must poison a stack entry on
+       EITHER half changing, not just the index half -- this is exactly the class of gap that
+       first shipped without the index half covered either, before being found and fixed. */
+    int          hint_param_reg;
+    unsigned int length_tracked_name;
+    bool         length_tracked_valid;
+    int          length_tracked_source_reg;
+    int          last_length_call_result_reg;
+    int          last_length_call_arg_reg;
+    int          safe_loop_item_regs[LOOP_MAX];
+    int          safe_loop_array_regs[LOOP_MAX];
+    int          safe_loop_depth;
+
     /* Top-level variable names, kept solely to detect a function body referencing one -- see
        var_names's own original comment (git blame) for the shadow-ban mechanism. */
     unsigned int global_names[FRAME_REGISTERS];
@@ -450,6 +496,56 @@ static void mark_shape_sensitive(int reg) {
     if (reg < P.current_param_count) { P.shape_sensitive_param[reg] = true; return; }
     int src = P.alias_source_param[reg];
     if (src >= 0) P.shape_sensitive_param[src] = true;
+}
+
+/* True iff idx_rk is a proven-safe, no-runtime-check index into the array currently held by
+   arr_reg -- i.e. (arr_reg, idx_rk) matches a PAIR on the safe_loop_item_regs/safe_loop_array_regs
+   stack, exactly as parse_for_in proved for its WHOLE body. Checking BOTH halves (not just the
+   index) is load-bearing, not defensive extra caution: a function can have more than one
+   array-like parameter, and a bound proven safe for array A must never be trusted for a *different*
+   array register B just because B happens to reuse the same index register number some other
+   call site verified was in range for A. idx_rk must also be a plain register (never a constant or
+   an already-raw value) -- this proof only ever applies to a range-for's own item register.
+
+   Packed-array field-access callers (OP_INDEX_FIELD_*_RAW_INT/REAL_UNCHECKED) have one ADDITIONAL
+   requirement beyond this function: arr_reg must also equal P.hint_param_reg, checked by the
+   caller before this is even consulted (that's what the surrounding reg_known_shape guard is for --
+   the field OFFSET those opcodes trust is only valid for that one specialized parameter). Typed-
+   array callers (OP_TYPED_INDEX_GET/SET_UNCHECKED) have no such requirement -- there is no offset
+   to resolve, just a plain element read/write, so any array register this function proves safe for
+   is sufficient on its own. */
+static bool index_safe_unchecked(int arr_reg, int idx_rk) {
+    if (idx_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
+    for (int i = 0; i < P.safe_loop_depth; i++) {
+        if (P.safe_loop_item_regs[i] == idx_rk && P.safe_loop_array_regs[i] == arr_reg) return true;
+    }
+    return false;
+}
+
+/* Must be called at every site that changes what register `reg` holds (plain '=', compound OP=,
+   destructuring, and -- for the name-shadowing edge case -- a for-loop reacquiring an
+   already-declared loop-variable name via var_slot). Poisons (never resurrects) any
+   safe_loop_item_regs/safe_loop_array_regs stack entry keyed on `reg` on EITHER side of the pair --
+   as the index (ordinary code reassigning a loop variable mid-body) or as the array (the
+   parameter itself being reassigned to point somewhere else, count and all, out from under a
+   still-live proof). Without covering both sides, index_safe_unchecked would keep trusting a
+   register NUMBER regardless of what it currently holds -- a real out-of-bounds read/write via
+   OP_INDEX_FIELD_*_RAW_*_UNCHECKED/OP_TYPED_INDEX_*_UNCHECKED, none of which have any runtime
+   check of their own to fall back on. Also invalidates length_tracked_valid if `reg` is the
+   parameter length_tracked_source_reg currently depends on -- the tracked "n == length(P)" fact is
+   only meaningful as long as P itself hasn't been reassigned, and nothing else re-derives that.
+   Overwrites (not removes) any matching stack slot with -1 -- the same "no known ___" sentinel
+   convention alias_source_param already uses -- so parse_for_in's push/pop depth-counting is
+   untouched: a dead slot simply never matches again until the loop that owns it naturally pops it,
+   and a fresh push always lands at an index beyond anything an enclosing scope could have
+   touched, so a dead slot can never be resurrected. */
+static void invalidate_register(int reg) {
+    if (reg < 0) return;
+    if (P.length_tracked_valid && reg == P.length_tracked_source_reg) P.length_tracked_valid = false;
+    for (int i = 0; i < P.safe_loop_depth; i++) {
+        if (P.safe_loop_item_regs[i] == reg)  P.safe_loop_item_regs[i]  = -1;
+        if (P.safe_loop_array_regs[i] == reg) P.safe_loop_array_regs[i] = -1;
+    }
 }
 
 /* Compile-time field lookup against a KNOWN Shape (only ever reached via P.reg_known_shape[], so
@@ -1479,8 +1575,15 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                         bool is_int = (ftype == TYPE_INTEGER);
                         int slot = is_int ? raw_int_alloc() : raw_real_alloc();
                         if (slot >= 0) {
-                            Opcode op = narrow ? (is_int ? OP_INDEX_FIELD_GET_RAW_INT32 : OP_INDEX_FIELD_GET_RAW_FLOAT32)
-                                               : (is_int ? OP_INDEX_FIELD_GET_RAW_INT   : OP_INDEX_FIELD_GET_RAW_REAL);
+                            /* arr_reg == P.hint_param_reg checked explicitly here (not inside
+                               index_safe_unchecked, which typed-array callers also use with no such
+                               requirement) -- the field OFFSET this opcode trusts is only valid for
+                               this one specialized parameter, never any other array a loop might
+                               ALSO have proven a safe index for. */
+                            bool unchecked = !narrow && arr_reg == P.hint_param_reg && index_safe_unchecked(arr_reg, rk_start);
+                            Opcode op = narrow    ? (is_int ? OP_INDEX_FIELD_GET_RAW_INT32 : OP_INDEX_FIELD_GET_RAW_FLOAT32)
+                                        : unchecked ? (is_int ? OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED : OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED)
+                                                    : (is_int ? OP_INDEX_FIELD_GET_RAW_INT   : OP_INDEX_FIELD_GET_RAW_REAL);
                             chunk_emit(c, PACK3(op, slot, arr_reg, 0));
                             chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(rk_start)));
                             rk = is_int ? (RK_RAW_INT_FLAG | slot) : (RK_RAW_REAL_FLAG | slot);
@@ -1499,7 +1602,19 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                 if (is_temp(arr_reg))  reg_free(1);
 
                 int dest = reg_alloc();
-                emit_index_get(c, dest, arr_reg, rk_start);
+                /* index_safe_unchecked already guarantees rk_start is a plain, non-const,
+                   non-raw register here -- always fits RK8 directly (registers never exceed
+                   FRAME_REGISTERS-1, well within RK8's 7 index bits), so no box_if_raw/spill
+                   handling is needed the way emit_index_get's general case requires. This is a
+                   loop-safety proof only, not a container-type one -- the array might turn out to
+                   be a plain array, dict, or anything else entirely, which is exactly why the
+                   opcode itself still checks TYPE_TYPED_ARRAY and simply won't have engaged the
+                   fast path if it's something else. */
+                if (index_safe_unchecked(arr_reg, rk_start)) {
+                    chunk_emit(c, PACK3(OP_TYPED_INDEX_GET_UNCHECKED, dest, arr_reg, pack_rk8(rk_start)));
+                } else {
+                    emit_index_get(c, dest, arr_reg, rk_start);
+                }
                 /* One-hop alias tracking for shape specialization (SPEC_KIND_ARRAY_OF_STRUCTS) --
                    see P.last_plain_index_dest_reg's own comment. Recorded unconditionally (not just
                    during a specialization recompile): P.last_plain_index_src_param only needs
@@ -1919,6 +2034,13 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             names[count++] = chunk_add_pool(c, token.value);
             lex();
         }
+        /* A destructuring target can never re-derive the length_tracked_name invariant (its value
+           comes from array-index unpacking, never a fresh length() call) -- invalidate eagerly. */
+        if (P.length_tracked_valid) {
+            for (unsigned int i = 0; i < count; i++) {
+                if (names[i] == P.length_tracked_name) { P.length_tracked_valid = false; break; }
+            }
+        }
         require(TOKEN_ASSIGN, "expected '=' after destructuring targets");
         if (parse_had_error) return;
 
@@ -1939,6 +2061,18 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             if (parse_had_error) return;
             arg_materialize(c, rk_next);
             rhs_count++;
+        }
+
+        /* Destructuring can rebind an already-shape-tracked or already-safe-loop-index register
+           (e.g. `pi, ok = try_lookup()` where `pi` previously held `particles[i]` and carried a
+           shape hint, or `i, extra = split(pair)` where `i` was an active loop index) -- clear all
+           three per-register facts for every target, same as the plain/compound assignment tails
+           above. Timed here (after the RHS is fully parsed) so a legitimate read of a target's OLD
+           value on the RHS itself -- e.g. `i, x = f(bodies[i].y)` -- still gets the fast path. */
+        for (unsigned int i = 0; i < count; i++) {
+            P.reg_known_shape[target_regs[i]] = NULL;
+            P.alias_source_param[target_regs[i]] = -1;
+            invalidate_register(target_regs[i]);
         }
 
         int arr_reg = rhs_reg_base;
@@ -1963,6 +2097,20 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
     if (consume(TOKEN_ASSIGN)) {
         int rk_val = parse_binary(c, 0);
         if (parse_had_error) return;
+
+        /* Tracks/invalidates length_tracked_name -- see P.last_length_call_result_reg's own
+           comment. Equality against rk_val (the FINAL, fully-parsed RHS) rather than clearing this
+           at every possible intervening op site: any further operation applied on top of the
+           length() call allocates its own new register, so `x = length(p) + 1` naturally fails
+           this check (rk_val is the ADD's dest, not length()'s), exactly as `x = length(p)` alone
+           naturally passes it -- same self-correcting equality trick as last_plain_index_dest_reg. */
+        if (P.last_length_call_result_reg >= 0 && rk_val == P.last_length_call_result_reg) {
+            P.length_tracked_name       = name_idx;
+            P.length_tracked_valid      = true;
+            P.length_tracked_source_reg = P.last_length_call_arg_reg;
+        } else if (P.length_tracked_valid && name_idx == P.length_tracked_name) {
+            P.length_tracked_valid = false;
+        }
 
         /* Looked up after parsing the RHS -- a self-referential first assignment creates the name as
            a side effect of parsing it, always boxed, so checking existence now naturally folds
@@ -2066,6 +2214,11 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         rk_val = box_if_raw(c, rk_val);
         int reg = var_slot(c, name_idx);
         if (reg < 0) return;   /* error_at already called */
+        /* See invalidate_safe_loop_reg's own comment -- without this, `reg` staying on
+           safe_loop_item_regs after this reassignment would let a later arr[reg].field inside the
+           same loop body keep trusting an index register that may no longer hold what the loop's
+           own PREP/LOOP put there. */
+        invalidate_register(reg);
         /* A shape-sensitive parameter reassigned to some other value (only reachable during a
            specialization recompile, where hint_param_reg's own register was seeded with a known
            Shape -- see parse_function_body) must lose that hint here: the register's VALUE just
@@ -2102,6 +2255,10 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
 
     for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
         if (!consume(compound_assign_ops[i].tok)) continue;
+
+        /* A compound assignment can never re-derive length_tracked_name's invariant (the RHS is
+           combined with the OLD value, never a fresh length() call alone) -- invalidate eagerly. */
+        if (P.length_tracked_valid && name_idx == P.length_tracked_name) P.length_tracked_valid = false;
 
         /* A raw-tracked compound-assignment target needs its own path -- var_lookup would return a
            bare register-shaped int with no distinguishing flag (real bug: silently misread as a
@@ -2192,8 +2349,12 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         if (parse_had_error) return;
         /* Same P.reg_known_shape invalidation as the plain-assignment tail above -- `reg`'s value
            is about to change (e.g. `bodies += extra_bodies`), so any shape hint on it is no longer
-           trustworthy. */
+           trustworthy. alias_source_param cleared alongside it now too (an earlier omission here --
+           the plain-assignment tail already clears both together); see invalidate_safe_loop_reg's
+           own comment for why safe_loop_item_regs needs the same treatment. */
         P.reg_known_shape[reg] = NULL;
+        P.alias_source_param[reg] = -1;
+        invalidate_register(reg);
         emit_binary(c, reg, compound_assign_ops[i].op, reg, rk_rhs);
         if (is_temp(rk_rhs)) reg_free(1);
         return;
@@ -2316,8 +2477,14 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
                     int slot = raw_materialize(c, rk_val, field_kind);
                     if (slot >= 0) {
+                        /* obj_reg == P.hint_param_reg checked explicitly (see the GET site's
+                           identical comment above) -- the field OFFSET these opcodes trust is only
+                           valid for this one specialized parameter. */
+                        bool unchecked = !field_narrow_bit && obj_reg == P.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
                         Opcode op = field_narrow_bit
                             ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT32 : OP_INDEX_FIELD_SET_RAW_FLOAT32)
+                            : unchecked
+                            ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED : OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED)
                             : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT   : OP_INDEX_FIELD_SET_RAW_REAL);
                         chunk_emit(c, PACK_OP_A_W16(op, obj_reg, pack_rk16(pending_rk_idx)));
                         chunk_emit(c, PACK_2X16((uint16_t)foffset, (uint16_t)slot));
@@ -2355,8 +2522,14 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
                     int slot = raw_materialize(c, rk_rhs, field_kind);
                     if (slot >= 0) {
+                        /* obj_reg == P.hint_param_reg checked explicitly (see the GET site's
+                           identical comment above) -- the field OFFSET these opcodes trust is only
+                           valid for this one specialized parameter. */
+                        bool unchecked = !field_narrow_bit && obj_reg == P.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
                         Opcode op = field_narrow_bit
                             ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT32 : OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32)
+                            : unchecked
+                            ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED : OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED)
                             : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT   : OP_INDEX_FIELD_COMPOUND_RAW_REAL);
                         chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
                         chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(pending_rk_idx)));
@@ -2464,8 +2637,20 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 }
             }
         }
-        if (pending_is_field) emit_field_set(c, obj_reg, pending_field_idx, rk_val);
-        else                   emit_index_set(c, obj_reg, pending_rk_idx, rk_val);
+        if (pending_is_field) {
+            emit_field_set(c, obj_reg, pending_field_idx, rk_val);
+        } else if (index_safe_unchecked(obj_reg, pending_rk_idx)) {
+            /* pending_rk_idx already guaranteed a plain register by index_safe_unchecked -- always
+               fits RK8 directly. rk_val can be anything, so it still needs emit_index_set's own
+               box/spill handling, just with the opcode swapped. */
+            int rk_val_boxed = box_if_raw(c, rk_val);
+            int spilled = 0;
+            if (!rk8_fits(rk_val_boxed)) { rk_val_boxed = materialize(c, rk_val_boxed); spilled++; }
+            chunk_emit(c, PACK3(OP_TYPED_INDEX_SET_UNCHECKED, obj_reg, pack_rk8(pending_rk_idx), pack_rk8(rk_val_boxed)));
+            if (spilled) reg_free(spilled);
+        } else {
+            emit_index_set(c, obj_reg, pending_rk_idx, rk_val);
+        }
 
         if (is_temp(rk_val)) reg_free(1);
         if (!pending_is_field && is_temp(pending_rk_idx)) reg_free(1);
@@ -2695,7 +2880,26 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
                                           same spelling must shadow to boxed first. */
     int item_reg = var_slot(c, loop_var_name);
     if (item_reg < 0) return;
+    /* var_slot has no block scoping -- an already-declared name (a sibling or enclosing loop
+       reusing the same spelling, e.g. `for i in 0..n: ... for i in 0..m: ...`) returns THAT
+       register back, which may still carry a shape hint or a live safe_loop_item_regs entry from
+       whatever last used it. This loop's own PREP/LOOP is about to start overwriting it every
+       iteration regardless of what THIS loop turns out to prove, so any stale fact must be cleared
+       before this loop's own body (or its own bound_safe/start_safe below) can be compiled. */
+    P.reg_known_shape[item_reg] = NULL;
+    P.alias_source_param[item_reg] = -1;
+    invalidate_register(item_reg);
+    /* invalidate_register only catches loop_var_name reusing a register some OTHER tracked fact
+       depends on -- it can't catch loop_var_name reusing the length_tracked_name NAME itself
+       (e.g. `for n in 0..1000: ...` after `n = length(bodies)`), since var_slot's return value for
+       an existing name is just a register number, indistinguishable here from a brand new one.
+       Every iteration of THIS loop is about to overwrite that register with values that have
+       nothing to do with length(bodies) -- without this check, length_tracked_valid would stay
+       true, and a LATER `for i in 0..n:` would wrongly trust n's post-loop leftover value as if it
+       still equalled length(bodies). */
+    if (P.length_tracked_valid && loop_var_name == P.length_tracked_name) P.length_tracked_valid = false;
 
+    unsigned int start_code_begin = c->count;
     int rk_start = parse_binary(c, 0);   /* the range's start, or the whole collection if no '..' follows */
 
     /* Direction is inferred at runtime from cur vs end, not step's sign. `..` is for-loop-specific
@@ -2708,6 +2912,69 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
 
         require(TOKEN_COLON, "expected ':' after for-in clause");
         if (parse_had_error) return;
+
+        /* Loop-bound-hoisting safety proof -- index_safe_unchecked's own comment (above) has the
+           full mechanism this feeds. Checked here, BEFORE arg_materialize below (which may copy
+           rk_start/rk_end into fresh registers that no longer identify their true source).
+           bound_safe: rk_end reads EXACTLY the one local variable currently proven == length(P)
+           for SOME parameter P (name-keyed via P.length_tracked_name, so this stays correct
+           regardless of raw/boxed storage-kind shuffling elsewhere) -- bound_array_reg records
+           WHICH parameter P was, since that's what every later index_safe_unchecked check must
+           match against, not just any array happening to reuse the same index register. start_safe:
+           rk_start is either the literal 0, or an active enclosing safe loop's own item register
+           PROVEN SAFE FOR THIS SAME bound_array_reg (a bare `for j in i..n`), or that register plus
+           a non-negative literal constant (`for j in (i+1)..n` -- nbody's actual pairwise
+           inner-loop shape) -- every case provably >= 0 given the enclosing loop's own already-
+           established bound, for the SAME array. Both halves fail closed: any shape this doesn't
+           recognize (a computed start/end, an unrelated variable, a raw local, or a start proven
+           safe only for a DIFFERENT array) simply leaves this_loop_safe false and the loop compiles
+           exactly as it always has. */
+        bool bound_safe = false;
+        int  bound_array_reg = -1;
+        if (P.length_tracked_valid &&
+            !(rk_end & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) {
+            for (int vi = 0; vi < P.var_count; vi++) {
+                if (P.var_names[vi] == P.length_tracked_name && P.var_kind[vi] == VAR_BOXED &&
+                    P.var_regs[vi] == rk_end) {
+                    bound_safe = true;
+                    bound_array_reg = P.length_tracked_source_reg;
+                    break;
+                }
+            }
+        }
+        bool start_safe = false;
+        if (bound_safe) {
+            if (rk_start & RK_CONST_FLAG) {
+                AerVal startv = c->pool[rk_start & ~RK_CONST_FLAG];
+                start_safe = (aer_type(startv) == TYPE_INTEGER && aer_as_int(startv) == 0);
+            } else if (!(rk_start & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) {
+                for (int si = 0; si < P.safe_loop_depth; si++) {
+                    if (P.safe_loop_item_regs[si] == rk_start && P.safe_loop_array_regs[si] == bound_array_reg) { start_safe = true; break; }
+                }
+                /* Not a bare safe register -- check for exactly "safe_reg + non-negative-const",
+                   the one instruction a `(i+1)` start compiles to (emit_binary, parser.c). Decoded
+                   from the just-emitted word rather than matched syntactically, since this parser
+                   compiles expressions directly with no separate AST pass to inspect. */
+                if (!start_safe && c->count - start_code_begin == 1) {
+                    uint32_t w = c->code[start_code_begin];
+                    if ((w & 0xFF) == OP_ADD && (int)UNPACK_A(w) == rk_start) {
+                        uint8_t lhs8 = (uint8_t)UNPACK_B(w), rhs8 = (uint8_t)UNPACK_C(w);
+                        if (!RK8_IS_CONST(lhs8) && RK8_IS_CONST(rhs8)) {
+                            int lhs_reg = RK8_INDEX(lhs8);
+                            bool lhs_active_safe = false;
+                            for (int si = 0; si < P.safe_loop_depth; si++) {
+                                if (P.safe_loop_item_regs[si] == lhs_reg && P.safe_loop_array_regs[si] == bound_array_reg) { lhs_active_safe = true; break; }
+                            }
+                            if (lhs_active_safe) {
+                                AerVal rhsv = c->pool[RK8_INDEX(rhs8)];
+                                if (aer_type(rhsv) == TYPE_INTEGER && aer_as_int(rhsv) >= 0) start_safe = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        bool this_loop_safe = bound_safe && start_safe && P.safe_loop_depth < LOOP_MAX;
 
         /* Snapshotted once, matching Lua/Python's range-for semantics -- a later mutation of the
            source variable has no effect on an already-running loop. Used to reuse a plain register
@@ -2733,14 +3000,23 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
             P.next_temp_register = saved_reserved_floor;
             return;
         }
+        /* Pushed/popped exactly around this one loop's own body -- see safe_loop_item_regs's own
+           comment (Parser struct) for why this is a small stack, not a whole-frame table. */
+        if (this_loop_safe) {
+            P.safe_loop_array_regs[P.safe_loop_depth] = bound_array_reg;
+            P.safe_loop_item_regs[P.safe_loop_depth]  = item_reg;
+            P.safe_loop_depth++;
+        }
         unsigned int body_start = c->count;
         parse_block(c);
         if (parse_had_error) {
+            if (this_loop_safe) P.safe_loop_depth--;
             P.loop_depth--;
             P.reserved_floor     = saved_reserved_floor;
             P.next_temp_register = saved_reserved_floor;
             return;
         }
+        if (this_loop_safe) P.safe_loop_depth--;
 
         unsigned int loop_bottom = c->count;
         emit_iter_range_loop(c, cur_reg, end_reg, step_reg, item_reg, body_start);
@@ -2786,6 +3062,17 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
     if (key_reg < 0) return;
     int val_reg = var_slot(c, val_name);
     if (val_reg < 0) return;
+    /* Same name-shadowing reasoning as parse_for_in's own identical block just above. */
+    P.reg_known_shape[key_reg] = NULL;
+    P.alias_source_param[key_reg] = -1;
+    invalidate_register(key_reg);
+    P.reg_known_shape[val_reg] = NULL;
+    P.alias_source_param[val_reg] = -1;
+    invalidate_register(val_reg);
+    /* Same length_tracked_name-by-NAME reasoning as parse_for_in's own identical check. */
+    if (P.length_tracked_valid && (key_name == P.length_tracked_name || val_name == P.length_tracked_name)) {
+        P.length_tracked_valid = false;
+    }
 
     int rk_col = parse_binary(c, 0);
     require(TOKEN_COLON, "expected ':' after for-in clause");
@@ -3104,17 +3391,42 @@ static int builtin_call_id(AerString* name) {
 /* Same contiguous-register materialization and result-register reuse as parse_call, emitting
    OP_CALL_BUILTIN instead. */
 static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
+    unsigned int arg_code_begin = c->count;
     int arg_reg_base;
     int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after call arguments");
     if (parse_had_error) return 0;
+    unsigned int arg_code_end = c->count;
 
     int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
     if (arg_count > 1) reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
+    int call_id = builtin_call_id(aer_as_string(c->pool[name_idx]));
     chunk_emit(c, PACK3(OP_CALL_BUILTIN, dest, base, arg_count));
     chunk_emit(c, (uint32_t)name_idx);
-    chunk_emit(c, (uint32_t)builtin_call_id(aer_as_string(c->pool[name_idx])));
+    chunk_emit(c, (uint32_t)call_id);
+
+    /* One-shot side-channel pair to parse_assignment, consumed via exact register equality -- same
+       discipline as P.last_plain_index_dest_reg. Recognizes `length(P)` for ANY parameter P (not
+       just a struct/packed-array specialization's hint_param_reg -- a plain function taking a
+       typed array is just as eligible for the loop-bound-hoisting proof, it just has no shape to
+       specialize on at all). arg_materialize (parse_contiguous_exprs) copies a non-temp register
+       (a parameter always is one) via a fresh OP_MOVE rather than reusing it in place, so the
+       argument's ORIGINAL register only survives as that MOVE's own source operand, not as `base`
+       itself; decoded here since parse_contiguous_exprs has no other way to report it. */
+    P.last_length_call_result_reg = -1;
+    P.last_length_call_arg_reg    = -1;
+    if (call_id == CALL_BUILTIN_LENGTH && arg_count == 1) {
+        int arg_orig_reg = base;
+        if (arg_code_end - arg_code_begin == 1) {
+            uint32_t w = c->code[arg_code_begin];
+            if ((w & 0xFF) == OP_MOVE && (int)UNPACK_A(w) == base) arg_orig_reg = (int)UNPACK_B(w);
+        }
+        if (arg_orig_reg >= 0 && arg_orig_reg < P.current_param_count) {
+            P.last_length_call_result_reg = dest;
+            P.last_length_call_arg_reg    = arg_orig_reg;
+        }
+    }
     return dest;
 }
 
@@ -3460,6 +3772,16 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     P.last_plain_index_src_param        = -1;
     P.last_plain_index_known_elem_shape = NULL;
     P.current_param_count = param_count;
+    /* hint_param_reg only enables the loop-bound-hoisting optimization for a packed-array
+       specialization (kind == SPEC_KIND_PACKED_ARRAY, hint_is_element_shape false) -- an
+       array-of-structs specialization has no per-object structural guarantee (see SPEC_KIND_
+       ARRAY_OF_STRUCTS's own comment, vm.c) so index_safe_unchecked must never engage for one. */
+    P.hint_param_reg              = hint_is_element_shape ? -1 : hint_param_reg;
+    P.length_tracked_valid        = false;
+    P.length_tracked_source_reg   = -1;
+    P.last_length_call_result_reg = -1;
+    P.last_length_call_arg_reg    = -1;
+    P.safe_loop_depth              = 0;
 
     P.function_depth++;
     for (int i = 0; i < param_count; i++) {

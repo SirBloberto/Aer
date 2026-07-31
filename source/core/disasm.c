@@ -93,6 +93,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* Single-word RK8-packed family -- special-cased in disassemble_one like OP_BINARY. */
     [OP_INDEX_GET] = { "OP_INDEX_GET", "reg = reg[rk]" },
     [OP_INDEX_SET] = { "OP_INDEX_SET", "reg[rk] = rk" },
+    [OP_TYPED_INDEX_GET_UNCHECKED] = { "OP_TYPED_INDEX_GET_UNCHECKED", "loop-proven-safe: reg = typed_arr[rk]" },
+    [OP_TYPED_INDEX_SET_UNCHECKED] = { "OP_TYPED_INDEX_SET_UNCHECKED", "loop-proven-safe: typed_arr[rk] = rk" },
     [OP_DESTRUCTURE] = { "OP_DESTRUCTURE", "reg, reg = destructure(reg)" },
     /* word0: dest+arr_reg. word1: rk_start16+rk_end16. */
     [OP_SLICE_GET] = { "OP_SLICE_GET", "reg = reg[rk:rk]", {0}, false, 1, 0 },
@@ -177,6 +179,16 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_FIELD_COMPOUND_RAW_REAL]       = { "OP_FIELD_COMPOUND_RAW_REAL",       "specialized: struct.field OP= rawr", {0}, false, 2, 0 },
     [OP_INDEX_FIELD_COMPOUND_RAW_INT]  = { "OP_INDEX_FIELD_COMPOUND_RAW_INT",  "specialized: packed_arr[rk].field OP= rawi", {0}, false, 2, 0 },
     [OP_INDEX_FIELD_COMPOUND_RAW_REAL] = { "OP_INDEX_FIELD_COMPOUND_RAW_REAL", "specialized: packed_arr[rk].field OP= rawr", {0}, false, 2, 0 },
+
+    /* _UNCHECKED counterparts -- same word layouts as the 3 wide INDEX_FIELD_*_RAW_INT/REAL
+       families above, decoded by the same branches below; see vm.h's own comment on this family
+       for the compile-time proof that makes skipping vm_packed_raw_elem's index checks safe. */
+    [OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED]       = { "OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED",       "specialized+loop-proven-safe: rawi = packed_arr[rk].field", {0}, false, 1, 0 },
+    [OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED]      = { "OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED",      "specialized+loop-proven-safe: rawr = packed_arr[rk].field", {0}, false, 1, 0 },
+    [OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED]       = { "OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED",       "specialized+loop-proven-safe: packed_arr[rk].field = rawi", {0}, false, 1, 0 },
+    [OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED]      = { "OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED",      "specialized+loop-proven-safe: packed_arr[rk].field = rawr", {0}, false, 1, 0 },
+    [OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED]  = { "OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED",  "specialized+loop-proven-safe: packed_arr[rk].field OP= rawi", {0}, false, 2, 0 },
+    [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED] = { "OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED", "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr", {0}, false, 2, 0 },
 
     /* Narrow (int32/float32) counterparts of the whole family above -- same word layouts, just a
        4-byte field instead of 8. See vm.h's own comment on this opcode family. */
@@ -289,11 +301,12 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     /* Full 8-bit mask must match DISPATCH()'s exactly -- opcode is unambiguously its own byte now. */
     Opcode op = (Opcode)(op_word & 0xFF);
     const OpInfo* info = &op_info[op];
-    /* %-36s must stay >= the longest Opcode enum member's name (currently
-       OP_INDEX_FIELD_COMPOUND_RAW_REAL, 32 chars) -- a shorter width doesn't truncate, it just lets
-       that one line's description column start later than every other line's, since printf only
-       pads a short name, never cuts a long one. Bump this if a future opcode name exceeds it. */
-    fprintf(out, "%6u  %-36s  %s", offset, opcode_name(op), info->desc);
+    /* %-44s must stay >= the longest Opcode enum member's name (currently
+       OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED, 42 chars) -- a shorter width doesn't truncate, it
+       just lets that one line's description column start later than every other line's, since
+       printf only pads a short name, never cuts a long one. Bump this if a future opcode name
+       exceeds it. */
+    fprintf(out, "%6u  %-44s  %s", offset, opcode_name(op), info->desc);
 
     unsigned int pos = offset + 1;
     if (info->variable) {
@@ -327,11 +340,11 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rk8(out, c, UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
-    } else if (op == OP_INDEX_GET) {
+    } else if (op == OP_INDEX_GET || op == OP_TYPED_INDEX_GET_UNCHECKED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
-    } else if (op == OP_INDEX_SET) {
+    } else if (op == OP_INDEX_SET || op == OP_TYPED_INDEX_SET_UNCHECKED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rk8(out, c, UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
@@ -374,8 +387,10 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_val_word));
         print_rk16(out, c, UNPACK_2X16_LO(field_val_word));
     } else if (op == OP_INDEX_FIELD_GET_RAW_INT || op == OP_INDEX_FIELD_GET_RAW_REAL
-            || op == OP_INDEX_FIELD_GET_RAW_INT32 || op == OP_INDEX_FIELD_GET_RAW_FLOAT32) {
-        bool is_int = (op == OP_INDEX_FIELD_GET_RAW_INT || op == OP_INDEX_FIELD_GET_RAW_INT32);
+            || op == OP_INDEX_FIELD_GET_RAW_INT32 || op == OP_INDEX_FIELD_GET_RAW_FLOAT32
+            || op == OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED || op == OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED) {
+        bool is_int = (op == OP_INDEX_FIELD_GET_RAW_INT || op == OP_INDEX_FIELD_GET_RAW_INT32
+                    || op == OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED);
         if (is_int) print_rawi(out, (int)UNPACK_A(op_word)); else print_rawr(out, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         uint32_t field_rk_word = c->code[pos++];
@@ -389,8 +404,10 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         unsigned int foffset = c->code[pos++];
         fprintf(out, "  off=%u", foffset);
     } else if (op == OP_INDEX_FIELD_SET_RAW_INT || op == OP_INDEX_FIELD_SET_RAW_REAL
-            || op == OP_INDEX_FIELD_SET_RAW_INT32 || op == OP_INDEX_FIELD_SET_RAW_FLOAT32) {
-        bool is_int = (op == OP_INDEX_FIELD_SET_RAW_INT || op == OP_INDEX_FIELD_SET_RAW_INT32);
+            || op == OP_INDEX_FIELD_SET_RAW_INT32 || op == OP_INDEX_FIELD_SET_RAW_FLOAT32
+            || op == OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED || op == OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED) {
+        bool is_int = (op == OP_INDEX_FIELD_SET_RAW_INT || op == OP_INDEX_FIELD_SET_RAW_INT32
+                    || op == OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED);
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rk16(out, c, UNPACK_W16(op_word));
         uint32_t off_slot_word = c->code[pos++];
@@ -561,8 +578,10 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         int slot = (int)c->code[pos++];
         if (is_int) print_rawi(out, slot); else print_rawr(out, slot);
     } else if (op == OP_INDEX_FIELD_COMPOUND_RAW_INT || op == OP_INDEX_FIELD_COMPOUND_RAW_REAL
-            || op == OP_INDEX_FIELD_COMPOUND_RAW_INT32 || op == OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32) {
-        bool is_int = (op == OP_INDEX_FIELD_COMPOUND_RAW_INT || op == OP_INDEX_FIELD_COMPOUND_RAW_INT32);
+            || op == OP_INDEX_FIELD_COMPOUND_RAW_INT32 || op == OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32
+            || op == OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED || op == OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED) {
+        bool is_int = (op == OP_INDEX_FIELD_COMPOUND_RAW_INT || op == OP_INDEX_FIELD_COMPOUND_RAW_INT32
+                    || op == OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED);
         print_field(out, c, FLD_REG,   (int)UNPACK_A(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
         uint32_t field_rk_word = c->code[pos++];

@@ -1058,6 +1058,20 @@ static inline __attribute__((always_inline)) unsigned char* vm_packed_raw_elem(A
     return pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
 }
 
+/* _UNCHECKED counterpart of vm_packed_raw_elem, for the 6 OP_INDEX_FIELD_*_RAW_INT/REAL_UNCHECKED
+   opcodes below -- only ever emitted when the index is proven, at compile time, to already be an
+   in-range integer for the WHOLE loop it came from (parser.c's index_safe_unchecked), so the index
+   type check, negative-index adjustment, bounds check, and NULL-on-failure contract all become
+   unreachable and are dropped. The array's own type check is kept regardless -- see
+   vm_packed_raw_elem's own comment just above this one on why that one specific check stays a
+   defensive net rather than a trusted compile-time fact even where a proof exists. */
+static inline __attribute__((always_inline)) unsigned char* vm_packed_raw_elem_unchecked(AerVal obj, AerVal* idx, unsigned int foffset) {
+    if (aer_type(obj) != TYPE_PACKED_ARRAY) { error("internal error: specialized packed-array field access on a non-packed-array value"); return NULL; }
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    int64_t i = aer_as_int(*idx);
+    return pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+}
+
 /* Elementwise add/sub/mul on two same-kind, same-length typed arrays. Each (kind, op) pair is its own
    tight, branch-free loop over flat, contiguous, uniformly-typed memory -- exactly the shape GCC's
    auto-vectorizer can turn into real SIMD (NEON on ARM, SSE/AVX on x86) with zero hand-written
@@ -1738,6 +1752,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_ARRAY_NEW]         = &&lbl_array_new,
         [OP_INDEX_GET]         = &&lbl_index_get,
         [OP_INDEX_SET]         = &&lbl_index_set,
+        [OP_TYPED_INDEX_GET_UNCHECKED] = &&lbl_typed_index_get_unchecked,
+        [OP_TYPED_INDEX_SET_UNCHECKED] = &&lbl_typed_index_set_unchecked,
         [OP_DESTRUCTURE]       = &&lbl_destructure,
         [OP_SLICE_GET]         = &&lbl_slice_get,
         [OP_DICT_NEW]          = &&lbl_dict_new,
@@ -1815,6 +1831,13 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_FIELD_COMPOUND_RAW_REAL]        = &&lbl_field_compound_raw_real,
         [OP_INDEX_FIELD_COMPOUND_RAW_INT]  = &&lbl_index_field_compound_raw_int,
         [OP_INDEX_FIELD_COMPOUND_RAW_REAL] = &&lbl_index_field_compound_raw_real,
+
+        [OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED]      = &&lbl_index_field_get_raw_int_unchecked,
+        [OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED]     = &&lbl_index_field_get_raw_real_unchecked,
+        [OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED]      = &&lbl_index_field_set_raw_int_unchecked,
+        [OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED]     = &&lbl_index_field_set_raw_real_unchecked,
+        [OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED]  = &&lbl_index_field_compound_raw_int_unchecked,
+        [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED] = &&lbl_index_field_compound_raw_real_unchecked,
 
         [OP_INDEX_FIELD_GET_RAW_INT32]  = &&lbl_index_field_get_raw_int32,
         [OP_INDEX_FIELD_GET_RAW_FLOAT32] = &&lbl_index_field_get_raw_float32,
@@ -2458,6 +2481,56 @@ lbl_index_set: {
     AerVal idx = *vm_rk_ptr8(vm, const_pool, UNPACK_B(op_word));
     AerVal val = *vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
     vm_index_set_compute(vm, registers[arr_reg], idx, val);
+    DISPATCH();
+}
+
+/* Loop-bound-hoisting counterparts of lbl_index_get/lbl_index_set -- see OP_TYPED_INDEX_GET/
+   SET_UNCHECKED's own comment (vm.h) for the full mechanism. Same word layout as OP_INDEX_GET/SET
+   exactly, so the parser's emission code is a straight copy with the opcode constant swapped.
+
+   Unlike the packed-array field family, this opcode carries ONLY an index-safety proof, not a
+   container-IDENTITY one -- there is no reg_known_shape-style compile-time fact establishing
+   arr_reg is even a typed array at all (a plain function taking one has no specialization/
+   recompile step to hang such a fact on). So the TYPE_TYPED_ARRAY check below is not a defensive
+   net on top of an otherwise-trusted assumption; it is the ONLY thing deciding whether the fast
+   path applies at all, and a miss must fall all the way through to the exact same fully generic,
+   fully checked behavior lbl_index_get/lbl_index_set already give ANY OTHER container type
+   (plain array, dict, string, ...) -- not an error. Erroring here would break ordinary indexing
+   on every non-typed-array value the parser's loop-safety proof (which knows nothing about
+   container type) still emits this opcode for. */
+lbl_typed_index_get_unchecked: {
+    int dest_reg = (int)UNPACK_A(op_word);
+    int arr_reg  = (int)UNPACK_B(op_word);
+    AerVal* idx = vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
+    AerVal obj = registers[arr_reg];
+    if (aer_type(obj) != TYPE_TYPED_ARRAY) {
+        vm_index_get_compute(obj, *idx, &registers[dest_reg]);
+        if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);   /* matches lbl_index_get's own post-compute step */
+        DISPATCH();
+    }
+    AerTypedArray* ta = aer_as_typed_array(obj);
+    int64_t i = aer_as_int(*idx);
+    unsigned int width = vm_typed_elem_width(ta->elem_kind);
+    registers[dest_reg] = vm_typed_elem_read(ta->data + (size_t)i * width, ta->elem_kind);
+    DISPATCH();
+}
+
+lbl_typed_index_set_unchecked: {
+    int arr_reg = (int)UNPACK_A(op_word);
+    AerVal* idx = vm_rk_ptr8(vm, const_pool, UNPACK_B(op_word));
+    AerVal* val = vm_rk_ptr8(vm, const_pool, UNPACK_C(op_word));
+    AerVal obj = registers[arr_reg];
+    if (aer_type(obj) != TYPE_TYPED_ARRAY) {
+        vm_index_set_compute(vm, obj, *idx, *val);
+        DISPATCH();
+    }
+    AerTypedArray* ta = aer_as_typed_array(obj);
+    /* Value-type/range validation is a separate concern from index safety and is NOT skipped --
+       see vm_typed_array_check's own contract (vm_typed_elem_write's comment above). */
+    if (!vm_typed_array_check(c, ta->elem_kind, *val)) DISPATCH();
+    int64_t i = aer_as_int(*idx);
+    unsigned int width = vm_typed_elem_width(ta->elem_kind);
+    vm_typed_elem_write(ta->data + (size_t)i * width, ta->elem_kind, *val);
     DISPATCH();
 }
 
@@ -3143,6 +3216,107 @@ lbl_index_field_compound_raw_real: {
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    double lhs; memcpy(&lhs, elem, 8);
+    double rhs = raw_reals[rhs_slot];
+    double result;
+    switch (bin_op) {
+        case OP_ADD: result = lhs + rhs; break;
+        case OP_SUB: result = lhs - rhs; break;
+        case OP_MUL: result = lhs * rhs; break;
+        default: error("internal error: unsupported raw compound-assign op"); DISPATCH();
+    }
+    memcpy(elem, &result, 8);
+    DISPATCH();
+}
+
+/* _UNCHECKED counterparts of the 6 wide INDEX_FIELD_*_RAW_INT/REAL opcodes above -- identical in
+   every respect (same encoding, same raw slot family, same fields) except they resolve the
+   element through vm_packed_raw_elem_unchecked instead. See that function's own comment and
+   parser.c's index_safe_unchecked for the compile-time proof that makes this safe: only ever
+   emitted for a `for i in 0..n:`-shaped loop where n was itself proven == length() of this same
+   packed-array parameter and never reassigned since, so i is guaranteed in range for every
+   iteration without re-checking it here. No int32/float32 (narrow-field) counterparts -- not
+   measured hot enough yet to justify doubling this family again; add them the same way if a
+   profile ever shows otherwise. */
+lbl_index_field_get_raw_int_unchecked: {
+    int dest_slot = (int)UNPACK_A(op_word);
+    int arr_reg   = (int)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    memcpy(&raw_ints[dest_slot], elem, 8);
+    DISPATCH();
+}
+
+lbl_index_field_get_raw_real_unchecked: {
+    int dest_slot = (int)UNPACK_A(op_word);
+    int arr_reg   = (int)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    memcpy(&raw_reals[dest_slot], elem, 8);
+    DISPATCH();
+}
+
+lbl_index_field_set_raw_int_unchecked: {
+    int obj_reg = (int)UNPACK_A(op_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    uint32_t off_slot_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
+    int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    memcpy(elem, &raw_ints[src_slot], 8);
+    DISPATCH();
+}
+
+lbl_index_field_set_raw_real_unchecked: {
+    int obj_reg = (int)UNPACK_A(op_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    uint32_t off_slot_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
+    int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    memcpy(elem, &raw_reals[src_slot], 8);
+    DISPATCH();
+}
+
+lbl_index_field_compound_raw_int_unchecked: {
+    int arr_reg   = (int)UNPACK_A(op_word);
+    Opcode bin_op = (Opcode)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    int rhs_slot = (int)READ();
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    int64_t lhs; memcpy(&lhs, elem, 8);
+    int64_t rhs = raw_ints[rhs_slot];
+    int64_t result;
+    switch (bin_op) {
+        case OP_ADD: result = lhs + rhs; break;
+        case OP_SUB: result = lhs - rhs; break;
+        case OP_MUL: result = lhs * rhs; break;
+        default: error("internal error: unsupported raw compound-assign op"); DISPATCH();
+    }
+    memcpy(elem, &result, 8);
+    DISPATCH();
+}
+
+lbl_index_field_compound_raw_real_unchecked: {
+    int arr_reg   = (int)UNPACK_A(op_word);
+    Opcode bin_op = (Opcode)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    int rhs_slot = (int)READ();
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
     double lhs; memcpy(&lhs, elem, 8);
     double rhs = raw_reals[rhs_slot];
