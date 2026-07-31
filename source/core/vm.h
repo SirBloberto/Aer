@@ -291,6 +291,14 @@ typedef enum {
     OP_FIELD_COMPOUND_RAW_INT32,       OP_FIELD_COMPOUND_RAW_FLOAT32,
     OP_INDEX_FIELD_COMPOUND_RAW_INT32, OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32,
 
+    /* _UNCHECKED counterparts of the narrow INDEX_FIELD_*_RAW_INT32/FLOAT32 opcodes above -- same
+       relationship the wide _UNCHECKED family (above) has to its own checked counterparts: only
+       the index-safety half of vm_packed_raw_elem's checks is skipped, gated behind the exact same
+       index_safe_unchecked proof, narrow storage width unaffected. */
+    OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED,      OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED,
+    OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED,      OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED,
+    OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED, OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED,
+
     /* Only ever emitted at the very start of a specialized body's "raw-numeric variant" (see
        SpecEntry below), once per raw-bound parameter -- unconditionally reads the boxed AerVal the
        caller already placed in that parameter's own register (the calling convention never

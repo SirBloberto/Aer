@@ -1852,6 +1852,13 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INDEX_FIELD_COMPOUND_RAW_INT32]  = &&lbl_index_field_compound_raw_int32,
         [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32] = &&lbl_index_field_compound_raw_float32,
 
+        [OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED]      = &&lbl_index_field_get_raw_int32_unchecked,
+        [OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED]    = &&lbl_index_field_get_raw_float32_unchecked,
+        [OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED]      = &&lbl_index_field_set_raw_int32_unchecked,
+        [OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED]    = &&lbl_index_field_set_raw_float32_unchecked,
+        [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED]  = &&lbl_index_field_compound_raw_int32_unchecked,
+        [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED] = &&lbl_index_field_compound_raw_float32_unchecked,
+
         [OP_UNBOX_PARAM_INT]  = &&lbl_unbox_param_int,
         [OP_UNBOX_PARAM_REAL] = &&lbl_unbox_param_real,
     };
@@ -3407,6 +3414,103 @@ lbl_index_field_compound_raw_float32: {
     AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    double lhs = vm_raw_read_float32(elem);
+    double rhs = raw_reals[rhs_slot];
+    double result;
+    switch (bin_op) {
+        case OP_ADD: result = lhs + rhs; break;
+        case OP_SUB: result = lhs - rhs; break;
+        case OP_MUL: result = lhs * rhs; break;
+        default: error("internal error: unsupported raw compound-assign op"); DISPATCH();
+    }
+    vm_raw_write_float32(elem, result);
+    DISPATCH();
+}
+
+/* _UNCHECKED counterparts of the 6 narrow INDEX_FIELD_*_RAW_INT32/FLOAT32 opcodes above -- same
+   relationship the wide _UNCHECKED family (near lbl_index_field_compound_raw_real_unchecked) has
+   to its own checked counterparts; see that family's own comment and parser.c's
+   index_safe_unchecked for the compile-time proof. Narrow storage width (4 bytes) unaffected --
+   only vm_packed_raw_elem's index-side checks are skipped, via vm_packed_raw_elem_unchecked. */
+lbl_index_field_get_raw_int32_unchecked: {
+    int dest_slot = (int)UNPACK_A(op_word);
+    int arr_reg   = (int)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    raw_ints[dest_slot] = vm_raw_read_int32(elem);
+    DISPATCH();
+}
+
+lbl_index_field_get_raw_float32_unchecked: {
+    int dest_slot = (int)UNPACK_A(op_word);
+    int arr_reg   = (int)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    raw_reals[dest_slot] = vm_raw_read_float32(elem);
+    DISPATCH();
+}
+
+lbl_index_field_set_raw_int32_unchecked: {
+    int obj_reg = (int)UNPACK_A(op_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    uint32_t off_slot_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
+    int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    vm_raw_write_int32(elem, raw_ints[src_slot]);
+    DISPATCH();
+}
+
+lbl_index_field_set_raw_float32_unchecked: {
+    int obj_reg = (int)UNPACK_A(op_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_W16(op_word));
+    uint32_t off_slot_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
+    int src_slot          = (int)UNPACK_2X16_LO(off_slot_word);
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    vm_raw_write_float32(elem, raw_reals[src_slot]);
+    DISPATCH();
+}
+
+lbl_index_field_compound_raw_int32_unchecked: {
+    int arr_reg   = (int)UNPACK_A(op_word);
+    Opcode bin_op = (Opcode)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    int rhs_slot = (int)READ();
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
+    if (!elem) DISPATCH();
+    int64_t lhs = vm_raw_read_int32(elem);
+    int64_t rhs = raw_ints[rhs_slot];
+    int64_t result;
+    switch (bin_op) {
+        case OP_ADD: result = lhs + rhs; break;
+        case OP_SUB: result = lhs - rhs; break;
+        case OP_MUL: result = lhs * rhs; break;
+        default: error("internal error: unsupported raw compound-assign op"); DISPATCH();
+    }
+    vm_raw_write_int32(elem, result);
+    DISPATCH();
+}
+
+lbl_index_field_compound_raw_float32_unchecked: {
+    int arr_reg   = (int)UNPACK_A(op_word);
+    Opcode bin_op = (Opcode)UNPACK_B(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(vm, const_pool, UNPACK_2X16_LO(field_rk_word));
+    int rhs_slot = (int)READ();
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem) DISPATCH();
     double lhs = vm_raw_read_float32(elem);
     double rhs = raw_reals[rhs_slot];

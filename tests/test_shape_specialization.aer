@@ -218,4 +218,33 @@ assert(movers2[0].x == 3.0, "scale_with_local: element 0 advanced correctly")
 assert(movers2[1].x == 3.0, "scale_with_local: element 1 advanced correctly")
 assert(total == 6.0, "scale_with_local: local declared after the raw-bound parameter accumulates correctly, proving no register-identity confusion")
 
+# SPEC_KIND_ARRAY_OF_STRUCTS's one-hop-alias source table (P.reg_known_element_shape, parser.c) had
+# no invalidation anywhere except the full reset at function entry, until this session found and
+# fixed it -- reassigning the array-of-structs PARAMETER ITSELF (not the alias) to a differently-
+# shaped array left a stale "my elements are this shape" fact alive, so a FRESH one-hop alias
+# created afterward incorrectly inherited the OLD shape's field offsets against the NEW shape's
+# actual layout. `val` deliberately sits at a different offset in BigRec than in SmallRec (16 vs 8)
+# so a stale hint reads the wrong bytes entirely, not just happens to still work -- same style of
+# proof as reassign_then_read's Body/Wrong pair above.
+struct BigRec:
+    pad1 = 0.0
+    pad2 = 0.0
+    val = 111.0
+
+struct SmallRec:
+    pad1 = 0.0
+    val = 222.0
+
+function alias_after_param_reassign(recs, other_recs):
+    alias0 = recs[0]
+    first = alias0.val         # specializes on BigRec's shape via the one-hop alias
+    recs = other_recs           # reassigns the ARRAY PARAMETER itself to a differently-shaped array
+    alias1 = recs[0]             # a FRESH one-hop alias -- must NOT inherit BigRec's stale element shape
+    second = alias1.val
+    return [first, second]
+
+pair = alias_after_param_reassign([BigRec(0.0, 0.0, 111.0)], [SmallRec(0.0, 222.0)])
+assert(pair[0] == 111.0, "the alias created BEFORE the parameter reassignment reads BigRec's own val correctly")
+assert(pair[1] == 222.0, "the alias created AFTER reassigning the array parameter to a differently-shaped array reads SmallRec's own val (offset 8) correctly -- a stale BigRec element-shape hint would have read offset 16 instead, wrong entirely")
+
 print("test_shape_specialization.aer: all assertions passed.")

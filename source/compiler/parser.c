@@ -1580,10 +1580,12 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                                requirement) -- the field OFFSET this opcode trusts is only valid for
                                this one specialized parameter, never any other array a loop might
                                ALSO have proven a safe index for. */
-                            bool unchecked = !narrow && arr_reg == P.hint_param_reg && index_safe_unchecked(arr_reg, rk_start);
-                            Opcode op = narrow    ? (is_int ? OP_INDEX_FIELD_GET_RAW_INT32 : OP_INDEX_FIELD_GET_RAW_FLOAT32)
-                                        : unchecked ? (is_int ? OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED : OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED)
-                                                    : (is_int ? OP_INDEX_FIELD_GET_RAW_INT   : OP_INDEX_FIELD_GET_RAW_REAL);
+                            bool unchecked = arr_reg == P.hint_param_reg && index_safe_unchecked(arr_reg, rk_start);
+                            Opcode op = narrow
+                                ? (unchecked ? (is_int ? OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED : OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED)
+                                             : (is_int ? OP_INDEX_FIELD_GET_RAW_INT32 : OP_INDEX_FIELD_GET_RAW_FLOAT32))
+                                : (unchecked ? (is_int ? OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED   : OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED)
+                                             : (is_int ? OP_INDEX_FIELD_GET_RAW_INT   : OP_INDEX_FIELD_GET_RAW_REAL));
                             chunk_emit(c, PACK3(op, slot, arr_reg, 0));
                             chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(rk_start)));
                             rk = is_int ? (RK_RAW_INT_FLAG | slot) : (RK_RAW_REAL_FLAG | slot);
@@ -2066,11 +2068,15 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         /* Destructuring can rebind an already-shape-tracked or already-safe-loop-index register
            (e.g. `pi, ok = try_lookup()` where `pi` previously held `particles[i]` and carried a
            shape hint, or `i, extra = split(pair)` where `i` was an active loop index) -- clear all
-           three per-register facts for every target, same as the plain/compound assignment tails
+           four per-register facts for every target, same as the plain/compound assignment tails
            above. Timed here (after the RHS is fully parsed) so a legitimate read of a target's OLD
-           value on the RHS itself -- e.g. `i, x = f(bodies[i].y)` -- still gets the fast path. */
+           value on the RHS itself -- e.g. `i, x = f(bodies[i].y)` -- still gets the fast path.
+           reg_known_element_shape (the SPEC_KIND_ARRAY_OF_STRUCTS one-hop-alias table) was a real,
+           separate gap here until now -- unlike reg_known_shape/alias_source_param, nothing ever
+           cleared it on reassignment, only the full reset at parse_function_body entry. */
         for (unsigned int i = 0; i < count; i++) {
             P.reg_known_shape[target_regs[i]] = NULL;
+            P.reg_known_element_shape[target_regs[i]] = NULL;
             P.alias_source_param[target_regs[i]] = -1;
             invalidate_register(target_regs[i]);
         }
@@ -2219,6 +2225,16 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
            same loop body keep trusting an index register that may no longer hold what the loop's
            own PREP/LOOP put there. */
         invalidate_register(reg);
+        /* reg_known_element_shape[reg] (the SPEC_KIND_ARRAY_OF_STRUCTS one-hop-alias source table,
+           consulted when THIS register is later indexed, e.g. `bodies = particles[i]` reassigning
+           the array parameter itself) had no invalidation anywhere until now, unlike reg_known_shape/
+           alias_source_param just below -- cleared unconditionally here, before either branch, since
+           neither one is a case where `reg` legitimately deserves a surviving "my elements are this
+           shape" fact (only parse_function_body's initial seed for hint_param_reg is). A real,
+           reachable type-confusion bug without this: reassign a specialized array-of-structs
+           parameter to a differently-shaped array, then index through a fresh one-hop alias of it --
+           the field offset resolved would be the STALE shape's, not the new array's actual layout. */
+        P.reg_known_element_shape[reg] = NULL;
         /* A shape-sensitive parameter reassigned to some other value (only reachable during a
            specialization recompile, where hint_param_reg's own register was seeded with a known
            Shape -- see parse_function_body) must lose that hint here: the register's VALUE just
@@ -2349,10 +2365,11 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         if (parse_had_error) return;
         /* Same P.reg_known_shape invalidation as the plain-assignment tail above -- `reg`'s value
            is about to change (e.g. `bodies += extra_bodies`), so any shape hint on it is no longer
-           trustworthy. alias_source_param cleared alongside it now too (an earlier omission here --
-           the plain-assignment tail already clears both together); see invalidate_safe_loop_reg's
-           own comment for why safe_loop_item_regs needs the same treatment. */
+           trustworthy. alias_source_param and reg_known_element_shape cleared alongside it now too
+           (earlier omissions here -- the plain-assignment tail clears all three); see
+           invalidate_register's own comment for why safe_loop_item_regs needs the same treatment. */
         P.reg_known_shape[reg] = NULL;
+        P.reg_known_element_shape[reg] = NULL;
         P.alias_source_param[reg] = -1;
         invalidate_register(reg);
         emit_binary(c, reg, compound_assign_ops[i].op, reg, rk_rhs);
@@ -2480,12 +2497,12 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                         /* obj_reg == P.hint_param_reg checked explicitly (see the GET site's
                            identical comment above) -- the field OFFSET these opcodes trust is only
                            valid for this one specialized parameter. */
-                        bool unchecked = !field_narrow_bit && obj_reg == P.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
+                        bool unchecked = obj_reg == P.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
                         Opcode op = field_narrow_bit
-                            ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT32 : OP_INDEX_FIELD_SET_RAW_FLOAT32)
-                            : unchecked
-                            ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED : OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED)
-                            : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT   : OP_INDEX_FIELD_SET_RAW_REAL);
+                            ? (unchecked ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED : OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED)
+                                         : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT32 : OP_INDEX_FIELD_SET_RAW_FLOAT32))
+                            : (unchecked ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED   : OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED)
+                                         : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT   : OP_INDEX_FIELD_SET_RAW_REAL));
                         chunk_emit(c, PACK_OP_A_W16(op, obj_reg, pack_rk16(pending_rk_idx)));
                         chunk_emit(c, PACK_2X16((uint16_t)foffset, (uint16_t)slot));
                         int floor_now = (field_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
@@ -2525,12 +2542,12 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                         /* obj_reg == P.hint_param_reg checked explicitly (see the GET site's
                            identical comment above) -- the field OFFSET these opcodes trust is only
                            valid for this one specialized parameter. */
-                        bool unchecked = !field_narrow_bit && obj_reg == P.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
+                        bool unchecked = obj_reg == P.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
                         Opcode op = field_narrow_bit
-                            ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT32 : OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32)
-                            : unchecked
-                            ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED : OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED)
-                            : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT   : OP_INDEX_FIELD_COMPOUND_RAW_REAL);
+                            ? (unchecked ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED : OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED)
+                                         : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT32 : OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32))
+                            : (unchecked ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED   : OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED)
+                                         : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT   : OP_INDEX_FIELD_COMPOUND_RAW_REAL));
                         chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
                         chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(pending_rk_idx)));
                         chunk_emit(c, (uint32_t)slot);
@@ -2887,6 +2904,7 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
        iteration regardless of what THIS loop turns out to prove, so any stale fact must be cleared
        before this loop's own body (or its own bound_safe/start_safe below) can be compiled. */
     P.reg_known_shape[item_reg] = NULL;
+    P.reg_known_element_shape[item_reg] = NULL;
     P.alias_source_param[item_reg] = -1;
     invalidate_register(item_reg);
     /* invalidate_register only catches loop_var_name reusing a register some OTHER tracked fact
@@ -3064,9 +3082,11 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
     if (val_reg < 0) return;
     /* Same name-shadowing reasoning as parse_for_in's own identical block just above. */
     P.reg_known_shape[key_reg] = NULL;
+    P.reg_known_element_shape[key_reg] = NULL;
     P.alias_source_param[key_reg] = -1;
     invalidate_register(key_reg);
     P.reg_known_shape[val_reg] = NULL;
+    P.reg_known_element_shape[val_reg] = NULL;
     P.alias_source_param[val_reg] = -1;
     invalidate_register(val_reg);
     /* Same length_tracked_name-by-NAME reasoning as parse_for_in's own identical check. */

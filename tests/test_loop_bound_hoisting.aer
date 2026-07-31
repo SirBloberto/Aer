@@ -216,4 +216,34 @@ function reused_name_sum(nums):
 
 assert(reused_name_sum(xs) == xs[0] + xs[1], "a sibling loop reusing the length()-tracked variable's own NAME must invalidate length_tracked_valid, not just its register -- n is left at 2 (the last value the reused-name loop assigned) here, so this only sums indices 0..1")
 
+# ------------------------------------------------------------------ #
+# 9. Narrow (int32/float32) struct fields get the SAME loop-bound-    #
+#    hoisting treatment as wide fields -- OP_INDEX_FIELD_GET/SET/     #
+#    COMPOUND_RAW_INT32/FLOAT32_UNCHECKED, vm.c.                      #
+# ------------------------------------------------------------------ #
+
+struct NarrowPoint:
+    x = 0i
+    y = 0.0f
+
+function narrow_sum_and_bump(narrow_pts):
+    n = length(narrow_pts)
+    total = 0
+    for i in 0..n:
+        narrow_pts[i].x += 1
+        narrow_pts[i].y += 0.5
+        total += narrow_pts[i].x
+    return total
+
+nps = [NarrowPoint(1, 0.0); 4]
+nps[0].x = 2
+nps[1].x = 3
+nps[2].x = 5
+nps[3].x = 7
+# Both compound assignments here have a raw-int/raw-real-literal RHS (matching the field's own raw
+# kind exactly), so they stay on the raw compound fast path -- OP_INDEX_FIELD_COMPOUND_RAW_INT32/
+# FLOAT32_UNCHECKED, not the generic (boxing) fallback a mixed-kind RHS would force.
+assert(narrow_sum_and_bump(nps) == 3 + 4 + 6 + 8, "narrow (int32) field loop-bound-hoisted GET after a same-kind loop-bound-hoisted COMPOUND (+=)")
+assert(nps[0].y == 0.5 and nps[3].y == 0.5, "narrow (float32) field loop-bound-hoisted COMPOUND (+=), correct per-element result")
+
 print("test_loop_bound_hoisting.aer: all assertions passed.")
