@@ -46,6 +46,25 @@ typedef struct {
        cycle still touched every cell's state byte just to confirm it's old). */
     unsigned int*   slab_young_count;
 
+    /* Doubly-linked "slabs with young_count > 0" thread, parallel to slabs[], rooted at
+       young_slab_head (POOL_NO_SLAB if none). slab_young_count[] alone only lets pool_sweep skip a
+       fully-old-or-free slab's per-CELL scan in O(1) -- the sweep's own outer loop still visited
+       EVERY slab index just to read that one flag, every single minor cycle, an O(slab_count) cost
+       that dominates once a large grow-only pool (struct_array_scan.aer's 2M-particle struct_pool,
+       ~2000 slabs) has accumulated many fully-promoted slabs behind a live construction phase. This
+       thread lets a minor pool_sweep walk ONLY the slabs that still have >=1 young cell, true
+       O(live young slabs) instead. Doubly-linked (not singly, unlike slab_free_list/free_slab_head
+       above) because removal can happen to ANY slab in the thread, not just the head -- pool_sweep
+       unlinks whichever slab it just finished sweeping to 0, wherever that slab sits in the list --
+       whereas the free-list thread only ever pops its own head (pool_alloc's only consumer). A
+       slab's young_count can go from 0 back above 0 later (a cell pool_sweep just freed gets reused
+       by a later pool_alloc, which always allocates "born young" -- see pool_alloc's own comment),
+       so this is add/remove, not a one-directional watermark: pool_alloc re-links a slab the moment
+       its count crosses 0 -> 1, pool_sweep unlinks it the moment a sweep drives it back to 0. */
+    unsigned int*   young_slab_prev;
+    unsigned int*   young_slab_next;
+    unsigned int    young_slab_head;
+
     /* Per-slab free lists (parallel to slabs[]) plus an O(1) "which slabs currently have a free
        cell" thread (slab_free_next, rooted at free_slab_head) -- modeled directly on Luau's
        per-page free list + page-linking (lua_Page's own free list and prev/next fields), not AER's

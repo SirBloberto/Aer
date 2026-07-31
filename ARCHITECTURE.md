@@ -740,29 +740,52 @@ anyway: the code's own comment claimed this was already O(n) total, and it wasn'
 with sustained post-promotion append/update churn at larger scale, or with a smaller minor-GC
 threshold triggering more frequent cycles, would have hit the same quadratic wall this closes.
 
+### 5.15 Threading pool_sweep's minor pass through only the still-young slabs
+
+`slab_young_count[i] == 0` already let `pool_sweep` skip a fully-old-or-free slab's expensive
+per-cell scan in O(1) (§5.13's Pass 3) -- but the *outer* `for (i = 0; i < p->slab_count; i++)` loop
+still visited every slab index, every minor cycle, just to read that one flag. With slab count
+growing alongside a large pure-append workload (`struct_array_scan.aer`'s 2M-particle `struct_pool`,
+~2000 slabs by the end of construction), that's O(slab_count) of pure flag-checking per cycle even
+once the large majority of those slabs are fully promoted and have nothing left for a minor pass to
+do -- the exact shape of bug §5.14 fixed one layer up, for the remembered-set card scan.
+
+Fixed the same way §5.14's problem area is structured, but for slabs instead of cards: a doubly-
+linked "slabs with `young_count > 0`" thread (`young_slab_prev`/`young_slab_next`/`young_slab_head`,
+pool.c/pool.h), so a minor `pool_sweep` walks only the slabs that still have >=1 young cell instead
+of every slab index. Doubly-linked (unlike `slab_free_list`/`free_slab_head`, which only ever pops
+its own head) because removal can happen to any slab in the thread, not just the head. `pool_alloc`
+links a slab back in the moment its count crosses 0 -> 1 (a cell `pool_sweep` freed getting reused,
+always "born young"); `pool_sweep` unlinks it the moment a sweep drains it back to 0 -- the same
+bidirectional add/remove care §6 had already flagged this would need, not a simpler one-directional
+watermark. A major (non-`young_only`) sweep still walks every slab, since old cells matter there too
+and the young thread only ever tracks young ones.
+
+Verified: full test suite (Windows + Pi, including `test_pool_churn.aer` and `test_card_marking.aer`,
+which specifically exercise free/reuse churn through this exact machinery), ASAN clean on the Pi (no
+leaks or errors attributable to this change -- the one pre-existing `main.c` `real_argv` leak
+LeakSanitizer flags on every run, touched or not, is unrelated argv-parsing memory freed by process
+exit), and a 300-iteration fuzz run with zero crashes (2 hangs, both confirmed benign fuzzer-mutated
+loop-termination breaks unrelated to this change, one of them ironically inside
+`test_pool_churn.aer` itself: `i += 1` mutated to `i += -100000` inside `for i < 5:`, so the
+condition never goes false).
+
+Measured on the Pi, `struct_array_scan.aer` (2M particles, 4 repeated runs): **branch-misses fell
+11-33x** (176.5M -> 5.3-29.4M per run, consistent with turning an unpredictable "which slabs are
+old" branch into a tight, always-taken linked-list walk) and instructions fell a real but small
+~0.5% (73.78B -> ~73.37B, less outer-loop bookkeeping). Cycles and wall-clock stayed flat within this
+Pi's own documented run-to-run noise band (74.3-77.2B cycles / 41.0-43.1s, before and after both
+inside that range) -- §5.13's per-cell skip had already captured the large majority of the available
+win here, so the remaining outer-loop branch cost, while real and now measurably gone, wasn't a big
+enough fraction of the total to move wall-clock on this specific benchmark. Kept anyway: it's a
+genuine algorithmic-complexity fix (O(slab_count) -> O(live young slabs) per minor cycle) that will
+matter more as slab counts grow further, and the branch-miss reduction is real, large, and
+consistent across every run.
+
 ---
 
 ## 6. Known architectural limitations (current, unresolved)
 
-- **`pool_sweep`'s own slab loop is still O(total slab count) per minor cycle, not O(changed
-  slabs).** Root-caused via `perf annotate` on `struct_array_scan.aer` (2M-particle build, ~79% of
-  all cycles inside `gc_collect`): the hot instructions are `pool_sweep`'s `if (*state & POOL_FREE)`
-  and `pool_mark`'s `if (*state & POOL_MARKED)` — both inlined into `gc_collect` under `-flto`
-  (the third instance this session of that specific LTO-inlining surprise, after §5.12's frame-bloat
-  finding). `slab_young_count[i] == 0` already lets `pool_sweep` (`pool.c`) skip the expensive
-  per-cell scan for a fully-old slab in O(1) — but the *outer* `for (i = 0; i < p->slab_count; i++)`
-  loop still visits every slab index just to read that one flag, every single minor cycle, exactly
-  the same shape of bug §5.14 fixed for the remembered-set card scan. With slab count growing
-  alongside a pure-append workload, this is O(n) of pure flag-checking per cycle — confirmed
-  independently of §5.14's fix (measured before *and* after, no change, since this is a different
-  loop one layer down). Diagnosed, not fixed: the correct general fix needs the same kind of
-  per-slab linked-list threading `slab_free_list`/`free_slab_head` already do for free cells (a
-  "slabs with young_count > 0" thread), which is more involved than it sounds — a slab's young count
-  can go from 0 back above 0 (a cell freed by `pool_sweep` gets reused by a later `pool_alloc`, which
-  always allocates "born young" — see `pool_alloc`'s own comment, pool.h), so it needs the same
-  bidirectional add/remove care as the existing free-list thread, not a simpler one-directional
-  watermark. Left for a dedicated pass rather than rushed alongside this session's other fixes,
-  given the correctness stakes of getting a core sweep-loop invariant wrong.
 - **RK9-decode cost is real and not eliminated.** The register-vs-constant flag test inside
   `vm_rk_ptr9` remains a measurable cost even after PGO (shrunk, not eliminated — same code shape
   under profiling). An RR-opcode-split (separate register-register and register-constant opcode
