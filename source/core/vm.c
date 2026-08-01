@@ -1929,6 +1929,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_SUB_REAL]      = &&lbl_raw_sub_real,
         [OP_RAW_MUL_REAL]      = &&lbl_raw_mul_real,
         [OP_RAW_DIV_REAL]      = &&lbl_raw_div_real,
+        [OP_RAW_FMA_REAL]      = &&lbl_raw_fma_real,
+        [OP_RAW_FMS_REAL]      = &&lbl_raw_fms_real,
         [OP_RAW_LT_INT]        = &&lbl_raw_lt_int,
         [OP_RAW_GT_INT]        = &&lbl_raw_gt_int,
         [OP_RAW_LTE_INT]       = &&lbl_raw_lte_int,
@@ -4148,6 +4150,23 @@ lbl_raw_floor_div_int: {
 RAW_ARITH_REAL(add, +)
 RAW_ARITH_REAL(sub, -)
 RAW_ARITH_REAL(mul, *)
+
+/* Superinstruction for `x += a*b` / `x -= a*b` on raw real locals -- see OP_RAW_FMA_REAL's own
+   comment (vm.h) for what emits this and why it's still bit-identical to the unfused two-opcode
+   form (two roundings, not a hardware single-rounding FMA). dest doubles as the accumulator's
+   read source and write destination, same in-place convention RAW_ARITH_REAL's own dest==a
+   callers already rely on. */
+#define RAW_FUSED_MULACC_REAL(name, op) \
+lbl_raw_##name##_real: { \
+    int dest = (int)UNPACK_A(op_word); \
+    int a    = (int)UNPACK_B(op_word); \
+    int b    = (int)UNPACK_C(op_word); \
+    raw_reals[dest] = raw_reals[dest] op (raw_reals[a] * raw_reals[b]); \
+    DISPATCH(); \
+}
+RAW_FUSED_MULACC_REAL(fma, +)
+RAW_FUSED_MULACC_REAL(fms, -)
+#undef RAW_FUSED_MULACC_REAL
 
 lbl_raw_div_real: {
     int dest = (int)UNPACK_A(op_word);

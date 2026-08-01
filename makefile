@@ -55,6 +55,7 @@ TESTS := tests/test_core.aer \
          tests/test_card_marking.aer \
          tests/test_pool_churn.aer \
          tests/test_perf_fusion.aer \
+         tests/test_raw_fma_fusion.aer \
          tests/test_primitive_pass.aer \
          tests/test_dict_pool_stress.aer \
          tests/test_packed_arrays.aer \

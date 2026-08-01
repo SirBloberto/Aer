@@ -2330,9 +2330,32 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             Opcode boxed_op = compound_assign_ops[i].op;
             bool native_op_exists = (boxed_op == OP_ADD || boxed_op == OP_SUB || boxed_op == OP_MUL);
 
+            unsigned int rhs_start = c->count;
             int rk_rhs = parse_binary(c, 0);
             if (parse_had_error) return;
             RawKind rhs_kind = rk_raw_kind(c, rk_rhs);
+
+            /* `x += a*b` / `x -= a*b` on a raw real local -- fuses the RHS's own just-emitted
+               OP_RAW_MUL_REAL and this op's ADD/SUB into one OP_RAW_FMA_REAL/OP_RAW_FMS_REAL
+               dispatch (see that opcode's own comment, vm.h, for why this is still bit-identical
+               to the unfused form). Only when the RHS compiled down to EXACTLY one raw MUL whose
+               OWN dest is the slot rk_rhs itself points at (nothing else emitted in between, and
+               not some earlier-computed value being reused) -- any other shape just falls through
+               to the ordinary unfused path below, still fully correct. Real-only: nothing in this
+               codebase's own benchmarks has shown an int version of this shape yet. */
+            if (cur_kind == RAWK_REAL && (boxed_op == OP_ADD || boxed_op == OP_SUB) &&
+                rhs_kind == RAWK_REAL && c->count - rhs_start == 1) {
+                uint32_t mw = c->code[rhs_start];
+                if ((Opcode)(mw & 0xFF) == OP_RAW_MUL_REAL && (int)UNPACK_A(mw) == (rk_rhs & RK_RAW_SLOT_MASK)) {
+                    int dest_slot = P.var_regs[existing_idx];
+                    int mul_a = (int)UNPACK_B(mw), mul_b = (int)UNPACK_C(mw);
+                    c->count = rhs_start;   /* discard the MUL -- fused below instead */
+                    if ((int)UNPACK_A(mw) >= P.raw_real_reserved_floor) raw_real_free(1);
+                    Opcode fused = (boxed_op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
+                    chunk_emit(c, PACK3(fused, dest_slot, mul_a, mul_b));
+                    return;
+                }
+            }
 
             if (native_op_exists && rhs_kind == cur_kind) {
                 int dest_slot = P.var_regs[existing_idx];

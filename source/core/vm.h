@@ -215,6 +215,15 @@ typedef enum {
     OP_RAW_ADD_INT, OP_RAW_SUB_INT, OP_RAW_MUL_INT, OP_RAW_DIV_INT,
     OP_RAW_MOD_INT, OP_RAW_FLOOR_DIV_INT,
     OP_RAW_ADD_REAL, OP_RAW_SUB_REAL, OP_RAW_MUL_REAL, OP_RAW_DIV_REAL,
+    /* Superinstruction: `x += a*b` / `x -= a*b` on raw real locals (A = A +/- B*C, in place) --
+       collapses the MUL a compound-assignment's own RHS just emitted plus this op's own ADD/SUB
+       into ONE dispatch, when that RHS compiled down to exactly one raw MUL (see the compound-
+       assignment parser's own comment for the exact detection). Still two separate roundings
+       (mul, then add/sub) -- NOT a hardware single-rounding FMA instruction, so results stay
+       bit-identical to the unfused two-opcode form; the only thing removed is one interpreter
+       dispatch. Found via nbody.aer's own opcode-hit profile: this exact shape (`bivx -= dx*mj`,
+       `bodies[j].vx += dx*mi`) is 5,000,000 hits/opcode in its hottest loop. */
+    OP_RAW_FMA_REAL, OP_RAW_FMS_REAL,
     OP_RAW_LT_INT, OP_RAW_GT_INT, OP_RAW_LTE_INT, OP_RAW_GTE_INT,
     OP_RAW_LT_REAL, OP_RAW_GT_REAL, OP_RAW_LTE_REAL, OP_RAW_GTE_REAL,
     OP_BOX_INT, OP_BOX_REAL,

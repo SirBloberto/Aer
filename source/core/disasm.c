@@ -145,6 +145,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_RAW_SUB_REAL]      = { "OP_RAW_SUB_REAL",      "rawr = rawr - rawr" },
     [OP_RAW_MUL_REAL]      = { "OP_RAW_MUL_REAL",      "rawr = rawr * rawr" },
     [OP_RAW_DIV_REAL]      = { "OP_RAW_DIV_REAL",      "rawr = rawr / rawr" },
+    [OP_RAW_FMA_REAL]      = { "OP_RAW_FMA_REAL",      "rawr = rawr + rawr * rawr (fused mul-add dispatch, two roundings)" },
+    [OP_RAW_FMS_REAL]      = { "OP_RAW_FMS_REAL",      "rawr = rawr - rawr * rawr (fused mul-sub dispatch, two roundings)" },
     [OP_RAW_LT_INT]        = { "OP_RAW_LT_INT",        "reg = rawi < rawi" },
     [OP_RAW_GT_INT]        = { "OP_RAW_GT_INT",        "reg = rawi > rawi" },
     [OP_RAW_LTE_INT]       = { "OP_RAW_LTE_INT",       "reg = rawi <= rawi" },
@@ -548,7 +550,8 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         else                      print_rawi(out, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
         print_rawi(out, (int)UNPACK_C(op_word));
-    } else if (op == OP_RAW_ADD_REAL || op == OP_RAW_SUB_REAL || op == OP_RAW_MUL_REAL || op == OP_RAW_DIV_REAL) {
+    } else if (op == OP_RAW_ADD_REAL || op == OP_RAW_SUB_REAL || op == OP_RAW_MUL_REAL || op == OP_RAW_DIV_REAL ||
+               op == OP_RAW_FMA_REAL || op == OP_RAW_FMS_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
         print_rawr(out, (int)UNPACK_C(op_word));
