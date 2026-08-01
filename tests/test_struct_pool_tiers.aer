@@ -1,0 +1,57 @@
+#!/usr/bin/env aer
+import collection
+# AER test suite — size-classed struct pools (VmHeap.struct_pools[], keyed by Shape.instance_bytes;
+# vm.c/vm.h/gc.c). A single struct_pool sized for MAX_STRUCT_FIELDS (16) full-width fields was 268
+# bytes/cell regardless of a shape's actual field count -- a 3-field struct (TreeNode, binary_trees.aer)
+# wasted ~78% of every allocation. Now keyed by tier (16/32/64/128/256 bytes), the smallest tier
+# that fits each shape's own instance_bytes. Covers both tier extremes (1 field, the smallest tier;
+# 16 fields, MAX_STRUCT_FIELDS, the largest tier) plus GC survival across many instances of both
+# concurrently, to catch any tier-boundary or per-tier-pool bookkeeping mistake.
+# Machine-checked via assert(): a clean run exits 0; any failure prints "ASSERT FAILED: ..." and
+# the process exits nonzero (see main.c/error.c).
+
+struct One:
+    a = 0
+
+struct Sixteen:
+    f1 = 0
+    f2 = 0
+    f3 = 0
+    f4 = 0
+    f5 = 0
+    f6 = 0
+    f7 = 0
+    f8 = 0
+    f9 = 0
+    f10 = 0
+    f11 = 0
+    f12 = 0
+    f13 = 0
+    f14 = 0
+    f15 = 0
+    f16 = 0
+
+o = One(42)
+assert(o.a == 42, "1-field struct (smallest tier)")
+
+s = Sixteen(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+assert(s.f1 == 1 and s.f16 == 16 and s.f8 == 8, "16-field struct (largest tier, MAX_STRUCT_FIELDS)")
+
+# Many instances of both, most discarded (garbage), some kept -- stresses GC across two distinct
+# struct pool tiers concurrently, not just one shape at a time.
+kept_ones = []
+kept_sixteens = []
+i = 0
+for i < 5000:
+    throwaway_one = One(i)
+    throwaway_sixteen = Sixteen(i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i)
+    if i % 100 == 0:
+        collection.append(kept_ones, One(i))
+        collection.append(kept_sixteens, Sixteen(i, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i))
+    i += 1
+
+assert(length(kept_ones) == 50, "kept the right number of One instances across the GC churn")
+assert(kept_ones[10].a == 1000, "One instance survived GC with correct field value")
+assert(kept_sixteens[10].f16 == 1000, "Sixteen instance survived GC with correct field value")
+
+print("test_struct_pool_tiers.aer: all assertions passed.")

@@ -815,8 +815,20 @@ typedef struct {
     unsigned char* ptr;
 } TypedArrayFreeSlot;
 
+/* Size-classed slab pools for struct instances, keyed by Shape.instance_bytes (the exact fields-
+   buffer size that shape needs) -- a single pool sized for MAX_STRUCT_FIELDS (16) full-width
+   (16-byte) fields was 268 bytes/cell regardless of how many fields a shape actually has; TreeNode
+   (3 fields, 60 bytes actually needed) wasted ~78% of every allocation. Mirrors hashtable.c's own
+   KEY_TIER_SIZE scheme exactly -- STRUCT_PAYLOAD_TIER_SIZE lives in vm.c (paired with its elems-
+   per-slab table there), this is just the array-of-Pool storage. Every tier size is a valid struct
+   cell size on its own (no tier past the largest -- the largest tier already covers the
+   MAX_STRUCT_FIELDS worst case, so there's no malloc-fallback path to build here, unlike
+   hashtable.c's key pools which really can see an unbounded key length). */
+#define STRUCT_PAYLOAD_TIER_COUNT 5
+
 typedef struct {
-    Pool string_pool, array_pool, dict_pool, function_pool, struct_pool, packed_array_pool, typed_array_pool, result_pool;
+    Pool string_pool, array_pool, dict_pool, function_pool, packed_array_pool, typed_array_pool, result_pool;
+    Pool struct_pools[STRUCT_PAYLOAD_TIER_COUNT];
     bool pools_initialized;
 
     TypedArrayFreeSlot typed_array_free_cache[TYPED_ARRAY_FREE_CACHE_SLOTS];

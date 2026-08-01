@@ -54,6 +54,23 @@ static unsigned int default_minor_gc_threshold     = 2048;
 static unsigned int default_major_gc_every_n_minor = 10;
 static unsigned int default_gc_live_cell_ceiling   = 0;   /* 0 = unlimited */
 
+/* Tier sizes for the size-classed struct pools (VmHeap.struct_pools, vm.h's own comment on why).
+   Powers of two, same spirit as hashtable.c's KEY_TIER_SIZE -- the largest tier (256 = MAX_STRUCT_
+   FIELDS * sizeof(AerVal)) exactly covers the worst case, so every shape's instance_bytes fits
+   some tier; no malloc-fallback tier needed. pool_init itself floors any stride below 16 bytes
+   (pool.c, for the free-list pointer), so the smallest tier needs no special-casing here either. */
+static const size_t STRUCT_PAYLOAD_TIER_SIZE[STRUCT_PAYLOAD_TIER_COUNT] = { 16, 32, 64, 128, 256 };
+static const unsigned int STRUCT_TIER_ELEMS_PER_SLAB[STRUCT_PAYLOAD_TIER_COUNT] = { 64, 64, 64, 32, 16 };
+
+/* Smallest tier that fits instance_bytes -- ceiling, never floor, since a cell smaller than the
+   shape's own fields buffer would let AerStruct.fields (set to right after the header, in the
+   same cell) run past the cell's actual allocation. */
+static Pool* struct_pool_for_size(VmHeap* heap, unsigned int instance_bytes) {
+    for (unsigned int i = 0; i < STRUCT_PAYLOAD_TIER_COUNT; i++)
+        if (instance_bytes <= STRUCT_PAYLOAD_TIER_SIZE[i]) return &heap->struct_pools[i];
+    return &heap->struct_pools[STRUCT_PAYLOAD_TIER_COUNT - 1];   /* unreachable given the 256 ceiling above, but fail safe rather than out-of-bounds */
+}
+
 /* Initializes one heap's pools -- called once per VM (vm_init), not once per process, since every
    VM now owns its own. */
 static void vm_heap_init(VmHeap* heap) {
@@ -62,7 +79,8 @@ static void vm_heap_init(VmHeap* heap) {
     pool_init(&heap->array_pool,    sizeof(AerArray),    256);
     pool_init(&heap->dict_pool,     sizeof(AerDict),      64);
     pool_init(&heap->function_pool, sizeof(AerFunction),  64);
-    pool_init(&heap->struct_pool,   sizeof(AerStruct) + MAX_STRUCT_FIELDS * sizeof(AerVal), 64);
+    for (unsigned int i = 0; i < STRUCT_PAYLOAD_TIER_COUNT; i++)
+        pool_init(&heap->struct_pools[i], sizeof(AerStruct) + STRUCT_PAYLOAD_TIER_SIZE[i], STRUCT_TIER_ELEMS_PER_SLAB[i]);
     pool_init(&heap->packed_array_pool, sizeof(AerPackedArray), 64);
     pool_init(&heap->typed_array_pool, sizeof(AerTypedArray), 64);
     pool_init(&heap->result_pool,   sizeof(AerResult),   64);
@@ -245,12 +263,14 @@ void aer_debug_memory_report(FILE* out) {
     }
     fprintf(out, "  function header %10llu B  payload %10llu B\n", fn_hdr, fn_payload);
 
-    /* header = the fixed per-cell reservation; payload = each instance's own Shape.instance_bytes
-       (mixed raw/boxed per field now, not a uniform field_count * sizeof(AerVal)) -- the gap is
-       MAX_STRUCT_FIELDS's over-provisioning cost plus whatever typed fields saved by being raw. */
+    /* header = the fixed per-cell reservation; payload = each instance's own Shape.instance_bytes.
+       Now size-classed (struct_pools[], one per STRUCT_PAYLOAD_TIER_SIZE tier) rather than one
+       pool sized for MAX_STRUCT_FIELDS worst-case every time -- the remaining gap is just each
+       instance's own distance up to its tier's ceiling, not a flat 256-byte-regardless-of-shape
+       tax anymore. */
     uint64_t struct_hdr = 0, struct_payload = 0;
-    {
-        Pool* p = &heap->struct_pool;
+    for (unsigned int t = 0; t < STRUCT_PAYLOAD_TIER_COUNT; t++) {
+        Pool* p = &heap->struct_pools[t];
         for (unsigned int i = 0; i < p->slab_count; i++) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
@@ -452,7 +472,8 @@ void vm_free(VM* vm) {
     pool_destroy(&heap->array_pool);
     pool_destroy(&heap->dict_pool);
     pool_destroy(&heap->function_pool);
-    pool_destroy(&heap->struct_pool);
+    for (unsigned int i = 0; i < STRUCT_PAYLOAD_TIER_COUNT; i++)
+        pool_destroy(&heap->struct_pools[i]);
     pool_destroy(&heap->packed_array_pool);
     pool_destroy(&heap->typed_array_pool);
     pool_destroy(&heap->result_pool);
@@ -2573,7 +2594,7 @@ lbl_call_builtin: {
     bool handled = vm_call_builtin(c, builtin_id, args, arg_count, &registers[dest_reg]);
     if (!handled) error("'%s' is not defined, or was called with the wrong number of arguments",
                         aer_as_string(c->pool[name_idx])->data);
-    gc_maybe_collect(vm);   /* vm_call_builtin: struct_pool site + aer_make_string (type()) */
+    gc_maybe_collect(vm);   /* vm_call_builtin: a struct_pools tier site + aer_make_string (type()) */
     DISPATCH();
 }
 
@@ -2917,8 +2938,8 @@ lbl_iter_range_loop: {
     DISPATCH();
 }
 
-/* chunk_find_shape() by name, arity check, one struct_pool allocation, trailing fields
-   default-filled. */
+/* chunk_find_shape() by name, arity check, one struct_pools[] allocation (sized to the tier this
+   shape's instance_bytes fits), trailing fields default-filled. */
 lbl_struct_new: {
     int dest_reg           = (int)UNPACK_A(op_word);
     int arg_reg_base       = (int)UNPACK_B(op_word);
@@ -2943,7 +2964,7 @@ lbl_struct_new: {
         }
         if (!vm_check_narrow_field_write(declared, shape->field_narrow[i], registers[arg_reg_base + i])) DISPATCH();
     }
-    AerStruct* s = heap_alloc(&vm->heap, &vm->heap.struct_pool);
+    AerStruct* s = heap_alloc(&vm->heap, struct_pool_for_size(&vm->heap, shape->instance_bytes));
     s->shape  = shape;
     s->fields = (unsigned char*)s + sizeof(AerStruct);
     for (int i = 0; i < arg_count; i++)
@@ -2951,7 +2972,7 @@ lbl_struct_new: {
     for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
         vm_struct_field_write(s, i, vm_default_value(vm, shape->field_defaults[i]));
     registers[dest_reg] = aer_struct_val(s);
-    gc_maybe_collect(vm);   /* pool_alloc(&struct_pool) above, plus any vm_default_value array/dict defaults -- all rooted now that the struct itself is stored */
+    gc_maybe_collect(vm);   /* pool_alloc(&struct_pools[tier]) above, plus any vm_default_value array/dict defaults -- all rooted now that the struct itself is stored */
     DISPATCH();
 }
 

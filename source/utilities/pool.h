@@ -50,8 +50,8 @@ typedef struct {
        young_slab_head (POOL_NO_SLAB if none). slab_young_count[] alone only lets pool_sweep skip a
        fully-old-or-free slab's per-CELL scan in O(1) -- the sweep's own outer loop still visited
        EVERY slab index just to read that one flag, every single minor cycle, an O(slab_count) cost
-       that dominates once a large grow-only pool (struct_array_scan.aer's 2M-particle struct_pool,
-       ~2000 slabs) has accumulated many fully-promoted slabs behind a live construction phase. This
+       that dominates once a large grow-only pool (struct_array_scan.aer's 2M-particle struct_pools
+       tier, ~2000 slabs) has accumulated many fully-promoted slabs behind a live construction phase. This
        thread lets a minor pool_sweep walk ONLY the slabs that still have >=1 young cell, true
        O(live young slabs) instead. Doubly-linked (not singly, unlike slab_free_list/free_slab_head
        above) because removal can happen to ANY slab in the thread, not just the head -- pool_sweep

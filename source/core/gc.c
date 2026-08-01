@@ -270,21 +270,29 @@ static void free_result(void* cell)   { (void)cell; }   /* both fields are plain
 
 /* Every pool a VmHeap owns, by field offset (not a raw Pool* -- these describe VmHeap's shape once,
    generically, rather than one specific instance), paired with its finalizer. The single place all
-   8 pools are listed together; gc_finalize_all_pools, pool_sweep's call in gc_collect below, and
+   pools are listed together; gc_finalize_all_pools, pool_sweep's call in gc_collect below, and
    gc_count_live_cells all walk this instead of repeating their own hand-written list -- which is
-   exactly how gc_count_live_cells came to silently omit result_pool before. */
+   exactly how gc_count_live_cells came to silently omit result_pool before. struct_pools is
+   STRUCT_PAYLOAD_TIER_COUNT (vm.h) separate size-classed pools, not one -- each gets its own entry
+   here (offsetof on an array element with a constant index is valid C), all sharing the same
+   free_struct no-op finalizer since which tier a cell came from never matters for freeing it. */
 typedef struct { size_t offset; void (*on_free)(void* cell); } PoolEntry;
 static const PoolEntry pool_table[] = {
     { offsetof(VmHeap, string_pool),       free_string },
     { offsetof(VmHeap, array_pool),        free_array },
     { offsetof(VmHeap, dict_pool),         free_dict },
     { offsetof(VmHeap, function_pool),     free_function },
-    { offsetof(VmHeap, struct_pool),       free_struct },
+    { offsetof(VmHeap, struct_pools[0]),   free_struct },
+    { offsetof(VmHeap, struct_pools[1]),   free_struct },
+    { offsetof(VmHeap, struct_pools[2]),   free_struct },
+    { offsetof(VmHeap, struct_pools[3]),   free_struct },
+    { offsetof(VmHeap, struct_pools[4]),   free_struct },
     { offsetof(VmHeap, packed_array_pool), free_packed_array },
     { offsetof(VmHeap, typed_array_pool),  free_typed_array },
     { offsetof(VmHeap, result_pool),       free_result },
 };
 #define POOL_TABLE_COUNT (sizeof(pool_table) / sizeof(pool_table[0]))
+_Static_assert(STRUCT_PAYLOAD_TIER_COUNT == 5, "pool_table above hardcodes 5 struct_pools[] entries -- update both together");
 
 static inline Pool* pool_at(VmHeap* heap, size_t offset) { return (Pool*)((char*)heap + offset); }
 
