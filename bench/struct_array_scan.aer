@@ -31,9 +31,16 @@ function make_particles(n):
         i += 1
     return particles
 
-function advance_pass(particles, n, dt):
-    i = 0
-    for i < n:
+# n derived via length(particles) here (not taken as a parameter) and the loop written as
+# `for i in 0..n:` (not a manual `for i < n:` while-loop) -- matching nbody.aer's advance()'s own
+# idiom exactly, since that's what the loop-bound-hoisting safety proof (parser.c) keys off: it
+# only recognizes a range-for whose end is a local proven == length(some parameter), not an
+# arbitrary passed-in count claimed to match. Unlocks unchecked, cache-friendly array-of-structs
+# indexing for `particles[i]` (SPEC_KIND_ARRAY_OF_STRUCTS) that the previous while-loop form,
+# despite being computationally identical, could never qualify for.
+function advance_pass(particles, dt):
+    n = length(particles)
+    for i in 0..n:
         pi = particles[i]
         vx = pi.vx
         vy = pi.vy
@@ -41,13 +48,12 @@ function advance_pass(particles, n, dt):
         pi.x += vx * dt
         pi.y += vy * dt
         pi.z += vz * dt
-        i += 1
 
 particles = make_particles(N)
 start = time.now()
 p = 0
 for p < PASSES:
-    advance_pass(particles, N, 0.01)
+    advance_pass(particles, 0.01)
     p += 1
 dur = time.now() - start
 print("struct_array_scan: {N} particles x {PASSES} passes in {dur}s, x[0]={particles[0].x}")
