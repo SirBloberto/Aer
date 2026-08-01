@@ -20,12 +20,13 @@ for i < N:
 
 # Averaging toward b each pass is a contraction (a stays bounded, converging toward b) -- keeps
 # the values well away from overflow across many thousands of passes, while still doing a real
-# add and a real mul over the whole array every single pass.
+# add and a real mul over the whole array every single pass. Written as one expression (not a
+# separate `c = a + b` statement) so parse_binary_ops's typed-array chain fusion (vm.c's
+# OP_TYPED_ARRAY_CHAIN2) actually applies -- (a + b) never materializes as its own array at all.
 start = time.now()
 p = 0
 for p < PASSES:
-    c = a + b
-    a = c * half
+    a = (a + b) * half
     p += 1
 dur = time.now() - start
 print("typed_elementwise: {N} elems x {PASSES} passes in {dur}s, a[0]={a[0]}")

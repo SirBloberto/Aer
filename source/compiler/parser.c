@@ -1934,6 +1934,34 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             c->count = lhs_start;   /* discard lhs's OP_FIELD_GET, never executed */
         }
 
+        /* Fusion of `(A op1 B) op2 C` into one typed-array pass (OP_TYPED_ARRAY_CHAIN2, vm.c) --
+           checked the same way and at the same point as lhs_is_field just above: lhs's own
+           just-emitted code, before parsing the outer RHS, so there's no risk of excising
+           something an RHS jump target depends on. Requires BOTH operators to be one of the 3
+           fusable arithmetic ones (matching vm.c's own op_chain2_index) and the inner op's own
+           operands to be plain registers, not constants -- a constant operand would need
+           materializing into one first, simpler to just not fuse that narrower case for now, same
+           "fails closed" philosophy as index_safe_unchecked and friends: an unrecognized shape
+           just takes the ordinary, already-correct unfused path. */
+        bool lhs_is_chain2 = false;
+        int lhs_chain2_a = 0, lhs_chain2_b = 0;
+        Opcode lhs_chain2_op1 = OP_ADD;
+        if (!lhs_is_field && c->count - lhs_start == 1) {
+            uint32_t w = c->code[lhs_start];
+            Opcode wop = (Opcode)(w & 0xFF);
+            if ((wop == OP_ADD || wop == OP_SUB || wop == OP_MUL) && (int)UNPACK_A(w) == lhs &&
+                (op == OP_ADD || op == OP_SUB || op == OP_MUL)) {
+                uint8_t a8 = (uint8_t)UNPACK_B(w), b8 = (uint8_t)UNPACK_C(w);
+                if (!RK8_IS_CONST(a8) && !RK8_IS_CONST(b8)) {
+                    lhs_is_chain2 = true;
+                    lhs_chain2_op1 = wop;
+                    lhs_chain2_a = RK8_INDEX(a8);
+                    lhs_chain2_b = RK8_INDEX(b8);
+                    c->count = lhs_start;   /* discard the inner op, never executed as its own instruction */
+                }
+            }
+        }
+
         unsigned int rhs_start = c->count;
         int rhs = parse_binary(c, prec);   /* same precedence as floor -> left-associative */
 
@@ -1950,6 +1978,20 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             }
             chunk_emit(c, PACK3(OP_FIELD_BINARY, dest, lhs_struct_reg, op));
             chunk_emit(c, PACK_2X16(lhs_field_idx, pack_rk16(rhs)));
+            lhs = dest;
+            lhs_start = c->count;
+            continue;
+        }
+
+        if (lhs_is_chain2) {
+            /* C must be a plain register too -- the opcode reads registers[c_reg] directly, no RK
+               decode. materialize handles both "was raw" and "was a bare constant" in one call. */
+            int c_reg = materialize(c, rhs);
+            if (is_temp(c_reg)) reg_free(1);
+            int dest = reg_alloc();
+            chunk_emit(c, PACK3(OP_TYPED_ARRAY_CHAIN2, dest, lhs_chain2_a, lhs_chain2_b));
+            chunk_emit(c, PACK_2X16((uint16_t)lhs_chain2_op1, (uint16_t)c_reg));
+            chunk_emit(c, (uint32_t)op);
             lhs = dest;
             lhs_start = c->count;
             continue;

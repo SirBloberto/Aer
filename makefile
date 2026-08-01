@@ -59,6 +59,7 @@ TESTS := tests/test_core.aer \
          tests/test_dict_pool_stress.aer \
          tests/test_packed_arrays.aer \
          tests/test_typed_arrays.aer \
+         tests/test_typed_array_chain2.aer \
          tests/test_narrow_fields.aer \
          tests/test_shape_specialization.aer \
          tests/test_loop_bound_hoisting.aer \

@@ -196,6 +196,15 @@ typedef enum {
        operand shape as OP_FIELD_BINARY (dest slot unused, no destination register needed). */
     OP_FIELD_COMPOUND, /* struct_reg, field_name_pool_idx, bin_op, rk_rhs */
 
+    /* Fusion of `(A op1 B) op2 C` written as one expression -- parse_binary_ops truncates the
+       just-emitted "A op1 B" (when it's exactly one plain boxed binary op) and re-encodes it as
+       this opcode's own operands, alongside the outer op2/C. Checked at runtime whether A/B/C are
+       all matching-shape typed arrays (the only case this actually fuses); anything else computes
+       the exact unfused result instead, same value either way. See vm_typed_array_chain2's own
+       comment (vm.c) for why this exists -- eliminates a whole intermediate array, not just an
+       allocation, for a chained elementwise typed-array transform. */
+    OP_TYPED_ARRAY_CHAIN2, /* dest_reg, a_reg, b_reg; word1: op1(hi16)/c_reg(lo16); word2: op2 */
+
     /* Shell mode: a bare statement's non-null result is printed. */
     OP_PRINT_REPL, /* operand: src_reg -- prints registers[src_reg] unless it's TYPE_NULL */
 
@@ -556,6 +565,12 @@ _Static_assert(offsetof(struct AerStruct, gc_state) == 0, "pool.c assumes gc_sta
 AerVal vm_struct_field_read(AerStruct* s, unsigned int slot);
 void   vm_struct_field_write(AerStruct* s, unsigned int slot, AerVal v);
 
+/* Byte width of one element: 4 for int32/float32, 8 for int64/float64. Not file-static -- gc.c's
+   free_typed_array needs it too, to recompute a dying typed array's data-buffer size (count is
+   already on the struct; the byte width isn't) before deciding whether it qualifies for the
+   free-cache above. */
+unsigned int vm_typed_elem_width(TypedArrayElemKind kind);
+
 /* Which runtime shape a shape-sensitive parameter arrived as, at the point specialization was
    triggered. STRUCT/PACKED_ARRAY both carry a hard structural guarantee (a struct instance's shape
    never changes; a packed array can't hold mixed shapes by construction) -- safe with no further
@@ -773,9 +788,29 @@ typedef struct {
     unsigned int count, cap;
 } MarkWorklist;
 
+/* Small, size-keyed free-list cache for typed-array DATA buffers -- the variable-sized payload
+   (count * elem width), not the fixed-size AerTypedArray header, which already goes through
+   typed_array_pool above like every other GC-tracked object. Repeatedly transforming a typed
+   array of the same shape (`c = a + b; a = c * half`, elementwise-style code) otherwise churns
+   plain malloc/free every single pass even though the size never changes. A handful of slots,
+   linearly scanned (size classes/hashing would be overkill for what's meant to catch "the last
+   few buffers this exact size, freed a moment ago") and a per-buffer size ceiling (so one giant,
+   never-to-be-reused allocation can't sit here retaining memory indefinitely) keep this bounded.
+   Checked by vm_new_typed_array (vm.c) before calling xmalloc; populated by free_typed_array
+   (gc.c) instead of calling free(), whenever there's a free slot and the buffer qualifies. */
+#define TYPED_ARRAY_FREE_CACHE_SLOTS     8
+#define TYPED_ARRAY_FREE_CACHE_MAX_BYTES (4u * 1024 * 1024)
+
+typedef struct {
+    size_t         size;   /* 0 = empty slot */
+    unsigned char* ptr;
+} TypedArrayFreeSlot;
+
 typedef struct {
     Pool string_pool, array_pool, dict_pool, function_pool, struct_pool, packed_array_pool, typed_array_pool, result_pool;
     bool pools_initialized;
+
+    TypedArrayFreeSlot typed_array_free_cache[TYPED_ARRAY_FREE_CACHE_SLOTS];
 
     /* Old objects a write barrier caught holding a young reference; entries are only ever
        added/deduped, never removed, and re-traced as extra roots on every minor collection

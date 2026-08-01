@@ -242,7 +242,30 @@ static void free_dict(void* cell)     { AerDict* d = (AerDict*)cell; hashtable_f
 static void free_function(void* cell) { (void)cell; }   /* nothing to free -- no closure upvalues array anymore */
 static void free_struct(void* cell)   { (void)cell; }   /* items lives inline in this same cell -- nothing separate to free */
 static void free_packed_array(void* cell) { free(((AerPackedArray*)cell)->data); }
-static void free_typed_array(void* cell)  { free(((AerTypedArray*)cell)->data); }
+/* Stashes the data buffer into current_heap's free-cache (vm.h's own comment on TypedArrayFreeSlot)
+   instead of actually freeing it, when there's a free slot and the buffer qualifies (nonzero size,
+   at or under the per-buffer ceiling) -- vm_new_typed_array (vm.c) checks that same cache before
+   ever calling xmalloc, so a typed array repeatedly rebuilt at the same size (an elementwise-
+   transform loop's own shape) reuses the buffer instead of churning malloc/free every pass.
+   current_heap is guaranteed to be the heap this cell actually belongs to here: vm_run_slice sets
+   it for the ordinary minor/major GC path, and vm_free (vm.c) now explicitly saves/sets/restores
+   it around the whole-heap teardown finalize pass this function is also reachable from. */
+static void free_typed_array(void* cell) {
+    AerTypedArray* ta = (AerTypedArray*)cell;
+    if (!ta->data) return;
+    size_t size = (size_t)ta->count * vm_typed_elem_width(ta->elem_kind);
+    VmHeap* heap = vm_current_heap();
+    if (heap && size > 0 && size <= TYPED_ARRAY_FREE_CACHE_MAX_BYTES) {
+        for (unsigned int i = 0; i < TYPED_ARRAY_FREE_CACHE_SLOTS; i++) {
+            if (heap->typed_array_free_cache[i].size == 0) {
+                heap->typed_array_free_cache[i].size = size;
+                heap->typed_array_free_cache[i].ptr  = ta->data;
+                return;
+            }
+        }
+    }
+    free(ta->data);
+}
 static void free_result(void* cell)   { (void)cell; }   /* both fields are plain AerVals -- nothing separately owned */
 
 /* Every pool a VmHeap owns, by field offset (not a raw Pool* -- these describe VmHeap's shape once,

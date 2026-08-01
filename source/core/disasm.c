@@ -127,6 +127,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_FIELD_BINARY] = { "OP_FIELD_BINARY", "fused: reg = struct.field OP rk (field on the left)", {0}, false, 1, 0 },
     /* word0: struct_reg+bin_op. word1: field_idx16+rk16. */
     [OP_FIELD_COMPOUND] = { "OP_FIELD_COMPOUND", "fused: struct.field OP= rk (resolved once, no dest reg)", {0}, false, 1, 0 },
+    /* word0: dest+a_reg+b_reg. word1: op1(hi16)+c_reg(lo16). word2: op2. */
+    [OP_TYPED_ARRAY_CHAIN2] = { "OP_TYPED_ARRAY_CHAIN2", "fused: reg = (reg op1 reg) op2 reg (typed-array chain, runtime-checked)", {0}, false, 2, 0 },
     [OP_PRINT_REPL] = { "OP_PRINT_REPL", "shell mode: print reg unless null", {FLD_REG}, false, 0, 1 },
 
     /* Raw-arithmetic family -- special-cased below; fields[]/packed/trailing_words kept for
@@ -521,6 +523,15 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         uint32_t field_rk_word = c->code[pos++];
         print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_rk_word));
         print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
+    } else if (op == OP_TYPED_ARRAY_CHAIN2) {
+        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
+        uint32_t word1 = c->code[pos++];
+        print_field(out, c, FLD_BINOP, (int)UNPACK_2X16_HI(word1));
+        print_field(out, c, FLD_REG,   (int)UNPACK_2X16_LO(word1));
+        uint32_t op2 = c->code[pos++];
+        print_field(out, c, FLD_BINOP, (int)op2);
     } else if (op == OP_RAW_LOAD_INT) {
         print_rawi(out, (int)UNPACK_A(op_word));
         int32_t imm = (int32_t)c->code[pos++];
