@@ -6,6 +6,14 @@ import time
 SIZE = 800
 MAX_ITER = 200
 
+# The two OUTER loops here are range-for (not manual `for x < limit:` while-loops), same fix as
+# sieve.aer/struct_array_scan.aer -- their trip count is fixed (SIZE, no early exit), so the fused
+# OP_ITER_RANGE_LOOP is a clean win. The INNER per-point loop below deliberately stays a manual
+# while-loop: its trip count is highly data-dependent (`return iter` escapes anywhere from 1 to
+# max_iter), and measurement showed range-for's fused single branch actually predicts WORSE than
+# separate compare/jump/increment ops under that kind of call-to-call variance (branch-misses rose
+# ~9x, 7.45M -> 65.66M, more than offsetting the raw instruction-count win) -- not every loop shape
+# benefits from this fusion equally.
 function mandelbrot_point(cx, cy, max_iter):
     x = 0.0
     y = 0.0
@@ -24,15 +32,11 @@ function mandelbrot_point(cx, cy, max_iter):
 
 start = time.now()
 inside_count = 0
-py = 0
-for py < SIZE:
-    px = 0
-    for px < SIZE:
+for py in 0..SIZE:
+    for px in 0..SIZE:
         cx = float(px) / float(SIZE) * 3.5 - 2.5
         cy = float(py) / float(SIZE) * 2.0 - 1.0
         if mandelbrot_point(cx, cy, MAX_ITER) == MAX_ITER:
             inside_count += 1
-        px += 1
-    py += 1
 dur = time.now() - start
 print("mandelbrot {SIZE}x{SIZE}: {dur}s, inside={inside_count}")
