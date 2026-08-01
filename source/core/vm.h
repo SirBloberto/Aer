@@ -827,6 +827,15 @@ typedef struct {
        across all pools since the last minor GC; major_gc_every_n_minor runs a major pass after
        that many minor ones. 0 for gc_live_cell_ceiling means unlimited (aer_gc_set_ceiling). */
     unsigned int minor_gc_threshold, major_gc_every_n_minor, gc_live_cell_ceiling;
+    /* minor_gc_threshold's own floor -- gc_rescale_minor_threshold (gc.c) recomputes
+       minor_gc_threshold itself after every major collection as max(this floor, current live
+       cell count), so a program with a large, mostly-static live heap (see gc_rescale_minor_
+       threshold's own comment) automatically gets a bigger nursery instead of re-tracing that
+       same live data on every major almost as often as a program with barely any live data at
+       all. Never itself mutated by that rescale -- only aer_gc_configure changes it -- which is
+       what lets the threshold shrink back down again if the live set is later freed, instead of
+       ratcheting upward forever. */
+    unsigned int minor_gc_threshold_floor;
     unsigned int minor_collections_run, major_collections_run, minor_since_major;
     int          gc_suppress_depth;
 

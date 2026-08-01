@@ -72,6 +72,7 @@ static void vm_heap_init(VmHeap* heap) {
         heap->typed_array_free_cache[i].ptr  = NULL;
     }
     heap->minor_gc_threshold     = default_minor_gc_threshold;
+    heap->minor_gc_threshold_floor = default_minor_gc_threshold;
     heap->major_gc_every_n_minor = default_major_gc_every_n_minor;
     heap->gc_live_cell_ceiling   = default_gc_live_cell_ceiling;
     heap->pools_initialized = true;
@@ -148,7 +149,7 @@ void aer_gc_configure(unsigned int minor_threshold, unsigned int major_every_n_m
     /* Also apply immediately to whichever heap is already current, if one exists -- so
        reconfiguring an already-running VM takes effect right away, not just for the next one. */
     VmHeap* heap = require_current_heap();
-    if (minor_threshold)     heap->minor_gc_threshold     = minor_threshold;
+    if (minor_threshold)     { heap->minor_gc_threshold = minor_threshold; heap->minor_gc_threshold_floor = minor_threshold; }
     if (major_every_n_minor) heap->major_gc_every_n_minor = major_every_n_minor;
 }
 
