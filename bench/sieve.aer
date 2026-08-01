@@ -9,10 +9,16 @@ function sieve(limit):
     for p in 2..n:
         if is_composite[p] == 0:
             count += 1
-            multiple = p * p
-            for multiple <= limit:
-                is_composite[multiple] = 1
-                multiple += p
+            # A range-for (not a manual `for multiple <= limit:` while-loop) so the marking pass
+            # gets the same loop-rotated single-dispatch condition+advance (OP_ITER_RANGE_LOOP)
+            # every other range-for in this codebase already gets, instead of 4 separate boxed
+            # dispatches (compare, jump, add, jump-back) per marked multiple. Guarded by `p*p < n`
+            # first: range-for direction is inferred from start vs end (a positive step works for
+            # either), so an unguarded `(p*p)..n..p` would silently iterate DESCENDING instead of
+            # being empty on the (common, for p near sqrt(limit)) case where p*p already >= n.
+            if p * p < n:
+                for multiple in (p * p)..n..p:
+                    is_composite[multiple] = 1
     return count
 
 LIMIT = 10000000
