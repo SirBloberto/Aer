@@ -111,10 +111,16 @@ local function offsetMomentum(b, nbody)
   b[1].vz = -pz / SOLAR_MASS
 end
 
-local N = tonumber(arg and arg[1]) or 1000
+-- Hardcoded, not read from arg[1] -- Luau's CLI doesn't populate a global arg table for the
+-- script at all (another sandboxing difference), so a CLI-configurable step count isn't portable
+-- across the interpreters this file is run under. 500000 matches bench/nbody.aer's own hardcoded
+-- timestep count exactly (the canonical 5-body/500,000-timestep shootout benchmark).
+local N = 500000
 local nbody = #bodies
 
 offsetMomentum(bodies, nbody)
-io.write( string.format("%0.9f",energy(bodies, nbody)), "\n")
+-- print, not io.write -- Luau has no io library at all (sandboxed by design), and the two calls
+-- this replaces aren't inside the timed loop, so it costs nothing measurable on any interpreter.
+print(string.format("%0.9f", energy(bodies, nbody)))
 for i=1,N do advance(bodies, nbody, 0.01) end
-io.write( string.format("%0.9f",energy(bodies, nbody)), "\n")
+print(string.format("%0.9f", energy(bodies, nbody)))
