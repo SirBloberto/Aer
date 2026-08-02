@@ -329,6 +329,22 @@ typedef enum {
        machinery (var_kind/var_lookup_rk), completely unaware this value ever arrived boxed. */
     OP_UNBOX_PARAM_INT, OP_UNBOX_PARAM_REAL,
 
+    /* A bare comparison as the WHOLE condition of an if/while (parse_if/parse_for_while, parser.c)
+       collapses the comparison and its OP_JUMP_IF_FALSE_REG into one dispatch -- the comparison's
+       boolean result was only ever going to be read once, immediately, by the jump that follows it,
+       so materializing it into a register just to re-read and vm_truthy()-check it a moment later
+       is pure overhead. Found via fib_bench's own opcode-hit profile: OP_LT + OP_JUMP_IF_FALSE_REG
+       together were ~41% of all dispatches for `if n < 2`. Deliberately narrow -- only the 6 plain
+       BOXED comparisons (never raw or raw-boxed; those already have their own faster opcodes, see
+       try_emit_cmp_raw_boxed/try_emit_binary_raw) and only when the comparison is the ENTIRE
+       condition with nothing else emitted around it (`not`, `and`/`or`, or any other wrapping
+       expression all correctly fall back to the ordinary, unfused path).
+       word0 = PACK3(op, 0 [unused -- no destination register, the result is never stored],
+                     rk_lhs8, rk_rhs8)
+       word1 = jump target (same as OP_JUMP_IF_FALSE_REG's own trailing word) */
+    OP_EQ_JUMP_IF_FALSE, OP_NEQ_JUMP_IF_FALSE,
+    OP_LT_JUMP_IF_FALSE, OP_GT_JUMP_IF_FALSE, OP_LTE_JUMP_IF_FALSE, OP_GTE_JUMP_IF_FALSE,
+
     OP_OPCODE_COUNT_MARKER   /* not a real opcode -- sizes the static assert below */
 } Opcode;
 _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — widen the opcode field");

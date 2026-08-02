@@ -346,8 +346,10 @@ assert(is_order_arr[0] == 999 and is_order_arr[1] == 200,
 #     via plain OP_JUMP_IF_FALSE.                                      #
 # ------------------------------------------------------------------ #
 
-# Each of these routes the comparison through an actual `if` CONDITION (emit_jump_if_false_reg) —
-# not through a plain boolean-valued function argument, which would never touch it at all.
+# Each of these routes the comparison through an actual `if` CONDITION — a bare comparison as the
+# WHOLE condition collapses into one OP_*_JUMP_IF_FALSE dispatch (emit_cond_jump_if_false,
+# parser.c); every non-fusing case below still falls back to materialize + OP_JUMP_IF_FALSE_REG.
+# Not routed through a plain boolean-valued function argument, which would never touch either path.
 if 1 == 1:
     cb_r = true
 else:

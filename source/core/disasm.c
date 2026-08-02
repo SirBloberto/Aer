@@ -34,8 +34,8 @@ typedef struct {
     int packed;
 } OpInfo;
 
-/* OP_UNBOX_PARAM_REAL is the last member of the Opcode enum (vm.h). */
-#define OP_INFO_MAX OP_UNBOX_PARAM_REAL
+/* OP_GTE_JUMP_IF_FALSE is the last member of the Opcode enum (vm.h). */
+#define OP_INFO_MAX OP_GTE_JUMP_IF_FALSE
 
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* OP_ADD..OP_IN: one opcode per operator, whole instruction in one word (PACK3 + RK8 pair) --
@@ -218,6 +218,12 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
 
     [OP_UNBOX_PARAM_INT]  = { "OP_UNBOX_PARAM_INT",  "specialized: rawi = unbox(reg) [untagged]" },
     [OP_UNBOX_PARAM_REAL] = { "OP_UNBOX_PARAM_REAL", "specialized: rawr = unbox(reg) [untagged]" },
+    [OP_EQ_JUMP_IF_FALSE]  = { "OP_EQ_JUMP_IF_FALSE",  "jump if !(rk == rk)", {0}, false, 1, 0 },
+    [OP_NEQ_JUMP_IF_FALSE] = { "OP_NEQ_JUMP_IF_FALSE", "jump if !(rk != rk)", {0}, false, 1, 0 },
+    [OP_LT_JUMP_IF_FALSE]  = { "OP_LT_JUMP_IF_FALSE",  "jump if !(rk < rk)",  {0}, false, 1, 0 },
+    [OP_GT_JUMP_IF_FALSE]  = { "OP_GT_JUMP_IF_FALSE",  "jump if !(rk > rk)",  {0}, false, 1, 0 },
+    [OP_LTE_JUMP_IF_FALSE] = { "OP_LTE_JUMP_IF_FALSE", "jump if !(rk <= rk)", {0}, false, 1, 0 },
+    [OP_GTE_JUMP_IF_FALSE] = { "OP_GTE_JUMP_IF_FALSE", "jump if !(rk >= rk)", {0}, false, 1, 0 },
     [OP_RAW_LT_INT_BOXED]   = { "OP_RAW_LT_INT_BOXED",   "reg = rawi < reg (tag-checked)" },
     [OP_RAW_GT_INT_BOXED]   = { "OP_RAW_GT_INT_BOXED",   "reg = rawi > reg (tag-checked)" },
     [OP_RAW_LTE_INT_BOXED]  = { "OP_RAW_LTE_INT_BOXED",  "reg = rawi <= reg (tag-checked)" },
@@ -351,6 +357,11 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rk8(out, c, UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
+    } else if (op == OP_EQ_JUMP_IF_FALSE || op == OP_NEQ_JUMP_IF_FALSE || op == OP_LT_JUMP_IF_FALSE ||
+               op == OP_GT_JUMP_IF_FALSE || op == OP_LTE_JUMP_IF_FALSE || op == OP_GTE_JUMP_IF_FALSE) {
+        print_rk8(out, c, UNPACK_B(op_word));
+        print_rk8(out, c, UNPACK_C(op_word));
+        print_field(out, c, FLD_JUMP, (int)c->code[pos++]);
     } else if (op == OP_INDEX_GET || op == OP_TYPED_INDEX_GET_UNCHECKED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));

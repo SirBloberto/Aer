@@ -2024,6 +2024,13 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
 
         [OP_UNBOX_PARAM_INT]  = &&lbl_unbox_param_int,
         [OP_UNBOX_PARAM_REAL] = &&lbl_unbox_param_real,
+
+        [OP_EQ_JUMP_IF_FALSE]  = &&lbl_eq_jump_if_false,
+        [OP_NEQ_JUMP_IF_FALSE] = &&lbl_neq_jump_if_false,
+        [OP_LT_JUMP_IF_FALSE]  = &&lbl_lt_jump_if_false,
+        [OP_GT_JUMP_IF_FALSE]  = &&lbl_gt_jump_if_false,
+        [OP_LTE_JUMP_IF_FALSE] = &&lbl_lte_jump_if_false,
+        [OP_GTE_JUMP_IF_FALSE] = &&lbl_gte_jump_if_false,
     };
 
     DISPATCH();
@@ -2167,6 +2174,40 @@ BINARY_OP_INT_ONLY(rshift, OP_RSHIFT, { *result = aer_int(l >> rv); })
 
 #undef BINARY_OP_INT_REAL
 #undef BINARY_OP_INT_ONLY
+
+/* Fused comparison-and-branch (vm.h's own comment on OP_LT_JUMP_IF_FALSE et al. has the full
+   rationale) -- no destination register at all, the truth value is consumed immediately by the
+   branch decision below instead of being written out and read back. The cold (non-int/non-real)
+   path skips gc_maybe_collect() unlike BINARY_OP_INT_REAL's shared cold path above -- a boolean
+   result never allocates, on any operand type, so there is nothing here for a collection to ever
+   need to run for. */
+#define CMP_JUMP_IF_FALSE(NAME, OPENUM, INT_CMP, REAL_CMP) \
+lbl_##NAME##_jump_if_false: { \
+    AerVal* ra = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word)); \
+    AerVal* rb = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word)); \
+    ValueType ta = ra->tag, tb = rb->tag; \
+    int target = READ(); \
+    bool cond; \
+    if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) { \
+        int64_t l = ra->as.i, rv = rb->as.i; \
+        cond = (INT_CMP); \
+    } else if (ta == TYPE_REAL && tb == TYPE_REAL) { \
+        double l = ra->as.d, rv = rb->as.d; \
+        cond = (REAL_CMP); \
+    } else { \
+        cond = vm_truthy(vm_binary_cold(c, *ra, *rb, OPENUM, ta, tb)); \
+    } \
+    if (!cond) ip = (unsigned int)target; \
+    DISPATCH(); \
+}
+
+CMP_JUMP_IF_FALSE(eq,  OP_EQ,  l == rv, l == rv)
+CMP_JUMP_IF_FALSE(neq, OP_NEQ, l != rv, l != rv)
+CMP_JUMP_IF_FALSE(lt,  OP_LT,  l <  rv, l <  rv)
+CMP_JUMP_IF_FALSE(gt,  OP_GT,  l >  rv, l >  rv)
+CMP_JUMP_IF_FALSE(lte, OP_LTE, l <= rv, l <= rv)
+CMP_JUMP_IF_FALSE(gte, OP_GTE, l >= rv, l >= rv)
+#undef CMP_JUMP_IF_FALSE
 
 /* No int/int or real/real fast path -- dispatches straight to the shared vm_in(). */
 lbl_in: {

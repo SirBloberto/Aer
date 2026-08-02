@@ -274,6 +274,8 @@ static int box_if_raw(Chunk* c, int rk);
    (a no-op for a plain register or constant) -- only parse_binary_ops's own raw-composing path
    (try_emit_binary_raw) tries the native route before reaching here. */
 static int materialize(Chunk* c, int rk);
+/* Forward-declared so emit_cond_jump_if_false (below) can come before it. */
+static bool is_temp(int rk);
 
 static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
     rk_lhs = box_if_raw(c, rk_lhs);
@@ -286,6 +288,46 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
     if (!rk8_fits(rk_rhs)) { rk_rhs = materialize(c, rk_rhs); spilled++; }
     chunk_emit(c, PACK3(op, dest, pack_rk8(rk_lhs), pack_rk8(rk_rhs)));
     if (spilled) reg_free(spilled);
+}
+
+/* Emits the branch-on-false half of an if/while condition. Fuses a bare, plain-boxed comparison --
+   nothing else emitted around it -- directly with the branch into one dispatch instead of
+   materializing its result into a register just to read it straight back a moment later
+   (OP_LT_JUMP_IF_FALSE and its 5 siblings, vm.h's own comment has the full rationale and the
+   fib_bench profile that motivated it). Detected the same way this file's other retrofit fusions
+   are (lhs_is_field/lhs_is_chain2 in parse_binary_ops, the FMA fusion in parse_assignment): look at
+   what was JUST compiled, before anything else runs, and roll it back if it matches. Falls back to
+   the ordinary materialize+emit_jump_if_false_reg path for every other condition shape --
+   and/or, a bare boolean, a non-comparison expression, a raw or raw-boxed comparison (already
+   faster via their own dedicated opcodes, see try_emit_cmp_raw_boxed/try_emit_binary_raw), or a
+   comparison whose operand needed spilling into a scratch register (more than one word emitted). */
+static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int cond_start) {
+    if (c->count - cond_start == 1) {
+        uint32_t w = c->code[cond_start];
+        bool matched = true;
+        Opcode fused_op;
+        switch ((Opcode)(w & 0xFF)) {
+            case OP_EQ:  fused_op = OP_EQ_JUMP_IF_FALSE;  break;
+            case OP_NEQ: fused_op = OP_NEQ_JUMP_IF_FALSE; break;
+            case OP_LT:  fused_op = OP_LT_JUMP_IF_FALSE;  break;
+            case OP_GT:  fused_op = OP_GT_JUMP_IF_FALSE;  break;
+            case OP_LTE: fused_op = OP_LTE_JUMP_IF_FALSE; break;
+            case OP_GTE: fused_op = OP_GTE_JUMP_IF_FALSE; break;
+            default: matched = false; fused_op = OP_EQ_JUMP_IF_FALSE; break;   /* value unused when matched is false */
+        }
+        if (matched && (int)UNPACK_A(w) == rk_cond) {
+            uint8_t rk_lhs8 = (uint8_t)UNPACK_B(w), rk_rhs8 = (uint8_t)UNPACK_C(w);
+            c->count = cond_start;   /* discard the standalone comparison -- fused below instead */
+            chunk_emit(c, PACK3(fused_op, 0, rk_lhs8, rk_rhs8));
+            unsigned int patch = c->count;
+            chunk_emit(c, 0);   /* placeholder -- patched by the caller, same convention as emit_jump_if_false_reg */
+            return patch;
+        }
+    }
+    int reg_cond = materialize(c, rk_cond);
+    unsigned int patch = emit_jump_if_false_reg(c, reg_cond);
+    if (is_temp(reg_cond)) reg_free(1);
+    return patch;
 }
 
 unsigned int emit_jump_if_false_reg(Chunk* c, int reg) {
@@ -2895,15 +2937,14 @@ static void parse_block(Chunk* c) {
 }
 
 static void parse_if(Chunk* c) {
+    unsigned int cond_start = c->count;
     int rk_cond = parse_binary(c, 0);
     require(TOKEN_COLON, "expected ':' after if condition");
     /* require() can't abort on failure -- without this, a malformed condition still compiles a
        real branch. */
     if (parse_had_error) return;
 
-    int reg_cond = materialize(c, rk_cond);
-    unsigned int patch_jif = emit_jump_if_false_reg(c, reg_cond);
-    if (is_temp(reg_cond)) reg_free(1);
+    unsigned int patch_jif = emit_cond_jump_if_false(c, rk_cond, cond_start);
 
     /* P.branch_depth disqualifies a variable assigned while nonzero from ever being raw-tracked --
        a name assigned different types down mutually-exclusive branches can't be resolved without
@@ -2947,9 +2988,10 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
     require(TOKEN_COLON, "expected ':' after for/while condition");
     if (parse_had_error) return;
 
-    int reg_cond = materialize(c, rk_cond);
-    unsigned int patch_exit = emit_jump_if_false_reg(c, reg_cond);
-    if (is_temp(reg_cond)) reg_free(1);
+    /* loop_top doubles as cond_start here -- it's already exactly "the bytecode offset the
+       condition's own first instruction starts at" (the same reason the loop's own back-edge
+       jumps there to re-evaluate the condition each iteration). */
+    unsigned int patch_exit = emit_cond_jump_if_false(c, rk_cond, loop_top);
 
     parse_loop_body(c, loop_top, patch_exit);
 }
