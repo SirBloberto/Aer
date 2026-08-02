@@ -2052,27 +2052,52 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
 
         /* Found via a per-opcode dispatch audit: `x OP y.field` compiled as OP_FIELD_GET immediately
            followed by OP_BINARY reading it back -- two dispatches for one operation. Recognized
-           by checking whether the RHS was exactly one bare field read (now 2 words). */
+           by checking whether the RHS was exactly one bare field read (now 2 words).
+           Reuses OP_FIELD_BINARY (`field OP' x`) rather than a mirror-image opcode of its own --
+           `x OP field` and `field OP' x` compute the identical result whenever op' is either op
+           itself (ADD/MUL/EQ/NEQ/bitwise -- all commutative) or op's reversed-order comparison
+           (LT/GT and LTE/GTE swap: `x < field` is exactly `field > x`, no different computation,
+           just the operands read in the other order). SUB/DIV/MOD/FLOOR_DIV/LSHIFT/RSHIFT/IN have
+           no such equivalent (`x - field` is not expressible as `field OP' x` for any single
+           operator OP') and fall through to the ordinary, unfused path below instead -- this is
+           the rarer argument order for exactly the operators that don't commute, so losing the
+           fusion only there (never for the common ADD/comparison cases) was judged an acceptable
+           trade against carrying a whole second, near-duplicate opcode (and its own vm_binary_fast
+           call site) for a fusion the other opcode can already express by construction. */
         if (c->count - rhs_start == 2 && (c->code[rhs_start] & 0xFF) == OP_FIELD_GET) {
-            int struct_reg = (int)UNPACK_B(c->code[rhs_start]);
-            unsigned int field_idx = c->code[rhs_start + 1];
-            c->count = rhs_start;   /* discard the OP_FIELD_GET just emitted, never executed */
-
-            /* rhs is always the OP_FIELD_GET result (never raw); lhs could be raw -- box it. */
-            lhs = box_if_raw(c, lhs);
-            if (is_temp(rhs)) reg_free(1);
-            if (is_temp(lhs)) reg_free(1);
-
-            int dest = reg_alloc();
-            if (!rk16_fits(lhs)) {
-                error_at("Expression too large to compile (register/constant index exceeds the fused field-op encoding's range)");
-                return lhs;
+            Opcode commuted_op;
+            bool commutable = true;
+            switch (op) {
+                case OP_ADD: case OP_MUL: case OP_EQ: case OP_NEQ:
+                case OP_BITWISE_AND: case OP_BITWISE_OR: case OP_BITWISE_XOR:
+                    commuted_op = op; break;
+                case OP_LT:  commuted_op = OP_GT;  break;
+                case OP_GT:  commuted_op = OP_LT;  break;
+                case OP_LTE: commuted_op = OP_GTE; break;
+                case OP_GTE: commuted_op = OP_LTE; break;
+                default: commutable = false; commuted_op = op; break;   /* SUB/DIV/MOD/FLOOR_DIV/LSHIFT/RSHIFT/IN -- order-sensitive, no fusion */
             }
-            chunk_emit(c, PACK3(OP_BINARY_FIELD, dest, struct_reg, op));
-            chunk_emit(c, PACK_2X16(field_idx, pack_rk16(lhs)));
-            lhs = dest;
-            lhs_start = c->count;
-            continue;
+            if (commutable) {
+                int struct_reg = (int)UNPACK_B(c->code[rhs_start]);
+                unsigned int field_idx = c->code[rhs_start + 1];
+                c->count = rhs_start;   /* discard the OP_FIELD_GET just emitted, never executed */
+
+                /* rhs is always the OP_FIELD_GET result (never raw); lhs could be raw -- box it. */
+                lhs = box_if_raw(c, lhs);
+                if (is_temp(rhs)) reg_free(1);
+                if (is_temp(lhs)) reg_free(1);
+
+                int dest = reg_alloc();
+                if (!rk16_fits(lhs)) {
+                    error_at("Expression too large to compile (register/constant index exceeds the fused field-op encoding's range)");
+                    return lhs;
+                }
+                chunk_emit(c, PACK3(OP_FIELD_BINARY, dest, struct_reg, commuted_op));
+                chunk_emit(c, PACK_2X16(field_idx, pack_rk16(lhs)));
+                lhs = dest;
+                lhs_start = c->count;
+                continue;
+            }
         }
 
         /* Tries a native raw op first (both provably int/real); false means not raw-composable, and

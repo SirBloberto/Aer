@@ -122,8 +122,9 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* Single-word RK8-packed -- special-cased. */
     [OP_UNARY] = { "OP_UNARY", "reg = unary_op(rk)" },
     [OP_CAST]  = { "OP_CAST",  "reg = cast(rk)" },
-    /* word0: dest+struct_reg+bin_op. word1: field_idx16+rk16. */
-    [OP_BINARY_FIELD] = { "OP_BINARY_FIELD", "fused: reg = rk OP struct.field (field on the right)", {0}, false, 1, 0 },
+    /* word0: dest+struct_reg+bin_op. word1: field_idx16+rk16. Covers both `struct.field OP rk`
+       AND `rk OP struct.field` -- the parser canonicalizes the latter into this same opcode
+       wherever that's exact (see OP_FIELD_BINARY's own comment, vm.h). */
     [OP_FIELD_BINARY] = { "OP_FIELD_BINARY", "fused: reg = struct.field OP rk (field on the left)", {0}, false, 1, 0 },
     /* word0: struct_reg+bin_op. word1: field_idx16+rk16. */
     [OP_FIELD_COMPOUND] = { "OP_FIELD_COMPOUND", "fused: struct.field OP= rk (resolved once, no dest reg)", {0}, false, 1, 0 },
@@ -525,13 +526,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_NAME, name_idx);
         int builtin_id = (int)c->code[pos++];
         fprintf(out, "  id=%s", call_builtin_id_names[builtin_id]);
-    } else if (op == OP_BINARY_FIELD) {
-        print_field(out, c, FLD_REG,   (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG,   (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_BINOP, (int)UNPACK_C(op_word));
-        uint32_t field_rk_word = c->code[pos++];
-        print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_rk_word));
-        print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
     } else if (op == OP_FIELD_BINARY) {
         print_field(out, c, FLD_REG,   (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG,   (int)UNPACK_B(op_word));

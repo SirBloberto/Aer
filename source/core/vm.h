@@ -182,11 +182,15 @@ typedef enum {
        of its own needed. */
     OP_CAST, /* dest_reg, cast_type, rk_operand */
 
-    /* Fusion of `x OP y.field` -- parse_binary_ops truncates the just-emitted OP_FIELD_GET and
-       re-encodes it as this opcode's trailing operands. */
-    OP_BINARY_FIELD, /* dest_reg, rk_lhs, bin_op, struct_reg, field_name_pool_idx */
-
-    /* Mirror for `y.field OP x` -- the field is the LEFT operand, so correct for every operator. */
+    /* Fusion of `x OP y.field` AND its mirror `y.field OP x` -- ONE opcode covers both argument
+       orders. parse_binary_ops truncates the just-emitted OP_FIELD_GET and re-encodes it as this
+       opcode's trailing operands; for the `x OP y.field` order specifically, it also canonicalizes
+       the operator (commutative ops unchanged, comparisons flipped: `x < field` becomes `field >
+       x`) so the field is always the LEFT operand here, needing only one physical opcode instead
+       of a mirror-image OP_BINARY_FIELD for the 11 of 18 possible operators where that's a free
+       transformation. The 7 order-sensitive operators (SUB/DIV/MOD/FLOOR_DIV/LSHIFT/RSHIFT/IN)
+       don't fuse in the `x OP field` order at all -- see parse_binary_ops's own comment for why
+       carrying a second opcode just for that narrower, rarer case wasn't judged worth it. */
     OP_FIELD_BINARY, /* dest_reg, struct_reg, field_name_pool_idx, bin_op, rk_rhs */
 
     /* `struct.field OP= rhs` -- reads, computes, and writes back in one dispatch, one

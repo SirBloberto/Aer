@@ -2229,7 +2229,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INDEX_FIELD_COMPOUND] = &&lbl_index_field_compound,
         [OP_UNARY]             = &&lbl_unary,
         [OP_CAST]              = &&lbl_cast,
-        [OP_BINARY_FIELD]      = &&lbl_binary_field,
         [OP_FIELD_BINARY]      = &&lbl_field_binary,
         [OP_FIELD_COMPOUND]    = &&lbl_field_compound,
         [OP_TYPED_ARRAY_CHAIN2] = &&lbl_typed_array_chain2,
@@ -3095,32 +3094,10 @@ lbl_field_get: {
     DISPATCH();
 }
 
-/* Feeds the field value straight into the binary op instead of a register first. bin_op is a
-   runtime value here, so the int/int and real/real cases still route through vm_binary_fast,
-   falling back to vm_binary_cold for anything else. */
-lbl_binary_field: {
-    unsigned int site   = ip - 1;
-    int dest_reg   = (int)UNPACK_A(op_word);
-    int struct_reg = (int)UNPACK_B(op_word);
-    Opcode bin_op  = (Opcode)UNPACK_C(op_word);
-    uint32_t field_rk_word = READ();
-    int field_idx  = (int)UNPACK_2X16_HI(field_rk_word);
-    AerVal* lhs = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
-    AerStruct* oa; int slot; unsigned int foffset; ValueType ftype; bool narrow;
-    if (!vm_resolve_field(vm, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype, &narrow)) DISPATCH();
-    AerVal rhs = vm_struct_field_read_at(oa, foffset, ftype, narrow);
-    ValueType ta = aer_type(*lhs), tb = aer_type(rhs);
-    bool handled;
-    registers[dest_reg] = vm_binary_fast(*lhs, rhs, bin_op, ta, tb, &handled);
-    /* Only needed on the cold path (string concat) -- the fast path never allocates. */
-    if (!handled) {
-        registers[dest_reg] = vm_binary_cold(c, *lhs, rhs, bin_op, ta, tb);
-        gc_maybe_collect(vm);
-    }
-    DISPATCH();
-}
-
-/* Mirror of lbl_binary_field for the other operand order. */
+/* `x OP y.field` no longer has its own opcode -- parse_binary_ops canonicalizes it into this
+   opcode's own `field OP' x` form at compile time instead (see that function's own comment, and
+   OP_FIELD_BINARY's, vm.h, for why that's exact, not an approximation, for every operator that
+   reaches here). */
 lbl_field_binary: {
     unsigned int site   = ip - 1;
     int dest_reg   = (int)UNPACK_A(op_word);
