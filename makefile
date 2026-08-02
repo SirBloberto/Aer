@@ -133,6 +133,50 @@ test-fmt: fmt-tool
 	diff object/fmt_test_out.aer object/fmt_test_out2.aer
 	@echo "test-fmt: input formats to the expected canonical output, which is a fixed point"
 
+# Profile-guided optimization -- two-phase build (make pgo). Re-tested from scratch against
+# current HEAD: the codebase has changed substantially since an earlier attempt showed a severe
+# struct_array_scan.aer regression (struct pool tiering, FMA fusion, several range-for rewrites all
+# landed since). Uses its own object tree (object/pgo), not the ordinary object/, since a .gcda
+# profile counter file is tied to the exact directory its .o was compiled into -- phase 2
+# recompiles in place rather than deleting anything between phases, since wiping object/pgo before
+# the -fprofile-use compile would also delete the just-recorded counters it depends on.
+#
+# Re-measured full 15-benchmark suite on a Raspberry Pi 4 (perf stat, performance governor): still
+# genuinely mixed, not a clean win -- 6 benchmarks improve on wall-clock (mandelbrot -16.2%, nbody
+# -6.6%, binary_trees -5.0%, sieve -4.7%, nbody_large_packed -4.2%, typed_array_bench -2.3%), 8
+# regress (dict_bench +17.2%, nbody_large_packed_narrow +10.2%, small_dict_bench +9.4%,
+# lookup_table_bench +5.3%, typed_elementwise +3.4%, fib_bench +3.1%, log_processing +3.0%,
+# nbody_large_boxed +2.5%), and struct_array_scan is roughly flat (+1.5%, instructions -9.1% but
+# branch-misses 1.45M->196M). Less severe than the earlier attempt, but dict_bench and
+# struct_array_scan were BOTH in PGO_TRAIN below and still regressed/went flat -- PGO isn't
+# reliably helping even on benchmarks it trained on. Kept as opt-in tooling only (this target isn't
+# part of `all`/the default build), same treatment debug-tools/asan already get -- not because the
+# mechanism is broken, but because "which half of your benchmarks do you want to sacrifice" isn't a
+# decision this build should make silently by default.
+PGO_OBJDIR := object/pgo
+# Deliberately mixed shapes -- a numeric loop-heavy pair (nbody, sieve), a dict-heavy one
+# (dict_bench), and two struct/packed-array-allocation-heavy ones (binary_trees,
+# struct_array_scan) -- so the profile isn't overfit to one access pattern.
+PGO_TRAIN := bench/nbody.aer bench/sieve.aer bench/dict_bench.aer bench/binary_trees.aer bench/struct_array_scan.aer
+
+pgo:
+	@rm -rf $(PGO_OBJDIR) binary/aer-pgo-gen$(EXE) binary/aer-pgo$(EXE)
+	@mkdir -p $(PGO_OBJDIR) binary
+	@for f in $(SOURCE); do \
+		o=$(PGO_OBJDIR)/$$(echo $$f | sed -e 's|^source/||' -e 's|\.c$$|.o|'); \
+		mkdir -p $$(dirname $$o); \
+		gcc $(FLAGS) -fprofile-generate -c $$f -o $$o || exit 1; \
+	done
+	gcc $(FLAGS) -fprofile-generate -o binary/aer-pgo-gen$(EXE) $(patsubst source/%.c,$(PGO_OBJDIR)/%.o,$(SOURCE)) -lm $(WINLIBS)
+	@echo "-- training on a representative benchmark mix (numeric loop / dict / struct-allocation heavy) --"
+	@for b in $(PGO_TRAIN); do ./binary/aer-pgo-gen$(EXE) $$b >/dev/null || exit 1; done
+	@for f in $(SOURCE); do \
+		o=$(PGO_OBJDIR)/$$(echo $$f | sed -e 's|^source/||' -e 's|\.c$$|.o|'); \
+		gcc $(FLAGS) -fprofile-use -fprofile-correction -c $$f -o $$o || exit 1; \
+	done
+	gcc $(FLAGS) -fprofile-use -fprofile-correction -o binary/aer-pgo$(EXE) $(patsubst source/%.c,$(PGO_OBJDIR)/%.o,$(SOURCE)) -lm $(WINLIBS)
+	@echo "PGO build complete: binary/aer-pgo$(EXE) (training binary binary/aer-pgo-gen$(EXE) left in place too)"
+
 # ASAN build for tests/fuzz.py; may not link on a bare MinGW install (needs libasan).
 asan: $(SOURCE)
 	@mkdir -p binary
