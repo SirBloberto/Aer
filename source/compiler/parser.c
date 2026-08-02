@@ -2050,6 +2050,40 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             continue;
         }
 
+        /* `(temp_raw_real) +/- a*b` -- generalizes the compound-assignment FMA/FMS fusion
+           (parse_assignment's `x += a*b` handling) to any plain expression whose running-sum
+           operand is itself a fresh raw-real TEMPORARY, not just a named compound-assign target.
+           Found via nbody.aer's own hot-loop bytecode: its distance-squared `dx*dx + dy*dy +
+           dz*dz` (5,000,000 hits/iteration in advance()) compiles to 5 raw dispatches today
+           (MUL, MUL, ADD, MUL, ADD) even though OP_RAW_FMA_REAL already exists to collapse
+           exactly this shape -- it just had no path to fire outside compound-assignment before
+           this. Only safe when lhs is a TEMPORARY (raw slot >= raw_real_reserved_floor): a named
+           variable's own slot must never be overwritten in place here, since (unlike `x += a*b`,
+           where mutating x IS the statement's whole point) a plain expression's lhs might still be
+           read again later with its original value -- raw_real_alloc's own floor invariant (every
+           temp lands above every named variable's reserved slot) is exactly what makes this one
+           check sufficient. Requires the RHS to have compiled to EXACTLY one raw MUL, nothing
+           else -- any other shape falls through to the ordinary unfused path below, still fully
+           correct. Real-only, matching the compound-assignment version -- no int demand seen yet
+           either. */
+        if (!lhs_is_field && !lhs_is_chain2 && (op == OP_ADD || op == OP_SUB) &&
+            rk_raw_kind(c, lhs) == RAWK_REAL && (lhs & RK_RAW_SLOT_MASK) >= P.raw_real_reserved_floor &&
+            c->count - rhs_start == 1) {
+            uint32_t mw = c->code[rhs_start];
+            if ((Opcode)(mw & 0xFF) == OP_RAW_MUL_REAL && rk_raw_kind(c, rhs) == RAWK_REAL &&
+                (int)UNPACK_A(mw) == (rhs & RK_RAW_SLOT_MASK)) {
+                int lhs_slot = lhs & RK_RAW_SLOT_MASK;
+                int mul_a = (int)UNPACK_B(mw), mul_b = (int)UNPACK_C(mw);
+                c->count = rhs_start;   /* discard the MUL -- fused below instead */
+                if ((int)UNPACK_A(mw) >= P.raw_real_reserved_floor) raw_real_free(1);
+                Opcode fused = (op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
+                chunk_emit(c, PACK3(fused, lhs_slot, mul_a, mul_b));
+                lhs = RK_RAW_REAL_FLAG | lhs_slot;
+                lhs_start = c->count;
+                continue;
+            }
+        }
+
         /* Found via a per-opcode dispatch audit: `x OP y.field` compiled as OP_FIELD_GET immediately
            followed by OP_BINARY reading it back -- two dispatches for one operation. Recognized
            by checking whether the RHS was exactly one bare field read (now 2 words).

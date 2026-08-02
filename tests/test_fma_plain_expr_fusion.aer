@@ -1,0 +1,53 @@
+# Generalized FMA/FMS fusion: `(temp_raw_real) +/- a*b` in a PLAIN expression (not just
+# compound assignment) should collapse to one OP_RAW_FMA_REAL/OP_RAW_FMS_REAL dispatch when the
+# running-sum operand is a fresh temporary -- but must NEVER fire in a way that corrupts a named
+# variable's value if that variable is read again afterward with its original value.
+
+# Basic dot-product shape (nbody's own hot-loop idiom) -- exercises the running chain
+# dx*dx + dy*dy + dz*dz, all fresh temporaries.
+dx = 3.0
+dy = 4.0
+dz = 12.0
+sq = dx*dx + dy*dy + dz*dz
+assert(sq == 169.0, "dot-product sum-of-squares")
+
+# FMS shape (mandelbrot's own idiom): a*b - c*d
+zr = 3.0
+zi = 4.0
+diff = zr*zr - zi*zi
+assert(diff == -7.0, "difference-of-squares (FMS)")
+
+# Chained subtraction: a*b - c*d - e*f
+a1, b1, c1, d1, e1, f1 = 5.0, 5.0, 2.0, 2.0, 1.0, 1.0
+chained = a1*b1 - c1*d1 - e1*f1
+assert(chained == 20.0, "chained FMS: 25 - 4 - 1")
+
+# Safety-critical: a NAMED raw-real local used as the lhs of a plain (non-compound) `+`
+# expression must NOT be mutated in place if it's read again afterward with its ORIGINAL value.
+total = 10.0
+other = total + 2.0 * 2.0   # must NOT overwrite total's own slot -- total is a named local, not a temp
+assert(other == 14.0, "named-local lhs: computed value correct")
+assert(total == 10.0, "named-local lhs: original variable NOT corrupted by the fusion")
+
+# Same hazard, but with total reused inside a single expression via a function call (both
+# arguments evaluated left-to-right; the first must not be retroactively corrupted by the second).
+function two(a, b):
+    return a, b
+x, y = two(total, total + 3.0 * 3.0)
+assert(x == 10.0, "first call arg reads total's original value")
+assert(y == 19.0, "second call arg computes total + 9 correctly")
+assert(total == 10.0, "total still uncorrupted after being used in both call arguments")
+
+# Mixed int locals must NOT accidentally fuse (OP_RAW_FMA_REAL/FMS_REAL are real-only) --
+# correctness of the unfused int path must be untouched.
+ia, ib, ic = 3, 4, 5
+isq = ia*ia + ib*ib
+assert(isq == 25, "int sum-of-squares stays correct (no int FMA exists)")
+
+# A boxed (non-raw) accumulator must also be untouched -- e.g. a value coming from a dict lookup
+# or any other path that never became a raw real.
+d = {"v": 7.0}
+bsq = d["v"] * d["v"] + 1.0 * 1.0
+assert(bsq == 50.0, "boxed accumulator path stays correct")
+
+print("all plain-expression FMA/FMS fusion checks passed")
