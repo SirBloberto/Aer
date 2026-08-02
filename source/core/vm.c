@@ -589,10 +589,22 @@ static inline __attribute__((always_inline)) AerVal vm_promote_real(AerVal v) {
 /* Binary operation dispatch                                            */
 /* ------------------------------------------------------------------ */
 
-/* Int/int and real/real fast path only -- small enough to always_inline at its two callers
-   (the field-fusion opcodes) without icache bloat. Sets *handled = false for anything else;
-   caller falls back to vm_binary_cold(). */
-static inline __attribute__((always_inline)) AerVal vm_binary_fast(AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb, bool* handled) {
+/* Int/int and real/real fast path, shared by every struct-field-fusion opcode (field_binary,
+   field_compound, chain2, index_field_compound, ...). Was `always_inline` on the reasoning that it
+   was "small enough" -- true back when it had 2 callers, stale once it grew to 7: always_inline
+   duplicated this whole function's body at EVERY call site, measured as the dominant reason
+   lbl_binary_field/lbl_field_binary were among the largest compiled handlers in vm_run_slice.
+   Downgraded to a plain `inline` hint -- letting the compiler's own per-call-site cost model decide
+   -- confirmed via a full clean test-suite pass and a real vm_run_slice size reduction.
+   (A follow-on attempt reworked the `bool* handled` out-parameter into a caller-supplied `is_int`
+   flag, on the theory that force-inlining had been hiding a real address-taken-local cost. Repeat
+   measurement on the Pi didn't support that story -- L1-dcache-load-misses turned out to vary by
+   10x+ run-to-run on this exact benchmark with ZERO code changes at all, meaning the original
+   "confirmed" finding was a false signal from an unlucky single sample, not a reproducible effect --
+   and the branch-misses/cycles data pointed the other way (a real, if modest, regression). Reverted;
+   *handled stays the out-parameter design below.) Sets *handled = false for anything else; caller
+   falls back to vm_binary_cold(). */
+static inline AerVal vm_binary_fast(AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb, bool* handled) {
     *handled = true;
     if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) {
         int64_t l = aer_as_int(a), rv = aer_as_int(b);
@@ -1199,8 +1211,8 @@ static AerTypedArray* vm_new_typed_array(TypedArrayElemKind kind, unsigned int c
 /* Fused (A op1 B) op2 C over three same-kind, same-length typed arrays, in ONE pass -- no
    intermediate array materialized for (A op1 B) at all. Emitted only when the parser recognizes
    `(A op1 B) op2 C` written as a single expression (parse_binary_ops, parser.c), the same
-   "recognize a specific just-emitted shape and replace it" idea OP_FIELD_BINARY/OP_BINARY_FIELD
-   already use for struct-field arithmetic, just for typed-array chains instead. Verified against a
+   "recognize a specific just-emitted shape and replace it" idea OP_FIELD_BINARY already uses for
+   struct-field arithmetic, just for typed-array chains instead. Verified against a
    standalone (non-AER) C micro-benchmark before building this: fusing eliminates a real,
    measured ~1.65x of wall-clock on a chained elementwise transform (two full array-length passes,
    each touching every byte of 3 arrays, collapse into one pass touching 4 -- less total memory
@@ -1798,6 +1810,293 @@ static void chunk_ensure_call_spec_cache(Chunk* c) {
     memset(c->call_spec_cache + old_cap, 0, sizeof(CallSpecCacheEntry) * (c->call_spec_cache_cap - old_cap));
 }
 
+/* lbl_call's own cold path, split out to a real (never-inlined) function -- this entire block used
+   to sit directly inline in lbl_call, gated behind `target_f->shape_sensitive_mask != 0`, which is
+   false for the overwhelming majority of functions (see the guard's own comment at the one call
+   site below). Measured directly: lbl_call compiled to ~572 machine instructions with this inlined,
+   by far the single largest opcode handler in vm_run_slice (next-largest hot handlers measured
+   under 40) -- meaning every ordinary, non-specialized call paid the icache cost of this rarely-
+   taken code sitting in the hottest dispatch site in the VM, even though it never executed it.
+   noinline is required, not just default behavior: a static function with exactly one call site is
+   a prime candidate for GCC/LTO to inline right back in without it, silently undoing this split. */
+static void __attribute__((noinline)) vm_call_resolve_specialization(
+        Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base, unsigned int ip,
+        unsigned int* chosen_offset, unsigned int* chosen_max_registers,
+        unsigned int* chosen_max_raw_ints, unsigned int* chosen_max_raw_reals) {
+    unsigned int site = ip - 3;   /* this instruction's own word0 offset -- ip already advanced past all 3 words by now */
+    /* Lowest set bit -- which argument register carries the shape-sensitive parameter. Only
+       the first such parameter is ever used to key specialization; a function using more than
+       one parameter for field access still compiles and runs correctly, it just never
+       specializes on the others. */
+    int param_index = __builtin_ctz(target_f->shape_sensitive_mask);
+    AerVal arg = registers[arg_reg_base + param_index];
+    Shape* observed = NULL;
+    SpecKind kind = SPEC_KIND_STRUCT;
+    if (aer_type(arg) == TYPE_PACKED_ARRAY) {
+        observed = aer_as_packed_array(arg)->shape;
+        kind = SPEC_KIND_PACKED_ARRAY;
+    } else if (aer_type(arg) == TYPE_STRUCT) {
+        observed = aer_as_struct(arg)->shape;
+        kind = SPEC_KIND_STRUCT;
+    } else if (aer_type(arg) == TYPE_ARRAY) {
+        /* A plain array carries no structural shape guarantee of its own (AerArray.shape is
+           dead, always NULL) -- peek element 0 as a CANDIDATE shape only; the homogeneity scan
+           just below is what actually earns the right to trust it, every single call, since
+           unlike a packed array or a lone struct instance, a plain array's contents can differ
+           from call to call (or even be heterogeneous outright). */
+        AerArray* arr = aer_as_array(arg);
+        if (arr->count > 0 && aer_type(arr->items[0]) == TYPE_STRUCT) {
+            observed = aer_as_struct(arr->items[0])->shape;
+            kind = SPEC_KIND_ARRAY_OF_STRUCTS;
+        }
+    }
+
+    /* SPEC_KIND_ARRAY_OF_STRUCTS gets no structural guarantee, so -- unlike the other two
+       kinds, which are safe forever once observed -- this must re-verify EVERY call, not just
+       on a shape/cache miss: same array reused across two calls could be mutated to hold a
+       different shape in between, and nothing else here would notice. O(n), same order as
+       advance_pass's own per-call work, so this is the exact cost the design accepted for this
+       case (see linear-rolling-dream.md's Part B). A single mismatched element silently falls
+       back to the generic body for THIS call only -- observed is left in place conceptually,
+       but the cache/table are simply never touched below, so a later, uniform call still
+       specializes normally.
+
+       The scan itself is skippable, though: if THIS call site already fully verified this EXACT
+       array (by pointer) at its CURRENT AerArray.generation against this same shape on some
+       earlier call, items[] provably hasn't been restructured since (generation only changes on
+       index-assignment/append/delete/insert -- see its own comment, value.h) -- trusting that
+       prior verification is exactly as safe as the structural guarantee the other two kinds get
+       for free, just re-derived per generation instead of assumed forever. This is what turns
+       struct_array_scan.aer's real pattern (same 2M-particle array, 50 calls, only field VALUES
+       change between calls) from paying the O(n) scan on every one of the 50 into paying it once. */
+    if (kind == SPEC_KIND_ARRAY_OF_STRUCTS) {
+        AerArray* arr = aer_as_array(arg);
+        chunk_ensure_call_spec_cache(c);
+        CallSpecCacheEntry* site_entry = &c->call_spec_cache[site];
+        bool already_verified = site_entry->last_verified_array == arr &&
+                                    site_entry->last_verified_generation == arr->generation &&
+                                    site_entry->last_shape == observed;
+        if (!already_verified) {
+            for (unsigned int idx = 0; idx < arr->count; idx++) {
+                AerVal item = arr->items[idx];
+                if (aer_type(item) != TYPE_STRUCT || aer_as_struct(item)->shape != observed) {
+                    observed = NULL;
+                    break;
+                }
+            }
+            if (observed) {
+                site_entry->last_verified_array      = arr;
+                site_entry->last_verified_generation  = arr->generation;
+            }
+        }
+    }
+
+    if (observed) {
+        chunk_ensure_call_spec_cache(c);
+        CallSpecCacheEntry* site_entry = &c->call_spec_cache[site];
+        SpecEntry* entry = NULL;
+        if (site_entry->last_shape == observed) {
+            *chosen_offset        = site_entry->last_code_offset;
+            *chosen_max_registers = site_entry->last_max_registers;
+            *chosen_max_raw_ints  = site_entry->last_max_raw_ints;
+            *chosen_max_raw_reals = site_entry->last_max_raw_reals;
+            entry = site_entry->last_entry;
+        } else {
+            SpecEntry* found = NULL;
+            for (int i = 0; i < target_f->specialization_count; i++)
+                if (target_f->specializations[i].shape == observed) { found = &target_f->specializations[i]; break; }
+            if (!found && target_f->specialization_count < SPEC_MAX) {
+                SpecEntry fresh;
+                if (parser_specialize_function(c, target_f, observed, kind, param_index, &fresh, NULL, NULL, 0)) {
+                    /* The recompile just appended new code to THIS running chunk -- every
+                       per-word cache must cover the new size before any of its sites dispatch.
+                       debug_hits[] is the same idiom (chunk_ensure_debug_hits) but debug-tools-
+                       only -- DISPATCH() increments c->debug_hits[offset] for every opcode word
+                       when built with AER_DEBUG_TOOLS, so skipping this resize here is a real,
+                       silent out-of-bounds write the moment the specialized body's own code
+                       (now beyond the ORIGINAL debug_hits_cap) executes, in that build only --
+                       found via a real Windows heap-corruption crash inside a LATER, unrelated
+                       malloc, exactly the kind of delayed symptom this class of bug produces. */
+#ifdef AER_DEBUG_TOOLS
+                    chunk_ensure_debug_hits(c);
+#endif
+                    chunk_ensure_field_cache(c);
+                    chunk_ensure_call_spec_cache(c);
+                    site_entry = &c->call_spec_cache[site];   /* re-fetch: chunk_ensure_call_spec_cache may have reallocated the array */
+                    target_f->specializations[target_f->specialization_count++] = fresh;
+                    found = &target_f->specializations[target_f->specialization_count - 1];
+                } else {
+                    target_f->megamorphic = true;   /* treat a recompile failure like exhausting the table -- stop retrying every call */
+                }
+            } else if (!found) {
+                target_f->megamorphic = true;   /* table full and still a new shape -- stop specializing this function */
+            }
+            if (found) {
+                site_entry->last_shape          = found->shape;
+                site_entry->last_code_offset    = found->code_offset;
+                site_entry->last_max_registers  = found->max_registers;
+                site_entry->last_max_raw_ints   = found->max_raw_ints;
+                site_entry->last_max_raw_reals  = found->max_raw_reals;
+                site_entry->last_entry          = found;
+                *chosen_offset        = found->code_offset;
+                *chosen_max_registers = found->max_registers;
+                *chosen_max_raw_ints  = found->max_raw_ints;
+                *chosen_max_raw_reals = found->max_raw_reals;
+                entry = found;
+            }
+        }
+
+        /* Raw-numeric-variant check -- an independent axis from the shape cache/table lookup
+           above, re-derived fresh every call (cheap: at most SPEC_MAX_RAW_PARAMS aer_type()
+           reads, nowhere near the cost of a shape/homogeneity miss) rather than mirrored into
+           its own site-cache fields, since `entry` (from either the cache hit or the table
+           lookup just above) already gives direct access to whichever SpecEntry's own
+           raw_variant_* fields are relevant. See SpecEntry's own comment, vm.h, for why this is
+           a SEPARATE per-entry variant rather than folding raw-param-kind into the shape axis
+           itself. */
+        /* SPEC_KIND_ARRAY_OF_STRUCTS was previously excluded here, based on an apparent ~20%
+           regression on struct_array_scan.aer. Re-investigated with real hardware performance
+           counters (perf stat, Raspberry Pi 4) rather than wall-clock alone: dispatch counts and
+           GC stats were already known to be identical or better with the variant enabled: this
+           time cycles, instructions, AND branch-misses were all lower too (branch-misses ~18-40x
+           lower: 289-292K vs 5.3-11.8M across repeated runs) -- and the ORIGINAL guarded build's
+           own branch-misses varied more than 2x between two back-to-back runs of the identical
+           binary, meaning that build was unstable on its own before any comparison even started.
+           That instability is consistent with the original "~20% regression" having been a noisy
+           single-sample wall-clock artifact, not a real effect. Confirmed at both a reduced scale
+           (N=100,000, isolated from an unrelated O(n^2) GC bug in unrelated benchmark setup code)
+           and the real N=2,000,000 scale (19.01s enabled vs 20.32s excluded, ~6.4% faster,
+           consistent with the reduced-scale ~7% figure) -- guard removed. */
+        if (entry && entry->raw_param_count >= 0) {
+            int cand_regs[SPEC_MAX_RAW_PARAMS];
+            ValueType cand_types[SPEC_MAX_RAW_PARAMS];
+            int cand_count = 0;
+            for (unsigned int pi = 0; pi < target_f->arity && cand_count < SPEC_MAX_RAW_PARAMS; pi++) {
+                if ((int)pi == param_index) continue;
+                AerVal pv = registers[arg_reg_base + pi];
+                ValueType pt = aer_type(pv);
+                if (pt != TYPE_INTEGER && pt != TYPE_REAL) { cand_count = 0; break; }   /* not all-numeric -- no raw variant applies this call */
+                cand_regs[cand_count]  = (int)pi;
+                cand_types[cand_count] = pt;
+                cand_count++;
+            }
+
+            if (cand_count > 0) {
+                bool matches_existing = entry->raw_param_count == cand_count;
+                if (matches_existing) {
+                    for (int k = 0; k < cand_count; k++)
+                        if (entry->raw_param_regs[k] != cand_regs[k] || entry->raw_param_types[k] != cand_types[k]) { matches_existing = false; break; }
+                }
+                if (matches_existing) {
+                    *chosen_offset        = entry->raw_variant_code_offset;
+                    *chosen_max_registers = entry->raw_variant_max_registers;
+                    *chosen_max_raw_ints  = entry->raw_variant_max_raw_ints;
+                    *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
+                } else if (entry->raw_param_count == 0) {
+                    /* Never attempted for THIS entry -- try to compile it now. A failure here
+                       (raw_ints/raw_reals budget exhausted -- realistic, since this shape's own
+                       raw field usage already competes for the same 32-slot budget) sets
+                       raw_param_count to -1, a PERMANENT bailout for this one SpecEntry only --
+                       never retried every call, but also never affecting `megamorphic` or the
+                       shape table, since this axis is fully decoupled from those. */
+                    SpecEntry variant;
+                    if (parser_specialize_function(c, target_f, observed, kind, param_index, &variant,
+                                                        cand_regs, cand_types, cand_count)) {
+#ifdef AER_DEBUG_TOOLS
+                        chunk_ensure_debug_hits(c);
+#endif
+                        chunk_ensure_field_cache(c);
+                        chunk_ensure_call_spec_cache(c);
+                        entry->raw_variant_code_offset     = variant.code_offset;
+                        entry->raw_variant_max_registers   = variant.max_registers;
+                        entry->raw_variant_max_raw_ints    = variant.max_raw_ints;
+                        entry->raw_variant_max_raw_reals   = variant.max_raw_reals;
+                        for (int k = 0; k < cand_count; k++) {
+                            entry->raw_param_regs[k]  = cand_regs[k];
+                            entry->raw_param_types[k] = cand_types[k];
+                        }
+                        entry->raw_param_count = cand_count;
+                        *chosen_offset        = entry->raw_variant_code_offset;
+                        *chosen_max_registers = entry->raw_variant_max_registers;
+                        *chosen_max_raw_ints  = entry->raw_variant_max_raw_ints;
+                        *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
+                    } else {
+                        entry->raw_param_count = -1;
+                    }
+                }
+                /* else: entry already has a DIFFERENT raw-numeric variant than this call's
+                   observed types -- don't attempt a second one, just use the baseline
+                   offset/sizes already chosen above (still fully correct, just boxed dt again
+                   for this one call). */
+            }
+        }
+    }
+}
+
+/* lbl_call_module's own cold path, same reasoning as vm_call_resolve_specialization above: this
+   whole dispatch -- a switch across 10 separate stdlib module-call functions plus the generic
+   host/file-module fallback -- used to sit directly inline in lbl_call_module. Measured at ~1079
+   compiled instructions, the single largest opcode handler in vm_run_slice (larger even than
+   lbl_call's own cold path was before its own extraction) -- not from complex logic (the source is
+   under 40 lines), but from register-spill/reload overhead: vm_run_slice hoists many locals
+   (registers/raw_ints/raw_reals/ip/...) into machine registers for the whole hot loop, and each of
+   the ~10 separate external calls this handler makes forces the compiler to spill and reload them
+   around the call boundary, unrelated to how RARELY any given call site actually reaches a given
+   module. Splitting this into a real function pays that spill/reload cost once, at the single call
+   site below, instead of once per module-call case.
+   POP is safe to use here (no early-return side effect, unlike PUSH -- see PUSH's own macro, above
+   vm_run_slice); the io-disabled case's error() call unwinds via longjmp before anything past it
+   would run (confirmed: error() always longjmps whenever runtime_error_unwind_target is set, which
+   it always is during normal vm_run_slice execution), so it's safe to call directly here too,
+   exactly as safe as it already was inline. This function's own result is provably always `true`
+   by the time it returns -- the `false` case calls error() itself instead of returning -- but the
+   compiler can't know that, hence returning it anyway rather than declaring void. */
+static bool __attribute__((noinline)) vm_call_module_dispatch(
+        VM* vm, Chunk* c, int module_idx, int fn_idx, int module_id, int fn_id, int arg_count) {
+    bool handled;
+    /* module_id/fn_id resolved at parse time -- a switch on two ints instead of a strcmp chain.
+       CALL_MODULE_DYNAMIC (host/file module) still resolves by name at runtime. */
+    switch (module_id) {
+        case CALL_MODULE_MATH:   handled = aer_math_call(vm, fn_id, arg_count);   break;
+        case CALL_MODULE_RANDOM: handled = aer_random_call(vm, fn_id, arg_count); break;
+        case CALL_MODULE_STRING: handled = aer_string_call(vm, fn_id, arg_count); break;
+        case CALL_MODULE_TIME:   handled = aer_time_call(vm, fn_id, arg_count);   break;
+        case CALL_MODULE_JSON:   handled = aer_json_call(vm, c, fn_id, arg_count);   break;
+        case CALL_MODULE_COLLECTION: handled = aer_collection_call(vm, fn_id, arg_count); break;
+        case CALL_MODULE_NET:    handled = aer_net_call(vm, fn_id, arg_count);   break;
+        case CALL_MODULE_REGEX:  handled = aer_regex_call(vm, fn_id, arg_count); break;
+        case CALL_MODULE_ACTOR:     handled = aer_actor_module_call(vm, fn_id, arg_count);     break;
+        case CALL_MODULE_SCHEDULER: handled = aer_scheduler_module_call(vm, fn_id, arg_count); break;
+        default: {
+            const char* module = aer_as_string(c->pool[module_idx])->data;
+            const char* fn     = aer_as_string(c->pool[fn_idx])->data;
+            /* io is the one module still reached through the generic host-call path
+               (aer_host_call) rather than a fixed CALL_MODULE_* case -- gated here by name
+               specifically so --no-io never touches a real embedding host's own custom modules,
+               which go through this exact same path. */
+            if (!vm->io_enabled && strcmp(module, "io") == 0) {
+                /* POP itself is defined inside vm_run_slice (needs its DISPATCH-loop-local
+                   `vm` binding for the overflow/underflow checks the macro shares with PUSH) --
+                   this early-drain has no early-return hazard PUSH's own version does, so
+                   inlining its one-line body directly here is exactly as safe as calling the
+                   macro would be. */
+                for (int i = 0; i < arg_count; i++) {
+                    if (vm->stack_top > 0) --vm->stack_top; else error("Stack underflow");
+                }
+                error("io is disabled for this run (--no-io)");   /* never returns -- unwinds instead */
+            }
+            if (aer_host_is_module(module, (unsigned int)strlen(module)))
+                handled = aer_host_call(vm, module, fn, arg_count);
+            else
+                handled = aer_module_call(vm, module, fn, arg_count);
+            break;
+        }
+    }
+    if (!handled)
+        error("'%s' has no function '%s'", aer_as_string(c->pool[module_idx])->data, aer_as_string(c->pool[fn_idx])->data);
+    return handled;
+}
+
 /* max_instructions == 0 means unlimited (every existing caller via the vm_run() wrapper below) --
    the budget decrement only happens at loop-back-edge and call opcodes (the only places a script
    can spend unbounded time), not on every DISPATCH(), so the check costs nothing on the common
@@ -2286,214 +2585,9 @@ lbl_call: {
     unsigned int chosen_max_raw_reals = target_f->max_raw_reals;
 
     if (!target_f->megamorphic && target_f->shape_sensitive_mask != 0) {
-        unsigned int site = ip - 3;   /* this instruction's own word0 offset -- ip already advanced past all 3 words by now */
-        /* Lowest set bit -- which argument register carries the shape-sensitive parameter. Only
-           the first such parameter is ever used to key specialization; a function using more than
-           one parameter for field access still compiles and runs correctly, it just never
-           specializes on the others. */
-        int param_index = __builtin_ctz(target_f->shape_sensitive_mask);
-        AerVal arg = registers[arg_reg_base + param_index];
-        Shape* observed = NULL;
-        SpecKind kind = SPEC_KIND_STRUCT;
-        if (aer_type(arg) == TYPE_PACKED_ARRAY) {
-            observed = aer_as_packed_array(arg)->shape;
-            kind = SPEC_KIND_PACKED_ARRAY;
-        } else if (aer_type(arg) == TYPE_STRUCT) {
-            observed = aer_as_struct(arg)->shape;
-            kind = SPEC_KIND_STRUCT;
-        } else if (aer_type(arg) == TYPE_ARRAY) {
-            /* A plain array carries no structural shape guarantee of its own (AerArray.shape is
-               dead, always NULL) -- peek element 0 as a CANDIDATE shape only; the homogeneity scan
-               just below is what actually earns the right to trust it, every single call, since
-               unlike a packed array or a lone struct instance, a plain array's contents can differ
-               from call to call (or even be heterogeneous outright). */
-            AerArray* arr = aer_as_array(arg);
-            if (arr->count > 0 && aer_type(arr->items[0]) == TYPE_STRUCT) {
-                observed = aer_as_struct(arr->items[0])->shape;
-                kind = SPEC_KIND_ARRAY_OF_STRUCTS;
-            }
-        }
-
-        /* SPEC_KIND_ARRAY_OF_STRUCTS gets no structural guarantee, so -- unlike the other two
-           kinds, which are safe forever once observed -- this must re-verify EVERY call, not just
-           on a shape/cache miss: same array reused across two calls could be mutated to hold a
-           different shape in between, and nothing else here would notice. O(n), same order as
-           advance_pass's own per-call work, so this is the exact cost the design accepted for this
-           case (see linear-rolling-dream.md's Part B). A single mismatched element silently falls
-           back to the generic body for THIS call only -- observed is left in place conceptually,
-           but the cache/table are simply never touched below, so a later, uniform call still
-           specializes normally.
-
-           The scan itself is skippable, though: if THIS call site already fully verified this EXACT
-           array (by pointer) at its CURRENT AerArray.generation against this same shape on some
-           earlier call, items[] provably hasn't been restructured since (generation only changes on
-           index-assignment/append/delete/insert -- see its own comment, value.h) -- trusting that
-           prior verification is exactly as safe as the structural guarantee the other two kinds get
-           for free, just re-derived per generation instead of assumed forever. This is what turns
-           struct_array_scan.aer's real pattern (same 2M-particle array, 50 calls, only field VALUES
-           change between calls) from paying the O(n) scan on every one of the 50 into paying it once. */
-        if (kind == SPEC_KIND_ARRAY_OF_STRUCTS) {
-            AerArray* arr = aer_as_array(arg);
-            chunk_ensure_call_spec_cache(c);
-            CallSpecCacheEntry* site_entry = &c->call_spec_cache[site];
-            bool already_verified = site_entry->last_verified_array == arr &&
-                                        site_entry->last_verified_generation == arr->generation &&
-                                        site_entry->last_shape == observed;
-            if (!already_verified) {
-                for (unsigned int idx = 0; idx < arr->count; idx++) {
-                    AerVal item = arr->items[idx];
-                    if (aer_type(item) != TYPE_STRUCT || aer_as_struct(item)->shape != observed) {
-                        observed = NULL;
-                        break;
-                    }
-                }
-                if (observed) {
-                    site_entry->last_verified_array      = arr;
-                    site_entry->last_verified_generation  = arr->generation;
-                }
-            }
-        }
-
-        if (observed) {
-            chunk_ensure_call_spec_cache(c);
-            CallSpecCacheEntry* site_entry = &c->call_spec_cache[site];
-            SpecEntry* entry = NULL;
-            if (site_entry->last_shape == observed) {
-                chosen_offset        = site_entry->last_code_offset;
-                chosen_max_registers = site_entry->last_max_registers;
-                chosen_max_raw_ints  = site_entry->last_max_raw_ints;
-                chosen_max_raw_reals = site_entry->last_max_raw_reals;
-                entry = site_entry->last_entry;
-            } else {
-                SpecEntry* found = NULL;
-                for (int i = 0; i < target_f->specialization_count; i++)
-                    if (target_f->specializations[i].shape == observed) { found = &target_f->specializations[i]; break; }
-                if (!found && target_f->specialization_count < SPEC_MAX) {
-                    SpecEntry fresh;
-                    if (parser_specialize_function(c, target_f, observed, kind, param_index, &fresh, NULL, NULL, 0)) {
-                        /* The recompile just appended new code to THIS running chunk -- every
-                           per-word cache must cover the new size before any of its sites dispatch.
-                           debug_hits[] is the same idiom (chunk_ensure_debug_hits) but debug-tools-
-                           only -- DISPATCH() increments c->debug_hits[offset] for every opcode word
-                           when built with AER_DEBUG_TOOLS, so skipping this resize here is a real,
-                           silent out-of-bounds write the moment the specialized body's own code
-                           (now beyond the ORIGINAL debug_hits_cap) executes, in that build only --
-                           found via a real Windows heap-corruption crash inside a LATER, unrelated
-                           malloc, exactly the kind of delayed symptom this class of bug produces. */
-#ifdef AER_DEBUG_TOOLS
-                        chunk_ensure_debug_hits(c);
-#endif
-                        chunk_ensure_field_cache(c);
-                        chunk_ensure_call_spec_cache(c);
-                        site_entry = &c->call_spec_cache[site];   /* re-fetch: chunk_ensure_call_spec_cache may have reallocated the array */
-                        target_f->specializations[target_f->specialization_count++] = fresh;
-                        found = &target_f->specializations[target_f->specialization_count - 1];
-                    } else {
-                        target_f->megamorphic = true;   /* treat a recompile failure like exhausting the table -- stop retrying every call */
-                    }
-                } else if (!found) {
-                    target_f->megamorphic = true;   /* table full and still a new shape -- stop specializing this function */
-                }
-                if (found) {
-                    site_entry->last_shape          = found->shape;
-                    site_entry->last_code_offset    = found->code_offset;
-                    site_entry->last_max_registers  = found->max_registers;
-                    site_entry->last_max_raw_ints   = found->max_raw_ints;
-                    site_entry->last_max_raw_reals  = found->max_raw_reals;
-                    site_entry->last_entry          = found;
-                    chosen_offset        = found->code_offset;
-                    chosen_max_registers = found->max_registers;
-                    chosen_max_raw_ints  = found->max_raw_ints;
-                    chosen_max_raw_reals = found->max_raw_reals;
-                    entry = found;
-                }
-            }
-
-            /* Raw-numeric-variant check -- an independent axis from the shape cache/table lookup
-               above, re-derived fresh every call (cheap: at most SPEC_MAX_RAW_PARAMS aer_type()
-               reads, nowhere near the cost of a shape/homogeneity miss) rather than mirrored into
-               its own site-cache fields, since `entry` (from either the cache hit or the table
-               lookup just above) already gives direct access to whichever SpecEntry's own
-               raw_variant_* fields are relevant. See SpecEntry's own comment, vm.h, for why this is
-               a SEPARATE per-entry variant rather than folding raw-param-kind into the shape axis
-               itself. */
-            /* SPEC_KIND_ARRAY_OF_STRUCTS was previously excluded here, based on an apparent ~20%
-               regression on struct_array_scan.aer. Re-investigated with real hardware performance
-               counters (perf stat, Raspberry Pi 4) rather than wall-clock alone: dispatch counts and
-               GC stats were already known to be identical or better with the variant enabled: this
-               time cycles, instructions, AND branch-misses were all lower too (branch-misses ~18-40x
-               lower: 289-292K vs 5.3-11.8M across repeated runs) -- and the ORIGINAL guarded build's
-               own branch-misses varied more than 2x between two back-to-back runs of the identical
-               binary, meaning that build was unstable on its own before any comparison even started.
-               That instability is consistent with the original "~20% regression" having been a noisy
-               single-sample wall-clock artifact, not a real effect. Confirmed at both a reduced scale
-               (N=100,000, isolated from an unrelated O(n^2) GC bug in unrelated benchmark setup code)
-               and the real N=2,000,000 scale (19.01s enabled vs 20.32s excluded, ~6.4% faster,
-               consistent with the reduced-scale ~7% figure) -- guard removed. */
-            if (entry && entry->raw_param_count >= 0) {
-                int cand_regs[SPEC_MAX_RAW_PARAMS];
-                ValueType cand_types[SPEC_MAX_RAW_PARAMS];
-                int cand_count = 0;
-                for (unsigned int pi = 0; pi < target_f->arity && cand_count < SPEC_MAX_RAW_PARAMS; pi++) {
-                    if ((int)pi == param_index) continue;
-                    AerVal pv = registers[arg_reg_base + pi];
-                    ValueType pt = aer_type(pv);
-                    if (pt != TYPE_INTEGER && pt != TYPE_REAL) { cand_count = 0; break; }   /* not all-numeric -- no raw variant applies this call */
-                    cand_regs[cand_count]  = (int)pi;
-                    cand_types[cand_count] = pt;
-                    cand_count++;
-                }
-
-                if (cand_count > 0) {
-                    bool matches_existing = entry->raw_param_count == cand_count;
-                    if (matches_existing) {
-                        for (int k = 0; k < cand_count; k++)
-                            if (entry->raw_param_regs[k] != cand_regs[k] || entry->raw_param_types[k] != cand_types[k]) { matches_existing = false; break; }
-                    }
-                    if (matches_existing) {
-                        chosen_offset        = entry->raw_variant_code_offset;
-                        chosen_max_registers = entry->raw_variant_max_registers;
-                        chosen_max_raw_ints  = entry->raw_variant_max_raw_ints;
-                        chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
-                    } else if (entry->raw_param_count == 0) {
-                        /* Never attempted for THIS entry -- try to compile it now. A failure here
-                           (raw_ints/raw_reals budget exhausted -- realistic, since this shape's own
-                           raw field usage already competes for the same 32-slot budget) sets
-                           raw_param_count to -1, a PERMANENT bailout for this one SpecEntry only --
-                           never retried every call, but also never affecting `megamorphic` or the
-                           shape table, since this axis is fully decoupled from those. */
-                        SpecEntry variant;
-                        if (parser_specialize_function(c, target_f, observed, kind, param_index, &variant,
-                                                            cand_regs, cand_types, cand_count)) {
-#ifdef AER_DEBUG_TOOLS
-                            chunk_ensure_debug_hits(c);
-#endif
-                            chunk_ensure_field_cache(c);
-                            chunk_ensure_call_spec_cache(c);
-                            entry->raw_variant_code_offset     = variant.code_offset;
-                            entry->raw_variant_max_registers   = variant.max_registers;
-                            entry->raw_variant_max_raw_ints    = variant.max_raw_ints;
-                            entry->raw_variant_max_raw_reals   = variant.max_raw_reals;
-                            for (int k = 0; k < cand_count; k++) {
-                                entry->raw_param_regs[k]  = cand_regs[k];
-                                entry->raw_param_types[k] = cand_types[k];
-                            }
-                            entry->raw_param_count = cand_count;
-                            chosen_offset        = entry->raw_variant_code_offset;
-                            chosen_max_registers = entry->raw_variant_max_registers;
-                            chosen_max_raw_ints  = entry->raw_variant_max_raw_ints;
-                            chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
-                        } else {
-                            entry->raw_param_count = -1;
-                        }
-                    }
-                    /* else: entry already has a DIFFERENT raw-numeric variant than this call's
-                       observed types -- don't attempt a second one, just use the baseline
-                       offset/sizes already chosen above (still fully correct, just boxed dt again
-                       for this one call). */
-                }
-            }
-        }
+        vm_call_resolve_specialization(c, target_f, registers, arg_reg_base, ip,
+                                            &chosen_offset, &chosen_max_registers,
+                                            &chosen_max_raw_ints, &chosen_max_raw_reals);
     }
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];
@@ -2580,45 +2674,12 @@ lbl_call_module: {
     int module_id    = (int)UNPACK_2X16_HI(ids_word);
     int fn_id        = (int16_t)UNPACK_2X16_LO(ids_word);   /* sign-extend -- FN_ID_UNKNOWN is -1 */
     for (int i = 0; i < arg_count; i++) PUSH(registers[arg_reg_base + i]);
-    bool handled = false;
-    /* module_id/fn_id resolved at parse time -- a switch on two ints instead of a strcmp chain.
-       CALL_MODULE_DYNAMIC (host/file module) still resolves by name at runtime. */
-    switch (module_id) {
-        case CALL_MODULE_MATH:   handled = aer_math_call(vm, fn_id, arg_count);   break;
-        case CALL_MODULE_RANDOM: handled = aer_random_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_STRING: handled = aer_string_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_TIME:   handled = aer_time_call(vm, fn_id, arg_count);   break;
-        case CALL_MODULE_JSON:   handled = aer_json_call(vm, c, fn_id, arg_count);   break;
-        case CALL_MODULE_COLLECTION: handled = aer_collection_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_NET:    handled = aer_net_call(vm, fn_id, arg_count);   break;
-        case CALL_MODULE_REGEX:  handled = aer_regex_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_ACTOR:     handled = aer_actor_module_call(vm, fn_id, arg_count);     break;
-        case CALL_MODULE_SCHEDULER: handled = aer_scheduler_module_call(vm, fn_id, arg_count); break;
-        default: {
-            const char* module = aer_as_string(c->pool[module_idx])->data;
-            const char* fn     = aer_as_string(c->pool[fn_idx])->data;
-            /* io is the one module still reached through the generic host-call path
-               (aer_host_call) rather than a fixed CALL_MODULE_* case -- gated here by name
-               specifically so --no-io never touches a real embedding host's own custom modules,
-               which go through this exact same path. */
-            if (!vm->io_enabled && strcmp(module, "io") == 0) {
-                for (int i = 0; i < arg_count; i++) POP();
-                error("io is disabled for this run (--no-io)");
-                PUSH(aer_null());
-                handled = true;
-                break;
-            }
-            if (aer_host_is_module(module, (unsigned int)strlen(module)))
-                handled = aer_host_call(vm, module, fn, arg_count);
-            else
-                handled = aer_module_call(vm, module, fn, arg_count);
-            break;
-        }
-    }
-    if (handled) { registers[dest_reg] = POP(); gc_maybe_collect(vm); DISPATCH(); }   /* stdlib/module functions routinely allocate (new strings/arrays/etc.) */
-    error("'%s' has no function '%s'", aer_as_string(c->pool[module_idx])->data, aer_as_string(c->pool[fn_idx])->data);
-    for (int i = 0; i < arg_count; i++) POP();
-    registers[dest_reg] = aer_null();
+    /* vm_call_module_dispatch (below) never actually returns with the call unresolved -- it calls
+       error() itself in that case, which unwinds before coming back here -- so by the time control
+       reaches this line, the module function's result is already sitting on top of the value stack. */
+    vm_call_module_dispatch(vm, c, module_idx, fn_idx, module_id, fn_id, arg_count);
+    registers[dest_reg] = POP();
+    gc_maybe_collect(vm);   /* stdlib/module functions routinely allocate (new strings/arrays/etc.) */
     DISPATCH();
 }
 
