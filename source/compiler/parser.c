@@ -290,17 +290,24 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
     if (spilled) reg_free(spilled);
 }
 
-/* Emits the branch-on-false half of an if/while condition. Fuses a bare, plain-boxed comparison --
-   nothing else emitted around it -- directly with the branch into one dispatch instead of
-   materializing its result into a register just to read it straight back a moment later
-   (OP_LT_JUMP_IF_FALSE and its 5 siblings, vm.h's own comment has the full rationale and the
-   fib_bench profile that motivated it). Detected the same way this file's other retrofit fusions
-   are (lhs_is_field/lhs_is_chain2 in parse_binary_ops, the FMA fusion in parse_assignment): look at
-   what was JUST compiled, before anything else runs, and roll it back if it matches. Falls back to
-   the ordinary materialize+emit_jump_if_false_reg path for every other condition shape --
-   and/or, a bare boolean, a non-comparison expression, a raw or raw-boxed comparison (already
-   faster via their own dedicated opcodes, see try_emit_cmp_raw_boxed/try_emit_binary_raw), or a
-   comparison whose operand needed spilling into a scratch register (more than one word emitted). */
+/* Emits the branch-on-false half of an if/while condition. Fuses a bare comparison -- nothing else
+   emitted around it -- directly with the branch into one dispatch instead of materializing its
+   result into a register just to read it straight back a moment later (OP_LT_JUMP_IF_FALSE and its
+   siblings, vm.h's own comment has the full rationale: fib_bench's profile motivated the plain
+   boxed family, mandelbrot's motivated adding the raw-boxed-int family too -- same mechanism either
+   way, only the boxed boolean destination write disappears; a raw comparison's own raw-slot/
+   register reads are completely unaffected). Deliberately does NOT cover raw-raw int/real or
+   raw-boxed real comparisons -- measured zero benefit anywhere in bench/ for those 3 families, but
+   a real branch-misprediction cost on every program regardless (vm.h's own comment has the numbers).
+   Detected the same way this file's other retrofit fusions are (lhs_is_field/lhs_is_chain2 in
+   parse_binary_ops, the FMA fusion in parse_assignment): look at what was JUST compiled, before
+   anything else runs, and roll it back if it matches -- true regardless of which comparison family
+   produced it, since every one of them (plain boxed, raw-boxed) already places its boxed-bool
+   destination in the exact same word0 A field and its own two operands in B/C, so one dispatch table
+   covers all of them. Falls back to the ordinary materialize+emit_jump_if_false_reg path for every
+   other condition shape -- and/or, a bare boolean, a non-comparison expression, a raw-raw or
+   raw-boxed-real comparison, or a comparison whose operand needed spilling into a scratch register
+   (more than one word emitted). */
 static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int cond_start) {
     if (c->count - cond_start == 1) {
         uint32_t w = c->code[cond_start];
@@ -313,6 +320,10 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
             case OP_GT:  fused_op = OP_GT_JUMP_IF_FALSE;  break;
             case OP_LTE: fused_op = OP_LTE_JUMP_IF_FALSE; break;
             case OP_GTE: fused_op = OP_GTE_JUMP_IF_FALSE; break;
+            case OP_RAW_LT_INT_BOXED:  fused_op = OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE;  break;
+            case OP_RAW_GT_INT_BOXED:  fused_op = OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE;  break;
+            case OP_RAW_LTE_INT_BOXED: fused_op = OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE; break;
+            case OP_RAW_GTE_INT_BOXED: fused_op = OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE; break;
             default: matched = false; fused_op = OP_EQ_JUMP_IF_FALSE; break;   /* value unused when matched is false */
         }
         if (matched && (int)UNPACK_A(w) == rk_cond) {

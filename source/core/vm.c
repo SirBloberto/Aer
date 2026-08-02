@@ -2031,6 +2031,11 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_GT_JUMP_IF_FALSE]  = &&lbl_gt_jump_if_false,
         [OP_LTE_JUMP_IF_FALSE] = &&lbl_lte_jump_if_false,
         [OP_GTE_JUMP_IF_FALSE] = &&lbl_gte_jump_if_false,
+
+        [OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE]  = &&lbl_raw_lt_int_boxed_jump_if_false,
+        [OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE]  = &&lbl_raw_gt_int_boxed_jump_if_false,
+        [OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lte_int_boxed_jump_if_false,
+        [OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gte_int_boxed_jump_if_false,
     };
 
     DISPATCH();
@@ -4395,6 +4400,36 @@ lbl_raw_gte_real_boxed: {
     else error("Cannot apply '>=' to float and %s", vm_type_name(c, *rhs));
     DISPATCH();
 }
+
+/* Same fusion as OP_LT_JUMP_IF_FALSE et al. above, scoped to just the raw-boxed int family -- vm.h's
+   own comment on OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE has the full rationale, including why the other
+   3 raw comparison families (raw-raw int/real, raw-boxed real) were tried and dropped: measured zero
+   benefit anywhere in bench/, but a real branch-misprediction tax on every program regardless (more
+   indirect-branch dispatch sites competing for the same finite-size hardware branch-target-predictor
+   table). rhs may legitimately be TYPE_REAL against an int raw slot -- same int/real mixing the
+   unfused raw-boxed opcode above already allows. On a genuine type mismatch, error() unwinds
+   (longjmp) before `cond` is ever read -- it only exists to keep the compiler from warning about a
+   possibly-unread variable on that path. */
+#define RAW_CMP_INT_BOXED_JUMP_IF_FALSE(name, op, opstr) \
+lbl_raw_##name##_int_boxed_jump_if_false: { \
+    int slot = (int)UNPACK_B(op_word); \
+    int reg  = (int)UNPACK_C(op_word); \
+    AerVal* rhs = &registers[reg]; \
+    int target = READ(); \
+    bool cond; \
+    if (rhs->tag == TYPE_INTEGER) cond = (raw_ints[slot] op rhs->as.i); \
+    else if (rhs->tag == TYPE_REAL) cond = ((double)raw_ints[slot] op rhs->as.d); \
+    else { error("Cannot apply '" opstr "' to integer and %s", vm_type_name(c, *rhs)); cond = false; } \
+    if (!cond) ip = (unsigned int)target; \
+    DISPATCH(); \
+}
+
+RAW_CMP_INT_BOXED_JUMP_IF_FALSE(lt, <, "<")
+RAW_CMP_INT_BOXED_JUMP_IF_FALSE(gt, >, ">")
+RAW_CMP_INT_BOXED_JUMP_IF_FALSE(lte, <=, "<=")
+RAW_CMP_INT_BOXED_JUMP_IF_FALSE(gte, >=, ">=")
+
+#undef RAW_CMP_INT_BOXED_JUMP_IF_FALSE
 
 lbl_halt:
     runtime_error_unwind_target = saved_unwind_target;

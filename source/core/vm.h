@@ -345,6 +345,28 @@ typedef enum {
     OP_EQ_JUMP_IF_FALSE, OP_NEQ_JUMP_IF_FALSE,
     OP_LT_JUMP_IF_FALSE, OP_GT_JUMP_IF_FALSE, OP_LTE_JUMP_IF_FALSE, OP_GTE_JUMP_IF_FALSE,
 
+    /* Same fusion as OP_LT_JUMP_IF_FALSE et al. above, extended to JUST the raw-boxed int family --
+       found via mandelbrot's own profile: its `for iter < max_iter:` (a raw int loop counter
+       against a boxed function-parameter bound) is OP_RAW_LT_INT_BOXED, paying the exact same
+       materialize-then-jump tax the plain boxed family did. Deliberately narrower than an earlier
+       attempt at all 4 raw comparison families (raw-raw int/real, raw-boxed int/real, 16 opcodes):
+       measured, that wider version's OTHER 12 opcodes earned nothing (mandelbrot's OWN escape check,
+       `if x2 + y2 > 4.0:`, doesn't qualify -- computing x2+y2 is its own instruction just before the
+       compare, so the bare-comparison-only detection this fusion requires correctly declines it; no
+       other benchmark in bench/ was found hitting the other 3 families either) while still costing
+       every program a measurable branch-misprediction tax: each new opcode is a new indirect-branch
+       dispatch SITE competing for the same finite-size hardware branch-target-predictor table every
+       OTHER opcode's dispatch already relies on, whether or not a given program ever uses the new
+       opcode itself (confirmed via perf -- branch-misses rose on programs, like fib_bench, that
+       never execute any of these 16 opcodes at all; icache/dcache miss rates were unaffected, ruling
+       those out). Keeping only the 4 opcodes with a proven win keeps that unavoidable tax as small
+       as it can be for the benefit actually captured. Operand layout is the existing raw-boxed-int
+       opcode's own word0 B/C fields verbatim (a raw slot + a boxed register) -- only the A field
+       (the boxed-bool destination, unused here) and the trailing jump-target word change, exactly
+       mirroring OP_LT_JUMP_IF_FALSE's own shape. */
+    OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE,  OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE,
+    OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE, OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE,
+
     OP_OPCODE_COUNT_MARKER   /* not a real opcode -- sizes the static assert below */
 } Opcode;
 _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — widen the opcode field");
