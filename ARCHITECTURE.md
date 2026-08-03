@@ -1128,6 +1128,22 @@ consistent across every run.
   the 1 hang found was reproduced identically against the exact pre-SSO commit via `git archive`,
   confirming it predates this change). Cross-language ratios improved substantially on all three
   target benchmarks against Luau (e.g. `lookup_table_bench` from 85% behind to 44% behind).
+
+  **Follow-up: `AER_STRING_INLINE_MAX` raised 11 -> 15, still free.** Compiling `struct AerString`
+  at each threshold showed `sizeof` holds at 32 bytes anywhere from 7 through 15 (take 3's field
+  order — `gc_state, length, data, inline_buf` — packs `length` into what would otherwise be
+  padding ahead of the 8-byte-aligned `data` pointer; it only jumps to 40 bytes at 16). Take 2's
+  struct, by contrast, used `gc_state, data, length, inline_buf`, which hits 32 bytes already at 7
+  and 40 at 15 — the real reason take 2's own `MAX=15` attempt taxed `struct_array_scan`: that cost
+  came from a bigger cell, not from inlining more bytes, and take 3's layout doesn't pay it. 15 is
+  the top of the current free range, and `log_processing.aer`'s `path_counts` keys give it real
+  work: `"/favicon.ico"` (12 bytes) and `"/static/app.js"` (14 bytes) both missed the original
+  11-byte cutoff and were still heap-allocating every line under it. Measured on the Pi: `dict_bench`/
+  `small_dict_bench`/`lookup_table_bench` unchanged (their longest strings already fit under 11),
+  `struct_array_scan` unchanged (confirming the cell really doesn't grow), `log_processing` a
+  further ~0.76% instruction-count win on top of the -17.0% above, and a spot check of
+  `binary_trees`/`fib_bench`/`mandelbrot`/`nbody`/`sieve` (no meaningful string activity) all
+  unchanged. Full test suite green on Windows and the Pi.
 - **DONE: array-reserve builtin — `collection.reserve(arr, n)`.** Mirrors `hashtable_reserve`'s
   existing dict contract: pre-sizes `items`/`capacity` once, `xrealloc` immediately to `n` rather
   than doubling on every overflow, a no-op if already big enough, never shrinks. Verified with a
