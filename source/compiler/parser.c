@@ -147,6 +147,24 @@ typedef struct Parser {
     int          global_regs[FRAME_REGISTERS];
     int          global_count;
 
+    /* Side-channel from a plain assignment's RHS parse to its own reassignment-kind check just
+       after (parse_assignment) -- set to the target's OWN name right before parsing its RHS,
+       consulted right after via self_ref_watch_seen. var_lookup_rk is the ONE place every bare
+       identifier reference resolves through (see its own comment), so hooking there catches a
+       self-reference regardless of how deep inside the RHS expression it's buried, with no need
+       to understand any opcode's operand encoding. Lets `x = <existing-raw-x-changing-kind>`
+       inside a loop tell apart the genuinely unsafe case (the RHS reads x's OWN old value, e.g.
+       `total = total + something_boxed` -- the already-emitted read would go stale after the
+       first iteration's shadow) from the common, completely safe one (the RHS doesn't reference x
+       at all, e.g. `total = some_function_call()` -- nothing about shadowing to a fresh boxed
+       register on iteration 2 changes what iteration 2's RHS computes). Found via
+       bench/typed_array_bench.aer: `total = scale_and_accumulate(xs, factor)` inside `for pass in
+       0..200:` used to hit the former's blanket refusal despite matching the latter, safe shape --
+       a real, over-broad false positive in the existing check, invisible before top-level
+       variables could ever be raw in the first place. */
+    unsigned int self_ref_watch_name;
+    bool         self_ref_watch_seen;
+
     /* Forward-referenced calls not yet resolved to a real function -- see PendingCall's own
        comment above. */
     PendingCall* pending_calls;
@@ -309,8 +327,35 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
    raw-boxed-real comparison, or a comparison whose operand needed spilling into a scratch register
    (more than one word emitted). */
 static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int cond_start) {
-    if (c->count - cond_start == 1) {
-        uint32_t w = c->code[cond_start];
+    /* A raw-vs-constant comparison (try_emit_binary_raw's own comparison-vs-constant special
+       case, above) always has an OP_LOADK immediately before the comparison word -- materializing
+       the constant into an actual register is unavoidable (the raw-boxed opcodes' own operand
+       encoding has no constant-pool support), so the ordinary "exactly one word" check below would
+       never fire for this shape at all. Recognized here as its own narrow case: keep the LOADK
+       (it's still needed, the fused opcode below still reads that same register), just fuse the
+       comparison with the branch as usual, so this shape still collapses from 3 dispatches
+       (LOADK, compare, jump) to 2 (LOADK, fused compare+jump) instead of the full 1 a plain
+       operand gets -- still a real win, just not as large. Guarded on the LOADK's own dest being a
+       TEMP (>= reserved_floor): a named variable's register being coincidentally read right after
+       its own most recent LOADK is not the same guarantee (that register might still be read again
+       later), so only a compiler-introduced temp -- always what try_emit_binary_raw's own
+       materialize() call produces -- is safe to assume dead here. */
+    unsigned int cmp_word_start = cond_start;
+    if (c->count - cond_start == 2) {
+        uint32_t loadk_w = c->code[cond_start];
+        if ((loadk_w & 0xFF) == OP_LOADK) {
+            uint32_t cmp_w = c->code[cond_start + 1];
+            Opcode cmp_op = (Opcode)(cmp_w & 0xFF);
+            bool is_raw_boxed_cmp = (cmp_op == OP_RAW_LT_INT_BOXED || cmp_op == OP_RAW_GT_INT_BOXED ||
+                                         cmp_op == OP_RAW_LTE_INT_BOXED || cmp_op == OP_RAW_GTE_INT_BOXED);
+            int loadk_dest = (int)UNPACK_A(loadk_w);
+            if (is_raw_boxed_cmp && (int)UNPACK_C(cmp_w) == loadk_dest && loadk_dest >= P.reserved_floor) {
+                cmp_word_start = cond_start + 1;
+            }
+        }
+    }
+    if (c->count - cmp_word_start == 1) {
+        uint32_t w = c->code[cmp_word_start];
         bool matched = true;
         Opcode fused_op;
         switch ((Opcode)(w & 0xFF)) {
@@ -328,7 +373,7 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
         }
         if (matched && (int)UNPACK_A(w) == rk_cond) {
             uint8_t rk_lhs8 = (uint8_t)UNPACK_B(w), rk_rhs8 = (uint8_t)UNPACK_C(w);
-            c->count = cond_start;   /* discard the standalone comparison -- fused below instead */
+            c->count = cmp_word_start;   /* discard the standalone comparison (keeping any LOADK before it) -- fused below instead */
             chunk_emit(c, PACK3(fused_op, 0, rk_lhs8, rk_rhs8));
             unsigned int patch = c->count;
             chunk_emit(c, 0);   /* placeholder -- patched by the caller, same convention as emit_jump_if_false_reg */
@@ -761,6 +806,7 @@ static int materialize(Chunk* c, int rk) {
 /* Every reader of a variable's value must go through this, not raw P.var_regs[i], or a raw slot
    index gets misread as a plain register (real bug found in string interpolation). */
 static bool var_lookup_rk(unsigned int name_idx, int* out_rk) {
+    if (name_idx == P.self_ref_watch_name) P.self_ref_watch_seen = true;
     for (int i = 0; i < P.var_count; i++) {
         if (P.var_names[i] != name_idx) continue;
         switch (P.var_kind[i]) {
@@ -951,6 +997,42 @@ static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind
 static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int* out_rk) {
     RawKind kind_lhs = rk_raw_kind(c, rk_lhs);
     RawKind kind_rhs = rk_raw_kind(c, rk_rhs);
+
+    /* Comparison-only special case: rk_raw_kind reports a bare literal constant as raw-composable,
+       exactly like an already-materialized raw slot -- indistinguishable by kind alone below.
+       That's the right call for arithmetic (raw-raw is the cheapest form there regardless of
+       which operand started as a literal), but wrong for a comparison against an ALREADY-raw
+       operand: boxing the constant instead (one OP_LOADK) keeps it eligible for the existing
+       raw-vs-boxed comparison fusion (try_emit_cmp_raw_boxed, whose own -JUMP_IF_FALSE variant may
+       fuse the branch too, emit_cond_jump_if_false), which raw-materializing it into an actual raw
+       slot rules out permanently -- that opcode's own handler (lbl_raw_lt_int_boxed etc., vm.c)
+       reads its "boxed" operand as a bare register index, no constant-pool support, so this
+       fusion is only reachable via a boxed register in the first place. Found via
+       small_dict_bench.aer's `i < 200000` (a raw loop counter against a literal bound), once
+       top-level locals could be raw at all: OP_RAW_LOAD_INT + OP_RAW_LT_INT +
+       OP_JUMP_IF_FALSE_REG (3 dispatches) instead of OP_LOADK + the fused compare+jump (2). Never
+       worse even when the comparison isn't a bare loop/if condition (no fusion to gain that way):
+       OP_LOADK + OP_RAW_LT_INT_BOXED is the same 2 dispatches OP_RAW_LOAD_INT + OP_RAW_LT_INT
+       already was. */
+    if ((op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE) &&
+            kind_lhs != RAWK_NONE && kind_lhs == kind_rhs) {
+        bool lhs_is_slot = (rk_lhs & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) != 0;
+        bool rhs_is_slot = (rk_rhs & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) != 0;
+        bool lhs_is_const = (rk_lhs & RK_CONST_FLAG) != 0;
+        bool rhs_is_const = (rk_rhs & RK_CONST_FLAG) != 0;
+        if (lhs_is_slot && rhs_is_const) {
+            int boxed = materialize(c, rk_rhs);
+            if (try_emit_cmp_raw_boxed(c, op, rk_lhs, kind_lhs, boxed, RAWK_NONE, out_rk)) return true;
+            rk_rhs = boxed;   /* fusion declined (shouldn't happen given the setup above) -- fall through with the now-boxed operand */
+            kind_rhs = RAWK_NONE;
+        } else if (rhs_is_slot && lhs_is_const) {
+            int boxed = materialize(c, rk_lhs);
+            if (try_emit_cmp_raw_boxed(c, op, boxed, RAWK_NONE, rk_rhs, kind_rhs, out_rk)) return true;
+            rk_lhs = boxed;
+            kind_lhs = RAWK_NONE;
+        }
+    }
+
     if ((kind_lhs == RAWK_NONE) != (kind_rhs == RAWK_NONE)) {
         if (try_emit_arith_raw_boxed(c, op, rk_lhs, kind_lhs, rk_rhs, kind_rhs, out_rk)) return true;
         return try_emit_cmp_raw_boxed(c, op, rk_lhs, kind_lhs, rk_rhs, kind_rhs, out_rk);
@@ -2255,6 +2337,10 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
     }
 
     if (consume(TOKEN_ASSIGN)) {
+        /* Watches for a self-reference during the RHS parse -- see self_ref_watch_name's own
+           comment (top of file) for why and what consumes self_ref_watch_seen just below. */
+        P.self_ref_watch_name = name_idx;
+        P.self_ref_watch_seen = false;
         int rk_val = parse_binary(c, 0);
         if (parse_had_error) return;
 
@@ -2290,10 +2376,23 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                     }
                 }
             }
-            /* Eligible for raw storage iff: inside a function body, outside any if/else branch, and the
-               RHS is provably int/real. */
+            /* Eligible for raw storage iff: outside any if/else branch, and the RHS is provably
+               int/real -- NOT gated on function_depth (top-level scope qualifies too, not just a
+               function body). Verified safe for top-level specifically: frame 0's raw_ints/
+               raw_reals arrays are linked once for the VM's entire life at full capacity
+               (RAW_REGISTERS_INT/REAL, vm_init) and aer_vm_reset_for_reuse (called before every
+               REPL line) never touches them -- exactly the same persistence boxed top-level
+               registers already rely on, confirmed via smoke_test.c's own run_repl_line, which
+               restores vm->raw_ints/raw_reals from call_stack[0] alongside vm->registers.
+               global_regs[] (the shadow-ban mechanism) only ever compares register NUMBERS by
+               name for its ban check, never dereferences them as real storage, so a raw slot
+               index living there instead of an ordinary register index changes nothing about it
+               either. Found via dict_bench.aer/lookup_table_bench.aer/small_dict_bench.aer: their
+               top-level accumulator/loop-counter locals (`sum += h[key]`, `i += 1`) were paying
+               full boxed tag-checked arithmetic for their entire run, unlike the exact same
+               pattern already optimized inside any function body. */
             RawKind rhs_kind = rk_raw_kind(c, rk_val);
-            if (P.function_depth > 0 && P.branch_depth == 0 && rhs_kind != RAWK_NONE) {
+            if (P.branch_depth == 0 && rhs_kind != RAWK_NONE) {
                 int slot = (rhs_kind == RAWK_INT) ? raw_int_reserve_one() : raw_real_reserve_one();
                 if (slot >= 0) {
                     int src_slot = raw_materialize(c, rk_val, rhs_kind);
@@ -2343,8 +2442,14 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                  A looped self-referential shadow (`total = total + x`) must refuse to compile
                rather than silently freeze at the pre-loop value -- the RHS bytecode reading the
                old raw value was already emitted before this shadow decision, and re-runs every
-               iteration reading a slot nothing writes to anymore (real bug found this way). */
-            if (P.loop_depth > 0) {
+               iteration reading a slot nothing writes to anymore (real bug found this way).
+               Gated on self_ref_watch_seen, not just loop_depth: that failure mode only exists
+               when the RHS actually reads x's OWN old value -- a reassignment that doesn't (e.g.
+               `total = some_function_call()`) has nothing stale to re-read on the next iteration,
+               so shadowing to a fresh boxed register is exactly as safe here as it already is
+               outside a loop. Found via bench/typed_array_bench.aer hitting the blanket refusal
+               despite matching this exact safe shape -- see self_ref_watch_name's own comment. */
+            if (P.loop_depth > 0 && P.self_ref_watch_seen) {
                 error_at("This assignment would change '%s' from a fixed numeric type to a different type, but it's inside a loop — not supported. If you're accumulating with +, -, or *, use the compound form ('%s += ...' etc.) instead — it doesn't have this restriction. Otherwise, restructure so the type change happens outside any loop.",
                          aer_as_string(c->pool[name_idx])->data, aer_as_string(c->pool[name_idx])->data);
                 return;

@@ -33,7 +33,7 @@ assert(done_index < length(messages) - 1, "the messenger finished while the loop
 # across many scheduler rounds reproduces exactly what one uninterrupted run would give).
 expected_total = 0
 for i in 0..2000000:
-    expected_total = expected_total + i
+    expected_total += i
 assert(messages[length(messages) - 1] == "total:{expected_total}", "the looper's sliced, multi-round execution produced the exact same result an uninterrupted run would")
 
 # The actor is still usable after being driven by the scheduler, not left in a broken state.

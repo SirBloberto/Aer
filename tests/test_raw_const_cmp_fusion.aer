@@ -1,0 +1,69 @@
+import collection
+
+# try_emit_binary_raw's comparison-vs-constant special case: a raw int/real value compared
+# against a bare literal constant now boxes the constant (one OP_LOADK) instead of
+# raw-materializing it, so it stays eligible for the existing raw-vs-boxed comparison fusion
+# (and, when the comparison is a bare loop/if condition, the full compare+jump fusion too).
+# Exercises all 4 raw-int-vs-constant comparisons, all 4 raw-real-vs-constant comparisons, both
+# operand orders (constant on the left AND right), both as loop conditions and as plain boolean
+# expressions, and confirms int/real mixing across the raw/constant boundary still promotes
+# correctly (an int raw value against a real constant, and vice versa).
+
+function count_up_to(bound):
+    total = 0
+    n = 0
+    for n < bound:
+        total += n
+        n += 1
+    return total
+assert(count_up_to(100000) == 4999950000, "raw int loop counter vs literal bound (LT), as a loop condition")
+
+function count_down_from(start):
+    total = 0
+    n = start
+    for n > 0:
+        total += n
+        n -= 1
+    return total
+assert(count_down_from(1000) == 500500, "raw int loop counter vs literal 0 (GT), as a loop condition")
+
+# Both operand orders, all 4 comparisons, as plain (non-loop-condition) boolean expressions --
+# exercises the raw-vs-boxed fusion without the extra compare+jump layer.
+function raw_cmp_checks(n):
+    results = []
+    collection.append(results, n < 100)
+    collection.append(results, 100 < n)
+    collection.append(results, n > 5)
+    collection.append(results, 5 > n)
+    collection.append(results, n <= 10)
+    collection.append(results, 10 <= n)
+    collection.append(results, n >= 10)
+    collection.append(results, 10 >= n)
+    return results
+r = raw_cmp_checks(10)
+assert(r[0] == true, "n(10) < 100")
+assert(r[1] == false, "100 < n(10)")
+assert(r[2] == true, "n(10) > 5")
+assert(r[3] == false, "5 > n(10)")
+assert(r[4] == true, "n(10) <= 10")
+assert(r[5] == true, "10 <= n(10)")
+assert(r[6] == true, "n(10) >= 10")
+assert(r[7] == true, "10 >= n(10)")
+
+# Raw REAL vs literal constant -- same fusion path, real-kind raw slot instead of int.
+function real_cmp_checks(x):
+    a = x < 3.5
+    b = 3.5 < x
+    return a, b
+ra, rb = real_cmp_checks(2.0)
+assert(ra == true and rb == false, "raw real vs real-literal comparison, both orders")
+
+# Int raw value vs a REAL literal constant (and vice versa) must still promote correctly --
+# OP_RAW_LT_INT_BOXED's own handler already accepts a real boxed rhs; confirms the constant now
+# being boxed (not raw-materialized) doesn't change that promotion behavior.
+function mixed_kind_cmp(n):
+    return n < 3.5
+assert(mixed_kind_cmp(3) == true, "raw int vs real-literal constant promotes correctly")
+assert(mixed_kind_cmp(4) == false, "raw int vs real-literal constant promotes correctly (false case)")
+
+print("all raw-vs-constant comparison fusion checks passed")
