@@ -13,9 +13,11 @@
    one for Chunk.name_index) and every HashTable records which one it was created with. */
 #define HASH_KEY_TIER_COUNT    4
 #define HASH_SPARSE_TIER_COUNT 5
+#define HASH_DENSE_TIER_COUNT  6
 typedef struct {
     Pool key_pools[HASH_KEY_TIER_COUNT];
     Pool sparse_pools[HASH_SPARSE_TIER_COUNT];
+    Pool dense_pools[HASH_DENSE_TIER_COUNT];
     bool initialized;
 } HashPools;
 

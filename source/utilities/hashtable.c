@@ -14,12 +14,10 @@ static void rehash_sparse(HashTable* t);
 
 /* t->capacity is always a power of two, so every probe index uses `& (capacity - 1)`. */
 
-/* Size-classed slab pools for keys and the sparse probe array (both alloc-new/free-old, never
-   realloc'd in place); sizes past the largest tier fall back to plain malloc. The dense array is
-   a separate, plain xrealloc-doubling allocation (aer_collection.c's append() growth pattern) --
-   its access pattern is sequential append/scan, not the random-probe pattern pooling helps with.
-   Tier layout lives here (not per-HashPools-instance) since every HashPools instance uses the same
-   fixed tier sizes -- only the actual Pool state differs per instance. */
+/* Size-classed slab pools for keys, the sparse probe array, and the dense entry array (all
+   alloc-new/free-old, never realloc'd in place); sizes past the largest tier fall back to plain
+   malloc. Tier layout lives here (not per-HashPools-instance) since every HashPools instance uses
+   the same fixed tier sizes -- only the actual Pool state differs per instance. */
 /* 16-byte floor is required, not tuning -- pool_free writes its free-list pointer at bytes [8,16). */
 static const size_t       KEY_TIER_SIZE[HASH_KEY_TIER_COUNT]           = { 16, 32, 64, 128 };
 static const unsigned int KEY_TIER_ELEMS_PER_SLAB[HASH_KEY_TIER_COUNT] = { 256, 128, 64, 32 };
@@ -27,12 +25,21 @@ static const unsigned int KEY_TIER_ELEMS_PER_SLAB[HASH_KEY_TIER_COUNT] = { 256, 
 static const unsigned int SPARSE_TIER_CAPACITY[HASH_SPARSE_TIER_COUNT]       = { 16, 32, 64, 128, 256 };
 static const unsigned int SPARSE_TIER_ELEMS_PER_SLAB[HASH_SPARSE_TIER_COUNT] = { 64, 32, 16, 8, 4 };
 
+/* Entry counts, not bytes -- matches dense_grow_if_needed's own doubling sequence (0->4->8->16->...)
+   exactly, so t->dense_capacity always lands precisely on a tier boundary and dense_free's
+   exact-match lookup (mirroring sparse_array_free) never misses. Past 128 entries, growth falls
+   back to plain xmalloc/free like KEY_TIER_SIZE/SPARSE_TIER_CAPACITY do past their own largest tier. */
+static const unsigned int DENSE_TIER_CAPACITY[HASH_DENSE_TIER_COUNT]       = { 4, 8, 16, 32, 64, 128 };
+static const unsigned int DENSE_TIER_ELEMS_PER_SLAB[HASH_DENSE_TIER_COUNT] = { 64, 32, 16, 8, 4, 2 };
+
 void hashtable_pools_init(HashPools* pools) {
     if (pools->initialized) return;
     for (unsigned int i = 0; i < HASH_KEY_TIER_COUNT; i++)
         pool_init(&pools->key_pools[i], KEY_TIER_SIZE[i], KEY_TIER_ELEMS_PER_SLAB[i]);
     for (unsigned int i = 0; i < HASH_SPARSE_TIER_COUNT; i++)
         pool_init(&pools->sparse_pools[i], (size_t)SPARSE_TIER_CAPACITY[i] * sizeof(unsigned int), SPARSE_TIER_ELEMS_PER_SLAB[i]);
+    for (unsigned int i = 0; i < HASH_DENSE_TIER_COUNT; i++)
+        pool_init(&pools->dense_pools[i], (size_t)DENSE_TIER_CAPACITY[i] * sizeof(HashTableEntry), DENSE_TIER_ELEMS_PER_SLAB[i]);
     pools->initialized = true;
 }
 
@@ -63,6 +70,22 @@ static void sparse_array_free(HashPools* pools, unsigned int* sparse, unsigned i
     for (unsigned int i = 0; i < HASH_SPARSE_TIER_COUNT; i++)
         if (capacity == SPARSE_TIER_CAPACITY[i]) { pool_free(&pools->sparse_pools[i], sparse); return; }
     free(sparse);
+}
+
+/* No memset, unlike sparse_array_alloc -- the dense array has no "empty" sentinel to fill in.
+   Every live slot [0, t->count) is always fully written by hashtable_put_hashed before anything
+   reads it, and nothing ever reads past t->count, so an uninitialized cell is harmless. */
+static HashTableEntry* dense_array_alloc(HashPools* pools, unsigned int capacity) {
+    for (unsigned int i = 0; i < HASH_DENSE_TIER_COUNT; i++)
+        if (capacity == DENSE_TIER_CAPACITY[i]) return pool_alloc(&pools->dense_pools[i]);
+    return xmalloc((size_t)capacity * sizeof(HashTableEntry));
+}
+
+static void dense_array_free(HashPools* pools, HashTableEntry* dense, unsigned int capacity) {
+    if (!dense) return;
+    for (unsigned int i = 0; i < HASH_DENSE_TIER_COUNT; i++)
+        if (capacity == DENSE_TIER_CAPACITY[i]) { pool_free(&pools->dense_pools[i], dense); return; }
+    free(dense);
 }
 
 unsigned int hashtable_key_true_len(const char* data, unsigned int len) {
@@ -97,10 +120,32 @@ static bool hash_match(const HashTableEntry* entry, const char* key, unsigned in
     return entry->key && entry->length == length && memcmp(entry->key, key, length) == 0;
 }
 
+/* Alloc-new/copy/free-old once any tier is involved -- the pools don't support growing a cell in
+   place, only handing back a whole new one. But a table that grows one entry at a time with no
+   hashtable_reserve up front (dict_bench.aer's pattern: 200k individual inserts, no pre-sizing)
+   climbs past the largest tier and keeps doubling for the rest of its life entirely in plain-malloc
+   territory -- forcing every one of THOSE growth steps through a manual memcpy would throw away
+   realloc's ability to extend the same block in place for a large standalone allocation, which is
+   exactly the case measured to regress dict_bench (+3.1% instructions) before this check was added.
+   Once both the old and new capacity are already past the last tier, there's no pool involved on
+   either side, so plain xrealloc is strictly better -- only the climb through the tiers themselves
+   (and the one crossing from the last tier into plain-malloc territory) needs the copy dance. */
 static void dense_grow_if_needed(HashTable* t) {
     if (t->count < t->dense_capacity) return;
-    t->dense_capacity = t->dense_capacity ? t->dense_capacity * 2 : 4;
-    t->dense = xrealloc(t->dense, sizeof(HashTableEntry) * t->dense_capacity);
+    unsigned int new_capacity = t->dense_capacity ? t->dense_capacity * 2 : 4;
+    unsigned int largest_tier = DENSE_TIER_CAPACITY[HASH_DENSE_TIER_COUNT - 1];
+    if (t->dense_capacity > largest_tier) {
+        t->dense = xrealloc(t->dense, sizeof(HashTableEntry) * new_capacity);
+        t->dense_capacity = new_capacity;
+        return;
+    }
+    HashTableEntry* new_dense = dense_array_alloc(t->pools, new_capacity);
+    if (t->dense) {
+        memcpy(new_dense, t->dense, sizeof(HashTableEntry) * t->count);
+        dense_array_free(t->pools, t->dense, t->dense_capacity);
+    }
+    t->dense          = new_dense;
+    t->dense_capacity = new_capacity;
 }
 
 void hashtable_put(HashTable* t, char* key, unsigned int length, AerVal value) {
@@ -203,8 +248,26 @@ static void rehash_sparse(HashTable* t) {
    duplicate key in the literal, say). */
 void hashtable_reserve(HashTable* t, unsigned int expected_count) {
     if (t->dense_capacity < expected_count) {
-        t->dense_capacity = expected_count;
-        t->dense = xrealloc(t->dense, sizeof(HashTableEntry) * t->dense_capacity);
+        /* Rounded up to dense_grow_if_needed's own doubling sequence (4, 8, 16, ...), not set to
+           expected_count directly -- a tiered dense_array_alloc only has cells at those exact
+           sizes, and a caller reserving e.g. 5 needs the same 8-capacity cell growth would have
+           produced anyway. */
+        unsigned int new_capacity = t->dense_capacity ? t->dense_capacity : 4;
+        while (new_capacity < expected_count) new_capacity *= 2;
+        unsigned int largest_tier = DENSE_TIER_CAPACITY[HASH_DENSE_TIER_COUNT - 1];
+        if (t->dense_capacity > largest_tier) {
+            /* Already past every tier on both sides -- see dense_grow_if_needed's own comment on
+               why this stays a plain xrealloc instead of the pooled alloc-new/copy/free-old dance. */
+            t->dense = xrealloc(t->dense, sizeof(HashTableEntry) * new_capacity);
+        } else {
+            HashTableEntry* new_dense = dense_array_alloc(t->pools, new_capacity);
+            if (t->dense) {
+                memcpy(new_dense, t->dense, sizeof(HashTableEntry) * t->count);
+                dense_array_free(t->pools, t->dense, t->dense_capacity);
+            }
+            t->dense = new_dense;
+        }
+        t->dense_capacity = new_capacity;
     }
     if (!t->sparse) {
         unsigned int capacity = HASHTABLE_INIT_SIZE;
@@ -273,6 +336,6 @@ void hashtable_free(HashTable* t) {
     HashPools* pools = t->pools;
     hashtable_clear(t);
     if (t->sparse) sparse_array_free(pools, t->sparse, t->capacity);
-    free(t->dense);
+    dense_array_free(pools, t->dense, t->dense_capacity);
     *t = (HashTable){0};
 }
