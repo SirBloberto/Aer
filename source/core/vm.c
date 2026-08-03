@@ -617,6 +617,22 @@ static inline __attribute__((always_inline)) AerVal vm_promote_real(AerVal v) {
     return v;
 }
 
+/* AER's integers are int64_t, but this build targets 32-bit ARM (armv7l Pi) with no ARCH_FLAGS
+   (see makefile -- deliberately portable, not tuned to one CPU). Confirmed by compiling `a % b` for
+   both widths on that target: even 32-bit modulo isn't a hardware instruction on the default
+   toolchain target (no guaranteed integer-divide extension without -mcpu), but it's still a much
+   cheaper libgcc call (__aeabi_idivmod/__aeabi_uidivmod, one 32-bit long-division) than 64-bit
+   modulo (__aeabi_ldivmod, roughly double the work). `n % 500`-shaped code (dict-bucket-style
+   moduli, the common case) always has both operands well inside int32 range, so it's worth
+   checking rather than always paying the 64-bit rate. rv != -1 is required, not incidental: INT32_
+   MIN % -1 is undefined behavior (a 32-bit division overflow) even though the same values are fine
+   at 64-bit width, since -2^31 doesn't overflow when widened to int64_t first. */
+static inline int64_t aer_mod_int64(int64_t l, int64_t rv) {
+    if (rv != -1 && l >= INT32_MIN && l <= INT32_MAX && rv >= INT32_MIN && rv <= INT32_MAX)
+        return (int32_t)l % (int32_t)rv;
+    return l % rv;
+}
+
 /* ------------------------------------------------------------------ */
 /* Binary operation dispatch                                            */
 /* ------------------------------------------------------------------ */
@@ -652,7 +668,7 @@ static inline AerVal vm_binary_fast(AerVal a, AerVal b, Opcode op, ValueType ta,
                 return aer_int((int64_t)floor((double)l / (double)rv));
             case OP_MOD:
                 if (rv == 0) { error("Modulo by zero"); return aer_int(0); }
-                return aer_int(l % rv);
+                return aer_int(aer_mod_int64(l, rv));
             case OP_LSHIFT:      return aer_int(l << rv);
             case OP_RSHIFT:      return aer_int(l >> rv);
             case OP_BITWISE_AND: return aer_int(l &  rv);
@@ -2489,7 +2505,7 @@ BINARY_OP_INT_REAL(floor_div, OP_FLOOR_DIV,
     { if (rv == 0) { error("Division by zero"); *result = aer_int(0); } else { *result = aer_int((int64_t)floor((double)l / (double)rv)); } },
     { if (rv == 0.0) { error("Division by zero"); *result = aer_real(0.0); } else { *result = aer_real(floor(l / rv)); } })
 BINARY_OP_INT_REAL(mod, OP_MOD,
-    { if (rv == 0) { error("Modulo by zero"); *result = aer_int(0); } else { *result = aer_int(l % rv); } },
+    { if (rv == 0) { error("Modulo by zero"); *result = aer_int(0); } else { *result = aer_int(aer_mod_int64(l, rv)); } },
     { *result = aer_real(fmod(l, rv)); })
 BINARY_OP_INT_REAL(eq,  OP_EQ,  { *result = aer_bool(l == rv); }, { *result = aer_bool(l == rv); })
 BINARY_OP_INT_REAL(neq, OP_NEQ, { *result = aer_bool(l != rv); }, { *result = aer_bool(l != rv); })
@@ -4260,7 +4276,7 @@ lbl_raw_mod_int: {
     int b    = (int)UNPACK_C(op_word);
     int64_t rv = raw_ints[b];
     if (rv == 0) { error("Modulo by zero"); raw_ints[dest] = 0; }
-    else raw_ints[dest] = raw_ints[a] % rv;
+    else raw_ints[dest] = aer_mod_int64(raw_ints[a], rv);
     DISPATCH();
 }
 
