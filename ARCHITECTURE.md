@@ -1174,6 +1174,57 @@ consistent across every run.
   raw-opcode SET/COMPOUND family does not range-check on overflow (silently truncates), matching
   every other raw arithmetic opcode's existing "raw means unchecked, for speed" convention -- unlike
   the boxed path's own `vm_check_narrow_field_write`, which does check.
+- **DONE: 32-bit-safe fast path for integer modulo.** This build targets 32-bit ARM (armv7l Pi)
+  with `ARCH_FLAGS` deliberately empty (portable by default, see the makefile). `perf record -e
+  cycles` on `lookup_table_bench.aer` (`n % 500`, both operands always well inside int32 range)
+  showed `__udivmoddi4` -- the 64-bit software modulo libgcc falls back to here -- at 8.2% of
+  cycles. Compiled `a % b` at both widths on the actual target rather than assuming: even 32-bit
+  modulo isn't a hardware instruction on this toolchain's default target (no guaranteed
+  integer-divide extension without `-mcpu`), but `__aeabi_(u)idivmod` (32-bit software long
+  division) is meaningfully cheaper than `__aeabi_ldivmod` (64-bit). `aer_mod_int64()` (`vm.c`) now
+  does the modulo at 32-bit width and widens back when both operands fit `int32_t` -- used by both
+  the boxed `OP_MOD` path and the raw `OP_RAW_MOD_INT` fast path. `rv != -1` is a required guard,
+  not incidental: `INT32_MIN % -1` is undefined behavior (32-bit division overflow) even though the
+  identical values are fine at 64-bit width. Measured on the Pi: `lookup_table_bench` -3.5%
+  instructions, `log_processing` (also uses `%`) a further -1.3%; every benchmark with no modulo in
+  its hot loop unchanged.
+- **DONE: pool the hashtable's dense entry array.** Profiling `small_dict_bench.aer` (perf record)
+  after the modulo fix still showed `pool_alloc`/`hashtable_key_dup`/`hashtable_put_hashed` plus
+  `gc_collect`/`hashtable_free`/`_int_malloc`/`_int_free` dominating -- `rec = {"id": i, "name":
+  ..., ...}` builds a brand-new `HashTable` every iteration. The sparse probe array and every key
+  already come from `HashPools`' size-classed tiers (see `2.2`/dict-payload-pooling); the dense
+  entry array (`HashTableEntry[]`) was the one piece still going through plain `xrealloc`/`free`.
+  Added `DENSE_TIER_CAPACITY = {4,8,16,32,64,128}` (entry counts, matching `dense_grow_if_needed`'s
+  own doubling sequence exactly, so `dense_capacity` always lands on a tier boundary) with the same
+  alloc-new/free-old shape `sparse_array_alloc/free` already uses. First attempt regressed
+  `dict_bench.aer` (+3.1% instructions): forcing every growth step through alloc-new+memcpy+free-old
+  unconditionally throws away `xrealloc`'s ability to extend a large standalone allocation in place,
+  which matters for a table that grows one entry at a time with no `hashtable_reserve` up front (its
+  actual pattern, climbing well past the largest tier). Fixed by keeping plain `xrealloc` once both
+  the old and new capacity are already past the last tier -- only the climb through the tiers
+  themselves pays the copy. Measured on the Pi: `small_dict_bench` -11.4% instructions,
+  `dict_bench`/`lookup_table_bench`/`log_processing`/`struct_array_scan` all within noise of the
+  modulo-fix-only numbers (confirming no regression and that `lookup_table_bench`'s 500-entry table,
+  past the tier ceiling, correctly gets no extra benefit here). ASAN clean (one pre-existing,
+  unrelated `main.c:58` leak, not new) plus a 200-iteration fuzz pass.
+- **Considered, declined: sharing constant dict-literal keys instead of duplicating them.**
+  `OP_DICT_NEW` calls `hashtable_key_dup` for every key on every evaluation, even though a literal
+  like `{"id": i, ...}`'s keys are the same constant-pool bytes every time. Avoiding the duplicate
+  safely needs `HashTableEntry` to know, per entry, whether it owns its key or is borrowing a
+  constant -- `hashtable_free`/`rehash_sparse`/the duplicate-key overwrite path in
+  `hashtable_put_hashed` all free a key unconditionally today. That requires either a new field on
+  every entry (`HashTableEntry` is 40 bytes; even a 1-byte ownership flag rounds it up to 48 -- an
+  8-byte tax on every entry in every dict in the language, literal-keyed or not) or stealing a bit
+  from `length` (no memory cost, but `hash_match` -- the hottest function in every dict lookup,
+  called on every probe -- would need to mask it out on every single comparison, everywhere).
+  Same economics that already killed `OP_COMPOUND_BINARY` and `OP_MOD_POW2_INT` earlier this
+  session: a cost paid by every dict operation in the language, for a win that only helps repeated
+  dict-*literal* construction specifically, not the more common "build once, read many times"
+  pattern. The more honest version of this idea doesn't shrink the tax, it avoids it by going
+  further: recognize a dict literal whose keys are always literal strings and give it a
+  struct-shaped fast path via the existing `Shape` machinery instead of a hashtable at all -- a
+  materially bigger feature (has to preserve dicts' dynamic-key-insertion semantics), not a small
+  follow-on. Declined for now; revisit only if that bigger shape-specialization idea gets picked up.
 
 ---
 
