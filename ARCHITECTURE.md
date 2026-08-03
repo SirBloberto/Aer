@@ -1091,15 +1091,43 @@ consistent across every run.
   changes rather than anything string-pool-size-related. `binary_trees`/`dict_bench`/
   `small_dict_bench`/`fib_bench` showed no measurable change either way.
 
-  **Deferred, not landed.** A ~5-6% win on the one benchmark this exists for, paid for with a ~2%
-  tax on an unrelated one plus the `aer_make_string`/`aer_make_string_copy` dual-API surface and the
-  `chunk_add_pool` landmine risk, is a mixed result, not a clean win — and this is the second time
-  this specific idea has come back marginal after a real prerequisite fix looked like it should have
-  unblocked it. The full take-2 diff (converted call sites, `MAX=3` tuning included) is preserved as
-  a git stash on the `fixed-width-opcodes` worktree, tagged
-  `sso-take2-deferred-mixed-result-2026-07-28`, rather than either landed or discarded, in case a
-  future pass finds the actual source of the `struct_array_scan` tax (which would remove the only
-  thing offsetting the win) or a smaller/different inlining shape that avoids it.
+  **Take 2 deferred, not landed at the time.** A ~5-6% win on the one benchmark this exists for,
+  paid for with a ~2% tax on an unrelated one plus the `aer_make_string`/`aer_make_string_copy`
+  dual-API surface and the `chunk_add_pool` landmine risk, was a mixed result, not a clean win — and
+  it was the second time this specific idea had come back marginal after a real prerequisite fix
+  looked like it should have unblocked it. The full take-2 diff (converted call sites, `MAX=3`
+  tuning included) was kept as a git stash on the `fixed-width-opcodes` worktree, tagged
+  `sso-take2-deferred-mixed-result-2026-07-28`, rather than landed or discarded, against a future
+  pass finding either the actual source of the `struct_array_scan` tax or a different target
+  workload that changes the cost/benefit balance.
+
+  **Take 3: landed.** That future pass came from profiling a different benchmark family than the
+  one take 2 was tuned for. `perf record -e cycles` + `perf report --stdio` against `dict_bench.aer`
+  (large numbers of short-lived, short (`"key_0"`..`"key_199999"`-shaped) dict-key strings, a
+  pattern take 1/2 never targeted) showed malloc/free/`gc_collect`/`aer_format_int`/`memcmp` combined
+  at over 43% of cycles — the ephemeral-key-string allocation rate `dict_bench`/`small_dict_bench`/
+  `lookup_table_bench` all share is exactly the cost class inlining removes. Re-applied the preserved
+  take-2 stash on top of current `HEAD`, resolving conflicts by keeping the stashed (SSO) side and
+  converting the same `xmalloc`+`memcpy`+`aer_make_string` call sites to `aer_make_string_copy`
+  throughout `vm.c`/`lexer.c`/`parser.c`, with the take-1 `chunk_add_pool` landmine still fixed
+  proactively as in take 2. Chose `AER_STRING_INLINE_MAX = 11` — a third, independent threshold
+  from take 2's 15/3, sized for the actual target key strings rather than for the struct-alignment
+  boundary alone (11 still rounds `AerString` to the same 32-byte bucket as 7, but covers the target
+  keys, most of which run 5-11 bytes).
+
+  Measured on the Pi (`perf stat`, `performance` governor, 2 samples/side): `dict_bench` -22.5%
+  instructions, `small_dict_bench` -10.0%, `lookup_table_bench` -22.2% — plus an unexpected bonus win
+  on `log_processing` (-17.0%), the exact benchmark take 2's `MAX=15`/`MAX=7`/`MAX=11` settings had
+  all made *worse*, now improved instead, most likely because the rest of the session's since-landed
+  GC/allocator work (per-slab free lists, adaptive minor-GC threshold) changed the balance take 2 was
+  measured against. `struct_array_scan` — the one benchmark that regressed under every prior
+  attempt — showed only noise-level movement this time (+0.04%), not a repeat of the ~2% tax. Full
+  four-suite regression (Windows + Pi) green, a comprehensive compile sweep across every `.aer` file
+  in the repo clean, ASAN clean on the 3 target benchmarks (one pre-existing, unrelated 8-byte
+  `main.c:58` CLI-arg leak, not a new one), and a 300-iteration ASAN fuzz run on the Pi (0 crashes;
+  the 1 hang found was reproduced identically against the exact pre-SSO commit via `git archive`,
+  confirming it predates this change). Cross-language ratios improved substantially on all three
+  target benchmarks against Luau (e.g. `lookup_table_bench` from 85% behind to 44% behind).
 - **DONE: array-reserve builtin — `collection.reserve(arr, n)`.** Mirrors `hashtable_reserve`'s
   existing dict contract: pre-sizes `items`/`capacity` once, `xrealloc` immediately to `n` rather
   than doubling on every overflow, a no-op if already big enough, never shrinks. Verified with a
