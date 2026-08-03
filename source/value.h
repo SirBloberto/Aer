@@ -167,8 +167,26 @@ _Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_s
    here (tried as cached_hash/hash_valid fields, then again as a side array keyed off an
    aligned-slab pool redesign) -- both were removed: the first for coupling a leaf value type to
    hashtable.c's hashing details for a narrow win, the second measured as a net regression across
-   most real workloads (see pool.h). */
-#define AER_STRING_INLINE_MAX 11
+   most real workloads (see pool.h).
+
+   AER_STRING_INLINE_MAX=15, not take 2's 11 or 3: struct size doesn't grow smoothly with this
+   number, it jumps in 8-byte steps set by `data`'s own alignment requirement, so there's free
+   headroom inside a step before the next one forces a bigger cell. This struct's field order
+   (gc_state, length, data, inline_buf) packs `length`'s 4 bytes into what would otherwise be
+   padding ahead of the 8-byte-aligned pointer -- confirmed by compiling this exact struct at each
+   threshold: sizeof stays 32 bytes for AER_STRING_INLINE_MAX anywhere from 7 through 15, and only
+   jumps to 40 at 16. Take 2's struct (gc_state, data, length, inline_buf) didn't get this for free
+   -- that field order hits 32 bytes at 7 already and 40 at 15, which is the real reason take 2's
+   MAX=15 attempt cost struct_array_scan a scan-time tax: it was paying for a bigger cell, not for
+   inlining more bytes. 15 is the top of the current free range, and it isn't just headroom for its
+   own sake: log_processing.aer's path_counts dict keys include "/favicon.ico" (12 bytes) and
+   "/static/app.js" (14 bytes), both past take 3's original 11-byte cutoff and still heap-allocated
+   every line under it. Measured switching 11->15 on the Pi: dict_bench/small_dict_bench/
+   lookup_table_bench unchanged (their longest strings already fit under 11), struct_array_scan
+   unchanged (noise-level either way, confirming the cell truly doesn't grow), log_processing a
+   further real ~0.76% instruction-count win on top of take 3's already-landed -17.0%. binary_trees/
+   fib_bench/mandelbrot/nbody/sieve (no meaningful string activity) all unchanged. */
+#define AER_STRING_INLINE_MAX 15
 struct AerString {
     unsigned char gc_state;
     unsigned int length;
