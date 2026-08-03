@@ -373,12 +373,44 @@ static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size)
    (emit_string_token) before any VM/pool exists -- without the guard, an uninitialized heap's
    zero elem_size makes pool_alloc hand back a ~1-byte allocation (confirmed heap-buffer-overflow
    via ASAN, back when this was a single process-global pool). */
-AerVal aer_make_string(char* data, unsigned int length) {
+static AerString* aer_string_alloc(unsigned int length) {
     VmHeap* heap = require_current_heap();
     vm_heap_init(heap);
     AerString* s = heap_alloc(heap, &heap->string_pool);
-    s->data = data;
     s->length = length;
+    return s;
+}
+
+AerVal aer_make_string(char* data, unsigned int length) {
+    AerString* s = aer_string_alloc(length);
+    if (length <= AER_STRING_INLINE_MAX) {
+        /* Small-string optimization (see AerString's own comment, value.h): copy into this cell's
+           own inline_buf and drop the caller's separately-allocated buffer. This exists only to keep
+           every EXISTING aer_make_string call site correct without editing it -- it does NOT avoid
+           an allocation by itself (the caller already paid for `data`'s malloc before calling this);
+           aer_make_string_copy, below, is the version that actually avoids one. */
+        memcpy(s->inline_buf, data, length);
+        s->inline_buf[length] = '\0';
+        s->data = s->inline_buf;
+        free(data);
+    } else {
+        s->data = data;
+    }
+    return aer_string_val(s);
+}
+
+AerVal aer_make_string_copy(const char* src, unsigned int length) {
+    AerString* s = aer_string_alloc(length);
+    if (length <= AER_STRING_INLINE_MAX) {
+        memcpy(s->inline_buf, src, length);
+        s->inline_buf[length] = '\0';
+        s->data = s->inline_buf;
+    } else {
+        char* buf = xmalloc((size_t)length + 1);
+        memcpy(buf, src, length);
+        buf[length] = '\0';
+        s->data = buf;
+    }
     return aer_string_val(s);
 }
 
@@ -773,6 +805,14 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
         if (op == OP_NEQ) return aer_bool(!eq);
         if (op == OP_ADD) {
             unsigned int len = as->length + bs->length;
+            if (len <= AER_STRING_INLINE_MAX) {
+                /* Assembled on the stack, not the heap -- the concat result is short enough to land
+                   entirely inline in the new AerString cell, so there's nothing to allocate at all. */
+                char stackbuf[AER_STRING_INLINE_MAX + 1];
+                memcpy(stackbuf, as->data, as->length);
+                memcpy(stackbuf + as->length, bs->data, bs->length);
+                return aer_make_string_copy(stackbuf, len);
+            }
             char* buf = xmalloc(len + 1);
             memcpy(buf, as->data, as->length);
             memcpy(buf + as->length, bs->data, bs->length);
@@ -838,7 +878,8 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
         owned = sb.buf;
         len   = (unsigned int)sb.len;
     } else {
-        /* Copies into a fresh owned buffer since AerString always owns its data, and buf is a stack array that can't be handed to aer_make_string directly. */
+        /* Formatted onto the stack, then copied straight into the new AerString cell (inline when
+           short) via aer_make_string_copy -- buf itself is never heap-allocated. */
         char buf[64];
         switch (aer_type(v)) {
             case TYPE_NULL:     snprintf(buf, sizeof(buf), "null");                              break;
@@ -849,11 +890,10 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
             case TYPE_ARRAY: case TYPE_DICT: case TYPE_STRUCT: case TYPE_STRING: case TYPE_PACKED_ARRAY: case TYPE_TYPED_ARRAY: case TYPE_RESULT: break;   /* handled above */
             case TYPE_ANY: break;   /* never a real AerVal's tag -- only Shape.field_types[] uses it */
         }
-        len   = (unsigned int)strlen(buf);
-        owned = xmalloc(len + 1);
-        memcpy(owned, buf, len + 1);
+        /* No chunk_add_pool interning: this string is used once and never looked up by pool index again. Interning would grow the pool/name_index forever per unique value — measured 7x slower for 100k unique casts vs. 10 distinct ones. */
+        return aer_make_string_copy(buf, (unsigned int)strlen(buf));
     }
-    /* No chunk_add_pool interning: this string is used once and never looked up by pool index again. Interning would grow the pool/name_index forever per unique value -- measured 7x slower for 100k unique casts vs. 10 distinct ones. */
+    /* No chunk_add_pool interning -- same reasoning as above. */
     return aer_make_string(owned, len);
 }
 
@@ -1449,10 +1489,7 @@ static inline void vm_struct_field_write_at(AerStruct* s, unsigned int offset, V
 static bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
     if ((uint64_t)*idx >= d->map.count) return false;
     unsigned int key_len = d->map.dense[*idx].length;
-    char* key_buf = xmalloc(key_len + 1);
-    memcpy(key_buf, d->map.dense[*idx].key, key_len);
-    key_buf[key_len] = '\0';
-    *out_key = aer_make_string(key_buf, key_len);   /* no chunk_add_pool interning -- see vm_to_str's comment */
+    *out_key = aer_make_string_copy(d->map.dense[*idx].key, key_len);   /* no chunk_add_pool interning -- see vm_to_str's comment */
     return true;
 }
 
@@ -1499,10 +1536,7 @@ AerVal aer_make_result(AerVal value, AerVal err) {
 }
 
 AerVal aer_make_error(const char* msg) {
-    size_t n   = strlen(msg);
-    char*  buf = xmalloc(n + 1);
-    memcpy(buf, msg, n + 1);
-    return aer_make_string(buf, (unsigned int)n);
+    return aer_make_string_copy(msg, (unsigned int)strlen(msg));
 }
 
 AerFunction* vm_new_function(void) {
@@ -1536,10 +1570,7 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
             if (arg_count != 1) return false;
             const char* tn = vm_type_name(c, args[0]);
             /* Copies rather than pointing at a static literal or the chunk's pool data -- AerString always owns its data, no exceptions. */
-            unsigned int tn_len = (unsigned int)strlen(tn);
-            char* tn_buf = xmalloc(tn_len + 1);
-            memcpy(tn_buf, tn, tn_len + 1);
-            *out = aer_make_string(tn_buf, tn_len);   /* no chunk_add_pool interning -- see vm_to_str's comment */
+            *out = aer_make_string_copy(tn, (unsigned int)strlen(tn));   /* no chunk_add_pool interning -- see vm_to_str's comment */
             return true;
         }
         case CALL_BUILTIN_ASSERT: {
@@ -1608,10 +1639,7 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         if (i < 0) i += len;
         if (i < 0 || i >= len) { error("String index %lld out of bounds (len %lld)", (long long)aer_as_int(idx), (long long)len); *out = aer_null(); return; }
         /* A single character is a length-1 string (AER has no char type); copies the byte since AerString must always own its data, even after obj is later collected. */
-        char* ch_buf = xmalloc(2);
-        ch_buf[0] = os->data[i];
-        ch_buf[1] = '\0';
-        *out = aer_make_string(ch_buf, 1); return;   /* no chunk_add_pool interning -- see vm_to_str's comment */
+        *out = aer_make_string_copy(os->data + i, 1); return;   /* no chunk_add_pool interning -- see vm_to_str's comment */
     } else if (aer_type(obj) == TYPE_RESULT) {
         /* result[0] is the value, result[1] is the err -- the same order every stdlib fallible
            function returns. */
@@ -2842,10 +2870,7 @@ lbl_slice_get: {
         int64_t start, end;
         if (!vm_slice_bounds(start_v, end_v, (int64_t)os->length, &start, &end)) { registers[dest_reg] = aer_null(); DISPATCH(); }
         unsigned int sub_len = (unsigned int)(end - start);
-        char* sub_buf = xmalloc(sub_len + 1);
-        memcpy(sub_buf, os->data + start, sub_len);
-        sub_buf[sub_len] = '\0';
-        registers[dest_reg] = aer_make_string(sub_buf, sub_len);   /* no chunk_add_pool interning -- see vm_to_str's comment */
+        registers[dest_reg] = aer_make_string_copy(os->data + start, sub_len);   /* no chunk_add_pool interning -- see vm_to_str's comment */
     } else {
         error("Cannot slice this type");
         registers[dest_reg] = aer_null();
@@ -2911,10 +2936,7 @@ lbl_iter_next_array: {
             ip = (unsigned int)end_target;
             DISPATCH();
         }
-        char* ch_buf = xmalloc(2);
-        ch_buf[0] = cs->data[idx];
-        ch_buf[1] = '\0';
-        registers[item_dest_reg] = aer_make_string(ch_buf, 1);   /* no chunk_add_pool interning -- see vm_to_str's comment */
+        registers[item_dest_reg] = aer_make_string_copy(cs->data + idx, 1);   /* no chunk_add_pool interning -- see vm_to_str's comment */
         registers[idx_reg]       = aer_int(idx + 1);
         gc_maybe_collect(vm);
         DISPATCH();
