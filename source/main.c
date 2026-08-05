@@ -5,7 +5,6 @@
 #include "aer.h"
 #include "aer_stdlib.h"
 #include "aer_module.h"
-#include "disasm.h"
 #include "error.h"
 #include "lexer.h"
 #include "parser.h"

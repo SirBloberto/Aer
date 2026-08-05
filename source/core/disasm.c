@@ -1,7 +1,7 @@
 #ifdef AER_DEBUG_TOOLS
 #include <stdlib.h>
 #include <string.h>
-#include "disasm.h"
+#include "vm.h"
 #include "error.h"
 
 /* Kinds of operand word this disassembler knows how to decode/print. */

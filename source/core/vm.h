@@ -1152,6 +1152,13 @@ AerVal register_get(VM* vm, int slot);
 #include <stdio.h>
 /* Byte-accurate per-pool memory breakdown; debug-tools only. */
 void aer_debug_memory_report(FILE* out);
+
+/* Prints, in order: a full annotated disassembly of c->code (offset, opcode name, one-line
+   description, decoded operands, and -- if c->debug_hits is populated -- a hit count and source
+   line for that instruction); a per-opcode summary table (name -> total hits, sorted descending);
+   and a per-source-line hot-spot rollup (line -> total hits, sorted descending). Debug-build only --
+   see the AER_DEBUG_TOOLS-gated Chunk.debug_hits field above. */
+void aer_disassemble(Chunk* c, FILE* out);
 #endif
 
 #endif
