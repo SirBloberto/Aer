@@ -4,9 +4,7 @@
 #include <string.h>
 #include "aer.h"
 #include "aer_host.h"
-#include "aer_actor.h"
 #include "aer_module.h"
-#include "aer_scheduler.h"
 #include "aer_stdlib.h"
 #include "error.h"
 #include "lexer.h"
