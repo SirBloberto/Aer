@@ -1,14 +1,12 @@
 include/aer.h:8
 source/compiler/lexer.c:10
 source/compiler/parser.c:7
-source/compiler/parser.c:36
 source/compiler/parser.c:15
 source/compiler/parser.c:18
 source/compiler/parser.c:13
 source/compiler/parser.c:16
 source/compiler/parser.c:17
 source/compiler/parser.c:12
-source/compiler/parser.c:19
 source/compiler/parser.c:10
 source/compiler/parser.c:16
 source/compiler/parser.c:8
@@ -30,10 +28,8 @@ source/compiler/parser.c:10
 source/compiler/parser.c:8
 source/compiler/parser.c:16
 source/compiler/parser.c:16
-source/compiler/parser.c:30
 source/compiler/parser.c:8
 source/compiler/parser.c:7
-source/compiler/parser.c:30
 source/compiler/parser.c:10
 source/compiler/parser.c:18
 source/compiler/parser.c:7

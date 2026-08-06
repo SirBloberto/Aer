@@ -96,42 +96,12 @@ typedef struct Parser {
     /* Nonzero while compiling a function body -- lets parse_return reject a top-level return. */
     int function_depth;
 
-    /* Loop-bound-hoisting safety tracking (index_safe_unchecked, parse_for_in) -- lets a
-       `for i in 0..n:`-shaped loop skip an array's index-side runtime checks entirely
-       (OP_INDEX_FIELD_*_RAW_INT/REAL_UNCHECKED and OP_TYPED_INDEX_GET/SET_UNCHECKED, vm.c) when n
-       is proven == length() of the SAME array the loop indexes. Deliberately NOT keyed to a single
-       "the interesting parameter" (that was this mechanism's original, packed-array-only shape,
-       tied to hint_param_reg below) -- a function can have more than one array-like parameter, and
-       proving a bound safe for ONE of them must never let a DIFFERENT array silently borrow that
-       proof. Every fact here is instead tracked per-array-register explicitly, and re-checked at
-       the point of use, not assumed.
-
-       hint_param_reg: mirrors parse_function_body's own parameter of the same name (only
-       meaningful during a packed-array, non-element-shape specialization recompile); -1 otherwise.
-       Still consulted by index_safe_unchecked's packed-array callers as an ADDITIONAL requirement
-       (the field-offset resolution those opcodes need is only valid for this one specialized
-       parameter) -- but no longer the thing that makes an index "safe" by itself; see
-       safe_loop_array_regs below for what actually does.
-
-       length_tracked_name/valid/source_reg: track which single local variable, if any, currently
-       holds a proven-fresh length(P) result, and which parameter register P was (name-keyed for
-       the variable itself, so this stays correct across raw/boxed storage-kind shadowing;
-       register-keyed for P, since that's what must be compared against the array actually being
-       indexed). last_length_call_result_reg/last_length_call_arg_reg are a one-shot side-channel
-       pair from parse_builtin_call to parse_assignment, consumed via exact register equality --
-       same discipline as last_plain_index_dest_reg above, so a further operation applied to a
-       length() result (which always allocates a new register) naturally fails the equality check
-       rather than needing to be cleared at every possible site.
-
-       safe_loop_item_regs/safe_loop_array_regs: a small stack of currently-active proven-safe
-       (index register, array register) PAIRS, pushed/popped together by parse_for_in exactly
-       around the one loop body each pair was proven safe for -- never a whole-frame table, so
-       there is no register-reuse staleness window on its own. But because array registers (not
-       just index registers) can ALSO be reassigned out from under a still-live entry (the
-       parameter itself pointing somewhere else, or the length()-tracked variable's own name being
-       reused by an unrelated for-loop), invalidate_register (below) must poison a stack entry on
-       EITHER half changing, not just the index half -- this is exactly the class of gap that
-       first shipped without the index half covered either, before being found and fixed. */
+    /* Loop-bound-hoisting safety tracking -- lets a `for i in 0..n:` loop skip an array's
+       index-side runtime checks when n is proven == length() of the SAME array it indexes. Every
+       fact is tracked per-array-register and re-checked at use, never keyed to one "interesting"
+       parameter, so proving a bound safe for one array can't let a different one borrow the proof.
+       invalidate_register must poison a safe_loop_* entry when EITHER the index or the array half
+       is reassigned -- the array half is the easier one to forget. */
     int hint_param_reg;
     unsigned int length_tracked_name;
     bool length_tracked_valid;
@@ -914,25 +884,12 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
     }
 }
 
-/* Raw-vs-boxed ADD/MUL, REAL only (commutative only -- SUB/DIV are order-sensitive and the common
-   real case, `boxed / raw_expr`, has the raw operand on the side this trick can't help anyway, so
-   they're left to the fully-boxed fallback). Found necessary once struct-field specialization
-   started producing raw values that frequently compose with a boxed parameter-derived value (e.g.
-   nbody's `bodies[j].mass * mag`, mag boxed because it derives from the function's own boxed `dt`
-   parameter) -- without this, every such raw field read was immediately boxed right back, erasing
-   the specialization's own benefit. Reuses the EXISTING OP_RAW_*_REAL_BOXED opcodes (already built
-   for compound assignment's `raw_local += boxed_expr`), which now promote an integer boxed operand
-   to real (matching vm_promote_real's own boxed-path semantics -- a real fix, needed regardless of
-   this function, since `real_raw_local += some_boxed_int` was already reachable and already wrong).
-
-   REAL only, deliberately -- the INT variants (OP_RAW_ADD_INT_BOXED etc.) can't be given the same
-   promotion fix: if the boxed operand turns out to be a real at runtime, the boxed path's own rule
-   is that int+real ALWAYS promotes the WHOLE result to real, which is impossible to do in place
-   into an existing raw INT slot (different underlying array, raw_ints[] vs raw_reals[]) -- there's
-   no way to know at compile time whether a given boxed operand might be a real, so this only ever
-   attempts the fusion where NOT knowing is provably safe (real accumulates real-or-int; there's no
-   "wrong" promotion direction left to guess). An int raw value composing with a boxed operand
-   always falls through to the ordinary, always-correct boxed path below. */
+/* Raw-vs-boxed ADD/MUL, real only. Commutative ops only -- SUB/DIV are order-sensitive and their
+   common shape puts the raw operand where this can't help. Reuses the existing OP_RAW_*_REAL_BOXED
+   opcodes, which promote an integer boxed operand to real.
+   Real only, deliberately: the INT variants can't promote the same way, since int+real must promote
+   the whole result to real and that cannot be done in place into a raw_ints[] slot. A raw int
+   composing with a boxed operand falls through to the boxed path. */
 static bool try_emit_arith_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind_lhs, int rk_rhs,
                                      RawKind kind_rhs, int* out_rk) {
     if (op != OP_ADD && op != OP_MUL) return false;
@@ -4494,36 +4451,12 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
     *out_min_param_count = min_param_count;
 }
 
-/* Compiles a function's body (parameter binding + parse_block + implicit-return-null +
-   peak-register capture), shared by the original top-level compile and a later specialization
-   recompile. Caller has already parsed the signature (parse_function_signature above) and must
-   save/restore the allocator/variable-table state itself if needed for its OWN purposes beyond
-   what this function restores -- this function saves and restores everything it touches, so it
-   never leaks state to the caller regardless of which of the two call sites it's used from.
-
-   hint_param_reg/hint_shape: when hint_param_reg >= 0 (always == that parameter's own register,
-   since parameters bind in order starting at 0), that parameter gets seeded with hint_shape for
-   this compile only -- lets '.field'/'[idx].field' accesses compile through the raw specialized
-   opcodes (parse_postfix_chain/parse_chain_assignment) instead of the generic ones. Pass -1/NULL
-   for an ordinary (non-specialized) compile, the overwhelmingly common case, which leaves both
-   shape tables below entirely NULL and so never takes the new codegen branches at all -- the
-   generic body is unaffected by this mechanism's mere existence.
-
-   hint_is_element_shape distinguishes WHICH table gets seeded: false (SPEC_KIND_STRUCT/
-   PACKED_ARRAY) seeds P.reg_known_shape[hint_param_reg] directly -- the parameter's own register IS
-   the struct/packed-array value. true (SPEC_KIND_ARRAY_OF_STRUCTS) seeds P.reg_known_element_shape
-   instead -- the parameter is a plain TYPE_ARRAY, never itself struct-shaped, so hint_shape
-   describes what `param[idx]` produces, not `param` itself; the plain index-get site in
-   parse_postfix_chain propagates it onto a one-hop local alias's own register (`pi = particles[i]`)
-   at the point parse_assignment binds it.
-
-   raw_param_regs/raw_param_types/raw_param_count: additionally bind these OTHER parameters (by
-   register index, each already known -- by the caller, lbl_call -- to be int/real at the ACTUAL
-   call site this recompile was triggered from) as raw locals instead of boxed, right at binding
-   time -- see the per-parameter loop below for how, and OP_UNBOX_PARAM_INT/REAL's own comment
-   (vm.h) for why doing this unconditionally (no runtime tag check) is safe here specifically. Pass
-   NULL/NULL/0 outside a raw-numeric-variant recompile (parser_specialize_function's own contract),
-   which leaves every parameter binding exactly as before -- always boxed via var_slot alone. */
+/* Compiles a function's body -- parameter binding, parse_block, implicit return null, peak-register
+   capture -- shared by the original compile and a specialization recompile. Saves and restores
+   everything it touches. hint_param_reg/hint_shape seed one parameter's shape for this compile
+   only; hint_is_element_shape picks the table: false means the parameter IS the struct/packed
+   array, true means it is a plain array and hint_shape describes `param[idx]`. raw_param_regs/
+   types/count bind those parameters as raw locals -- see OP_UNBOX_PARAM_INT/REAL (vm.h) for why. */
 static void parse_function_body(Chunk* c, unsigned int* param_names, int param_count, int hint_param_reg,
                                 Shape* hint_shape, bool hint_is_element_shape, const int* raw_param_regs,
                                 const ValueType* raw_param_types, int raw_param_count,
@@ -4729,35 +4662,11 @@ static void parse_function(Chunk* c) {
 }
 
 /* Lazily compiles a specialized body for target_f's shape-sensitive parameter, keyed by a Shape
-   actually observed at a real call site -- see vm.c's lbl_call_spec, the only caller. Re-lexes the
-   retained source span (ChunkFunction.source_span) in its own isolated span (same mechanism
-   parse_interpolated_expr already uses for a string interpolation's `{expr}` body), re-parses the
-   signature to re-derive param_names (never persisted from the original compile -- only arity/
-   defaults survive on target_f), then compiles the body with param_index's register seeded as
-   known-shape via parse_function_body's hint. Appends to c (the SAME chunk currently executing --
-   safe: every growable Chunk array is dereferenced through c-> at every use site, never a cached
-   raw pointer held across this call, and the caller is responsible for re-running
-   chunk_ensure_field_cache/chunk_ensure_call_spec_cache afterward so the newly-appended code's own
-   sites get valid cache slots before they're ever dispatched).
-
-   Returns true and fills *out_entry on success. False (should not happen in correct operation --
-   the exact same source already compiled once successfully; nothing about substituting a shape
-   hint changes the grammar) means the caller must fall back to the generic body, same as it would
-   for a shape it doesn't recognize at all. parser_had_error and every allocator/variable-table
-   global this touches are fully saved and restored either way, so a failed recompile can't corrupt
-   whatever the VM does next (including a later, unrelated aer_run_source call in the same process).
-
-   raw_param_regs/raw_param_types/raw_param_count (pass NULL/NULL/0 for the ordinary shape-only
-   compile): additionally bind these OTHER parameters -- by register index, each with its already-
-   OBSERVED runtime type (TYPE_INTEGER or TYPE_REAL; the caller, lbl_call, only ever calls this with
-   raw_param_count > 0 after confirming exactly that) -- as raw locals instead of boxed, emitting
-   one OP_UNBOX_PARAM_INT/REAL per one right at function entry. This is what lets a parameter like
-   `dt` (nbody's `advance(bodies, dt)`) compose with raw struct-field reads with zero per-use
-   tag-checking, the tag having already been proven once by lbl_call before ever choosing to jump
-   here. When raw_param_count > 0, *out_entry's shape/kind/raw_* fields are left untouched -- the
-   caller is building a raw-numeric VARIANT of an existing SpecEntry in that case, and only reads
-   code_offset/max_registers/max_raw_ints/max_raw_reals back out to copy into that entry's own
-   raw_variant_* fields itself. */
+   observed at a real call site (vm.c's lbl_call_spec is the only caller). Appends to the chunk
+   currently executing, so the caller must re-run chunk_ensure_field_cache/call_spec_cache after.
+   Every global it touches is saved and restored, so a false return can't corrupt what runs next.
+   raw_param_regs/types/count (NULL/NULL/0 for a shape-only compile) additionally bind those
+   parameters as raw locals; when set, *out_entry's shape/kind/raw_* are left for the caller. */
 bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape, SpecKind kind,
                                 int param_index, SpecEntry* out_entry, const int* raw_param_regs,
                                 const ValueType* raw_param_types, int raw_param_count) {
