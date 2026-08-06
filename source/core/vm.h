@@ -128,7 +128,10 @@ typedef enum {
 
     /* OP_ARRAY_NEW's bulk-copy applied to (key,val) register pairs; same key validation and
        owned-key discipline as stack dict construction. */
-    OP_DICT_NEW, /* dest_reg, pair_reg_base, pair_count -- key at base+2*i, val at +2*i+1 */
+    /* dest_reg, pair_reg_base, pair_count -- key at base+2*i, val at +2*i+1. Trailing word is 1
+       when every key is a string literal, letting the table borrow constant-pool bytes instead of
+       copying each one on every evaluation. */
+    OP_DICT_NEW,
 
     /* Single-variable iteration; break is a plain jump, no cleanup needed. */
     OP_ITER_NEXT_ARRAY, /* col_reg, idx_reg, item_dest_reg, end_target -- despite the name, also accepts a dict

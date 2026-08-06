@@ -163,7 +163,19 @@ void hashtable_put(HashTable* t, char* key, unsigned int length, AerVal value) {
     hashtable_put_hashed(t, key, length, hashtable_hash_bytes(key, length), value);
 }
 
-void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value) {
+/* Copies every borrowed key into pool storage so the table owns them all. Called before any mutation
+   that could free or replace a key -- a table is fully borrowed or fully owned, never a mix, so no
+   entry has to record ownership itself. */
+static void adopt_keys(HashTable* t) {
+    if (!t->keys_borrowed) return;
+    t->keys_borrowed = false;
+    for (unsigned int i = 0; i < t->count; i++)
+        t->dense[i].key = hashtable_key_dup(t->pools, t->dense[i].key, t->dense[i].length, NULL);
+}
+
+/* Shared insert; `owned` says whether we may free `key` when the slot is already taken. */
+static void put_prepared(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value,
+                         bool owned) {
     if (!t->sparse) {
         t->sparse = sparse_array_alloc(t->pools, HASHTABLE_INIT_SIZE);
         t->capacity = HASHTABLE_INIT_SIZE;
@@ -173,8 +185,9 @@ void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t
     for (unsigned int i = 0; i < t->capacity; i++) {
         unsigned int* slot = &t->sparse[(hash + i) & (t->capacity - 1)];
         if (*slot != SPARSE_EMPTY && hash_match(&t->dense[*slot], key, length)) {
-            /* Key already present (e.g. duplicate key in a dict literal) -- just overwrite the payload. */
-            hashtable_key_free(t->pools, key, length);
+            /* Key already present (a duplicate in a dict literal) -- overwrite the payload and
+               drop the incoming copy, if we made one. */
+            if (owned) hashtable_key_free(t->pools, key, length);
             t->dense[*slot].payload = value;
             return;
         }
@@ -300,7 +313,25 @@ void hashtable_reserve(HashTable* t, unsigned int expected_count) {
    entries. Two independent fixups: the sparse array's probe chain after the removed slot must be
    repaired (classic open-addressing deletion), and the dense array must stay hole-free by moving
    the last entry into the vacated slot. */
+void hashtable_put_borrowed(HashTable* t, const char* key, unsigned int length, uint64_t hash,
+                            AerVal value) {
+    /* Only legal while the table owns nothing, or adopt_keys' all-or-nothing rule breaks. Every
+       caller builds a fresh literal, so this holds by construction. */
+    if (t->count == 0) t->keys_borrowed = true;
+    if (!t->keys_borrowed) {
+        hashtable_put_hashed(t, hashtable_key_dup(t->pools, key, length, NULL), length, hash, value);
+        return;
+    }
+    put_prepared(t, (char*)key, length, hash, value, false);
+}
+
+void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value) {
+    adopt_keys(t);
+    put_prepared(t, key, length, hash, value, true);
+}
+
 void hashtable_remove(HashTable* t, const char* key, unsigned int length) {
+    adopt_keys(t);
     if (!t->sparse) return;
     uint64_t hash = hashtable_hash_bytes(key, length);
 
@@ -349,8 +380,9 @@ void hashtable_remove(HashTable* t, const char* key, unsigned int length) {
 }
 
 void hashtable_clear(HashTable* t) {
-    for (unsigned int i = 0; i < t->count; i++)
-        hashtable_key_free(t->pools, t->dense[i].key, t->dense[i].length);
+    if (!t->keys_borrowed)
+        for (unsigned int i = 0; i < t->count; i++)
+            hashtable_key_free(t->pools, t->dense[i].key, t->dense[i].length);
     t->count = 0;
 }
 
