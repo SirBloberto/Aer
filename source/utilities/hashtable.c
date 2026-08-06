@@ -173,10 +173,8 @@ static void adopt_keys(HashTable* t) {
         t->dense[i].key = hashtable_key_dup(t->pools, t->dense[i].key, t->dense[i].length, NULL);
 }
 
-/* Shared insert; `owned` says whether we may free `key` when the slot is already taken.
-   always_inline so splitting this out cannot change hashtable_put_hashed's own codegen -- every
-   dict write goes through it, and letting LTO decide measured as a broad ~1.5% tax. */
-static inline __attribute__((always_inline)) void put_prepared(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value,
+/* Shared insert; `owned` says whether we may free `key` when the slot is already taken. */
+static void put_prepared(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value,
                          bool owned) {
     if (!t->sparse) {
         t->sparse = sparse_array_alloc(t->pools, HASHTABLE_INIT_SIZE);
