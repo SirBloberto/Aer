@@ -76,8 +76,6 @@ typedef enum {
     OP_MOVE, /* operands: dest_reg, src_reg -- registers[dest_reg] = registers[src_reg] */
     /* dest_reg, src_reg -- dest = (src is a Result); gates |>'s short-circuit (compile_pipe). */
     OP_IS_RESULT,
-    /* RK-encoded operand: register index, or (bit 30 set) constant-pool index -- see vm_rk_value. */
-    OP_BINARY, /* operands: dest_reg, rk_b, bin_op, rk_c -- registers[dest_reg] = rk_b OP rk_c */
 
     /* Condition is read straight from a register/RK constant, never popped. */
     OP_JUMP_IF_FALSE_REG, /* operands: reg, target -- jump to target if registers[reg] is falsy */
@@ -664,11 +662,11 @@ typedef struct {
     unsigned int max_raw_ints;
     unsigned int max_raw_reals;
 
-    /* Shape-specializing compilation (lazy, per-call-observed-shape recompiles) -- see OP_CALL_SPEC
-       and lbl_call_spec (vm.c). Bit i set = parameter i was seen used as the base of a struct-field
-       access (directly, or through a one-hop plain-local alias) during the ordinary compile; folded
-       in at function-exit, same moment max_registers/max_raw_ints/max_raw_reals are captured. Zero
-       means this function is never specialized -- OP_CALL is emitted for it, not OP_CALL_SPEC. */
+    /* Shape-specializing compilation (lazy, per-call-observed-shape recompiles) -- see
+       vm_call_resolve_specialization (vm.c). Bit i set = parameter i was seen used as the base of a
+       struct-field access (directly, or through a one-hop plain-local alias) during the ordinary
+       compile; folded in at function-exit, same moment max_registers/max_raw_ints/max_raw_reals are
+       captured. Zero means this function is never specialized, and lbl_call skips the lookup. */
     unsigned int shape_sensitive_mask;
     /* Owned copy of the source text spanning from '(' through the end of the body -- NULL unless
        shape_sensitive_mask != 0. Needed to re-invoke the parser later (long after the original
@@ -714,7 +712,7 @@ typedef struct {
     bool narrow; /* same reasoning as offset/ftype above -- cached, not re-derived from shape */
 } FieldCacheEntry;
 
-/* One per-callsite specialization-dispatch cache entry (OP_CALL_SPEC) -- same monomorphic-inline-
+/* One per-callsite specialization-dispatch cache entry (lbl_call) -- same monomorphic-inline-
    cache idea as FieldCacheEntry above: the last shape seen AT THIS CALL SITE, checked before
    falling into the callee's own (function-wide) SpecEntry table on a miss. last_shape == NULL
    means never populated. */
@@ -776,8 +774,8 @@ typedef struct {
     FieldCacheEntry* field_cache;
     unsigned int field_cache_cap;
 
-    /* Per-site inline cache for OP_CALL_SPEC, same growth/addressing idiom as field_cache above
-       (sized to c->count, indexed by bytecode word offset). */
+    /* Per-site inline cache for lbl_call's specialization dispatch, same growth/addressing idiom as
+       field_cache above (sized to c->count, indexed by bytecode word offset). */
     CallSpecCacheEntry* call_spec_cache;
     unsigned int call_spec_cache_cap;
 

@@ -132,7 +132,7 @@ int main(void) {
         check(run_chunk(&c, &vm), "(2+3)*(4+5): chunk ran to completion without error");
         AerVal result = register_get(&vm, result_reg);
         check(aer_type(result) == TYPE_INTEGER && aer_as_int(result) == 45,
-              "(2+3)*(4+5) == 45, computed via nested OP_BINARY with register reuse");
+              "(2+3)*(4+5) == 45, computed via nested binary opcodes with register reuse");
         check(result_reg == 0,
               "the allocator reused register 0 for the final result instead of growing to register 2");
 
@@ -174,9 +174,8 @@ int main(void) {
         chunk_free(&c);
     }
 
-    /* Test 3: division by zero still errors correctly through OP_BINARY, matching vm_binary's
-       normal error behavior — proves this path isn't silently swallowing errors just because it's
-       a new, isolated opcode family. */
+    /* Test 3: division by zero still errors correctly through OP_DIV -- proves this path isn't
+       silently swallowing errors just because it's an isolated opcode family. */
     {
         Chunk c;
         chunk_init(&c);
@@ -188,7 +187,7 @@ int main(void) {
         chunk_emit(&c, OP_HALT);
 
         VM vm;
-        check(!run_chunk(&c, &vm), "1/0 through OP_BINARY reports a runtime error, same as the stack VM's OP_DIV would");
+        check(!run_chunk(&c, &vm), "1/0 through OP_DIV reports a runtime error");
 
         chunk_free(&c);
     }
@@ -1088,8 +1087,8 @@ int main(void) {
         chunk_free(&c);
     }
 
-    /* Test 38 (M5 slice 8): 'in' — falls straight through to the generic OP_BINARY/vm_binary
-       path already used by every other binary operator, so this is really a table-entry test. */
+    /* Test 38 (M5 slice 8): 'in' -- falls straight through to the generic binary-operator
+       dispatch path used by every other binary operator, so this is really a table-entry test. */
     {
         Chunk c;
         chunk_init(&c);
@@ -1844,7 +1843,7 @@ int main(void) {
     }
 
     /* Test 75 (shape-specializing compilation, groundwork) — shape_sensitive_mask/source_span are
-       still write-only (nothing consumes them yet, see OP_CALL_SPEC's own comment in vm.h), but
+       still write-only (nothing consumes them yet, see ChunkFunction's own comment in vm.h), but
        this is the riskiest new mechanism to get subtly wrong (an off-by-one on the span boundary
        is silent corruption, not a compile error, once the recompile step is built on top of it) —
        worth verifying directly, in isolation, before anything else depends on it. */

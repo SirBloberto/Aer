@@ -67,7 +67,7 @@ typedef struct Parser {
     /* Per-variable storage kind -- see VarKind's own comment above. */
     VarKind var_kind[FRAME_REGISTERS];
 
-    /* Shape-specializing compilation (see OP_CALL_SPEC, vm.c) -- tracks which of the CURRENT
+    /* Shape-specializing compilation (see vm_call_resolve_specialization, vm.c) -- tracks which of the CURRENT
        function's parameters have been used as the base of a struct-field access, directly or
        through a one-hop plain-local alias. See mark_shape_sensitive's own comment for how these
        three fields work together. */
@@ -251,7 +251,7 @@ static bool rk8_fits(int rk) {
 /* Forward-declared so emit_binary (which needs it) can come before it. */
 static int box_if_raw(Chunk* c, int rk);
 
-/* Every OP_BINARY-family emission funnels through here. Boxes any raw-flagged operand first
+/* Every binary-operator emission funnels through here. Boxes any raw-flagged operand first
    (a no-op for a plain register or constant) -- only parse_binary_ops's own raw-composing path
    (try_emit_binary_raw) tries the native route before reaching here. */
 static int materialize(Chunk* c, int rk);
@@ -1916,7 +1916,7 @@ static int parse_not(Chunk* c) {
     return dest;
 }
 
-/* Recurses into parse_unary so chained unary (`~~x`) works. rk is RK-encoded like OP_BINARY. */
+/* Recurses into parse_unary so chained unary (`~~x`) works. rk is RK-encoded like any binary operand. */
 static int parse_unary_inner(Chunk* c) {
     if (consume(TOKEN_NOT)) return parse_not(c);
 
@@ -2323,7 +2323,7 @@ static int parse_binary(Chunk* c, unsigned int min_prec) {
 }
 
 /* The 6 arithmetic compound-assign operators (bitwise OP= forms were deliberately dropped -- a
-   second spelling with no new capability). `x OP= expr` compiles to one OP_BINARY with dest ==
+   second spelling with no new capability). `x OP= expr` compiles to one binary opcode with dest ==
    lhs == x's own register. */
 static const struct {
     TokenType tok;
@@ -4154,7 +4154,7 @@ static void parse_raise(Chunk* c) {
 
 /* A function value in expression position -- an anonymous function has no name to self-reference
    by, so parse_function's registration-before-body ordering simply doesn't apply. Not a
-   specialization target either way: OP_CALL_SPEC only targets named, ChunkFunction-registered
+   specialization target either way: lbl_call only specializes named, ChunkFunction-registered
    calls (func_index indexes chunk->functions[]), and AerFunction (what this compiles into) has no
    specialization table -- always compiles with no shape hint (-1/NULL). */
 static int parse_function_expr(Chunk* c) {
@@ -4189,7 +4189,7 @@ static int parse_function_expr(Chunk* c) {
 }
 
 /* Parses `(params...):' -- shared by the original top-level function compile and a later
-   specialization recompile (vm.c's lbl_call_spec, re-lexing a retained source span, see
+   specialization recompile (vm.c's vm_call_resolve_specialization, re-lexing a retained source span, see
    ChunkFunction.source_span). Caller must already be positioned right at '('. Once one parameter
    has a default, every parameter after it must too. */
 static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal* param_defaults,
@@ -4436,7 +4436,7 @@ static void parse_function(Chunk* c) {
 }
 
 /* Lazily compiles a specialized body for target_f's shape-sensitive parameter, keyed by a Shape
-   observed at a real call site (vm.c's lbl_call_spec is the only caller). Appends to the chunk
+   observed at a real call site (vm.c's vm_call_resolve_specialization is the only caller). Appends to the chunk
    currently executing, so the caller must re-run chunk_ensure_field_cache/call_spec_cache after.
    Every global it touches is saved and restored, so a false return can't corrupt what runs next.
    raw_param_regs/types/count (NULL/NULL/0 for a shape-only compile) additionally bind those

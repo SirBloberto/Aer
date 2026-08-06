@@ -76,7 +76,7 @@ void parser_restore_state(ParserState* saved);
 void parse(Chunk* c);
 
 /* Lazily compiles a specialized body for a shape-sensitive function, keyed by a Shape observed at
-   a real call site -- see vm.c's lbl_call_spec (the only caller) and this function's own comment
+   a real call site -- see vm.c's vm_call_resolve_specialization (the only caller) and its own comment
    in parser.c for the full contract. */
 bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape, SpecKind kind,
                                 int param_index, SpecEntry* out_entry, const int* raw_param_regs,

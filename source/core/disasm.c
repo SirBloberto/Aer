@@ -82,8 +82,6 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_LOADK] = {"OP_LOADK", "reg = pool constant", {FLD_REG, FLD_POOL}, false, 0, 2},
     [OP_MOVE] = {"OP_MOVE", "reg = reg", {FLD_REG, FLD_REG}, false, 0, 2},
     [OP_IS_RESULT] = {"OP_IS_RESULT", "reg = is-result(reg)", {FLD_REG, FLD_REG}, false, 0, 2},
-    /* Whole instruction in one word (PACK3 + RK8 pair) -- special-cased, no trailing wide fields. */
-    [OP_BINARY] = {"OP_BINARY", "reg = rk OP rk"},
     /* word0: op+reg. word1: target (dedicated). */
     [OP_JUMP_IF_FALSE_REG] =
         {"OP_JUMP_IF_FALSE_REG", "jump if !reg, no pop", {FLD_REG, FLD_JUMP}, false, 1, 1},
@@ -120,7 +118,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
                       false,
                       0,
                       3},
-    /* Single-word RK8-packed family -- special-cased in disassemble_one like OP_BINARY. */
+    /* Single-word RK8-packed family -- special-cased in disassemble_one, like OP_ADD..OP_RSHIFT. */
     [OP_INDEX_GET] = {"OP_INDEX_GET", "reg = reg[rk]"},
     [OP_INDEX_SET] = {"OP_INDEX_SET", "reg[rk] = rk"},
     [OP_TYPED_INDEX_GET_UNCHECKED] = {"OP_TYPED_INDEX_GET_UNCHECKED",

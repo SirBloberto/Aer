@@ -153,14 +153,6 @@ AerVal register_get(VM* vm, int slot) {
     return vm->registers[slot];
 }
 
-/* Ordinary RK operand as the parser's own compile-time tagged int (RK_CONST_FLAG at bit 30) --
-   used only in the two or three spots still working with that representation directly rather
-   than a wire-encoded RK8/RK16 byte/halfword. */
-static inline AerVal vm_rk_value(VM* vm, Chunk* c, int rk) {
-    if (rk & RK_CONST_FLAG) return c->pool[rk & ~RK_CONST_FLAG];
-    return vm->registers[rk];
-}
-
 /* RK16: 1 flag + 15 index bits, the wire form most RK operands use. Returns a pointer into the
    hoisted const_pool/registers, not a copy. Takes registers directly rather than re-deriving from
    a VM*: that re-fetch, through a pointer the compiler cannot prove is unaliased inside this
@@ -2847,10 +2839,9 @@ lbl_call : {
         DISPATCH();
     }
 
-    /* Gated on shape_sensitive_mask -- zero for most functions, one already-fetched field -- rather
-       than a separate opcode. A separate OP_CALL_SPEC cannot work: shape-sensitivity is only known
-       once the whole body has compiled, but forward-referenced and self-recursive calls need their
-       opcode chosen before that. Deciding here means every site sees the final truth. */
+    /* Gated on shape_sensitive_mask (zero for most functions, one already-fetched field) rather than
+       on a distinct call opcode: shape-sensitivity is only known once the whole body has compiled,
+       but forward-referenced and self-recursive calls need their opcode chosen before that. */
     unsigned int chosen_offset = (unsigned int)callee_offset;
     unsigned int chosen_max_registers = target_f->max_registers;
     unsigned int chosen_max_raw_ints = target_f->max_raw_ints;
