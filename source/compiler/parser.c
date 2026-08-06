@@ -2541,14 +2541,10 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                 int src_slot = raw_materialize(c, rk_val, rhs_kind);
                 if (src_slot >= 0) {
                     if (src_slot != dest_slot) {
+                        Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
+                        chunk_emit(c, PACK3(move_op, dest_slot, src_slot, 0));
                         int floor_now =
                             (rhs_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
-                        /* Reassignment is the hot case -- mandelbrot's inner loop is all of it. */
-                        if (!retarget_raw_dest(c, src_slot, dest_slot, floor_now)) {
-                            Opcode move_op =
-                                (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
-                            chunk_emit(c, PACK3(move_op, dest_slot, src_slot, 0));
-                        }
                         if (src_slot >= floor_now) {
                             if (rhs_kind == RAWK_INT)
                                 raw_int_free(1);
