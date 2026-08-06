@@ -99,35 +99,17 @@ static unsigned int chunk_pool_append(Chunk* c, AerVal v) {
 unsigned int chunk_add_pool(Chunk* c, AerVal v) {
     /* Strings dominate call volume and the REPL never resets the pool between lines, so dedup them via name_index (O(1)) instead of the O(n) linear scan below, kept for rarer non-string literals. */
     if (aer_type(v) == TYPE_STRING) {
-        /* Tokens are substrings of the source buffer, not NUL-terminated -- build an owned copy first. */
+        /* vs->data works as the lookup key directly: every string reaching here was built by
+           aer_make_string_copy, which always NUL-terminates, inline or heap. */
         AerString* vs = aer_as_string(v);
-        char* key = xmalloc(vs->length + 1);
-        memcpy(key, vs->data, vs->length);
-        key[vs->length] = '\0';
+        unsigned int key_len = hashtable_key_true_len(vs->data, vs->length);
+        AerVal* existing = hashtable_get(&c->name_index, vs->data, key_len);
+        if (existing) return (unsigned int)aer_as_int(*existing);
 
-        unsigned int key_len = hashtable_key_true_len(key, vs->length);
-        AerVal* existing = hashtable_get(&c->name_index, key, key_len);
-        if (existing) {
-            free(key);
-            return (unsigned int)aer_as_int(*existing);
-        }
-
-        /* vs->data is owned at every call site -- free before replacing or it leaks. Skipped for an
-           inline (SSO) string: its bytes live in this cell's own inline_buf, so there is nothing to
-           reclaim and repointing would discard the SSO win. Calling free() on an inline_buf address
-           is what caused a STATUS_HEAP_CORRUPTION crash the first time SSO was implemented. */
-        bool inline_string = (vs->data == vs->inline_buf);
-        if (!inline_string) {
-            free(vs->data);
-            vs->data = key; /* pool entry takes ownership of `key` */
-        }
         unsigned int idx = chunk_pool_append(c, v);
-
-        /* Independent copy, not an alias of c->pool[idx]'s, so both can be freed independently without a double-free. */
-        char* index_key = hashtable_key_dup(c->name_index.pools, key, key_len, NULL);
+        /* name_index keeps its own copy so it and the pool entry free independently. */
+        char* index_key = hashtable_key_dup(c->name_index.pools, vs->data, key_len, NULL);
         hashtable_put(&c->name_index, index_key, key_len, aer_int((int64_t)idx));
-        if (inline_string)
-            free(key); /* not adopted above -- name_index took its own independent copy instead */
         return idx;
     }
 
