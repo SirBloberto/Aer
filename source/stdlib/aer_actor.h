@@ -3,13 +3,9 @@
 
 #include "vm.h"
 
-/* Each Actor owns an independent, long-lived VM+Chunk (the same instantiation primitive
-   aer_module_load uses for an import, aer_vm_instantiate_from_file), plus a plain host-side
-   mailbox. Reachable from AER scripts via the `actor` module, whose binding lives at the end of
-   aer_actor.c, and driven cooperatively by aer_scheduler.c -- the only other file that needs any
-   of this. Everything the scheduler does NOT need is static in aer_actor.c rather than declared
-   here: spawn/id/find/send/try_receive/free are all reached only through the `actor` module
-   binding, which sits in that same file. */
+/* Each Actor owns an independent, long-lived VM+Chunk plus a plain host-side mailbox. Reached from
+   scripts via the `actor` module at the end of aer_actor.c, and driven by aer_scheduler.c -- the
+   only other file needing any of this. Everything the scheduler does not need is static there. */
 
 typedef struct Actor Actor;
 

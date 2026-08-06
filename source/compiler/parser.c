@@ -3922,22 +3922,11 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
     chunk_emit(c, (uint32_t)name_idx);
     chunk_emit(c, (uint32_t)call_id);
 
-    /* One-shot side-channel pair to parse_assignment, consumed via exact register equality -- same
-       discipline as P.last_plain_index_dest_reg. Recognizes `length(P)` for ANY plain-register P,
-       parameter or local (not just a struct/packed-array specialization's hint_param_reg -- a
-       plain function taking, or locally building, a typed array is just as eligible for the
-       loop-bound-hoisting proof, it just has no shape to specialize on at all). Not restricted to
-       P.current_param_count as this originally was: the packed-array-field-access sites still
-       separately gate on `arr_reg == P.hint_param_reg` (a specialized parameter's field offsets
-       are only valid for THAT parameter), so widening this shared, lower-level fact to cover
-       locals can't let a local reach the field-offset-trusting opcodes -- only the typed-array
-       bare-index family, which has no such requirement (see index_safe_unchecked's own comment).
-       Sieve-of-Eratosthenes' `is_composite` (bench/sieve.aer) is the motivating case: a typed
-       array built and indexed entirely within one function, never passed in as a parameter at
-       all. arg_materialize (parse_contiguous_exprs) copies a non-temp register (a parameter or an
-       already-declared local always is one) via a fresh OP_MOVE rather than reusing it in place,
-       so the argument's ORIGINAL register only survives as that MOVE's own source operand, not as
-       `base` itself; decoded here since parse_contiguous_exprs has no other way to report it. */
+    /* One-shot side channel to parse_assignment, consumed by exact register equality. Recognizes
+       `length(P)` for any plain-register P, parameter or local -- a locally-built typed array is
+       just as eligible for the bound proof, it simply has no shape to specialize on. Widening
+       beyond parameters is safe because the field-access sites separately require
+       arr_reg == P.hint_param_reg, so a local can only ever reach the bare-index family. */
     P.last_length_call_result_reg = -1;
     P.last_length_call_arg_reg = -1;
     if (call_id == CALL_BUILTIN_LENGTH && arg_count == 1) {
@@ -4306,14 +4295,9 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     P.function_depth++;
     for (int i = 0; i < param_count; i++) {
         var_slot(c, param_names[i]);
-        /* Parameter i is always register i (var_slot binds parameters first, in order, right
-           after the allocator resets to 0 above) -- no need to inspect var_slot's return value.
-           Deliberately called even for a parameter about to be rebound raw below: it still needs to
-           burn its boxed register slot (advance P.reserved_floor) so `mark_shape_sensitive`/
-           `P.alias_source_param`'s assumption that parameter i always occupies register i
-           contiguously keeps holding for every OTHER parameter -- skipping it here (the way an
-           ordinary local's raw promotion skips var_slot entirely) would let a later parameter or
-           local collide into this "freed" register number and be misattributed as a parameter. */
+        /* Parameter i is always register i, so var_slot's return value needs no inspection. Called
+           even for a parameter about to be rebound raw: it must still burn its boxed slot so the
+           "parameter i occupies register i" assumption keeps holding for the others. */
         if (i == hint_param_reg) {
             if (hint_is_element_shape)
                 P.reg_known_element_shape[i] = hint_shape;
@@ -4385,13 +4369,9 @@ static void parse_function(Chunk* c) {
                  aer_as_string(token.value)->data);
         return;
     }
-    /* Captured unconditionally (cheap -- a pointer, not a copy) so the source span from '(' through
-       the end of the body is available to retain later IF this function turns out to be shape-
-       sensitive (see the source_span capture after the body compiles, below). Must be captured
-       BEFORE the lex() just below, not after -- current_source_cursor() reflects the position past
-       whatever token was JUST scanned, and token here is still the function's name (not yet '('),
-       so the cursor sits exactly at '(' now; capturing after lex() would already be past '(' (it
-       would then hold the position past '(' itself, i.e. mid-parameter-list). */
+    /* Captured unconditionally so the span from '(' onward is available if this function turns out
+       shape-sensitive. Must happen before the lex() below: the cursor reflects the position past
+       the token just scanned, which is still the name, so it sits exactly at '(' now. */
     const char* span_start = current_source_cursor();
     unsigned int span_start_line = current_source_line();
     lex();
@@ -4803,16 +4783,10 @@ void parser_reset(void) {
        program's own fresh Chunk. */
 }
 
-/* Every parser global lives in one Parser struct now (see its own comment, above) -- a nested
-   compile (module import, lazy shape-specialization recompile) snapshots the whole thing and
-   starts P fresh, then restores it afterward. Safe to do wholesale, including fields that were
-   historically excluded from this snapshot (shape_sensitive_param/current_param_count/
-   alias_source_param/reg_known_shape/reg_known_element_shape/last_plain_index_(fields)/
-   any_compile_error): every one of them is unconditionally reset before its own next real read
-   (parse_function_body resets the whole shape-specialization group at its own entry; parse()
-   resets any_compile_error at its own entry; the nested specialization-recompile path calls
-   neither of those on its way in, so it never observes or depends on whatever this snapshot
-   carries for them either way). */
+/* A nested compile snapshots the whole Parser struct, starts P fresh, and restores afterward. Safe
+   wholesale, including fields historically excluded: each is unconditionally reset before its own
+   next real read, and the nested recompile path never observes what the snapshot carries for
+   them. struct_names is the one exception -- see parser_restore_state. */
 /* parser.h already forward-declares `struct ParserState` (an opaque handle for callers outside
    this file) -- a trivial one-field wrapper around Parser satisfies that without duplicating
    Parser's own field list a second time. */
@@ -4825,24 +4799,12 @@ ParserState* parser_save_state(void) {
     s->p = P;
     P = (Parser){
         0}; /* zeroes everything reg_reset() would, plus every other field -- see this function's own comment above */
-    /* struct_names/struct_count/struct_cap are the one exception to "unconditionally reset before
-       its own next real read": every OTHER field this wholesale zero touches is per-FUNCTION state
-       parse_function_body re-establishes at its own entry, but struct definitions are a global,
-       program-wide fact, fixed once at top-level parse time and never re-derived by a nested
-       recompile. A specialized function body can construct ANY previously-defined struct, not just
-       its own hint_shape's -- is_struct_name(name_idx) (parser.c) with an empty table can't tell
-       `SomeStruct(...)` from a call to an undefined function of that name, silently falling through
-       to is_forward_ref's fallback (func_offset/func_index left at 0) instead of OP_STRUCT_NEW. That
-       compiles a real call to WHATEVER function occupies index 0 -- a genuine, reachable
-       memory-safety-adjacent bug. Found while investigating a since-reverted specialization variant
-       (a plain-numeric-parameter recursive function building a Node/Wrap-style tree structure
-       overflowed the call stack), but the underlying gap is in this shared recompile machinery
-       itself, reachable by any shape-specialized function whose body ALSO constructs an unrelated
-       struct type (see test_shape_specialization.aer's own regression test). Carried over by value
-       (not re-pointing into the outer P's own array) since the nested compile's OWN struct_register
-       calls (a fresh top-level struct definition inside a nested module-import compile, the other
-       parser_save_state caller) must append to its own, separate table without corrupting the
-       outer compile's. */
+    /* struct_names is the exception to "reset before its next read": struct definitions are a
+       program-wide fact, never re-derived by a nested recompile, and a specialized body may
+       construct any of them. With an empty table is_struct_name cannot tell `SomeStruct(...)` from
+       an undefined function, and it compiles a call to whatever occupies index 0 -- reachable and
+       memory-safety-adjacent. Carried by value so a nested compile's own registrations stay
+       separate from the outer table. */
     if (s->p.struct_cap > 0) {
         P.struct_names = xmalloc(sizeof(unsigned int) * (size_t)s->p.struct_cap);
         memcpy(P.struct_names, s->p.struct_names, sizeof(unsigned int) * (size_t)s->p.struct_count);
@@ -4862,13 +4824,10 @@ void parser_restore_state(ParserState* s) {
     free(s);
 }
 
-/* Per-statement rollback: a compile error rolls back that statement and resumes at the next
-   boundary, so a REPL can keep going after a mistake. Does not reset the parser's persistent
-   tables -- see parser_reset. Once every statement compiles, anything still in the
-   forward-reference pending list never got defined in this call -- reported at its own original
-   call site (a saved cursor), neutralized by overwriting the call's opcode word with a bare
-   OP_HALT (not just patching the jump target, which would still run the call's own side effects
-   first). Drained unconditionally -- forward references only resolve within one call. */
+/* Per-statement rollback so a REPL survives a mistake; persistent tables are left alone (see
+   parser_reset). Anything still pending in the forward-reference list never got defined, and is
+   reported at its original call site, then neutralized by overwriting the call's opcode word with
+   OP_HALT -- patching only the jump target would still run the call's side effects. */
 void parse(Chunk* c) {
     P.any_compile_error = false;
     while (!equal(TOKEN_END_OF_FILE)) {

@@ -53,14 +53,10 @@ void aer_gc_set_ceiling(unsigned int max_live_cells);
    aer_run_source(). */
 void aer_vm_reset_for_reuse(VM* vm);
 
-/* Parses source (appended after whatever's already in chunk -- the same incremental-compile model
-   the REPL relies on for cross-statement function/variable persistence) and runs it on vm.
-   Equivalent to: aer_vm_reset_for_reuse(vm); shell(source); lex(); parse(chunk);
-   chunk_emit(chunk, OP_HALT); runtime_had_error = false; return vm_run(vm); -- returns whatever
-   vm_run returns. Does not check parse_had_error before running (matching the REPL's own
-   recover-and-continue behavior, not file mode's stricter refusal) -- a host that wants file-mode's
-   "don't run anything if any statement failed to compile" safety should check parse_had_error
-   itself before calling this, the same policy choice main.c's own run_file() makes explicitly. */
+/* Parses source, appended after whatever is already in chunk -- the incremental-compile model the
+   REPL relies on -- and runs it on vm, returning whatever vm_run returns. Does not check
+   parse_had_error first, matching the REPL's recover-and-continue behavior; a host wanting file
+   mode's stricter "run nothing if anything failed to compile" should check it before calling. */
 bool aer_run_source(VM* vm, Chunk* chunk, const char* source);
 
 /* Embedding: coarse capability toggles. All three default true (unchanged from every prior

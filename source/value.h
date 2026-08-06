@@ -64,13 +64,10 @@ typedef struct AerVal {
    size-descending order -- recovers real bytes per cell with no behavior change; see ARCHITECTURE.md. */
 struct AerArray {
     unsigned char gc_state;
-    /* Card marking for the O(n) minor-GC rescan fix -- see gc_barrier_array's own comment (gc.c).
-       dirty_cards is NULL until this array is actually remembered (its first old-array-holding-a-
-       young-value write), so the common case (never promoted to old) pays nothing extra; one bit
-       per element once allocated. dirty_all is a coarser fallback set by any operation that shifts
-       element-to-index correspondence (collection.delete/insert/sort) -- rather than shift every
-       affected bit for a rare path, the next minor GC just rescans the whole array that one cycle
-       and clears dirty_all again. */
+    /* Card marking for the O(n) minor-GC rescan fix; see gc_barrier_array (gc.c). dirty_cards stays
+       NULL until the array is first remembered, so an array never promoted to old pays nothing.
+       dirty_all is the coarse fallback for operations that shift index correspondence -- the next
+       minor GC rescans the whole array once rather than shifting every bit. */
     bool dirty_all;
     unsigned int count;
     AerVal* items;
@@ -85,13 +82,10 @@ struct AerArray {
     Shape* shape; /* NULL for ordinary arrays; set for struct instances */
     unsigned char* dirty_cards;
     unsigned int dirty_cards_bytes;
-    /* [dirty_min_byte, dirty_max_byte) bounds the actual range of set bits since the last clear --
-       mark_card_dirty (gc.c) maintains this on every write. Without it, gc_collect's card-scan (and
-       its post-scan memset) has to walk all of dirty_cards_bytes every cycle regardless of how few
-       bits are actually set, which is exactly as O(current size) as the whole-array fallback it was
-       meant to replace: a pure-growth "build a huge array via many appends" pattern still pays
-       O(n^2) total, just with a cheaper per-byte constant. dirty_min_byte == (unsigned int)-1 means
-       "nothing dirty" (dirty_max_byte stays a harmless 0, making the scan's < bound naturally empty). */
+    /* Bounds the range of set bits since the last clear, maintained by mark_card_dirty. Without it
+       the card scan and its post-scan memset walk all of dirty_cards_bytes every cycle regardless
+       of how few bits are set -- leaving a pure-growth append loop at O(n^2), just with a cheaper
+       constant. dirty_min_byte == (unsigned int)-1 means nothing is dirty. */
     unsigned int dirty_min_byte, dirty_max_byte;
 };
 _Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");

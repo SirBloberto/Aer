@@ -112,14 +112,10 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
             return (unsigned int)aer_as_int(*existing);
         }
 
-        /* vs->data was already owned at every call site -- free before replacing, or it's orphaned
-           (confirmed real leak via ASAN). Skipped for an inline (SSO) string: its bytes already live
-           inside this very cell (vs->inline_buf, value.h) at no extra allocation cost, so there's
-           nothing to reclaim, and repointing it at `key` would only throw away the SSO win for no
-           reason -- `key`'s content is a redundant copy in that case (freed below instead, once
-           name_index has made its own independent copy of it). This is the exact landmine that
-           caused a STATUS_HEAP_CORRUPTION crash the first time SSO was implemented: calling free()
-           on an inline string's own inline_buf address (not a real heap allocation at all). */
+        /* vs->data is owned at every call site -- free before replacing or it leaks. Skipped for an
+           inline (SSO) string: its bytes live in this cell's own inline_buf, so there is nothing to
+           reclaim and repointing would discard the SSO win. Calling free() on an inline_buf address
+           is what caused a STATUS_HEAP_CORRUPTION crash the first time SSO was implemented. */
         bool inline_string = (vs->data == vs->inline_buf);
         if (!inline_string) {
             free(vs->data);

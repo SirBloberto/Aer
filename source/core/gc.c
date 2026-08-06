@@ -34,14 +34,11 @@ static void gc_remember(VmHeap* heap, void* ptr, RememberedKind kind) {
     heap->remembered_count++;
 }
 
-/* Card marking: grows *dirty_cards (if needed) to cover `index`, then sets that bit, and widens
-   [*dirty_min_byte, *dirty_max_byte) to include it. Shared by gc_barrier_array/gc_barrier_dict --
-   AerArray and AerDict aren't a common type in C, so the relevant fields are passed by pointer
-   instead of duplicating this logic twice. Called on EVERY qualifying write, not just the one that
-   first adds the container to remembered_set (gc_remember's own dedup only governs remembered_set
-   membership, not which indices need rescanning). The min/max range is what makes gc_collect's
-   rescan (and its post-scan clear) actually bounded by how much changed, rather than by the
-   container's current total size -- see AerArray.dirty_min_byte's own comment (value.h). */
+/* Card marking: grows *dirty_cards to cover `index`, sets that bit, and widens
+   [*dirty_min_byte, *dirty_max_byte). Fields are passed by pointer so gc_barrier_array and
+   gc_barrier_dict share this. Called on every qualifying write, not just the one that first
+   remembers the container. The min/max range is what bounds gc_collect's rescan by how much
+   changed rather than by the container's total size. */
 static void mark_card_dirty(unsigned char** dirty_cards, unsigned int* dirty_cards_bytes,
                             unsigned int* dirty_min_byte, unsigned int* dirty_max_byte, unsigned int index) {
     unsigned int needed_bytes = index / 8 + 1;
@@ -70,13 +67,9 @@ void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value)
     gc_remember(heap, a, REMEMBERED_ARRAY);
 }
 
-/* Struct field-set write barrier -- AerStruct is its own type/pool now, not a shaped AerArray, so
-   it needs its own barrier instead of gc_barrier_array's old shape-ternary dispatch. Only ever
-   needs to consider TYPE_ANY fields in practice (a raw typed field can never hold a reference the
-   GC must trace), but the caller doesn't need to know that -- value_is_young already returns false
-   for a primitive regardless. No card marking here -- a struct's field count is small and fixed
-   (MAX_STRUCT_FIELDS), so a full per-struct rescan is already bounded, unlike an unboundedly
-   growing array/dict; the O(n^2) problem this fixes is specific to unbounded containers. */
+/* Struct field-set write barrier -- AerStruct has its own pool, so it needs its own barrier. No
+   card marking: a struct's field count is small and fixed, so a full rescan is already bounded.
+   The O(n^2) problem cards solve is specific to unbounded containers. */
 void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value) {
     VmHeap* heap = &vm->heap;
     if (!heap->gc_ever_collected) return;
@@ -262,14 +255,10 @@ static void free_struct(void* cell) {
 static void free_packed_array(void* cell) {
     free(((AerPackedArray*)cell)->data);
 }
-/* Stashes the data buffer into current_heap's free-cache (vm.h's own comment on TypedArrayFreeSlot)
-   instead of actually freeing it, when there's a free slot and the buffer qualifies (nonzero size,
-   at or under the per-buffer ceiling) -- vm_new_typed_array (vm.c) checks that same cache before
-   ever calling xmalloc, so a typed array repeatedly rebuilt at the same size (an elementwise-
-   transform loop's own shape) reuses the buffer instead of churning malloc/free every pass.
-   current_heap is guaranteed to be the heap this cell actually belongs to here: vm_run_slice sets
-   it for the ordinary minor/major GC path, and vm_free (vm.c) now explicitly saves/sets/restores
-   it around the whole-heap teardown finalize pass this function is also reachable from. */
+/* Stashes the data buffer into current_heap's free-cache rather than freeing it, when a slot is
+   free and the buffer qualifies -- vm_new_typed_array checks that cache before xmalloc, so a
+   repeatedly-rebuilt same-size array reuses the buffer. current_heap is guaranteed to be this
+   cell's own heap: vm_run_slice sets it for normal GC, and vm_free brackets teardown with it. */
 static void free_typed_array(void* cell) {
     AerTypedArray* ta = (AerTypedArray*)cell;
     if (!ta->data) return;
@@ -290,14 +279,10 @@ static void free_result(void* cell) {
     (void)cell;
 } /* both fields are plain AerVals -- nothing separately owned */
 
-/* Every pool a VmHeap owns, by field offset (not a raw Pool* -- these describe VmHeap's shape once,
-   generically, rather than one specific instance), paired with its finalizer. The single place all
-   pools are listed together; gc_finalize_all_pools, pool_sweep's call in gc_collect below, and
-   gc_count_live_cells all walk this instead of repeating their own hand-written list -- which is
-   exactly how gc_count_live_cells came to silently omit result_pool before. struct_pools is
-   STRUCT_PAYLOAD_TIER_COUNT (vm.h) separate size-classed pools, not one -- each gets its own entry
-   here (offsetof on an array element with a constant index is valid C), all sharing the same
-   free_struct no-op finalizer since which tier a cell came from never matters for freeing it. */
+/* Every pool a VmHeap owns, by field offset rather than raw pointer, paired with its finalizer.
+   The single place all pools are listed; gc_finalize_all_pools, pool_sweep and gc_count_live_cells
+   all walk this instead of hand-written lists -- which is how gc_count_live_cells once silently
+   omitted result_pool. struct_pools contributes one entry per size-class tier. */
 typedef struct {
     size_t offset;
     void (*on_free)(void* cell);
@@ -358,21 +343,12 @@ static void gc_collect(VM* vm, bool minor) {
 
             switch (e->kind) {
                 case REMEMBERED_ARRAY: {
-                    /* Card-marked: only the indices actually dirtied since the last rescan get
-                       revisited (turning a pure-growth "build a huge array via many appends"
-                       pattern into true O(n) total instead of O(n^2)) -- dirty_all is the fallback
-                       for an operation that shifts element-to-index correspondence instead
-                       (collection.delete/insert/sort, aer_collection.c), and !dirty_cards is a
-                       defensive fallback that should never actually trigger (every write reaching
-                       this array via gc_barrier_array already dirties a card before remembering
-                       it), kept anyway rather than assumed. The scan (and the clear below) is
-                       bounded to [dirty_min_byte, dirty_max_byte) -- without that, this loop and the
-                       memset both still walk the container's ENTIRE current dirty_cards_bytes every
-                       cycle regardless of how few bits are actually set, which is exactly the
-                       O(current size) cost per cycle the card scheme was meant to avoid: a
-                       pure-growth append loop still pays O(n^2) total, just with a cheaper constant
-                       (measured: struct_array_scan.aer's 2M-particle build spent ~79% of all cycles
-                       in gc_collect before this bound existed). */
+                    /* Only indices dirtied since the last rescan get revisited, turning a
+                       pure-growth append pattern into true O(n) total. dirty_all is the fallback
+                       for operations that shift index correspondence; !dirty_cards is defensive and
+                       should never trigger. Bounding the scan and the clear to
+                       [dirty_min_byte, dirty_max_byte) is what avoids walking the whole card array
+                       every cycle -- without it a build loop still pays O(n^2). */
                     AerArray* a = (AerArray*)e->ptr;
                     if (a->dirty_all || !a->dirty_cards) {
                         for (unsigned int j = 0; j < a->count; j++)
@@ -479,16 +455,10 @@ unsigned int gc_count_live_cells(VmHeap* heap) {
    gc_run_collection_cycle), not once per allocation or per minor. */
 #define AER_MINOR_THRESHOLD_CAP (4u * 1024 * 1024)
 
-/* Rescales minor_gc_threshold to the current live set, capped, floored at whatever
-   minor_gc_threshold_floor was configured to (vm.h's own comment has the full "why"): a program
-   with a small live heap keeps collecting at the small configured default (bounded peak memory is
-   the whole point of a small nursery there), while one with a large, largely-static live heap
-   (log_processing.aer's 200k-line array was the motivating case -- profiled at ~46% of total
-   cycles in gc_collect, nearly all of it re-marking that same never-mutated array on every major)
-   gets a proportionally bigger nursery instead of re-tracing that live data almost as often as a
-   program with barely any live data at all. Recomputed fresh from minor_gc_threshold_floor (never
-   from the previous minor_gc_threshold) every time, so a later-freed live set shrinks the
-   threshold back down again on the very next major, rather than ratcheting upward forever. */
+/* Rescales minor_gc_threshold to the live set, capped, floored at minor_gc_threshold_floor. A small
+   live heap keeps the small configured default, since bounded peak memory is the point there; a
+   large, largely-static one gets a proportionally bigger nursery instead of re-tracing that data
+   nearly as often. Recomputed from the floor each time so it can shrink again. */
 static void gc_rescale_minor_threshold(VmHeap* heap, unsigned int live) {
     unsigned int scaled = live > AER_MINOR_THRESHOLD_CAP ? AER_MINOR_THRESHOLD_CAP : live;
     heap->minor_gc_threshold =

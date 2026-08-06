@@ -18,13 +18,10 @@ void aer_format_real(double d, char* buf, size_t bufsize) {
     }
 }
 
-/* snprintf("%lld", ...) replacement -- integer-to-string is on the hot path for any script doing
-   string interpolation or print() with integers (every dict key format, every "{expr}" with an
-   int), and profiling a dict-heavy benchmark found __vfprintf_internal/_itoa/__vsnprintf_internal
-   at a combined ~14% of cycles, entirely from this one conversion. snprintf's generality (format
-   string parsing, locale handling) is pure overhead for "write these decimal digits" -- a plain
-   digit-extraction loop skips all of it. bufsize isn't checked: every caller passes a >=64-byte
-   buffer, and int64's longest possible rendering ("-9223372036854775808") is 20 bytes + NUL. */
+/* snprintf("%lld", ...) replacement: integer-to-string is hot for any script doing interpolation or
+   print() with integers, and profiling a dict-heavy benchmark put printf internals at ~14% of
+   cycles from this one conversion. bufsize is unchecked -- every caller passes >=64 bytes and
+   int64's longest rendering is 20 bytes plus NUL. */
 void aer_format_int(long long v, char* buf, size_t bufsize) {
     (void)bufsize;
     char tmp[20];

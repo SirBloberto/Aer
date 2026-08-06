@@ -183,16 +183,11 @@ void shell(char* line) {
     indent_reset();
 }
 
-/* Fresh, independent text span (string interpolation's `{expr}` body, or a shape-specialization
-   recompile's retained function source). Caller must bracket with lexer_save_state()/
-   lexer_restore_state(). Uses its own heap File, freed on restore.
-
-   start_line is the ABSOLUTE line (in whatever file the span was cut from) that the span's own
-   first character sits on -- stored as line_base = start_line - 1 so current_source_line()'s
-   existing "starts counting at 1" formula lands on start_line at span position 0, instead of
-   reporting 1 (relative to the span's own start) the way it did before this parameter existed.
-   That was a real bug: a specialization recompile's error/debug line numbers were off by however
-   many lines precede the function in its source file. */
+/* Fresh, independent text span (an interpolation body, or a specialization recompile's retained
+   source). Caller must bracket with lexer_save_state/restore_state; uses its own heap File.
+   start_line is the absolute line the span's first character sits on, stored as line_base =
+   start_line - 1 so current_source_line() lands on it at span position 0 rather than reporting 1
+   relative to the span -- otherwise a recompile's line numbers are off by the function's offset. */
 void lexer_begin_span(const char* text, unsigned int len, unsigned int start_line) {
     char* buf = xmalloc((size_t)len + 1);
     memcpy(buf, text, len);

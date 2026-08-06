@@ -1,22 +1,9 @@
-/* aer_lsp.c -- a language server for AER, linking the real compiler (lexer.c/parser.c) directly
-   rather than reimplementing the grammar. Diagnostics are the real compiler's own parse errors --
-   perfect accuracy, zero drift, since this IS `aer` itself, not a guess at what it accepts.
-   Go-to-definition/completion are a separate, coarse, token-based symbol scan (the real
-   single-pass compiler has no retained symbol table to query) -- good enough to jump to a
-   function/struct declaration or complete a known module's functions, not scope-aware, not a
-   rename-refactor or find-all-references engine.
-
-   Transport: LSP's standard Content-Length-framed JSON-RPC over stdio. Hand-rolled, no library --
-   only as much JSON parsing/encoding as the specific methods below need, not a general parser.
-
-   Known, deliberate limitation: `import` executes the imported file's top-level code at parse
-   time (chunk_add_import -> aer_module_load -> vm_run) -- running the real parser for diagnostics
-   on every keystroke would, for a file importing a local helper module, actually run that
-   helper's top-level code as a side effect of getting diagnostics. Mitigated with
-   aer_set_import_enabled(false) for every diagnostic pass: file-based imports report a clean
-   "not checked by the language server" diagnostic instead of executing. Fixed native modules
-   (math/net/regex/etc.) are unaffected -- importing one never runs anything.
-*/
+/* A language server linking the real compiler rather than reimplementing the grammar, so
+   diagnostics are the actual parse errors with zero drift. Go-to-definition and completion are a
+   separate coarse token scan -- the single-pass compiler retains no symbol table -- so neither is
+   scope-aware. Transport is Content-Length-framed JSON-RPC over stdio, hand-rolled.
+   `import` runs the imported file's top-level code at parse time, so every diagnostic pass sets
+   aer_set_import_enabled(false) and reports file imports as unchecked instead of executing them. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

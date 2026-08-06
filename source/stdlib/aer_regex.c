@@ -3,13 +3,10 @@
 #include "aer_stdlib.h"
 #include "error.h"
 
-/* A small backtracking engine for the practical common subset: literals, '.', character classes
-   ('[abc]', '[^a-z]', '\d \w \s \D \W \S'), '*'/'+'/'?' quantifiers (on single atoms AND on
-   groups), '^'/'$' anchors, '|' alternation, and '(...)' grouping (non-capturing -- match/find/
-   replace never need to extract a sub-match, only the overall match). No backreferences, no
-   named groups, no lazy quantifiers -- rolled in-house rather than depending on a system library
-   (POSIX <regex.h> isn't reliably available on the MinGW target anyway), matching this project's
-   existing precedent (its own PRNG instead of libc rand(), its own GC). */
+/* A small backtracking engine for the practical common subset: literals, '.', character classes,
+   '*'/'+'/'?' on atoms and groups, '^'/'$', '|', and non-capturing '(...)'. No backreferences,
+   named groups, or lazy quantifiers. In-house rather than POSIX <regex.h>, which isn't reliably
+   available on the MinGW target, matching this project's own PRNG and GC precedent. */
 
 typedef enum { NODE_CHAR, NODE_ANY, NODE_CLASS, NODE_START, NODE_END, NODE_GROUP } NodeType;
 

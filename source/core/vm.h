@@ -1002,18 +1002,11 @@ bool chunk_add_import(Chunk* c, const char* name, unsigned int len, const char* 
                       unsigned int path_len);
 bool chunk_is_imported(Chunk* c, const char* name, unsigned int len);
 
-/* Process-wide capability DEFAULTS -- default true (every prior release's always-on behavior,
-   unchanged unless a host/CLI flag opts out). io/net are only defaults now: vm_init copies them
-   into VM.io_enabled/net_enabled at creation, and aer_net_call/the io dispatch case in vm_run_slice
-   check the per-VM field, not these globals directly -- so two VMs in the same process can now run
-   with different io/net capabilities (a plugin host running an untrusted script alongside a
-   trusted one, say). import_enabled stays a real, directly-checked global: chunk_add_import() runs
-   at PARSE time with only a Chunk* in scope, no VM* at all (the same "Chunk has no owning VM"
-   situation the hashtable pools hit) -- giving it the same per-VM treatment would need routing
-   through current_heap-style "current VM" plumbing for a check that fires once per import
-   statement, not worth it for that. Set via aer_set_io_enabled()/aer_set_net_enabled()/
-   aer_set_import_enabled() (include/aer.h), not directly. This is a blast-radius limiter, not a
-   real permission system -- see the README's Sandboxing note. */
+/* Process-wide capability defaults, all true. io/net are defaults only: vm_init copies them into
+   VM.io_enabled/net_enabled, and the runtime checks the per-VM field, so two VMs in one process can
+   differ. import_enabled stays a directly-checked global because chunk_add_import runs at parse
+   time with only a Chunk* in scope. Set via aer_set_*_enabled(). A blast-radius limiter, not a
+   permission system -- see the README's Sandboxing note. */
 extern bool aer_io_enabled;
 extern bool aer_net_enabled;
 extern bool aer_import_enabled;

@@ -135,16 +135,12 @@ static bool hash_match(const HashTableEntry* entry, const char* key, unsigned in
     return entry->key && entry->length == length && memcmp(entry->key, key, length) == 0;
 }
 
-/* Alloc-new/copy/free-old once any tier is involved -- the pools don't support growing a cell in
-   place, only handing back a whole new one. But a table that grows one entry at a time with no
-   hashtable_reserve up front (dict_bench.aer's pattern: 200k individual inserts, no pre-sizing)
-   climbs past the largest tier and keeps doubling for the rest of its life entirely in plain-malloc
-   territory -- forcing every one of THOSE growth steps through a manual memcpy would throw away
-   realloc's ability to extend the same block in place for a large standalone allocation, which is
-   exactly the case measured to regress dict_bench (+3.1% instructions) before this check was added.
-   Once both the old and new capacity are already past the last tier, there's no pool involved on
-   either side, so plain xrealloc is strictly better -- only the climb through the tiers themselves
-   (and the one crossing from the last tier into plain-malloc territory) needs the copy dance. */
+/* Alloc-new/copy/free-old once a tier is involved -- pools hand back a whole new cell, never grow
+   one in place. But a table growing one entry at a time with no hashtable_reserve climbs past the
+   largest tier and doubles in plain-malloc territory forever after; forcing those steps through a
+   manual memcpy discards realloc's in-place extend and measured +3.1% on dict_bench. Once both
+   capacities are past the last tier there is no pool involved, so plain xrealloc is strictly
+   better -- only the climb through the tiers needs the copy. */
 static void dense_grow_if_needed(HashTable* t) {
     if (t->count < t->dense_capacity) return;
     unsigned int new_capacity = t->dense_capacity ? t->dense_capacity * 2 : 4;

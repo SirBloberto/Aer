@@ -5,16 +5,10 @@
 #include <stddef.h>
 
 /* Slab allocator for fixed-size objects, extended for generational mark-sweep GC. Each cell's
-   one-byte GC state is the owning struct's own first field (pinned to offset 0 by _Static_asserts
-   in value.h) -- in the object, not a side table, so barrier checks need no reverse lookup.
-
-   An aligned-slab + per-slab packed side-array alternative (state bytes moved out of the struct
-   entirely, addressed by masking a cell pointer) was prototyped and measured against sieve/nbody/
-   fib/dict/small-dict/lookup-table/hash-cache-micro: no net win on the large-dict case it targeted,
-   and a real ~8-20% regression on sieve, small_dict_bench, lookup_table_bench, and
-   hash_cache_micro (the extra mask+divide+separate-cache-line cost on every individual
-   pool_mark/pool_is_young call outweighed the sweep/clear_marks locality win everywhere but the one
-   case it was aimed at). Reverted; this embedded-byte design stays. */
+   one-byte GC state is the owning struct's first field (pinned to offset 0 by _Static_asserts in
+   value.h) -- in the object, not a side table, so barrier checks need no reverse lookup. An
+   aligned-slab side-array alternative was prototyped and measured 8-20% worse on four benchmarks:
+   the per-call mask and divide outweighed the sweep locality win. */
 #define POOL_MARKED 0x1 /* this collection cycle only */
 #define POOL_OLD 0x2 /* set once a cell survives a collection; cleared on every pool_alloc */
 #define POOL_FREE                                                                                            \
@@ -47,38 +41,18 @@ typedef struct {
        cycle still touched every cell's state byte just to confirm it's old). */
     unsigned int* slab_young_count;
 
-    /* Doubly-linked "slabs with young_count > 0" thread, parallel to slabs[], rooted at
-       young_slab_head (POOL_NO_SLAB if none). slab_young_count[] alone only lets pool_sweep skip a
-       fully-old-or-free slab's per-CELL scan in O(1) -- the sweep's own outer loop still visited
-       EVERY slab index just to read that one flag, every single minor cycle, an O(slab_count) cost
-       that dominates once a large grow-only pool (struct_array_scan.aer's 2M-particle struct_pools
-       tier, ~2000 slabs) has accumulated many fully-promoted slabs behind a live construction phase. This
-       thread lets a minor pool_sweep walk ONLY the slabs that still have >=1 young cell, true
-       O(live young slabs) instead. Doubly-linked (not singly, unlike slab_free_list/free_slab_head
-       above) because removal can happen to ANY slab in the thread, not just the head -- pool_sweep
-       unlinks whichever slab it just finished sweeping to 0, wherever that slab sits in the list --
-       whereas the free-list thread only ever pops its own head (pool_alloc's only consumer). A
-       slab's young_count can go from 0 back above 0 later (a cell pool_sweep just freed gets reused
-       by a later pool_alloc, which always allocates "born young" -- see pool_alloc's own comment),
-       so this is add/remove, not a one-directional watermark: pool_alloc re-links a slab the moment
-       its count crosses 0 -> 1, pool_sweep unlinks it the moment a sweep drives it back to 0. */
+    /* Doubly-linked thread of slabs with young_count > 0, rooted at young_slab_head.
+       slab_young_count alone lets pool_sweep skip a slab's cell scan, but its outer loop still
+       visited every slab index each cycle -- O(slab_count), which dominates once a grow-only pool
+       has thousands of fully-promoted slabs. Doubly-linked because any slab can leave the thread,
+       not just the head. A slab rejoins when pool_alloc reuses a freed cell (always born young). */
     unsigned int* young_slab_prev;
     unsigned int* young_slab_next;
     unsigned int young_slab_head;
 
-    /* Per-slab free lists (parallel to slabs[]) plus an O(1) "which slabs currently have a free
-       cell" thread (slab_free_next, rooted at free_slab_head) -- modeled directly on Luau's
-       per-page free list + page-linking (lua_Page's own free list and prev/next fields), not AER's
-       own earlier design here, which used ONE free list shared by the whole pool and therefore
-       couldn't tell which slab a reused cell came from -- exactly the case that used to force
-       slab_young_count's skip to give up entirely (see the removed `reused` field this replaces).
-       Every one of the 8 GC-tracked pools frees cells exclusively via pool_sweep's own internal
-       path (AER has no manual/explicit object destruction, only GC-driven reclamation), which
-       always knows its own slab index for free -- so slab_young_count is now unconditionally exact
-       for them, no fallback needed. hashtable.c's pools never populate this (they only ever call
-       the public pool_free, never pool_free_at), so free_slab_head simply stays POOL_NO_SLAB for
-       them forever and they fall straight through to the pool-wide free_list above, completely
-       unaffected. */
+    /* Per-slab free lists plus an O(1) thread of slabs holding a free cell, modeled on Luau's
+       per-page free list. The earlier single pool-wide free list could not tell which slab a reused
+       cell came from, which is what forced slab_young_count's skip to give up entirely. */
     void** slab_free_list; /* per-slab free-list head, parallel to slabs[] */
     unsigned int* slab_free_next; /* per-slab "next slab with a free cell" thread, parallel to slabs[] */
     unsigned int free_slab_head; /* POOL_NO_SLAB if no slab currently has a free cell */

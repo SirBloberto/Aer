@@ -13,14 +13,10 @@ static bool math_pop_double(VM* vm, const char* name, double* out) {
     return false;
 }
 
-/* The computation + domain check for every single-argument, real-in function returning a plain
-   real or int (sqrt, floor, ceil, round, sin, cos, tan, exp, log, log2, log10). One place knows
-   what each computes and what its domain allows, instead of eleven near-identical blocks that can
-   drift apart as they're separately maintained. Raises the exact per-function error itself on a
-   domain violation (like every other error() here, it longjmps away immediately -- see error.c)
-   and returns false; *out is only meaningful when this returns true. abs (type-preserving int/real,
-   not real->?) and the 0-/2-arg functions (pi, pow, min, max) aren't this shape -- they stay
-   inline in aer_math_call below. */
+/* Computation and domain check for every single-argument real-in math function. One place knows
+   what each computes and what its domain allows, rather than eleven near-identical blocks that can
+   drift apart. Raises its own error and returns false on a domain violation; *out is meaningful
+   only on true. abs and the 0-/2-arg functions aren't this shape and stay inline below. */
 static bool math_unary(int fn_id, double x, AerVal* out) {
     switch (fn_id) {
         case FN_MATH_SQRT:
