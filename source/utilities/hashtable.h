@@ -44,11 +44,12 @@ typedef struct {
     unsigned int count; /* live entries -- also dense's used length */
     unsigned int dense_capacity; /* allocated length of dense -- grows independently of capacity */
     unsigned int capacity; /* allocated length of sparse; power of two */
-    HashPools* pools; /* set once at creation -- see HashPools' own comment above */
     /* Keys point into permanent constant-pool storage instead of being owned, so none are freed.
-       Set only by hashtable_put_borrowed; any owning mutation calls adopt_keys first, so a table
-       is never half-borrowed. Fits existing padding -- HashTable does not grow. */
+       Set only by hashtable_put_borrowed; any owning mutation calls adopt_keys first, so a table is
+       never half-borrowed. Declared here, before `pools`, to land in the alignment padding after
+       `capacity` -- placed after `pools` instead it grows HashTable 40 -> 48 bytes. */
     bool keys_borrowed;
+    HashPools* pools; /* set once at creation -- see HashPools' own comment above */
 } HashTable;
 
 /* `length` must be the key's TRUE length -- i.e. already truncated at any embedded NUL via
