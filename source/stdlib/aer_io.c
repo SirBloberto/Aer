@@ -12,18 +12,21 @@
 #define STDIN_HANDLE 0
 
 /* Borrowed argv slice for io.args() -- see aer_io_set_args (aer_stdlib.h). */
-static int    io_argc = 0;
+static int io_argc = 0;
 static char** io_argv = NULL;
 
 /* stdin (or any non-seekable stream) can't be pre-sized via fseek/ftell, so read until EOF into a growing buffer. */
 static AerVal io_read_until_eof(FILE* fp) {
     size_t cap = 4096, len = 0;
-    char*  buf = xmalloc(cap);
+    char* buf = xmalloc(cap);
     for (;;) {
-        if (len == cap) { cap *= 2; buf = xrealloc(buf, cap); }
+        if (len == cap) {
+            cap *= 2;
+            buf = xrealloc(buf, cap);
+        }
         size_t n = fread(buf + len, 1, cap - len, fp);
         len += n;
-        if (n == 0) break;   /* EOF or a read error either way */
+        if (n == 0) break; /* EOF or a read error either way */
     }
     buf = xrealloc(buf, len + 1);
     buf[len] = '\0';
@@ -37,14 +40,15 @@ static AerVal io_read_fp(FILE* fp) {
     if (size < 0) return aer_make_result(aer_null(), aer_make_error(strerror(errno)));
     fseek(fp, 0, SEEK_SET);
 
-    char*  buf   = xmalloc((size_t)size + 1);
+    char* buf = xmalloc((size_t)size + 1);
     size_t nread = fread(buf, 1, (size_t)size, fp);
     buf[nread] = '\0';
     return aer_make_result(aer_make_string(buf, (unsigned int)nread), aer_null());
 }
 
 static AerVal io_read(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)userdata;
+    (void)vm;
+    (void)userdata;
     if (arg_count != 1) {
         error("io.read() requires a path string or io.stdin()'s handle");
         return aer_null();
@@ -85,7 +89,8 @@ static AerVal io_write_mode(AerVal path_v, AerVal data_v, const char* mode) {
 }
 
 static AerVal io_write(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)userdata;
+    (void)vm;
+    (void)userdata;
     if (arg_count != 2 || aer_type(args[0]) != TYPE_STRING || aer_type(args[1]) != TYPE_STRING) {
         error("io.write() requires a path and a string");
         return aer_null();
@@ -94,7 +99,8 @@ static AerVal io_write(VM* vm, int arg_count, AerVal* args, void* userdata) {
 }
 
 static AerVal io_append(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)userdata;
+    (void)vm;
+    (void)userdata;
     if (arg_count != 2 || aer_type(args[0]) != TYPE_STRING || aer_type(args[1]) != TYPE_STRING) {
         error("io.append() requires a path and a string");
         return aer_null();
@@ -104,7 +110,8 @@ static AerVal io_append(VM* vm, int arg_count, AerVal* args, void* userdata) {
 
 /* A plain boolean, not a Result -- "no" is an answer here, never an error. */
 static AerVal io_exists(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)userdata;
+    (void)vm;
+    (void)userdata;
     if (arg_count != 1 || aer_type(args[0]) != TYPE_STRING) {
         error("io.exists() requires a path string");
         return aer_null();
@@ -114,7 +121,8 @@ static AerVal io_exists(VM* vm, int arg_count, AerVal* args, void* userdata) {
 }
 
 static AerVal io_remove(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)userdata;
+    (void)vm;
+    (void)userdata;
     if (arg_count != 1 || aer_type(args[0]) != TYPE_STRING) {
         error("io.remove() requires a path string");
         return aer_null();
@@ -129,20 +137,22 @@ static AerVal io_remove(VM* vm, int arg_count, AerVal* args, void* userdata) {
 }
 
 static AerVal io_args(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)args; (void)userdata;
+    (void)vm;
+    (void)args;
+    (void)userdata;
     if (arg_count != 0) {
         error("io.args() takes no arguments");
         return aer_null();
     }
     AerArray* r = vm_new_array();
-    r->count    = 0;
+    r->count = 0;
     r->capacity = io_argc > 0 ? (unsigned int)io_argc : 4;
-    r->items    = xmalloc(sizeof(AerVal) * r->capacity);
-    r->shape    = NULL;
+    r->items = xmalloc(sizeof(AerVal) * r->capacity);
+    r->shape = NULL;
     r->generation = 0;
     for (int i = 0; i < io_argc; i++) {
-        size_t n   = strlen(io_argv[i]);
-        char*  buf = xmalloc(n + 1);
+        size_t n = strlen(io_argv[i]);
+        char* buf = xmalloc(n + 1);
         memcpy(buf, io_argv[i], n + 1);
         r->items[r->count++] = aer_make_string(buf, (unsigned int)n);
     }
@@ -150,7 +160,9 @@ static AerVal io_args(VM* vm, int arg_count, AerVal* args, void* userdata) {
 }
 
 static AerVal io_stdin(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)args; (void)userdata;
+    (void)vm;
+    (void)args;
+    (void)userdata;
     if (arg_count != 0) {
         error("io.stdin() takes no arguments");
         return aer_null();
@@ -167,7 +179,8 @@ static const char* io_last_sep(const char* s, unsigned int len) {
 }
 
 static AerVal io_basename(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)userdata;
+    (void)vm;
+    (void)userdata;
     if (arg_count != 1 || aer_type(args[0]) != TYPE_STRING) {
         error("io.basename() requires a path string");
         return aer_null();
@@ -183,7 +196,8 @@ static AerVal io_basename(VM* vm, int arg_count, AerVal* args, void* userdata) {
 }
 
 static AerVal io_dirname(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)userdata;
+    (void)vm;
+    (void)userdata;
     if (arg_count != 1 || aer_type(args[0]) != TYPE_STRING) {
         error("io.dirname() requires a path string");
         return aer_null();
@@ -206,7 +220,8 @@ static AerVal io_dirname(VM* vm, int arg_count, AerVal* args, void* userdata) {
 }
 
 static AerVal io_join(VM* vm, int arg_count, AerVal* args, void* userdata) {
-    (void)vm; (void)userdata;
+    (void)vm;
+    (void)userdata;
     if (arg_count != 2 || aer_type(args[0]) != TYPE_STRING || aer_type(args[1]) != TYPE_STRING) {
         error("io.join() requires two path strings");
         return aer_null();
@@ -230,14 +245,14 @@ void aer_io_set_args(int argc, char** argv) {
 }
 
 void aer_io_register(void) {
-    aer_register_function("io", "read",   io_read,   NULL);
-    aer_register_function("io", "write",  io_write,  NULL);
+    aer_register_function("io", "read", io_read, NULL);
+    aer_register_function("io", "write", io_write, NULL);
     aer_register_function("io", "append", io_append, NULL);
     aer_register_function("io", "exists", io_exists, NULL);
     aer_register_function("io", "remove", io_remove, NULL);
-    aer_register_function("io", "stdin",  io_stdin,  NULL);
-    aer_register_function("io", "args",   io_args,   NULL);
+    aer_register_function("io", "stdin", io_stdin, NULL);
+    aer_register_function("io", "args", io_args, NULL);
     aer_register_function("io", "basename", io_basename, NULL);
-    aer_register_function("io", "dirname",  io_dirname,  NULL);
-    aer_register_function("io", "join",     io_join,     NULL);
+    aer_register_function("io", "dirname", io_dirname, NULL);
+    aer_register_function("io", "join", io_join, NULL);
 }

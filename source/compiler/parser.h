@@ -10,7 +10,7 @@
    preloaded so the allocator never hands them out. */
 void reg_reset(void);
 void reg_reserve(int count);
-int  reg_alloc(void);
+int reg_alloc(void);
 void reg_free(int count);
 
 /* Emits with a 0 placeholder target and returns its offset for patch_jump. */
@@ -19,7 +19,7 @@ void patch_jump(Chunk* c, unsigned int patch_offset, unsigned int target);
 
 /* callee_offset must be known at the call site (no patch step) -- lay out the callee first. */
 unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count,
-                           unsigned int func_index);
+                       unsigned int func_index);
 void emit_return(Chunk* c, int src_reg);
 
 /* Functions as values (see OP_CALL_VALUE's comment in vm.h). */
@@ -49,10 +49,12 @@ unsigned int emit_iter_next_pair(Chunk* c, int col_reg, int idx_reg, int key_des
 /* Rotated range-for. cur/end/step MUST be loop-owned snapshot registers, never an alias to a
    variable's register. prep returns the empty-range exit patch offset. */
 unsigned int emit_iter_range_prep(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg);
-void emit_iter_range_loop(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg, unsigned int body_target);
+void emit_iter_range_loop(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg,
+                          unsigned int body_target);
 
 /* Type/field names are plain pool indices (compile-time constants, never registers). */
-void emit_struct_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int arg_reg_base, int arg_count);
+void emit_struct_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int arg_reg_base,
+                     int arg_count);
 void emit_field_get(Chunk* c, int dest_reg, int struct_reg, unsigned int field_name_pool_idx);
 void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, int rk_val);
 
@@ -67,7 +69,7 @@ void parser_reset(void);
    file mid-compile -- without it the import corrupts the outer compile. */
 typedef struct ParserState ParserState;
 ParserState* parser_save_state(void);
-void           parser_restore_state(ParserState* saved);
+void parser_restore_state(ParserState* saved);
 
 /* Compile lexed source into bytecode. Safe to call repeatedly on the same chunk (REPL):
    per-statement recovery rolls back a failed statement and resumes. */
@@ -77,8 +79,7 @@ void parse(Chunk* c);
    a real call site -- see vm.c's lbl_call_spec (the only caller) and this function's own comment
    in parser.c for the full contract. */
 bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape, SpecKind kind,
-                                    int param_index, SpecEntry* out_entry,
-                                    const int* raw_param_regs, const ValueType* raw_param_types,
-                                    int raw_param_count);
+                                int param_index, SpecEntry* out_entry, const int* raw_param_regs,
+                                const ValueType* raw_param_types, int raw_param_count);
 
 #endif

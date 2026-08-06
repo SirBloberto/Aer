@@ -14,26 +14,26 @@
 #endif
 
 typedef struct {
-    char*        name;    /* the import name, e.g. "helpers" -- keyed by this alone, process-wide, not by resolved path; two same-named imports from different dirs collide */
-    Chunk*       chunk;
-    VM*          vm;
-    unsigned int halt_addr;   /* return address for the cross-VM call trampoline in aer_module_call() */
+    char*
+        name; /* the import name, e.g. "helpers" -- keyed by this alone, process-wide, not by resolved path; two same-named imports from different dirs collide */
+    Chunk* chunk;
+    VM* vm;
+    unsigned int halt_addr; /* return address for the cross-VM call trampoline in aer_module_call() */
 } FileModule;
 
 /* Both arrays below grow the same way append() does (start small, double on overflow) rather than capping at a fixed file count, since there's no principled limit on how many files a program imports. */
-static FileModule*  modules          = NULL;
-static int          module_count     = 0;
-static int          module_capacity  = 0;
+static FileModule* modules = NULL;
+static int module_count = 0;
+static int module_capacity = 0;
 
 /* "Currently loading" stack -- detects A-imports-B-imports-A cycles instead of recursing until the process runs out of file slots or stack space. */
-static char** loading_stack    = NULL;
-static int    loading_depth    = 0;
-static int    loading_capacity = 0;
+static char** loading_stack = NULL;
+static int loading_depth = 0;
+static int loading_capacity = 0;
 
 static FileModule* find_module(const char* name, unsigned int len) {
     for (int i = 0; i < module_count; i++)
-        if (strlen(modules[i].name) == len && strncmp(modules[i].name, name, len) == 0)
-            return &modules[i];
+        if (strlen(modules[i].name) == len && strncmp(modules[i].name, name, len) == 0) return &modules[i];
     return NULL;
 }
 
@@ -63,7 +63,8 @@ static bool file_exists(const char* path) {
 static bool is_absolute_path(const char* p, unsigned int len) {
     if (len == 0) return false;
     if (p[0] == '/' || p[0] == '\\') return true;
-    if (len >= 2 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') return true;
+    if (len >= 2 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':')
+        return true;
     return false;
 }
 
@@ -87,7 +88,8 @@ static char* resolve_path(const char* path_name, unsigned int len) {
         const char* start = aer_path;
         while (*start) {
             const char* end = start;
-            while (*end && *end != PATH_LIST_SEP) end++;
+            while (*end && *end != PATH_LIST_SEP)
+                end++;
             size_t entry_len = (size_t)(end - start);
             if (entry_len > 0) {
                 bool needs_sep = start[entry_len - 1] != '/' && start[entry_len - 1] != '\\';
@@ -97,7 +99,10 @@ static char* resolve_path(const char* path_name, unsigned int len) {
                 if (needs_sep) dirbuf[entry_len] = '/';
                 char* candidate = join_path(dirbuf, joined_dir_len, path_name, len);
                 free(dirbuf);
-                if (file_exists(candidate)) { free(same_dir_path); return candidate; }
+                if (file_exists(candidate)) {
+                    free(same_dir_path);
+                    return candidate;
+                }
                 free(candidate);
             }
             start = *end ? end + 1 : end;
@@ -132,12 +137,13 @@ static void push_null_result(VM* vm) {
    corrupting whatever compile is already in progress on the caller's side (a nested import, or
    an actor spawned mid-script)" and nothing else; each caller layers its own specific concerns
    (circular-import detection, module-name registration, contextual error wording) on top. */
-InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** out_chunk, unsigned int* out_halt_addr) {
+InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** out_chunk,
+                                               unsigned int* out_halt_addr) {
     /* Save the caller's lexer position and lookahead token so parsing can resume exactly where it
        left off once this nested read+lex+parse+run cycle (which reuses the same global
        lexer/parser state) completes. */
-    LexerState* saved       = lexer_save_state();
-    Token       saved_token = token;
+    LexerState* saved = lexer_save_state();
+    Token saved_token = token;
     /* Save the parser's file-scope tables too, or compiling this corrupts the caller's own
        still-in-progress compile. */
     ParserState* saved_parser = parser_save_state();
@@ -154,7 +160,7 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
     VM* saved_active_vm = vm_active_error_vm();
 
     Chunk* mchunk = xmalloc(sizeof(Chunk));
-    VM*    mvm    = xmalloc(sizeof(VM));
+    VM* mvm = xmalloc(sizeof(VM));
     chunk_init(mchunk);
     mchunk->source_filename = xstrdup(path);
     vm_init(mvm, mchunk);
@@ -209,15 +215,14 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
         free(mchunk);
         return result;
     }
-    *out_vm        = mvm;
-    *out_chunk     = mchunk;
+    *out_vm = mvm;
+    *out_chunk = mchunk;
     *out_halt_addr = halt_addr;
     return INSTANTIATE_OK;
 }
 
-bool aer_module_load(const char* name, unsigned int len,
-                      const char* path_name, unsigned int path_len) {
-    if (find_module(name, len)) return true;   /* already loaded, not an error */
+bool aer_module_load(const char* name, unsigned int len, const char* path_name, unsigned int path_len) {
+    if (find_module(name, len)) return true; /* already loaded, not an error */
 
     char* path = resolve_path(path_name, path_len);
 
@@ -234,7 +239,9 @@ bool aer_module_load(const char* name, unsigned int len,
     }
     loading_stack[loading_depth++] = path;
 
-    VM* mvm = NULL; Chunk* mchunk = NULL; unsigned int halt_addr = 0;
+    VM* mvm = NULL;
+    Chunk* mchunk = NULL;
+    unsigned int halt_addr = 0;
     InstantiateResult r = aer_vm_instantiate_from_file(path, &mvm, &mchunk, &halt_addr);
     loading_depth--;
 
@@ -249,11 +256,11 @@ bool aer_module_load(const char* name, unsigned int len,
         modules = xrealloc(modules, sizeof(FileModule) * module_capacity);
     }
     FileModule* m = &modules[module_count++];
-    m->name      = xmalloc(len + 1);
+    m->name = xmalloc(len + 1);
     memcpy(m->name, name, len);
     m->name[len] = '\0';
-    m->chunk     = mchunk;
-    m->vm        = mvm;
+    m->chunk = mchunk;
+    m->vm = mvm;
     m->halt_addr = halt_addr;
     free(path);
     return true;

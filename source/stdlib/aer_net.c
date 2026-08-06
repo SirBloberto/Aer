@@ -32,7 +32,9 @@ static void ensure_socket_layer(void) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
     wsa_ready = true;
 }
-static void sock_close(sock_t s) { closesocket(s); }
+static void sock_close(sock_t s) {
+    closesocket(s);
+}
 static const char* sock_errmsg(void) {
     static char buf[64];
     snprintf(buf, sizeof(buf), "socket error %d", WSAGetLastError());
@@ -41,9 +43,13 @@ static const char* sock_errmsg(void) {
 #else
 typedef int sock_t;
 #define SOCK_INVALID (-1)
-static void ensure_socket_layer(void) { }
-static void sock_close(sock_t s) { close(s); }
-static const char* sock_errmsg(void) { return strerror(errno); }
+static void ensure_socket_layer(void) {}
+static void sock_close(sock_t s) {
+    close(s);
+}
+static const char* sock_errmsg(void) {
+    return strerror(errno);
+}
 #endif
 
 #ifdef _WIN32
@@ -73,7 +79,10 @@ static bool set_nonblocking(sock_t s, bool nonblocking) {
    indefinitely, regardless of what the target does. */
 static bool connect_with_timeout(sock_t s, const struct sockaddr* addr, socklen_t addrlen) {
     set_nonblocking(s, true);
-    if (connect(s, addr, addrlen) == 0) { set_nonblocking(s, false); return true; }
+    if (connect(s, addr, addrlen) == 0) {
+        set_nonblocking(s, false);
+        return true;
+    }
 #ifdef _WIN32
     if (WSAGetLastError() != WSAEWOULDBLOCK) return false;
 #else
@@ -83,11 +92,11 @@ static bool connect_with_timeout(sock_t s, const struct sockaddr* addr, socklen_
     FD_ZERO(&write_set);
     FD_SET(s, &write_set);
     struct timeval tv;
-    tv.tv_sec  = NET_TIMEOUT_SECONDS;
+    tv.tv_sec = NET_TIMEOUT_SECONDS;
     tv.tv_usec = 0;
     if (select((int)s + 1, NULL, &write_set, NULL, &tv) <= 0) {
         set_nonblocking(s, false);
-        return false;   /* timed out or select() itself failed */
+        return false; /* timed out or select() itself failed */
     }
     int so_error = 0;
     socklen_t len = sizeof(so_error);
@@ -106,10 +115,10 @@ static bool wait_ready(sock_t s, bool for_write, int timeout_sec) {
     FD_ZERO(&fds);
     FD_SET(s, &fds);
     struct timeval tv;
-    tv.tv_sec  = timeout_sec;
+    tv.tv_sec = timeout_sec;
     tv.tv_usec = 0;
-    int ready = for_write ? select((int)s + 1, NULL, &fds, NULL, &tv)
-                          : select((int)s + 1, &fds, NULL, NULL, &tv);
+    int ready =
+        for_write ? select((int)s + 1, NULL, &fds, NULL, &tv) : select((int)s + 1, &fds, NULL, NULL, &tv);
     return ready > 0;
 }
 
@@ -125,12 +134,12 @@ typedef struct SocketEntry {
     struct SocketEntry* next;
 } SocketEntry;
 
-static SocketEntry* sockets        = NULL;
-static unsigned int  next_socket_id = 1;   /* 0 reserved as "no such handle" */
+static SocketEntry* sockets = NULL;
+static unsigned int next_socket_id = 1; /* 0 reserved as "no such handle" */
 
 static unsigned int register_socket(sock_t s) {
     SocketEntry* e = xmalloc(sizeof(SocketEntry));
-    e->id   = next_socket_id++;
+    e->id = next_socket_id++;
     e->sock = s;
     e->next = sockets;
     sockets = e;
@@ -142,20 +151,29 @@ static bool resolve_socket(AerVal handle_v, sock_t* out_sock) {
     if (aer_type(handle_v) != TYPE_INTEGER) return false;
     unsigned int id = (unsigned int)aer_as_int(handle_v);
     for (SocketEntry* e = sockets; e; e = e->next) {
-        if (e->id == id) { *out_sock = e->sock; return true; }
+        if (e->id == id) {
+            *out_sock = e->sock;
+            return true;
+        }
     }
     return false;
 }
 
 static void unregister_socket(unsigned int id) {
     SocketEntry** link = &sockets;
-    while (*link && (*link)->id != id) link = &(*link)->next;
-    if (*link) { SocketEntry* dead = *link; *link = dead->next; free(dead); }
+    while (*link && (*link)->id != id)
+        link = &(*link)->next;
+    if (*link) {
+        SocketEntry* dead = *link;
+        *link = dead->next;
+        free(dead);
+    }
 }
 
 bool aer_net_call(VM* vm, int fn_id, int arg_count) {
     if (!vm->net_enabled) {
-        for (int i = 0; i < arg_count; i++) vm_stack_pop(vm);
+        for (int i = 0; i < arg_count; i++)
+            vm_stack_pop(vm);
         error("net is disabled for this run (--no-net)");
         vm_stack_push(vm, aer_null());
         return true;
@@ -175,7 +193,7 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
 
         struct addrinfo hints;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family   = AF_UNSPEC;
+        hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         struct addrinfo* res = NULL;
         int gai = getaddrinfo(aer_as_string(host_v)->data, port_str, &hints, &res);
@@ -202,7 +220,7 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
     }
 
     if (fn_id == FN_NET_SEND && arg_count == 2) {
-        AerVal data_v   = vm_stack_pop(vm);
+        AerVal data_v = vm_stack_pop(vm);
         AerVal handle_v = vm_stack_pop(vm);
         if (aer_type(handle_v) != TYPE_INTEGER || aer_type(data_v) != TYPE_STRING) {
             error("net.send() requires a connection handle and a string");
@@ -232,7 +250,7 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
     }
 
     if (fn_id == FN_NET_RECV && arg_count == 2) {
-        AerVal max_v    = vm_stack_pop(vm);
+        AerVal max_v = vm_stack_pop(vm);
         AerVal handle_v = vm_stack_pop(vm);
         if (aer_type(handle_v) != TYPE_INTEGER || aer_type(max_v) != TYPE_INTEGER || aer_as_int(max_v) <= 0) {
             error("net.recv() requires a connection handle and a positive max-byte count");
@@ -252,8 +270,8 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
             vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
             return true;
         }
-        char*   buf       = xmalloc((size_t)max_bytes);
-        long    got       = recv(s, buf, (int)max_bytes, 0);
+        char* buf = xmalloc((size_t)max_bytes);
+        long got = recv(s, buf, (int)max_bytes, 0);
         if (got < 0) {
             free(buf);
             vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
@@ -299,9 +317,9 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
            matches every other net-facing test in this codebase, which already targets 127.0.0.1. */
         struct addrinfo hints;
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family   = AF_INET;
+        hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
-        hints.ai_flags    = AI_PASSIVE;
+        hints.ai_flags = AI_PASSIVE;
         struct addrinfo* res = NULL;
         int gai = getaddrinfo(NULL, port_str, &hints, &res);
         if (gai != 0) {

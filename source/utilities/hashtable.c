@@ -6,9 +6,9 @@
 #include "pool.h"
 
 #define HASHTABLE_INIT_SIZE 16
-#define HASHTABLE_HIGH      70
-#define HASHTABLE_LOW       50
-#define SPARSE_EMPTY        0xFFFFFFFFu
+#define HASHTABLE_HIGH 70
+#define HASHTABLE_LOW 50
+#define SPARSE_EMPTY 0xFFFFFFFFu
 
 static void rehash_sparse(HashTable* t);
 
@@ -19,27 +19,29 @@ static void rehash_sparse(HashTable* t);
    malloc. Tier layout lives here (not per-HashPools-instance) since every HashPools instance uses
    the same fixed tier sizes -- only the actual Pool state differs per instance. */
 /* 16-byte floor is required, not tuning -- pool_free writes its free-list pointer at bytes [8,16). */
-static const size_t       KEY_TIER_SIZE[HASH_KEY_TIER_COUNT]           = { 16, 32, 64, 128 };
-static const unsigned int KEY_TIER_ELEMS_PER_SLAB[HASH_KEY_TIER_COUNT] = { 256, 128, 64, 32 };
+static const size_t KEY_TIER_SIZE[HASH_KEY_TIER_COUNT] = {16, 32, 64, 128};
+static const unsigned int KEY_TIER_ELEMS_PER_SLAB[HASH_KEY_TIER_COUNT] = {256, 128, 64, 32};
 
-static const unsigned int SPARSE_TIER_CAPACITY[HASH_SPARSE_TIER_COUNT]       = { 16, 32, 64, 128, 256 };
-static const unsigned int SPARSE_TIER_ELEMS_PER_SLAB[HASH_SPARSE_TIER_COUNT] = { 64, 32, 16, 8, 4 };
+static const unsigned int SPARSE_TIER_CAPACITY[HASH_SPARSE_TIER_COUNT] = {16, 32, 64, 128, 256};
+static const unsigned int SPARSE_TIER_ELEMS_PER_SLAB[HASH_SPARSE_TIER_COUNT] = {64, 32, 16, 8, 4};
 
 /* Entry counts, not bytes -- matches dense_grow_if_needed's own doubling sequence (0->4->8->16->...)
    exactly, so t->dense_capacity always lands precisely on a tier boundary and dense_free's
    exact-match lookup (mirroring sparse_array_free) never misses. Past 128 entries, growth falls
    back to plain xmalloc/free like KEY_TIER_SIZE/SPARSE_TIER_CAPACITY do past their own largest tier. */
-static const unsigned int DENSE_TIER_CAPACITY[HASH_DENSE_TIER_COUNT]       = { 4, 8, 16, 32, 64, 128 };
-static const unsigned int DENSE_TIER_ELEMS_PER_SLAB[HASH_DENSE_TIER_COUNT] = { 64, 32, 16, 8, 4, 2 };
+static const unsigned int DENSE_TIER_CAPACITY[HASH_DENSE_TIER_COUNT] = {4, 8, 16, 32, 64, 128};
+static const unsigned int DENSE_TIER_ELEMS_PER_SLAB[HASH_DENSE_TIER_COUNT] = {64, 32, 16, 8, 4, 2};
 
 void hashtable_pools_init(HashPools* pools) {
     if (pools->initialized) return;
     for (unsigned int i = 0; i < HASH_KEY_TIER_COUNT; i++)
         pool_init(&pools->key_pools[i], KEY_TIER_SIZE[i], KEY_TIER_ELEMS_PER_SLAB[i]);
     for (unsigned int i = 0; i < HASH_SPARSE_TIER_COUNT; i++)
-        pool_init(&pools->sparse_pools[i], (size_t)SPARSE_TIER_CAPACITY[i] * sizeof(unsigned int), SPARSE_TIER_ELEMS_PER_SLAB[i]);
+        pool_init(&pools->sparse_pools[i], (size_t)SPARSE_TIER_CAPACITY[i] * sizeof(unsigned int),
+                  SPARSE_TIER_ELEMS_PER_SLAB[i]);
     for (unsigned int i = 0; i < HASH_DENSE_TIER_COUNT; i++)
-        pool_init(&pools->dense_pools[i], (size_t)DENSE_TIER_CAPACITY[i] * sizeof(HashTableEntry), DENSE_TIER_ELEMS_PER_SLAB[i]);
+        pool_init(&pools->dense_pools[i], (size_t)DENSE_TIER_CAPACITY[i] * sizeof(HashTableEntry),
+                  DENSE_TIER_ELEMS_PER_SLAB[i]);
     pools->initialized = true;
 }
 
@@ -51,14 +53,20 @@ static char* key_alloc(HashPools* pools, size_t size) {
 
 static void key_free(HashPools* pools, char* p, size_t size) {
     for (unsigned int i = 0; i < HASH_KEY_TIER_COUNT; i++)
-        if (size <= KEY_TIER_SIZE[i]) { pool_free(&pools->key_pools[i], p); return; }
+        if (size <= KEY_TIER_SIZE[i]) {
+            pool_free(&pools->key_pools[i], p);
+            return;
+        }
     free(p);
 }
 
 static unsigned int* sparse_array_alloc(HashPools* pools, unsigned int capacity) {
     unsigned int* s;
     for (unsigned int i = 0; i < HASH_SPARSE_TIER_COUNT; i++)
-        if (capacity == SPARSE_TIER_CAPACITY[i]) { s = pool_alloc(&pools->sparse_pools[i]); goto fill; }
+        if (capacity == SPARSE_TIER_CAPACITY[i]) {
+            s = pool_alloc(&pools->sparse_pools[i]);
+            goto fill;
+        }
     s = xmalloc((size_t)capacity * sizeof(unsigned int));
 fill:
     /* Every byte 0xFF makes every unsigned int slot SPARSE_EMPTY (0xFFFFFFFF). */
@@ -68,7 +76,10 @@ fill:
 
 static void sparse_array_free(HashPools* pools, unsigned int* sparse, unsigned int capacity) {
     for (unsigned int i = 0; i < HASH_SPARSE_TIER_COUNT; i++)
-        if (capacity == SPARSE_TIER_CAPACITY[i]) { pool_free(&pools->sparse_pools[i], sparse); return; }
+        if (capacity == SPARSE_TIER_CAPACITY[i]) {
+            pool_free(&pools->sparse_pools[i], sparse);
+            return;
+        }
     free(sparse);
 }
 
@@ -84,13 +95,17 @@ static HashTableEntry* dense_array_alloc(HashPools* pools, unsigned int capacity
 static void dense_array_free(HashPools* pools, HashTableEntry* dense, unsigned int capacity) {
     if (!dense) return;
     for (unsigned int i = 0; i < HASH_DENSE_TIER_COUNT; i++)
-        if (capacity == DENSE_TIER_CAPACITY[i]) { pool_free(&pools->dense_pools[i], dense); return; }
+        if (capacity == DENSE_TIER_CAPACITY[i]) {
+            pool_free(&pools->dense_pools[i], dense);
+            return;
+        }
     free(dense);
 }
 
 unsigned int hashtable_key_true_len(const char* data, unsigned int len) {
     unsigned int true_len = 0;
-    while (true_len < len && data[true_len] != '\0') true_len++;
+    while (true_len < len && data[true_len] != '\0')
+        true_len++;
     return true_len;
 }
 
@@ -144,7 +159,7 @@ static void dense_grow_if_needed(HashTable* t) {
         memcpy(new_dense, t->dense, sizeof(HashTableEntry) * t->count);
         dense_array_free(t->pools, t->dense, t->dense_capacity);
     }
-    t->dense          = new_dense;
+    t->dense = new_dense;
     t->dense_capacity = new_capacity;
 }
 
@@ -154,7 +169,7 @@ void hashtable_put(HashTable* t, char* key, unsigned int length, AerVal value) {
 
 void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value) {
     if (!t->sparse) {
-        t->sparse   = sparse_array_alloc(t->pools, HASHTABLE_INIT_SIZE);
+        t->sparse = sparse_array_alloc(t->pools, HASHTABLE_INIT_SIZE);
         t->capacity = HASHTABLE_INIT_SIZE;
     } else if (t->count * 100 >= HASHTABLE_HIGH * t->capacity)
         rehash_sparse(t);
@@ -170,9 +185,9 @@ void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t
         if (*slot == SPARSE_EMPTY) {
             dense_grow_if_needed(t);
             HashTableEntry* entry = &t->dense[t->count];
-            entry->key     = key;
-            entry->length  = length;
-            entry->hash    = hash;
+            entry->key = key;
+            entry->length = length;
+            entry->hash = hash;
             entry->payload = value;
             *slot = t->count;
             t->count++;
@@ -216,7 +231,10 @@ static void sparse_place(HashTable* t, unsigned int dense_idx) {
     uint64_t hash = t->dense[dense_idx].hash;
     for (unsigned int i = 0; i < t->capacity; i++) {
         unsigned int* slot = &t->sparse[(hash + i) & (t->capacity - 1)];
-        if (*slot == SPARSE_EMPTY) { *slot = dense_idx; return; }
+        if (*slot == SPARSE_EMPTY) {
+            *slot = dense_idx;
+            return;
+        }
     }
 }
 
@@ -230,8 +248,8 @@ static void rehash_sparse(HashTable* t) {
         capacity *= 2;
 
     unsigned int* old_sparse = t->sparse;
-    unsigned int  old_capacity = t->capacity;
-    t->sparse   = sparse_array_alloc(t->pools, capacity);
+    unsigned int old_capacity = t->capacity;
+    t->sparse = sparse_array_alloc(t->pools, capacity);
     t->capacity = capacity;
 
     for (unsigned int i = 0; i < t->count; i++)
@@ -253,7 +271,8 @@ void hashtable_reserve(HashTable* t, unsigned int expected_count) {
            sizes, and a caller reserving e.g. 5 needs the same 8-capacity cell growth would have
            produced anyway. */
         unsigned int new_capacity = t->dense_capacity ? t->dense_capacity : 4;
-        while (new_capacity < expected_count) new_capacity *= 2;
+        while (new_capacity < expected_count)
+            new_capacity *= 2;
         unsigned int largest_tier = DENSE_TIER_CAPACITY[HASH_DENSE_TIER_COUNT - 1];
         if (t->dense_capacity > largest_tier) {
             /* Already past every tier on both sides -- see dense_grow_if_needed's own comment on
@@ -273,7 +292,7 @@ void hashtable_reserve(HashTable* t, unsigned int expected_count) {
         unsigned int capacity = HASHTABLE_INIT_SIZE;
         while (expected_count * 100 >= HASHTABLE_HIGH * capacity)
             capacity *= 2;
-        t->sparse   = sparse_array_alloc(t->pools, capacity);
+        t->sparse = sparse_array_alloc(t->pools, capacity);
         t->capacity = capacity;
     } else if (expected_count * 100 >= HASHTABLE_HIGH * t->capacity) {
         rehash_sparse(t);
@@ -294,8 +313,12 @@ void hashtable_remove(HashTable* t, const char* key, unsigned int length) {
     for (unsigned int i = 0; i < t->capacity; i++) {
         unsigned int probe = (unsigned int)((hash + i) & (t->capacity - 1));
         unsigned int slot_val = t->sparse[probe];
-        if (slot_val == SPARSE_EMPTY) return;   /* not found */
-        if (hash_match(&t->dense[slot_val], key, length)) { found_slot = probe; removed_idx = slot_val; break; }
+        if (slot_val == SPARSE_EMPTY) return; /* not found */
+        if (hash_match(&t->dense[slot_val], key, length)) {
+            found_slot = probe;
+            removed_idx = slot_val;
+            break;
+        }
     }
     if (found_slot == t->capacity) return;
 
@@ -320,7 +343,10 @@ void hashtable_remove(HashTable* t, const char* key, unsigned int length) {
         uint64_t moved_hash = t->dense[removed_idx].hash;
         for (unsigned int i = 0; i < t->capacity; i++) {
             unsigned int probe = (unsigned int)((moved_hash + i) & (t->capacity - 1));
-            if (t->sparse[probe] == last) { t->sparse[probe] = removed_idx; break; }
+            if (t->sparse[probe] == last) {
+                t->sparse[probe] = removed_idx;
+                break;
+            }
         }
     }
     t->count--;

@@ -13,10 +13,10 @@
 #include "vm.h"
 
 Token token;
-Mode  mode;
+Mode mode;
 
 static Chunk chunk;
-static VM    vm;
+static VM vm;
 
 static void run();
 static void run_shell();
@@ -37,9 +37,12 @@ static unsigned int parse_memory_size(const char* s) {
     char* end;
     double n = strtod(s, &end);
     unsigned int multiplier = 1;
-    if (*end == 'K' || *end == 'k')      multiplier = 1000u;
-    else if (*end == 'M' || *end == 'm') multiplier = 1000000u;
-    else if (*end == 'G' || *end == 'g') multiplier = 1000000000u;
+    if (*end == 'K' || *end == 'k')
+        multiplier = 1000u;
+    else if (*end == 'M' || *end == 'm')
+        multiplier = 1000000u;
+    else if (*end == 'G' || *end == 'g')
+        multiplier = 1000000000u;
     return (unsigned int)(n * multiplier);
 }
 
@@ -54,14 +57,14 @@ int main(int argc, char** argv) {
        run BEFORE vm_init below: vm_init seeds vm.io_enabled/net_enabled from the current
        aer_io_enabled/aer_net_enabled globals once, so --no-io/--no-net need to already be applied
        to those globals by the time it runs, or the flag would silently do nothing for this vm. */
-    int    real_argc = 1;
+    int real_argc = 1;
     char** real_argv = xmalloc(sizeof(char*) * (size_t)argc);
     real_argv[0] = argv[0];
     for (int i = 1; i < argc; i++) {
-        static const char no_io[]      = "--no-io";
-        static const char no_net[]     = "--no-net";
-        static const char no_import[]  = "--no-import";
-        static const char mem_size[]   = "--memory-size=";
+        static const char no_io[] = "--no-io";
+        static const char no_net[] = "--no-net";
+        static const char no_import[] = "--no-import";
+        static const char mem_size[] = "--memory-size=";
 #ifdef AER_DEBUG_TOOLS
         static const char debug_path[] = "--debug-path=";
 #endif
@@ -84,7 +87,7 @@ int main(int argc, char** argv) {
     argc = real_argc;
     argv = real_argv;
 
-    vm_init(&vm, &chunk);   /* registers io, same as every other stdlib module */
+    vm_init(&vm, &chunk); /* registers io, same as every other stdlib module */
 
     int status = 0;
     if (argc == 1) {
@@ -132,18 +135,18 @@ static void run_shell() {
     mode = MODE_SHELL;
     start_terminal("aer");
 
-    char*  block_buf  = NULL;
+    char* block_buf = NULL;
     size_t block_size = 0;
-    bool   in_block   = false;
+    bool in_block = false;
 
     while (1) {
         char* line = handle_terminal();
         if (!line) {
             /* Ctrl-C -- abandon any in-progress multi-line block, like Python's REPL */
             free(block_buf);
-            block_buf  = NULL;
+            block_buf = NULL;
             block_size = 0;
-            in_block   = false;
+            in_block = false;
             set_terminal_prompt(">>> ");
             continue;
         }
@@ -182,9 +185,9 @@ static void run_shell() {
             set_terminal_prompt(">>> ");
             aer_run_source(&vm, &chunk, block_buf);
             free(block_buf);
-            block_buf  = NULL;
+            block_buf = NULL;
             block_size = 0;
-            in_block   = false;
+            in_block = false;
             continue;
         }
 
@@ -206,7 +209,10 @@ static bool run_file(char* path) {
     const char* dump_path = debug_dump_path;
     if (dump_path) {
         FILE* dump_out = strcmp(dump_path, "-") == 0 ? stderr : fopen(dump_path, "w");
-        if (!dump_out) { fprintf(stderr, "--debug-path: could not open '%s' for writing\n", dump_path); dump_out = stderr; }
+        if (!dump_out) {
+            fprintf(stderr, "--debug-path: could not open '%s' for writing\n", dump_path);
+            dump_out = stderr;
+        }
         aer_disassemble(&chunk, dump_out);
         aer_debug_memory_report(dump_out);
         if (dump_out != stderr) fclose(dump_out);
@@ -220,12 +226,15 @@ static void help() {
     printf("Usage: aer [command|file]\n");
     printf("  help      Show this message\n");
     printf("  version   Show Aer version\n");
-    printf("  <file> [args...]   Execute an Aer source file; extra arguments reach the script via io.args()\n");
+    printf(
+        "  <file> [args...]   Execute an Aer source file; extra arguments reach the script via io.args()\n");
     printf("  (no args) Start interactive shell\n");
     printf("  --no-io              Disable the io module for this run\n");
     printf("  --no-net             Disable the net module for this run\n");
-    printf("  --no-import          Disable file-based import for this run (fixed stdlib modules still work)\n");
-    printf("  --memory-size=<N>[K|M|G]  Cap live GC cells (not bytes) at N; suffix multiplies by 1e3/1e6/1e9\n");
+    printf(
+        "  --no-import          Disable file-based import for this run (fixed stdlib modules still work)\n");
+    printf(
+        "  --memory-size=<N>[K|M|G]  Cap live GC cells (not bytes) at N; suffix multiplies by 1e3/1e6/1e9\n");
 #ifdef AER_DEBUG_TOOLS
     printf("  --debug-path=<path>  Write a disassembly + hit-count/memory dump here after running\n");
     printf("                       <file> (\"-\" for stderr)\n");

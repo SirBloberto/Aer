@@ -32,7 +32,7 @@
 #include "vm.h"
 
 Token token;
-Mode  mode;
+Mode mode;
 
 /* ------------------------------------------------------------------ */
 /* Minimal JSON -- only what the specific LSP methods below need        */
@@ -47,10 +47,12 @@ static const char* json_find_key(const char* json, const char* key) {
     const char* p = strstr(json, pattern);
     if (!p) return NULL;
     p += strlen(pattern);
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
     if (*p != ':') return NULL;
     p++;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
     return p;
 }
 
@@ -84,7 +86,10 @@ static char* json_get_string(const char* json, const char* key) {
                 default: c = *p; break;
             }
         }
-        if (len + 1 >= cap) { cap *= 2; out = xrealloc(out, cap); }
+        if (len + 1 >= cap) {
+            cap *= 2;
+            out = xrealloc(out, cap);
+        }
         out[len++] = c;
         p++;
     }
@@ -129,9 +134,12 @@ static void send_message(const char* json_body) {
 /* ------------------------------------------------------------------ */
 
 #define MAX_OPEN_DOCS 64
-typedef struct { char* uri; char* text; } OpenDoc;
+typedef struct {
+    char* uri;
+    char* text;
+} OpenDoc;
 static OpenDoc open_docs[MAX_OPEN_DOCS];
-static int     open_doc_count = 0;
+static int open_doc_count = 0;
 
 static void set_document(const char* uri, const char* text) {
     for (int i = 0; i < open_doc_count; i++) {
@@ -142,7 +150,7 @@ static void set_document(const char* uri, const char* text) {
         }
     }
     if (open_doc_count >= MAX_OPEN_DOCS) return;
-    open_docs[open_doc_count].uri  = xstrdup(uri);
+    open_docs[open_doc_count].uri = xstrdup(uri);
     open_docs[open_doc_count].text = xstrdup(text);
     open_doc_count++;
 }
@@ -157,16 +165,19 @@ static const char* get_document(const char* uri) {
 /* Diagnostics -- the real compiler, import disabled, never run         */
 /* ------------------------------------------------------------------ */
 
-typedef struct { unsigned int line, col; char message[512]; } Diag;
+typedef struct {
+    unsigned int line, col;
+    char message[512];
+} Diag;
 static Diag diag_buf[128];
-static int  diag_count;
+static int diag_count;
 
 static void collect_diag(unsigned int line, unsigned int col, const char* message, void* userdata) {
     (void)userdata;
     if (diag_count >= 128) return;
     Diag* d = &diag_buf[diag_count++];
     d->line = line;
-    d->col  = col;
+    d->col = col;
     strncpy(d->message, message, sizeof(d->message) - 1);
     d->message[sizeof(d->message) - 1] = '\0';
 }
@@ -174,10 +185,11 @@ static void collect_diag(unsigned int line, unsigned int col, const char* messag
 static void run_diagnostics(const char* text) {
     diag_count = 0;
     aer_set_diagnostic_callback(collect_diag, NULL);
-    aer_set_import_enabled(false);   /* see this file's own top comment -- never execute a helper module's code just to lint */
+    aer_set_import_enabled(
+        false); /* see this file's own top comment -- never execute a helper module's code just to lint */
 
     Chunk chunk;
-    VM    vm;
+    VM vm;
     chunk_init(&chunk);
     vm_init(&vm, &chunk);
     mode = MODE_RUN;
@@ -199,17 +211,23 @@ static void buf_append_escaped(char** buf, size_t* cap, size_t* len, const char*
         const char* esc = NULL;
         char single = *p;
         switch (*p) {
-            case '"':  esc = "\\\""; break;
+            case '"': esc = "\\\""; break;
             case '\\': esc = "\\\\"; break;
-            case '\n': esc = "\\n";  break;
-            case '\r': esc = "\\r";  break;
-            case '\t': esc = "\\t";  break;
+            case '\n': esc = "\\n"; break;
+            case '\r': esc = "\\r"; break;
+            case '\t': esc = "\\t"; break;
             default: break;
         }
         size_t need = esc ? strlen(esc) : 1;
-        if (*len + need + 1 >= *cap) { *cap = (*cap + need) * 2; *buf = xrealloc(*buf, *cap); }
-        if (esc) { memcpy(*buf + *len, esc, need); *len += need; }
-        else (*buf)[(*len)++] = single;
+        if (*len + need + 1 >= *cap) {
+            *cap = (*cap + need) * 2;
+            *buf = xrealloc(*buf, *cap);
+        }
+        if (esc) {
+            memcpy(*buf + *len, esc, need);
+            *len += need;
+        } else
+            (*buf)[(*len)++] = single;
     }
 }
 
@@ -217,19 +235,27 @@ static void publish_diagnostics(const char* uri) {
     /* Built in memory first so the Content-Length header can be exact. */
     char* buf = xmalloc(65536);
     size_t cap = 65536, len = 0;
-#define APPEND(...) do { \
-        int n = snprintf(buf + len, cap - len, __VA_ARGS__); \
-        if (n > 0 && (size_t)n >= cap - len) { cap = (len + (size_t)n) * 2; buf = xrealloc(buf, cap); n = snprintf(buf + len, cap - len, __VA_ARGS__); } \
-        if (n > 0) len += (size_t)n; \
+#define APPEND(...)                                                                                          \
+    do {                                                                                                     \
+        int n = snprintf(buf + len, cap - len, __VA_ARGS__);                                                 \
+        if (n > 0 && (size_t)n >= cap - len) {                                                               \
+            cap = (len + (size_t)n) * 2;                                                                     \
+            buf = xrealloc(buf, cap);                                                                        \
+            n = snprintf(buf + len, cap - len, __VA_ARGS__);                                                 \
+        }                                                                                                    \
+        if (n > 0) len += (size_t)n;                                                                         \
     } while (0)
 
-    APPEND("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"%s\",\"diagnostics\":[", uri);
+    APPEND("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/"
+           "publishDiagnostics\",\"params\":{\"uri\":\"%s\",\"diagnostics\":[",
+           uri);
     for (int i = 0; i < diag_count; i++) {
         Diag* d = &diag_buf[i];
         unsigned int line0 = d->line > 0 ? d->line - 1 : 0;
-        unsigned int col0  = d->col  > 0 ? d->col  - 1 : 0;
+        unsigned int col0 = d->col > 0 ? d->col - 1 : 0;
         if (i > 0) APPEND(",");
-        APPEND("{\"range\":{\"start\":{\"line\":%u,\"character\":%u},\"end\":{\"line\":%u,\"character\":%u}},\"severity\":1,\"source\":\"aer\",\"message\":\"",
+        APPEND("{\"range\":{\"start\":{\"line\":%u,\"character\":%u},\"end\":{\"line\":%u,\"character\":%u}},"
+               "\"severity\":1,\"source\":\"aer\",\"message\":\"",
                line0, col0, line0, col0 + 1);
         buf_append_escaped(&buf, &cap, &len, d->message);
         APPEND("\"}");
@@ -247,9 +273,14 @@ static void publish_diagnostics(const char* uri) {
 /* (comments/whitespace don't matter here, unlike aer_fmt.c)            */
 /* ------------------------------------------------------------------ */
 
-typedef struct { char name[128]; unsigned int line; bool is_struct; bool may_fail; } Symbol;
+typedef struct {
+    char name[128];
+    unsigned int line;
+    bool is_struct;
+    bool may_fail;
+} Symbol;
 static Symbol symbols[512];
-static int    symbol_count;
+static int symbol_count;
 
 /* Named functions can't nest (parser.c), so the next function/struct declaration always marks the
    end of the current one's body -- a raise anywhere between one declaration and the next is
@@ -263,7 +294,8 @@ static void scan_symbols(const char* text) {
     while (token.type != TOKEN_END_OF_FILE && symbol_count < 512) {
         if ((prev_type == TOKEN_FUNCTION || prev_type == TOKEN_STRUCT) && token.type == TOKEN_IDENTIFIER) {
             AerString* s = aer_as_string(token.value);
-            unsigned int n = s->length < sizeof(symbols[0].name) - 1 ? s->length : sizeof(symbols[0].name) - 1;
+            unsigned int n =
+                s->length < sizeof(symbols[0].name) - 1 ? s->length : sizeof(symbols[0].name) - 1;
             memcpy(symbols[symbol_count].name, s->data, n);
             symbols[symbol_count].name[n] = '\0';
             symbols[symbol_count].line = current_source_line();
@@ -281,21 +313,27 @@ static void scan_symbols(const char* text) {
 
 /* Mirrors parser.c's own module_call_id/module_fn_id tables (kept in sync by hand -- a small,
    rarely-changing list, not the kind of thing worth a shared header for). */
-typedef struct { const char* module; const char* fns[16]; } ModuleFns;
+typedef struct {
+    const char* module;
+    const char* fns[16];
+} ModuleFns;
 static const ModuleFns MODULE_FNS[] = {
-    { "math", { "sqrt","pow","floor","ceil","abs","min","max","sin","cos","log","log2","log10","pi","round","tan","exp" } },
-    { "random", { "random","randint","seed","choice","shuffle", NULL } },
-    { "string", { "upper","lower","trim","contains","split","starts_with","ends_with","repeat","replace","join","index_of", NULL } },
-    { "time", { "now","strftime","sleep","parse", NULL } },
-    { "json", { "encode","decode", NULL } },
-    { "collection", { "append","delete","copy","insert","index_of","keys","sort", NULL } },
-    { "net", { "connect","send","recv","close", NULL } },
-    { "regex", { "match","find","replace", NULL } },
-    { "actor", { "spawn","send","receive","call", NULL } },
-    { "scheduler", { "add","run", NULL } },
-    { "io", { "read","write","append","exists","remove","stdin","args", NULL } },
-    { NULL, {NULL} }
-};
+    {"math",
+     {"sqrt", "pow", "floor", "ceil", "abs", "min", "max", "sin", "cos", "log", "log2", "log10", "pi",
+      "round", "tan", "exp"}},
+    {"random", {"random", "randint", "seed", "choice", "shuffle", NULL}},
+    {"string",
+     {"upper", "lower", "trim", "contains", "split", "starts_with", "ends_with", "repeat", "replace", "join",
+      "index_of", NULL}},
+    {"time", {"now", "strftime", "sleep", "parse", NULL}},
+    {"json", {"encode", "decode", NULL}},
+    {"collection", {"append", "delete", "copy", "insert", "index_of", "keys", "sort", NULL}},
+    {"net", {"connect", "send", "recv", "close", NULL}},
+    {"regex", {"match", "find", "replace", NULL}},
+    {"actor", {"spawn", "send", "receive", "call", NULL}},
+    {"scheduler", {"add", "run", NULL}},
+    {"io", {"read", "write", "append", "exists", "remove", "stdin", "args", NULL}},
+    {NULL, {NULL}}};
 
 /* ------------------------------------------------------------------ */
 /* Method handlers                                                      */
@@ -305,11 +343,12 @@ static void handle_initialize(const char* msg) {
     long id = json_get_int(msg, "id", 0);
     char resp[1024];
     snprintf(resp, sizeof(resp),
-        "{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"capabilities\":{"
-        "\"textDocumentSync\":1,"
-        "\"definitionProvider\":true,"
-        "\"completionProvider\":{\"triggerCharacters\":[\".\"]}"
-        "}}}", id);
+             "{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"capabilities\":{"
+             "\"textDocumentSync\":1,"
+             "\"definitionProvider\":true,"
+             "\"completionProvider\":{\"triggerCharacters\":[\".\"]}"
+             "}}}",
+             id);
     send_message(resp);
 }
 
@@ -317,9 +356,13 @@ static void handle_initialize(const char* msg) {
    mode, TextDocumentSyncKind.Full -- see handle_initialize) are both simply keyed "text", and
    json_get_string does an unstructured find-anywhere scan, so one call handles both shapes. */
 static void handle_did_open_or_change(const char* msg) {
-    char* uri  = json_get_string(msg, "uri");
+    char* uri = json_get_string(msg, "uri");
     char* text = json_get_string(msg, "text");
-    if (!uri || !text) { free(uri); free(text); return; }
+    if (!uri || !text) {
+        free(uri);
+        free(text);
+        return;
+    }
 
     set_document(uri, text);
     run_diagnostics(text);
@@ -338,12 +381,14 @@ static bool is_word_char(char c) {
 static bool find_word_at(const char* text, long line, long character, char* out, size_t out_size) {
     const char* p = text;
     for (long l = 0; l < line && *p; l++) {
-        while (*p && *p != '\n') p++;
+        while (*p && *p != '\n')
+            p++;
         if (*p == '\n') p++;
     }
     const char* line_start = p;
     const char* line_end = p;
-    while (*line_end && *line_end != '\n') line_end++;
+    while (*line_end && *line_end != '\n')
+        line_end++;
 
     long len = (long)(line_end - line_start);
     long col = character < len ? character : len - 1;
@@ -353,9 +398,11 @@ static bool find_word_at(const char* text, long line, long character, char* out,
     if (!is_word_char(*at)) return false;
 
     const char* start = at;
-    while (start > line_start && is_word_char(start[-1])) start--;
+    while (start > line_start && is_word_char(start[-1]))
+        start--;
     const char* end = at;
-    while (end < line_end && is_word_char(*end)) end++;
+    while (end < line_end && is_word_char(*end))
+        end++;
 
     size_t n = (size_t)(end - start);
     if (n == 0 || n >= out_size) return false;
@@ -376,7 +423,10 @@ static void handle_definition(const char* msg) {
     if (text && line >= 0 && character >= 0 && find_word_at(text, line, character, word, sizeof(word))) {
         scan_symbols(text);
         for (int i = 0; i < symbol_count; i++) {
-            if (!strcmp(symbols[i].name, word)) { found = &symbols[i]; break; }
+            if (!strcmp(symbols[i].name, word)) {
+                found = &symbols[i];
+                break;
+            }
         }
     }
 
@@ -384,8 +434,9 @@ static void handle_definition(const char* msg) {
     if (found) {
         unsigned int line0 = found->line > 0 ? found->line - 1 : 0;
         snprintf(resp, sizeof(resp),
-            "{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"uri\":\"%s\",\"range\":{\"start\":{\"line\":%u,\"character\":0},\"end\":{\"line\":%u,\"character\":0}}}}",
-            id, uri ? uri : "", line0, line0);
+                 "{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":{\"uri\":\"%s\",\"range\":{\"start\":{\"line\":%"
+                 "u,\"character\":0},\"end\":{\"line\":%u,\"character\":0}}}}",
+                 id, uri ? uri : "", line0, line0);
     } else {
         snprintf(resp, sizeof(resp), "{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":null}", id);
     }
@@ -401,10 +452,15 @@ static void handle_completion(const char* msg) {
 
     char* buf = xmalloc(16384);
     size_t cap = 16384, len = 0;
-#define APPEND(...) do { \
-        int n = snprintf(buf + len, cap - len, __VA_ARGS__); \
-        if (n > 0 && (size_t)n >= cap - len) { cap = (len + (size_t)n) * 2; buf = xrealloc(buf, cap); n = snprintf(buf + len, cap - len, __VA_ARGS__); } \
-        if (n > 0) len += (size_t)n; \
+#define APPEND(...)                                                                                          \
+    do {                                                                                                     \
+        int n = snprintf(buf + len, cap - len, __VA_ARGS__);                                                 \
+        if (n > 0 && (size_t)n >= cap - len) {                                                               \
+            cap = (len + (size_t)n) * 2;                                                                     \
+            buf = xrealloc(buf, cap);                                                                        \
+            n = snprintf(buf + len, cap - len, __VA_ARGS__);                                                 \
+        }                                                                                                    \
+        if (n > 0) len += (size_t)n;                                                                         \
     } while (0)
 
     APPEND("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":[", id);
@@ -421,7 +477,8 @@ static void handle_completion(const char* msg) {
             if (!first) APPEND(",");
             first = false;
             if (symbols[i].may_fail)
-                APPEND("{\"label\":\"%s\",\"kind\":%d,\"detail\":\"may fail\"}", symbols[i].name, symbols[i].is_struct ? 7 : 3);
+                APPEND("{\"label\":\"%s\",\"kind\":%d,\"detail\":\"may fail\"}", symbols[i].name,
+                       symbols[i].is_struct ? 7 : 3);
             else
                 APPEND("{\"label\":\"%s\",\"kind\":%d}", symbols[i].name, symbols[i].is_struct ? 7 : 3);
         }
@@ -438,7 +495,10 @@ static void handle_completion(const char* msg) {
 /* Every diagnostic already reaches the client structured, via aer_set_diagnostic_callback in
    run_diagnostics() -- without registering this too, the plain-text sink's default (stderr) would
    print the same parse error a second time, as raw text, on every keystroke that has one. */
-static void discard_plain_error(const char* message, void* userdata) { (void)message; (void)userdata; }
+static void discard_plain_error(const char* message, void* userdata) {
+    (void)message;
+    (void)userdata;
+}
 
 int main(void) {
 #ifdef _WIN32
@@ -453,7 +513,10 @@ int main(void) {
         if (!msg) break;
 
         char* method = json_get_string(msg, "method");
-        if (!method) { free(msg); continue; }
+        if (!method) {
+            free(msg);
+            continue;
+        }
 
         if (!strcmp(method, "initialize")) {
             handle_initialize(msg);

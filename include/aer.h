@@ -35,8 +35,7 @@ unsigned int aer_assert_failure_count(void);
 /* Embedding: garbage collector introspection and tuning. See the README's Memory and Security section for the generational design these report on and configure. */
 
 /* Any of the three out-params may be NULL if that figure isn't wanted. live_cells is a snapshot from the pools' own bookkeeping (not a fresh trace), so it can include cells that are actually garbage but haven't been swept yet -- same caveat any generational collector's "live" figure has between collections. Each VM now has its own independent heap (see README's Memory and Security section) -- this reports on whichever VM most recently ran (or was vm_init()'d), not a single process-wide figure. */
-void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
-                  unsigned int* major_collections);
+void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections, unsigned int* major_collections);
 
 /* Overrides the collector's tuning constants (defaults: 2048 minor threshold, every 10th minor triggers a major). 0 for either argument leaves that one unchanged, so a host can override just one knob without needing to repeat the other's current value. Safe to call at any time, including before any VM exists yet -- every VM created afterward inherits the new defaults, and whichever VM is already current (if any) is updated immediately too. */
 void aer_gc_configure(unsigned int minor_threshold, unsigned int major_every_n_minor);

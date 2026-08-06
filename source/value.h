@@ -4,21 +4,22 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>   /* memcmp, for the inline string helpers below */
+#include <string.h> /* memcmp, for the inline string helpers below */
 
 /* Forward declarations -- mutual references between AerVal and collection types */
-typedef struct AerArray       AerArray;
-typedef struct AerDict        AerDict;
-typedef struct AerFunction    AerFunction;
-typedef struct AerString      AerString;
-typedef struct AerStruct      AerStruct;   /* full definition in vm.h -- needs Shape's real definition, defined there too */
+typedef struct AerArray AerArray;
+typedef struct AerDict AerDict;
+typedef struct AerFunction AerFunction;
+typedef struct AerString AerString;
+typedef struct AerStruct
+    AerStruct; /* full definition in vm.h -- needs Shape's real definition, defined there too */
 typedef struct AerPackedArray AerPackedArray;
-typedef struct AerTypedArray  AerTypedArray;
-typedef struct AerResult      AerResult;
-typedef struct Shape       Shape;   /* full definition in vm.h -- needs pool-index arrays */
+typedef struct AerTypedArray AerTypedArray;
+typedef struct AerResult AerResult;
+typedef struct Shape Shape; /* full definition in vm.h -- needs pool-index arrays */
 
 typedef enum ValueType {
-    TYPE_NULL,      /* zero-value; (AerVal){0} is null */
+    TYPE_NULL, /* zero-value; (AerVal){0} is null */
     TYPE_BOOLEAN,
     TYPE_INTEGER,
     TYPE_REAL,
@@ -50,10 +51,10 @@ typedef enum ValueType {
 typedef struct AerVal {
     ValueType tag;
     union {
-        bool      b;
+        bool b;
         int64_t i;
-        double    d;
-        void*     ptr;
+        double d;
+        void* ptr;
     } as;
 } AerVal;
 
@@ -70,9 +71,9 @@ struct AerArray {
        element-to-index correspondence (collection.delete/insert/sort) -- rather than shift every
        affected bit for a rare path, the next minor GC just rescans the whole array that one cycle
        and clears dirty_all again. */
-    bool           dirty_all;
+    bool dirty_all;
     unsigned int count;
-    AerVal*      items;
+    AerVal* items;
     unsigned int capacity;
     /* Bumped on every mutation that can change which shapes occupy items[] -- index-assignment
        replacing an element (OP_INDEX_SET), and collection.append/delete/insert (aer_collection.c).
@@ -81,9 +82,9 @@ struct AerArray {
        skip its O(n) homogeneity re-scan when the same array at the same generation was already
        verified against the same shape on a previous call. */
     unsigned int generation;
-    Shape*       shape;   /* NULL for ordinary arrays; set for struct instances */
+    Shape* shape; /* NULL for ordinary arrays; set for struct instances */
     unsigned char* dirty_cards;
-    unsigned int   dirty_cards_bytes;
+    unsigned int dirty_cards_bytes;
     /* [dirty_min_byte, dirty_max_byte) bounds the actual range of set bits since the last clear --
        mark_card_dirty (gc.c) maintains this on every write. Without it, gc_collect's card-scan (and
        its post-scan memset) has to walk all of dirty_cards_bytes every cycle regardless of how few
@@ -91,7 +92,7 @@ struct AerArray {
        meant to replace: a pure-growth "build a huge array via many appends" pattern still pays
        O(n^2) total, just with a cheaper per-byte constant. dirty_min_byte == (unsigned int)-1 means
        "nothing dirty" (dirty_max_byte stays a harmless 0, making the scan's < bound naturally empty). */
-    unsigned int   dirty_min_byte, dirty_max_byte;
+    unsigned int dirty_min_byte, dirty_max_byte;
 };
 _Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
@@ -100,9 +101,9 @@ _Static_assert(offsetof(struct AerArray, gc_state) == 0, "pool.c assumes gc_stat
    write barrier and no mark recursion. */
 struct AerPackedArray {
     unsigned char gc_state;
-    unsigned int  count;
+    unsigned int count;
     unsigned char* data;
-    Shape*        shape;
+    Shape* shape;
 };
 _Static_assert(offsetof(struct AerPackedArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
@@ -121,9 +122,9 @@ typedef enum {
    heap reference, so no write barrier and no mark recursion. No Shape -- there are no fields, just
    one uniform element kind for the whole array. */
 struct AerTypedArray {
-    unsigned char      gc_state;
-    unsigned char*     data;
-    unsigned int       count;
+    unsigned char gc_state;
+    unsigned char* data;
+    unsigned int count;
     TypedArrayElemKind elem_kind;
 };
 _Static_assert(offsetof(struct AerTypedArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
@@ -132,13 +133,16 @@ _Static_assert(offsetof(struct AerTypedArray, gc_state) == 0, "pool.c assumes gc
    defaults (the sole pointer), not size-descending -- see this file's own top comment. */
 struct AerFunction {
     unsigned char gc_state;
-    uint16_t     arity;
-    uint16_t     min_arity;       /* params [0, min_arity) are required; [min_arity, arity) use defaults[] below, in order */
+    uint16_t arity;
+    uint16_t
+        min_arity; /* params [0, min_arity) are required; [min_arity, arity) use defaults[] below, in order */
     unsigned int code_offset;
-    unsigned int max_registers;   /* this function's real peak register need -- see ChunkFunction's own comment, vm.h */
-    unsigned int max_raw_ints;    /* this function's real peak raw_ints[] slot need -- see ChunkFunction's own comment, vm.h */
-    unsigned int max_raw_reals;   /* same, for raw_reals[] */
-    AerVal*      defaults;        /* NULL if min_arity == arity; else (arity - min_arity) compile-time-literal values */
+    unsigned int
+        max_registers; /* this function's real peak register need -- see ChunkFunction's own comment, vm.h */
+    unsigned int
+        max_raw_ints; /* this function's real peak raw_ints[] slot need -- see ChunkFunction's own comment, vm.h */
+    unsigned int max_raw_reals; /* same, for raw_reals[] */
+    AerVal* defaults; /* NULL if min_arity == arity; else (arity - min_arity) compile-time-literal values */
 };
 _Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
@@ -190,8 +194,8 @@ _Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_s
 struct AerString {
     unsigned char gc_state;
     unsigned int length;
-    char*        data;    /* always points at either inline_buf (short) or an owned xmalloc'd buffer (long) */
-    char         inline_buf[AER_STRING_INLINE_MAX + 1];   /* NUL-terminated, like data always is */
+    char* data; /* always points at either inline_buf (short) or an owned xmalloc'd buffer (long) */
+    char inline_buf[AER_STRING_INLINE_MAX + 1]; /* NUL-terminated, like data always is */
 };
 _Static_assert(offsetof(struct AerString, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
@@ -225,51 +229,107 @@ AerVal aer_make_error(const char* msg);
 
 /* Every payload read/write goes through these accessors, never a direct `.as.x` elsewhere. */
 
-static inline ValueType aer_type(AerVal v) { return v.tag; }
+static inline ValueType aer_type(AerVal v) {
+    return v.tag;
+}
 
 static inline AerVal aer_null(void) {
-    AerVal v; v.tag = TYPE_NULL; v.as.ptr = NULL; return v;
+    AerVal v;
+    v.tag = TYPE_NULL;
+    v.as.ptr = NULL;
+    return v;
 }
 
 static inline AerVal aer_bool(bool b) {
     /* as.i = 0 first -- vm_packed_slot_write memcpy's the whole 8-byte union, not just byte 0 */
-    AerVal v; v.tag = TYPE_BOOLEAN; v.as.i = 0; v.as.b = b; return v;
+    AerVal v;
+    v.tag = TYPE_BOOLEAN;
+    v.as.i = 0;
+    v.as.b = b;
+    return v;
 }
 
 static inline AerVal aer_real(double d) {
-    AerVal v; v.tag = TYPE_REAL; v.as.d = d; return v;
+    AerVal v;
+    v.tag = TYPE_REAL;
+    v.as.d = d;
+    return v;
 }
 
 /* A plain `int64_t` fits the value union at any magnitude -- no heap-boxed overflow path needed. */
 static inline AerVal aer_int(int64_t n) {
-    AerVal v; v.tag = TYPE_INTEGER; v.as.i = n; return v;
+    AerVal v;
+    v.tag = TYPE_INTEGER;
+    v.as.i = n;
+    return v;
 }
 
 static inline AerVal aer_box_ptr(ValueType tag, void* p) {
-    AerVal v; v.tag = tag; v.as.ptr = p; return v;
+    AerVal v;
+    v.tag = tag;
+    v.as.ptr = p;
+    return v;
 }
 
-static inline AerVal aer_string_val(AerString* s)     { return aer_box_ptr(TYPE_STRING, s); }
-static inline AerVal aer_function_val(AerFunction* f)  { return aer_box_ptr(TYPE_FUNCTION, f); }
-static inline AerVal aer_array_val(AerArray* a)        { return aer_box_ptr(TYPE_ARRAY, a); }
-static inline AerVal aer_dict_val(AerDict* d)          { return aer_box_ptr(TYPE_DICT, d); }
-static inline AerVal aer_struct_val(AerStruct* s)      { return aer_box_ptr(TYPE_STRUCT, s); }
-static inline AerVal aer_packed_array_val(AerPackedArray* a) { return aer_box_ptr(TYPE_PACKED_ARRAY, a); }
-static inline AerVal aer_typed_array_val(AerTypedArray* a) { return aer_box_ptr(TYPE_TYPED_ARRAY, a); }
-static inline AerVal aer_result_val(AerResult* r)       { return aer_box_ptr(TYPE_RESULT, r); }
+static inline AerVal aer_string_val(AerString* s) {
+    return aer_box_ptr(TYPE_STRING, s);
+}
+static inline AerVal aer_function_val(AerFunction* f) {
+    return aer_box_ptr(TYPE_FUNCTION, f);
+}
+static inline AerVal aer_array_val(AerArray* a) {
+    return aer_box_ptr(TYPE_ARRAY, a);
+}
+static inline AerVal aer_dict_val(AerDict* d) {
+    return aer_box_ptr(TYPE_DICT, d);
+}
+static inline AerVal aer_struct_val(AerStruct* s) {
+    return aer_box_ptr(TYPE_STRUCT, s);
+}
+static inline AerVal aer_packed_array_val(AerPackedArray* a) {
+    return aer_box_ptr(TYPE_PACKED_ARRAY, a);
+}
+static inline AerVal aer_typed_array_val(AerTypedArray* a) {
+    return aer_box_ptr(TYPE_TYPED_ARRAY, a);
+}
+static inline AerVal aer_result_val(AerResult* r) {
+    return aer_box_ptr(TYPE_RESULT, r);
+}
 
-static inline bool      aer_as_bool(AerVal v) { return v.as.b; }
-static inline double    aer_as_real(AerVal v) { return v.as.d; }
-static inline int64_t aer_as_int(AerVal v)  { return v.as.i; }
+static inline bool aer_as_bool(AerVal v) {
+    return v.as.b;
+}
+static inline double aer_as_real(AerVal v) {
+    return v.as.d;
+}
+static inline int64_t aer_as_int(AerVal v) {
+    return v.as.i;
+}
 
-static inline AerString*   aer_as_string(AerVal v)   { return (AerString*)v.as.ptr; }
-static inline AerFunction* aer_as_function(AerVal v) { return (AerFunction*)v.as.ptr; }
-static inline AerArray*    aer_as_array(AerVal v)     { return (AerArray*)v.as.ptr; }
-static inline AerDict*     aer_as_dict(AerVal v)      { return (AerDict*)v.as.ptr; }
-static inline AerStruct*   aer_as_struct(AerVal v)    { return (AerStruct*)v.as.ptr; }
-static inline AerPackedArray* aer_as_packed_array(AerVal v) { return (AerPackedArray*)v.as.ptr; }
-static inline AerTypedArray*  aer_as_typed_array(AerVal v)  { return (AerTypedArray*)v.as.ptr; }
-static inline AerResult*      aer_as_result(AerVal v)        { return (AerResult*)v.as.ptr; }
+static inline AerString* aer_as_string(AerVal v) {
+    return (AerString*)v.as.ptr;
+}
+static inline AerFunction* aer_as_function(AerVal v) {
+    return (AerFunction*)v.as.ptr;
+}
+static inline AerArray* aer_as_array(AerVal v) {
+    return (AerArray*)v.as.ptr;
+}
+static inline AerDict* aer_as_dict(AerVal v) {
+    return (AerDict*)v.as.ptr;
+}
+static inline AerStruct* aer_as_struct(AerVal v) {
+    return (AerStruct*)v.as.ptr;
+}
+static inline AerPackedArray* aer_as_packed_array(AerVal v) {
+    return (AerPackedArray*)v.as.ptr;
+}
+static inline AerTypedArray* aer_as_typed_array(AerVal v) {
+    return (AerTypedArray*)v.as.ptr;
+}
+static inline AerResult* aer_as_result(AerVal v) {
+    return (AerResult*)v.as.ptr;
+}
 
 /* Byte-index of needle's first occurrence in hay, or -1; empty needle matches at 0. The one
    substring search behind string.contains/index_of and `in` on strings. */
@@ -290,8 +350,14 @@ static inline int aer_string_compare(const AerString* a, const AerString* b) {
 
 /* Coerces integer or real to a plain double; false for any other type. */
 static inline bool aer_as_double(AerVal v, double* out) {
-    if (aer_type(v) == TYPE_INTEGER) { *out = (double)aer_as_int(v); return true; }
-    if (aer_type(v) == TYPE_REAL)    { *out = aer_as_real(v);        return true; }
+    if (aer_type(v) == TYPE_INTEGER) {
+        *out = (double)aer_as_int(v);
+        return true;
+    }
+    if (aer_type(v) == TYPE_REAL) {
+        *out = aer_as_real(v);
+        return true;
+    }
     return false;
 }
 

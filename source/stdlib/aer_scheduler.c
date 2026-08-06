@@ -17,11 +17,11 @@
    been set up." */
 typedef struct Task {
     Actor* actor;
-    bool   finished;
+    bool finished;
     struct Task* next;
 } Task;
 
-static Task* tasks      = NULL;
+static Task* tasks = NULL;
 static Task* tasks_tail = NULL;
 
 /* Small enough that no single task can visibly starve the others for long, large enough that a
@@ -35,11 +35,13 @@ static bool aer_scheduler_add(Actor* actor, const char* fn, int arg_count, AerVa
     if (!aer_actor_prepare_call(actor, fn, arg_count, args)) return false;
 
     Task* t = xmalloc(sizeof(Task));
-    t->actor    = actor;
+    t->actor = actor;
     t->finished = false;
-    t->next     = NULL;
-    if (tasks_tail) tasks_tail->next = t;
-    else            tasks = t;
+    t->next = NULL;
+    if (tasks_tail)
+        tasks_tail->next = t;
+    else
+        tasks = t;
     tasks_tail = t;
     return true;
 }
@@ -67,7 +69,7 @@ static void aer_scheduler_run(void) {
                    one task's error must not poison every other task's (or the caller's) exit
                    status, and runtime_had_error alone isn't enough (see aer_actor.c). */
                 runtime_had_error = false;
-                parse_had_error   = false;
+                parse_had_error = false;
             }
         }
     }
@@ -84,14 +86,13 @@ static void aer_scheduler_run(void) {
 /* Script-facing `scheduler` module                                     */
 /* ------------------------------------------------------------------ */
 
-
 /* noinline -- see aer_host_call's own comment (aer_host.c): same 4KB VM_STACK_MAX-array,
    single-call-site shape that was inflating vm_run_slice's stack frame via LTO. */
-__attribute__((noinline))
-bool aer_scheduler_module_call(VM* vm, int fn_id, int arg_count) {
+__attribute__((noinline)) bool aer_scheduler_module_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_SCHEDULER_ADD && arg_count >= 2) {
         AerVal popped[VM_STACK_MAX];
-        for (int i = arg_count - 1; i >= 0; i--) popped[i] = vm_stack_pop(vm);
+        for (int i = arg_count - 1; i >= 0; i--)
+            popped[i] = vm_stack_pop(vm);
 
         if (aer_type(popped[1]) != TYPE_STRING) {
             error("scheduler.add() requires an actor handle and a function-name string");
@@ -107,7 +108,8 @@ bool aer_scheduler_module_call(VM* vm, int fn_id, int arg_count) {
 
         bool ok = aer_scheduler_add(a, aer_as_string(popped[1])->data, arg_count - 2, &popped[2]);
         if (!ok) {
-            error("scheduler.add(): '%s' is not defined on that actor's script", aer_as_string(popped[1])->data);
+            error("scheduler.add(): '%s' is not defined on that actor's script",
+                  aer_as_string(popped[1])->data);
             vm_stack_push(vm, aer_null());
             return true;
         }

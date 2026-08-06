@@ -8,8 +8,8 @@
 
 typedef struct File {
     char* name;
-    char* start;   /* immutable pointer to beginning of buffer */
-    char* buffer;  /* advances as we lex */
+    char* start; /* immutable pointer to beginning of buffer */
+    char* buffer; /* advances as we lex */
     /* Absolute source line where this File's buffer begins -- 0 for a real file or REPL line
        (current_source_line's own newline-count already gives the right absolute number there). A
        span (lexer_begin_span) starts its OWN buffer at line 1 relative to itself, so this is the
@@ -18,35 +18,43 @@ typedef struct File {
 } File;
 
 /* Array of File* (not File values) -- nested imports save a raw File* across their own lex/parse/run cycle via lexer_save_state, so growing this array must never move an already-issued File's address. */
-static File** files_storage  = NULL;
-static int    file_capacity  = 0;
-static int    file_index     = 0;
-static File*  current;
+static File** files_storage = NULL;
+static int file_capacity = 0;
+static int file_index = 0;
+static File* current;
 
 /* Indentation state -- reset before each parse */
 static unsigned int indent_stack[64];
-static int          indent_depth;
-static int          pending_dedents;
-static bool         at_line_start;
+static int indent_depth;
+static int pending_dedents;
+static bool at_line_start;
 
 /* Nesting depth of unclosed (/[/{ -- while > 0, newlines are whitespace instead of statement terminators, letting calls/literals span multiple lines. */
 static int bracket_depth;
 
 static void indent_reset() {
     indent_stack[0] = 0;
-    indent_depth    = 1;
+    indent_depth = 1;
     pending_dedents = 0;
-    bracket_depth   = 0;
-    at_line_start   = true;
+    bracket_depth = 0;
+    at_line_start = true;
 }
 
 /* For error.c to print source context */
-const char* current_source_start()  { return current->start; }
-const char* current_source_cursor() { return current->buffer; }
-const char* current_source_name()   { return current->name; }
+const char* current_source_start() {
+    return current->start;
+}
+const char* current_source_cursor() {
+    return current->buffer;
+}
+const char* current_source_name() {
+    return current->name;
+}
 
 /* Narrow escape hatch for reporting a deferred error at a saved position, not a general seek. */
-void lexer_set_cursor(const char* pos) { current->buffer = (char*)pos; }
+void lexer_set_cursor(const char* pos) {
+    current->buffer = (char*)pos;
+}
 
 /* For parser.c to tag bytecode with its source line (Chunk.line_mark_offsets) -- same scan as error_at(), just returning the number. */
 unsigned int current_source_line() {
@@ -57,32 +65,32 @@ unsigned int current_source_line() {
 }
 
 struct LexerState {
-    File*        file;
+    File* file;
     unsigned int indent_stack[64];
-    int          indent_depth;
-    int          pending_dedents;
-    bool         at_line_start;
-    int          bracket_depth;
+    int indent_depth;
+    int pending_dedents;
+    bool at_line_start;
+    int bracket_depth;
 };
 
 LexerState* lexer_save_state(void) {
     LexerState* s = xmalloc(sizeof(LexerState));
     s->file = current;
     memcpy(s->indent_stack, indent_stack, sizeof(indent_stack));
-    s->indent_depth    = indent_depth;
+    s->indent_depth = indent_depth;
     s->pending_dedents = pending_dedents;
-    s->at_line_start   = at_line_start;
-    s->bracket_depth   = bracket_depth;
+    s->at_line_start = at_line_start;
+    s->bracket_depth = bracket_depth;
     return s;
 }
 
 void lexer_restore_state(LexerState* s) {
     current = s->file;
     memcpy(indent_stack, s->indent_stack, sizeof(indent_stack));
-    indent_depth    = s->indent_depth;
+    indent_depth = s->indent_depth;
     pending_dedents = s->pending_dedents;
-    bracket_depth   = s->bracket_depth;
-    at_line_start    = s->at_line_start;
+    bracket_depth = s->bracket_depth;
+    at_line_start = s->at_line_start;
     free(s);
 }
 
@@ -92,16 +100,27 @@ void lexer_restore_state(LexerState* s) {
 
 void read_file(char* filename) {
     FILE* fp = fopen(filename, "rb");
-    if (!fp) { error("Cannot open file: %s", filename); return; }
+    if (!fp) {
+        error("Cannot open file: %s", filename);
+        return;
+    }
 
     fseek(fp, 0, SEEK_END);
     long size = ftell(fp);
-    if (size < 0) { fclose(fp); error("Cannot determine size of file: %s", filename); return; }
+    if (size < 0) {
+        fclose(fp);
+        error("Cannot determine size of file: %s", filename);
+        return;
+    }
     fseek(fp, 0, SEEK_SET);
     unsigned long length = (unsigned long)size;
 
     char* buf = malloc(length + 1);
-    if (!buf) { fclose(fp); error("Out of memory reading file: %s", filename); return; }
+    if (!buf) {
+        fclose(fp);
+        error("Out of memory reading file: %s", filename);
+        return;
+    }
     unsigned long nread = (unsigned long)fread(buf, 1, length, fp);
     fclose(fp);
     buf[nread] = '\0';
@@ -113,23 +132,28 @@ void read_file(char* filename) {
     if (strlen(buf) != nread) {
         unsigned long at = (unsigned long)strlen(buf);
         free(buf);
-        error("Source file '%s' contains an embedded NUL byte at offset %lu -- not a valid AER source file", filename, at);
+        error("Source file '%s' contains an embedded NUL byte at offset %lu -- not a valid AER source file",
+              filename, at);
         return;
     }
 
     /* Normalize Windows line endings: strip \r in-place */
-    char* dst = buf; char* src = buf;
-    while (*src) { if (*src != '\r') *dst++ = *src; src++; }
+    char* dst = buf;
+    char* src = buf;
+    while (*src) {
+        if (*src != '\r') *dst++ = *src;
+        src++;
+    }
     *dst = '\0';
 
     if (file_index >= file_capacity) {
         file_capacity = file_capacity ? file_capacity * 2 : 8;
         files_storage = xrealloc(files_storage, sizeof(File*) * file_capacity);
     }
-    File* file    = xmalloc(sizeof(File));
-    file->name    = filename;
-    file->start   = buf;
-    file->buffer  = buf;
+    File* file = xmalloc(sizeof(File));
+    file->name = filename;
+    file->start = buf;
+    file->buffer = buf;
     file->line_base = 0;
     files_storage[file_index++] = file;
     current = file;
@@ -145,11 +169,15 @@ void shell(char* line) {
     previous = strdup(line);
     if (!previous) error("Out of memory in shell");
     /* Strip \r from pasted Windows-style input */
-    char* r = previous; char* w = previous;
-    while (*r) { if (*r != '\r') *w++ = *r; r++; }
+    char* r = previous;
+    char* w = previous;
+    while (*r) {
+        if (*r != '\r') *w++ = *r;
+        r++;
+    }
     *w = '\0';
-    shell_file.name   = "shell";
-    shell_file.start  = previous;
+    shell_file.name = "shell";
+    shell_file.start = previous;
     shell_file.buffer = previous;
     current = &shell_file;
     indent_reset();
@@ -174,10 +202,10 @@ void lexer_begin_span(const char* text, unsigned int len, unsigned int start_lin
         file_capacity = file_capacity ? file_capacity * 2 : 8;
         files_storage = xrealloc(files_storage, sizeof(File*) * file_capacity);
     }
-    File* file    = xmalloc(sizeof(File));
-    file->name    = "<interpolation>";
-    file->start   = buf;
-    file->buffer  = buf;
+    File* file = xmalloc(sizeof(File));
+    file->name = "<interpolation>";
+    file->start = buf;
+    file->buffer = buf;
     file->line_base = start_line - 1;
     files_storage[file_index++] = file;
     current = file;
@@ -192,7 +220,7 @@ void lexer_begin_span(const char* text, unsigned int len, unsigned int start_lin
 /* ------------------------------------------------------------------ */
 
 static void emit(TokenType type, unsigned int length) {
-    token.type    = type;
+    token.type = type;
     current->buffer += length;
 }
 
@@ -238,7 +266,10 @@ static void skip_whitespace_and_comments() {
     while (true) {
         skip_whitespace();
         /* Inside an unclosed bracket a newline is just whitespace -- swallow before the indent scan. */
-        if (*current->buffer == '\n' && bracket_depth > 0) { current->buffer++; continue; }
+        if (*current->buffer == '\n' && bracket_depth > 0) {
+            current->buffer++;
+            continue;
+        }
         if (*current->buffer != '#') return;
         skip_comment();
     }
@@ -255,17 +286,18 @@ static void lex_number() {
             emit(TOKEN_ERROR, 2);
             return;
         }
-        char* end; errno = 0;
+        char* end;
+        errno = 0;
         int64_t val = strtoll(buf, &end, 16);
         if (errno == ERANGE) error_at("Integer literal overflow");
-        if (isalpha((unsigned char)*end) || *end == '_')
-            error_at("Invalid character after integer literal");
+        if (isalpha((unsigned char)*end) || *end == '_') error_at("Invalid character after integer literal");
         emit_integer(val, (unsigned int)(end - buf));
         return;
     }
 
     /* lex() only calls lex_number() on a digit, so int_len is always >= 1 -- safe to fall through from error_at() below without an explicit return. */
-    char* end; errno = 0;
+    char* end;
+    errno = 0;
     int64_t int_val = strtoll(buf, &end, 10);
     if (errno == ERANGE) error_at("Integer literal overflow");
     unsigned int int_len = (unsigned int)(end - buf);
@@ -281,8 +313,7 @@ static void lex_number() {
             token.narrow = true;
             return;
         }
-        if (isalpha((unsigned char)*end) || *end == '_')
-            error_at("Invalid character after integer literal");
+        if (isalpha((unsigned char)*end) || *end == '_') error_at("Invalid character after integer literal");
         emit_integer(int_val, int_len);
         return;
     }
@@ -298,8 +329,7 @@ static void lex_number() {
         token.narrow = true;
         return;
     }
-    if (isalpha((unsigned char)*end) || *end == '_')
-        error_at("Invalid character after float literal");
+    if (isalpha((unsigned char)*end) || *end == '_') error_at("Invalid character after float literal");
     emit_real(real_val, len);
 }
 
@@ -307,28 +337,38 @@ static bool lex_keyword(unsigned int length) {
     char* b = current->buffer;
 
     /* Booleans handled inline -- not in the keyword table */
-    if (length == sizeof("true")  - 1 && strncmp(b, "true",  sizeof("true")  - 1) == 0) { emit_boolean(TOKEN_TRUE);  return true; }
-    if (length == sizeof("false") - 1 && strncmp(b, "false", sizeof("false") - 1) == 0) { emit_boolean(TOKEN_FALSE); return true; }
+    if (length == sizeof("true") - 1 && strncmp(b, "true", sizeof("true") - 1) == 0) {
+        emit_boolean(TOKEN_TRUE);
+        return true;
+    }
+    if (length == sizeof("false") - 1 && strncmp(b, "false", sizeof("false") - 1) == 0) {
+        emit_boolean(TOKEN_FALSE);
+        return true;
+    }
 
-    static const struct { const char* word; unsigned int len; TokenType type; } keywords[] = {
-        { "if",       sizeof("if")       - 1, TOKEN_IF       },
-        { "else",     sizeof("else")     - 1, TOKEN_ELSE     },
-        { "for",      sizeof("for")      - 1, TOKEN_FOR      },
-        { "in",       sizeof("in")       - 1, TOKEN_IN       },
-        { "struct",   sizeof("struct")   - 1, TOKEN_STRUCT   },
-        { "function", sizeof("function") - 1, TOKEN_FUNCTION },
-        { "return",   sizeof("return")   - 1, TOKEN_RETURN   },
-        { "raise",    sizeof("raise")    - 1, TOKEN_RAISE    },
-        { "break",    sizeof("break")    - 1, TOKEN_BREAK    },
-        { "continue", sizeof("continue") - 1, TOKEN_CONTINUE },
-        { "null",     sizeof("null")     - 1, TOKEN_NULL     },
-        { "import",   sizeof("import")   - 1, TOKEN_IMPORT   },
-        { "integer",   sizeof("integer")   - 1, TOKEN_TYPE_INTEGER   },
-        { "float",     sizeof("float")     - 1, TOKEN_TYPE_FLOAT     },
-        { "boolean",   sizeof("boolean")   - 1, TOKEN_TYPE_BOOLEAN   },
-        { "and",       sizeof("and")       - 1, TOKEN_AND            },
-        { "or",        sizeof("or")        - 1, TOKEN_OR             },
-        { "not",       sizeof("not")       - 1, TOKEN_NOT            },
+    static const struct {
+        const char* word;
+        unsigned int len;
+        TokenType type;
+    } keywords[] = {
+        {"if", sizeof("if") - 1, TOKEN_IF},
+        {"else", sizeof("else") - 1, TOKEN_ELSE},
+        {"for", sizeof("for") - 1, TOKEN_FOR},
+        {"in", sizeof("in") - 1, TOKEN_IN},
+        {"struct", sizeof("struct") - 1, TOKEN_STRUCT},
+        {"function", sizeof("function") - 1, TOKEN_FUNCTION},
+        {"return", sizeof("return") - 1, TOKEN_RETURN},
+        {"raise", sizeof("raise") - 1, TOKEN_RAISE},
+        {"break", sizeof("break") - 1, TOKEN_BREAK},
+        {"continue", sizeof("continue") - 1, TOKEN_CONTINUE},
+        {"null", sizeof("null") - 1, TOKEN_NULL},
+        {"import", sizeof("import") - 1, TOKEN_IMPORT},
+        {"integer", sizeof("integer") - 1, TOKEN_TYPE_INTEGER},
+        {"float", sizeof("float") - 1, TOKEN_TYPE_FLOAT},
+        {"boolean", sizeof("boolean") - 1, TOKEN_TYPE_BOOLEAN},
+        {"and", sizeof("and") - 1, TOKEN_AND},
+        {"or", sizeof("or") - 1, TOKEN_OR},
+        {"not", sizeof("not") - 1, TOKEN_NOT},
     };
     static const int keyword_count = sizeof(keywords) / sizeof(*keywords);
 
@@ -351,14 +391,19 @@ static void lex_string() {
     while (*current->buffer != '\0' && *current->buffer != '\n' &&
            !(*current->buffer == '"' && brace_depth == 0)) {
         if (*current->buffer == '\\' && *(current->buffer + 1) != '\0') {
-            current->buffer += 2;  /* skip escaped char (e.g. \" \{) so it's never treated specially */
+            current->buffer += 2; /* skip escaped char (e.g. \" \{) so it's never treated specially */
             continue;
         }
-        if (*current->buffer == '{') brace_depth++;
-        else if (*current->buffer == '}' && brace_depth > 0) brace_depth--;
+        if (*current->buffer == '{')
+            brace_depth++;
+        else if (*current->buffer == '}' && brace_depth > 0)
+            brace_depth--;
         current->buffer++;
     }
-    if (*current->buffer != '"') { error_at("Unterminated string"); return; }
+    if (*current->buffer != '"') {
+        error_at("Unterminated string");
+        return;
+    }
     unsigned int length = (unsigned int)(current->buffer - start);
     token.value = aer_make_string_copy(start, length);
     token.type = TOKEN_STRING;
@@ -372,7 +417,10 @@ static void lex_multiline_string() {
     while (*current->buffer != '\0' &&
            !(current->buffer[0] == '"' && current->buffer[1] == '"' && current->buffer[2] == '"'))
         current->buffer++;
-    if (*current->buffer != '"') { error_at("Unterminated multi-line string"); return; }
+    if (*current->buffer != '"') {
+        error_at("Unterminated multi-line string");
+        return;
+    }
     unsigned int length = (unsigned int)(current->buffer - start);
     token.value = aer_make_string_copy(start, length);
     token.type = TOKEN_STRING;
@@ -386,8 +434,7 @@ static void lex_identifier() {
         buf++;
         length++;
     }
-    if (!lex_keyword(length))
-        emit_string_token(TOKEN_IDENTIFIER, length);
+    if (!lex_keyword(length)) emit_string_token(TOKEN_IDENTIFIER, length);
 }
 
 /* ------------------------------------------------------------------ */
@@ -409,8 +456,11 @@ void lex() {
         /* Skip blank and comment-only lines */
         for (;;) {
             char* p = current->buffer;
-            while (*p == ' ') p++;
-            if (*p == '#') while (*p != '\n' && *p != '\0') p++;
+            while (*p == ' ')
+                p++;
+            if (*p == '#')
+                while (*p != '\n' && *p != '\0')
+                    p++;
             if (*p != '\n') break;
             current->buffer = p + 1;
         }
@@ -418,13 +468,22 @@ void lex() {
         /* Count leading spaces; error on tabs */
         char* p = current->buffer;
         unsigned int spaces = 0;
-        while (*p == ' ') { spaces++; p++; }
-        if (*p == '\t') { error_at("Tabs not allowed for indentation"); return; }
+        while (*p == ' ') {
+            spaces++;
+            p++;
+        }
+        if (*p == '\t') {
+            error_at("Tabs not allowed for indentation");
+            return;
+        }
 
         unsigned int top = indent_stack[indent_depth - 1];
 
         if (*p != '\0' && spaces > top) {
-            if (indent_depth >= 64) { error("Indentation too deep"); return; }
+            if (indent_depth >= 64) {
+                error("Indentation too deep");
+                return;
+            }
             indent_stack[indent_depth++] = spaces;
             current->buffer = p;
             token.type = TOKEN_INDENT;
@@ -440,12 +499,14 @@ void lex() {
                 error_at("Indentation does not match any outer level");
                 return;
             }
-            if (*p == '\0') { indent_depth = 1; }
+            if (*p == '\0') {
+                indent_depth = 1;
+            }
             pending_dedents = pops - 1;
             token.type = TOKEN_DEDENT;
             return;
         } else {
-            current->buffer = p;  /* same level: skip leading spaces */
+            current->buffer = p; /* same level: skip leading spaces */
         }
     }
 
@@ -453,18 +514,30 @@ void lex() {
 
     char* b = current->buffer;
 
-    if (isdigit((unsigned char)*b))  { lex_number();     return; }
-    if (isalpha((unsigned char)*b) || *b == '_') { lex_identifier(); return; }
+    if (isdigit((unsigned char)*b)) {
+        lex_number();
+        return;
+    }
+    if (isalpha((unsigned char)*b) || *b == '_') {
+        lex_identifier();
+        return;
+    }
     if (*b == '"') {
-        if (b[1] == '"' && b[2] == '"') { lex_multiline_string(); return; }
+        if (b[1] == '"' && b[2] == '"') {
+            lex_multiline_string();
+            return;
+        }
         lex_string();
         return;
     }
 
     switch (*b) {
-        case ',':  emit(TOKEN_COMMA,              1); return;
-        case ';':  emit(TOKEN_SEMICOLON,          1); return;
-        case '\n': at_line_start = true; emit(TOKEN_NEW_LINE, 1); return;
+        case ',': emit(TOKEN_COMMA, 1); return;
+        case ';': emit(TOKEN_SEMICOLON, 1); return;
+        case '\n':
+            at_line_start = true;
+            emit(TOKEN_NEW_LINE, 1);
+            return;
         case '\0':
             /* No trailing newline -- flush remaining indent levels */
             if (indent_depth > 1) {
@@ -474,47 +547,142 @@ void lex() {
                 token.type = TOKEN_DEDENT;
                 return;
             }
-            emit(TOKEN_END_OF_FILE, 0); return;
-        case '(':  bracket_depth++; emit(TOKEN_OPEN_PARENTHESE,    1); return;
-        case ')':  if (bracket_depth > 0) bracket_depth--; emit(TOKEN_CLOSE_PARENTHESE, 1); return;
-        case '[':  bracket_depth++; emit(TOKEN_OPEN_BRACKET,       1); return;
-        case ']':  if (bracket_depth > 0) bracket_depth--; emit(TOKEN_CLOSE_BRACKET,    1); return;
-        case '{':  bracket_depth++; emit(TOKEN_OPEN_BRACE,         1); return;
-        case '}':  if (bracket_depth > 0) bracket_depth--; emit(TOKEN_CLOSE_BRACE,      1); return;
-        case ':':  emit(TOKEN_COLON,              1); return;
-        case '.':  if (b[1]=='.') { emit(TOKEN_DOT_DOT, 2); return; }
-                   emit(TOKEN_DOT, 1); return;
-        case '~':  emit(TOKEN_BITWISE_NOT,        1); return;
-        case '*':  if (b[1]=='=') { emit(TOKEN_MULTIPLY_ASSIGN, 2); return; }
-                   emit(TOKEN_MULTIPLY, 1); return;
-        case '/':  if (b[1]=='/') {
-                       if (b[2]=='=') { emit(TOKEN_FLOOR_DIVIDE_ASSIGN, 3); return; }
-                       emit(TOKEN_FLOOR_DIVIDE, 2); return;
-                   }
-                   if (b[1]=='=') { emit(TOKEN_DIVIDE_ASSIGN, 2); return; }
-                   emit(TOKEN_DIVIDE, 1); return;
-        case '%':  if (b[1]=='=') { emit(TOKEN_MODULO_ASSIGN,   2); return; }
-                   emit(TOKEN_MODULO,   1); return;
-        case '+':  if (b[1]=='=') { emit(TOKEN_ADD_ASSIGN,      2); return; }
-                   emit(TOKEN_ADD,      1); return;
-        case '-':  if (b[1]=='=') { emit(TOKEN_SUBTRACT_ASSIGN, 2); return; }
-                   emit(TOKEN_SUBTRACT, 1); return;
-        case '!':  if (b[1]=='=') { emit(TOKEN_NOT_EQUAL,       2); return; }
-                   error_at("'!' is not an operator -- use 'not'"); emit(TOKEN_ERROR, 1); return;
-        case '=':  if (b[1]=='=') { emit(TOKEN_EQUAL,           2); return; }
-                   emit(TOKEN_ASSIGN,   1); return;
-        case '<':  if (b[1]=='<') { emit(TOKEN_LEFT_SHIFT, 2); return; }
-                   if (b[1]=='=') { emit(TOKEN_LESS_EQUAL, 2); return; }
-                   emit(TOKEN_LESS, 1); return;
-        case '>':  if (b[1]=='>') { emit(TOKEN_RIGHT_SHIFT, 2); return; }
-                   if (b[1]=='=') { emit(TOKEN_GREATER_EQUAL, 2); return; }
-                   emit(TOKEN_GREATER, 1); return;
-        case '&':  if (b[1]=='&') { error_at("'&&' is not an operator -- use 'and'"); emit(TOKEN_ERROR, 2); return; }
-                   emit(TOKEN_BITWISE_AND, 1); return;
-        case '|':  if (b[1]=='|') { error_at("'||' is not an operator -- use 'or'"); emit(TOKEN_ERROR, 2); return; }
-                   if (b[1]=='>') { emit(TOKEN_PIPE,        2); return; }
-                   emit(TOKEN_BITWISE_OR, 1); return;
-        case '^':  emit(TOKEN_BITWISE_XOR, 1); return;
+            emit(TOKEN_END_OF_FILE, 0);
+            return;
+        case '(':
+            bracket_depth++;
+            emit(TOKEN_OPEN_PARENTHESE, 1);
+            return;
+        case ')':
+            if (bracket_depth > 0) bracket_depth--;
+            emit(TOKEN_CLOSE_PARENTHESE, 1);
+            return;
+        case '[':
+            bracket_depth++;
+            emit(TOKEN_OPEN_BRACKET, 1);
+            return;
+        case ']':
+            if (bracket_depth > 0) bracket_depth--;
+            emit(TOKEN_CLOSE_BRACKET, 1);
+            return;
+        case '{':
+            bracket_depth++;
+            emit(TOKEN_OPEN_BRACE, 1);
+            return;
+        case '}':
+            if (bracket_depth > 0) bracket_depth--;
+            emit(TOKEN_CLOSE_BRACE, 1);
+            return;
+        case ':': emit(TOKEN_COLON, 1); return;
+        case '.':
+            if (b[1] == '.') {
+                emit(TOKEN_DOT_DOT, 2);
+                return;
+            }
+            emit(TOKEN_DOT, 1);
+            return;
+        case '~': emit(TOKEN_BITWISE_NOT, 1); return;
+        case '*':
+            if (b[1] == '=') {
+                emit(TOKEN_MULTIPLY_ASSIGN, 2);
+                return;
+            }
+            emit(TOKEN_MULTIPLY, 1);
+            return;
+        case '/':
+            if (b[1] == '/') {
+                if (b[2] == '=') {
+                    emit(TOKEN_FLOOR_DIVIDE_ASSIGN, 3);
+                    return;
+                }
+                emit(TOKEN_FLOOR_DIVIDE, 2);
+                return;
+            }
+            if (b[1] == '=') {
+                emit(TOKEN_DIVIDE_ASSIGN, 2);
+                return;
+            }
+            emit(TOKEN_DIVIDE, 1);
+            return;
+        case '%':
+            if (b[1] == '=') {
+                emit(TOKEN_MODULO_ASSIGN, 2);
+                return;
+            }
+            emit(TOKEN_MODULO, 1);
+            return;
+        case '+':
+            if (b[1] == '=') {
+                emit(TOKEN_ADD_ASSIGN, 2);
+                return;
+            }
+            emit(TOKEN_ADD, 1);
+            return;
+        case '-':
+            if (b[1] == '=') {
+                emit(TOKEN_SUBTRACT_ASSIGN, 2);
+                return;
+            }
+            emit(TOKEN_SUBTRACT, 1);
+            return;
+        case '!':
+            if (b[1] == '=') {
+                emit(TOKEN_NOT_EQUAL, 2);
+                return;
+            }
+            error_at("'!' is not an operator -- use 'not'");
+            emit(TOKEN_ERROR, 1);
+            return;
+        case '=':
+            if (b[1] == '=') {
+                emit(TOKEN_EQUAL, 2);
+                return;
+            }
+            emit(TOKEN_ASSIGN, 1);
+            return;
+        case '<':
+            if (b[1] == '<') {
+                emit(TOKEN_LEFT_SHIFT, 2);
+                return;
+            }
+            if (b[1] == '=') {
+                emit(TOKEN_LESS_EQUAL, 2);
+                return;
+            }
+            emit(TOKEN_LESS, 1);
+            return;
+        case '>':
+            if (b[1] == '>') {
+                emit(TOKEN_RIGHT_SHIFT, 2);
+                return;
+            }
+            if (b[1] == '=') {
+                emit(TOKEN_GREATER_EQUAL, 2);
+                return;
+            }
+            emit(TOKEN_GREATER, 1);
+            return;
+        case '&':
+            if (b[1] == '&') {
+                error_at("'&&' is not an operator -- use 'and'");
+                emit(TOKEN_ERROR, 2);
+                return;
+            }
+            emit(TOKEN_BITWISE_AND, 1);
+            return;
+        case '|':
+            if (b[1] == '|') {
+                error_at("'||' is not an operator -- use 'or'");
+                emit(TOKEN_ERROR, 2);
+                return;
+            }
+            if (b[1] == '>') {
+                emit(TOKEN_PIPE, 2);
+                return;
+            }
+            emit(TOKEN_BITWISE_OR, 1);
+            return;
+        case '^': emit(TOKEN_BITWISE_XOR, 1); return;
     }
 
     /* Unrecognized byte: error_at() doesn't exit in MODE_SHELL, so it must still be consumed here or parser.c's error-recovery loop spins forever re-lexing it. */
@@ -530,14 +698,12 @@ bool equal(TokenType match) {
 }
 
 void require(TokenType match, const char* msg) {
-    if (!equal(match))
-        error_at("%s", msg);
+    if (!equal(match)) error_at("%s", msg);
     lex();
 }
 
 bool consume(TokenType match) {
-    if (!equal(match))
-        return false;
+    if (!equal(match)) return false;
     lex();
     return true;
 }

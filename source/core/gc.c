@@ -23,13 +23,13 @@ static bool value_is_young(AerVal v) {
    REMEMBERED bit is always available -- no separate scan of remembered_set needed to dedup. */
 static void gc_remember(VmHeap* heap, void* ptr, RememberedKind kind) {
     (void)kind;
-    if (pool_is_remembered(ptr)) return;   /* already remembered */
+    if (pool_is_remembered(ptr)) return; /* already remembered */
     pool_mark_remembered(ptr);
     if (heap->remembered_count >= heap->remembered_cap) {
         heap->remembered_cap = heap->remembered_cap ? heap->remembered_cap * 2 : 64;
         heap->remembered_set = xrealloc(heap->remembered_set, sizeof(RememberedEntry) * heap->remembered_cap);
     }
-    heap->remembered_set[heap->remembered_count].ptr  = ptr;
+    heap->remembered_set[heap->remembered_count].ptr = ptr;
     heap->remembered_set[heap->remembered_count].kind = kind;
     heap->remembered_count++;
 }
@@ -43,8 +43,7 @@ static void gc_remember(VmHeap* heap, void* ptr, RememberedKind kind) {
    rescan (and its post-scan clear) actually bounded by how much changed, rather than by the
    container's current total size -- see AerArray.dirty_min_byte's own comment (value.h). */
 static void mark_card_dirty(unsigned char** dirty_cards, unsigned int* dirty_cards_bytes,
-                             unsigned int* dirty_min_byte, unsigned int* dirty_max_byte,
-                             unsigned int index) {
+                            unsigned int* dirty_min_byte, unsigned int* dirty_max_byte, unsigned int index) {
     unsigned int needed_bytes = index / 8 + 1;
     if (needed_bytes > *dirty_cards_bytes) {
         *dirty_cards = xrealloc(*dirty_cards, needed_bytes);
@@ -64,8 +63,8 @@ static void mark_card_dirty(unsigned char** dirty_cards, unsigned int* dirty_car
    elements' indices. */
 void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value) {
     VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected) return;   /* nothing can be old yet -- see gc_ever_collected's own comment */
-    if (pool_is_young(a)) return;   /* young containers are re-traced normally next cycle */
+    if (!heap->gc_ever_collected) return; /* nothing can be old yet -- see gc_ever_collected's own comment */
+    if (pool_is_young(a)) return; /* young containers are re-traced normally next cycle */
     if (!value_is_young(new_value)) return;
     mark_card_dirty(&a->dirty_cards, &a->dirty_cards_bytes, &a->dirty_min_byte, &a->dirty_max_byte, index);
     gc_remember(heap, a, REMEMBERED_ARRAY);
@@ -94,7 +93,7 @@ void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value) {
    collection.delete sets dirty_all instead (see AerDict.dirty_cards's own comment, vm.h). */
 void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value) {
     VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected) return;   /* nothing can be old yet -- see gc_ever_collected's own comment */
+    if (!heap->gc_ever_collected) return; /* nothing can be old yet -- see gc_ever_collected's own comment */
     if (pool_is_young(d)) return;
     if (!value_is_young(new_value)) return;
     mark_card_dirty(&d->dirty_cards, &d->dirty_cards_bytes, &d->dirty_min_byte, &d->dirty_max_byte, index);
@@ -112,11 +111,15 @@ void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value) {
    every entry gets pushed and popped every single GC cycle for nothing. */
 static bool value_has_cell(AerVal v) {
     switch (aer_type(v)) {
-        case TYPE_STRING: case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_DICT: case TYPE_FUNCTION:
-        case TYPE_PACKED_ARRAY: case TYPE_TYPED_ARRAY: case TYPE_RESULT:
-            return true;
-        default:
-            return false;
+        case TYPE_STRING:
+        case TYPE_ARRAY:
+        case TYPE_STRUCT:
+        case TYPE_DICT:
+        case TYPE_FUNCTION:
+        case TYPE_PACKED_ARRAY:
+        case TYPE_TYPED_ARRAY:
+        case TYPE_RESULT: return true;
+        default: return false;
     }
 }
 
@@ -131,7 +134,7 @@ static void worklist_push(VmHeap* heap, AerVal v, bool minor) {
     if (minor && !value_is_young(v)) return;
     MarkWorklist* wl = &heap->gc_worklist;
     if (wl->count >= wl->cap) {
-        wl->cap   = wl->cap ? wl->cap * 2 : 256;
+        wl->cap = wl->cap ? wl->cap * 2 : 256;
         wl->items = xrealloc(wl->items, sizeof(AerVal) * wl->cap);
     }
     wl->items[wl->count++] = v;
@@ -145,7 +148,7 @@ static void mark_function(AerFunction* f) {
 static void mark_value(VmHeap* heap, AerVal v, bool minor) {
     switch (aer_type(v)) {
         case TYPE_STRING:
-            pool_mark(aer_as_string(v));   /* a leaf -- data owns no other Values */
+            pool_mark(aer_as_string(v)); /* a leaf -- data owns no other Values */
             break;
         case TYPE_ARRAY: {
             AerArray* a = aer_as_array(v);
@@ -176,9 +179,7 @@ static void mark_value(VmHeap* heap, AerVal v, bool minor) {
                 /* Keys are plain owned char*, not Values -- nothing to push. */
             }
             break;
-        case TYPE_FUNCTION:
-            mark_function(aer_as_function(v));
-            break;
+        case TYPE_FUNCTION: mark_function(aer_as_function(v)); break;
         case TYPE_PACKED_ARRAY:
             /* A GC leaf -- every field is a fixed primitive, never a heap reference. */
             pool_mark(aer_as_packed_array(v));
@@ -197,7 +198,7 @@ static void mark_value(VmHeap* heap, AerVal v, bool minor) {
             break;
         }
         default:
-            break;   /* null/boolean/integer/float reference no heap cell -- integers are never boxed under the tagged representation */
+            break; /* null/boolean/integer/float reference no heap cell -- integers are never boxed under the tagged representation */
     }
 }
 
@@ -236,15 +237,31 @@ static void mark_chunk_roots(VmHeap* heap, Chunk* chunk, bool minor) {
 /* Generational GC -- sweep finalizers                                  */
 /* ------------------------------------------------------------------ */
 
-static void free_string(void* cell)   {
+static void free_string(void* cell) {
     AerString* s = (AerString*)cell;
-    if (s->data != s->inline_buf) free(s->data);   /* an inline (SSO) string owns nothing separate -- see AerString's own comment, value.h */
+    if (s->data != s->inline_buf)
+        free(
+            s->data); /* an inline (SSO) string owns nothing separate -- see AerString's own comment, value.h */
 }
-static void free_array(void* cell)    { AerArray* a = (AerArray*)cell; free(a->items); free(a->dirty_cards); }
-static void free_dict(void* cell)     { AerDict* d = (AerDict*)cell; hashtable_free(&d->map); free(d->dirty_cards); }   /* hashtable_free already frees every entry's key */
-static void free_function(void* cell) { (void)cell; }   /* nothing to free -- no closure upvalues array anymore */
-static void free_struct(void* cell)   { (void)cell; }   /* items lives inline in this same cell -- nothing separate to free */
-static void free_packed_array(void* cell) { free(((AerPackedArray*)cell)->data); }
+static void free_array(void* cell) {
+    AerArray* a = (AerArray*)cell;
+    free(a->items);
+    free(a->dirty_cards);
+}
+static void free_dict(void* cell) {
+    AerDict* d = (AerDict*)cell;
+    hashtable_free(&d->map);
+    free(d->dirty_cards);
+} /* hashtable_free already frees every entry's key */
+static void free_function(void* cell) {
+    (void)cell;
+} /* nothing to free -- no closure upvalues array anymore */
+static void free_struct(void* cell) {
+    (void)cell;
+} /* items lives inline in this same cell -- nothing separate to free */
+static void free_packed_array(void* cell) {
+    free(((AerPackedArray*)cell)->data);
+}
 /* Stashes the data buffer into current_heap's free-cache (vm.h's own comment on TypedArrayFreeSlot)
    instead of actually freeing it, when there's a free slot and the buffer qualifies (nonzero size,
    at or under the per-buffer ceiling) -- vm_new_typed_array (vm.c) checks that same cache before
@@ -262,14 +279,16 @@ static void free_typed_array(void* cell) {
         for (unsigned int i = 0; i < TYPED_ARRAY_FREE_CACHE_SLOTS; i++) {
             if (heap->typed_array_free_cache[i].size == 0) {
                 heap->typed_array_free_cache[i].size = size;
-                heap->typed_array_free_cache[i].ptr  = ta->data;
+                heap->typed_array_free_cache[i].ptr = ta->data;
                 return;
             }
         }
     }
     free(ta->data);
 }
-static void free_result(void* cell)   { (void)cell; }   /* both fields are plain AerVals -- nothing separately owned */
+static void free_result(void* cell) {
+    (void)cell;
+} /* both fields are plain AerVals -- nothing separately owned */
 
 /* Every pool a VmHeap owns, by field offset (not a raw Pool* -- these describe VmHeap's shape once,
    generically, rather than one specific instance), paired with its finalizer. The single place all
@@ -279,25 +298,31 @@ static void free_result(void* cell)   { (void)cell; }   /* both fields are plain
    STRUCT_PAYLOAD_TIER_COUNT (vm.h) separate size-classed pools, not one -- each gets its own entry
    here (offsetof on an array element with a constant index is valid C), all sharing the same
    free_struct no-op finalizer since which tier a cell came from never matters for freeing it. */
-typedef struct { size_t offset; void (*on_free)(void* cell); } PoolEntry;
+typedef struct {
+    size_t offset;
+    void (*on_free)(void* cell);
+} PoolEntry;
 static const PoolEntry pool_table[] = {
-    { offsetof(VmHeap, string_pool),       free_string },
-    { offsetof(VmHeap, array_pool),        free_array },
-    { offsetof(VmHeap, dict_pool),         free_dict },
-    { offsetof(VmHeap, function_pool),     free_function },
-    { offsetof(VmHeap, struct_pools[0]),   free_struct },
-    { offsetof(VmHeap, struct_pools[1]),   free_struct },
-    { offsetof(VmHeap, struct_pools[2]),   free_struct },
-    { offsetof(VmHeap, struct_pools[3]),   free_struct },
-    { offsetof(VmHeap, struct_pools[4]),   free_struct },
-    { offsetof(VmHeap, packed_array_pool), free_packed_array },
-    { offsetof(VmHeap, typed_array_pool),  free_typed_array },
-    { offsetof(VmHeap, result_pool),       free_result },
+    {offsetof(VmHeap, string_pool), free_string},
+    {offsetof(VmHeap, array_pool), free_array},
+    {offsetof(VmHeap, dict_pool), free_dict},
+    {offsetof(VmHeap, function_pool), free_function},
+    {offsetof(VmHeap, struct_pools[0]), free_struct},
+    {offsetof(VmHeap, struct_pools[1]), free_struct},
+    {offsetof(VmHeap, struct_pools[2]), free_struct},
+    {offsetof(VmHeap, struct_pools[3]), free_struct},
+    {offsetof(VmHeap, struct_pools[4]), free_struct},
+    {offsetof(VmHeap, packed_array_pool), free_packed_array},
+    {offsetof(VmHeap, typed_array_pool), free_typed_array},
+    {offsetof(VmHeap, result_pool), free_result},
 };
 #define POOL_TABLE_COUNT (sizeof(pool_table) / sizeof(pool_table[0]))
-_Static_assert(STRUCT_PAYLOAD_TIER_COUNT == 5, "pool_table above hardcodes 5 struct_pools[] entries -- update both together");
+_Static_assert(STRUCT_PAYLOAD_TIER_COUNT == 5,
+               "pool_table above hardcodes 5 struct_pools[] entries -- update both together");
 
-static inline Pool* pool_at(VmHeap* heap, size_t offset) { return (Pool*)((char*)heap + offset); }
+static inline Pool* pool_at(VmHeap* heap, size_t offset) {
+    return (Pool*)((char*)heap + offset);
+}
 
 /* vm_free's own teardown call (vm.c) -- every cell finalized regardless of mark/generation state,
    since the whole heap is going away, not just the garbage since the last cycle (contrast
@@ -328,7 +353,8 @@ static void gc_collect(VM* vm, bool minor) {
         unsigned int kept = 0;
         for (unsigned int i = 0; i < heap->remembered_count; i++) {
             RememberedEntry* e = &heap->remembered_set[i];
-            if (pool_is_freed(e->ptr)) continue;   /* e->kind is irrelevant -- the byte lives on e->ptr's own cell regardless of which pool */
+            if (pool_is_freed(e->ptr))
+                continue; /* e->kind is irrelevant -- the byte lives on e->ptr's own cell regardless of which pool */
 
             switch (e->kind) {
                 case REMEMBERED_ARRAY: {
@@ -349,7 +375,8 @@ static void gc_collect(VM* vm, bool minor) {
                        in gc_collect before this bound existed). */
                     AerArray* a = (AerArray*)e->ptr;
                     if (a->dirty_all || !a->dirty_cards) {
-                        for (unsigned int j = 0; j < a->count; j++) worklist_push(heap, a->items[j], minor);
+                        for (unsigned int j = 0; j < a->count; j++)
+                            worklist_push(heap, a->items[j], minor);
                     } else {
                         for (unsigned int byte_i = a->dirty_min_byte; byte_i < a->dirty_max_byte; byte_i++) {
                             unsigned char byte = a->dirty_cards[byte_i];
@@ -464,7 +491,8 @@ unsigned int gc_count_live_cells(VmHeap* heap) {
    threshold back down again on the very next major, rather than ratcheting upward forever. */
 static void gc_rescale_minor_threshold(VmHeap* heap, unsigned int live) {
     unsigned int scaled = live > AER_MINOR_THRESHOLD_CAP ? AER_MINOR_THRESHOLD_CAP : live;
-    heap->minor_gc_threshold = scaled > heap->minor_gc_threshold_floor ? scaled : heap->minor_gc_threshold_floor;
+    heap->minor_gc_threshold =
+        scaled > heap->minor_gc_threshold_floor ? scaled : heap->minor_gc_threshold_floor;
 }
 
 /* Runs only between complete opcodes, where stack/scope/frame invariants are consistent. Called

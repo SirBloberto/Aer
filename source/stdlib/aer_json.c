@@ -15,13 +15,13 @@ static void json_encode_string(StrBuf* b, const char* s, unsigned int len) {
     for (unsigned int i = 0; i < len; i++) {
         unsigned char ch = (unsigned char)s[i];
         switch (ch) {
-            case '"':  strbuf_append(b, "\\\""); break;
+            case '"': strbuf_append(b, "\\\""); break;
             case '\\': strbuf_append(b, "\\\\"); break;
-            case '\n': strbuf_append(b, "\\n");  break;
-            case '\r': strbuf_append(b, "\\r");  break;
-            case '\t': strbuf_append(b, "\\t");  break;
-            case '\b': strbuf_append(b, "\\b");  break;
-            case '\f': strbuf_append(b, "\\f");  break;
+            case '\n': strbuf_append(b, "\\n"); break;
+            case '\r': strbuf_append(b, "\\r"); break;
+            case '\t': strbuf_append(b, "\\t"); break;
+            case '\b': strbuf_append(b, "\\b"); break;
+            case '\f': strbuf_append(b, "\\f"); break;
             default:
                 if (ch < 0x20) {
                     char esc[8];
@@ -39,18 +39,22 @@ static void json_encode_string(StrBuf* b, const char* s, unsigned int len) {
 static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
     char tmp[64];
     switch (aer_type(v)) {
-        case TYPE_NULL:    strbuf_append(b, "null"); break;
+        case TYPE_NULL: strbuf_append(b, "null"); break;
         case TYPE_BOOLEAN: strbuf_append(b, aer_as_bool(v) ? "true" : "false"); break;
-        case TYPE_INTEGER: aer_format_int((long long)aer_as_int(v), tmp, sizeof(tmp));  strbuf_append(b, tmp); break;
-        case TYPE_REAL:    aer_format_real(aer_as_real(v), tmp, sizeof(tmp)); strbuf_append(b, tmp); break;
+        case TYPE_INTEGER:
+            aer_format_int((long long)aer_as_int(v), tmp, sizeof(tmp));
+            strbuf_append(b, tmp);
+            break;
+        case TYPE_REAL:
+            aer_format_real(aer_as_real(v), tmp, sizeof(tmp));
+            strbuf_append(b, tmp);
+            break;
         case TYPE_STRING: {
             AerString* s = aer_as_string(v);
             json_encode_string(b, s->data, s->length);
             break;
         }
-        case TYPE_FUNCTION:
-            error("json.encode() cannot serialize a function value");
-            return false;
+        case TYPE_FUNCTION: error("json.encode() cannot serialize a function value"); return false;
         case TYPE_ARRAY: {
             AerArray* a = aer_as_array(v);
             strbuf_append_char(b, '[');
@@ -90,16 +94,10 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
             strbuf_append_char(b, '}');
             break;
         }
-        case TYPE_PACKED_ARRAY:
-            error("json.encode() cannot serialize a packed array value");
-            return false;
-        case TYPE_TYPED_ARRAY:
-            error("json.encode() cannot serialize a typed array value");
-            return false;
-        case TYPE_RESULT:
-            error("json.encode() cannot serialize a Result value");
-            return false;
-        case TYPE_ANY: break;   /* never a real AerVal's tag -- only Shape.field_types[] uses it */
+        case TYPE_PACKED_ARRAY: error("json.encode() cannot serialize a packed array value"); return false;
+        case TYPE_TYPED_ARRAY: error("json.encode() cannot serialize a typed array value"); return false;
+        case TYPE_RESULT: error("json.encode() cannot serialize a Result value"); return false;
+        case TYPE_ANY: break; /* never a real AerVal's tag -- only Shape.field_types[] uses it */
     }
     return true;
 }
@@ -109,10 +107,10 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    const char*  s;
+    const char* s;
     unsigned int len;
     unsigned int pos;
-    char*        err;   /* xmalloc'd message once set; NULL means "still ok" */
+    char* err; /* xmalloc'd message once set; NULL means "still ok" */
 } JsonParser;
 
 static void json_skip_ws(JsonParser* p) {
@@ -124,7 +122,7 @@ static void json_skip_ws(JsonParser* p) {
 }
 
 static void json_set_error(JsonParser* p, const char* msg) {
-    if (p->err) return;   /* keep the first error, not the last */
+    if (p->err) return; /* keep the first error, not the last */
     size_t n = strlen(msg);
     p->err = xmalloc(n + 1);
     memcpy(p->err, msg, n + 1);
@@ -140,27 +138,63 @@ static bool json_match_literal(JsonParser* p, const char* lit) {
 static AerVal json_parse_value(JsonParser* p);
 
 static AerVal json_parse_string_raw(JsonParser* p) {
-    p->pos++;   /* opening quote */
+    p->pos++; /* opening quote */
     StrBuf b;
     strbuf_init(&b);
     while (p->pos < p->len && p->s[p->pos] != '"') {
         char ch = p->s[p->pos];
-        if (ch != '\\') { strbuf_append_char(&b, ch); p->pos++; continue; }
+        if (ch != '\\') {
+            strbuf_append_char(&b, ch);
+            p->pos++;
+            continue;
+        }
 
         p->pos++;
-        if (p->pos >= p->len) { json_set_error(p, "Unterminated escape in JSON string"); free(b.buf); return aer_null(); }
+        if (p->pos >= p->len) {
+            json_set_error(p, "Unterminated escape in JSON string");
+            free(b.buf);
+            return aer_null();
+        }
         char esc = p->s[p->pos];
         switch (esc) {
-            case '"':  strbuf_append_char(&b, '"');  p->pos++; break;
-            case '\\': strbuf_append_char(&b, '\\'); p->pos++; break;
-            case '/':  strbuf_append_char(&b, '/');  p->pos++; break;
-            case 'n':  strbuf_append_char(&b, '\n'); p->pos++; break;
-            case 't':  strbuf_append_char(&b, '\t'); p->pos++; break;
-            case 'r':  strbuf_append_char(&b, '\r'); p->pos++; break;
-            case 'b':  strbuf_append_char(&b, '\b'); p->pos++; break;
-            case 'f':  strbuf_append_char(&b, '\f'); p->pos++; break;
+            case '"':
+                strbuf_append_char(&b, '"');
+                p->pos++;
+                break;
+            case '\\':
+                strbuf_append_char(&b, '\\');
+                p->pos++;
+                break;
+            case '/':
+                strbuf_append_char(&b, '/');
+                p->pos++;
+                break;
+            case 'n':
+                strbuf_append_char(&b, '\n');
+                p->pos++;
+                break;
+            case 't':
+                strbuf_append_char(&b, '\t');
+                p->pos++;
+                break;
+            case 'r':
+                strbuf_append_char(&b, '\r');
+                p->pos++;
+                break;
+            case 'b':
+                strbuf_append_char(&b, '\b');
+                p->pos++;
+                break;
+            case 'f':
+                strbuf_append_char(&b, '\f');
+                p->pos++;
+                break;
             case 'u': {
-                if (p->pos + 4 >= p->len) { json_set_error(p, "Invalid \\u escape in JSON string"); free(b.buf); return aer_null(); }
+                if (p->pos + 4 >= p->len) {
+                    json_set_error(p, "Invalid \\u escape in JSON string");
+                    free(b.buf);
+                    return aer_null();
+                }
                 char hex[5];
                 memcpy(hex, p->s + p->pos + 1, 4);
                 hex[4] = '\0';
@@ -170,12 +204,11 @@ static AerVal json_parse_string_raw(JsonParser* p) {
                 if (code < 0x80) {
                     strbuf_append_char(&b, (char)code);
                 } else if (code < 0x800) {
-                    char buf2[2] = { (char)(0xC0 | (code >> 6)), (char)(0x80 | (code & 0x3F)) };
+                    char buf2[2] = {(char)(0xC0 | (code >> 6)), (char)(0x80 | (code & 0x3F))};
                     strbuf_append_n(&b, buf2, 2);
                 } else {
-                    char buf3[3] = { (char)(0xE0 | (code >> 12)),
-                                      (char)(0x80 | ((code >> 6) & 0x3F)),
-                                      (char)(0x80 | (code & 0x3F)) };
+                    char buf3[3] = {(char)(0xE0 | (code >> 12)), (char)(0x80 | ((code >> 6) & 0x3F)),
+                                    (char)(0x80 | (code & 0x3F))};
                     strbuf_append_n(&b, buf3, 3);
                 }
                 break;
@@ -186,53 +219,72 @@ static AerVal json_parse_string_raw(JsonParser* p) {
                 return aer_null();
         }
     }
-    if (p->pos >= p->len) { json_set_error(p, "Unterminated string in JSON"); free(b.buf); return aer_null(); }
-    p->pos++;   /* closing quote */
+    if (p->pos >= p->len) {
+        json_set_error(p, "Unterminated string in JSON");
+        free(b.buf);
+        return aer_null();
+    }
+    p->pos++; /* closing quote */
     return aer_make_string(b.buf, (unsigned int)b.len);
 }
 
 static AerVal json_parse_number(JsonParser* p) {
     unsigned int start = p->pos;
     if (p->pos < p->len && p->s[p->pos] == '-') p->pos++;
-    if (p->pos >= p->len || !isdigit((unsigned char)p->s[p->pos])) { json_set_error(p, "Invalid number in JSON"); return aer_null(); }
+    if (p->pos >= p->len || !isdigit((unsigned char)p->s[p->pos])) {
+        json_set_error(p, "Invalid number in JSON");
+        return aer_null();
+    }
     if (p->s[p->pos] == '0') {
         p->pos++;
     } else {
-        while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos])) p->pos++;
+        while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos]))
+            p->pos++;
     }
     bool is_real = false;
     if (p->pos < p->len && p->s[p->pos] == '.') {
         is_real = true;
         p->pos++;
-        if (p->pos >= p->len || !isdigit((unsigned char)p->s[p->pos])) { json_set_error(p, "Invalid number in JSON"); return aer_null(); }
-        while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos])) p->pos++;
+        if (p->pos >= p->len || !isdigit((unsigned char)p->s[p->pos])) {
+            json_set_error(p, "Invalid number in JSON");
+            return aer_null();
+        }
+        while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos]))
+            p->pos++;
     }
     if (p->pos < p->len && (p->s[p->pos] == 'e' || p->s[p->pos] == 'E')) {
         is_real = true;
         p->pos++;
         if (p->pos < p->len && (p->s[p->pos] == '+' || p->s[p->pos] == '-')) p->pos++;
-        if (p->pos >= p->len || !isdigit((unsigned char)p->s[p->pos])) { json_set_error(p, "Invalid number in JSON"); return aer_null(); }
-        while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos])) p->pos++;
+        if (p->pos >= p->len || !isdigit((unsigned char)p->s[p->pos])) {
+            json_set_error(p, "Invalid number in JSON");
+            return aer_null();
+        }
+        while (p->pos < p->len && isdigit((unsigned char)p->s[p->pos]))
+            p->pos++;
     }
     unsigned int n = p->pos - start;
     char buf[64];
-    if (n >= sizeof(buf)) n = sizeof(buf) - 1;   /* absurd literal -- truncate rather than overflow */
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1; /* absurd literal -- truncate rather than overflow */
     memcpy(buf, p->s + start, n);
     buf[n] = '\0';
     return is_real ? aer_real(strtod(buf, NULL)) : aer_int(strtoll(buf, NULL, 10));
 }
 
 static AerVal json_parse_array(JsonParser* p) {
-    p->pos++;   /* '[' */
+    p->pos++; /* '[' */
     AerArray* r = vm_new_array();
-    r->count    = 0;
+    r->count = 0;
     r->capacity = 4;
-    r->items    = xmalloc(sizeof(AerVal) * r->capacity);
-    r->shape    = NULL;
+    r->items = xmalloc(sizeof(AerVal) * r->capacity);
+    r->shape = NULL;
     r->generation = 0;
 
     json_skip_ws(p);
-    if (p->pos < p->len && p->s[p->pos] == ']') { p->pos++; return aer_array_val(r); }
+    if (p->pos < p->len && p->s[p->pos] == ']') {
+        p->pos++;
+        return aer_array_val(r);
+    }
 
     while (true) {
         AerVal v = json_parse_value(p);
@@ -243,9 +295,19 @@ static AerVal json_parse_array(JsonParser* p) {
         }
         r->items[r->count++] = v;
         json_skip_ws(p);
-        if (p->pos >= p->len) { json_set_error(p, "Unterminated array in JSON"); return aer_null(); }
-        if (p->s[p->pos] == ',') { p->pos++; json_skip_ws(p); continue; }
-        if (p->s[p->pos] == ']') { p->pos++; break; }
+        if (p->pos >= p->len) {
+            json_set_error(p, "Unterminated array in JSON");
+            return aer_null();
+        }
+        if (p->s[p->pos] == ',') {
+            p->pos++;
+            json_skip_ws(p);
+            continue;
+        }
+        if (p->s[p->pos] == ']') {
+            p->pos++;
+            break;
+        }
         json_set_error(p, "Expected ',' or ']' in JSON array");
         return aer_null();
     }
@@ -253,21 +315,30 @@ static AerVal json_parse_array(JsonParser* p) {
 }
 
 static AerVal json_parse_object(JsonParser* p) {
-    p->pos++;   /* '{' */
+    p->pos++; /* '{' */
     AerDict* d = vm_new_dict();
 
     json_skip_ws(p);
-    if (p->pos < p->len && p->s[p->pos] == '}') { p->pos++; return aer_dict_val(d); }
+    if (p->pos < p->len && p->s[p->pos] == '}') {
+        p->pos++;
+        return aer_dict_val(d);
+    }
 
     while (true) {
         json_skip_ws(p);
-        if (p->pos >= p->len || p->s[p->pos] != '"') { json_set_error(p, "Expected string key in JSON object"); return aer_null(); }
+        if (p->pos >= p->len || p->s[p->pos] != '"') {
+            json_set_error(p, "Expected string key in JSON object");
+            return aer_null();
+        }
         AerVal key_v = json_parse_string_raw(p);
         if (p->err) return aer_null();
         AerString* ks = aer_as_string(key_v);
 
         json_skip_ws(p);
-        if (p->pos >= p->len || p->s[p->pos] != ':') { json_set_error(p, "Expected ':' in JSON object"); return aer_null(); }
+        if (p->pos >= p->len || p->s[p->pos] != ':') {
+            json_set_error(p, "Expected ':' in JSON object");
+            return aer_null();
+        }
         p->pos++;
         json_skip_ws(p);
 
@@ -279,9 +350,18 @@ static AerVal json_parse_object(JsonParser* p) {
         hashtable_put(&d->map, k, klen, val);
 
         json_skip_ws(p);
-        if (p->pos >= p->len) { json_set_error(p, "Unterminated object in JSON"); return aer_null(); }
-        if (p->s[p->pos] == ',') { p->pos++; continue; }
-        if (p->s[p->pos] == '}') { p->pos++; break; }
+        if (p->pos >= p->len) {
+            json_set_error(p, "Unterminated object in JSON");
+            return aer_null();
+        }
+        if (p->s[p->pos] == ',') {
+            p->pos++;
+            continue;
+        }
+        if (p->s[p->pos] == '}') {
+            p->pos++;
+            break;
+        }
         json_set_error(p, "Expected ',' or '}' in JSON object");
         return aer_null();
     }
@@ -290,21 +370,36 @@ static AerVal json_parse_object(JsonParser* p) {
 
 static AerVal json_parse_value(JsonParser* p) {
     json_skip_ws(p);
-    if (p->pos >= p->len) { json_set_error(p, "Unexpected end of JSON input"); return aer_null(); }
+    if (p->pos >= p->len) {
+        json_set_error(p, "Unexpected end of JSON input");
+        return aer_null();
+    }
     char ch = p->s[p->pos];
     if (ch == '"') return json_parse_string_raw(p);
     if (ch == '{') return json_parse_object(p);
     if (ch == '[') return json_parse_array(p);
-    if (ch == 't') { if (json_match_literal(p, "true"))  return aer_bool(true);  json_set_error(p, "Invalid literal in JSON"); return aer_null(); }
-    if (ch == 'f') { if (json_match_literal(p, "false")) return aer_bool(false); json_set_error(p, "Invalid literal in JSON"); return aer_null(); }
-    if (ch == 'n') { if (json_match_literal(p, "null"))  return aer_null();      json_set_error(p, "Invalid literal in JSON"); return aer_null(); }
+    if (ch == 't') {
+        if (json_match_literal(p, "true")) return aer_bool(true);
+        json_set_error(p, "Invalid literal in JSON");
+        return aer_null();
+    }
+    if (ch == 'f') {
+        if (json_match_literal(p, "false")) return aer_bool(false);
+        json_set_error(p, "Invalid literal in JSON");
+        return aer_null();
+    }
+    if (ch == 'n') {
+        if (json_match_literal(p, "null")) return aer_null();
+        json_set_error(p, "Invalid literal in JSON");
+        return aer_null();
+    }
     if (ch == '-' || isdigit((unsigned char)ch)) return json_parse_number(p);
     json_set_error(p, "Unexpected character in JSON");
     return aer_null();
 }
 
 static AerVal json_decode(AerString* input, char** err_out) {
-    JsonParser p = { input->data, input->length, 0, NULL };
+    JsonParser p = {input->data, input->length, 0, NULL};
     AerVal result = json_parse_value(&p);
     if (!p.err) {
         json_skip_ws(&p);

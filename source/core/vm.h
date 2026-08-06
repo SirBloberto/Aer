@@ -16,47 +16,64 @@ struct AerDict {
        own (value.h). dirty_cards indexes map.dense[] by its DENSE index (stable across ordinary
        insert/update; hashtable_remove's swap-compaction invalidates it, which is why
        collection.delete sets dirty_all rather than trying to shift the affected bit). */
-    bool           dirty_all;
-    unsigned int   dirty_cards_bytes;
-    HashTable      map;
+    bool dirty_all;
+    unsigned int dirty_cards_bytes;
+    HashTable map;
     unsigned char* dirty_cards;
     /* Bounds the actual set-bit range since the last clear -- see AerArray's own comment (value.h)
        for why this is needed on top of dirty_cards itself. */
-    unsigned int   dirty_min_byte, dirty_max_byte;
+    unsigned int dirty_min_byte, dirty_max_byte;
 };
 _Static_assert(offsetof(struct AerDict, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
 typedef enum {
     /* Binary arithmetic */
-    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_FLOOR_DIV,
+    OP_ADD,
+    OP_SUB,
+    OP_MUL,
+    OP_DIV,
+    OP_MOD,
+    OP_FLOOR_DIV,
 
     /* Binary comparison */
-    OP_EQ, OP_NEQ, OP_LT, OP_GT, OP_LTE, OP_GTE,
-    OP_IN,              /* key in dict → key existence; value in array → element scan */
+    OP_EQ,
+    OP_NEQ,
+    OP_LT,
+    OP_GT,
+    OP_LTE,
+    OP_GTE,
+    OP_IN, /* key in dict → key existence; value in array → element scan */
 
     /* Never dispatched -- parser tags for `&&`/`||`, which compile to short-circuit jumps. */
-    OP_AND, OP_OR,
-    OP_PIPE,            /* never dispatched either -- `x |> f(args)` desugars to a call at parse time; kept as a lookup-table tag only, same reason as OP_AND/OP_OR */
+    OP_AND,
+    OP_OR,
+    OP_PIPE, /* never dispatched either -- `x |> f(args)` desugars to a call at parse time; kept as a lookup-table tag only, same reason as OP_AND/OP_OR */
 
     /* Binary bitwise */
-    OP_BITWISE_AND, OP_BITWISE_OR, OP_BITWISE_XOR, OP_LSHIFT, OP_RSHIFT,
+    OP_BITWISE_AND,
+    OP_BITWISE_OR,
+    OP_BITWISE_XOR,
+    OP_LSHIFT,
+    OP_RSHIFT,
 
     /* Unary */
-    OP_NEGATE, OP_NOT, OP_BITWISE_NOT,
+    OP_NEGATE,
+    OP_NOT,
+    OP_BITWISE_NOT,
 
     /* OP_JUMP's handler only touches vm->ip, so register opcodes reuse it for unconditional jumps. */
-    OP_JUMP,            /* operand: absolute code index */
+    OP_JUMP, /* operand: absolute code index */
 
     /* Struct definitions only -- instantiation/field access are register opcodes below. */
-    OP_DEFINE_STRUCT,    /* operands: name pool idx, field count, then that many (field-name, default-value) pool-idx pairs -- registers a Shape in the chunk's shape table */
+    OP_DEFINE_STRUCT, /* operands: name pool idx, field count, then that many (field-name, default-value) pool-idx pairs -- registers a Shape in the chunk's shape table */
 
     /* Misc */
-    OP_TO_STR,  /* used as OP_UNARY's unary_op tag (string interpolation's value-to-string step) -- see vm_to_str() */
+    OP_TO_STR, /* used as OP_UNARY's unary_op tag (string interpolation's value-to-string step) -- see vm_to_str() */
     OP_HALT,
 
     /* ---- register-VM opcodes (packed encoding: see PACK3/PACK_BINARY below). */
-    OP_LOADK,  /* operands: dest_reg, pool_idx -- registers[dest_reg] = chunk pool constant */
-    OP_MOVE,   /* operands: dest_reg, src_reg -- registers[dest_reg] = registers[src_reg] */
+    OP_LOADK, /* operands: dest_reg, pool_idx -- registers[dest_reg] = chunk pool constant */
+    OP_MOVE, /* operands: dest_reg, src_reg -- registers[dest_reg] = registers[src_reg] */
     /* dest_reg, src_reg -- dest = (src is a Result); gates |>'s short-circuit (compile_pipe). */
     OP_IS_RESULT,
     /* RK-encoded operand: register index, or (bit 30 set) constant-pool index -- see vm_rk_value. */
@@ -66,7 +83,7 @@ typedef enum {
     OP_JUMP_IF_FALSE_REG, /* operands: reg, target -- jump to target if registers[reg] is falsy */
 
     /* Calls -- per-call register windowing (CallFrame): each call gets an isolated bank. */
-    OP_CALL,   /* dest_reg, callee_offset, arg_reg_base, arg_count -- copies args into the
+    OP_CALL, /* dest_reg, callee_offset, arg_reg_base, arg_count -- copies args into the
                      callee frame, saves return address + dest, jumps */
     OP_RETURN, /* src_reg (callee frame) -- result to caller's dest_reg, pops the frame, jumps back */
 
@@ -77,8 +94,8 @@ typedef enum {
        byte is patched in place. Same dispatch label as OP_CALL; overwrites the CURRENT frame's
        registers[0..arg_count) (arg registers are always temps, above any local) and jumps --
        call_depth/dest_reg/return_ip stay untouched. */
-    OP_TAIL_CALL,        /* same operands as OP_CALL; dest_reg is unused (ignored) here */
-    OP_TAIL_CALL_VALUE,  /* same operands as OP_CALL_VALUE; dest_reg is unused (ignored) here */
+    OP_TAIL_CALL, /* same operands as OP_CALL; dest_reg is unused (ignored) here */
+    OP_TAIL_CALL_VALUE, /* same operands as OP_CALL_VALUE; dest_reg is unused (ignored) here */
 
     /* Bridges to the stack-based stdlib dispatch: push args from registers, call aer_*_call(),
        pop the one result into dest_reg. Stack-neutral. */
@@ -92,9 +109,9 @@ typedef enum {
     OP_CALL_BUILTIN, /* operands: dest_reg, name_pool_idx, arg_reg_base, arg_count, builtin_id */
 
     /* Registers can hold heap values -- mark_vm_roots scans all of registers[] per live frame. */
-    OP_ARRAY_NEW,  /* dest_reg, item_reg_base, item_count */
-    OP_INDEX_GET,  /* dest_reg, arr_reg, rk_idx -- via vm_index_get_compute */
-    OP_INDEX_SET,  /* arr_reg, rk_idx, rk_val -- via vm_index_set_compute (includes the write barrier) */
+    OP_ARRAY_NEW, /* dest_reg, item_reg_base, item_count */
+    OP_INDEX_GET, /* dest_reg, arr_reg, rk_idx -- via vm_index_get_compute */
+    OP_INDEX_SET, /* arr_reg, rk_idx, rk_val -- via vm_index_set_compute (includes the write barrier) */
 
     /* Loop-bound-hoisting counterparts of OP_INDEX_GET/SET, typed-array only -- same word layout
        (dest/arr/rk_idx for GET; arr/rk_idx/rk_val for SET), only ever emitted when index_safe_
@@ -110,18 +127,18 @@ typedef enum {
        hang one on); only the index-range half of the safety argument is a compile-time fact here.
        No compound (+=) counterpart -- not measured hot enough yet to justify the extra opcode
        surface; add one the same way if a profile ever shows otherwise. */
-    OP_TYPED_INDEX_GET_UNCHECKED,  /* dest_reg, arr_reg, rk_idx */
-    OP_TYPED_INDEX_SET_UNCHECKED,  /* arr_reg, rk_idx, rk_val */
+    OP_TYPED_INDEX_GET_UNCHECKED, /* dest_reg, arr_reg, rk_idx */
+    OP_TYPED_INDEX_SET_UNCHECKED, /* arr_reg, rk_idx, rk_val */
 
     /* `a, b = expr`: Result/array unpacks normally, anything else becomes (value, null). */
     OP_DESTRUCTURE, /* target0_reg, target1_reg, src_reg */
 
     /* Slicing (array or string); a missing bound compiles to an RK null constant. */
-    OP_SLICE_GET,  /* dest_reg, arr_reg, rk_start, rk_end */
+    OP_SLICE_GET, /* dest_reg, arr_reg, rk_start, rk_end */
 
     /* OP_ARRAY_NEW's bulk-copy applied to (key,val) register pairs; same key validation and
        owned-key discipline as stack dict construction. */
-    OP_DICT_NEW,   /* dest_reg, pair_reg_base, pair_count -- key at base+2*i, val at +2*i+1 */
+    OP_DICT_NEW, /* dest_reg, pair_reg_base, pair_count -- key at base+2*i, val at +2*i+1 */
 
     /* Single-variable iteration; break is a plain jump, no cleanup needed. */
     OP_ITER_NEXT_ARRAY, /* col_reg, idx_reg, item_dest_reg, end_target -- despite the name, also accepts a dict
@@ -145,8 +162,8 @@ typedef enum {
     /* Instantiation/field get/set need register operands (definitions reuse OP_DEFINE_STRUCT). */
     OP_STRUCT_NEW, /* dest_reg, type_name_pool_idx, arg_reg_base, arg_count -- arity-checked, trailing
                           fields default-filled */
-    OP_FIELD_GET,  /* dest_reg, struct_reg, field_name_pool_idx */
-    OP_FIELD_SET,  /* struct_reg, field_name_pool_idx, rk_val -- includes the gc_barrier_array call */
+    OP_FIELD_GET, /* dest_reg, struct_reg, field_name_pool_idx */
+    OP_FIELD_SET, /* struct_reg, field_name_pool_idx, rk_val -- includes the gc_barrier_array call */
 
     /* `[value; count]` repeat-literal -- replaces the old `Type[count]` entirely. Evaluates the
        fill expression exactly once (into fill_reg), then branches on ITS RUNTIME TYPE: TYPE_STRUCT
@@ -215,10 +232,18 @@ typedef enum {
     /* Raw (unboxed) arithmetic on provably-monotype locals; operands are raw_ints/raw_reals slot
        indices, no RK encoding. Comparisons produce a boxed boolean; OP_BOX_* is the only bridge
        back to registers[]. */
-    OP_RAW_LOAD_INT, OP_RAW_LOAD_REAL,
-    OP_RAW_ADD_INT, OP_RAW_SUB_INT, OP_RAW_MUL_INT, OP_RAW_DIV_INT,
-    OP_RAW_MOD_INT, OP_RAW_FLOOR_DIV_INT,
-    OP_RAW_ADD_REAL, OP_RAW_SUB_REAL, OP_RAW_MUL_REAL, OP_RAW_DIV_REAL,
+    OP_RAW_LOAD_INT,
+    OP_RAW_LOAD_REAL,
+    OP_RAW_ADD_INT,
+    OP_RAW_SUB_INT,
+    OP_RAW_MUL_INT,
+    OP_RAW_DIV_INT,
+    OP_RAW_MOD_INT,
+    OP_RAW_FLOOR_DIV_INT,
+    OP_RAW_ADD_REAL,
+    OP_RAW_SUB_REAL,
+    OP_RAW_MUL_REAL,
+    OP_RAW_DIV_REAL,
     /* Superinstruction: `x += a*b` / `x -= a*b` on raw real locals (A = A +/- B*C, in place) --
        collapses the MUL a compound-assignment's own RHS just emitted plus this op's own ADD/SUB
        into ONE dispatch, when that RHS compiled down to exactly one raw MUL (see the compound-
@@ -227,16 +252,29 @@ typedef enum {
        bit-identical to the unfused two-opcode form; the only thing removed is one interpreter
        dispatch. Found via nbody.aer's own opcode-hit profile: this exact shape (`bivx -= dx*mj`,
        `bodies[j].vx += dx*mi`) is 5,000,000 hits/opcode in its hottest loop. */
-    OP_RAW_FMA_REAL, OP_RAW_FMS_REAL,
-    OP_RAW_LT_INT, OP_RAW_GT_INT, OP_RAW_LTE_INT, OP_RAW_GTE_INT,
-    OP_RAW_LT_REAL, OP_RAW_GT_REAL, OP_RAW_LTE_REAL, OP_RAW_GTE_REAL,
-    OP_BOX_INT, OP_BOX_REAL,
+    OP_RAW_FMA_REAL,
+    OP_RAW_FMS_REAL,
+    OP_RAW_LT_INT,
+    OP_RAW_GT_INT,
+    OP_RAW_LTE_INT,
+    OP_RAW_GTE_INT,
+    OP_RAW_LT_REAL,
+    OP_RAW_GT_REAL,
+    OP_RAW_LTE_REAL,
+    OP_RAW_GTE_REAL,
+    OP_BOX_INT,
+    OP_BOX_REAL,
     /* Raw-to-raw copy -- OP_MOVE's analog for raw slots. */
-    OP_RAW_MOVE_INT, OP_RAW_MOVE_REAL,
+    OP_RAW_MOVE_INT,
+    OP_RAW_MOVE_REAL,
     /* In-place accumulation of a BOXED value into a raw slot (`e += <boxed expr>`); runtime tag
        check, ADD/SUB/MUL only. */
-    OP_RAW_ADD_INT_BOXED, OP_RAW_SUB_INT_BOXED, OP_RAW_MUL_INT_BOXED,
-    OP_RAW_ADD_REAL_BOXED, OP_RAW_SUB_REAL_BOXED, OP_RAW_MUL_REAL_BOXED,
+    OP_RAW_ADD_INT_BOXED,
+    OP_RAW_SUB_INT_BOXED,
+    OP_RAW_MUL_INT_BOXED,
+    OP_RAW_ADD_REAL_BOXED,
+    OP_RAW_SUB_REAL_BOXED,
+    OP_RAW_MUL_REAL_BOXED,
     /* Same tag-checked raw-vs-boxed arithmetic as the _BOXED family above, but NON-destructive:
        (dest, src_raw, boxed_reg) -- raw_reals[dest] = raw_reals[src_raw] <op> unbox(boxed_reg),
        src_raw left untouched. Used by try_emit_arith_raw_boxed (parser.c) for a general (non-
@@ -247,11 +285,18 @@ typedef enum {
        restriction (see try_emit_arith_raw_boxed's comment for why INT never gets this treatment).
        ADD/MUL only, mirroring try_emit_arith_raw_boxed's own restriction to commutative ops -- no
        SUB_TO exists since nothing ever emits one (order-sensitive, left to the boxed fallback). */
-    OP_RAW_ADD_REAL_BOXED_TO, OP_RAW_MUL_REAL_BOXED_TO,
+    OP_RAW_ADD_REAL_BOXED_TO,
+    OP_RAW_MUL_REAL_BOXED_TO,
     /* Raw-vs-boxed comparison producing a boxed boolean -- removes the OP_BOX_INT that dominated
        `for i <= limit:`-shaped loops. Not in-place. */
-    OP_RAW_LT_INT_BOXED, OP_RAW_GT_INT_BOXED, OP_RAW_LTE_INT_BOXED, OP_RAW_GTE_INT_BOXED,
-    OP_RAW_LT_REAL_BOXED, OP_RAW_GT_REAL_BOXED, OP_RAW_LTE_REAL_BOXED, OP_RAW_GTE_REAL_BOXED,
+    OP_RAW_LT_INT_BOXED,
+    OP_RAW_GT_INT_BOXED,
+    OP_RAW_LTE_INT_BOXED,
+    OP_RAW_GTE_INT_BOXED,
+    OP_RAW_LT_REAL_BOXED,
+    OP_RAW_GT_REAL_BOXED,
+    OP_RAW_LTE_REAL_BOXED,
+    OP_RAW_GTE_REAL_BOXED,
     /* Pool fallback for literals outside the old 20-bit immediate; kept as a distinct opcode
        (rather than widening OP_RAW_LOAD_INT's own immediate) since the fixed-width redesign below
        gives OP_RAW_LOAD_INT a full 32-bit immediate anyway -- this opcode now only exists for
@@ -265,10 +310,14 @@ typedef enum {
        Shape a parameter has. The field's byte offset is then a compile-time constant -- no
        vm_resolve_field_by_shape call, no boxed AerVal ever constructed. Never appears in a
        function's ordinary (generic, always-present) body. */
-    OP_INDEX_FIELD_GET_RAW_INT, OP_INDEX_FIELD_GET_RAW_REAL,
-    OP_FIELD_GET_RAW_INT,       OP_FIELD_GET_RAW_REAL,
-    OP_INDEX_FIELD_SET_RAW_INT, OP_INDEX_FIELD_SET_RAW_REAL,
-    OP_FIELD_SET_RAW_INT,       OP_FIELD_SET_RAW_REAL,
+    OP_INDEX_FIELD_GET_RAW_INT,
+    OP_INDEX_FIELD_GET_RAW_REAL,
+    OP_FIELD_GET_RAW_INT,
+    OP_FIELD_GET_RAW_REAL,
+    OP_INDEX_FIELD_SET_RAW_INT,
+    OP_INDEX_FIELD_SET_RAW_REAL,
+    OP_FIELD_SET_RAW_INT,
+    OP_FIELD_SET_RAW_REAL,
     /* Same specialized-body-only contract as the GET/SET family above, but for a compound
        assignment (`field += <expr>`) whose RHS already resolved to a RAW value at compile time
        (try_emit_arith_raw_boxed or a bare raw local/literal) -- reads the field raw, applies the op
@@ -278,8 +327,10 @@ typedef enum {
        uses). ADD/SUB/MUL only, mirroring the _BOXED compound family's own restriction -- /=, %=,
        //= still fall back to the generic OP_FIELD_COMPOUND/OP_INDEX_FIELD_COMPOUND. Distinct
        opcodes for the fused index+field (packed array) vs bare-struct case, same split as GET/SET. */
-    OP_FIELD_COMPOUND_RAW_INT,       OP_FIELD_COMPOUND_RAW_REAL,
-    OP_INDEX_FIELD_COMPOUND_RAW_INT, OP_INDEX_FIELD_COMPOUND_RAW_REAL,
+    OP_FIELD_COMPOUND_RAW_INT,
+    OP_FIELD_COMPOUND_RAW_REAL,
+    OP_INDEX_FIELD_COMPOUND_RAW_INT,
+    OP_INDEX_FIELD_COMPOUND_RAW_REAL,
 
     /* _UNCHECKED counterparts of the three INDEX_FIELD_*_RAW_INT/REAL opcodes above -- same
        compile-time-constant offset, but additionally skip vm_packed_raw_elem's index-type check,
@@ -292,9 +343,12 @@ typedef enum {
        The array's own type/shape is still guarded by the ordinary reg_known_shape mechanism these
        opcodes are gated behind (cleared on any reassignment of the parameter), so only the
        index-safety half of vm_packed_raw_elem's checks is actually removable here. */
-    OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED,      OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED,
-    OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED,      OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED,
-    OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED, OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED,
+    OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED,
+    OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED,
+    OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED,
+    OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED,
+    OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED,
+    OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED,
 
     /* Narrow (int32/float32) counterparts of the entire RAW field-access family above -- same
        specialized-body-only contract, same compile-time-constant offset, but the field's own
@@ -306,20 +360,29 @@ typedef enum {
        COMPOUND opcodes here do NOT range-check on overflow -- silently truncating instead, the
        same "raw means unchecked, for speed" tradeoff every other raw arithmetic opcode in this
        file already makes (e.g. OP_RAW_ADD_INT's own int64 wraparound is never checked either). */
-    OP_INDEX_FIELD_GET_RAW_INT32, OP_INDEX_FIELD_GET_RAW_FLOAT32,
-    OP_FIELD_GET_RAW_INT32,       OP_FIELD_GET_RAW_FLOAT32,
-    OP_INDEX_FIELD_SET_RAW_INT32, OP_INDEX_FIELD_SET_RAW_FLOAT32,
-    OP_FIELD_SET_RAW_INT32,       OP_FIELD_SET_RAW_FLOAT32,
-    OP_FIELD_COMPOUND_RAW_INT32,       OP_FIELD_COMPOUND_RAW_FLOAT32,
-    OP_INDEX_FIELD_COMPOUND_RAW_INT32, OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32,
+    OP_INDEX_FIELD_GET_RAW_INT32,
+    OP_INDEX_FIELD_GET_RAW_FLOAT32,
+    OP_FIELD_GET_RAW_INT32,
+    OP_FIELD_GET_RAW_FLOAT32,
+    OP_INDEX_FIELD_SET_RAW_INT32,
+    OP_INDEX_FIELD_SET_RAW_FLOAT32,
+    OP_FIELD_SET_RAW_INT32,
+    OP_FIELD_SET_RAW_FLOAT32,
+    OP_FIELD_COMPOUND_RAW_INT32,
+    OP_FIELD_COMPOUND_RAW_FLOAT32,
+    OP_INDEX_FIELD_COMPOUND_RAW_INT32,
+    OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32,
 
     /* _UNCHECKED counterparts of the narrow INDEX_FIELD_*_RAW_INT32/FLOAT32 opcodes above -- same
        relationship the wide _UNCHECKED family (above) has to its own checked counterparts: only
        the index-safety half of vm_packed_raw_elem's checks is skipped, gated behind the exact same
        index_safe_unchecked proof, narrow storage width unaffected. */
-    OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED,      OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED,
-    OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED,      OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED,
-    OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED, OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED,
+    OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED,
+    OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED,
+    OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED,
+    OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED,
+    OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED,
+    OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED,
 
     /* Only ever emitted at the very start of a specialized body's "raw-numeric variant" (see
        SpecEntry below), once per raw-bound parameter -- unconditionally reads the boxed AerVal the
@@ -331,7 +394,8 @@ typedef enum {
        the time this opcode runs, the tag is already a proven fact, not an assumption. Every
        reference to that parameter for the rest of the body then goes through the ordinary raw-local
        machinery (var_kind/var_lookup_rk), completely unaware this value ever arrived boxed. */
-    OP_UNBOX_PARAM_INT, OP_UNBOX_PARAM_REAL,
+    OP_UNBOX_PARAM_INT,
+    OP_UNBOX_PARAM_REAL,
 
     /* A bare comparison as the WHOLE condition of an if/while (parse_if/parse_for_while, parser.c)
        collapses the comparison and its OP_JUMP_IF_FALSE_REG into one dispatch -- the comparison's
@@ -346,8 +410,12 @@ typedef enum {
        word0 = PACK3(op, 0 [unused -- no destination register, the result is never stored],
                      rk_lhs8, rk_rhs8)
        word1 = jump target (same as OP_JUMP_IF_FALSE_REG's own trailing word) */
-    OP_EQ_JUMP_IF_FALSE, OP_NEQ_JUMP_IF_FALSE,
-    OP_LT_JUMP_IF_FALSE, OP_GT_JUMP_IF_FALSE, OP_LTE_JUMP_IF_FALSE, OP_GTE_JUMP_IF_FALSE,
+    OP_EQ_JUMP_IF_FALSE,
+    OP_NEQ_JUMP_IF_FALSE,
+    OP_LT_JUMP_IF_FALSE,
+    OP_GT_JUMP_IF_FALSE,
+    OP_LTE_JUMP_IF_FALSE,
+    OP_GTE_JUMP_IF_FALSE,
 
     /* Same fusion as OP_LT_JUMP_IF_FALSE et al. above, extended to JUST the raw-boxed int family --
        found via mandelbrot's own profile: its `for iter < max_iter:` (a raw int loop counter
@@ -368,10 +436,12 @@ typedef enum {
        opcode's own word0 B/C fields verbatim (a raw slot + a boxed register) -- only the A field
        (the boxed-bool destination, unused here) and the trailing jump-target word change, exactly
        mirroring OP_LT_JUMP_IF_FALSE's own shape. */
-    OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE,  OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE,
-    OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE, OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE,
+    OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE,
+    OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE,
+    OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE,
+    OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE,
 
-    OP_OPCODE_COUNT_MARKER   /* not a real opcode -- sizes the static assert below */
+    OP_OPCODE_COUNT_MARKER /* not a real opcode -- sizes the static assert below */
 } Opcode;
 _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — widen the opcode field");
 
@@ -381,7 +451,7 @@ _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — 
 #define RK_CONST_FLAG (1 << 30)
 
 /* Compiler-internal raw-slot tags (bits 28/29) -- never emitted into an instruction word. */
-#define RK_RAW_INT_FLAG  (1 << 29)
+#define RK_RAW_INT_FLAG (1 << 29)
 #define RK_RAW_REAL_FLAG (1 << 28)
 #define RK_RAW_SLOT_MASK 0x1F
 
@@ -391,7 +461,7 @@ _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — 
 
 /* Raw slot counts -- stored as a full byte on the wire now (no bit-packing pressure), but the
    allocator ceiling itself is unchanged from the original design. */
-#define RAW_REGISTERS_INT  32
+#define RAW_REGISTERS_INT 32
 #define RAW_REGISTERS_REAL 32
 
 /* Fixed-width, word-granular instruction encoding: every instruction is one or more 32-bit words,
@@ -401,44 +471,47 @@ _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — 
 
 /* op(8) | A(8) | B(8) | C(8), low byte first -- generic 1-4 byte-field packer, unchanged in spirit
    from the old scheme's own PACK3 (which already only used the low 32 bits of its wider word). */
-#define PACK3(op, a, b, cc) \
-    (((uint32_t)(op) & 0xFF) | (((uint32_t)(a) & 0xFF) << 8) | (((uint32_t)(b) & 0xFF) << 16) | (((uint32_t)(cc) & 0xFF) << 24))
-#define PACK2(op, a, b)   PACK3(op, a, b, 0)
-#define PACK1(op, a)      PACK3(op, a, 0, 0)
-#define UNPACK_A(word) (((word) >> 8)  & 0xFF)
+#define PACK3(op, a, b, cc)                                                                                  \
+    (((uint32_t)(op)&0xFF) | (((uint32_t)(a)&0xFF) << 8) | (((uint32_t)(b)&0xFF) << 16) |                    \
+     (((uint32_t)(cc)&0xFF) << 24))
+#define PACK2(op, a, b) PACK3(op, a, b, 0)
+#define PACK1(op, a) PACK3(op, a, 0, 0)
+#define UNPACK_A(word) (((word) >> 8) & 0xFF)
 #define UNPACK_B(word) (((word) >> 16) & 0xFF)
 #define UNPACK_C(word) (((word) >> 24) & 0xFF)
 
 /* Packs two independent 16-bit fields into one word -- used for word1-style "two wide fields,
    no room for anything else" shapes (e.g. field_idx + an RK16 operand). */
-#define PACK_2X16(hi, lo) ((((uint32_t)(hi) & 0xFFFF) << 16) | ((uint32_t)(lo) & 0xFFFF))
+#define PACK_2X16(hi, lo) ((((uint32_t)(hi)&0xFFFF) << 16) | ((uint32_t)(lo)&0xFFFF))
 #define UNPACK_2X16_HI(word) (((word) >> 16) & 0xFFFF)
-#define UNPACK_2X16_LO(word) ((word) & 0xFFFF)
+#define UNPACK_2X16_LO(word) ((word)&0xFFFF)
 
 /* RK8: 1 flag bit + 7 index bits. A register index is always < FRAME_REGISTERS(128) by the time it
    reaches emission, so it fits with zero headroom; a constant-pool index past 127 must be hoisted
    into a scratch register first (parser.c's existing materialize(), unchanged). */
 #define RK8_CONST_FLAG 0x80U
 #define RK8_INDEX_MASK 0x7FU
-#define RK8_MAX_INDEX  0x7F
+#define RK8_MAX_INDEX 0x7F
 static inline uint8_t pack_rk8(int rk) {
-    if (rk & RK_CONST_FLAG) return (uint8_t)(RK8_CONST_FLAG | ((unsigned)(rk & ~RK_CONST_FLAG) & RK8_INDEX_MASK));
+    if (rk & RK_CONST_FLAG)
+        return (uint8_t)(RK8_CONST_FLAG | ((unsigned)(rk & ~RK_CONST_FLAG) & RK8_INDEX_MASK));
     return (uint8_t)((unsigned)rk & RK8_INDEX_MASK);
 }
-#define RK8_IS_CONST(b) ((b) & RK8_CONST_FLAG)
-#define RK8_INDEX(b)    ((b) & RK8_INDEX_MASK)
+#define RK8_IS_CONST(b) ((b)&RK8_CONST_FLAG)
+#define RK8_INDEX(b) ((b)&RK8_INDEX_MASK)
 
 /* RK16: 1 flag bit + 15 index bits (32767 registers/constants direct) -- generous enough that no
    overflow path is needed anywhere it's used. */
 #define RK16_CONST_FLAG (1U << 15)
 #define RK16_INDEX_MASK 0x7FFFU
-#define RK16_MAX_INDEX  0x7FFF
+#define RK16_MAX_INDEX 0x7FFF
 static inline uint16_t pack_rk16(int rk) {
-    if (rk & RK_CONST_FLAG) return (uint16_t)(RK16_CONST_FLAG | ((unsigned)(rk & ~RK_CONST_FLAG) & RK16_INDEX_MASK));
+    if (rk & RK_CONST_FLAG)
+        return (uint16_t)(RK16_CONST_FLAG | ((unsigned)(rk & ~RK_CONST_FLAG) & RK16_INDEX_MASK));
     return (uint16_t)((unsigned)rk & RK16_INDEX_MASK);
 }
-#define RK16_IS_CONST(w) ((w) & RK16_CONST_FLAG)
-#define RK16_INDEX(w)    ((w) & RK16_INDEX_MASK)
+#define RK16_IS_CONST(w) ((w)&RK16_CONST_FLAG)
+#define RK16_INDEX(w) ((w)&RK16_INDEX_MASK)
 
 /* type_name_idx / field_name_idx / module_idx / fn_idx / callee_offset / jump targets all get a
    full dedicated 32-bit word wherever this comment appears in the shapes below -- no packing, no
@@ -447,120 +520,121 @@ static inline uint16_t pack_rk16(int rk) {
 /* op(8) | a(8) | w16(16) -- one small field plus one 16-bit field, both in word0. Used by opcodes
    whose only two real fields are a register/small-count and one RK16/count16 value (OP_FIELD_SET,
    OP_INDEX_FIELD_SET's obj_reg+rk_idx half). */
-#define PACK_OP_A_W16(op, a, w16) \
-    (((uint32_t)(op) & 0xFF) | (((uint32_t)(a) & 0xFF) << 8) | (((uint32_t)(w16) & 0xFFFF) << 16))
+#define PACK_OP_A_W16(op, a, w16)                                                                            \
+    (((uint32_t)(op)&0xFF) | (((uint32_t)(a)&0xFF) << 8) | (((uint32_t)(w16)&0xFFFF) << 16))
 #define UNPACK_W16(word) (((word) >> 16) & 0xFFFFU)
 
 /* OP_DEFINE_STRUCT's header word: op(8) | name_idx(16) | field_count(8) -- name_idx sits in the
    middle (unlike PACK_OP_A_W16), so it gets its own macro rather than misusing that one. */
-#define PACK_STRUCT_HEADER(name_idx, field_count) \
-    (((uint32_t)(OP_DEFINE_STRUCT) & 0xFF) | (((uint32_t)(name_idx) & 0xFFFF) << 8) | (((uint32_t)(field_count) & 0xFF) << 24))
-#define UNPACK_STRUCT_HEADER_NAME(word)  (((word) >> 8)  & 0xFFFFU)
+#define PACK_STRUCT_HEADER(name_idx, field_count)                                                            \
+    (((uint32_t)(OP_DEFINE_STRUCT)&0xFF) | (((uint32_t)(name_idx)&0xFFFF) << 8) |                            \
+     (((uint32_t)(field_count)&0xFF) << 24))
+#define UNPACK_STRUCT_HEADER_NAME(word) (((word) >> 8) & 0xFFFFU)
 #define UNPACK_STRUCT_HEADER_COUNT(word) (((word) >> 24) & 0xFFU)
 
 /* OP_CAST operand values -- target type for `x as T` (T=string compiles to OP_TO_STR instead, since that conversion already existed). */
 #define CAST_INTEGER 0
-#define CAST_FLOAT   1
+#define CAST_FLOAT 1
 #define CAST_BOOLEAN 2
 
 /* OP_CALL_MODULE's trailing module_id word, resolved at parse time; CALL_MODULE_DYNAMIC =
    host/file module, resolved by name at runtime. */
-#define CALL_MODULE_MATH       0
-#define CALL_MODULE_RANDOM     1
-#define CALL_MODULE_STRING     2
-#define CALL_MODULE_TIME       3
-#define CALL_MODULE_JSON       4
+#define CALL_MODULE_MATH 0
+#define CALL_MODULE_RANDOM 1
+#define CALL_MODULE_STRING 2
+#define CALL_MODULE_TIME 3
+#define CALL_MODULE_JSON 4
 #define CALL_MODULE_COLLECTION 5
-#define CALL_MODULE_NET        6
-#define CALL_MODULE_REGEX      7
-#define CALL_MODULE_ACTOR      8
-#define CALL_MODULE_SCHEDULER  9
-#define CALL_MODULE_DYNAMIC    10
+#define CALL_MODULE_NET 6
+#define CALL_MODULE_REGEX 7
+#define CALL_MODULE_ACTOR 8
+#define CALL_MODULE_SCHEDULER 9
+#define CALL_MODULE_DYNAMIC 10
 
 /* Second trailing word: fn_id within the module (each module owns a flat id space);
    FN_ID_UNKNOWN still errors by name, never misroutes to id 0. */
-#define FN_ID_UNKNOWN   (-1)
+#define FN_ID_UNKNOWN (-1)
 
-#define FN_MATH_SQRT    0
-#define FN_MATH_POW     1
-#define FN_MATH_FLOOR   2
-#define FN_MATH_CEIL    3
-#define FN_MATH_ABS     4
-#define FN_MATH_MIN     5
-#define FN_MATH_MAX     6
-#define FN_MATH_SIN     7
-#define FN_MATH_COS     8
-#define FN_MATH_LOG     9
-#define FN_MATH_LOG2    10
-#define FN_MATH_LOG10   11
-#define FN_MATH_PI      12
-#define FN_MATH_ROUND   13
-#define FN_MATH_TAN     14
-#define FN_MATH_EXP     15
+#define FN_MATH_SQRT 0
+#define FN_MATH_POW 1
+#define FN_MATH_FLOOR 2
+#define FN_MATH_CEIL 3
+#define FN_MATH_ABS 4
+#define FN_MATH_MIN 5
+#define FN_MATH_MAX 6
+#define FN_MATH_SIN 7
+#define FN_MATH_COS 8
+#define FN_MATH_LOG 9
+#define FN_MATH_LOG2 10
+#define FN_MATH_LOG10 11
+#define FN_MATH_PI 12
+#define FN_MATH_ROUND 13
+#define FN_MATH_TAN 14
+#define FN_MATH_EXP 15
 
-#define FN_RANDOM_RANDOM  0
+#define FN_RANDOM_RANDOM 0
 #define FN_RANDOM_RANDINT 1
-#define FN_RANDOM_SEED    2
-#define FN_RANDOM_CHOICE  3
+#define FN_RANDOM_SEED 2
+#define FN_RANDOM_CHOICE 3
 #define FN_RANDOM_SHUFFLE 4
 
-#define FN_STRING_UPPER       0
-#define FN_STRING_LOWER       1
-#define FN_STRING_TRIM        2
-#define FN_STRING_CONTAINS    3
-#define FN_STRING_SPLIT       4
+#define FN_STRING_UPPER 0
+#define FN_STRING_LOWER 1
+#define FN_STRING_TRIM 2
+#define FN_STRING_CONTAINS 3
+#define FN_STRING_SPLIT 4
 #define FN_STRING_STARTS_WITH 5
-#define FN_STRING_ENDS_WITH   6
-#define FN_STRING_REPEAT      7
-#define FN_STRING_REPLACE     8
-#define FN_STRING_JOIN        9
-#define FN_STRING_INDEX_OF    10
+#define FN_STRING_ENDS_WITH 6
+#define FN_STRING_REPEAT 7
+#define FN_STRING_REPLACE 8
+#define FN_STRING_JOIN 9
+#define FN_STRING_INDEX_OF 10
 
-#define FN_TIME_NOW       0
-#define FN_TIME_STRFTIME  1
-#define FN_TIME_SLEEP     2
-#define FN_TIME_PARSE     3
-#define FN_TIME_TO_PARTS  4
+#define FN_TIME_NOW 0
+#define FN_TIME_STRFTIME 1
+#define FN_TIME_SLEEP 2
+#define FN_TIME_PARSE 3
+#define FN_TIME_TO_PARTS 4
 #define FN_TIME_FROM_PARTS 5
 
 #define FN_JSON_ENCODE 0
 #define FN_JSON_DECODE 1
 
-#define FN_COLLECTION_APPEND   0
-#define FN_COLLECTION_DELETE   1
-#define FN_COLLECTION_COPY     2
-#define FN_COLLECTION_INSERT   3
+#define FN_COLLECTION_APPEND 0
+#define FN_COLLECTION_DELETE 1
+#define FN_COLLECTION_COPY 2
+#define FN_COLLECTION_INSERT 3
 #define FN_COLLECTION_INDEX_OF 4
-#define FN_COLLECTION_KEYS     5
-#define FN_COLLECTION_SORT     6
-#define FN_COLLECTION_RESERVE  7
+#define FN_COLLECTION_KEYS 5
+#define FN_COLLECTION_SORT 6
+#define FN_COLLECTION_RESERVE 7
 
 #define FN_NET_CONNECT 0
-#define FN_NET_SEND    1
-#define FN_NET_RECV    2
-#define FN_NET_CLOSE   3
-#define FN_NET_LISTEN  4
-#define FN_NET_ACCEPT  5
+#define FN_NET_SEND 1
+#define FN_NET_RECV 2
+#define FN_NET_CLOSE 3
+#define FN_NET_LISTEN 4
+#define FN_NET_ACCEPT 5
 
-#define FN_REGEX_MATCH    0
-#define FN_REGEX_FIND     1
-#define FN_REGEX_REPLACE  2
+#define FN_REGEX_MATCH 0
+#define FN_REGEX_FIND 1
+#define FN_REGEX_REPLACE 2
 #define FN_REGEX_FIND_ALL 3
 
-#define FN_ACTOR_SPAWN   0
-#define FN_ACTOR_SEND    1
+#define FN_ACTOR_SPAWN 0
+#define FN_ACTOR_SEND 1
 #define FN_ACTOR_RECEIVE 2
-#define FN_ACTOR_CALL    3
+#define FN_ACTOR_CALL 3
 
 #define FN_SCHEDULER_ADD 0
 #define FN_SCHEDULER_RUN 1
 
 /* OP_CALL_BUILTIN's trailing builtin_id -- no DYNAMIC case; is_builtin_name gates every site. */
 #define CALL_BUILTIN_LENGTH 0
-#define CALL_BUILTIN_PRINT  1
-#define CALL_BUILTIN_TYPE   2
+#define CALL_BUILTIN_PRINT 1
+#define CALL_BUILTIN_TYPE 2
 #define CALL_BUILTIN_ASSERT 3
-#define CALL_BUILTIN_PANIC  4
+#define CALL_BUILTIN_PANIC 4
 /* The only way AER source constructs a Result -- lets user functions join |>'s short-circuit. */
 #define CALL_BUILTIN_RESULT 5
 
@@ -569,13 +643,13 @@ static inline uint16_t pack_rk16(int rk) {
 /* A struct type's blueprint (field names in order + default literals); individually heap-allocated
    and never moved/realloc'd, so AerStruct.shape pointers stay valid as the shape table grows. */
 struct Shape {
-    unsigned int name;                              /* pool index of the struct's type name */
+    unsigned int name; /* pool index of the struct's type name */
     unsigned int field_count;
-    unsigned int field_names[MAX_STRUCT_FIELDS];     /* pool indices, declaration order       */
-    AerVal       field_defaults[MAX_STRUCT_FIELDS];
+    unsigned int field_names[MAX_STRUCT_FIELDS]; /* pool indices, declaration order       */
+    AerVal field_defaults[MAX_STRUCT_FIELDS];
     /* TYPE_ANY = no declared type. A declared type is enforced once at FIELD_SET/construction,
        then trusted -- the fused opcodes skip the runtime check on that side. */
-    ValueType    field_types[MAX_STRUCT_FIELDS];
+    ValueType field_types[MAX_STRUCT_FIELDS];
     /* True for a TYPE_INTEGER/TYPE_REAL field whose default was written with an `i`/`f` literal
        suffix (`x = 42i`, `x = 0.0f`) -- selects narrow (4-byte int32/float32) storage instead of the
        usual 8-byte int64/float64. Works identically on a plain struct instance or as a packed-array
@@ -584,7 +658,7 @@ struct Shape {
        specialization's raw-unboxed fast path also has narrow counterparts of its own opcode family
        (OP_FIELD_GET_RAW_INT32/FLOAT32 etc.) selected via shape_find_field's own narrow output,
        parser.c. False (meaningless) for any other field kind. */
-    bool         field_narrow[MAX_STRUCT_FIELDS];
+    bool field_narrow[MAX_STRUCT_FIELDS];
     /* Byte offset of each field within an instance's fields buffer (AerStruct.fields) -- a typed
        field (TYPE_ANY excluded) is stored RAW in 8 bytes (no tag; the type is this Shape's own
        static knowledge, never read from the instance) unless field_narrow marks it 4 instead, an
@@ -592,7 +666,7 @@ struct Shape {
        including a reference type the GC must trace. Computed once in OP_DEFINE_STRUCT's handler,
        right after field_types/field_narrow are known. See vm_struct_field_read/vm_struct_field_write. */
     unsigned int field_offsets[MAX_STRUCT_FIELDS];
-    unsigned int instance_bytes;   /* total size of the fields buffer -- sum of every field's width above */
+    unsigned int instance_bytes; /* total size of the fields buffer -- sum of every field's width above */
 };
 
 /* A single struct instance -- its own type (TYPE_STRUCT), split out from AerArray specifically
@@ -602,9 +676,9 @@ struct Shape {
    No count/capacity: a struct's field count is always shape->field_count, fixed, never grows --
    carrying them the way the old shared AerArray design did was already dead weight. */
 struct AerStruct {
-    unsigned char  gc_state;   /* byte 0, same pool.c convention as every other pool-managed type */
-    Shape*         shape;
-    unsigned char* fields;     /* set to (char*)a + sizeof(AerStruct) at construction -- inline in
+    unsigned char gc_state; /* byte 0, same pool.c convention as every other pool-managed type */
+    Shape* shape;
+    unsigned char* fields; /* set to (char*)a + sizeof(AerStruct) at construction -- inline in
                                    the same pool cell, matching AerArray's own items pointer trick */
 };
 _Static_assert(offsetof(struct AerStruct, gc_state) == 0, "pool.c assumes gc_state is byte 0");
@@ -614,7 +688,7 @@ _Static_assert(offsetof(struct AerStruct, gc_state) == 0, "pool.c assumes gc_sta
    opcode in vm.c plus json.encode's struct-serialization branch (aer_json.c), which is why these
    aren't file-static. */
 AerVal vm_struct_field_read(AerStruct* s, unsigned int slot);
-void   vm_struct_field_write(AerStruct* s, unsigned int slot, AerVal v);
+void vm_struct_field_write(AerStruct* s, unsigned int slot, AerVal v);
 
 /* Byte width of one element: 4 for int32/float32, 8 for int64/float64. Not file-static -- gc.c's
    free_typed_array needs it too, to recompute a dying typed array's data-buffer size (count is
@@ -644,8 +718,8 @@ typedef enum {
 #define SPEC_MAX_RAW_PARAMS 3
 
 typedef struct {
-    Shape*       shape;
-    SpecKind     kind;
+    Shape* shape;
+    SpecKind kind;
     unsigned int code_offset;
     unsigned int max_registers;
     unsigned int max_raw_ints;
@@ -672,9 +746,9 @@ typedef struct {
        match raw_param_types exactly -- a call observing a different type for one of them just falls
        back to this entry's baseline body for that one call, same non-invasive-fallback spirit as
        the shape axis's own homogeneity check. */
-    int          raw_param_count;
-    int          raw_param_regs[SPEC_MAX_RAW_PARAMS];
-    ValueType    raw_param_types[SPEC_MAX_RAW_PARAMS];
+    int raw_param_count;
+    int raw_param_regs[SPEC_MAX_RAW_PARAMS];
+    ValueType raw_param_types[SPEC_MAX_RAW_PARAMS];
     unsigned int raw_variant_code_offset;
     unsigned int raw_variant_max_registers;
     unsigned int raw_variant_max_raw_ints;
@@ -685,11 +759,11 @@ typedef struct {
 /* Runtime-visible function registration -- outlives the parser tables so cross-module calls
    can find exports by name after compilation (same precedent as chunk->shapes[]). */
 typedef struct {
-    unsigned int name;           /* pool index of the function's name */
+    unsigned int name; /* pool index of the function's name */
     unsigned int code_offset;
     unsigned int arity;
     unsigned int min_arity;
-    AerVal*      defaults;       /* (arity - min_arity) owned values or NULL; freed by chunk_free */
+    AerVal* defaults; /* (arity - min_arity) owned values or NULL; freed by chunk_free */
     /* Real peak register need, patched in after the body compiles; the FRAME_REGISTERS
        placeholder (read only by in-body self-reference) is never an under-allocation. */
     unsigned int max_registers;
@@ -710,7 +784,7 @@ typedef struct {
        An owned copy, not a retained lexer pointer: the REPL/aer_run_source path frees and replaces
        its one static source buffer on the NEXT call, which would dangle a raw pointer the instant
        a second such call happens -- exactly when a lazy specialization might fire. */
-    char*        source_span;
+    char* source_span;
     unsigned int source_span_len;
     /* Absolute source line the span's first character ('(') sits on -- passed to lexer_begin_span
        so a specialization recompile's bytecode gets tagged with true source line numbers instead
@@ -722,9 +796,9 @@ typedef struct {
        CallSpecCacheEntry first, then this table on a miss) before recompiling for a never-before-seen
        shape. megamorphic permanently stops specializing once the table fills, falling back to the
        generic body via code_offset above for every further call. */
-    SpecEntry    specializations[SPEC_MAX];
-    int          specialization_count;
-    bool         megamorphic;
+    SpecEntry specializations[SPEC_MAX];
+    int specialization_count;
+    bool megamorphic;
 } ChunkFunction;
 
 /* ------------------------------------------------------------------ */
@@ -741,11 +815,11 @@ typedef struct {
    this makes a cache hit read them from the entry itself (already touched for the shape check)
    instead. */
 typedef struct {
-    Shape*       shape;
-    int          slot;
+    Shape* shape;
+    int slot;
     unsigned int offset;
-    ValueType    ftype;
-    bool         narrow;   /* same reasoning as offset/ftype above -- cached, not re-derived from shape */
+    ValueType ftype;
+    bool narrow; /* same reasoning as offset/ftype above -- cached, not re-derived from shape */
 } FieldCacheEntry;
 
 /* One per-callsite specialization-dispatch cache entry (OP_CALL_SPEC) -- same monomorphic-inline-
@@ -753,7 +827,7 @@ typedef struct {
    falling into the callee's own (function-wide) SpecEntry table on a miss. last_shape == NULL
    means never populated. */
 typedef struct {
-    Shape*       last_shape;
+    Shape* last_shape;
     unsigned int last_code_offset;
     unsigned int last_max_registers;
     unsigned int last_max_raw_ints;
@@ -766,7 +840,7 @@ typedef struct {
        never verified; only ever set on a scan that fully SUCCEEDED, never on a failed/heterogeneous
        one, so a later genuinely-uniform call still gets a fresh, correct scan rather than trusting a
        stale negative result. */
-    AerArray*    last_verified_array;
+    AerArray* last_verified_array;
     unsigned int last_verified_generation;
     /* Direct pointer into target_f->specializations[] for whichever SpecEntry last_shape matched --
        lets a site-cache HIT still reach that entry's raw-numeric-variant fields (raw_param_regs/
@@ -774,38 +848,39 @@ typedef struct {
        Stable for the chunk's life once set: SpecEntry lives inside a FIXED-SIZE array
        (ChunkFunction.specializations[SPEC_MAX], never reallocated/grown), the same stability
        assumption lbl_call already relies on for target_f itself across a specialization recompile. */
-    SpecEntry*   last_entry;
+    SpecEntry* last_entry;
 } CallSpecCacheEntry;
 
 typedef struct {
     uint32_t* code;
     unsigned int count, capacity;
 
-    char* source_filename;   /* owned copy; NULL for a chunk with no real file (e.g. aer_run_source on a raw string) */
+    char*
+        source_filename; /* owned copy; NULL for a chunk with no real file (e.g. aer_run_source on a raw string) */
 
-    AerVal*      pool;           /* constants and variable names -- all deduplicated by value */
+    AerVal* pool; /* constants and variable names -- all deduplicated by value */
     unsigned int pool_count, pool_cap;
 
     /* name -> pool index, for O(1) dedup of TYPE_STRING pool entries (chunk_add_pool, vm.c); owns an independent copy of each key. */
-    HashTable    name_index;
+    HashTable name_index;
 
     /* Struct type registry appended to by OP_DEFINE_STRUCT; redeclaring a struct appends rather than replaces so old Shape pointers stay valid, and chunk_find_shape() searches newest-first. */
-    Shape**      shapes;
+    Shape** shapes;
     unsigned int shape_count, shape_cap;
 
     /* Function registry -- appended by func_register, searched newest-first. */
     ChunkFunction* functions;
-    unsigned int   function_count, function_cap;
+    unsigned int function_count, function_cap;
 
     /* Module names from `import`, parse-time only, tracked on the chunk so a later REPL line still recognizes a module an earlier line imported. */
-    char**       imported_modules;
+    char** imported_modules;
     unsigned int import_count, import_cap;
 
     /* Offset -> source line, one entry per statement; strictly increasing (binary-searched);
        rolled back with bytecode on parse-error recovery. */
     unsigned int* line_mark_offsets;
     unsigned int* line_mark_lines;
-    unsigned int  line_mark_count, line_mark_cap;
+    unsigned int line_mark_count, line_mark_cap;
 
     /* Per-site inline cache for FIELD_GET/SET: last Shape* + resolved slot. Monomorphic sites
        skip the name scan; polymorphic sites just miss. Shape* is never reallocated, so a cached
@@ -821,7 +896,7 @@ typedef struct {
 #ifdef AER_DEBUG_TOOLS
     /* Per-word dispatch counters (debug-tools only); only opcode words increment. */
     uint64_t* debug_hits;
-    unsigned int         debug_hits_cap;
+    unsigned int debug_hits_cap;
 #endif
 } Chunk;
 
@@ -830,12 +905,15 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 typedef enum { REMEMBERED_ARRAY, REMEMBERED_DICT, REMEMBERED_STRUCT } RememberedKind;
-typedef struct { void* ptr; RememberedKind kind; } RememberedEntry;
+typedef struct {
+    void* ptr;
+    RememberedKind kind;
+} RememberedEntry;
 
 /* Explicit growable worklist, not C recursion, since user data structures have no depth limit;
    pool_mark's "already marked" return terminates cycles correctly. */
 typedef struct {
-    AerVal*      items;
+    AerVal* items;
     unsigned int count, cap;
 } MarkWorklist;
 
@@ -849,11 +927,11 @@ typedef struct {
    never-to-be-reused allocation can't sit here retaining memory indefinitely) keep this bounded.
    Checked by vm_new_typed_array (vm.c) before calling xmalloc; populated by free_typed_array
    (gc.c) instead of calling free(), whenever there's a free slot and the buffer qualifies. */
-#define TYPED_ARRAY_FREE_CACHE_SLOTS     8
+#define TYPED_ARRAY_FREE_CACHE_SLOTS 8
 #define TYPED_ARRAY_FREE_CACHE_MAX_BYTES (4u * 1024 * 1024)
 
 typedef struct {
-    size_t         size;   /* 0 = empty slot */
+    size_t size; /* 0 = empty slot */
     unsigned char* ptr;
 } TypedArrayFreeSlot;
 
@@ -879,7 +957,7 @@ typedef struct {
        added/deduped, never removed, and re-traced as extra roots on every minor collection
        thereafter. */
     RememberedEntry* remembered_set;
-    unsigned int     remembered_count, remembered_cap;
+    unsigned int remembered_count, remembered_cap;
     /* Set once, forever, on the first real collection this heap ever runs -- before that,
        POOL_OLD can't be set anywhere, so the write barrier is provably a no-op. */
     bool gc_ever_collected;
@@ -900,7 +978,7 @@ typedef struct {
        ratcheting upward forever. */
     unsigned int minor_gc_threshold_floor;
     unsigned int minor_collections_run, major_collections_run, minor_since_major;
-    int          gc_suppress_depth;
+    int gc_suppress_depth;
 
     /* Cells allocated since gc_reset_alloc_counts -- gc_maybe_collect checks this against
        minor_gc_threshold. Was a single process-global counter (pool.c); now one per heap. */
@@ -917,14 +995,14 @@ typedef struct {
 /* Virtual machine                                                      */
 /* ------------------------------------------------------------------ */
 
-#define VM_STACK_MAX    256
-#define VM_CALL_MAX     64
-#define VM_KEY_MAX      4096   /* max dict key length for stack-buffered lookups */
+#define VM_STACK_MAX 256
+#define VM_CALL_MAX 64
+#define VM_KEY_MAX 4096 /* max dict key length for stack-buffered lookups */
 
 /* Per-call register frame; lives in the VM struct so a nested module VM gets its own chain. */
 typedef struct {
     /* Bump-pointer base into vm->register_stack -- a call is a pointer add, never an allocation. */
-    AerVal*      registers;
+    AerVal* registers;
     /* Registers THIS frame reserved (callee's compile-time peak; FRAME_REGISTERS for frame 0) --
        read by the next push. */
     unsigned int frame_size;
@@ -934,77 +1012,85 @@ typedef struct {
        (mirrors registers/frame_size above) rather than fixed inline arrays -- a fixed array here
        would cost every frame RAW_REGISTERS_INT+REAL slots regardless of whether that function uses
        any raw locals at all. */
-    int64_t*     raw_ints;
-    double*      raw_reals;
+    int64_t* raw_ints;
+    double* raw_reals;
     unsigned int raw_int_frame_size;
     unsigned int raw_real_frame_size;
 
-    unsigned int return_ip;   /* where to resume in the CALLER */
-    int          dest_reg;    /* which of the CALLER's registers gets the return value */
+    unsigned int return_ip; /* where to resume in the CALLER */
+    int dest_reg; /* which of the CALLER's registers gets the return value */
 
-    unsigned int code_offset;  /* this frame's entry point, for stack traces; unset on frame 0 */
-    unsigned int tail_calls_collapsed;  /* tail calls collapsed into this frame since its last real push */
-    bool synthetic_entry;  /* true for a setup_call()-pushed frame -- return_ip isn't a real caller line */
+    unsigned int code_offset; /* this frame's entry point, for stack traces; unset on frame 0 */
+    unsigned int tail_calls_collapsed; /* tail calls collapsed into this frame since its last real push */
+    bool synthetic_entry; /* true for a setup_call()-pushed frame -- return_ip isn't a real caller line */
 } CallFrame;
 /* Regression guard: raw_ints/raw_reals used to be fixed inline arrays here (RAW_REGISTERS_INT +
    RAW_REGISTERS_REAL int64_t/double slots each), costing every single frame ~550+ bytes whether or
    not that function used any raw locals at all. They're pointers into a shared VM-level bump-pointer
    stack now (see raw_int_stack/raw_real_stack below) -- if this ever creeps back up near the old
    size, someone likely reintroduced fixed per-frame arrays instead of the shared-stack pattern. */
-_Static_assert(sizeof(CallFrame) <= 96, "CallFrame grew unexpectedly large -- raw_ints/raw_reals should stay pointers into the shared VM-level raw_int_stack/raw_real_stack, not fixed inline per-frame arrays");
+_Static_assert(sizeof(CallFrame) <= 96,
+               "CallFrame grew unexpectedly large -- raw_ints/raw_reals should stay pointers into the shared "
+               "VM-level raw_int_stack/raw_real_stack, not fixed inline per-frame arrays");
 
 typedef struct {
-    Chunk*       chunk;
+    Chunk* chunk;
     unsigned int ip;
 
     /* This VM's own heap -- every pool it allocates from, independent of every other VM's. */
-    VmHeap       heap;
+    VmHeap heap;
 
     /* Per-VM capability toggles, seeded from the process-wide aer_io_enabled/aer_net_enabled
        defaults at vm_init AND every aer_run_source call (the REPL/embedding "run more code into an
        existing VM" entry point) -- see those externs' own comment below for why io/net moved here
        but import_enabled didn't. */
-    bool         io_enabled;
-    bool         net_enabled;
+    bool io_enabled;
+    bool net_enabled;
 
     /* Scratch argument channel for bridging out of the register convention (stdlib/module calls). */
-    AerVal       stack[VM_STACK_MAX];
-    int          stack_top;
+    AerVal stack[VM_STACK_MAX];
+    int stack_top;
 
     /* Always point at call_stack[call_depth]'s arrays -- repointed together on call/return. */
-    CallFrame  call_stack[VM_CALL_MAX];
-    AerVal*      registers;
-    int64_t*     raw_ints;
-    double*      raw_reals;
-    int          call_depth;
+    CallFrame call_stack[VM_CALL_MAX];
+    AerVal* registers;
+    int64_t* raw_ints;
+    double* raw_reals;
+    int call_depth;
 
     /* One shared register bank for the whole chain (calls bump a base pointer). Same worst-case
        size as a flat design, but the actually-touched working set is far smaller. */
-    AerVal       register_stack[VM_CALL_MAX * FRAME_REGISTERS];
+    AerVal register_stack[VM_CALL_MAX * FRAME_REGISTERS];
     /* Same bump-pointer-bank idea as register_stack, for raw_ints[]/raw_reals[] -- see CallFrame's
        own comment for why this replaced per-frame fixed arrays. */
-    int64_t      raw_int_stack[VM_CALL_MAX * RAW_REGISTERS_INT];
-    double       raw_real_stack[VM_CALL_MAX * RAW_REGISTERS_REAL];
+    int64_t raw_int_stack[VM_CALL_MAX * RAW_REGISTERS_INT];
+    double raw_real_stack[VM_CALL_MAX * RAW_REGISTERS_REAL];
 } VM;
 
 /* Bounds-checked push/pop for native-module files, outside vm_run's PUSH()/POP() macros. */
 static inline bool vm_stack_push(VM* vm, AerVal v) {
-    if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return false; }
+    if (vm->stack_top >= VM_STACK_MAX) {
+        error("Stack overflow");
+        return false;
+    }
     vm->stack[vm->stack_top++] = v;
     return true;
 }
 
 static inline AerVal vm_stack_pop(VM* vm) {
-    if (vm->stack_top <= 0) { error("Stack underflow"); return aer_null(); }
+    if (vm->stack_top <= 0) {
+        error("Stack underflow");
+        return aer_null();
+    }
     return vm->stack[--vm->stack_top];
 }
 
-void         chunk_init(Chunk* c);
-void         chunk_free(Chunk* c);
-void         chunk_emit(Chunk* c, uint32_t word);
+void chunk_init(Chunk* c);
+void chunk_free(Chunk* c);
+void chunk_emit(Chunk* c, uint32_t word);
 
 /* Records that bytecode from `offset` onward belongs to source `line`, once per statement not instruction (see line_mark_offsets); no-op if offset doesn't strictly increase from the last mark. */
-void         chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line);
+void chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line);
 
 /* The source line whose statement contains `offset` (the largest recorded mark at or before it), or 0 if the chunk has no marks yet. */
 unsigned int chunk_line_for_offset(Chunk* c, unsigned int offset);
@@ -1023,11 +1109,11 @@ void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb);
 void vm_print_value(Chunk* c, AerVal v, bool in_collection);
 
 unsigned int chunk_add_pool(Chunk* c, AerVal v);
-Shape*       chunk_find_shape(Chunk* c, const char* name);
+Shape* chunk_find_shape(Chunk* c, const char* name);
 
 /* `defaults` is taken by ownership, never copied. */
-void           chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offset,
-                                   unsigned int arity, unsigned int min_arity, AerVal* defaults);
+void chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offset, unsigned int arity,
+                        unsigned int min_arity, AerVal* defaults);
 ChunkFunction* chunk_find_function(Chunk* c, const char* name);
 
 /* Parse-time variant -- name_idx is a dedup'd pool index, so this is an int compare, no strcmp. */
@@ -1038,8 +1124,8 @@ ChunkFunction* chunk_find_function_by_offset(Chunk* c, unsigned int code_offset)
 
 /* `name` binds the module; `path_name` resolves to the file (dots as separators). Neither
    is NUL-terminated. */
-bool chunk_add_import(Chunk* c, const char* name, unsigned int len,
-                       const char* path_name, unsigned int path_len);
+bool chunk_add_import(Chunk* c, const char* name, unsigned int len, const char* path_name,
+                      unsigned int path_len);
 bool chunk_is_imported(Chunk* c, const char* name, unsigned int len);
 
 /* Process-wide capability DEFAULTS -- default true (every prior release's always-on behavior,
@@ -1065,7 +1151,7 @@ void vm_free(VM* vm);
    on the C call stack (aer_module.c's aer_vm_instantiate_from_file) -- see vm_current_heap's own
    comment in vm.c for why vm_run_slice's save/restore alone isn't enough here. */
 VmHeap* vm_current_heap(void);
-void    vm_set_current_heap(VmHeap* heap);
+void vm_set_current_heap(VmHeap* heap);
 
 /* Same save/restore need as vm_current_heap, for the file-scope active_vm_for_errors global (vm.c)
    -- vm_init() unconditionally repoints it at the new VM before that VM ever runs. */
@@ -1077,9 +1163,9 @@ void vm_set_active_error_vm(VM* vm);
 bool vm_run(VM* vm);
 
 typedef enum {
-    VM_SLICE_DONE,      /* reached OP_HALT */
-    VM_SLICE_YIELDED,   /* max_instructions reached at a loop back-edge or call; vm->ip is a valid resume point */
-    VM_SLICE_ERROR,     /* runtime error, same as vm_run's false */
+    VM_SLICE_DONE, /* reached OP_HALT */
+    VM_SLICE_YIELDED, /* max_instructions reached at a loop back-edge or call; vm->ip is a valid resume point */
+    VM_SLICE_ERROR, /* runtime error, same as vm_run's false */
 } VmSliceResult;
 
 /* vm_run(vm) is exactly vm_run_slice(vm, 0) -- 0 means unlimited, the only budget every caller but
@@ -1099,8 +1185,7 @@ void vm_gc_unsuppress(void);
 
 /* Cross-module call setup (aer_module_call only): pushes a real frame with dest_reg fixed at
    0 -- after the trampoline drains, the result is in call_stack[0].registers[0]. */
-bool setup_call(VM* target, ChunkFunction* fn, int arg_count,
-                    AerVal* args, unsigned int return_ip);
+bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsigned int return_ip);
 
 /* Returns an uninitialized AerArray header from vm.c's internal slab pool, as if xmalloc'd directly (every in-file vm.c site still uses pool_alloc); exposed only because aer_stdlib.c's string.split() needs one and the pool isn't a raw global outside vm.c. */
 AerArray* vm_new_array(void);

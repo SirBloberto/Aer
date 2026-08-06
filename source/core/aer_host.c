@@ -3,21 +3,21 @@
 #include "error.h"
 
 typedef struct {
-    char*       module;
-    char*       name;
+    char* module;
+    char* name;
     AerNativeFn fn;
-    void*       userdata;
+    void* userdata;
 } HostFunction;
 
 static HostFunction host_functions[MAX_HOST_FUNCTIONS];
-static int          host_function_count = 0;
+static int host_function_count = 0;
 
 bool aer_register_function(const char* module, const char* name, AerNativeFn fn, void* userdata) {
     if (host_function_count >= MAX_HOST_FUNCTIONS) return false;
     HostFunction* h = &host_functions[host_function_count++];
-    h->module   = xstrdup(module);
-    h->name     = xstrdup(name);
-    h->fn       = fn;
+    h->module = xstrdup(module);
+    h->name = xstrdup(name);
+    h->fn = fn;
     h->userdata = userdata;
     return true;
 }
@@ -37,8 +37,7 @@ bool aer_host_is_module(const char* name, unsigned int len) {
    does a linear host-function scan and a memcpy, not remotely hot) for a dispatch loop whose own
    frame stays small enough to not crowd out L1: same instruction count, ~9-10% fewer cycles on
    nbody_large_packed_narrow.aer across 8 runs each side. */
-__attribute__((noinline))
-bool aer_host_call(VM* vm, const char* module, const char* fn_name, int arg_count) {
+__attribute__((noinline)) bool aer_host_call(VM* vm, const char* module, const char* fn_name, int arg_count) {
     HostFunction* h = NULL;
     for (int i = 0; i < host_function_count; i++) {
         if (strcmp(host_functions[i].module, module) != 0) continue;
@@ -48,7 +47,10 @@ bool aer_host_call(VM* vm, const char* module, const char* fn_name, int arg_coun
     }
     if (!h) return false;
 
-    if (vm->stack_top < arg_count) { error("Stack underflow"); return true; }
+    if (vm->stack_top < arg_count) {
+        error("Stack underflow");
+        return true;
+    }
 
     /* A copy, not a live pointer into the VM's stack (see aer.h's AerNativeFn contract) --
        arg_count <= vm->stack_top <= VM_STACK_MAX keeps it in bounds. */
@@ -58,7 +60,10 @@ bool aer_host_call(VM* vm, const char* module, const char* fn_name, int arg_coun
     AerVal ret = h->fn(vm, arg_count, args, h->userdata);
     vm->stack_top -= arg_count;
 
-    if (vm->stack_top >= VM_STACK_MAX) { error("Stack overflow"); return true; }
+    if (vm->stack_top >= VM_STACK_MAX) {
+        error("Stack overflow");
+        return true;
+    }
     vm->stack[vm->stack_top++] = ret;
     return true;
 }

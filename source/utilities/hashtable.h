@@ -11,9 +11,9 @@
    or have no owning VM at all (a Chunk's name_index, which outlives/exists independently of any
    one VM). Each owner supplies its own HashPools (a VM's own, embedded in VmHeap; a process-global
    one for Chunk.name_index) and every HashTable records which one it was created with. */
-#define HASH_KEY_TIER_COUNT    4
+#define HASH_KEY_TIER_COUNT 4
 #define HASH_SPARSE_TIER_COUNT 5
-#define HASH_DENSE_TIER_COUNT  6
+#define HASH_DENSE_TIER_COUNT 6
 typedef struct {
     Pool key_pools[HASH_KEY_TIER_COUNT];
     Pool sparse_pools[HASH_SPARSE_TIER_COUNT];
@@ -31,20 +31,20 @@ void hashtable_pools_init(HashPools* pools);
    key; the AerVal payload's heap cells belong to the GC. `hash` is cached at insertion so a rehash
    or remove's repair walk never recomputes it. */
 typedef struct {
-    char*        key;
+    char* key;
     unsigned int length;
-    uint64_t     hash;
-    AerVal       payload;
+    uint64_t hash;
+    AerVal payload;
 } HashTableEntry;
 
 typedef struct {
-    HashTableEntry* dense;          /* insertion-appended, packed [0, count), no holes */
-    unsigned int*   sparse;         /* capacity-sized probe array; UINT32_MAX = empty,
+    HashTableEntry* dense; /* insertion-appended, packed [0, count), no holes */
+    unsigned int* sparse; /* capacity-sized probe array; UINT32_MAX = empty,
                                         otherwise a dense-array index */
-    unsigned int    count;          /* live entries -- also dense's used length */
-    unsigned int    dense_capacity; /* allocated length of dense -- grows independently of capacity */
-    unsigned int    capacity;       /* allocated length of sparse; power of two */
-    HashPools*      pools;          /* set once at creation -- see HashPools' own comment above */
+    unsigned int count; /* live entries -- also dense's used length */
+    unsigned int dense_capacity; /* allocated length of dense -- grows independently of capacity */
+    unsigned int capacity; /* allocated length of sparse; power of two */
+    HashPools* pools; /* set once at creation -- see HashPools' own comment above */
 } HashTable;
 
 /* `length` must be the key's TRUE length -- i.e. already truncated at any embedded NUL via
@@ -52,17 +52,17 @@ typedef struct {
    must all agree on this same truncated length for a given key's bytes, or a lookup and its own
    prior insert can silently disagree (get/put pairs originating from the same source bytes should
    always call hashtable_key_true_len once and reuse the result for both). */
-void    hashtable_put(HashTable* t, char* key, unsigned int length, AerVal value);
+void hashtable_put(HashTable* t, char* key, unsigned int length, AerVal value);
 AerVal* hashtable_get(HashTable* t, const char* key, unsigned int length);
-void    hashtable_remove(HashTable* t, const char* key, unsigned int length);
-void    hashtable_clear(HashTable* t);
-void    hashtable_free(HashTable* t);
+void hashtable_remove(HashTable* t, const char* key, unsigned int length);
+void hashtable_clear(HashTable* t);
+void hashtable_free(HashTable* t);
 
 /* Pre-sizes both the sparse and dense arrays for an expected final entry count known up front (a
    dict literal's pair_count, at parse time) -- t->pools must already be set. Skips the incremental
    growth every hashtable_put would otherwise do one entry at a time; a no-op if the table's
    already at least this big. Never shrinks anything. */
-void    hashtable_reserve(HashTable* t, unsigned int expected_count);
+void hashtable_reserve(HashTable* t, unsigned int expected_count);
 
 /* Same contract as the plain versions above, but the caller has already computed (or cached) the
    key's hash itself -- e.g. an AerString reused as a dict key many times, or an existing
@@ -70,7 +70,7 @@ void    hashtable_reserve(HashTable* t, unsigned int expected_count);
    own hash_bytes() call. `hash` MUST equal hash_bytes(key, length) exactly, or this table's probe
    sequence silently disagrees with a plain hashtable_get/put's, corrupting lookups. The plain
    versions are defined in terms of these, not the other way around. */
-void    hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value);
+void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value);
 AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length, uint64_t hash);
 
 /* Same probe as hashtable_get_hashed, but returns the entry's dense-array index (or -1) instead of
@@ -88,7 +88,7 @@ uint64_t hashtable_hash_bytes(const char* key, unsigned int length);
    key will eventually be put into (or was removed from) -- a key duped from one HashPools and
    freed into another would corrupt both. */
 char* hashtable_key_dup(HashPools* pools, const char* data, unsigned int len, unsigned int* out_len);
-void  hashtable_key_free(HashPools* pools, char* key, unsigned int len);
+void hashtable_key_free(HashPools* pools, char* key, unsigned int len);
 
 /* The length hashtable_key_dup would truncate `data`/`len` to (first embedded NUL, or `len`
    itself if none). A caller that needs the true length before deciding whether to look up or

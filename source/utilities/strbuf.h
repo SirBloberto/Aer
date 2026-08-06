@@ -5,7 +5,11 @@
 
 /* Growable string buffer shared by value formatting (vm.c) and JSON encoding (aer_json.c).
    Always NUL-terminated; the caller owns buf and frees it (or hands it to aer_make_string). */
-typedef struct { char* buf; size_t len; size_t cap; } StrBuf;
+typedef struct {
+    char* buf;
+    size_t len;
+    size_t cap;
+} StrBuf;
 
 void strbuf_init(StrBuf* b);
 void strbuf_append_n(StrBuf* b, const char* s, size_t n);

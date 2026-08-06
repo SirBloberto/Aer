@@ -7,51 +7,51 @@
 typedef enum TokenType {
     /* Binary ops -- precedence is looked up by binary_op_info()'s switch in parser.c, not by enum
        order, so nothing here needs to stay contiguous. */
-    TOKEN_OR,               /* or */
-    TOKEN_PIPE,             /* |> -- x |> f(a) desugars to f(x, a) */
-    TOKEN_AND,              /* and */
-    TOKEN_BITWISE_OR,       /* |  */
-    TOKEN_BITWISE_XOR,      /* ^  */
-    TOKEN_BITWISE_AND,      /* &  */
-    TOKEN_EQUAL,            /* == */
-    TOKEN_NOT_EQUAL,        /* != */
-    TOKEN_LESS,             /* <  */
-    TOKEN_GREATER,          /* >  */
-    TOKEN_LESS_EQUAL,       /* <= */
-    TOKEN_GREATER_EQUAL,    /* >= */
-    TOKEN_IN,               /* in -- membership test: `key in dict`, `value in array` */
-    TOKEN_LEFT_SHIFT,       /* << */
-    TOKEN_RIGHT_SHIFT,      /* >> */
-    TOKEN_ADD,              /* +  */
-    TOKEN_SUBTRACT,         /* -  */
-    TOKEN_MULTIPLY,         /* *  */
-    TOKEN_DIVIDE,           /* /  */
-    TOKEN_MODULO,           /* %  */
-    TOKEN_FLOOR_DIVIDE,     /* // */
+    TOKEN_OR, /* or */
+    TOKEN_PIPE, /* |> -- x |> f(a) desugars to f(x, a) */
+    TOKEN_AND, /* and */
+    TOKEN_BITWISE_OR, /* |  */
+    TOKEN_BITWISE_XOR, /* ^  */
+    TOKEN_BITWISE_AND, /* &  */
+    TOKEN_EQUAL, /* == */
+    TOKEN_NOT_EQUAL, /* != */
+    TOKEN_LESS, /* <  */
+    TOKEN_GREATER, /* >  */
+    TOKEN_LESS_EQUAL, /* <= */
+    TOKEN_GREATER_EQUAL, /* >= */
+    TOKEN_IN, /* in -- membership test: `key in dict`, `value in array` */
+    TOKEN_LEFT_SHIFT, /* << */
+    TOKEN_RIGHT_SHIFT, /* >> */
+    TOKEN_ADD, /* +  */
+    TOKEN_SUBTRACT, /* -  */
+    TOKEN_MULTIPLY, /* *  */
+    TOKEN_DIVIDE, /* /  */
+    TOKEN_MODULO, /* %  */
+    TOKEN_FLOOR_DIVIDE, /* // */
 
     /* Assignment operators */
-    TOKEN_ASSIGN,           /* =   */
-    TOKEN_ADD_ASSIGN,       /* +=  */
-    TOKEN_SUBTRACT_ASSIGN,  /* -=  */
-    TOKEN_MULTIPLY_ASSIGN,  /* *=  */
-    TOKEN_DIVIDE_ASSIGN,    /* /=  */
-    TOKEN_MODULO_ASSIGN,    /* %=  */
+    TOKEN_ASSIGN, /* =   */
+    TOKEN_ADD_ASSIGN, /* +=  */
+    TOKEN_SUBTRACT_ASSIGN, /* -=  */
+    TOKEN_MULTIPLY_ASSIGN, /* *=  */
+    TOKEN_DIVIDE_ASSIGN, /* /=  */
+    TOKEN_MODULO_ASSIGN, /* %=  */
     TOKEN_FLOOR_DIVIDE_ASSIGN, /* //= */
 
     /* Unary operators */
-    TOKEN_NOT,              /* not -- see binary_op_info's comment: binds tighter than and/or, looser than everything else */
-    TOKEN_BITWISE_NOT,      /* ~  */
+    TOKEN_NOT, /* not -- see binary_op_info's comment: binds tighter than and/or, looser than everything else */
+    TOKEN_BITWISE_NOT, /* ~  */
 
     /* Punctuation */
-    TOKEN_OPEN_PARENTHESE,  /* (  */
+    TOKEN_OPEN_PARENTHESE, /* (  */
     TOKEN_CLOSE_PARENTHESE, /* )  */
-    TOKEN_OPEN_BRACKET,     /* [  */
-    TOKEN_CLOSE_BRACKET,    /* ]  */
-    TOKEN_OPEN_BRACE,       /* {  */
-    TOKEN_CLOSE_BRACE,      /* }  */
-    TOKEN_COLON,            /* :  */
-    TOKEN_DOT,              /* .  -- struct field access: p.x */
-    TOKEN_DOT_DOT,          /* .. */
+    TOKEN_OPEN_BRACKET, /* [  */
+    TOKEN_CLOSE_BRACKET, /* ]  */
+    TOKEN_OPEN_BRACE, /* {  */
+    TOKEN_CLOSE_BRACE, /* }  */
+    TOKEN_COLON, /* :  */
+    TOKEN_DOT, /* .  -- struct field access: p.x */
+    TOKEN_DOT_DOT, /* .. */
 
     /* Literals */
     TOKEN_IDENTIFIER,
@@ -80,7 +80,7 @@ typedef enum TokenType {
     TOKEN_TYPE_BOOLEAN,
 
     TOKEN_COMMA,
-    TOKEN_SEMICOLON,        /* ;  -- the repeat-literal separator, `[value; count]`, and nothing else */
+    TOKEN_SEMICOLON, /* ;  -- the repeat-literal separator, `[value; count]`, and nothing else */
 
     TOKEN_INDENT,
     TOKEN_DEDENT,
@@ -93,12 +93,12 @@ typedef enum TokenType {
 
 typedef struct Token {
     TokenType type;
-    AerVal    value;
+    AerVal value;
     /* Set only for TOKEN_INTEGER/TOKEN_REAL immediately suffixed `i`/`f` (`42i`, `0.0f`) -- a
        parse-time-only marker (a runtime AerVal has no memory of it) selecting 32-bit int32/float32
        storage in a repeat-literal array (`[0.0f; n]`) or a struct field's default. Meaningless on
        any other token type. */
-    bool      narrow;
+    bool narrow;
 } Token;
 
 void read_file(char* name);
@@ -128,7 +128,7 @@ const char* current_source_name();
 /* Captures everything read_file()/indent tracking need to resume the CURRENT file's lexing where it left off after a nested read_file()+lex()+parse() cycle for an imported file completes; opaque outside lexer.c -- only ever saved and restored, never inspected. */
 typedef struct LexerState LexerState;
 LexerState* lexer_save_state(void);
-void        lexer_restore_state(LexerState* state);
+void lexer_restore_state(LexerState* state);
 
 /* Begins lexing a fresh, independent text span (e.g. a string interpolation's `{expr}` body) --
    see this function's own comment in lexer.c for the save/restore contract callers must follow.
