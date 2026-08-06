@@ -2121,10 +2121,6 @@ no per-`VM` granularity. Running genuinely untrusted AER source still needs more
 permission system would need per-`VM` capability sets and, for `io`/`import` specifically, path
 allowlisting, neither of which exist today.
 
-Hashtable key lookups (`in`, `delete`, index get/set) build a null-terminated copy of the key into a
-fixed `VM_KEY_MAX` (4096 byte) stack buffer rather than a length-sized VLA, so an oversized key
-raises a normal AER runtime error instead of risking a stack overflow.
-
 ---
 
 ## File Map
