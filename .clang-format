@@ -1,0 +1,37 @@
+# Formatting is enforced in CI (clang-format --dry-run --Werror), not left to reviewer discipline.
+# Change a value here and the whole tree reformats -- run `make format` and commit that separately
+# from any behavior change, so the reformat diff never hides a real one.
+Language: Cpp
+BasedOnStyle: LLVM
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 110
+
+# Single-statement guards (`if (!p) return;`) stay on one line -- that was already the plurality
+# style. Anything carrying an else gets braces, where the one-line form actually misleads.
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortCaseLabelsOnASingleLine: true
+
+# Column alignment is deliberately off: it looks tidy, but one field rename re-diffs the whole
+# block and buries the real change in whitespace noise.
+AlignConsecutiveDeclarations: false
+AlignConsecutiveAssignments: false
+AlignConsecutiveMacros: false
+AlignTrailingComments: false
+
+PointerAlignment: Left
+DerivePointerAlignment: false
+BreakBeforeBraces: Attach
+IndentCaseLabels: true
+SpaceAfterCStyleCast: false
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+
+# Includes are hand-ordered and some orderings are load-bearing -- never let the formatter shuffle
+# them.
+SortIncludes: false
+ReflowComments: false

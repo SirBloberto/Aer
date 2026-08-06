@@ -192,5 +192,20 @@ FUZZ_SEED       := --seed 100
 fuzz: asan
 	python3 tests/fuzz.py --binary binary/aer-asan$(EXE) --iterations $(FUZZ_ITERATIONS) $(FUZZ_SEED)
 
+# Formatting and comment-density gates -- both run in CI, so a drifting tree fails the build
+# rather than relying on whoever is editing to remember the conventions (ARCHITECTURE.md).
+FORMAT_FILES := $(wildcard source/*.c source/*.h source/*/*.c source/*/*.h include/*.h)
+
+format:
+	clang-format -i $(FORMAT_FILES)
+
+check-format:
+	clang-format --dry-run --Werror $(FORMAT_FILES)
+
+check-comments:
+	python3 tools/check_comments.py
+
+check-style: check-format check-comments
+
 clean:
 	rm -rf binary/* object/* tests/fuzz_crashes

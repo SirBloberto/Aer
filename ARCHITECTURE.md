@@ -1319,6 +1319,34 @@ This isn't a stylistic preference layered on top of the project — AER's own st
 light, fast, and easy to understand (see README), and a dense comment block works against "easy to
 understand" exactly as much as an unnecessary abstraction does.
 
+**Prefer a check over a comment.** If a comment exists to warn ("don't reorder these fields", "this
+must stay byte 0"), a `_Static_assert` says the same thing and cannot be skimmed past — it fails the
+build with the reason attached. `AerString` and every pooled type use this for their layout
+constraints. Reach for it before writing the paragraph.
+
+**Enforced, not just stated.** `make check-comments` (run in CI) fails on any block over 6 lines.
+The blocks that predate the check are grandfathered in `tools/comment_baseline.txt`; that file is a
+ratchet, so removing an entry is welcome and adding one needs a real reason. This rule lived here as
+prose for a long time and drifted back to 20% comment density anyway — the check is the same rule
+with teeth.
+
+### Formatting
+
+`.clang-format` at the repo root is authoritative; `make format` applies it, `make check-format`
+verifies it, and CI runs the latter. The settings that were a real judgment call:
+
+- **`AllowShortIfStatementsOnASingleLine: WithoutElse`** — `if (!p) return;` stays on one line,
+  which was already the most common form. Anything with an `else` gets braces, where the one-line
+  version genuinely misleads.
+- **`ColumnLimit: 110`** — wide enough for this codebase's operand-heavy VM code without the
+  638-character lines that existed before.
+- **`AlignConsecutive*: false`** — column-aligned declarations look tidy, but one rename re-diffs
+  the whole block and buries real changes in whitespace.
+- **`SortIncludes: false`** — include order is hand-maintained and parts of it are load-bearing.
+
+Reformat commits must be separate from behavior changes, so a large whitespace diff never hides a
+real one.
+
 ### Dead code
 
 If a function, opcode, branch, or file is confirmed unused, delete it outright — don't comment it
