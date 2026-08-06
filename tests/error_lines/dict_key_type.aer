@@ -1,0 +1,4 @@
+# vm_index_set_compute -- non-string dict key.
+d = {"a": 1}
+k = 5
+d[k] = 2   #!error: key must be a string

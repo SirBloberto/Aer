@@ -1,0 +1,4 @@
+# vm_index_get_compute, reached from lbl_index_get.
+items = [1, 2, 3]
+n = 7
+v = items[n]   #!error: out of bounds

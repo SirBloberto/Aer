@@ -1,0 +1,22 @@
+# An error raised inside a shape-specialized recompile must still report its true source line.
+# The specialized body is re-lexed from a retained source span long after the original parse, so
+# without ChunkFunction.source_span_line this reports a line relative to the span's own start --
+# near the top of the file rather than its own. The padding above the function makes that failure
+# mode obvious instead of an off-by-one.
+
+struct Body:
+    x = 0.0
+    m = 0.0
+
+function scale(b, divisor):
+    b.x = b.x * 2.0
+    return b.x / divisor   #!error: Division by zero
+
+bodies = [Body(1.0, 2.0), Body(3.0, 4.0)]
+
+i = 0
+for i < 50:
+    r = scale(bodies[0], 2.0)
+    i += 1
+
+r = scale(bodies[0], 0.0)

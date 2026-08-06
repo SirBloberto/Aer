@@ -1,0 +1,3 @@
+s = "abc"
+i = 99
+c = s[i]   #!error: out of bounds

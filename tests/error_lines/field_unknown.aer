@@ -1,0 +1,6 @@
+struct Point:
+    x = 0.0
+    y = 0.0
+
+p = Point(1.0, 2.0)
+v = p.z   #!error: z

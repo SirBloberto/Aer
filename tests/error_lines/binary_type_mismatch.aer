@@ -1,0 +1,4 @@
+# Falls out of the int/int and real/real fast paths into vm_binary_cold.
+s = "text"
+n = 1
+bad = s - n   #!error: Cannot apply '-' to string and integer

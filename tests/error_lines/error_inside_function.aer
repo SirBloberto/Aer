@@ -1,0 +1,8 @@
+# The report must name the faulting line inside the callee, not the call site.
+function inner(a, b):
+    return a / b   #!error: Division by zero
+
+function outer(x):
+    return inner(x, 0)
+
+r = outer(5)

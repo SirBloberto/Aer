@@ -80,6 +80,8 @@ test: all
 	done
 	@echo "=== tests/test_stdin.aer (piped input) ==="
 	@echo "expected stdin content" | ./binary/aer$(EXE) tests/test_stdin.aer
+	@echo "=== tests/error_lines (reported line numbers) ==="
+	python3 tests/error_lines.py --binary binary/aer$(EXE)
 
 # Embedding smoke test — links the library directly, no main.c/CLI.
 test-embed: $(LIBOBJECT)
