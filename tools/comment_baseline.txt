@@ -73,14 +73,11 @@ source/core/vm.c:16
 source/core/vm.c:9
 source/core/vm.c:9
 source/core/vm.c:9
-source/core/vm.h:14
-source/core/vm.h:12
 source/core/vm.h:9
 source/core/vm.h:7
 source/core/vm.h:8
 source/core/vm.h:10
 source/core/vm.h:9
-source/core/vm.h:11
 source/core/vm.h:10
 source/core/vm.h:10
 source/core/vm.h:13

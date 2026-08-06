@@ -113,20 +113,10 @@ typedef enum {
     OP_INDEX_GET, /* dest_reg, arr_reg, rk_idx -- via vm_index_get_compute */
     OP_INDEX_SET, /* arr_reg, rk_idx, rk_val -- via vm_index_set_compute (includes the write barrier) */
 
-    /* Loop-bound-hoisting counterparts of OP_INDEX_GET/SET, typed-array only -- same word layout
-       (dest/arr/rk_idx for GET; arr/rk_idx/rk_val for SET), only ever emitted when index_safe_
-       unchecked (parser.c) proved the index in range for the WHOLE enclosing loop, exactly the
-       packed-array field family's own OP_INDEX_FIELD_*_RAW_*_UNCHECKED opcodes above. Unlike that
-       family, there is no compile-time-baked field offset here and no separate "specialized but
-       still checked" tier -- elem_kind (int32/float32/int64/float64) is read at RUNTIME from the
-       array object itself (vm_typed_elem_read/write already take it as a parameter), so one opcode
-       covers every element kind uniformly. The array's own TYPE_TYPED_ARRAY tag IS still checked --
-       same deliberate defensive-net reasoning as vm_packed_raw_elem_unchecked's own comment -- since
-       these opcodes carry no compile-time container-identity proof analogous to reg_known_shape at
-       all (a plain function taking a typed array parameter has no specialization/recompile step to
-       hang one on); only the index-range half of the safety argument is a compile-time fact here.
-       No compound (+=) counterpart -- not measured hot enough yet to justify the extra opcode
-       surface; add one the same way if a profile ever shows otherwise. */
+    /* Typed-array-only OP_INDEX_GET/SET, same word layout, emitted only where index_safe_unchecked
+       (parser.c) proved the index in range for the whole enclosing loop. elem_kind is read at
+       runtime from the array, so one opcode covers every element kind. The TYPE_TYPED_ARRAY tag is
+       still checked -- only the index-range half of the safety argument is a compile-time fact. */
     OP_TYPED_INDEX_GET_UNCHECKED, /* dest_reg, arr_reg, rk_idx */
     OP_TYPED_INDEX_SET_UNCHECKED, /* arr_reg, rk_idx, rk_val */
 
@@ -165,18 +155,11 @@ typedef enum {
     OP_FIELD_GET, /* dest_reg, struct_reg, field_name_pool_idx */
     OP_FIELD_SET, /* struct_reg, field_name_pool_idx, rk_val -- includes the gc_barrier_array call */
 
-    /* `[value; count]` repeat-literal -- replaces the old `Type[count]` entirely. Evaluates the
-       fill expression exactly once (into fill_reg), then branches on ITS RUNTIME TYPE: TYPE_STRUCT
-       builds a packed array (AerPackedArray, fixed-primitive fields only, checked here just like
-       the old opcode did) with every element a copy of that one instance's own field values (not
-       necessarily the Shape's static defaults -- a real capability gain over the old `Type[count]`,
-       which could only ever use declared defaults); TYPE_INTEGER/TYPE_REAL builds a bare numeric
-       array (AerTypedArray) instead. narrow_flag (0 = none, 1 = int32, 2 = float32) is a pure
-       parse-time decision -- set only when the fill expression was written as a literal `i`/`f`
-       suffixed token directly in this position (`[0.0f; n]`), never derived from a runtime value
-       (see parse_primary_inner's own comment on where this is decided). Any other fill type is a
-       runtime error -- the fill expression is arbitrary, so eligibility can't be known until it
-       actually evaluates. */
+    /* `[value; count]` repeat-literal. Evaluates the fill expression once into fill_reg, then
+       branches on its runtime type: TYPE_STRUCT builds a packed array copying that instance's own
+       field values, TYPE_INTEGER/TYPE_REAL builds a typed array, anything else is a runtime error.
+       narrow_flag (0 none, 1 int32, 2 float32) is parse-time only -- set solely when the fill was
+       written as an `i`/`f` suffixed literal in this position, never derived from a runtime value. */
     OP_ARRAY_REPEAT, /* word0: dest_reg, fill_reg, narrow_flag -- word1: rk_count (RK16) */
 
     /* Fused `obj[index].field` get/set -- packed arrays have no standalone element reference, so
@@ -332,17 +315,11 @@ typedef enum {
     OP_INDEX_FIELD_COMPOUND_RAW_INT,
     OP_INDEX_FIELD_COMPOUND_RAW_REAL,
 
-    /* _UNCHECKED counterparts of the three INDEX_FIELD_*_RAW_INT/REAL opcodes above -- same
-       compile-time-constant offset, but additionally skip vm_packed_raw_elem's index-type check,
-       negative-index adjustment, bounds check, and null check entirely. Only ever emitted (see
-       parser.c's index_safe_unchecked/parse_for_in) when the index register is PROVEN, at compile
-       time, to be exactly a `for i in 0..n:`-style range-for's own loop variable where `n` was
-       itself proven == length(this same packed-array parameter) and never reassigned since --
-       every iteration's index is then guaranteed 0 <= i < n == the array's actual (permanently
-       fixed at construction, vm.c's OP_ARRAY_REPEAT) element count, with zero runtime check needed.
-       The array's own type/shape is still guarded by the ordinary reg_known_shape mechanism these
-       opcodes are gated behind (cleared on any reassignment of the parameter), so only the
-       index-safety half of vm_packed_raw_elem's checks is actually removable here. */
+    /* _UNCHECKED counterparts of the INDEX_FIELD_*_RAW_INT/REAL opcodes above: same compile-time
+       offset, but skip vm_packed_raw_elem's index-type, negative-adjust, bounds and null checks.
+       Emitted only where the index is provably a `for i in 0..n:` loop variable with n proven ==
+       length(this same array) and unreassigned. Shape is still guarded by reg_known_shape, so only
+       the index-safety half is removed. */
     OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED,
     OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED,
     OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED,
