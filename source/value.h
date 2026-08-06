@@ -150,7 +150,8 @@ struct AerString {
     char inline_buf[AER_STRING_INLINE_MAX + 1];
 };
 _Static_assert(offsetof(struct AerString, gc_state) == 0, "pool.c assumes gc_state is byte 0");
-_Static_assert(sizeof(struct AerString) == 32, "length must precede data to fill its alignment padding");
+_Static_assert(offsetof(struct AerString, data) == offsetof(struct AerString, length) + sizeof(unsigned int),
+               "length must sit immediately before data, leaving no padding between them");
 
 /* Set once at construction, never mutated -- so no write barrier needed, unlike AerArray/AerDict. */
 struct AerResult {
