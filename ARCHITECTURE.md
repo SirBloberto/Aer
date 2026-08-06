@@ -782,6 +782,37 @@ genuine algorithmic-complexity fix (O(slab_count) -> O(live young slabs) per min
 matter more as slab counts grow further, and the branch-miss reduction is real, large, and
 consistent across every run.
 
+### 5.16 Interpreter code size is not an instruction-cache problem (measured, not fixed)
+
+`vm_run_slice` compiles to ~55KB on x86-64 and ~45KB on the Pi, against a 32KB L1i — roughly 4x
+Lua's `luaV_execute`, and the obvious next lever after §5.12 is to push cold opcode bodies out of
+line the way that section pushed cold *callees* out of the frame, shrinking the function toward
+something that fits.
+
+Measured first, and the premise does not hold. L1 instruction-cache miss rates across the suite:
+
+| benchmark | instructions | L1i misses | miss rate |
+|---|---|---|---|
+| `nbody` | 8.10B | 1.50M | 0.05% |
+| `sieve` | 6.96B | 0.29M | 0.02% |
+| `fib_bench` | 0.78B | 0.06M | 0.03% |
+| `dict_bench` | 0.79B | 0.27M | 0.10% |
+| `struct_array_scan` | 47.10B | 2.46M | 0.02% |
+
+The function's *size* is not its *working set*. With 157 opcodes, any one benchmark dispatches a
+few dozen, so the bytes actually fetched are the hot labels plus the jump table — the cold labels
+occupy address space that is never touched, and the hardware never pays for them. Outlining them
+would add a real `bl`/return per cold dispatch to relieve a stall that is already down in the
+noise, so it is deliberately not done. Note this is the opposite conclusion from §5.12, and for a
+concrete reason: that section's win was a **data**-side frame the prologue touches unconditionally
+on every call, not an instruction-side fetch that only happens if the code actually runs.
+
+The same sweep pinned this Pi's cycle-counter noise band precisely, which §5.12 estimated at 1-3%:
+running `tools/bench.py` with base and head set to the *same* ref reports per-benchmark cycle
+deltas from -0.92% to +1.26%, while instruction counts over the same runs agree to within 0.03%.
+Any cycles-based claim below about 1.5% on this hardware is unfalsifiable — use instruction counts
+as the gate, and treat `--event cycles` as a coarse sanity check only.
+
 ---
 
 ## 6. Known architectural limitations (current, unresolved)
