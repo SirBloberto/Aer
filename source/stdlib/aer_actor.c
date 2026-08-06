@@ -25,7 +25,8 @@ struct Actor {
 static Actor* actors = NULL;
 static unsigned int next_actor_id = 1;   /* 0 reserved as "no such actor" */
 
-Actor* aer_actor_spawn(const char* path) {
+/* Loads path's top-level code into a fresh, independent VM once. NULL on a compile/runtime error. */
+static Actor* aer_actor_spawn(const char* path) {
     /* read_file() (called inside aer_vm_instantiate_from_file) only ever reads through this
        pointer via fopen() -- never mutated, so the cast is safe in practice, matching every
        other path string in this codebase's own imprecise-but-harmless char* convention. */
@@ -44,9 +45,13 @@ Actor* aer_actor_spawn(const char* path) {
     return a;
 }
 
-unsigned int aer_actor_id(Actor* actor) { return actor->id; }
+/* A stable, process-unique handle safe to hand to AER scripts as a plain integer. Never a raw
+   pointer cast -- a script passing back a wrong/stale integer must get a clean "no such actor"
+   error via aer_actor_find(), not a wild pointer dereference; the whole point of vm_run() never
+   crashing the host applies just as much to a script's own mistakes here. */
+static unsigned int aer_actor_id(Actor* actor) { return actor->id; }
 
-Actor* aer_actor_find(unsigned int id) {
+static Actor* aer_actor_find(unsigned int id) {
     for (Actor* a = actors; a; a = a->next) if (a->id == id) return a;
     return NULL;
 }
@@ -93,7 +98,12 @@ bool aer_actor_call(Actor* actor, const char* fn, int arg_count, AerVal* args, A
     return true;
 }
 
-bool aer_actor_send(Actor* actor, const char* message, unsigned int len) {
+/* Mailbox: a plain host-side FIFO of byte strings, never a live AerVal -- a value from one
+   actor's pools is meaningless in another's. Message content (e.g. JSON, via each side's own
+   json.encode()/json.decode() calls) is entirely up to the AER code on each end; the mailbox
+   itself only ever moves bytes. send() copies message; try_receive() hands back an owned buffer
+   the caller must free(). */
+static bool aer_actor_send(Actor* actor, const char* message, unsigned int len) {
     Mailbox* m = xmalloc(sizeof(Mailbox));
     m->data = xmalloc(len);
     memcpy(m->data, message, len);
@@ -105,7 +115,7 @@ bool aer_actor_send(Actor* actor, const char* message, unsigned int len) {
     return true;
 }
 
-bool aer_actor_try_receive(Actor* actor, char** out_message, unsigned int* out_len) {
+static bool aer_actor_try_receive(Actor* actor, char** out_message, unsigned int* out_len) {
     Mailbox* m = actor->mailbox_head;
     if (!m) return false;
     actor->mailbox_head = m->next;
@@ -126,7 +136,7 @@ static void free_mailbox(Actor* a) {
     }
 }
 
-void aer_actor_free(Actor* actor) {
+static void aer_actor_free(Actor* actor) {
     Actor** link = &actors;
     while (*link && *link != actor) link = &(*link)->next;
     if (*link) *link = actor->next;

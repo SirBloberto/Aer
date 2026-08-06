@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "aer.h"
+#include "aer_actor.h"
 #include "aer_stdlib.h"
 #include "aer_module.h"
 #include "error.h"
@@ -100,6 +101,7 @@ int main(int argc, char** argv) {
 
     /* Not load-bearing at process exit -- exercises the same teardown path an embedding host would use. */
     aer_module_free_all();
+    aer_actor_free_all();
     return status;
 }
 

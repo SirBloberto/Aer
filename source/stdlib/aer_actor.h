@@ -5,26 +5,16 @@
 
 /* Each Actor owns an independent, long-lived VM+Chunk (the same instantiation primitive
    aer_module_load uses for an import, aer_vm_instantiate_from_file), plus a plain host-side
-   mailbox. Reachable from AER scripts via the `actor` module (aer_actor_module.c) and driven
-   cooperatively by aer_scheduler.c/h, which calls aer_actor_prepare_call() then repeatedly
-   vm_run_slice()s the actor's own VM instead of running a call to completion in one shot. */
+   mailbox. Reachable from AER scripts via the `actor` module, whose binding lives at the end of
+   aer_actor.c, and driven cooperatively by aer_scheduler.c -- the only other file that needs any
+   of this. Everything the scheduler does NOT need is static in aer_actor.c rather than declared
+   here: spawn/id/find/send/try_receive/free are all reached only through the `actor` module
+   binding, which sits in that same file. */
 
 typedef struct Actor Actor;
 
-/* Loads path's top-level code into a fresh, independent VM once. NULL on a compile/runtime error. */
-Actor* aer_actor_spawn(const char* path);
-
-/* A stable, process-unique handle safe to hand to AER scripts as a plain integer (aer_actor_module.c).
-   Never a raw pointer cast -- a script passing back a wrong/stale integer must get a clean "no such
-   actor" error via aer_actor_find(), not a wild pointer dereference; the whole point of vm_run()
-   never crashing the host applies just as much to a script's own mistakes here. */
-unsigned int aer_actor_id(Actor* actor);
-Actor* aer_actor_find(unsigned int id);
-
-/* aer_actor_find() plus the type check every script-facing caller needs first -- shared by
-   aer_actor_module.c and aer_scheduler_module.c so the "is this actually an integer handle" check
-   lives in one place instead of two identical copies. NULL for anything that isn't a valid,
-   currently-live actor handle. */
+/* aer_actor_find() plus the type check a script-facing caller needs first -- NULL for anything
+   that isn't a valid, currently-live actor handle. */
 Actor* aer_actor_resolve(AerVal handle);
 
 /* Calls a top-level function already defined in actor's own script -- the same trampoline shape
@@ -44,15 +34,9 @@ bool aer_actor_prepare_call(Actor* actor, const char* fn, int arg_count, AerVal*
    opaque everywhere else. */
 VM* aer_actor_vm(Actor* actor);
 
-/* Mailbox: a plain host-side FIFO of byte strings, never a live AerVal -- a value from one
-   actor's pools is meaningless in another's. Message content (e.g. JSON, via each side's own
-   json.encode()/json.decode() calls) is entirely up to the AER code on each end; the mailbox
-   itself only ever moves bytes. send() copies message; try_receive() hands back an owned buffer
-   the caller must free(). */
-bool aer_actor_send(Actor* actor, const char* message, unsigned int len);
-bool aer_actor_try_receive(Actor* actor, char** out_message, unsigned int* out_len);
-
-void aer_actor_free(Actor* actor);
+/* Frees every actor still alive, each one's whole VM+Chunk with it. The actor-side counterpart to
+   aer_module_free_all() (aer_module.h), and called next to it -- an embedding host that spawns
+   actors needs both to tear down cleanly, not just the module half. */
 void aer_actor_free_all(void);
 
 #endif
