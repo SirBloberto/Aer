@@ -10,7 +10,7 @@ Instructions, not wall-clock: wall-clock on this Pi swings several percent from 
 while instruction counts are stable to ~0.05% run to run.
 
 Usage: python3 tools/bench.py [--base REF] [--head REF] [--runs N] [--threshold PCT]
-                              [--only NAME,NAME] [--host USER@HOST]
+                              [--only NAME,NAME] [--host USER@HOST] [--event EVENT]
 """
 import argparse
 import re
@@ -44,13 +44,13 @@ def deploy(host, ref, path):
         sys.exit("build at %s reported errors -- aborting rather than measuring a broken tree" % ref)
 
 
-def measure(host, path, name, runs):
-    """Minimum of `runs` instruction counts -- the least noise-inflated sample, not a mean."""
+def measure(host, path, name, runs, event):
+    """Minimum of `runs` counts -- the least noise-inflated sample, not a mean."""
     best = None
     for _ in range(runs):
-        r = ssh(host, "cd %s && perf stat -e instructions ./binary/aer bench/%s.aer 2>&1 >/dev/null"
-                % (path, name))
-        m = re.search(r"^\s*([0-9,]+)\s+instructions", r.stdout + r.stderr, re.M)
+        r = ssh(host, "cd %s && perf stat -e %s ./binary/aer bench/%s.aer 2>&1 >/dev/null"
+                % (path, event, name))
+        m = re.search(r"^\s*([0-9,]+)\s+%s" % re.escape(event), r.stdout + r.stderr, re.M)
         if not m:
             return None
         v = int(m.group(1).replace(",", ""))
@@ -66,6 +66,9 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.3, help="flag deltas over this percent")
     ap.add_argument("--only", default="", help="comma-separated benchmark subset")
     ap.add_argument("--host", default="pi@192.168.18.13")
+    # Changes that only move icache/BTB pressure (removing a dispatch-table entry, outlining a cold
+    # opcode body) are instruction-neutral by construction and can only be judged on cycles.
+    ap.add_argument("--event", default="instructions", help="perf event to count")
     args = ap.parse_args()
 
     names = [n.strip() for n in args.only.split(",") if n.strip()] or BENCHMARKS
@@ -77,8 +80,8 @@ def main():
     print("-" * 62)
     regressions, improvements = [], []
     for name in names:
-        b = measure(args.host, "~/bench-base", name, args.runs)
-        h = measure(args.host, "~/bench-head", name, args.runs)
+        b = measure(args.host, "~/bench-base", name, args.runs, args.event)
+        h = measure(args.host, "~/bench-head", name, args.runs, args.event)
         if b is None or h is None:
             print("%-22s %14s %14s %9s" % (name, "?", "?", "FAILED"))
             continue
@@ -92,8 +95,8 @@ def main():
         print("%-22s %14d %14d %+8.2f%%%s" % (name, b, h, pct, flag))
 
     print("-" * 62)
-    print("base=%s  head=%s  runs=%d (min)  threshold=%.2f%%"
-          % (args.base, args.head, args.runs, args.threshold))
+    print("base=%s  head=%s  runs=%d (min)  threshold=%.2f%%  event=%s"
+          % (args.base, args.head, args.runs, args.threshold, args.event))
     for name, pct in improvements:
         print("  improved: %-20s %+.2f%%" % (name, pct))
     if regressions:
