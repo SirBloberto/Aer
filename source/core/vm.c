@@ -31,15 +31,11 @@ static VmHeap* require_current_heap(void) {
     return current_heap;
 }
 
-/* Exposed so a caller that's about to vm_init() a NESTED VM while its own execution is paused on
-   the C call stack (aer_vm_instantiate_from_file: a file-module import, or an actor spawn) can
-   save the heap that was active before that nested vm_init unconditionally overwrites it, and
-   restore it once the nested VM's compile+run cycle is done -- vm_run_slice's own save/restore
-   only brackets vm_run() itself, not the vm_init()+parse() that happens before it, which is where
-   current_heap first gets clobbered. Without this, allocations made by the OUTER VM after a nested
-   import returns would keep landing in the nested VM's heap: a live object only reachable from the
-   outer VM's registers, invisible to the nested VM's own (now-independent) GC roots, silently
-   collected out from under it -- the exact heap corruption this was written to prevent. */
+/* Lets a caller about to vm_init() a nested VM (a module import, an actor spawn) save and restore
+   the previously-active heap: vm_run_slice's own save/restore brackets only vm_run(), not the
+   vm_init()+parse() before it, which is where current_heap first gets clobbered. Without it, the
+   outer VM's later allocations land in the nested heap -- reachable only from the outer VM's
+   registers, invisible to the nested GC's roots, and silently collected. */
 VmHeap* vm_current_heap(void) {
     return current_heap;
 }
@@ -127,15 +123,10 @@ static inline AerVal vm_rk_value(VM* vm, Chunk* c, int rk) {
     return vm->registers[rk];
 }
 
-/* RK16 (1 flag + 15 index bits) -- the wire form most RK operands use now (a whole halfword to
-   itself, or paired with one other 16-bit field). Returns a pointer into the hoisted
-   const_pool/registers, not a copy, so callers dereference once or forward it into an
-   always_inline consumer. Takes registers directly (the hoisted local every one of this
-   function's ~50 call sites already has in scope, all inside vm_run_slice's own dispatch loop)
-   rather than a VM* to re-derive vm->registers from -- that re-fetch, through a pointer the
-   compiler can't prove nothing else in this giant computed-goto function could have written,
-   showed up as a real, measured cost (perf annotate, fib_bench): ~4.5% fewer instructions and
-   ~5.2% fewer cycles once passed the already-hoisted pointer directly instead. */
+/* RK16: 1 flag + 15 index bits, the wire form most RK operands use. Returns a pointer into the
+   hoisted const_pool/registers, not a copy. Takes registers directly rather than re-deriving from
+   a VM*: that re-fetch, through a pointer the compiler cannot prove is unaliased inside this
+   computed-goto function, measured ~4.5% more instructions on fib_bench. */
 static inline AerVal* vm_rk_ptr16(AerVal* registers, AerVal* const_pool, uint32_t rk16) {
     if (rk16 & RK16_CONST_FLAG) return &const_pool[rk16 & RK16_INDEX_MASK];
     return &registers[rk16 & RK16_INDEX_MASK];
@@ -156,13 +147,9 @@ static inline AerVal* vm_rk_ptr8(AerVal* registers, AerVal* const_pool, uint32_t
 /* ------------------------------------------------------------------ */
 
 /* True if v's own pooled cell is young; null/boolean/real (and inline integers) have no cell, so they're trivially "not young". */
-/* Embedding-facing (vm_gc_suppress/unsuppress here; aer_gc_configure/aer_gc_set_ceiling below) --
-   none of these gained a VM* parameter: changing their signatures would break every existing
-   embedder. Suppress/unsuppress and aer_gc_stats operate on whichever heap is current (there's no
-   "before any VM" case that makes sense for a nesting counter or a stats snapshot). configure/
-   set_ceiling are different: real usage calls them BEFORE creating a VM (this project's own
-   smoke_test.c does), so they also update process-wide defaults every freshly-initialized heap
-   picks up (vm_heap_init), not just current_heap -- see their own comments. */
+/* None of these take a VM* -- adding one would break every existing embedder. Suppress/unsuppress
+   and aer_gc_stats act on the current heap. configure/set_ceiling also update process-wide
+   defaults, since real usage calls them before any VM exists. */
 void vm_gc_suppress(void) {
     require_current_heap()->gc_suppress_depth++;
 }
@@ -410,20 +397,11 @@ void vm_init(VM* vm, Chunk* chunk) {
 
 void vm_free(VM* vm) {
     VmHeap* heap = &vm->heap;
-    /* Each live cell's own separately-owned payload (a string's data buffer, an array's items,
-       a dict's whole hashtable, a packed array's data buffer) must be freed before the pool's own
-       slab memory goes away -- pool_destroy alone would leak every one of them. Every cell gets
-       finalized here regardless of mark/generation state, unlike a normal sweep: the whole heap is
-       going away, not just the garbage since the last cycle. Delegates to gc.c (gc_finalize_all_
-       pools) rather than exposing all 7 individual finalizer functions just for this one call site.
-
-       current_heap is saved/set/restored around this call specifically for free_typed_array (gc.c),
-       the one finalizer that now needs to know WHICH heap it's freeing into (to stash a data buffer
-       in that heap's own free-cache instead of actually freeing it) -- every other finalizer just
-       calls free() unconditionally and never cared. Without this, vm_free's own caller might not be
-       the heap's last active user (current_heap could be NULL, or point at some OTHER still-live
-       VM's heap -- a nested module VM closing while its parent stays active, say), and a stash
-       would land in the wrong heap's cache entirely: a real cross-heap corruption, not just a leak. */
+    /* Every live cell's separately-owned payload must be freed before its pool's slabs go away;
+       pool_destroy alone would leak them all. Unlike a normal sweep this finalizes regardless of
+       mark state -- the whole heap is going, not just recent garbage.
+       current_heap is saved/set/restored for free_typed_array, which stashes buffers into a
+       specific heap's cache; without it a stash can land in another live VM's heap. */
     VmHeap* saved_current_heap = current_heap;
     current_heap = heap;
     gc_finalize_all_pools(heap);
@@ -552,16 +530,9 @@ static inline __attribute__((always_inline)) AerVal vm_promote_real(AerVal v) {
     return v;
 }
 
-/* AER's integers are int64_t, but this build targets 32-bit ARM (armv7l Pi) with no ARCH_FLAGS
-   (see makefile -- deliberately portable, not tuned to one CPU). Confirmed by compiling `a % b` for
-   both widths on that target: even 32-bit modulo isn't a hardware instruction on the default
-   toolchain target (no guaranteed integer-divide extension without -mcpu), but it's still a much
-   cheaper libgcc call (__aeabi_idivmod/__aeabi_uidivmod, one 32-bit long-division) than 64-bit
-   modulo (__aeabi_ldivmod, roughly double the work). `n % 500`-shaped code (dict-bucket-style
-   moduli, the common case) always has both operands well inside int32 range, so it's worth
-   checking rather than always paying the 64-bit rate. rv != -1 is required, not incidental: INT32_
-   MIN % -1 is undefined behavior (a 32-bit division overflow) even though the same values are fine
-   at 64-bit width, since -2^31 doesn't overflow when widened to int64_t first. */
+/* AER integers are int64_t, but on 32-bit ARM a 64-bit modulo is a libgcc call roughly twice the
+   work of the 32-bit one, so narrow when both operands fit. rv != -1 is required, not incidental:
+   INT32_MIN % -1 overflows at 32-bit width while being perfectly fine at 64. */
 static inline int64_t aer_mod_int64(int64_t l, int64_t rv) {
     if (rv != -1 && l >= INT32_MIN && l <= INT32_MAX && rv >= INT32_MIN && rv <= INT32_MAX)
         return (int32_t)l % (int32_t)rv;
@@ -572,21 +543,10 @@ static inline int64_t aer_mod_int64(int64_t l, int64_t rv) {
 /* Operator semantics -- what +, ==, in, ... actually do                */
 /* ------------------------------------------------------------------ */
 
-/* Int/int and real/real fast path, shared by every struct-field-fusion opcode (field_binary,
-   field_compound, chain2, index_field_compound, ...). Was `always_inline` on the reasoning that it
-   was "small enough" -- true back when it had 2 callers, stale once it grew to 7: always_inline
-   duplicated this whole function's body at EVERY call site, measured as the dominant reason
-   lbl_binary_field/lbl_field_binary were among the largest compiled handlers in vm_run_slice.
-   Downgraded to a plain `inline` hint -- letting the compiler's own per-call-site cost model decide
-   -- confirmed via a full clean test-suite pass and a real vm_run_slice size reduction.
-   (A follow-on attempt reworked the `bool* handled` out-parameter into a caller-supplied `is_int`
-   flag, on the theory that force-inlining had been hiding a real address-taken-local cost. Repeat
-   measurement on the Pi didn't support that story -- L1-dcache-load-misses turned out to vary by
-   10x+ run-to-run on this exact benchmark with ZERO code changes at all, meaning the original
-   "confirmed" finding was a false signal from an unlucky single sample, not a reproducible effect --
-   and the branch-misses/cycles data pointed the other way (a real, if modest, regression). Reverted;
-   *handled stays the out-parameter design below.) Sets *handled = false for anything else; caller
-   falls back to vm_binary_cold(). */
+/* Int/int and real/real fast path shared by every struct-field-fusion opcode. A plain `inline`
+   hint, not always_inline: with 7 call sites, forcing it made lbl_binary_field/lbl_field_binary
+   among the largest handlers in vm_run_slice. Sets *handled = false for anything else, and the
+   caller falls back to vm_binary_cold(). */
 static inline AerVal vm_binary_fast(AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb,
                                     bool* handled) {
     *handled = true;
@@ -1208,13 +1168,9 @@ static inline void vm_typed_elem_write(unsigned char* slot, TypedArrayElemKind k
     }
 }
 
-/* Shared by every specialized packed-array raw field opcode below (GET/SET/COMPOUND x int/real/
-   int32/float32, 12 handlers in all) -- each one only differs in which raw slot array it reads/
-   writes and at what width, never in how the element's address is resolved. always_inline: this is
-   dispatch-loop code, not a real call boundary -- confirmed codegen-equivalent to the prior
-   hand-inlined form via before/after benchmarks (see ARCHITECTURE.md). Returns NULL, having already
-   reported the error, on any failure -- every call site's existing `if (!elem) DISPATCH();` matches
-   the unfused form's own `error(...); DISPATCH();` contract exactly. */
+/* Shared by all 12 specialized packed-array raw field opcodes, which differ only in which raw slot
+   array they touch and at what width. always_inline: dispatch-loop code, not a real call boundary.
+   Returns NULL having already reported the error, matching each call site's `if (!elem) DISPATCH()`. */
 static inline __attribute__((always_inline)) unsigned char* vm_packed_raw_elem(AerVal obj, AerVal* idx,
                                                                                unsigned int foffset) {
     if (aer_type(obj) != TYPE_PACKED_ARRAY) {
@@ -1235,13 +1191,10 @@ static inline __attribute__((always_inline)) unsigned char* vm_packed_raw_elem(A
     return pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
 }
 
-/* _UNCHECKED counterpart of vm_packed_raw_elem, for the 6 OP_INDEX_FIELD_*_RAW_INT/REAL_UNCHECKED
-   opcodes below -- only ever emitted when the index is proven, at compile time, to already be an
-   in-range integer for the WHOLE loop it came from (parser.c's index_safe_unchecked), so the index
-   type check, negative-index adjustment, bounds check, and NULL-on-failure contract all become
-   unreachable and are dropped. The array's own type check is kept regardless -- see
-   vm_packed_raw_elem's own comment just above this one on why that one specific check stays a
-   defensive net rather than a trusted compile-time fact even where a proof exists. */
+/* _UNCHECKED counterpart of vm_packed_raw_elem: the index is proven in range for the whole loop
+   (parser.c's index_safe_unchecked), so the type check, negative adjust, bounds check and
+   NULL-return contract are all unreachable and dropped. The array's own type check stays -- see
+   vm_packed_raw_elem above for why that one remains a defensive net. */
 static inline __attribute__((always_inline)) unsigned char*
 vm_packed_raw_elem_unchecked(AerVal obj, AerVal* idx, unsigned int foffset) {
     if (aer_type(obj) != TYPE_PACKED_ARRAY) {
@@ -1253,25 +1206,12 @@ vm_packed_raw_elem_unchecked(AerVal obj, AerVal* idx, unsigned int foffset) {
     return pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
 }
 
-/* Elementwise add/sub/mul on two same-kind, same-length typed arrays. Each (kind, op) pair is its own
-   tight, branch-free loop over flat, contiguous, uniformly-typed memory -- exactly the shape GCC's
-   auto-vectorizer can turn into real SIMD (NEON on ARM, SSE/AVX on x86) with zero hand-written
-   intrinsics, portable to whatever the build target supports. Confirmed on real hardware (Pi 4,
-   armhf) before writing this: plain -O2 (this project's normal build flag) does NOT vectorize any
-   of these regardless of kind, and -O3 alone only vectorizes the two integer kinds, not the float
-   ones (NEON's float SIMD isn't strictly IEEE-754-compliant, so GCC won't use it without an
-   explicit opt-in). Both problems are solved the same way: a per-function `optimize` attribute
-   (confirmed to work standalone, overriding the file's own global -O2, with no global build-flag
-   change at all) requesting O3-level vectorization on every one of these functions specifically,
-   plus fast-math on top for the two float32 ones only. fast-math changes rounding/NaN/associativity
-   guarantees, so scoping it to exactly these two functions keeps every other float operation in the
-   language under strict IEEE 754 semantics, exactly as before this feature existed. Measured
-   ~2.2-2.4x on cache-resident arrays; the win vanishes for arrays much larger than cache (the loop
-   becomes memory-bandwidth-bound, where no amount of extra ALU throughput helps) -- still correct
-   at any size, just not accelerated. float64 does not vectorize on this specific 32-bit ARM target
-   at all (no double-precision NEON lanes) even with fast-math; kept as a plain (still O3-attributed)
-   loop since other targets (x86-64, AArch64) may still auto-vectorize it, and it's no worse than
-   before either way. */
+/* Elementwise add/sub/mul over two same-kind typed arrays. Each (kind, op) pair is its own
+   branch-free loop over flat contiguous memory -- the shape GCC's auto-vectorizer turns into SIMD
+   with no intrinsics. Plain -O2 vectorizes none of these and -O3 alone skips the float kinds, so
+   each function carries its own `optimize` attribute, plus fast-math on the two float32 ones only
+   -- scoped there so every other float operation keeps strict IEEE 754. Measured ~2.2-2.4x while
+   cache-resident; past cache the loop is bandwidth-bound and the win disappears. */
 #define AER_TYPED_ELEMENTWISE(name, ctype, op_expr)                                                          \
     static __attribute__((optimize("O3", "tree-vectorize"))) void name(                                      \
         ctype* restrict c, const ctype* restrict a, const ctype* restrict b, unsigned int n) {               \
@@ -1331,22 +1271,11 @@ static AerTypedArray* vm_new_typed_array(TypedArrayElemKind kind, unsigned int c
     return ta;
 }
 
-/* Fused (A op1 B) op2 C over three same-kind, same-length typed arrays, in ONE pass -- no
-   intermediate array materialized for (A op1 B) at all. Emitted only when the parser recognizes
-   `(A op1 B) op2 C` written as a single expression (parse_binary_ops, parser.c), the same
-   "recognize a specific just-emitted shape and replace it" idea OP_FIELD_BINARY already uses for
-   struct-field arithmetic, just for typed-array chains instead. Verified against a
-   standalone (non-AER) C micro-benchmark before building this: fusing eliminates a real,
-   measured ~1.65x of wall-clock on a chained elementwise transform (two full array-length passes,
-   each touching every byte of 3 arrays, collapse into one pass touching 4 -- less total memory
-   traffic, not just fewer allocations) -- independent of whether the loop actually vectorizes
-   (confirmed: plain -O2 doesn't vectorize any of these either, same as AER_TYPED_ELEMENTWISE's own
-   finding above; the win is from memory traffic, so the O3/fast-math attributes below are a bonus
-   on top, not what the win depends on). Only ADD/SUB/MUL are covered (not DIV -- less common
-   in this shape, and division's own cost/edge cases make it a worse fit for blind fusion); any
-   other operator combination, or operands that turn out not to all be matching typed arrays at
-   runtime, falls back to the exact unfused computation (lbl_typed_array_chain2 below), still fully
-   correct, just without the fusion win for that one call. */
+/* Fuses (A op1 B) op2 C over three typed arrays into one pass, materializing no intermediate.
+   Emitted only when the parser sees the whole expression at once. The ~1.65x win is from memory
+   traffic -- two passes over 3 arrays become one over 4 -- not from vectorization. ADD/SUB/MUL
+   only; any other operator, or operands that aren't all matching typed arrays at runtime, falls
+   back to the unfused computation below. */
 #define AER_TYPED_CHAIN2(name, ctype, expr)                                                                  \
     static __attribute__((optimize("O3", "tree-vectorize"))) void name(                                      \
         ctype* restrict r, const ctype* restrict a, const ctype* restrict b, const ctype* restrict cc,       \
@@ -1495,13 +1424,10 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
     return aer_typed_array_val(r);
 }
 
-/* One struct field, at its own Shape-computed byte offset -- raw via vm_packed_slot_read/write for
-   a typed 8-byte field, vm_typed_elem_read/write above for a narrow (4-byte int32/float32) one, or a
-   plain 16-byte memcpy for TYPE_ANY (neither packed-slot scheme applies to a full boxed AerVal).
-   Declared in vm.h since aer_json.c's struct-serialization branch needs these too, not just vm.c's
-   own opcodes. Iterates every field with no per-site cache to draw on (print/json.encode), so it
-   looks offset/ftype/narrow up fresh -- vm_struct_field_read_at below is the one every opcode call
-   site should use instead, once it already has them from the field cache. */
+/* One struct field at its Shape-computed offset: packed-slot access for a typed 8-byte field, the
+   narrow reader/writer for a 4-byte one, a 16-byte memcpy for TYPE_ANY. Declared in vm.h because
+   aer_json.c needs it too. Looks offset/ftype/narrow up fresh, so opcode call sites should use
+   vm_struct_field_read_at below once the field cache has already resolved them. */
 /* ------------------------------------------------------------------ */
 /* Struct field read/write -- boxed and narrow                      */
 /* ------------------------------------------------------------------ */
@@ -1609,13 +1535,9 @@ static inline void vm_raw_write_float32(unsigned char* p, double v) {
     memcpy(p, &fv, 4);
 }
 
-/* Same contract as vm_struct_field_read/write above, but offset/ftype/narrow are already in hand
-   (from vm_resolve_field's cache output) instead of being re-derived from s->shape here -- every
-   opcode call site uses these, not the by-slot versions above. The `ftype == TYPE_ANY`/`narrow`
-   branches themselves are not the cost this avoids: for any real (monomorphic) call site it's the
-   same outcome every single time, so branch prediction makes it free after the first iteration.
-   What was real and worth removing was the extra pointer-chase through s->shape to re-fetch
-   offset/ftype/narrow on every access even after the cache already proved the shape matched. */
+/* As above, but offset/ftype/narrow come from vm_resolve_field's cache instead of being re-derived
+   from s->shape. The branches themselves are free at any monomorphic site; what this avoids is the
+   extra pointer-chase through s->shape on every access. */
 static inline AerVal vm_struct_field_read_at(AerStruct* s, unsigned int offset, ValueType ftype,
                                              bool narrow) {
     unsigned char* p = s->fields + offset;
@@ -2109,15 +2031,10 @@ static void chunk_ensure_call_spec_cache(Chunk* c) {
     memset(c->call_spec_cache + old_cap, 0, sizeof(CallSpecCacheEntry) * (c->call_spec_cache_cap - old_cap));
 }
 
-/* lbl_call's own cold path, split out to a real (never-inlined) function -- this entire block used
-   to sit directly inline in lbl_call, gated behind `target_f->shape_sensitive_mask != 0`, which is
-   false for the overwhelming majority of functions (see the guard's own comment at the one call
-   site below). Measured directly: lbl_call compiled to ~572 machine instructions with this inlined,
-   by far the single largest opcode handler in vm_run_slice (next-largest hot handlers measured
-   under 40) -- meaning every ordinary, non-specialized call paid the icache cost of this rarely-
-   taken code sitting in the hottest dispatch site in the VM, even though it never executed it.
-   noinline is required, not just default behavior: a static function with exactly one call site is
-   a prime candidate for GCC/LTO to inline right back in without it, silently undoing this split. */
+/* lbl_call's cold path, split out because inlining it made lbl_call ~572 machine instructions --
+   by far the largest handler in vm_run_slice, next-largest under 40 -- so every ordinary call paid
+   its icache cost without executing it. noinline is required: a static function with one call site
+   is a prime candidate for LTO to inline right back in. */
 static void __attribute__((noinline))
 vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
                                unsigned int ip, unsigned int* chosen_offset,
@@ -2152,24 +2069,12 @@ vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* regist
         }
     }
 
-    /* SPEC_KIND_ARRAY_OF_STRUCTS gets no structural guarantee, so -- unlike the other two
-       kinds, which are safe forever once observed -- this must re-verify EVERY call, not just
-       on a shape/cache miss: same array reused across two calls could be mutated to hold a
-       different shape in between, and nothing else here would notice. O(n), same order as
-       advance_pass's own per-call work, so this is the exact cost the design accepted for this
-       case (see linear-rolling-dream.md's Part B). A single mismatched element silently falls
-       back to the generic body for THIS call only -- observed is left in place conceptually,
-       but the cache/table are simply never touched below, so a later, uniform call still
-       specializes normally.
-
-       The scan itself is skippable, though: if THIS call site already fully verified this EXACT
-       array (by pointer) at its CURRENT AerArray.generation against this same shape on some
-       earlier call, items[] provably hasn't been restructured since (generation only changes on
-       index-assignment/append/delete/insert -- see its own comment, value.h) -- trusting that
-       prior verification is exactly as safe as the structural guarantee the other two kinds get
-       for free, just re-derived per generation instead of assumed forever. This is what turns
-       struct_array_scan.aer's real pattern (same 2M-particle array, 50 calls, only field VALUES
-       change between calls) from paying the O(n) scan on every one of the 50 into paying it once. */
+    /* SPEC_KIND_ARRAY_OF_STRUCTS has no structural guarantee, so it re-verifies every call: the
+       same array can be mutated to hold a different shape between calls. A mismatch falls back to
+       the generic body for that call only, leaving the cache untouched.
+       The scan is skipped when this site already verified this exact array, by pointer, at its
+       current AerArray.generation -- generation only changes on restructuring, so a prior
+       verification still holds. That is what makes a repeatedly-scanned array pay O(n) once. */
     if (kind == SPEC_KIND_ARRAY_OF_STRUCTS) {
         AerArray* arr = aer_as_array(arg);
         chunk_ensure_call_spec_cache(c);
@@ -2213,15 +2118,10 @@ vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* regist
                 SpecEntry fresh;
                 if (parser_specialize_function(c, target_f, observed, kind, param_index, &fresh, NULL, NULL,
                                                0)) {
-                    /* The recompile just appended new code to THIS running chunk -- every
-                       per-word cache must cover the new size before any of its sites dispatch.
-                       debug_hits[] is the same idiom (chunk_ensure_debug_hits) but debug-tools-
-                       only -- DISPATCH() increments c->debug_hits[offset] for every opcode word
-                       when built with AER_DEBUG_TOOLS, so skipping this resize here is a real,
-                       silent out-of-bounds write the moment the specialized body's own code
-                       (now beyond the ORIGINAL debug_hits_cap) executes, in that build only --
-                       found via a real Windows heap-corruption crash inside a LATER, unrelated
-                       malloc, exactly the kind of delayed symptom this class of bug produces. */
+                    /* The recompile appended code to this running chunk, so every per-word cache
+                       must cover the new size before any site dispatches. debug_hits[] included:
+                       DISPATCH() writes it per opcode under AER_DEBUG_TOOLS, so skipping the resize
+                       is a silent out-of-bounds write in that build. */
 #ifdef AER_DEBUG_TOOLS
                     chunk_ensure_debug_hits(c);
 #endif
@@ -2255,27 +2155,13 @@ vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* regist
             }
         }
 
-        /* Raw-numeric-variant check -- an independent axis from the shape cache/table lookup
-           above, re-derived fresh every call (cheap: at most SPEC_MAX_RAW_PARAMS aer_type()
-           reads, nowhere near the cost of a shape/homogeneity miss) rather than mirrored into
-           its own site-cache fields, since `entry` (from either the cache hit or the table
-           lookup just above) already gives direct access to whichever SpecEntry's own
-           raw_variant_* fields are relevant. See SpecEntry's own comment, vm.h, for why this is
-           a SEPARATE per-entry variant rather than folding raw-param-kind into the shape axis
-           itself. */
-        /* SPEC_KIND_ARRAY_OF_STRUCTS was previously excluded here, based on an apparent ~20%
-           regression on struct_array_scan.aer. Re-investigated with real hardware performance
-           counters (perf stat, Raspberry Pi 4) rather than wall-clock alone: dispatch counts and
-           GC stats were already known to be identical or better with the variant enabled: this
-           time cycles, instructions, AND branch-misses were all lower too (branch-misses ~18-40x
-           lower: 289-292K vs 5.3-11.8M across repeated runs) -- and the ORIGINAL guarded build's
-           own branch-misses varied more than 2x between two back-to-back runs of the identical
-           binary, meaning that build was unstable on its own before any comparison even started.
-           That instability is consistent with the original "~20% regression" having been a noisy
-           single-sample wall-clock artifact, not a real effect. Confirmed at both a reduced scale
-           (N=100,000, isolated from an unrelated O(n^2) GC bug in unrelated benchmark setup code)
-           and the real N=2,000,000 scale (19.01s enabled vs 20.32s excluded, ~6.4% faster,
-           consistent with the reduced-scale ~7% figure) -- guard removed. */
+        /* An axis independent of the shape lookup above, re-derived each call rather than cached --
+           at most SPEC_MAX_RAW_PARAMS aer_type() reads, and `entry` already exposes the relevant
+           raw_variant_* fields. See SpecEntry (vm.h) for why it is a separate variant. */
+        /* SPEC_KIND_ARRAY_OF_STRUCTS was once excluded here over an apparent regression that perf
+           counters did not reproduce -- cycles, instructions and branch-misses were all lower with
+           the variant enabled, and the guarded build's own branch-misses varied 2x between
+           identical runs. The guard was removed. */
         if (entry && entry->raw_param_count >= 0) {
             int cand_regs[SPEC_MAX_RAW_PARAMS];
             ValueType cand_types[SPEC_MAX_RAW_PARAMS];
@@ -2349,24 +2235,12 @@ vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* regist
     }
 }
 
-/* lbl_call_module's own cold path, same reasoning as vm_call_resolve_specialization above: this
-   whole dispatch -- a switch across 10 separate stdlib module-call functions plus the generic
-   host/file-module fallback -- used to sit directly inline in lbl_call_module. Measured at ~1079
-   compiled instructions, the single largest opcode handler in vm_run_slice (larger even than
-   lbl_call's own cold path was before its own extraction) -- not from complex logic (the source is
-   under 40 lines), but from register-spill/reload overhead: vm_run_slice hoists many locals
-   (registers/raw_ints/raw_reals/ip/...) into machine registers for the whole hot loop, and each of
-   the ~10 separate external calls this handler makes forces the compiler to spill and reload them
-   around the call boundary, unrelated to how RARELY any given call site actually reaches a given
-   module. Splitting this into a real function pays that spill/reload cost once, at the single call
-   site below, instead of once per module-call case.
-   POP is safe to use here (no early-return side effect, unlike PUSH -- see PUSH's own macro, above
-   vm_run_slice); the io-disabled case's error() call unwinds via longjmp before anything past it
-   would run (confirmed: error() always longjmps whenever runtime_error_unwind_target is set, which
-   it always is during normal vm_run_slice execution), so it's safe to call directly here too,
-   exactly as safe as it already was inline. This function's own result is provably always `true`
-   by the time it returns -- the `false` case calls error() itself instead of returning -- but the
-   compiler can't know that, hence returning it anyway rather than declaring void. */
+/* lbl_call_module's cold path, split for the same reason as vm_call_resolve_specialization: inlined
+   it measured ~1079 instructions, the largest handler in vm_run_slice -- not from complex logic but
+   from spilling vm_run_slice's hoisted locals around each of ~10 external calls. Splitting pays
+   that once at the single call site. POP is safe here (no early-return, unlike PUSH), and the
+   io-disabled error() longjmps before anything after it runs. Always returns true by the time it
+   returns; the compiler just cannot prove it. */
 static bool __attribute__((noinline)) vm_call_module_dispatch(VM* vm, Chunk* c, int module_idx, int fn_idx,
                                                               int module_id, int fn_id, int arg_count) {
     bool handled;
@@ -2457,15 +2331,10 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
        touch. Synced at the end of every DISPATCH() and around vm_call_value (the only other
        write to this VM's ip). */
     unsigned int ip = vm->ip;
-    /* Same hoisting idea as ip above, applied to the other three pointers that are stable for the
-       whole current call and only change at the 3 call/return sites below (lbl_call, lbl_call_value
-       via vm_call_value, lbl_return) -- confirmed via instruction-level profiling (perf annotate on
-       nbody.aer) that raw_reals[...]'s own pointer reload (vm->raw_reals is a field read fresh
-       from the VM struct, not cached) was among the single hottest instructions in the whole
-       dispatch loop. register_stack/raw_int_stack/raw_real_stack (vm.h) are fixed-size inline VM
-       arrays, never reallocated, so these pointers are safe to cache in registers across dispatches
-       -- they only need refreshing at the same 3 sites vm->registers/raw_ints/raw_reals themselves
-       get reassigned. */
+    /* Hoists the three pointers that are stable for the whole call and change only at the 3
+       call/return sites below. vm->raw_reals' own reload was among the hottest instructions in the
+       dispatch loop (perf annotate, nbody). The backing stacks are fixed-size inline VM arrays,
+       never reallocated, so caching them across dispatches is safe. */
     AerVal* registers = vm->registers;
     int64_t* raw_ints = vm->raw_ints;
     double* raw_reals = vm->raw_reals;
