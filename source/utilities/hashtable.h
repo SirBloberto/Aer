@@ -45,10 +45,6 @@ typedef struct {
     unsigned int dense_capacity; /* allocated length of dense -- grows independently of capacity */
     unsigned int capacity; /* allocated length of sparse; power of two */
     HashPools* pools; /* set once at creation -- see HashPools' own comment above */
-    /* Keys point into permanent constant-pool storage instead of being owned, so none are freed.
-       Set only by hashtable_put_borrowed; any owning mutation calls adopt_keys first, so a table
-       is never half-borrowed. Fits existing padding -- HashTable does not grow. */
-    bool keys_borrowed;
 } HashTable;
 
 /* `length` must be the key's TRUE length -- i.e. already truncated at any embedded NUL via
@@ -76,11 +72,6 @@ void hashtable_reserve(HashTable* t, unsigned int expected_count);
    versions are defined in terms of these, not the other way around. */
 void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value);
 AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length, uint64_t hash);
-
-/* Inserts without copying `key`, which must outlive this table -- a constant-pool AerString's
-   bytes, kept alive permanently by mark_chunk_roots. Only valid while the table owns no keys. */
-void hashtable_put_borrowed(HashTable* t, const char* key, unsigned int length, uint64_t hash,
-                            AerVal value);
 
 /* Same probe as hashtable_get_hashed, but returns the entry's dense-array index (or -1) instead of
    a payload pointer -- see its own comment, hashtable.c, for why the GC's write barrier needs this. */
