@@ -426,22 +426,6 @@ void emit_slice_get(Chunk* c, int dest_reg, int arr_reg, int rk_start, int rk_en
     chunk_emit(c, PACK_2X16(pack_rk16(rk_start), pack_rk16(rk_end)));
 }
 
-/* True if the just-emitted instruction wrote `src_slot` as a pure destination and was retargeted at
-   `dest_slot` instead, making a following move unnecessary. Only a temp (>= floor) may be
-   retargeted -- a named variable's slot can still be read later. */
-static bool retarget_raw_dest(Chunk* c, int src_slot, int dest_slot, int floor_now) {
-    if (src_slot < floor_now || c->count == 0) return false;
-    uint32_t last = c->code[c->count - 1];
-    Opcode op = (Opcode)(last & 0xFF);
-    if (op != OP_RAW_ADD_INT && op != OP_RAW_SUB_INT && op != OP_RAW_MUL_INT &&
-        op != OP_RAW_ADD_REAL && op != OP_RAW_SUB_REAL && op != OP_RAW_MUL_REAL &&
-        op != OP_RAW_DIV_REAL)
-        return false;
-    if ((int)UNPACK_A(last) != src_slot) return false;
-    c->code[c->count - 1] = PACK3(op, dest_slot, UNPACK_B(last), UNPACK_C(last));
-    return true;
-}
-
 void emit_dict_new(Chunk* c, int dest_reg, int pair_reg_base, int pair_count) {
     chunk_emit(c, PACK3(OP_DICT_NEW, dest_reg, pair_reg_base, pair_count));
 }
@@ -2499,19 +2483,11 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                             raw_real_free(1);
                     } else {
                         if (src_slot != slot) {
+                            /* Direct analog of the boxed path's "reg != rk_val -> MOVE" case. */
+                            Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
+                            chunk_emit(c, PACK3(move_op, slot, src_slot, 0));
                             int floor_now =
                                 (rhs_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
-                            /* If the RHS's own last instruction already wrote src_slot, retarget it at
-                               `slot` rather than copying afterwards -- OP_RAW_MOVE_REAL was 10.9% of
-                               every dispatch in mandelbrot doing exactly that. Only for a temp: a named
-                               variable's slot may still be read, and only for these ops, whose A field
-                               is a pure destination (FMA/FMS read A as an accumulator, so they cannot
-                               be retargeted). */
-                            if (!retarget_raw_dest(c, src_slot, slot, floor_now)) {
-                                Opcode move_op =
-                                    (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
-                                chunk_emit(c, PACK3(move_op, slot, src_slot, 0));
-                            }
                             if (src_slot >= floor_now) {
                                 if (rhs_kind == RAWK_INT)
                                     raw_int_free(1);
