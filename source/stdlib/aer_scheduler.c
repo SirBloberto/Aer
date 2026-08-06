@@ -1,8 +1,15 @@
 #include <stdlib.h>
-#include "aer_scheduler.h"
+#include "aer_actor.h"
 #include "aer_module.h"
 #include "aer_stdlib.h"
 #include "error.h"
+
+/* Cooperative round-robin scheduler over already-spawned actors (aer_actor.h). Single OS thread,
+   never true parallelism -- matches the process-global GC pools' existing constraint (see
+   aer_actor.h's own comment). Each task is one function call on one actor, driven in bounded
+   instruction slices via vm_run_slice (vm.h) instead of to completion, so a long-running task
+   can't starve the others; interleaving comes from visiting every unfinished task once per round,
+   not from anything opcode-level knowing about "other actors." */
 
 /* Every yield-checkpoint in vm_run_slice (vm.c's lbl_jump/lbl_call/lbl_iter_range_loop) only ever
    fires at a genuine instruction boundary, so resuming a task is always just "call vm_run_slice
@@ -22,7 +29,9 @@ static Task* tasks_tail = NULL;
    see the plan's note on the scheduler being a first cut, not a tuned production scheduler. */
 #define SCHEDULER_SLICE_INSTRUCTIONS 1000
 
-bool aer_scheduler_add(Actor* actor, const char* fn, int arg_count, AerVal* args) {
+/* Registers fn(args...) as a task to run on actor under the scheduler. False if fn isn't defined
+   on actor's script. Must be called before aer_scheduler_run() -- a task can't be added mid-run. */
+static bool aer_scheduler_add(Actor* actor, const char* fn, int arg_count, AerVal* args) {
     if (!aer_actor_prepare_call(actor, fn, arg_count, args)) return false;
 
     Task* t = xmalloc(sizeof(Task));
@@ -35,7 +44,12 @@ bool aer_scheduler_add(Actor* actor, const char* fn, int arg_count, AerVal* args
     return true;
 }
 
-void aer_scheduler_run(void) {
+/* Runs every added task to completion (or to a runtime error, isolated per task the same way
+   aer_actor_call already isolates one) before returning. Blocks the calling thread for as long as
+   any task takes -- there's no way to observe partial progress from outside; a task that never
+   finishes (e.g. a genuine infinite loop) means this never returns, the same as any other infinite
+   loop in AER already behaves. Clears the task list on return either way. */
+static void aer_scheduler_run(void) {
     bool any_unfinished = true;
     while (any_unfinished) {
         any_unfinished = false;
