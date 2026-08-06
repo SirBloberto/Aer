@@ -1,6 +1,7 @@
 #ifdef AER_DEBUG_TOOLS
 #include <stdlib.h>
 #include <string.h>
+#include "aer.h"
 #include "vm.h"
 #include "error.h"
 
@@ -734,6 +735,108 @@ void aer_disassemble(Chunk* c, FILE* out) {
     for (int i = 0; i < by_line_count; i++)
         fprintf(out, "  line %-6u %llu\n", by_line[i].line, by_line[i].hits);
     free(by_line);
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-pool memory report                                              */
+/* ------------------------------------------------------------------ */
+
+/* aer_gc_stats() only counts live cells, which understates real usage -- string/array/dict
+   payloads are separate xmalloc'd allocations the pool doesn't track. */
+void aer_debug_memory_report(FILE* out) {
+    /* vm_current_heap(), not vm.c's own require_current_heap() -- that one lazily installs the
+       bootstrap heap, which is the right thing for an allocation path but not for a read-only
+       report. Nothing to describe if no VM ever ran. */
+    VmHeap* heap = vm_current_heap();
+    if (!heap) { fprintf(out, "\n--- memory ---\n(no active heap)\n"); return; }
+    fprintf(out, "\n--- memory ---\n");
+
+    uint64_t str_hdr = 0, str_payload = 0;
+    {
+        Pool* p = &heap->string_pool;
+        for (unsigned int i = 0; i < p->slab_count; i++) {
+            unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
+            for (unsigned int j = 0; j < count; j++) {
+                AerString* s = (AerString*)(p->slabs[i] + (size_t)j * p->stride);
+                if (s->gc_state & POOL_FREE) continue;
+                str_hdr += sizeof(AerString);
+                str_payload += s->length;
+            }
+        }
+    }
+    fprintf(out, "  string   header %10llu B  payload %10llu B\n", str_hdr, str_payload);
+
+    uint64_t arr_hdr = 0, arr_payload = 0;
+    {
+        Pool* p = &heap->array_pool;
+        for (unsigned int i = 0; i < p->slab_count; i++) {
+            unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
+            for (unsigned int j = 0; j < count; j++) {
+                AerArray* a = (AerArray*)(p->slabs[i] + (size_t)j * p->stride);
+                if (a->gc_state & POOL_FREE) continue;
+                arr_hdr += sizeof(AerArray);
+                arr_payload += (uint64_t)a->capacity * sizeof(AerVal);
+            }
+        }
+    }
+    fprintf(out, "  array    header %10llu B  payload %10llu B\n", arr_hdr, arr_payload);
+
+    uint64_t dict_hdr = 0, dict_payload = 0;
+    {
+        Pool* p = &heap->dict_pool;
+        for (unsigned int i = 0; i < p->slab_count; i++) {
+            unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
+            for (unsigned int j = 0; j < count; j++) {
+                AerDict* d = (AerDict*)(p->slabs[i] + (size_t)j * p->stride);
+                if (d->gc_state & POOL_FREE) continue;
+                dict_hdr += sizeof(AerDict);
+                dict_payload += (uint64_t)d->map.capacity * sizeof(unsigned int) +
+                                (uint64_t)d->map.dense_capacity * sizeof(HashTableEntry);
+                for (unsigned int b = 0; b < d->map.count; b++)
+                    dict_payload += d->map.dense[b].length + 1;
+            }
+        }
+    }
+    fprintf(out, "  dict     header %10llu B  payload %10llu B\n", dict_hdr, dict_payload);
+
+    uint64_t fn_hdr = 0, fn_payload = 0;
+    {
+        Pool* p = &heap->function_pool;
+        for (unsigned int i = 0; i < p->slab_count; i++) {
+            unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
+            for (unsigned int j = 0; j < count; j++) {
+                AerFunction* f = (AerFunction*)(p->slabs[i] + (size_t)j * p->stride);
+                if (f->gc_state & POOL_FREE) continue;
+                fn_hdr += sizeof(AerFunction);
+                if (f->defaults) fn_payload += (uint64_t)(f->arity - f->min_arity) * sizeof(AerVal);
+            }
+        }
+    }
+    fprintf(out, "  function header %10llu B  payload %10llu B\n", fn_hdr, fn_payload);
+
+    /* header = the fixed per-cell reservation; payload = each instance's own Shape.instance_bytes.
+       Now size-classed (struct_pools[], one per STRUCT_PAYLOAD_TIER_SIZE tier) rather than one
+       pool sized for MAX_STRUCT_FIELDS worst-case every time -- the remaining gap is just each
+       instance's own distance up to its tier's ceiling, not a flat 256-byte-regardless-of-shape
+       tax anymore. */
+    uint64_t struct_hdr = 0, struct_payload = 0;
+    for (unsigned int t = 0; t < STRUCT_PAYLOAD_TIER_COUNT; t++) {
+        Pool* p = &heap->struct_pools[t];
+        for (unsigned int i = 0; i < p->slab_count; i++) {
+            unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
+            for (unsigned int j = 0; j < count; j++) {
+                AerStruct* s = (AerStruct*)(p->slabs[i] + (size_t)j * p->stride);
+                if (s->gc_state & POOL_FREE) continue;
+                struct_hdr += p->stride;
+                struct_payload += s->shape->instance_bytes;
+            }
+        }
+    }
+    fprintf(out, "  struct   reserved %9llu B  used %10llu B\n", struct_hdr, struct_payload);
+
+    unsigned int live, minor, major;
+    aer_gc_stats(&live, &minor, &major);
+    fprintf(out, "  %u live cells, %u minor collections, %u major collections\n", live, minor, major);
 }
 
 #endif
