@@ -71,6 +71,41 @@ static Pool* struct_pool_for_size(VmHeap* heap, unsigned int instance_bytes) {
                  1]; /* unreachable given the 256 ceiling above, but fail safe rather than out-of-bounds */
 }
 
+/* Smallest tier is 32, not 16: a payload only exists above AER_STRING_INLINE_MAX, so the smallest
+   buffer this ever allocates is 17 bytes and a 16-byte tier could never be selected. */
+static const size_t STRING_PAYLOAD_TIER_SIZE[STRING_PAYLOAD_TIER_COUNT] = {32, 64, 128, 256};
+static const unsigned int STRING_PAYLOAD_TIER_ELEMS_PER_SLAB[STRING_PAYLOAD_TIER_COUNT] = {128, 64, 32, 16};
+
+static void vm_heap_init(VmHeap* heap); /* defined below; the payload allocator needs it first */
+
+/* Tier owning a `length`-character payload, or -1 for the plain-malloc fallback. Both alloc and
+   free derive the class through this one function, so they cannot disagree. */
+static int string_payload_tier(unsigned int length) {
+    size_t need = (size_t)length + 1; /* + NUL, exactly what the allocation must hold */
+    for (int i = 0; i < STRING_PAYLOAD_TIER_COUNT; i++)
+        if (need <= STRING_PAYLOAD_TIER_SIZE[i]) return i;
+    return -1;
+}
+
+char* vm_string_payload_alloc(VmHeap* heap, unsigned int length) {
+    int tier = string_payload_tier(length);
+    if (tier < 0 || !heap) return xmalloc((size_t)length + 1);
+    vm_heap_init(heap);
+    return pool_alloc(&heap->string_payload_pools[tier]);
+}
+
+void vm_string_payload_free(VmHeap* heap, char* payload, unsigned int length) {
+    int tier = string_payload_tier(length);
+    if (tier < 0) {
+        free(payload);
+        return;
+    }
+    /* No heap means the payload outlived its own pools, which vm_free prevents by bracketing
+       gc_finalize_all_pools with current_heap. Leave it to the slab teardown rather than guess. */
+    if (!heap) return;
+    pool_free(&heap->string_payload_pools[tier], payload);
+}
+
 /* Initializes one heap's pools -- called once per VM (vm_init), not once per process, since every
    VM now owns its own. */
 static void vm_heap_init(VmHeap* heap) {
@@ -82,6 +117,9 @@ static void vm_heap_init(VmHeap* heap) {
     for (unsigned int i = 0; i < STRUCT_PAYLOAD_TIER_COUNT; i++)
         pool_init(&heap->struct_pools[i], sizeof(AerStruct) + STRUCT_PAYLOAD_TIER_SIZE[i],
                   STRUCT_TIER_ELEMS_PER_SLAB[i]);
+    for (unsigned int i = 0; i < STRING_PAYLOAD_TIER_COUNT; i++)
+        pool_init(&heap->string_payload_pools[i], STRING_PAYLOAD_TIER_SIZE[i],
+                  STRING_PAYLOAD_TIER_ELEMS_PER_SLAB[i]);
     pool_init(&heap->packed_array_pool, sizeof(AerPackedArray), 64);
     pool_init(&heap->typed_array_pool, sizeof(AerTypedArray), 64);
     pool_init(&heap->result_pool, sizeof(AerResult), 64);
@@ -324,7 +362,7 @@ AerVal aer_make_string_copy(const char* src, unsigned int length) {
         s->inline_buf[length] = '\0';
         s->data = s->inline_buf;
     } else {
-        char* buf = xmalloc((size_t)length + 1);
+        char* buf = vm_string_payload_alloc(require_current_heap(), length);
         memcpy(buf, src, length);
         buf[length] = '\0';
         s->data = buf;
@@ -421,6 +459,8 @@ void vm_free(VM* vm) {
     pool_destroy(&heap->function_pool);
     for (unsigned int i = 0; i < STRUCT_PAYLOAD_TIER_COUNT; i++)
         pool_destroy(&heap->struct_pools[i]);
+    for (unsigned int i = 0; i < STRING_PAYLOAD_TIER_COUNT; i++)
+        pool_destroy(&heap->string_payload_pools[i]);
     pool_destroy(&heap->packed_array_pool);
     pool_destroy(&heap->typed_array_pool);
     pool_destroy(&heap->result_pool);
@@ -757,7 +797,7 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
                 memcpy(stackbuf + as->length, bs->data, bs->length);
                 return aer_make_string_copy(stackbuf, len);
             }
-            char* buf = xmalloc(len + 1);
+            char* buf = vm_string_payload_alloc(require_current_heap(), len);
             memcpy(buf, as->data, as->length);
             memcpy(buf + as->length, bs->data, bs->length);
             buf[len] = '\0';

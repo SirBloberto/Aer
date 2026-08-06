@@ -824,9 +824,15 @@ typedef struct {
    in vm.c. The largest tier covers the worst case, so no malloc fallback is needed here. */
 #define STRUCT_PAYLOAD_TIER_COUNT 5
 
+/* Size-classed pools for the separately-owned payload of a string too long to inline. Same scheme
+   as struct_pools above and hashtable.c's key pools, including their plain-malloc fallback past the
+   largest tier, since a string's length is unbounded. */
+#define STRING_PAYLOAD_TIER_COUNT 4
+
 typedef struct {
     Pool string_pool, array_pool, dict_pool, function_pool, packed_array_pool, typed_array_pool, result_pool;
     Pool struct_pools[STRUCT_PAYLOAD_TIER_COUNT];
+    Pool string_payload_pools[STRING_PAYLOAD_TIER_COUNT];
     bool pools_initialized;
 
     TypedArrayFreeSlot typed_array_free_cache[TYPED_ARRAY_FREE_CACHE_SLOTS];
@@ -1019,6 +1025,12 @@ void vm_free(VM* vm);
    comment in vm.c for why vm_run_slice's save/restore alone isn't enough here. */
 VmHeap* vm_current_heap(void);
 void vm_set_current_heap(VmHeap* heap);
+
+/* Allocate/release a non-inline string's payload. `length` is the string's length, not the buffer
+   size -- both sides derive the same size class from it, so a pooled buffer can never be plain-freed
+   or vice versa. Only valid for length > AER_STRING_INLINE_MAX; shorter strings own nothing. */
+char* vm_string_payload_alloc(VmHeap* heap, unsigned int length);
+void vm_string_payload_free(VmHeap* heap, char* payload, unsigned int length);
 
 /* Same save/restore need as vm_current_heap, for the file-scope active_vm_for_errors global (vm.c)
    -- vm_init() unconditionally repoints it at the new VM before that VM ever runs. */

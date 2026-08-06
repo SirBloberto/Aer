@@ -230,11 +230,12 @@ static void mark_chunk_roots(VmHeap* heap, Chunk* chunk, bool minor) {
 /* Generational GC -- sweep finalizers                                  */
 /* ------------------------------------------------------------------ */
 
+/* An inline string owns nothing separate; anything longer holds a payload from
+   vm_string_payload_alloc, which re-derives the same size class from `length`. current_heap is this
+   cell's own heap for the same reason free_typed_array below can rely on it. */
 static void free_string(void* cell) {
     AerString* s = (AerString*)cell;
-    if (s->data != s->inline_buf)
-        free(
-            s->data); /* an inline (SSO) string owns nothing separate -- see AerString's own comment, value.h */
+    if (s->data != s->inline_buf) vm_string_payload_free(vm_current_heap(), s->data, s->length);
 }
 static void free_array(void* cell) {
     AerArray* a = (AerArray*)cell;
