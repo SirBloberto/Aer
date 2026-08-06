@@ -1991,15 +1991,11 @@ static AerVal vm_cast(AerVal v, int cast_type) {
 /* Dispatch loop -- computed goto                                       */
 /* ------------------------------------------------------------------ */
 
-/* GCC direct-threaded dispatch: each instruction jumps straight to the next handler, letting the
-   branch predictor learn per-instruction patterns instead of funnelling every opcode through one
-   shared switch.
-
-   This section cannot be split into another file, and that is a language constraint rather than
-   inertia: `goto *dispatch_table[op]` needs every `lbl_*` label to be visible in the same function,
-   and a label's address is only taken within the function that declares it. Everything ABOVE this
-   banner is ordinary C and can move freely; everything from vm_run_slice down stays together for
-   as long as dispatch works this way. */
+/* GCC direct-threaded dispatch: each instruction jumps straight to the next handler, so the branch
+   predictor learns per-instruction patterns instead of funnelling every opcode through one switch.
+   This section cannot move to another file, and that is a language constraint, not inertia:
+   `goto *dispatch_table[op]` needs every `lbl_*` label in the same function, and a label's address
+   is only takeable within the function declaring it. Everything above this banner can move freely. */
 
 #ifdef AER_DEBUG_TOOLS
 /* Grows debug_hits to cover c->code, zero-filling the new region; a no-op once already covered
@@ -2811,13 +2807,10 @@ lbl_call : {
         ip = (unsigned int)callee_offset;
         CallFrame* reused = &vm->call_stack[vm->call_depth];
         reused->code_offset = (unsigned int)callee_offset; /* reused frame now runs a different function */
-        /* The reused frame's own sizing was set for WHATEVER function last occupied it -- a tail
-           call can jump to a completely different function with a different max_registers/
-           max_raw_ints/max_raw_reals peak. Left stale, a later real (non-tail) call pushed from
-           inside this reused frame would compute its child's base from the WRONG (possibly too
-           small) frame_size, silently overlapping this frame's own still-live registers/raw
-           slots. base pointers (registers/raw_ints/raw_reals) are untouched -- same frame, same
-           backing memory, only how much of it this frame claims for itself changes. */
+        /* The reused frame's sizing belongs to whatever function last occupied it, and a tail call
+           can land on one with a different peak. Left stale, a later real call from inside this
+           frame computes its child's base from the wrong frame_size and overlaps still-live slots.
+           The base pointers are untouched -- same frame, same memory, only the claim changes. */
         reused->frame_size = target_f->max_registers;
         reused->raw_int_frame_size = target_f->max_raw_ints;
         reused->raw_real_frame_size = target_f->max_raw_reals;
@@ -2836,14 +2829,10 @@ lbl_call : {
         DISPATCH();
     }
 
-    /* Shape-based specialization dispatch -- gated on shape_sensitive_mask (zero for the
-       overwhelming majority of functions, a single already-fetched field check) rather than a
-       separate opcode. A separate OP_CALL_SPEC, chosen at EMISSION time, can't work: shape-
-       sensitivity is only known once a function's ENTIRE body has finished compiling, but a
-       forward-referenced call and a self-recursive call both need their opcode decided before
-       that -- doing it here instead means every call site just sees the final, fully-compiled
-       truth regardless of when or how it was originally compiled, no forward-reference or
-       recompile-timing problem to solve at all. */
+    /* Gated on shape_sensitive_mask -- zero for most functions, one already-fetched field -- rather
+       than a separate opcode. A separate OP_CALL_SPEC cannot work: shape-sensitivity is only known
+       once the whole body has compiled, but forward-referenced and self-recursive calls need their
+       opcode chosen before that. Deciding here means every site sees the final truth. */
     unsigned int chosen_offset = (unsigned int)callee_offset;
     unsigned int chosen_max_registers = target_f->max_registers;
     unsigned int chosen_max_raw_ints = target_f->max_raw_ints;
@@ -3031,20 +3020,11 @@ lbl_index_set : {
     DISPATCH();
 }
 
-/* Loop-bound-hoisting counterparts of lbl_index_get/lbl_index_set -- see OP_TYPED_INDEX_GET/
-   SET_UNCHECKED's own comment (vm.h) for the full mechanism. Same word layout as OP_INDEX_GET/SET
-   exactly, so the parser's emission code is a straight copy with the opcode constant swapped.
-
-   Unlike the packed-array field family, this opcode carries ONLY an index-safety proof, not a
-   container-IDENTITY one -- there is no reg_known_shape-style compile-time fact establishing
-   arr_reg is even a typed array at all (a plain function taking one has no specialization/
-   recompile step to hang such a fact on). So the TYPE_TYPED_ARRAY check below is not a defensive
-   net on top of an otherwise-trusted assumption; it is the ONLY thing deciding whether the fast
-   path applies at all, and a miss must fall all the way through to the exact same fully generic,
-   fully checked behavior lbl_index_get/lbl_index_set already give ANY OTHER container type
-   (plain array, dict, string, ...) -- not an error. Erroring here would break ordinary indexing
-   on every non-typed-array value the parser's loop-safety proof (which knows nothing about
-   container type) still emits this opcode for. */
+/* Loop-bound-hoisting counterparts of lbl_index_get/set, same word layout as OP_INDEX_GET/SET.
+   This opcode carries only an index-safety proof, never a container-identity one, so the
+   TYPE_TYPED_ARRAY check below is not a defensive net -- it is the only thing deciding whether the
+   fast path applies. A miss must fall through to the fully generic behavior for any other
+   container, not error: the parser's loop-safety proof knows nothing about container type. */
 lbl_typed_index_get_unchecked : {
     int dest_reg = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
@@ -3547,22 +3527,12 @@ lbl_field_set : {
     DISPATCH();
 }
 
-/* Shape-specialized field access (OP_INDEX_FIELD_GET_RAW_INT/REAL, OP_FIELD_GET_RAW_INT/REAL,
-   OP_INDEX_FIELD_SET_RAW_INT/REAL, OP_FIELD_SET_RAW_INT/REAL) -- only ever appears in a
-   ChunkFunction's SPECIALIZED body (see ChunkFunction.specializations, lbl_call's dispatch above), where
-   the parser already resolved the field's byte offset at COMPILE time against a Shape it proved
-   for one parameter. No vm_resolve_field_by_shape call, no inline-cache lookup, no boxed AerVal
-   ever constructed on the read side -- the 8 raw bytes at the field's offset are memcpy'd straight
-   into/out of a raw_ints[]/raw_reals[] slot, since a typed field's storage (vm_packed_slot_read/
-   write's own layout) is already bit-for-bit identical to a raw slot's.
-
-   The aer_type() check on the container below is a deliberate defensive safety net, not a cost
-   the design is supposed to need: the parser clears reg_known_shape[] on every reassignment path
-   it currently knows to guard (plain and compound assignment to an existing name, parser.c), but
-   that audit isn't yet proven exhaustive against every way a name's value can change (destructuring,
-   for-loop rebinding, etc.) -- until it is, trusting the compile-time proof unconditionally would
-   turn a compiler coverage gap into silent memory corruption instead of a clean, loud error. Revisit
-   once that audit is complete. */
+/* Shape-specialized field access, only present in a specialized body where the parser already
+   resolved the field's offset against a proven Shape -- no runtime resolve, no inline cache, no
+   boxed AerVal, since typed field storage is bit-identical to a raw slot's.
+   The aer_type() check below is a safety net: the parser clears reg_known_shape[] on the
+   reassignment paths it knows about, but that audit is not proven exhaustive, and a gap should
+   surface as a loud error rather than silent corruption. */
 lbl_index_field_get_raw_int : {
     int dest_slot = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
@@ -3777,15 +3747,10 @@ lbl_field_set_raw_float32 : {
     DISPATCH();
 }
 
-/* Raw-rhs compound assignment (`field += <already-raw expr>`) for the 4 combinations of
-   {bare struct, packed-array-fused index} x {int, real} -- same specialized-body-only contract
-   and same defensive aer_type() safety net as the GET/SET family above, but folding read + compute
-   + write into one dispatch with NEITHER side ever boxed: the field's current value is read
-   straight from its raw bytes, combined with rhs_slot's raw value via a 3-way switch (ADD/SUB/MUL
-   only -- matching the _BOXED compound family's own restriction; the parser never emits this
-   opcode for /=, %=, //=), and written back raw. Reachable only when the parser proved the RHS was
-   ALREADY a raw value at the compound-assignment site (a raw local, or the result of
-   try_emit_arith_raw_boxed) -- see parse_chain_assignment's compound-assignment branches. */
+/* Raw-rhs compound assignment for {bare struct, packed-array index} x {int, real}: same
+   specialized-body contract and safety net as the GET/SET family, folding read, compute and write
+   into one dispatch with neither side boxed. ADD/SUB/MUL only, matching the _BOXED family. Emitted
+   only where the parser proved the RHS was already raw. */
 lbl_field_compound_raw_int : {
     int struct_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
@@ -3882,15 +3847,10 @@ lbl_index_field_compound_raw_real : {
     DISPATCH();
 }
 
-/* _UNCHECKED counterparts of the 6 wide INDEX_FIELD_*_RAW_INT/REAL opcodes above -- identical in
-   every respect (same encoding, same raw slot family, same fields) except they resolve the
-   element through vm_packed_raw_elem_unchecked instead. See that function's own comment and
-   parser.c's index_safe_unchecked for the compile-time proof that makes this safe: only ever
-   emitted for a `for i in 0..n:`-shaped loop where n was itself proven == length() of this same
-   packed-array parameter and never reassigned since, so i is guaranteed in range for every
-   iteration without re-checking it here. No int32/float32 (narrow-field) counterparts -- not
-   measured hot enough yet to justify doubling this family again; add them the same way if a
-   profile ever shows otherwise. */
+/* _UNCHECKED counterparts of the 6 wide INDEX_FIELD_*_RAW_INT/REAL opcodes, identical except that
+   they resolve the element through vm_packed_raw_elem_unchecked. See parser.c's
+   index_safe_unchecked for the proof that the index is in range every iteration. No narrow-field
+   counterparts -- not measured hot enough to double the family again. */
 lbl_index_field_get_raw_int_unchecked : {
     int dest_slot = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
@@ -4909,15 +4869,10 @@ lbl_raw_gte_real_boxed : {
     DISPATCH();
 }
 
-/* Same fusion as OP_LT_JUMP_IF_FALSE et al. above, scoped to just the raw-boxed int family -- vm.h's
-   own comment on OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE has the full rationale, including why the other
-   3 raw comparison families (raw-raw int/real, raw-boxed real) were tried and dropped: measured zero
-   benefit anywhere in bench/, but a real branch-misprediction tax on every program regardless (more
-   indirect-branch dispatch sites competing for the same finite-size hardware branch-target-predictor
-   table). rhs may legitimately be TYPE_REAL against an int raw slot -- same int/real mixing the
-   unfused raw-boxed opcode above already allows. On a genuine type mismatch, error() unwinds
-   (longjmp) before `cond` is ever read -- it only exists to keep the compiler from warning about a
-   possibly-unread variable on that path. */
+/* OP_LT_JUMP_IF_FALSE's fusion scoped to the raw-boxed int family; see vm.h for why the other three
+   were dropped. rhs may legitimately be TYPE_REAL against an int raw slot, as the unfused opcode
+   already allows. On a real type mismatch error() longjmps before `cond` is read -- it exists only
+   to keep the compiler quiet about a possibly-unread variable. */
 #define RAW_CMP_INT_BOXED_JUMP_IF_FALSE(name, op, opstr)                                                     \
     lbl_raw_##name##_int_boxed_jump_if_false : {                                                             \
         int slot = (int)UNPACK_B(op_word);                                                                   \

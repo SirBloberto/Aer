@@ -182,15 +182,10 @@ typedef enum {
        of its own needed. */
     OP_CAST, /* dest_reg, cast_type, rk_operand */
 
-    /* Fusion of `x OP y.field` AND its mirror `y.field OP x` -- ONE opcode covers both argument
-       orders. parse_binary_ops truncates the just-emitted OP_FIELD_GET and re-encodes it as this
-       opcode's trailing operands; for the `x OP y.field` order specifically, it also canonicalizes
-       the operator (commutative ops unchanged, comparisons flipped: `x < field` becomes `field >
-       x`) so the field is always the LEFT operand here, needing only one physical opcode instead
-       of a mirror-image OP_BINARY_FIELD for the 11 of 18 possible operators where that's a free
-       transformation. The 7 order-sensitive operators (SUB/DIV/MOD/FLOOR_DIV/LSHIFT/RSHIFT/IN)
-       don't fuse in the `x OP field` order at all -- see parse_binary_ops's own comment for why
-       carrying a second opcode just for that narrower, rarer case wasn't judged worth it. */
+    /* One opcode for both argument orders of `x OP y.field`. parse_binary_ops truncates the
+       just-emitted OP_FIELD_GET, re-encodes it here, and canonicalizes the operator so the field is
+       always the left operand -- free for the 11 commutative-or-flippable operators. The 7
+       order-sensitive ones don't fuse in that order at all. */
     OP_FIELD_BINARY, /* dest_reg, struct_reg, field_name_pool_idx, bin_op, rk_rhs */
 
     /* `struct.field OP= rhs` -- reads, computes, and writes back in one dispatch, one
@@ -200,13 +195,9 @@ typedef enum {
        operand shape as OP_FIELD_BINARY (dest slot unused, no destination register needed). */
     OP_FIELD_COMPOUND, /* struct_reg, field_name_pool_idx, bin_op, rk_rhs */
 
-    /* Fusion of `(A op1 B) op2 C` written as one expression -- parse_binary_ops truncates the
-       just-emitted "A op1 B" (when it's exactly one plain boxed binary op) and re-encodes it as
-       this opcode's own operands, alongside the outer op2/C. Checked at runtime whether A/B/C are
-       all matching-shape typed arrays (the only case this actually fuses); anything else computes
-       the exact unfused result instead, same value either way. See vm_typed_array_chain2's own
-       comment (vm.c) for why this exists -- eliminates a whole intermediate array, not just an
-       allocation, for a chained elementwise typed-array transform. */
+    /* Fuses `(A op1 B) op2 C` written as one expression: parse_binary_ops truncates the inner op and
+       re-encodes it alongside op2/C. Fuses only when A/B/C turn out to be matching typed arrays at
+       runtime; anything else computes the same value unfused. */
     OP_TYPED_ARRAY_CHAIN2, /* dest_reg, a_reg, b_reg; word1: op1(hi16)/c_reg(lo16); word2: op2 */
 
     /* Shell mode: a bare statement's non-null result is printed. */
@@ -227,14 +218,9 @@ typedef enum {
     OP_RAW_SUB_REAL,
     OP_RAW_MUL_REAL,
     OP_RAW_DIV_REAL,
-    /* Superinstruction: `x += a*b` / `x -= a*b` on raw real locals (A = A +/- B*C, in place) --
-       collapses the MUL a compound-assignment's own RHS just emitted plus this op's own ADD/SUB
-       into ONE dispatch, when that RHS compiled down to exactly one raw MUL (see the compound-
-       assignment parser's own comment for the exact detection). Still two separate roundings
-       (mul, then add/sub) -- NOT a hardware single-rounding FMA instruction, so results stay
-       bit-identical to the unfused two-opcode form; the only thing removed is one interpreter
-       dispatch. Found via nbody.aer's own opcode-hit profile: this exact shape (`bivx -= dx*mj`,
-       `bodies[j].vx += dx*mi`) is 5,000,000 hits/opcode in its hottest loop. */
+    /* `x += a*b` / `x -= a*b` on raw real locals, in place, collapsing the RHS's MUL and this ADD/SUB
+       into one dispatch. Still two roundings, not a hardware FMA, so results are bit-identical to
+       the unfused pair -- only a dispatch is removed. */
     OP_RAW_FMA_REAL,
     OP_RAW_FMS_REAL,
     OP_RAW_LT_INT,
@@ -258,16 +244,10 @@ typedef enum {
     OP_RAW_ADD_REAL_BOXED,
     OP_RAW_SUB_REAL_BOXED,
     OP_RAW_MUL_REAL_BOXED,
-    /* Same tag-checked raw-vs-boxed arithmetic as the _BOXED family above, but NON-destructive:
-       (dest, src_raw, boxed_reg) -- raw_reals[dest] = raw_reals[src_raw] <op> unbox(boxed_reg),
-       src_raw left untouched. Used by try_emit_arith_raw_boxed (parser.c) for a general (non-
-       compound-assignment) expression composing a raw REAL local with a boxed value, where the raw
-       operand is a PERMANENT slot that must survive for later use -- the in-place _BOXED family
-       would need a defensive OP_RAW_MOVE_REAL first to avoid clobbering it (measured as 2 dispatches
-       where this is 1). Real-only, matching the _BOXED family's own asymmetric-promotion
-       restriction (see try_emit_arith_raw_boxed's comment for why INT never gets this treatment).
-       ADD/MUL only, mirroring try_emit_arith_raw_boxed's own restriction to commutative ops -- no
-       SUB_TO exists since nothing ever emits one (order-sensitive, left to the boxed fallback). */
+    /* Non-destructive form of the _BOXED family: raw_reals[dest] = raw_reals[src] <op> unbox(reg),
+       leaving src untouched. Used where the raw operand is a permanent slot that must survive, which
+       the in-place family would need a defensive OP_RAW_MOVE_REAL to protect. Real only, matching
+       the promotion restriction; ADD/MUL only, since nothing emits an order-sensitive variant. */
     OP_RAW_ADD_REAL_BOXED_TO,
     OP_RAW_MUL_REAL_BOXED_TO,
     /* Raw-vs-boxed comparison producing a boxed boolean -- removes the OP_BOX_INT that dominated
@@ -301,15 +281,9 @@ typedef enum {
     OP_INDEX_FIELD_SET_RAW_REAL,
     OP_FIELD_SET_RAW_INT,
     OP_FIELD_SET_RAW_REAL,
-    /* Same specialized-body-only contract as the GET/SET family above, but for a compound
-       assignment (`field += <expr>`) whose RHS already resolved to a RAW value at compile time
-       (try_emit_arith_raw_boxed or a bare raw local/literal) -- reads the field raw, applies the op
-       against the raw rhs directly (no box_if_raw), writes the result back raw, all in one
-       dispatch: no boxed AerVal ever constructed for either side, and no vm_resolve_field runtime
-       lookup either (the offset is the same compile-time constant the plain GET/SET family already
-       uses). ADD/SUB/MUL only, mirroring the _BOXED compound family's own restriction -- /=, %=,
-       //= still fall back to the generic OP_FIELD_COMPOUND/OP_INDEX_FIELD_COMPOUND. Distinct
-       opcodes for the fused index+field (packed array) vs bare-struct case, same split as GET/SET. */
+    /* Compound assignment whose RHS already resolved to a raw value: reads the field raw, applies
+       the op against the raw rhs, writes back raw, in one dispatch with neither side boxed and no
+       runtime field lookup. ADD/SUB/MUL only; /=, %=, //= fall back to the generic opcode. */
     OP_FIELD_COMPOUND_RAW_INT,
     OP_FIELD_COMPOUND_RAW_REAL,
     OP_INDEX_FIELD_COMPOUND_RAW_INT,
@@ -327,16 +301,10 @@ typedef enum {
     OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED,
     OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED,
 
-    /* Narrow (int32/float32) counterparts of the entire RAW field-access family above -- same
-       specialized-body-only contract, same compile-time-constant offset, but the field's own
-       STORAGE is 4 bytes (Shape.field_narrow, vm.h), not 8. The COMPUTE side is unchanged: a
-       narrow value is widened into an ordinary raw_ints[]/raw_reals[] slot (int64_t/double) on
-       read, narrowed back on write -- every raw ARITHMETIC opcode (OP_RAW_ADD_INT, etc.) stays
-       completely untouched, operating on the same slots regardless of a field's storage width.
-       Unlike the boxed path's int32 write (vm_check_narrow_field_write, gc.c), the narrow SET/
-       COMPOUND opcodes here do NOT range-check on overflow -- silently truncating instead, the
-       same "raw means unchecked, for speed" tradeoff every other raw arithmetic opcode in this
-       file already makes (e.g. OP_RAW_ADD_INT's own int64 wraparound is never checked either). */
+    /* Narrow (int32/float32) counterparts of the raw field-access family: storage is 4 bytes, but the
+       compute side is unchanged -- values widen into ordinary raw slots on read and narrow on write,
+       so every raw arithmetic opcode is untouched. Unlike the boxed path these do not range-check on
+       overflow, matching the "raw means unchecked" tradeoff every other raw opcode makes. */
     OP_INDEX_FIELD_GET_RAW_INT32,
     OP_INDEX_FIELD_GET_RAW_FLOAT32,
     OP_FIELD_GET_RAW_INT32,
@@ -361,32 +329,19 @@ typedef enum {
     OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED,
     OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED,
 
-    /* Only ever emitted at the very start of a specialized body's "raw-numeric variant" (see
-       SpecEntry below), once per raw-bound parameter -- unconditionally reads the boxed AerVal the
-       caller already placed in that parameter's own register (the calling convention never
-       changes; every argument is always copied in boxed) and copies its payload into a raw_ints/
-       raw_reals slot, ONE time, at function entry. Safe to do WITHOUT a tag check (unlike every
-       other raw-vs-boxed opcode in this file): lbl_call already verified this exact argument's
-       runtime type is int/real before ever choosing to jump into this variant's code_offset, so by
-       the time this opcode runs, the tag is already a proven fact, not an assumption. Every
-       reference to that parameter for the rest of the body then goes through the ordinary raw-local
-       machinery (var_kind/var_lookup_rk), completely unaware this value ever arrived boxed. */
+    /* Emitted once per raw-bound parameter at the start of a raw-numeric variant: reads the boxed
+       AerVal the caller placed in that register -- the calling convention always copies arguments
+       boxed -- and copies its payload into a raw slot. No tag check needed, unlike every other
+       raw-vs-boxed opcode: lbl_call already proved the type before jumping here. The rest of the
+       body then treats it as an ordinary raw local. */
     OP_UNBOX_PARAM_INT,
     OP_UNBOX_PARAM_REAL,
 
-    /* A bare comparison as the WHOLE condition of an if/while (parse_if/parse_for_while, parser.c)
-       collapses the comparison and its OP_JUMP_IF_FALSE_REG into one dispatch -- the comparison's
-       boolean result was only ever going to be read once, immediately, by the jump that follows it,
-       so materializing it into a register just to re-read and vm_truthy()-check it a moment later
-       is pure overhead. Found via fib_bench's own opcode-hit profile: OP_LT + OP_JUMP_IF_FALSE_REG
-       together were ~41% of all dispatches for `if n < 2`. Deliberately narrow -- only the 6 plain
-       BOXED comparisons (never raw or raw-boxed; those already have their own faster opcodes, see
-       try_emit_cmp_raw_boxed/try_emit_binary_raw) and only when the comparison is the ENTIRE
-       condition with nothing else emitted around it (`not`, `and`/`or`, or any other wrapping
-       expression all correctly fall back to the ordinary, unfused path).
-       word0 = PACK3(op, 0 [unused -- no destination register, the result is never stored],
-                     rk_lhs8, rk_rhs8)
-       word1 = jump target (same as OP_JUMP_IF_FALSE_REG's own trailing word) */
+    /* A bare comparison forming an entire if/while condition collapses with its
+       OP_JUMP_IF_FALSE_REG into one dispatch -- the boolean was only ever read once, immediately.
+       Only the 6 plain boxed comparisons (raw ones have faster opcodes already) and only when
+       nothing else is emitted around the comparison; anything wrapped falls back unfused.
+       word0 = PACK3(op, unused, rk_lhs8, rk_rhs8); word1 = jump target. */
     OP_EQ_JUMP_IF_FALSE,
     OP_NEQ_JUMP_IF_FALSE,
     OP_LT_JUMP_IF_FALSE,
@@ -612,14 +567,9 @@ struct Shape {
     /* TYPE_ANY = no declared type. A declared type is enforced once at FIELD_SET/construction,
        then trusted -- the fused opcodes skip the runtime check on that side. */
     ValueType field_types[MAX_STRUCT_FIELDS];
-    /* True for a TYPE_INTEGER/TYPE_REAL field whose default was written with an `i`/`f` literal
-       suffix (`x = 42i`, `x = 0.0f`) -- selects narrow (4-byte int32/float32) storage instead of the
-       usual 8-byte int64/float64. Works identically on a plain struct instance or as a packed-array
-       element (every element read/write uses shape->instance_bytes as the real per-element stride,
-       not a hardcoded 8-bytes-per-field assumption) -- see lbl_array_repeat, vm.c. Shape
-       specialization's raw-unboxed fast path also has narrow counterparts of its own opcode family
-       (OP_FIELD_GET_RAW_INT32/FLOAT32 etc.) selected via shape_find_field's own narrow output,
-       parser.c. False (meaningless) for any other field kind. */
+    /* True for an int/real field whose default carried an `i`/`f` suffix, selecting 4-byte storage
+       instead of 8. Works the same for a plain instance or a packed-array element, since every
+       access uses shape->instance_bytes as the stride. Meaningless for any other field kind. */
     bool field_narrow[MAX_STRUCT_FIELDS];
     /* Byte offset of each field within an instance's fields buffer (AerStruct.fields) -- a typed
        field (TYPE_ANY excluded) is stored RAW in 8 bytes (no tag; the type is this Shape's own
@@ -658,14 +608,10 @@ void vm_struct_field_write(AerStruct* s, unsigned int slot, AerVal v);
    free-cache above. */
 unsigned int vm_typed_elem_width(TypedArrayElemKind kind);
 
-/* Which runtime shape a shape-sensitive parameter arrived as, at the point specialization was
-   triggered. STRUCT/PACKED_ARRAY both carry a hard structural guarantee (a struct instance's shape
-   never changes; a packed array can't hold mixed shapes by construction) -- safe with no further
-   per-access check once observed. ARRAY_OF_STRUCTS (a plain array whose elements happen to all be
-   the same struct shape, accessed inside the function via a one-hop local alias, e.g.
-   `pi = particles[i]; ...; pi.field`) carries NO such guarantee -- a plain array is allowed to hold
-   heterogeneous elements, so every call must re-verify uniformity (see lbl_call's homogeneity
-   pre-check) before trusting a specialized body compiled against one particular element shape. */
+/* Which runtime shape a shape-sensitive parameter arrived as. STRUCT and PACKED_ARRAY carry a
+   structural guarantee -- a struct's shape never changes, a packed array cannot hold mixed shapes
+   -- so they need no per-access recheck. ARRAY_OF_STRUCTS carries none: a plain array may hold
+   heterogeneous elements, so every call must re-verify uniformity first. */
 typedef enum {
     SPEC_KIND_STRUCT,
     SPEC_KIND_PACKED_ARRAY,
@@ -778,14 +724,10 @@ typedef struct {
     unsigned int last_max_registers;
     unsigned int last_max_raw_ints;
     unsigned int last_max_raw_reals;
-    /* SPEC_KIND_ARRAY_OF_STRUCTS only: the last plain-array argument (by identity) and its
-       AerArray.generation at the moment lbl_call's O(n) homogeneity scan last confirmed every
-       element matched last_shape. A later call at this same site with the SAME array pointer AND
-       the SAME generation (i.e. items[] hasn't been restructured since -- see AerArray.generation's
-       own comment, value.h) can trust that verification and skip re-scanning entirely. NULL/0 means
-       never verified; only ever set on a scan that fully SUCCEEDED, never on a failed/heterogeneous
-       one, so a later genuinely-uniform call still gets a fresh, correct scan rather than trusting a
-       stale negative result. */
+    /* ARRAY_OF_STRUCTS only: the array (by pointer) and AerArray.generation at the last successful
+       homogeneity scan. A later call with both unchanged can skip re-scanning. NULL/0 means never
+       verified; only ever set on a scan that fully succeeded, so a failed one never poisons a
+       later genuinely-uniform call. */
     AerArray* last_verified_array;
     unsigned int last_verified_generation;
     /* Direct pointer into target_f->specializations[] for whichever SpecEntry last_shape matched --
@@ -863,16 +805,11 @@ typedef struct {
     unsigned int count, cap;
 } MarkWorklist;
 
-/* Small, size-keyed free-list cache for typed-array DATA buffers -- the variable-sized payload
-   (count * elem width), not the fixed-size AerTypedArray header, which already goes through
-   typed_array_pool above like every other GC-tracked object. Repeatedly transforming a typed
-   array of the same shape (`c = a + b; a = c * half`, elementwise-style code) otherwise churns
-   plain malloc/free every single pass even though the size never changes. A handful of slots,
-   linearly scanned (size classes/hashing would be overkill for what's meant to catch "the last
-   few buffers this exact size, freed a moment ago") and a per-buffer size ceiling (so one giant,
-   never-to-be-reused allocation can't sit here retaining memory indefinitely) keep this bounded.
-   Checked by vm_new_typed_array (vm.c) before calling xmalloc; populated by free_typed_array
-   (gc.c) instead of calling free(), whenever there's a free slot and the buffer qualifies. */
+/* Size-keyed free-list cache for typed-array data buffers -- the variable-sized payload, not the
+   header, which is pooled like every other GC object. Repeated same-shape transforms would
+   otherwise churn malloc/free every pass at a size that never changes. Bounded by a handful of
+   linearly-scanned slots and a per-buffer size ceiling, so one huge allocation cannot sit here
+   retaining memory. Checked by vm_new_typed_array, populated by free_typed_array. */
 #define TYPED_ARRAY_FREE_CACHE_SLOTS 8
 #define TYPED_ARRAY_FREE_CACHE_MAX_BYTES (4u * 1024 * 1024)
 
@@ -881,15 +818,10 @@ typedef struct {
     unsigned char* ptr;
 } TypedArrayFreeSlot;
 
-/* Size-classed slab pools for struct instances, keyed by Shape.instance_bytes (the exact fields-
-   buffer size that shape needs) -- a single pool sized for MAX_STRUCT_FIELDS (16) full-width
-   (16-byte) fields was 268 bytes/cell regardless of how many fields a shape actually has; TreeNode
-   (3 fields, 60 bytes actually needed) wasted ~78% of every allocation. Mirrors hashtable.c's own
-   KEY_TIER_SIZE scheme exactly -- STRUCT_PAYLOAD_TIER_SIZE lives in vm.c (paired with its elems-
-   per-slab table there), this is just the array-of-Pool storage. Every tier size is a valid struct
-   cell size on its own (no tier past the largest -- the largest tier already covers the
-   MAX_STRUCT_FIELDS worst case, so there's no malloc-fallback path to build here, unlike
-   hashtable.c's key pools which really can see an unbounded key length). */
+/* Size-classed slab pools for struct instances, keyed by Shape.instance_bytes. One pool sized for
+   the MAX_STRUCT_FIELDS worst case cost 268 bytes/cell regardless of a shape's real field count,
+   wasting ~78% on a 3-field node. Mirrors hashtable.c's KEY_TIER_SIZE scheme; the tier table lives
+   in vm.c. The largest tier covers the worst case, so no malloc fallback is needed here. */
 #define STRUCT_PAYLOAD_TIER_COUNT 5
 
 typedef struct {
@@ -914,14 +846,10 @@ typedef struct {
        across all pools since the last minor GC; major_gc_every_n_minor runs a major pass after
        that many minor ones. 0 for gc_live_cell_ceiling means unlimited (aer_gc_set_ceiling). */
     unsigned int minor_gc_threshold, major_gc_every_n_minor, gc_live_cell_ceiling;
-    /* minor_gc_threshold's own floor -- gc_rescale_minor_threshold (gc.c) recomputes
-       minor_gc_threshold itself after every major collection as max(this floor, current live
-       cell count), so a program with a large, mostly-static live heap (see gc_rescale_minor_
-       threshold's own comment) automatically gets a bigger nursery instead of re-tracing that
-       same live data on every major almost as often as a program with barely any live data at
-       all. Never itself mutated by that rescale -- only aer_gc_configure changes it -- which is
-       what lets the threshold shrink back down again if the live set is later freed, instead of
-       ratcheting upward forever. */
+    /* Floor for minor_gc_threshold, which gc_rescale_minor_threshold recomputes after every major
+       collection as max(floor, live cell count) -- so a large mostly-static live heap gets a bigger
+       nursery instead of re-tracing itself nearly as often. Never mutated by that rescale, only by
+       aer_gc_configure, which is what lets the threshold shrink again rather than ratchet upward. */
     unsigned int minor_gc_threshold_floor;
     unsigned int minor_collections_run, major_collections_run, minor_since_major;
     int gc_suppress_depth;
