@@ -207,5 +207,11 @@ check-comments:
 
 check-style: check-format check-comments
 
+# Clean-builds both refs on the Pi and prints a per-benchmark delta table. Always use this rather
+# than comparing against a checkout that happens to be lying around -- tar preserves mtimes, so a
+# stale tree can silently skip rebuilding and report a regression as noise.
+bench:
+	python3 tools/bench.py $(BENCH_ARGS)
+
 clean:
 	rm -rf binary/* object/* tests/fuzz_crashes
