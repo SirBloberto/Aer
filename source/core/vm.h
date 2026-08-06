@@ -877,7 +877,6 @@ typedef struct {
 
 #define VM_STACK_MAX 256
 #define VM_CALL_MAX 64
-#define VM_KEY_MAX 4096 /* max dict key length for stack-buffered lookups */
 
 /* Per-call register frame; lives in the VM struct so a nested module VM gets its own chain. */
 typedef struct {

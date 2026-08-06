@@ -674,15 +674,8 @@ static AerVal vm_in(AerVal a, AerVal b) {
             return aer_bool(false);
         }
         AerString* as = aer_as_string(a);
-        if (as->length > VM_KEY_MAX) {
-            error("Hashtable key too long (max %d bytes)", VM_KEY_MAX);
-            return aer_bool(false);
-        }
         unsigned int klen = hashtable_key_true_len(as->data, as->length);
-        char kbuf[VM_KEY_MAX + 1];
-        memcpy(kbuf, as->data, klen);
-        kbuf[klen] = '\0';
-        return aer_bool(hashtable_get_hashed(&aer_as_dict(b)->map, kbuf, klen,
+        return aer_bool(hashtable_get_hashed(&aer_as_dict(b)->map, as->data, klen,
                                              hashtable_hash_bytes(as->data, klen)) != NULL);
     }
     if (aer_type(b) == TYPE_ARRAY) {
@@ -1788,17 +1781,9 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
             return;
         }
         AerString* is = aer_as_string(idx);
-        if (is->length > VM_KEY_MAX) {
-            error("Hashtable key too long (max %d bytes)", VM_KEY_MAX);
-            *out = aer_null();
-            return;
-        }
         unsigned int klen = hashtable_key_true_len(is->data, is->length);
-        char kbuf[VM_KEY_MAX + 1];
-        memcpy(kbuf, is->data, klen);
-        kbuf[klen] = '\0';
-        AerVal* found =
-            hashtable_get_hashed(&aer_as_dict(obj)->map, kbuf, klen, hashtable_hash_bytes(is->data, klen));
+        AerVal* found = hashtable_get_hashed(&aer_as_dict(obj)->map, is->data, klen,
+                                             hashtable_hash_bytes(is->data, klen));
         if (!found) {
             *out = aer_null();
             return;
@@ -1921,19 +1906,12 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
             return;
         }
         AerString* is = aer_as_string(idx);
-        if (is->length > VM_KEY_MAX) {
-            error("Hashtable key too long (max %d bytes)", VM_KEY_MAX);
-            return;
-        }
         unsigned int klen = hashtable_key_true_len(is->data, is->length);
         uint64_t khash = hashtable_hash_bytes(is->data, klen);
-        char kbuf[VM_KEY_MAX + 1];
-        memcpy(kbuf, is->data, klen);
-        kbuf[klen] = '\0';
         AerDict* d = aer_as_dict(obj);
         /* Resolved BEFORE the write, not after -- an update reuses this exact dense index, a fresh
            key always lands at d->map.count (see gc_barrier_dict's own comment, gc.c). */
-        int existing_idx = hashtable_get_index_hashed(&d->map, kbuf, klen, khash);
+        int existing_idx = hashtable_get_index_hashed(&d->map, is->data, klen, khash);
         unsigned int write_idx = existing_idx >= 0 ? (unsigned int)existing_idx : d->map.count;
         gc_barrier_dict(vm, d, write_idx, val);
         if (existing_idx >= 0) {

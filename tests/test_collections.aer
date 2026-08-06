@@ -1,5 +1,6 @@
 #!/usr/bin/env aer
 import collection
+import string
 # AER test suite — arrays, hashtables, and nested collections.
 # Machine-checked via assert(): a clean run exits 0; any failure prints
 # "ASSERT FAILED: ..." and the process exits nonzero (see main.c/error.c).
@@ -73,6 +74,19 @@ assert(length(d) == 3, "hashtable length after assignment")
 
 collection.delete(d, "y")
 assert(not "y" in d, "delete removes a hashtable key")
+
+# Keys are length-bounded only by memory. Every dict path (set, get, `in`, delete) once copied its
+# key through a fixed 4096-byte stack buffer, so anything longer was a runtime error.
+long_key = string.repeat("k", 5000)
+other_long_key = string.repeat("k", 4999) + "j"
+big = {}
+big[long_key] = "stored"
+assert(length(long_key) == 5000, "a key well past the old 4096-byte cap builds fine")
+assert(big[long_key] == "stored", "a 5000-byte key round-trips through set and get")
+assert(long_key in big, "`in` matches a 5000-byte key")
+assert(not (other_long_key in big), "two 5000-byte keys differing in the last byte stay distinct")
+collection.delete(big, long_key)
+assert(not (long_key in big), "delete removes a 5000-byte key")
 
 # Hashtables have reference semantics
 d1 = {"a": 1}

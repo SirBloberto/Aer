@@ -86,22 +86,14 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
                 return true;
             }
             AerString* ks = aer_as_string(key);
-            if (ks->length > VM_KEY_MAX) {
-                error("Hashtable key too long (max %d bytes)", VM_KEY_MAX);
-                vm_stack_push(vm, aer_null());
-                return true;
-            }
             unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
-            char kbuf[VM_KEY_MAX + 1];
-            memcpy(kbuf, ks->data, klen);
-            kbuf[klen] = '\0';
             /* hashtable_remove swap-compacts the dense array (moves the last entry into the
                vacated slot), which invalidates any existing per-index dirty-card state -- rather
                than fix up the one moved entry's card (real complexity for a rare path), dirty_all
                just forces a full rescan next cycle if this dict is remembered (harmless, cheap,
                no-op otherwise). See AerDict.dirty_cards's own comment, vm.h. */
             aer_as_dict(obj)->dirty_all = true;
-            hashtable_remove(&aer_as_dict(obj)->map, kbuf, klen);
+            hashtable_remove(&aer_as_dict(obj)->map, ks->data, klen);
             vm_stack_push(vm, obj);
             return true;
         }
