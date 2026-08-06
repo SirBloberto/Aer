@@ -38,13 +38,8 @@ typedef struct {
     int continue_patch_count;
 } LoopContext;
 
-/* Every mutable global this file's compile functions share, folded into one struct (was 31+
-   separate file-scope statics plus a hand-mirrored ParserState snapshot struct) -- adding new
-   parser state now means declaring one field here, not three places kept in sync by hand (the
-   exact pattern that already caused real bugs in this codebase: P.var_kind init, P.branch_depth,
-   var_slot bypass). A single static instance (P, below) is the live state; parser_save_state/
-   restore_state (this file, near the bottom) snapshot and restore it wholesale for a nested
-   compile (module import, lazy shape-specialization recompile). */
+/* Every mutable global the compile functions share. P (below) is the live instance;
+   parser_save_state/restore_state snapshot it wholesale for a nested compile. */
 typedef struct Parser {
     /* The register allocator every compile function shares. next_temp_register tracks the next
        free temp; registers below reserved_floor are permanent and must never be handed out here. */
@@ -118,21 +113,10 @@ typedef struct Parser {
     int global_regs[FRAME_REGISTERS];
     int global_count;
 
-    /* Side-channel from a plain assignment's RHS parse to its own reassignment-kind check just
-       after (parse_assignment) -- set to the target's OWN name right before parsing its RHS,
-       consulted right after via self_ref_watch_seen. var_lookup_rk is the ONE place every bare
-       identifier reference resolves through (see its own comment), so hooking there catches a
-       self-reference regardless of how deep inside the RHS expression it's buried, with no need
-       to understand any opcode's operand encoding. Lets `x = <existing-raw-x-changing-kind>`
-       inside a loop tell apart the genuinely unsafe case (the RHS reads x's OWN old value, e.g.
-       `total = total + something_boxed` -- the already-emitted read would go stale after the
-       first iteration's shadow) from the common, completely safe one (the RHS doesn't reference x
-       at all, e.g. `total = some_function_call()` -- nothing about shadowing to a fresh boxed
-       register on iteration 2 changes what iteration 2's RHS computes). Found via
-       bench/typed_array_bench.aer: `total = scale_and_accumulate(xs, factor)` inside `for pass in
-       0..200:` used to hit the former's blanket refusal despite matching the latter, safe shape --
-       a real, over-broad false positive in the existing check, invisible before top-level
-       variables could ever be raw in the first place. */
+    /* Set to the assignment target's own name before parsing its RHS, read back after via
+       self_ref_watch_seen. var_lookup_rk hooks it, so a self-reference is caught however deep in
+       the RHS it sits. Distinguishes `total = total + x` (RHS reads the old value -- unsafe to
+       shadow mid-loop) from `total = f()` (does not -- safe). */
     unsigned int self_ref_watch_name;
     bool self_ref_watch_seen;
 
@@ -293,38 +277,16 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
     if (spilled) reg_free(spilled);
 }
 
-/* Emits the branch-on-false half of an if/while condition. Fuses a bare comparison -- nothing else
-   emitted around it -- directly with the branch into one dispatch instead of materializing its
-   result into a register just to read it straight back a moment later (OP_LT_JUMP_IF_FALSE and its
-   siblings, vm.h's own comment has the full rationale: fib_bench's profile motivated the plain
-   boxed family, mandelbrot's motivated adding the raw-boxed-int family too -- same mechanism either
-   way, only the boxed boolean destination write disappears; a raw comparison's own raw-slot/
-   register reads are completely unaffected). Deliberately does NOT cover raw-raw int/real or
-   raw-boxed real comparisons -- measured zero benefit anywhere in bench/ for those 3 families, but
-   a real branch-misprediction cost on every program regardless (vm.h's own comment has the numbers).
-   Detected the same way this file's other retrofit fusions are (lhs_is_field/lhs_is_chain2 in
-   parse_binary_ops, the FMA fusion in parse_assignment): look at what was JUST compiled, before
-   anything else runs, and roll it back if it matches -- true regardless of which comparison family
-   produced it, since every one of them (plain boxed, raw-boxed) already places its boxed-bool
-   destination in the exact same word0 A field and its own two operands in B/C, so one dispatch table
-   covers all of them. Falls back to the ordinary materialize+emit_jump_if_false_reg path for every
-   other condition shape -- and/or, a bare boolean, a non-comparison expression, a raw-raw or
-   raw-boxed-real comparison, or a comparison whose operand needed spilling into a scratch register
-   (more than one word emitted). */
+/* Emits the branch-on-false half of an if/while condition, fusing a bare comparison directly with
+   the branch instead of materializing a boolean just to read it back. Covers the plain-boxed and
+   raw-boxed-int families only; the other three measured no benefit against the per-opcode
+   branch-prediction cost (see vm.h). Detected by inspecting what was just compiled and rolling it
+   back, so anything else -- and/or, a bare boolean, a spilled operand -- falls through. */
 static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int cond_start) {
-    /* A raw-vs-constant comparison (try_emit_binary_raw's own comparison-vs-constant special
-       case, above) always has an OP_LOADK immediately before the comparison word -- materializing
-       the constant into an actual register is unavoidable (the raw-boxed opcodes' own operand
-       encoding has no constant-pool support), so the ordinary "exactly one word" check below would
-       never fire for this shape at all. Recognized here as its own narrow case: keep the LOADK
-       (it's still needed, the fused opcode below still reads that same register), just fuse the
-       comparison with the branch as usual, so this shape still collapses from 3 dispatches
-       (LOADK, compare, jump) to 2 (LOADK, fused compare+jump) instead of the full 1 a plain
-       operand gets -- still a real win, just not as large. Guarded on the LOADK's own dest being a
-       TEMP (>= reserved_floor): a named variable's register being coincidentally read right after
-       its own most recent LOADK is not the same guarantee (that register might still be read again
-       later), so only a compiler-introduced temp -- always what try_emit_binary_raw's own
-       materialize() call produces -- is safe to assume dead here. */
+    /* A raw-vs-constant comparison always emits OP_LOADK before the compare, so the one-word check
+       below never fires. Keep the LOADK, fuse the compare with the branch: 3 dispatches become 2.
+       Only when the LOADK's dest is a temp (>= reserved_floor) -- a named variable's register may
+       be read again later, so assuming it dead is unsound. */
     unsigned int cmp_word_start = cond_start;
     if (c->count - cond_start == 2) {
         uint32_t loadk_w = c->code[cond_start];
@@ -597,22 +559,11 @@ static void mark_shape_sensitive(int reg) {
     if (src >= 0) P.shape_sensitive_param[src] = true;
 }
 
-/* True iff idx_rk is a proven-safe, no-runtime-check index into the array currently held by
-   arr_reg -- i.e. (arr_reg, idx_rk) matches a PAIR on the safe_loop_item_regs/safe_loop_array_regs
-   stack, exactly as parse_for_in proved for its WHOLE body. Checking BOTH halves (not just the
-   index) is load-bearing, not defensive extra caution: a function can have more than one
-   array-like parameter, and a bound proven safe for array A must never be trusted for a *different*
-   array register B just because B happens to reuse the same index register number some other
-   call site verified was in range for A. idx_rk must also be a plain register (never a constant or
-   an already-raw value) -- this proof only ever applies to a range-for's own item register.
-
-   Packed-array field-access callers (OP_INDEX_FIELD_*_RAW_INT/REAL_UNCHECKED) have one ADDITIONAL
-   requirement beyond this function: arr_reg must also equal P.hint_param_reg, checked by the
-   caller before this is even consulted (that's what the surrounding reg_known_shape guard is for --
-   the field OFFSET those opcodes trust is only valid for that one specialized parameter). Typed-
-   array callers (OP_TYPED_INDEX_GET/SET_UNCHECKED) have no such requirement -- there is no offset
-   to resolve, just a plain element read/write, so any array register this function proves safe for
-   is sufficient on its own. */
+/* True iff (arr_reg, idx_rk) matches a pair on the safe_loop_item/array_regs stack. Both halves
+   must match: a bound proven for array A must never be trusted for a different array B that
+   happens to reuse the same index register. idx_rk must be a plain register.
+   Packed-array field callers additionally require arr_reg == P.hint_param_reg (the field offset
+   is only valid for that one specialized parameter); typed-array callers do not. */
 static bool index_safe_unchecked(int arr_reg, int idx_rk) {
     if (idx_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
     for (int i = 0; i < P.safe_loop_depth; i++) {
@@ -621,23 +572,12 @@ static bool index_safe_unchecked(int arr_reg, int idx_rk) {
     return false;
 }
 
-/* Must be called at every site that changes what register `reg` holds (plain '=', compound OP=,
-   destructuring, and -- for the name-shadowing edge case -- a for-loop reacquiring an
-   already-declared loop-variable name via var_slot). Poisons (never resurrects) any
-   safe_loop_item_regs/safe_loop_array_regs stack entry keyed on `reg` on EITHER side of the pair --
-   as the index (ordinary code reassigning a loop variable mid-body) or as the array (the
-   parameter itself being reassigned to point somewhere else, count and all, out from under a
-   still-live proof). Without covering both sides, index_safe_unchecked would keep trusting a
-   register NUMBER regardless of what it currently holds -- a real out-of-bounds read/write via
-   OP_INDEX_FIELD_*_RAW_*_UNCHECKED/OP_TYPED_INDEX_*_UNCHECKED, none of which have any runtime
-   check of their own to fall back on. Also invalidates length_tracked_valid if `reg` is the
-   parameter length_tracked_source_reg currently depends on -- the tracked "n == length(P)" fact is
-   only meaningful as long as P itself hasn't been reassigned, and nothing else re-derives that.
-   Overwrites (not removes) any matching stack slot with -1 -- the same "no known ___" sentinel
-   convention alias_source_param already uses -- so parse_for_in's push/pop depth-counting is
-   untouched: a dead slot simply never matches again until the loop that owns it naturally pops it,
-   and a fresh push always lands at an index beyond anything an enclosing scope could have
-   touched, so a dead slot can never be resurrected. */
+/* Call at every site that changes what `reg` holds. Poisons any safe_loop_item/array_regs entry
+   keyed on reg as EITHER the index or the array -- missing the array half means trusting a
+   register number regardless of what it now holds, an out-of-bounds read through the _UNCHECKED
+   opcodes, which have no runtime check to fall back on. Also clears length_tracked_valid if reg is
+   the parameter it depends on. Overwrites with -1 rather than removing, so parse_for_in's
+   push/pop depth counting is untouched and a dead slot can never be resurrected. */
 static void invalidate_register(int reg) {
     if (reg < 0) return;
     if (P.length_tracked_valid && reg == P.length_tracked_source_reg) P.length_tracked_valid = false;
@@ -647,18 +587,10 @@ static void invalidate_register(int reg) {
     }
 }
 
-/* Compile-time field lookup against a KNOWN Shape (only ever reached via P.reg_known_shape[], so
-   only during a specialization recompile) -- resolves the field's byte offset/type directly from
-   the Shape's own arrays, skipping vm_resolve_field_by_shape's runtime lookup and inline cache
-   entirely, since the shape is already a compile-time fact here. False means the field doesn't
-   exist on this shape -- callers fall back to the generic (runtime-checked, correctly-erroring)
-   opcode path rather than treating this as an internal error, since a genuinely missing field is
-   a normal source-level mistake the generic path already reports correctly.
-   *out_narrow is true for a narrow (int32/float32) field -- every caller uses it to pick between
-   the wide RAW opcode family (OP_FIELD_GET_RAW_INT/REAL etc.) and its narrow counterpart
-   (OP_FIELD_GET_RAW_INT32/FLOAT32 etc., vm.h), which widens/narrows at the field's own 4-byte
-   storage boundary while still computing through the same int64_t/double raw_ints[]/raw_reals[]
-   slots every raw arithmetic opcode uses regardless of a field's storage width. */
+/* Compile-time field lookup against a known Shape, resolving offset and type from the Shape's own
+   arrays instead of vm_resolve_field_by_shape's runtime lookup. False means the field is absent;
+   callers fall back to the generic opcode, which reports the source-level mistake correctly.
+   *out_narrow picks between the wide RAW opcode family and its int32/float32 counterpart. */
 static bool shape_find_field(Shape* shape, unsigned int field_name_idx, unsigned int* out_offset,
                              ValueType* out_type, bool* out_narrow) {
     for (unsigned int i = 0; i < shape->field_count; i++) {
@@ -905,16 +837,9 @@ static bool try_emit_arith_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind ki
     int slot = raw_materialize(c, raw_rk, kind);
     if (slot < 0) return false; /* raw-slot budget exhausted: fall back to boxed */
 
-    /* If raw_rk was already a temp (a freshly materialized literal, or an existing raw TEMP like a
-       specialized field-read result about to be freed anyway), computing in place is safe --
-       nothing else will read that slot again, so it can double as dest with zero new allocation,
-       via the ordinary in-place _BOXED opcode. If it aliases a NAMED raw local's own permanent
-       slot, mutating it in place would corrupt that local for any later use in the function --
-       the non-destructive _TO opcode variant handles that case by reading slot without touching
-       it and writing into a freshly allocated dest instead, avoiding the defensive
-       OP_RAW_MOVE_REAL the naive fix would otherwise need here (measured as a real, avoidable
-       extra dispatch on every fusion against a permanent local, e.g.
-       struct_array_scan.aer's `pi.x += vx * dt`, where vx is a permanent raw-real local). */
+    /* A temp raw_rk can double as dest -- nothing reads it again -- so use the in-place _BOXED
+       opcode. A named raw local's slot cannot: mutating it corrupts the local for later use, so
+       the non-destructive _TO variant reads it and writes a fresh dest instead. */
     int dest;
     Opcode raw_op;
     if (slot >= P.raw_real_reserved_floor) {
@@ -1007,22 +932,11 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     RawKind kind_lhs = rk_raw_kind(c, rk_lhs);
     RawKind kind_rhs = rk_raw_kind(c, rk_rhs);
 
-    /* Comparison-only special case: rk_raw_kind reports a bare literal constant as raw-composable,
-       exactly like an already-materialized raw slot -- indistinguishable by kind alone below.
-       That's the right call for arithmetic (raw-raw is the cheapest form there regardless of
-       which operand started as a literal), but wrong for a comparison against an ALREADY-raw
-       operand: boxing the constant instead (one OP_LOADK) keeps it eligible for the existing
-       raw-vs-boxed comparison fusion (try_emit_cmp_raw_boxed, whose own -JUMP_IF_FALSE variant may
-       fuse the branch too, emit_cond_jump_if_false), which raw-materializing it into an actual raw
-       slot rules out permanently -- that opcode's own handler (lbl_raw_lt_int_boxed etc., vm.c)
-       reads its "boxed" operand as a bare register index, no constant-pool support, so this
-       fusion is only reachable via a boxed register in the first place. Found via
-       small_dict_bench.aer's `i < 200000` (a raw loop counter against a literal bound), once
-       top-level locals could be raw at all: OP_RAW_LOAD_INT + OP_RAW_LT_INT +
-       OP_JUMP_IF_FALSE_REG (3 dispatches) instead of OP_LOADK + the fused compare+jump (2). Never
-       worse even when the comparison isn't a bare loop/if condition (no fusion to gain that way):
-       OP_LOADK + OP_RAW_LT_INT_BOXED is the same 2 dispatches OP_RAW_LOAD_INT + OP_RAW_LT_INT
-       already was. */
+    /* rk_raw_kind calls a bare literal raw-composable, which is right for arithmetic but wrong
+       for a comparison against an already-raw operand: boxing it (one OP_LOADK) keeps it eligible
+       for raw-vs-boxed comparison fusion, which raw-materializing rules out -- those handlers read
+       the boxed operand as a bare register, with no constant-pool support. Never worse: OP_LOADK +
+       fused compare is 2 dispatches, the same as the raw-materialized form it replaces. */
     if ((op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE) && kind_lhs != RAWK_NONE &&
         kind_lhs == kind_rhs) {
         bool lhs_is_slot = (rk_lhs & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) != 0;
@@ -1668,14 +1582,9 @@ static int parse_primary_inner(Chunk* c) {
             emit_array_new(c, dest, dest, 0);
             return dest;
         }
-        /* A bare `i`/`f`-suffixed numeric literal directly here (not wrapped in any other
-           expression) selects narrow (int32/float32) storage for the repeat-literal's numeric case
-           -- a suffix is parse-time-only information (see Token.narrow's own comment, lexer.h), so
-           this has to be decided from the token BEFORE parse_binary consumes it, not from the
-           runtime value it produces. Confirmed "not wrapped in anything else" by checking that
-           parsing the first element emitted zero opcodes -- a lone literal folds straight into a
-           constant-pool operand with no codegen, while `0.0f + 1` or any other compound expression
-           emits at least one real instruction. */
+        /* A suffix is parse-time-only information, so narrow storage must be decided from the token
+           before parse_binary consumes it. "Not wrapped in anything else" is confirmed by the first
+           element emitting zero opcodes -- a lone literal folds into a constant operand. */
         bool narrow_int_candidate = (token.type == TOKEN_INTEGER && token.narrow);
         bool narrow_float_candidate = (token.type == TOKEN_REAL && token.narrow);
         unsigned int emit_count_before = c->count;
@@ -1819,13 +1728,8 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                constant. */
             bool has_start = !equal(TOKEN_COLON);
             int rk_start = has_start ? parse_binary(c, 0) : 0;
-            /* Same fix/reasoning as parse_chain_assignment's fused index-field write side (see its
-               own comment): rk_start feeds directly into pack_rk16 below for the fused `[index].
-               field` read, a 16-bit RK slot with no "raw" state -- a genuinely raw-flagged index
-               (e.g. a manually promoted `for i < n:` counter) would corrupt that encoding, caught
-               here only as an incorrect "expression too large" error rather than silent corruption,
-               since rk16_fits doesn't mask out the raw flag bits either. No-op if rk_start isn't
-               raw-flagged (the overwhelmingly common case, a plain register or const already). */
+            /* rk_start feeds pack_rk16 below, a 16-bit slot with no raw state -- a raw-flagged index
+               would corrupt the encoding, and rk16_fits doesn't mask the flag bits either. */
             rk_start = box_if_raw(c, rk_start);
 
             if (!consume(TOKEN_COLON)) {
@@ -1854,14 +1758,10 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                         return rk;
                     }
                     mark_shape_sensitive(arr_reg);
-                    /* Specialized path: arr_reg's shape is a compile-time-known fact (only ever
-                       true during a specialization recompile) -- resolve the field directly and
-                       route the result through a raw slot instead of a boxed register, so it
-                       composes into further arithmetic via the SAME raw machinery a literal or
-                       raw local already uses (rk_raw_kind/box_if_raw), no new consumer-side logic
-                       needed. Falls back to the generic opcode below if the field isn't int/real,
-                       or if the raw-slot budget is exhausted (raw_int_alloc/raw_real_alloc return
-                       -1) -- same graceful-overflow convention raw locals already use. */
+                    /* arr_reg's shape is a compile-time fact here, so resolve the field directly and
+                       route the result through a raw slot, composing via the same raw machinery a
+                       raw local already uses. Falls back to the generic opcode if the field isn't
+                       int/real or the raw-slot budget is exhausted. */
                     Shape* known =
                         (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_known_shape[arr_reg] : NULL;
                     unsigned int foffset;
@@ -1906,27 +1806,18 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                 if (is_temp(arr_reg)) reg_free(1);
 
                 int dest = reg_alloc();
-                /* index_safe_unchecked already guarantees rk_start is a plain, non-const,
-                   non-raw register here -- always fits RK8 directly (registers never exceed
-                   FRAME_REGISTERS-1, well within RK8's 7 index bits), so no box_if_raw/spill
-                   handling is needed the way emit_index_get's general case requires. This is a
-                   loop-safety proof only, not a container-type one -- the array might turn out to
-                   be a plain array, dict, or anything else entirely, which is exactly why the
-                   opcode itself still checks TYPE_TYPED_ARRAY and simply won't have engaged the
-                   fast path if it's something else. */
+                /* rk_start is guaranteed plain and non-raw here, so it always fits RK8 directly.
+                   This is a loop-safety proof only, not a container-type one -- the opcode still
+                   checks TYPE_TYPED_ARRAY itself. */
                 if (index_safe_unchecked(arr_reg, rk_start)) {
                     chunk_emit(c, PACK3(OP_TYPED_INDEX_GET_UNCHECKED, dest, arr_reg, pack_rk8(rk_start)));
                 } else {
                     emit_index_get(c, dest, arr_reg, rk_start);
                 }
-                /* One-hop alias tracking for shape specialization (SPEC_KIND_ARRAY_OF_STRUCTS) --
-                   see P.last_plain_index_dest_reg's own comment. Recorded unconditionally (not just
-                   during a specialization recompile): P.last_plain_index_src_param only needs
-                   arr_reg's identity, which is available during the ordinary detection-phase
-                   compile too and is exactly what populates P.alias_source_param for
-                   shape_sensitive_mask. P.last_plain_index_known_elem_shape stays NULL outside an
-                   active specialization recompile, since P.reg_known_element_shape is only ever
-                   seeded there. */
+                /* One-hop alias tracking for SPEC_KIND_ARRAY_OF_STRUCTS. Recorded unconditionally:
+                   last_plain_index_src_param needs only arr_reg's identity, available during the
+                   ordinary compile too. last_plain_index_known_elem_shape stays NULL outside a
+                   specialization recompile, since reg_known_element_shape is only seeded there. */
                 P.last_plain_index_dest_reg = dest;
                 P.last_plain_index_src_param =
                     (arr_reg >= 0 && arr_reg < P.current_param_count) ? arr_reg : -1;
@@ -2274,15 +2165,10 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             c->count = lhs_start; /* discard lhs's OP_FIELD_GET, never executed */
         }
 
-        /* Fusion of `(A op1 B) op2 C` into one typed-array pass (OP_TYPED_ARRAY_CHAIN2, vm.c) --
-           checked the same way and at the same point as lhs_is_field just above: lhs's own
-           just-emitted code, before parsing the outer RHS, so there's no risk of excising
-           something an RHS jump target depends on. Requires BOTH operators to be one of the 3
-           fusable arithmetic ones (matching vm.c's own op_chain2_index) and the inner op's own
-           operands to be plain registers, not constants -- a constant operand would need
-           materializing into one first, simpler to just not fuse that narrower case for now, same
-           "fails closed" philosophy as index_safe_unchecked and friends: an unrecognized shape
-           just takes the ordinary, already-correct unfused path. */
+        /* Fuses `(A op1 B) op2 C` into one typed-array pass, checked like lhs_is_field above --
+           against just-emitted code, before the outer RHS is parsed. Both operators must be
+           fusable (see vm.c's op_chain2_index) and the inner operands plain registers; anything
+           else takes the ordinary unfused path. */
         bool lhs_is_chain2 = false;
         int lhs_chain2_a = 0, lhs_chain2_b = 0;
         Opcode lhs_chain2_op1 = OP_ADD;
@@ -2338,22 +2224,11 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             continue;
         }
 
-        /* `(temp_raw_real) +/- a*b` -- generalizes the compound-assignment FMA/FMS fusion
-           (parse_assignment's `x += a*b` handling) to any plain expression whose running-sum
-           operand is itself a fresh raw-real TEMPORARY, not just a named compound-assign target.
-           Found via nbody.aer's own hot-loop bytecode: its distance-squared `dx*dx + dy*dy +
-           dz*dz` (5,000,000 hits/iteration in advance()) compiles to 5 raw dispatches today
-           (MUL, MUL, ADD, MUL, ADD) even though OP_RAW_FMA_REAL already exists to collapse
-           exactly this shape -- it just had no path to fire outside compound-assignment before
-           this. Only safe when lhs is a TEMPORARY (raw slot >= raw_real_reserved_floor): a named
-           variable's own slot must never be overwritten in place here, since (unlike `x += a*b`,
-           where mutating x IS the statement's whole point) a plain expression's lhs might still be
-           read again later with its original value -- raw_real_alloc's own floor invariant (every
-           temp lands above every named variable's reserved slot) is exactly what makes this one
-           check sufficient. Requires the RHS to have compiled to EXACTLY one raw MUL, nothing
-           else -- any other shape falls through to the ordinary unfused path below, still fully
-           correct. Real-only, matching the compound-assignment version -- no int demand seen yet
-           either. */
+        /* Generalizes the compound-assignment FMA/FMS fusion to any plain expression whose running
+           sum is a fresh raw-real temporary. Safe only for a temporary (slot >=
+           raw_real_reserved_floor): a named variable's slot must not be overwritten in place, since
+           unlike `x += a*b` a plain expression's lhs may still be read with its original value.
+           Requires the RHS to be exactly one raw MUL; anything else falls through. Real only. */
         if (!lhs_is_field && !lhs_is_chain2 && (op == OP_ADD || op == OP_SUB) &&
             rk_raw_kind(c, lhs) == RAWK_REAL && (lhs & RK_RAW_SLOT_MASK) >= P.raw_real_reserved_floor &&
             c->count - rhs_start == 1) {
@@ -2372,20 +2247,10 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             }
         }
 
-        /* Found via a per-opcode dispatch audit: `x OP y.field` compiled as OP_FIELD_GET immediately
-           followed by OP_BINARY reading it back -- two dispatches for one operation. Recognized
-           by checking whether the RHS was exactly one bare field read (now 2 words).
-           Reuses OP_FIELD_BINARY (`field OP' x`) rather than a mirror-image opcode of its own --
-           `x OP field` and `field OP' x` compute the identical result whenever op' is either op
-           itself (ADD/MUL/EQ/NEQ/bitwise -- all commutative) or op's reversed-order comparison
-           (LT/GT and LTE/GTE swap: `x < field` is exactly `field > x`, no different computation,
-           just the operands read in the other order). SUB/DIV/MOD/FLOOR_DIV/LSHIFT/RSHIFT/IN have
-           no such equivalent (`x - field` is not expressible as `field OP' x` for any single
-           operator OP') and fall through to the ordinary, unfused path below instead -- this is
-           the rarer argument order for exactly the operators that don't commute, so losing the
-           fusion only there (never for the common ADD/comparison cases) was judged an acceptable
-           trade against carrying a whole second, near-duplicate opcode (and its own vm_binary_fast
-           call site) for a fusion the other opcode can already express by construction. */
+        /* Fuses `x OP y.field`, recognized by the RHS being exactly one bare field read. Reuses
+           OP_FIELD_BINARY (`field OP' x`) rather than a mirror opcode: the two agree whenever op is
+           commutative or is a comparison whose operands can be swapped (`x < f` == `f > x`).
+           SUB/DIV/MOD/shifts/IN have no such equivalent and fall through unfused. */
         if (c->count - rhs_start == 2 && (c->code[rhs_start] & 0xFF) == OP_FIELD_GET) {
             Opcode commuted_op;
             bool commutable = true;
@@ -2526,15 +2391,9 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             rhs_count++;
         }
 
-        /* Destructuring can rebind an already-shape-tracked or already-safe-loop-index register
-           (e.g. `pi, ok = try_lookup()` where `pi` previously held `particles[i]` and carried a
-           shape hint, or `i, extra = split(pair)` where `i` was an active loop index) -- clear all
-           four per-register facts for every target, same as the plain/compound assignment tails
-           above. Timed here (after the RHS is fully parsed) so a legitimate read of a target's OLD
-           value on the RHS itself -- e.g. `i, x = f(bodies[i].y)` -- still gets the fast path.
-           reg_known_element_shape (the SPEC_KIND_ARRAY_OF_STRUCTS one-hop-alias table) was a real,
-           separate gap here until now -- unlike reg_known_shape/alias_source_param, nothing ever
-           cleared it on reassignment, only the full reset at parse_function_body entry. */
+        /* Destructuring can rebind a shape-tracked or safe-loop-index register, so clear all four
+           per-register facts for every target. Timed after the RHS is parsed so a legitimate read
+           of a target's old value on the RHS still gets the fast path. */
         for (unsigned int i = 0; i < count; i++) {
             P.reg_known_shape[target_regs[i]] = NULL;
             P.reg_known_element_shape[target_regs[i]] = NULL;
@@ -2606,21 +2465,11 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                     }
                 }
             }
-            /* Eligible for raw storage iff: outside any if/else branch, and the RHS is provably
-               int/real -- NOT gated on function_depth (top-level scope qualifies too, not just a
-               function body). Verified safe for top-level specifically: frame 0's raw_ints/
-               raw_reals arrays are linked once for the VM's entire life at full capacity
-               (RAW_REGISTERS_INT/REAL, vm_init) and aer_vm_reset_for_reuse (called before every
-               REPL line) never touches them -- exactly the same persistence boxed top-level
-               registers already rely on, confirmed via smoke_test.c's own run_repl_line, which
-               restores vm->raw_ints/raw_reals from call_stack[0] alongside vm->registers.
-               global_regs[] (the shadow-ban mechanism) only ever compares register NUMBERS by
-               name for its ban check, never dereferences them as real storage, so a raw slot
-               index living there instead of an ordinary register index changes nothing about it
-               either. Found via dict_bench.aer/lookup_table_bench.aer/small_dict_bench.aer: their
-               top-level accumulator/loop-counter locals (`sum += h[key]`, `i += 1`) were paying
-               full boxed tag-checked arithmetic for their entire run, unlike the exact same
-               pattern already optimized inside any function body. */
+            /* Raw storage iff outside any if/else branch and the RHS is provably int/real -- not
+               gated on function_depth, so top-level qualifies. Safe there because frame 0's
+               raw_ints/raw_reals are linked at full capacity for the VM's life and
+               aer_vm_reset_for_reuse never touches them, exactly as boxed top-level registers
+               already rely on. global_regs[] only compares register numbers, never dereferences. */
             RawKind rhs_kind = rk_raw_kind(c, rk_val);
             if (P.branch_depth == 0 && rhs_kind != RAWK_NONE) {
                 int slot = (rhs_kind == RAWK_INT) ? raw_int_reserve_one() : raw_real_reserve_one();
@@ -2683,17 +2532,11 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                 }
                 /* Budget exhausted materializing the RHS -- fall through to the shadow path. */
             }
-            /* Mirrors var_slot's register-claiming, but rebinds an existing entry in place.
-                 A looped self-referential shadow (`total = total + x`) must refuse to compile
-               rather than silently freeze at the pre-loop value -- the RHS bytecode reading the
-               old raw value was already emitted before this shadow decision, and re-runs every
-               iteration reading a slot nothing writes to anymore (real bug found this way).
-               Gated on self_ref_watch_seen, not just loop_depth: that failure mode only exists
-               when the RHS actually reads x's OWN old value -- a reassignment that doesn't (e.g.
-               `total = some_function_call()`) has nothing stale to re-read on the next iteration,
-               so shadowing to a fresh boxed register is exactly as safe here as it already is
-               outside a loop. Found via bench/typed_array_bench.aer hitting the blanket refusal
-               despite matching this exact safe shape -- see self_ref_watch_name's own comment. */
+            /* Mirrors var_slot's register-claiming but rebinds in place. A looped self-referential
+               shadow (`total = total + x`) must refuse to compile: the RHS reading the old raw value
+               was already emitted and would re-read a slot nothing writes anymore. Gated on
+               self_ref_watch_seen rather than loop_depth, since a reassignment that doesn't read the
+               old value has nothing stale to re-read. */
             if (P.loop_depth > 0 && P.self_ref_watch_seen) {
                 error_at("This assignment would change '%s' from a fixed numeric type to a different type, "
                          "but it's inside a loop — not supported. If you're accumulating with +, -, or *, "
@@ -2732,30 +2575,16 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
            same loop body keep trusting an index register that may no longer hold what the loop's
            own PREP/LOOP put there. */
         invalidate_register(reg);
-        /* reg_known_element_shape[reg] (the SPEC_KIND_ARRAY_OF_STRUCTS one-hop-alias source table,
-           consulted when THIS register is later indexed, e.g. `bodies = particles[i]` reassigning
-           the array parameter itself) had no invalidation anywhere until now, unlike reg_known_shape/
-           alias_source_param just below -- cleared unconditionally here, before either branch, since
-           neither one is a case where `reg` legitimately deserves a surviving "my elements are this
-           shape" fact (only parse_function_body's initial seed for hint_param_reg is). A real,
-           reachable type-confusion bug without this: reassign a specialized array-of-structs
-           parameter to a differently-shaped array, then index through a fresh one-hop alias of it --
-           the field offset resolved would be the STALE shape's, not the new array's actual layout. */
+        /* Cleared unconditionally before either branch: only parse_function_body's initial seed
+           deserves a surviving "my elements are this shape" fact. Without this, reassigning a
+           specialized array-of-structs parameter and indexing through a fresh alias resolves the
+           stale shape's field offset -- reachable type confusion. */
         P.reg_known_element_shape[reg] = NULL;
-        /* A shape-sensitive parameter reassigned to some other value (only reachable during a
-           specialization recompile, where hint_param_reg's own register was seeded with a known
-           Shape -- see parse_function_body) must lose that hint here: the register's VALUE just
-           changed, but var_slot returns the SAME register number for an already-declared name, so
-           P.reg_known_shape[reg] would otherwise keep trusting a shape that may no longer be true.
-           A later '.field' access on this register must fall back to the generic, runtime-checked
-           opcode, not a raw one that would trust a stale offset against whatever this reg holds
-           now. Default to clearing it -- always safe (NULL outside an active specialization
-           anyway) -- UNLESS the RHS was exactly `some_param[idx]` (P.last_plain_index_dest_reg),
-           the one-hop alias pattern SPEC_KIND_ARRAY_OF_STRUCTS needs (`pi = particles[i]`):
-           there, propagate the parameter's known ELEMENT shape onto this alias's own permanent
-           register instead, so a later `pi.field` can also take the raw-opcode path. Consumed
-           (reset to -1) immediately so a later, unrelated assignment can never see a stale match
-           against a since-freed-and-reused temp register number. */
+        /* var_slot returns the same register for an already-declared name, so a reassigned
+           shape-sensitive parameter would keep a hint that may no longer hold. Clear it by default
+           -- always safe -- unless the RHS was exactly `some_param[idx]`, the one-hop alias pattern
+           SPEC_KIND_ARRAY_OF_STRUCTS needs, where the parameter's element shape propagates onto the
+           alias instead. Consumed immediately so a freed-and-reused temp can't match later. */
         if (rk_val == P.last_plain_index_dest_reg && P.last_plain_index_dest_reg >= 0) {
             P.reg_known_shape[reg] = P.last_plain_index_known_elem_shape;
             P.alias_source_param[reg] = P.last_plain_index_src_param;
@@ -2804,14 +2633,9 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             if (parse_had_error) return;
             RawKind rhs_kind = rk_raw_kind(c, rk_rhs);
 
-            /* `x += a*b` / `x -= a*b` on a raw real local -- fuses the RHS's own just-emitted
-               OP_RAW_MUL_REAL and this op's ADD/SUB into one OP_RAW_FMA_REAL/OP_RAW_FMS_REAL
-               dispatch (see that opcode's own comment, vm.h, for why this is still bit-identical
-               to the unfused form). Only when the RHS compiled down to EXACTLY one raw MUL whose
-               OWN dest is the slot rk_rhs itself points at (nothing else emitted in between, and
-               not some earlier-computed value being reused) -- any other shape just falls through
-               to the ordinary unfused path below, still fully correct. Real-only: nothing in this
-               codebase's own benchmarks has shown an int version of this shape yet. */
+            /* Fuses the RHS's just-emitted OP_RAW_MUL_REAL with this ADD/SUB into one FMA/FMS
+               dispatch. Only when the RHS was exactly one raw MUL writing the slot rk_rhs points
+               at; anything else falls through unfused. Real only. */
             if (cur_kind == RAWK_REAL && (boxed_op == OP_ADD || boxed_op == OP_SUB) &&
                 rhs_kind == RAWK_REAL && c->count - rhs_start == 1) {
                 uint32_t mw = c->code[rhs_start];
@@ -2990,17 +2814,9 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
 
     if (first_is_index) {
         pending_rk_idx = parse_binary(c, 0);
-        /* Boxed unconditionally, right here, regardless of which path (fused index-field or the
-           general emit_index_get/emit_index_set fallback) ends up consuming it below: the fused
-           opcodes pack it directly into a 16-bit RK slot with no third "raw" state (only a plain
-           register or a const-pool index ever fit there), so a genuinely raw-flagged index (e.g. a
-           manually promoted `for i < n:` counter, as opposed to a `for i in a..b:` range-for's
-           loop variable, which is always boxed already) would corrupt that encoding outright --
-           rk16_fits/rk8_fits only mask out RK_CONST_FLAG, not RK_RAW_INT_FLAG/RK_RAW_REAL_FLAG, so
-           it manifested as an incorrect "expression too large" compile error instead, rather than
-           silent corruption, but still a real bug (found via a genuinely raw loop-counter index
-           into a fused `arr[i].field += x`). A no-op for the general path -- emit_index_get/
-           emit_index_set already box their own index argument internally. */
+        /* Boxed unconditionally: the fused opcodes pack the index into a 16-bit RK slot with no raw
+           state, and rk16_fits/rk8_fits mask only RK_CONST_FLAG, so a raw-flagged index corrupts the
+           encoding (surfacing as a bogus "expression too large"). No-op for the general path. */
         pending_rk_idx = box_if_raw(c, pending_rk_idx);
         require(TOKEN_CLOSE_BRACKET, "expected ']' after index");
     } else {
@@ -3116,16 +2932,9 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 int rk_rhs = parse_binary(c, 0);
                 if (parse_had_error) return;
                 Opcode bin_op = compound_assign_ops[compound_i].op;
-                /* Decomposing this into separate raw GET + arithmetic + SET opcodes was tried and
-                   measured WORSE on nbody.aer whenever the rhs needed BOXING first -- the generic
-                   OP_INDEX_FIELD_COMPOUND already resolves+reads+computes+writes in one dispatch
-                   with no boxed AerVal for the field's own value, so decomposing just to box the
-                   rhs anyway added two dispatches for nothing. But when the rhs is ALREADY raw at
-                   this point (a raw local, or try_emit_arith_raw_boxed's fusion result -- common
-                   now that raw field reads compose with boxed values), there's no boxing to avoid
-                   paying for: OP_INDEX_FIELD_COMPOUND_RAW_INT/REAL reads/computes/writes the field
-                   raw AND takes rk_rhs raw directly, so this case has no downside, only upside
-                   (skips the box_if_raw the generic opcode would otherwise force on the rhs). */
+                /* Decomposing into raw GET + arithmetic + SET measured worse whenever the rhs needed
+                   boxing -- the generic opcode already does it all in one dispatch. When the rhs is
+                   already raw there is no boxing to avoid, so the RAW variant is pure upside. */
                 bool native_op_exists = (bin_op == OP_ADD || bin_op == OP_SUB || bin_op == OP_MUL);
                 if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
                     int slot = raw_materialize(c, rk_rhs, field_kind);
@@ -3567,14 +3376,10 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
     P.reg_known_element_shape[item_reg] = NULL;
     P.alias_source_param[item_reg] = -1;
     invalidate_register(item_reg);
-    /* invalidate_register only catches loop_var_name reusing a register some OTHER tracked fact
-       depends on -- it can't catch loop_var_name reusing the length_tracked_name NAME itself
-       (e.g. `for n in 0..1000: ...` after `n = length(bodies)`), since var_slot's return value for
-       an existing name is just a register number, indistinguishable here from a brand new one.
-       Every iteration of THIS loop is about to overwrite that register with values that have
-       nothing to do with length(bodies) -- without this check, length_tracked_valid would stay
-       true, and a LATER `for i in 0..n:` would wrongly trust n's post-loop leftover value as if it
-       still equalled length(bodies). */
+    /* invalidate_register cannot catch loop_var_name reusing the length_tracked_name NAME itself
+       (`for n in 0..1000:` after `n = length(bodies)`) -- var_slot returns a bare register number,
+       indistinguishable from a new one. This loop overwrites that register every iteration, so a
+       later `for i in 0..n:` would otherwise trust the stale leftover. */
     if (P.length_tracked_valid && loop_var_name == P.length_tracked_name) P.length_tracked_valid = false;
 
     unsigned int start_code_begin = c->count;
@@ -3593,22 +3398,11 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         require(TOKEN_COLON, "expected ':' after for-in clause");
         if (parse_had_error) return;
 
-        /* Loop-bound-hoisting safety proof -- index_safe_unchecked's own comment (above) has the
-           full mechanism this feeds. Checked here, BEFORE arg_materialize below (which may copy
-           rk_start/rk_end into fresh registers that no longer identify their true source).
-           bound_safe: rk_end reads EXACTLY the one local variable currently proven == length(P)
-           for SOME parameter P (name-keyed via P.length_tracked_name, so this stays correct
-           regardless of raw/boxed storage-kind shuffling elsewhere) -- bound_array_reg records
-           WHICH parameter P was, since that's what every later index_safe_unchecked check must
-           match against, not just any array happening to reuse the same index register. start_safe:
-           rk_start is either the literal 0, or an active enclosing safe loop's own item register
-           PROVEN SAFE FOR THIS SAME bound_array_reg (a bare `for j in i..n`), or that register plus
-           a non-negative literal constant (`for j in (i+1)..n` -- nbody's actual pairwise
-           inner-loop shape) -- every case provably >= 0 given the enclosing loop's own already-
-           established bound, for the SAME array. Both halves fail closed: any shape this doesn't
-           recognize (a computed start/end, an unrelated variable, a raw local, or a start proven
-           safe only for a DIFFERENT array) simply leaves this_loop_safe false and the loop compiles
-           exactly as it always has. */
+        /* Checked before arg_materialize, which may copy rk_start/rk_end into fresh registers that
+           no longer identify their source. bound_safe: rk_end reads exactly the local proven ==
+           length(P), and bound_array_reg records which P. start_safe: rk_start is literal 0, an
+           enclosing safe loop's item register proven for that SAME array, or that plus a
+           non-negative constant. Both fail closed -- an unrecognized shape just compiles as before. */
         bool bound_safe = false;
         int bound_array_reg = -1;
         if (P.length_tracked_valid && !(rk_end & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) {
