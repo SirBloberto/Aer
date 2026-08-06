@@ -3162,7 +3162,6 @@ lbl_dict_new : {
     int dest_reg = (int)UNPACK_A(op_word);
     int pair_reg_base = (int)UNPACK_B(op_word);
     int pair_count = (int)UNPACK_C(op_word);
-    bool const_keys = READ() != 0;
     AerDict* d = heap_alloc(&vm->heap, &vm->heap.dict_pool);
     memset(&d->map, 0, sizeof(d->map));
     d->map.pools = &vm->heap.dict_hash_pools;
@@ -3182,12 +3181,8 @@ lbl_dict_new : {
         AerString* ks = aer_as_string(key);
         unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
         uint64_t khash = hashtable_hash_bytes(ks->data, klen);
-        if (const_keys) {
-            hashtable_put_borrowed(&d->map, ks->data, klen, khash, val);
-        } else {
-            hashtable_put_hashed(&d->map, hashtable_key_dup(d->map.pools, ks->data, klen, NULL), klen,
-                                 khash, val);
-        }
+        char* k = hashtable_key_dup(d->map.pools, ks->data, klen, NULL);
+        hashtable_put_hashed(&d->map, k, klen, khash, val);
     }
     registers[dest_reg] = aer_dict_val(d);
     gc_maybe_collect(vm); /* pool_alloc(&dict_pool) above; result already rooted */

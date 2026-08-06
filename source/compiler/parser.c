@@ -426,9 +426,8 @@ void emit_slice_get(Chunk* c, int dest_reg, int arr_reg, int rk_start, int rk_en
     chunk_emit(c, PACK_2X16(pack_rk16(rk_start), pack_rk16(rk_end)));
 }
 
-void emit_dict_new(Chunk* c, int dest_reg, int pair_reg_base, int pair_count, bool const_keys) {
+void emit_dict_new(Chunk* c, int dest_reg, int pair_reg_base, int pair_count) {
     chunk_emit(c, PACK3(OP_DICT_NEW, dest_reg, pair_reg_base, pair_count));
-    chunk_emit(c, (uint32_t)(const_keys ? 1 : 0));
 }
 
 unsigned int emit_iter_next_array(Chunk* c, int col_reg, int idx_reg, int item_dest_reg) {
@@ -1636,15 +1635,9 @@ static int parse_primary_inner(Chunk* c) {
     if (consume(TOKEN_OPEN_BRACE)) {
         int pair_reg_base = -1;
         int pair_count = 0;
-        /* Every key a string literal means the dict can borrow constant-pool bytes rather than
-           copying each one every time this literal is evaluated (OP_DICT_NEW's trailing word). */
-        bool const_keys = true;
         if (!equal(TOKEN_CLOSE_BRACE)) {
             do {
                 int rk_key = parse_binary(c, 0);
-                if (!(rk_key & RK_CONST_FLAG) ||
-                    aer_type(c->pool[rk_key & ~RK_CONST_FLAG]) != TYPE_STRING)
-                    const_keys = false;
                 int reg_key = arg_materialize(c, rk_key);
                 if (pair_count == 0) pair_reg_base = reg_key;
                 require(TOKEN_COLON, "expected ':' after dict key");
@@ -1658,8 +1651,7 @@ static int parse_primary_inner(Chunk* c) {
         if (parse_had_error) return 0;
         int dest = (pair_count > 0) ? pair_reg_base : reg_alloc();
         if (pair_count > 1) reg_free(2 * pair_count - 1);
-        emit_dict_new(c, dest, pair_reg_base < 0 ? dest : pair_reg_base, pair_count,
-                      const_keys && pair_count > 0);
+        emit_dict_new(c, dest, pair_reg_base < 0 ? dest : pair_reg_base, pair_count);
         return dest;
     }
     if (token.type == TOKEN_INTEGER || token.type == TOKEN_REAL || token.type == TOKEN_TRUE ||

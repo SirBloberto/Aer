@@ -133,7 +133,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
                      "reg = new dict from contiguous key/value reg pairs",
                      {FLD_REG, FLD_REG, FLD_COUNT},
                      false,
-                     1,
+                     0,
                      3},
     /* word0: col+idx+item_dest. word1: end_target (dedicated). */
     [OP_ITER_NEXT_ARRAY] = {"OP_ITER_NEXT_ARRAY",
