@@ -84,10 +84,8 @@ source/core/vm.h:11
 source/core/vm.h:10
 source/core/vm.h:10
 source/core/vm.h:13
-source/core/vm.h:19
 source/core/vm.h:8
 source/core/vm.h:8
-source/core/vm.h:21
 source/core/vm.h:8
 source/core/vm.h:10
 source/core/vm.h:9

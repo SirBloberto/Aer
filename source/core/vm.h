@@ -417,25 +417,10 @@ typedef enum {
     OP_LTE_JUMP_IF_FALSE,
     OP_GTE_JUMP_IF_FALSE,
 
-    /* Same fusion as OP_LT_JUMP_IF_FALSE et al. above, extended to JUST the raw-boxed int family --
-       found via mandelbrot's own profile: its `for iter < max_iter:` (a raw int loop counter
-       against a boxed function-parameter bound) is OP_RAW_LT_INT_BOXED, paying the exact same
-       materialize-then-jump tax the plain boxed family did. Deliberately narrower than an earlier
-       attempt at all 4 raw comparison families (raw-raw int/real, raw-boxed int/real, 16 opcodes):
-       measured, that wider version's OTHER 12 opcodes earned nothing (mandelbrot's OWN escape check,
-       `if x2 + y2 > 4.0:`, doesn't qualify -- computing x2+y2 is its own instruction just before the
-       compare, so the bare-comparison-only detection this fusion requires correctly declines it; no
-       other benchmark in bench/ was found hitting the other 3 families either) while still costing
-       every program a measurable branch-misprediction tax: each new opcode is a new indirect-branch
-       dispatch SITE competing for the same finite-size hardware branch-target-predictor table every
-       OTHER opcode's dispatch already relies on, whether or not a given program ever uses the new
-       opcode itself (confirmed via perf -- branch-misses rose on programs, like fib_bench, that
-       never execute any of these 16 opcodes at all; icache/dcache miss rates were unaffected, ruling
-       those out). Keeping only the 4 opcodes with a proven win keeps that unavoidable tax as small
-       as it can be for the benefit actually captured. Operand layout is the existing raw-boxed-int
-       opcode's own word0 B/C fields verbatim (a raw slot + a boxed register) -- only the A field
-       (the boxed-bool destination, unused here) and the trailing jump-target word change, exactly
-       mirroring OP_LT_JUMP_IF_FALSE's own shape. */
+    /* OP_LT_JUMP_IF_FALSE's fusion, for the raw-boxed int family only -- the other 12 raw
+       comparison opcodes were measured earning nothing against the branch-predictor cost every
+       added opcode imposes. Operand layout is the raw-boxed int opcode's own word0 B/C verbatim,
+       plus a trailing jump-target word. */
     OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE,
     OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE,
     OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE,
@@ -725,27 +710,11 @@ typedef struct {
     unsigned int max_raw_ints;
     unsigned int max_raw_reals;
 
-    /* An additional, OPTIONAL specialized body for this SAME shape, additionally assuming up to
-       SPEC_MAX_RAW_PARAMS other (non-shape-sensitive) parameters are numeric (int/real) and binding
-       them as raw locals instead of boxed -- e.g. nbody's `advance(bodies, dt)`/struct_array_scan's
-       `advance_pass(particles, n, dt)`, where `dt` composes with raw struct-field reads in the hot
-       loop every call, but arrives boxed like every AER parameter (no exceptions, no parameter type
-       syntax exists). A SEPARATE variant rather than folding raw-param-kind into the SAME
-       Shape-keyed SPEC_MAX table above: doing that would let a fluctuating parameter type (unlikely
-       here, but not impossible in AER's fully dynamic typing) starve the shape axis's own small
-       budget and reach `megamorphic` sooner for no good reason. This axis is intentionally
-       decoupled and just silently declines to apply (falling back to this SpecEntry's OWN baseline
-       code_offset above, still fully correct) whenever it doesn't fit -- it never touches
-       `megamorphic` or the shape table at all.
-
-       raw_param_count: 0 = never attempted (the common case, checked first, free). -1 = attempted
-       once and failed (raw_ints/raw_reals budget exhausted for this shape's already-considerable
-       raw-field usage) -- a permanent-for-this-SpecEntry bailout so a full recompile isn't retried
-       every single call. >0 = successfully compiled for exactly these parameter registers/types;
-       reused on a later call only if the CURRENTLY observed types for those same registers still
-       match raw_param_types exactly -- a call observing a different type for one of them just falls
-       back to this entry's baseline body for that one call, same non-invasive-fallback spirit as
-       the shape axis's own homogeneity check. */
+    /* Optional second specialized body for this shape that also binds up to SPEC_MAX_RAW_PARAMS
+       numeric parameters as raw locals. Declines silently to this entry's baseline body when it
+       doesn't fit -- never touches `megamorphic` or the shape table.
+       raw_param_count: 0 = never attempted, -1 = attempted and permanently declined, >0 = compiled
+       for exactly raw_param_regs/raw_param_types, reused only while observed types still match. */
     int raw_param_count;
     int raw_param_regs[SPEC_MAX_RAW_PARAMS];
     ValueType raw_param_types[SPEC_MAX_RAW_PARAMS];
