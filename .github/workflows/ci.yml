@@ -22,11 +22,22 @@ jobs:
       - name: Run embedding smoke test
         run: make test-embed
 
-      # Fixed seed for reproducibility — see tests/fuzz.py's docstring on why
-      # an unseeded run occasionally reports a non-actionable "hang" from a
-      # seed fixture's own recursive logic, not an AER defect. timeout-minutes
-      # so a genuinely stuck run fails the job fast instead of eating GitHub's
-      # 6-hour default (a fuzz-runner hang has happened before).
+      - name: Run register-VM smoke test
+        run: make test-smoke
+
+      - name: Run opcode encoding round-trip test
+        run: make test-roundtrip
+
+      - name: Check every opcode is emitted by some test or benchmark
+        run: make check-opcode-coverage
+
+      - name: Check the formatter is idempotent on its own expected output
+        run: make test-fmt
+
+      # A fixed seed plus the interpreter's own instruction budget makes this reproduce exactly:
+      # the same seed yields the same findings on any machine, so a failure here is reproducible
+      # locally rather than a runner-load artifact. timeout-minutes is belt-and-braces against a
+      # stuck runner eating GitHub's 6-hour default.
       - name: Fuzz (ASAN build, fixed seed)
         timeout-minutes: 20
         shell: bash

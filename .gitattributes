@@ -1,0 +1,7 @@
+# aer-fmt always writes LF. Its fixtures are compared byte-for-byte against that output, so a
+# CRLF checkout makes test-fmt report every line as changed on Windows while passing on Linux.
+tests/fmt_input.aer     text eol=lf
+tests/fmt_expected.aer  text eol=lf
+
+# Compared against the interpreter's own stdout the same way.
+tests/error_lines/*.aer text eol=lf

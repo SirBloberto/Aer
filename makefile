@@ -211,6 +211,11 @@ check-format:
 check-comments:
 	python3 tools/check_comments.py
 
+# Fails when an opcode has no test or benchmark that emits it. Needs the disassembler build, so it
+# is not folded into check-style (which must stay a source-only, no-build check).
+check-opcode-coverage: debug-tools
+	python3 tools/check_opcode_coverage.py --binary binary/aer-debug$(EXE)
+
 check-style: check-format check-comments
 
 # Clean-builds both refs on the Pi and prints a per-benchmark delta table. Always use this rather
