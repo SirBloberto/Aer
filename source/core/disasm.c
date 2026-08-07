@@ -408,32 +408,32 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_LTE_JUMP_IF_FALSE] = {"OP_LTE_JUMP_IF_FALSE", "jump if !(rk <= rk)", {0}, false, 1, 0},
     [OP_GTE_JUMP_IF_FALSE] = {"OP_GTE_JUMP_IF_FALSE", "jump if !(rk >= rk)", {0}, false, 1, 0},
     [OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr < reg) (tag-checked)", {0}, false, 1, 0},
+        {"OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr < rk) (tag-checked)", {0}, false, 1, 0},
     [OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr > reg) (tag-checked)", {0}, false, 1, 0},
+        {"OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr > rk) (tag-checked)", {0}, false, 1, 0},
     [OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr <= reg) (tag-checked)", {0}, false, 1, 0},
+        {"OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr <= rk) (tag-checked)", {0}, false, 1, 0},
     [OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr >= reg) (tag-checked)", {0}, false, 1, 0},
+        {"OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr >= rk) (tag-checked)", {0}, false, 1, 0},
     /* Variable-length, but not OP_DEFINE_STRUCT's shape -- header word then part_count RK16
        words, one per part. Both walkers below special-case it. */
     [OP_INTERP] = {"OP_INTERP", "reg = one string built from N parts", {0}, false, 0, 2},
     [OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi < reg) (tag-checked)", {0}, false, 1, 0},
+        {"OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi < rk) (tag-checked)", {0}, false, 1, 0},
     [OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi > reg) (tag-checked)", {0}, false, 1, 0},
+        {"OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi > rk) (tag-checked)", {0}, false, 1, 0},
     [OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi <= reg) (tag-checked)", {0}, false, 1, 0},
+        {"OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi <= rk) (tag-checked)", {0}, false, 1, 0},
     [OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi >= reg) (tag-checked)", {0}, false, 1, 0},
-    [OP_RAW_LT_INT_BOXED] = {"OP_RAW_LT_INT_BOXED", "reg = rawi < reg (tag-checked)"},
-    [OP_RAW_GT_INT_BOXED] = {"OP_RAW_GT_INT_BOXED", "reg = rawi > reg (tag-checked)"},
-    [OP_RAW_LTE_INT_BOXED] = {"OP_RAW_LTE_INT_BOXED", "reg = rawi <= reg (tag-checked)"},
-    [OP_RAW_GTE_INT_BOXED] = {"OP_RAW_GTE_INT_BOXED", "reg = rawi >= reg (tag-checked)"},
-    [OP_RAW_LT_REAL_BOXED] = {"OP_RAW_LT_REAL_BOXED", "reg = rawr < reg (tag-checked)"},
-    [OP_RAW_GT_REAL_BOXED] = {"OP_RAW_GT_REAL_BOXED", "reg = rawr > reg (tag-checked)"},
-    [OP_RAW_LTE_REAL_BOXED] = {"OP_RAW_LTE_REAL_BOXED", "reg = rawr <= reg (tag-checked)"},
-    [OP_RAW_GTE_REAL_BOXED] = {"OP_RAW_GTE_REAL_BOXED", "reg = rawr >= reg (tag-checked)"},
+        {"OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi >= rk) (tag-checked)", {0}, false, 1, 0},
+    [OP_RAW_LT_INT_BOXED] = {"OP_RAW_LT_INT_BOXED", "reg = rawi < rk (tag-checked)"},
+    [OP_RAW_GT_INT_BOXED] = {"OP_RAW_GT_INT_BOXED", "reg = rawi > rk (tag-checked)"},
+    [OP_RAW_LTE_INT_BOXED] = {"OP_RAW_LTE_INT_BOXED", "reg = rawi <= rk (tag-checked)"},
+    [OP_RAW_GTE_INT_BOXED] = {"OP_RAW_GTE_INT_BOXED", "reg = rawi >= rk (tag-checked)"},
+    [OP_RAW_LT_REAL_BOXED] = {"OP_RAW_LT_REAL_BOXED", "reg = rawr < rk (tag-checked)"},
+    [OP_RAW_GT_REAL_BOXED] = {"OP_RAW_GT_REAL_BOXED", "reg = rawr > rk (tag-checked)"},
+    [OP_RAW_LTE_REAL_BOXED] = {"OP_RAW_LTE_REAL_BOXED", "reg = rawr <= rk (tag-checked)"},
+    [OP_RAW_GTE_REAL_BOXED] = {"OP_RAW_GTE_REAL_BOXED", "reg = rawr >= rk (tag-checked)"},
 };
 
 static const char* cast_name(int k) {
@@ -609,12 +609,12 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     } else if (op == OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE || op == OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE ||
                op == OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE || op == OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE) {
         print_rawi(out, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
+        print_rk8(out, c, UNPACK_C(op_word));
         print_field(out, c, FLD_JUMP, (int)c->code[pos++]);
     } else if (op == OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE || op == OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE ||
                op == OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE || op == OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE) {
         print_rawr(out, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
+        print_rk8(out, c, UNPACK_C(op_word));
         print_field(out, c, FLD_JUMP, (int)c->code[pos++]);
     } else if (op == OP_INDEX_GET || op == OP_TYPED_INDEX_GET_UNCHECKED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
@@ -906,12 +906,12 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
                op == OP_RAW_GTE_INT_BOXED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
+        print_rk8(out, c, UNPACK_C(op_word));
     } else if (op == OP_RAW_LT_REAL_BOXED || op == OP_RAW_GT_REAL_BOXED || op == OP_RAW_LTE_REAL_BOXED ||
                op == OP_RAW_GTE_REAL_BOXED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
+        print_rk8(out, c, UNPACK_C(op_word));
     } else {
         /* Generic path -- the handful of opcodes whose fields all fit the plain PACK3 shape
            (op+up to 3 byte fields) with nothing trailing, or nothing at all. */

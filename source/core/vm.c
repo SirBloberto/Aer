@@ -4943,8 +4943,7 @@ lbl_raw_load_int_pool : {
 lbl_raw_lt_int_boxed : {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
-    int reg = (int)UNPACK_C(op_word);
-    AerVal* rhs = &registers[reg];
+    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (rhs->tag == TYPE_INTEGER)
         registers[dest] = aer_bool(raw_ints[slot] < rhs->as.i);
     else if (rhs->tag == TYPE_REAL)
@@ -4957,8 +4956,7 @@ lbl_raw_lt_int_boxed : {
 lbl_raw_gt_int_boxed : {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
-    int reg = (int)UNPACK_C(op_word);
-    AerVal* rhs = &registers[reg];
+    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (rhs->tag == TYPE_INTEGER)
         registers[dest] = aer_bool(raw_ints[slot] > rhs->as.i);
     else if (rhs->tag == TYPE_REAL)
@@ -4971,8 +4969,7 @@ lbl_raw_gt_int_boxed : {
 lbl_raw_lte_int_boxed : {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
-    int reg = (int)UNPACK_C(op_word);
-    AerVal* rhs = &registers[reg];
+    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (rhs->tag == TYPE_INTEGER)
         registers[dest] = aer_bool(raw_ints[slot] <= rhs->as.i);
     else if (rhs->tag == TYPE_REAL)
@@ -4985,8 +4982,7 @@ lbl_raw_lte_int_boxed : {
 lbl_raw_gte_int_boxed : {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
-    int reg = (int)UNPACK_C(op_word);
-    AerVal* rhs = &registers[reg];
+    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (rhs->tag == TYPE_INTEGER)
         registers[dest] = aer_bool(raw_ints[slot] >= rhs->as.i);
     else if (rhs->tag == TYPE_REAL)
@@ -4999,8 +4995,7 @@ lbl_raw_gte_int_boxed : {
 lbl_raw_lt_real_boxed : {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
-    int reg = (int)UNPACK_C(op_word);
-    AerVal* rhs = &registers[reg];
+    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (rhs->tag == TYPE_REAL)
         registers[dest] = aer_bool(raw_reals[slot] < rhs->as.d);
     else if (rhs->tag == TYPE_INTEGER)
@@ -5013,8 +5008,7 @@ lbl_raw_lt_real_boxed : {
 lbl_raw_gt_real_boxed : {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
-    int reg = (int)UNPACK_C(op_word);
-    AerVal* rhs = &registers[reg];
+    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (rhs->tag == TYPE_REAL)
         registers[dest] = aer_bool(raw_reals[slot] > rhs->as.d);
     else if (rhs->tag == TYPE_INTEGER)
@@ -5027,8 +5021,7 @@ lbl_raw_gt_real_boxed : {
 lbl_raw_lte_real_boxed : {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
-    int reg = (int)UNPACK_C(op_word);
-    AerVal* rhs = &registers[reg];
+    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (rhs->tag == TYPE_REAL)
         registers[dest] = aer_bool(raw_reals[slot] <= rhs->as.d);
     else if (rhs->tag == TYPE_INTEGER)
@@ -5041,8 +5034,7 @@ lbl_raw_lte_real_boxed : {
 lbl_raw_gte_real_boxed : {
     int dest = (int)UNPACK_A(op_word);
     int slot = (int)UNPACK_B(op_word);
-    int reg = (int)UNPACK_C(op_word);
-    AerVal* rhs = &registers[reg];
+    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (rhs->tag == TYPE_REAL)
         registers[dest] = aer_bool(raw_reals[slot] >= rhs->as.d);
     else if (rhs->tag == TYPE_INTEGER)
@@ -5059,8 +5051,7 @@ lbl_raw_gte_real_boxed : {
 #define RAW_CMP_INT_BOXED_JUMP_IF_FALSE(name, op, opstr)                                                     \
     lbl_raw_##name##_int_boxed_jump_if_false : {                                                             \
         int slot = (int)UNPACK_B(op_word);                                                                   \
-        int reg = (int)UNPACK_C(op_word);                                                                    \
-        AerVal* rhs = &registers[reg];                                                                       \
+        AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));                                  \
         int target = READ();                                                                                 \
         bool cond;                                                                                           \
         if (rhs->tag == TYPE_INTEGER)                                                                        \
@@ -5086,8 +5077,7 @@ lbl_raw_gte_real_boxed : {
 #define RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(name, op, opstr)                                                    \
     lbl_raw_##name##_real_boxed_jump_if_false : {                                                            \
         int slot = (int)UNPACK_B(op_word);                                                                   \
-        int reg = (int)UNPACK_C(op_word);                                                                    \
-        AerVal* rhs = &registers[reg];                                                                       \
+        AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));                                  \
         int target = READ();                                                                                 \
         bool cond;                                                                                           \
         if (rhs->tag == TYPE_REAL)                                                                           \

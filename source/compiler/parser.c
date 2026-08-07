@@ -319,10 +319,6 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
    branch-prediction cost (see vm.h). Detected by inspecting what was just compiled and rolling it
    back, so anything else -- and/or, a bare boolean, a spilled operand -- falls through. */
 static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int cond_start) {
-    /* A raw-vs-constant comparison always emits OP_LOADK before the compare, so the one-word check
-       below never fires. Keep the LOADK, fuse the compare with the branch: 3 dispatches become 2.
-       Only when the LOADK's dest is a temp (>= reserved_floor) -- a named variable's register may
-       be read again later, so assuming it dead is unsound. */
     /* The comparison only has to be the LAST instruction of the condition, not the whole of it --
        `x * x + y * y > 4.0` computes into raw slots first, and used to miss the fusion entirely
        because the region was three words rather than two. Everything before it is kept. */
@@ -907,7 +903,8 @@ static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind
     int boxed_rk = lhs_raw ? rk_rhs : rk_lhs;
 
     if (!(raw_rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) return false;
-    if (boxed_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
+    if (boxed_rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
+    if (!rk8_fits(boxed_rk)) return false;
 
     /* `boxed OP raw` is `raw (flip) OP boxed` -- LT/GT and LTE/GTE swap. */
     Opcode effective_op = op;
@@ -955,7 +952,7 @@ static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind
 
     int dest = reg_alloc();
     P.last_cmp_offset = c->count;
-    chunk_emit(c, PACK3(raw_op, dest, slot, boxed_rk));
+    chunk_emit(c, PACK3(raw_op, dest, slot, pack_rk8(boxed_rk)));
     *out_rk = dest;
     return true;
 }
@@ -967,27 +964,24 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     RawKind kind_lhs = rk_raw_kind(c, rk_lhs);
     RawKind kind_rhs = rk_raw_kind(c, rk_rhs);
 
-    /* rk_raw_kind calls a bare literal raw-composable, which is right for arithmetic but wrong
-       for a comparison against an already-raw operand: boxing it (one OP_LOADK) keeps it eligible
-       for raw-vs-boxed comparison fusion, which raw-materializing rules out -- those handlers read
-       the boxed operand as a bare register, with no constant-pool support. Never worse: OP_LOADK +
-       fused compare is 2 dispatches, the same as the raw-materialized form it replaces. */
+    /* rk_raw_kind calls a bare literal raw-composable, which is right for arithmetic but wrong for
+       a comparison against an already-raw operand: raw-materializing it costs an OP_RAW_LOAD every
+       iteration, while the raw-vs-boxed compare takes it as a constant-pool operand for free. */
     if ((op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE) && kind_lhs != RAWK_NONE &&
         kind_lhs == kind_rhs) {
         bool lhs_is_slot = (rk_lhs & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) != 0;
         bool rhs_is_slot = (rk_rhs & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) != 0;
         bool lhs_is_const = (rk_lhs & RK_CONST_FLAG) != 0;
         bool rhs_is_const = (rk_rhs & RK_CONST_FLAG) != 0;
+        /* Declines only when the constant overruns RK8's 7-bit index, and then the OP_LOADK spill
+           puts it back in range for the second attempt below. */
         if (lhs_is_slot && rhs_is_const) {
-            int boxed = materialize(c, rk_rhs);
-            if (try_emit_cmp_raw_boxed(c, op, rk_lhs, kind_lhs, boxed, RAWK_NONE, out_rk)) return true;
-            rk_rhs =
-                boxed; /* fusion declined (shouldn't happen given the setup above) -- fall through with the now-boxed operand */
+            if (try_emit_cmp_raw_boxed(c, op, rk_lhs, kind_lhs, rk_rhs, RAWK_NONE, out_rk)) return true;
+            rk_rhs = materialize(c, rk_rhs);
             kind_rhs = RAWK_NONE;
         } else if (rhs_is_slot && lhs_is_const) {
-            int boxed = materialize(c, rk_lhs);
-            if (try_emit_cmp_raw_boxed(c, op, boxed, RAWK_NONE, rk_rhs, kind_rhs, out_rk)) return true;
-            rk_lhs = boxed;
+            if (try_emit_cmp_raw_boxed(c, op, rk_lhs, RAWK_NONE, rk_rhs, kind_rhs, out_rk)) return true;
+            rk_lhs = materialize(c, rk_lhs);
             kind_lhs = RAWK_NONE;
         }
     }

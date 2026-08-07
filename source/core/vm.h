@@ -249,7 +249,8 @@ typedef enum {
     OP_RAW_ADD_REAL_BOXED_TO,
     OP_RAW_MUL_REAL_BOXED_TO,
     /* Raw-vs-boxed comparison producing a boxed boolean -- removes the OP_BOX_INT that dominated
-       `for i <= limit:`-shaped loops. Not in-place. */
+       `for i <= limit:`-shaped loops. Not in-place. The boxed operand is RK8, so a literal bound
+       (`x*x + y*y > 4.0`) is read from the pool rather than reloaded into a register each pass. */
     OP_RAW_LT_INT_BOXED,
     OP_RAW_GT_INT_BOXED,
     OP_RAW_LTE_INT_BOXED,

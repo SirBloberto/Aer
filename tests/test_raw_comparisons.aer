@@ -261,4 +261,133 @@ function escape_steps(limit):
 assert(escape_steps(100.0) == 28, "a compare at the end of a longer condition still fuses and is correct")
 assert(escape_steps(0.1) == 0, "and is false immediately when it should be")
 
+# ------------------------------------------------------------------ #
+# 7. A raw slot compared against a LITERAL bound. The literal is a     #
+#    constant-pool operand rather than a register, so a wrong RK8      #
+#    decode reads the wrong pool entry and silently compares against   #
+#    some unrelated constant -- hence both operand orders and the      #
+#    equality case each operator straddles.                            #
+# ------------------------------------------------------------------ #
+
+function count_up_real_lt_literal():
+    rx = 1.0
+    steps = 0
+    for rx < 5.0:
+        rx += 1.0
+        steps += 1
+    return steps
+
+function count_up_real_lte_literal():
+    rx = 1.0
+    steps = 0
+    for rx <= 5.0:
+        rx += 1.0
+        steps += 1
+    return steps
+
+function count_down_real_gt_literal():
+    rx = 10.0
+    steps = 0
+    for rx > 4.0:
+        rx -= 1.0
+        steps += 1
+    return steps
+
+function count_down_real_gte_literal():
+    rx = 10.0
+    steps = 0
+    for rx >= 4.0:
+        rx -= 1.0
+        steps += 1
+    return steps
+
+assert(count_up_real_lt_literal() == 4, "raw real `<` a literal bound as a loop condition")
+assert(count_up_real_lte_literal() == 5, "raw real `<=` a literal bound includes the bound")
+assert(count_down_real_gt_literal() == 6, "raw real `>` a literal bound as a loop condition")
+assert(count_down_real_gte_literal() == 7, "raw real `>=` a literal bound includes the bound")
+
+# The literal on the LEFT -- the parser flips the operator and swaps the operands.
+function count_up_literal_gt_real():
+    rx = 1.0
+    steps = 0
+    for 5.0 > rx:
+        rx += 1.0
+        steps += 1
+    return steps
+
+function count_up_literal_gte_real():
+    rx = 1.0
+    steps = 0
+    for 5.0 >= rx:
+        rx += 1.0
+        steps += 1
+    return steps
+
+assert(count_up_literal_gt_real() == 4, "literal `>` raw real flips to the same loop as raw `<` literal")
+assert(count_up_literal_gte_real() == 5, "literal `>=` raw real flips to the same loop as raw `<=` literal")
+
+function count_down_int_gt_literal():
+    n = 10
+    steps = 0
+    for n > 4:
+        n -= 1
+        steps += 1
+    return steps
+
+function count_up_int_lte_literal():
+    n = 1
+    steps = 0
+    for n <= 5:
+        n += 1
+        steps += 1
+    return steps
+
+function count_down_literal_lt_int():
+    n = 10
+    steps = 0
+    for 4 < n:
+        n -= 1
+        steps += 1
+    return steps
+
+assert(count_down_int_gt_literal() == 6, "raw int `>` a literal bound as a loop condition")
+assert(count_up_int_lte_literal() == 5, "raw int `<=` a literal bound includes the bound")
+assert(count_down_literal_lt_int() == 6, "literal `<` raw int flips to the same loop as raw `>` literal")
+
+# Value position rather than a bare condition, which reaches the unfused compare opcodes.
+function real_literal_values():
+    rx = 2.5
+    return [rx > 4.0, rx >= 4.0, rx < 4.0, rx <= 4.0, 4.0 > rx, 4.0 <= rx]
+
+y = real_literal_values()
+assert(y[0] == false and y[1] == false, "raw real 2.5 is neither > nor >= the literal 4.0")
+assert(y[2] == true and y[3] == true, "raw real 2.5 is both < and <= the literal 4.0")
+assert(y[4] == true and y[5] == false, "the same comparisons with the literal on the left")
+
+function real_literal_at_bound():
+    rx = 4.0
+    return [rx > 4.0, rx >= 4.0, rx < 4.0, rx <= 4.0]
+
+z = real_literal_at_bound()
+assert(z[0] == false and z[1] == true, "raw real exactly at a literal bound: >= holds, > does not")
+assert(z[2] == false and z[3] == true, "raw real exactly at a literal bound: <= holds, < does not")
+
+function int_literal_values():
+    n = 7
+    return [n > 7, n >= 7, n < 7, n <= 7, 7 < n]
+
+q = int_literal_values()
+assert(q[0] == false and q[1] == true, "raw int exactly at a literal bound: >= holds, > does not")
+assert(q[2] == false and q[3] == true and q[4] == false, "raw int exactly at a literal bound, remaining operators")
+
+# A negative literal, which is a distinct pool entry from its positive twin.
+function negative_literal_bound():
+    rx = -2.5
+    n = -3
+    return [rx > -4.0, rx < -1.0, n >= -3, n < -3]
+
+nb = negative_literal_bound()
+assert(nb[0] == true and nb[1] == true, "raw real against negative literal bounds on both sides")
+assert(nb[2] == true and nb[3] == false, "raw int against a negative literal bound at equality")
+
 print("test_raw_comparisons.aer: all assertions passed.")
