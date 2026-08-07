@@ -3292,7 +3292,8 @@ lbl_slice_get : {
 /* Dict literal -- each key stored as an owned copy, never an alias into the source string. */
 lbl_dict_new : {
     int dest_reg = (int)UNPACK_A(op_word);
-    int pair_count = (int)UNPACK_B(op_word);
+    int pair_reg_base = (int)UNPACK_B(op_word);
+    int pair_count = (int)UNPACK_C(op_word);
     AerDict* d = heap_alloc(&vm->heap, &vm->heap.dict_pool);
     memset(&d->map, 0, sizeof(d->map));
     d->map.pools = &vm->heap.dict_hash_pools;
@@ -3303,8 +3304,8 @@ lbl_dict_new : {
     d->dirty_all = false;
     if (pair_count > 0) hashtable_reserve(&d->map, (unsigned int)pair_count);
     for (int i = 0; i < pair_count; i++) {
-        AerVal key = *vm_rk_ptr16(registers, const_pool, READ());
-        AerVal val = *vm_rk_ptr16(registers, const_pool, READ());
+        AerVal key = registers[pair_reg_base + 2 * i];
+        AerVal val = registers[pair_reg_base + 2 * i + 1];
         if (aer_type(key) != TYPE_STRING) {
             error("Hashtable keys must be strings");
             continue;

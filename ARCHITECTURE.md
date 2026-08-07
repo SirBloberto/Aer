@@ -885,6 +885,40 @@ The consequence for anyone picking this up: the remaining lever on call-heavy co
 dispatches**, not a cheaper `lbl_call`. Seven dispatches per `fib` call (compare-and-branch, two
 subtracts, two calls, add, return) is the number to attack, and only through fusion.
 
+### 5.16c Constants as RK operands: where it pays, and where fewer instructions ran slower
+
+`OP_LOADK` exists only to copy a pool constant into a register because some consuming opcode insists
+on one. It was the 11th hottest opcode in the suite, 60M dispatches, and essentially all of it was
+that kind of staging. Two attempts to remove it, with opposite outcomes.
+
+**Comparison bounds (landed).** The boxed operand of `OP_RAW_*_{INT,REAL}_BOXED` and its eight fused
+`_JUMP_IF_FALSE` forms was a plain register, so `x*x + y*y > 4.0` reloaded `4.0` every iteration --
+25.3M times in `mandelbrot` alone. Widening that operand to RK8 lets the compare address the pool
+entry directly: `mandelbrot`'s `OP_LOADK` count falls from 25.3M to 1442, **-1.61% instructions and
+-4.25% cycles**, `dict_bench` -0.52%, `small_dict_bench` -0.42%, nothing regressed past 0.11%. Note
+`pack_rk8` masks the index to 7 bits, so a pool index past 127 has to decline and fall back to the
+`OP_LOADK` spill or it would silently alias another constant. Registers are safe without a check
+because `FRAME_REGISTERS` is 128.
+
+**Dict-literal operands (reverted).** The same reasoning applied to `OP_DICT_NEW`, whose contiguous
+register run cost one `OP_LOADK` per constant key or value -- five per iteration in
+`small_dict_bench`, 16.5M dispatches, 25% of that benchmark's total. Making the operands trailing
+RK16 words (the shape `OP_INTERP` uses) removed all of them and cut the literal's build sequence
+from 12 dispatches to 7.
+
+It measured **-0.42% instructions and +1.87% cycles**, and 2.58s -> 2.64s wall-clock, on the one
+benchmark it was built for. Reverted. The trade was five predictable dispatches reading a contiguous
+register block for eight scattered 16-byte pool loads inside a single opcode, plus a serial `READ()`
+chain through the instruction stream; the pool entries for a dict's keys are not adjacent the way
+staged registers are.
+
+The methodological point is the more important one. Instruction count is this project's primary gate
+because it repeats to 0.03% while cycles spread ±0.4% and wall-clock is worse -- but here it moved
+the wrong way relative to real time, because the change traded instruction *count* for instruction
+*locality*. A change that relocates memory accesses rather than removing work needs a cycles and
+wall-clock confirmation before it is believed, with a ref-against-itself control run to establish the
+noise floor first.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a

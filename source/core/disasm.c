@@ -127,7 +127,12 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_DESTRUCTURE] = {"OP_DESTRUCTURE", "reg, reg = destructure(reg)"},
     /* word0: dest+arr_reg. word1: rk_start16+rk_end16. */
     [OP_SLICE_GET] = {"OP_SLICE_GET", "reg = reg[rk:rk]", {0}, false, 1, 0},
-    [OP_DICT_NEW] = {"OP_DICT_NEW", "reg = new dict from N key/value rk pairs", {0}, false, 0, 2},
+    [OP_DICT_NEW] = {"OP_DICT_NEW",
+                     "reg = new dict from contiguous key/value reg pairs",
+                     {FLD_REG, FLD_REG, FLD_COUNT},
+                     false,
+                     0,
+                     3},
     /* word0: col+idx+item_dest. word1: end_target (dedicated). */
     [OP_ITER_NEXT_ARRAY] = {"OP_ITER_NEXT_ARRAY",
                             "for-each step, array or dict-keys",
@@ -566,18 +571,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
                 fprintf(out, "reg%u", (unsigned int)RK16_INDEX(rk));
         }
         fprintf(out, "]");
-    } else if (op == OP_DICT_NEW) {
-        unsigned int count = UNPACK_B(op_word);
-        fprintf(out, "  reg=%u  pairs=%u  [", UNPACK_A(op_word), count);
-        for (unsigned int i = 0; i < count * 2; i++) {
-            uint32_t rk = c->code[pos++];
-            fprintf(out, "%s", i ? (i % 2 ? ": " : ", ") : "");
-            if (RK16_IS_CONST(rk))
-                print_pool_value(out, c->pool[RK16_INDEX(rk)]);
-            else
-                fprintf(out, "reg%u", (unsigned int)RK16_INDEX(rk));
-        }
-        fprintf(out, "]");
     } else if (info->variable) {
         /* header word already decoded via op_word; then (name+default, type) pairs -- 2 words per field. */
         int name_idx = (int)UNPACK_STRUCT_HEADER_NAME(op_word);
@@ -988,8 +981,6 @@ void aer_disassemble(Chunk* c, FILE* out) {
         unsigned int next;
         if (op == OP_INTERP) {
             next = offset + 1 + UNPACK_B(c->code[offset]);
-        } else if (op == OP_DICT_NEW) {
-            next = offset + 1 + 2 * UNPACK_B(c->code[offset]);
         } else if (info->variable) {
             uint32_t header = c->code[offset];
             int field_count = (int)UNPACK_STRUCT_HEADER_COUNT(header);

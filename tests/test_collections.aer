@@ -121,31 +121,6 @@ assert(record["scores"][-1] == 88, "hashtable containing an array, negative inde
 nested = {"a": {"b": {"c": 42}}}
 assert(nested["a"]["b"]["c"] == 42, "deeply nested hashtables")
 
-# A dict literal's keys and values are RK operands (OP_DICT_NEW), so a literal one is read from the
-# constant pool and a computed one from a register. Mixing the two in one literal, in both
-# positions, is what tells the two operand kinds apart -- swapping them silently builds the wrong
-# dict rather than failing.
-function build_record(id_value, label):
-    count = 3
-    return {"id": id_value, label: "computed-key", "doubled": count * 2, "flag": true, "pi": 3.5}
-
-rec = build_record(77, "dynamic")
-assert(rec["id"] == 77, "dict literal: a register value under a literal key")
-assert(rec["dynamic"] == "computed-key", "dict literal: a register KEY, which only the RK operand form can carry")
-assert(rec["doubled"] == 6, "dict literal: a value computed from a raw slot is boxed before the operand word")
-assert(rec["flag"] == true and rec["pi"] == 3.5, "dict literal: literal non-string values stay pool constants")
-assert(length(rec) == 5, "dict literal: every pair landed exactly once")
-
-# Later duplicate wins, and the operand walk must not lose its place doing it.
-dup = {"k": 1, "other": 2, "k": 3}
-assert(dup["k"] == 3 and dup["other"] == 2, "dict literal: a repeated key keeps the last value")
-assert(length(dup) == 2, "dict literal: a repeated key does not create a second entry")
-
-# Enough pairs to walk well past the 2-4 the other cases use.
-wide = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6, "g": 7, "h": 8, "i": 9, "j": 10}
-assert(length(wide) == 10, "dict literal: a wide literal reads every operand pair")
-assert(wide["a"] == 1 and wide["e"] == 5 and wide["j"] == 10, "dict literal: first, middle and last pair all land correctly")
-
 # ------------------------------------------------------------------ #
 # 16. collection module — copy, insert, index_of, keys, sort           #
 # ------------------------------------------------------------------ #

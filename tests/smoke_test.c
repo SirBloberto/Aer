@@ -516,13 +516,14 @@ int main(void) {
         unsigned int pool_20    = chunk_add_pool(&c, aer_int(20));
         unsigned int pool_99    = chunk_add_pool(&c, aer_int(99));
 
-        /* Both pairs are pool constants, so they go straight into OP_DICT_NEW's operand words --
-           no OP_LOADK staging, which is the whole point of the RK16 operand form. */
-        int pairs[4] = {(int)pool_key_a | RK_CONST_FLAG, (int)pool_10 | RK_CONST_FLAG,
-                        (int)pool_key_b | RK_CONST_FLAG, (int)pool_20 | RK_CONST_FLAG};
+        /* reg0/reg1 = key "a", val 10; reg2/reg3 = key "b", val 20 */
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 0, pool_key_a));
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 1, pool_10));
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 2, pool_key_b));
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 3, pool_20));
         reg_reserve(4);
 
-        emit_dict_new(&c, /*dest=*/4, pairs, /*pair_count=*/2);
+        emit_dict_new(&c, /*dest=*/4, /*pair_reg_base=*/0, /*pair_count=*/2);
 
         emit_index_get(&c, /*dest=*/5, /*arr_reg=*/4, /*rk_idx=*/(int)pool_key_b | RK_CONST_FLAG);
         emit_index_set(&c, /*arr_reg=*/4, /*rk_idx=*/(int)pool_key_a | RK_CONST_FLAG,
