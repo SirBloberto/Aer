@@ -37,7 +37,7 @@ void emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val);
 void emit_slice_get(Chunk* c, int dest_reg, int arr_reg, int rk_start, int rk_end);
 
 /* pair_count (key,val) register pairs: key at pair_reg_base+2*i, val at +2*i+1. */
-void emit_dict_new(Chunk* c, int dest_reg, int pair_reg_base, int pair_count);
+void emit_dict_new(Chunk* c, int dest_reg, const int* pair_rks, int pair_count);
 
 /* Emit-then-patch like emit_jump_if_false_reg; the caller emits this instruction's own offset
    as the loop's back-edge target. */

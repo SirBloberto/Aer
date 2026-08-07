@@ -456,8 +456,11 @@ void emit_slice_get(Chunk* c, int dest_reg, int arr_reg, int rk_start, int rk_en
     chunk_emit(c, PACK_2X16(pack_rk16(rk_start), pack_rk16(rk_end)));
 }
 
-void emit_dict_new(Chunk* c, int dest_reg, int pair_reg_base, int pair_count) {
-    chunk_emit(c, PACK3(OP_DICT_NEW, dest_reg, pair_reg_base, pair_count));
+/* pair_rks holds 2*pair_count RK values, key then value. */
+void emit_dict_new(Chunk* c, int dest_reg, const int* pair_rks, int pair_count) {
+    chunk_emit(c, PACK2(OP_DICT_NEW, dest_reg, pair_count));
+    for (int i = 0; i < 2 * pair_count; i++)
+        chunk_emit(c, pack_rk16(pair_rks[i]));
 }
 
 unsigned int emit_iter_next_array(Chunk* c, int col_reg, int idx_reg, int item_dest_reg) {
@@ -1677,28 +1680,41 @@ static int parse_primary_inner(Chunk* c) {
         emit_array_new(c, item_reg_base, item_reg_base, item_count);
         return item_reg_base;
     }
-    /* Each item is a key:value pair, so key/value materialize back to back, landing at
-       pair_reg_base+2i/+2i+1 to match OP_DICT_NEW's layout. */
+    /* Key and value are collected as RK values and emitted as OP_DICT_NEW's trailing words, so a
+       literal one costs nothing to place. Temps are released before the destination is claimed so
+       it reuses the lowest of them -- safe because the opcode reads every operand before writing
+       its destination, the same ordering emit_interp relies on. */
     if (consume(TOKEN_OPEN_BRACE)) {
-        int pair_reg_base = -1;
+        int pair_rks[2 * DICT_MAX_LITERAL_PAIRS];
         int pair_count = 0;
         if (!equal(TOKEN_CLOSE_BRACE)) {
             do {
-                int rk_key = parse_binary(c, 0);
-                int reg_key = arg_materialize(c, rk_key);
-                if (pair_count == 0) pair_reg_base = reg_key;
+                if (pair_count == DICT_MAX_LITERAL_PAIRS) {
+                    error_at("Dict literal has too many entries");
+                    return 0;
+                }
+                int rk_key = box_if_raw(c, parse_binary(c, 0));
                 require(TOKEN_COLON, "expected ':' after dict key");
                 if (parse_had_error) return 0;
-                int rk_val = parse_binary(c, 0);
-                arg_materialize(c, rk_val);
+                int rk_val = box_if_raw(c, parse_binary(c, 0));
+                if (!rk16_fits(rk_key) || !rk16_fits(rk_val)) {
+                    error_at("Dict literal entry too large to compile (register/constant index "
+                             "exceeds the dict-new encoding's range)");
+                    return 0;
+                }
+                pair_rks[2 * pair_count] = rk_key;
+                pair_rks[2 * pair_count + 1] = rk_val;
                 pair_count++;
             } while (consume(TOKEN_COMMA));
         }
         require(TOKEN_CLOSE_BRACE, "expected '}' after dict literal");
         if (parse_had_error) return 0;
-        int dest = (pair_count > 0) ? pair_reg_base : reg_alloc();
-        if (pair_count > 1) reg_free(2 * pair_count - 1);
-        emit_dict_new(c, dest, pair_reg_base < 0 ? dest : pair_reg_base, pair_count);
+        int temps = 0;
+        for (int i = 0; i < 2 * pair_count; i++)
+            if (is_temp(pair_rks[i])) temps++;
+        if (temps) reg_free(temps);
+        int dest = reg_alloc();
+        emit_dict_new(c, dest, pair_rks, pair_count);
         return dest;
     }
     if (token.type == TOKEN_INTEGER || token.type == TOKEN_REAL || token.type == TOKEN_TRUE ||

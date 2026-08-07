@@ -124,9 +124,11 @@ typedef enum {
     /* Slicing (array or string); a missing bound compiles to an RK null constant. */
     OP_SLICE_GET, /* dest_reg, arr_reg, rk_start, rk_end */
 
-    /* OP_ARRAY_NEW's bulk-copy applied to (key,val) register pairs; same key validation and
-       owned-key discipline as stack dict construction. */
-    OP_DICT_NEW, /* dest_reg, pair_reg_base, pair_count -- key at base+2*i, val at +2*i+1 */
+    /* Same key validation and owned-key discipline as stack dict construction. Operands are RK16
+       trailing words rather than a contiguous register run, so a literal key or value is read
+       straight from the pool -- `{"id": i}`-shaped literals used to spend one OP_LOADK per constant
+       just to stage it into the run. Variable-length like OP_INTERP. */
+    OP_DICT_NEW, /* word0: dest_reg, pair_count -- then 2*pair_count words, each one RK16 */
 
     /* Single-variable iteration; break is a plain jump, no cleanup needed. */
     OP_ITER_NEXT_ARRAY, /* col_reg, idx_reg, item_dest_reg, end_target -- despite the name, also accepts a dict
@@ -572,6 +574,10 @@ static inline uint16_t pack_rk16(int rk) {
 /* Parts in one OP_INTERP. Bounds the builder's stack scratch; a longer interpolation compiles to
    the ordinary concatenate chain instead, which has no limit. */
 #define INTERP_MAX_PARTS 16
+
+/* Pairs in one dict literal. Bounds the parser's operand scratch; the contiguous-register form this
+   replaced ran out of registers around 64 pairs, so nothing that used to compile now doesn't. */
+#define DICT_MAX_LITERAL_PAIRS 128
 
 #define MAX_STRUCT_FIELDS 16
 
