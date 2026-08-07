@@ -2504,6 +2504,15 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                         P.var_regs[P.var_count] = slot;
                         P.var_kind[P.var_count] = (rhs_kind == RAWK_INT) ? VAR_RAW_INT : VAR_RAW_REAL;
                         P.var_count++;
+                        /* Mirrors var_slot's own registration, which this path bypasses. Without it a
+                           top-level int/real is invisible to the shadow ban, so a function could
+                           silently declare a local of the same name -- the exact behaviour the ban
+                           exists to reject, and which still errored for a top-level string or array. */
+                        if (P.function_depth == 0 && P.global_count < FRAME_REGISTERS) {
+                            P.global_names[P.global_count] = name_idx;
+                            P.global_regs[P.global_count] = slot;
+                            P.global_count++;
+                        }
                         return;
                     }
                 }
