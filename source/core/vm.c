@@ -908,12 +908,12 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
    Must format exactly as vm_interp_build does -- a key written through OP_INTERP and read back
    through here would otherwise silently miss; tests/test_interp_dict_keys.aer guards that.
    Owns the buffer and the probe so neither lands in vm_run_slice's frame (5.16b). */
-static __attribute__((noinline)) bool vm_dict_get_interp(AerDict* d, const AerVal* parts, unsigned int count,
-                                                         AerVal* out) {
+static __attribute__((noinline)) bool vm_dict_get_interp(AerDict* d, const uint32_t* rks, unsigned int count,
+                                                         AerVal* registers, AerVal* const_pool, AerVal* out) {
     char key[INTERP_KEY_MAX];
     unsigned int at = 0;
     for (unsigned int i = 0; i < count; i++) {
-        AerVal v = parts[i];
+        AerVal v = *vm_rk_ptr16(registers, const_pool, rks[i]);
         const char* piece;
         unsigned int piece_len;
         char scratch[32];
@@ -1981,6 +1981,19 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         error("Cannot index type");
         *out = aer_null();
     }
+}
+
+/* vm_dict_get_interp's fallback: builds the key string for real, then takes the general index path.
+   Separate and noinline purely so its parts[] scratch stays out of vm_run_slice's frame (5.16b). */
+static __attribute__((noinline)) AerVal vm_index_get_interp_slow(VM* vm, AerVal obj, const uint32_t* rks,
+                                                                 unsigned int count, AerVal* registers,
+                                                                 AerVal* const_pool) {
+    AerVal parts[INTERP_MAX_PARTS];
+    for (unsigned int i = 0; i < count; i++)
+        parts[i] = *vm_rk_ptr16(registers, const_pool, rks[i]);
+    AerVal out;
+    vm_index_get_compute(obj, vm_interp_build(vm, parts, count), &out);
+    return out;
 }
 
 /* `a, b = expr` -- a genuine Result unpacks to (value, err); a plain 2-element array (not a
@@ -4690,20 +4703,21 @@ lbl_interp : {
     DISPATCH();
 }
 
+/* The operand words are read by the helpers straight out of the instruction stream rather than into
+   a local array -- 16 AerVals of scratch here would grow vm_run_slice's frame for every opcode
+   (5.16b). Both helpers read every part before dest is written, so dest may alias a part's register,
+   which emit_interp deliberately arranges. */
 lbl_index_get_interp : {
     int dest_reg = (int)UNPACK_A(op_word);
     int obj_reg = (int)UNPACK_B(op_word);
     unsigned int count = UNPACK_C(op_word);
-    AerVal parts[INTERP_MAX_PARTS];
-    for (unsigned int i = 0; i < count; i++)
-        parts[i] = *vm_rk_ptr16(registers, const_pool, READ());
+    const uint32_t* rks = &c->code[ip];
+    ip += count;
     AerVal obj = registers[obj_reg];
-    /* Every part is read before dest is written, so dest may alias a part's register -- emit_interp
-       deliberately reuses the lowest freed temp for it. */
-    if (aer_type(obj) == TYPE_DICT && vm_dict_get_interp(aer_as_dict(obj), parts, count, &registers[dest_reg]))
+    if (aer_type(obj) == TYPE_DICT &&
+        vm_dict_get_interp(aer_as_dict(obj), rks, count, registers, const_pool, &registers[dest_reg]))
         DISPATCH();
-    AerVal key = vm_interp_build(vm, parts, count);
-    vm_index_get_compute(obj, key, &registers[dest_reg]);
+    registers[dest_reg] = vm_index_get_interp_slow(vm, obj, rks, count, registers, const_pool);
     gc_maybe_collect(vm);
     DISPATCH();
 }
