@@ -161,4 +161,96 @@ for i < 60:
     i += 1
 assert(negn.small == -240, "narrow int32 field holds a negative value through the raw write path")
 
+# ------------------------------------------------------------------ #
+# 7. Narrow packed-array fields reached through an index the compiler   #
+#    cannot prove in range. Sections 5's `for i in 0..length(arr)`      #
+#    shape is always bound-hoisted, so it only ever reaches the         #
+#    UNCHECKED opcodes; a bare index parameter reaches the checked ones.#
+# ------------------------------------------------------------------ #
+
+function poke_narrow(arr, idx, step):
+    arr[idx].small += step
+    arr[idx].ratio = arr[idx].ratio + 0.25
+    return arr[idx].small
+
+grid = [Narrow(100, 0.0); 4]
+last = 0
+i = 0
+for i < 40:
+    last = poke_narrow(grid, 2, 5)
+    i += 1
+
+assert(grid[2].small == 300, "narrow int32 packed-array compound-assign via an unproven index: 100 + 40 * 5")
+assert(grid[2].ratio == 10.0, "narrow float32 packed-array assign via an unproven index: 40 * 0.25")
+assert(last == 300, "the specialized body's return value matches the field it wrote")
+assert(grid[0].small == 100, "elements the index never selected are untouched")
+assert(grid[3].ratio == 0.0, "and their narrow float field is untouched too")
+
+function poke_wide(arr, idx):
+    arr[idx].hits += 3
+    arr[idx].misses = arr[idx].hits + 1
+    return arr[idx].misses
+
+wide = [Counter(0, 0, 0.0); 4]
+lastw = 0
+i = 0
+for i < 40:
+    lastw = poke_wide(wide, 1)
+    i += 1
+
+assert(wide[1].hits == 120, "int64 packed-array compound-assign via an unproven index: 40 * 3")
+assert(wide[1].misses == 121, "int64 packed-array plain assign via an unproven index")
+assert(lastw == 121, "the wide specialized body's return value matches the field it wrote")
+assert(wide[0].hits == 0, "unselected elements of the wide packed array are untouched")
+
+# ------------------------------------------------------------------ #
+# 8. Plain (non-compound) assignment of an already-raw int value into a #
+#    narrow int32 field. Every narrow write above is either a compound  #
+#    op or lands on a float32 field, which reaches different opcodes.   #
+# ------------------------------------------------------------------ #
+
+function set_narrow(nv, base):
+    doubled = base * 2
+    nv.small = doubled
+    return nv.small
+
+target = Narrow(0, 0.0)
+seen = 0
+i = 0
+for i < 60:
+    seen = set_narrow(target, 21)
+    i += 1
+assert(target.small == 42, "plain assign of a raw int expression into a narrow int32 field")
+assert(seen == 42, "and reading it straight back in the same specialized body agrees")
+
+function set_narrow_indexed(arr, idx, base):
+    doubled = base * 3
+    arr[idx].small = doubled
+    return arr[idx].small
+
+cells = [Narrow(0, 0.0); 4]
+seen2 = 0
+i = 0
+for i < 40:
+    seen2 = set_narrow_indexed(cells, 3, 5)
+    i += 1
+assert(cells[3].small == 15, "plain assign of a raw int into a packed-array narrow int32 field, unproven index")
+assert(seen2 == 15, "and reading that element back agrees")
+assert(cells[0].small == 0, "unselected elements are untouched by the narrow int32 write")
+
+function fill_narrow(arr, base):
+    count = length(arr)
+    doubled = base * 4
+    for i in 0..count:
+        arr[i].small = doubled
+    return doubled
+
+filled = [Narrow(0, 0.0); 5]
+i = 0
+for i < 40:
+    r = fill_narrow(filled, 7)
+    i += 1
+assert(filled[0].small == 28, "bound-hoisted plain assign into a narrow int32 field writes the first element")
+assert(filled[4].small == 28, "and the last element, with bounds checks hoisted away")
+
 print("test_int_fields_specialized.aer: all assertions passed.")

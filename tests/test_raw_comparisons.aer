@@ -1,0 +1,201 @@
+#!/usr/bin/env aer
+# AER test suite — the raw (unboxed) comparison and raw-vs-boxed arithmetic opcode families.
+#
+# Every one of these opcodes is emitted by a real parser path, but the `>`, `>=` and `<=` halves
+# had no coverage: benchmarks and tests overwhelmingly write `<`, so OP_RAW_GT_REAL,
+# OP_RAW_GTE_REAL, OP_RAW_LTE_REAL, their _BOXED forms, and the fused
+# OP_RAW_GT/GTE_INT_BOXED_JUMP_IF_FALSE branch variants were never exercised. The same held for
+# OP_RAW_SUB_INT_BOXED and OP_RAW_MUL_INT_BOXED (`-=`/`*=` of a boxed value into a raw int slot).
+# These skip the boxing step and compare/accumulate raw slot contents directly, so a defect is a
+# silently wrong answer rather than a crash. Machine-checked via assert().
+
+# ------------------------------------------------------------------ #
+# 1. Raw real comparisons: all four relational operators, both        #
+#    orders, including the equal case each one straddles.             #
+# ------------------------------------------------------------------ #
+
+function real_ops(a, b):
+    gt = 0
+    gte = 0
+    lt = 0
+    lte = 0
+    if a > b:
+        gt = 1
+    if a >= b:
+        gte = 1
+    if a < b:
+        lt = 1
+    if a <= b:
+        lte = 1
+    return [gt, gte, lt, lte]
+
+r = real_ops(2.5, 1.5)
+assert(r[0] == 1 and r[1] == 1 and r[2] == 0 and r[3] == 0, "raw real 2.5 vs 1.5: greater, not less")
+r = real_ops(1.5, 2.5)
+assert(r[0] == 0 and r[1] == 0 and r[2] == 1 and r[3] == 1, "raw real 1.5 vs 2.5: less, not greater")
+r = real_ops(2.0, 2.0)
+assert(r[0] == 0 and r[1] == 1 and r[2] == 0 and r[3] == 1, "raw real equal case: >= and <= hold, > and < do not")
+
+# Negative and zero operands through the same paths.
+r = real_ops(-1.5, -3.0)
+assert(r[0] == 1 and r[3] == 0, "raw real comparison with both operands negative")
+r = real_ops(0.0, -0.0)
+assert(r[1] == 1 and r[3] == 1, "raw real 0.0 vs -0.0 compares equal in both directions")
+
+# ------------------------------------------------------------------ #
+# 2. Raw int comparisons against a boxed operand, used as a bare       #
+#    if/while condition so the compare fuses with its branch.          #
+# ------------------------------------------------------------------ #
+
+# `n` must be initialised from a literal to earn a raw slot -- initialising it from a parameter
+# makes it an ordinary boxed local, and none of these opcodes would be emitted at all.
+
+function count_down_gt(floor_value):
+    n = 10
+    steps = 0
+    for n > floor_value:
+        n -= 1
+        steps += 1
+    return steps
+
+assert(count_down_gt(4) == 6, "raw int `>` boxed as a loop condition counts down to the bound exclusively")
+assert(count_down_gt(10) == 0, "raw int `>` loop does not run when already at the bound")
+
+function count_down_gte(floor_value):
+    n = 10
+    steps = 0
+    for n >= floor_value:
+        n -= 1
+        steps += 1
+    return steps
+
+assert(count_down_gte(4) == 7, "raw int `>=` boxed as a loop condition includes the bound")
+assert(count_down_gte(10) == 1, "raw int `>=` loop runs exactly once when starting at the bound")
+
+function count_up_lte(ceiling):
+    n = 1
+    steps = 0
+    for n <= ceiling:
+        n += 1
+        steps += 1
+    return steps
+
+assert(count_up_lte(5) == 5, "raw int `<=` boxed as a loop condition includes the bound")
+assert(count_up_lte(1) == 1, "raw int `<=` loop runs once when starting at the bound")
+
+function compare_only(limit):
+    n = 7
+    a = 0
+    if n > limit:
+        a = 1
+    if n >= limit:
+        a += 10
+    if n < limit:
+        a += 100
+    return a
+
+assert(compare_only(3) == 11, "raw int vs boxed in value position: greater and greater-or-equal")
+assert(compare_only(7) == 10, "raw int vs boxed at equality: only greater-or-equal holds")
+assert(compare_only(9) == 100, "raw int vs boxed when less than the boxed operand")
+
+# ------------------------------------------------------------------ #
+# 3. Raw real compared against a boxed value (the _BOXED forms), and   #
+#    the same comparisons in a non-branch (value-producing) position.  #
+# ------------------------------------------------------------------ #
+
+function real_vs_boxed(x, items):
+    over = 0
+    under = 0
+    for i in 0..length(items):
+        if x >= items[i]:
+            over += 1
+        if x <= items[i]:
+            under += 1
+    return [over, under]
+
+vals = [1.0, 2.0, 3.0, 4.0]
+r = real_vs_boxed(2.0, vals)
+assert(r[0] == 2, "raw real >= boxed array element: 2.0 is >= 1.0 and 2.0")
+assert(r[1] == 3, "raw real <= boxed array element: 2.0 is <= 2.0, 3.0 and 4.0")
+
+flag = 2.5 > 1.5
+assert(flag == true, "a raw real comparison in value position yields a boolean, not a branch")
+flag2 = 1.5 >= 2.5
+assert(flag2 == false, "the false case of a value-position raw real comparison")
+
+# ------------------------------------------------------------------ #
+# 4. Raw int slots accumulating a BOXED right-hand side via -= and *=. #
+# ------------------------------------------------------------------ #
+
+function shrink(items):
+    acc = 100
+    for i in 0..length(items):
+        acc -= items[i]
+    return acc
+
+assert(shrink([1, 2, 3, 4]) == 90, "raw int -= boxed array element across every element")
+assert(shrink([5, -5]) == 100, "raw int -= with a negative boxed operand cancels out")
+
+function scale(items):
+    acc = 1
+    for i in 0..length(items):
+        acc *= items[i]
+    return acc
+
+assert(scale([2, 3, 4]) == 24, "raw int *= boxed array element across every element")
+assert(scale([-1, 3]) == -3, "raw int *= with a negative boxed operand keeps the sign")
+
+# Mixed with the addition form, which already had coverage -- confirms the three share a slot
+# correctly rather than each writing somewhere different.
+function mixed(items):
+    acc = 10
+    for i in 0..length(items):
+        acc += items[i]
+        acc -= 1
+        acc *= 2
+    return acc
+
+assert(mixed([1]) == 20, "add, subtract and multiply against boxed operands compose in one raw slot")
+assert(mixed([1, 0]) == 38, "and keep composing across iterations")
+
+# ------------------------------------------------------------------ #
+# 5. The same comparisons in VALUE position rather than as a bare      #
+#    condition -- a bare condition fuses into a branch opcode, so this #
+#    is the only way to reach the standalone compare forms.            #
+# ------------------------------------------------------------------ #
+
+function raw_vs_boxed_values(limit):
+    n = 7
+    is_gt = n > limit
+    is_gte = n >= limit
+    is_lt = n < limit
+    is_lte = n <= limit
+    return [is_gt, is_gte, is_lt, is_lte]
+
+v = raw_vs_boxed_values(3)
+assert(v[0] == true and v[1] == true and v[2] == false and v[3] == false, "raw int vs boxed, value position, greater")
+v = raw_vs_boxed_values(7)
+assert(v[0] == false and v[1] == true and v[2] == false and v[3] == true, "raw int vs boxed, value position, equal")
+v = raw_vs_boxed_values(9)
+assert(v[0] == false and v[1] == false and v[2] == true and v[3] == true, "raw int vs boxed, value position, less")
+
+function raw_real_pair():
+    a = 2.5
+    b = 4.0
+    return [a < b, a <= b, a > b, a >= b, b <= a]
+
+w = raw_real_pair()
+assert(w[0] == true and w[1] == true, "two raw real locals: less-than and less-or-equal")
+assert(w[2] == false and w[3] == false, "two raw real locals: greater comparisons are false")
+assert(w[4] == false, "two raw real locals compared in the reverse order")
+
+function raw_real_vs_boxed(bound):
+    a = 2.5
+    return [a >= bound, a <= bound]
+
+x = raw_real_vs_boxed(2.5)
+assert(x[0] == true and x[1] == true, "raw real vs boxed at equality: both >= and <= hold")
+x = raw_real_vs_boxed(9.0)
+assert(x[0] == false and x[1] == true, "raw real vs boxed below the bound")
+
+print("test_raw_comparisons.aer: all assertions passed.")
