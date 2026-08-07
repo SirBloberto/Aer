@@ -4703,25 +4703,6 @@ lbl_interp : {
     DISPATCH();
 }
 
-/* The operand words are read by the helpers straight out of the instruction stream rather than into
-   a local array -- 16 AerVals of scratch here would grow vm_run_slice's frame for every opcode
-   (5.16b). Both helpers read every part before dest is written, so dest may alias a part's register,
-   which emit_interp deliberately arranges. */
-lbl_index_get_interp : {
-    int dest_reg = (int)UNPACK_A(op_word);
-    int obj_reg = (int)UNPACK_B(op_word);
-    unsigned int count = UNPACK_C(op_word);
-    const uint32_t* rks = &c->code[ip];
-    ip += count;
-    AerVal obj = registers[obj_reg];
-    if (aer_type(obj) == TYPE_DICT &&
-        vm_dict_get_interp(aer_as_dict(obj), rks, count, registers, const_pool, &registers[dest_reg]))
-        DISPATCH();
-    registers[dest_reg] = vm_index_get_interp_slow(vm, obj, rks, count, registers, const_pool);
-    gc_maybe_collect(vm);
-    DISPATCH();
-}
-
 lbl_unary : {
     int dest = (int)UNPACK_A(op_word);
     Opcode unary_op = (Opcode)UNPACK_B(op_word);
@@ -5184,6 +5165,25 @@ lbl_raw_gte_real_boxed : {
     RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(gte, >=, ">=")
 
 #undef RAW_CMP_REAL_BOXED_JUMP_IF_FALSE
+
+/* The operand words are read by the helpers straight out of the instruction stream rather than into
+   a local array -- 16 AerVals of scratch here would grow vm_run_slice's frame for every opcode
+   (5.16b). Both helpers read every part before dest is written, so dest may alias a part's register,
+   which emit_interp deliberately arranges. */
+lbl_index_get_interp : {
+    int dest_reg = (int)UNPACK_A(op_word);
+    int obj_reg = (int)UNPACK_B(op_word);
+    unsigned int count = UNPACK_C(op_word);
+    const uint32_t* rks = &c->code[ip];
+    ip += count;
+    AerVal obj = registers[obj_reg];
+    if (aer_type(obj) == TYPE_DICT &&
+        vm_dict_get_interp(aer_as_dict(obj), rks, count, registers, const_pool, &registers[dest_reg]))
+        DISPATCH();
+    registers[dest_reg] = vm_index_get_interp_slow(vm, obj, rks, count, registers, const_pool);
+    gc_maybe_collect(vm);
+    DISPATCH();
+}
 
 lbl_halt:
     SLICE_RETURN(VM_SLICE_DONE);
