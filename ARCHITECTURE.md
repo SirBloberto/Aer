@@ -813,6 +813,43 @@ deltas from -0.92% to +1.26%, while instruction counts over the same runs agree 
 Any cycles-based claim below about 1.5% on this hardware is unfalsifiable — use instruction counts
 as the gate, and treat `--event cycles` as a coarse sanity check only.
 
+### 5.16b Why `lbl_call` cannot be micro-optimized (measured, three ways)
+
+`fib_bench` runs 134.4M dispatches for 8.26B instructions -- 61.5 instructions per dispatch, against
+`mandelbrot`'s 22.0 on the same interpreter -- so the call path looks like obvious low-hanging
+fruit. Three attempts, all reverted, and the reasons are worth keeping.
+
+**Reading back what the call just wrote.** `lbl_call` computed the callee's base pointers, stored
+them into the CallFrame, then loaded them straight back out through `vm->call_stack[vm->call_depth]`
+to refresh `vm->registers` and the hoisted locals. It also loaded `caller->registers`, which is by
+definition the hoisted `registers` local. Removing both round trips regressed **ten** benchmarks --
+`mandelbrot` +6.3%, `nbody` +4.7% -- while helping only `fib_bench`.
+
+`mandelbrot` spends 0.22% of its dispatches on calls (1,036,800 of 468,213,512), so a change
+confined to `lbl_call` cannot cost it 6% through its own work. A control confirmed it is not generic
+codegen churn either: swapping two independent decodes in a cold label moves every benchmark 0.00%.
+
+The mechanism is live ranges. `registers`/`raw_ints`/`raw_reals` are hoisted for the whole function,
+and `lbl_call` previously did not touch them -- it went through `caller->...` instead, leaving them
+**dead** across the entire call sequence. Referencing them there extends their live ranges over all
+of it, and in a function under this much register pressure that reshapes allocation for every other
+label. The "redundant" load is what keeps the hot arithmetic paths' allocation good. Reloading from
+memory is cheaper globally than reusing a value already in a register.
+
+**Hoisting the frame sizes too** (so `caller->registers + caller->frame_size` needs no loads at all)
+is the same trap one step further: four more live locals, and it cost `mandelbrot` 6.3% and `nbody`
+4.6% to buy `fib_bench` 2.9%.
+
+**Biasing the RK8 register-vs-constant branch.** `tst.w fp, #0x800000` inside `vm_rk_ptr8` is ~9.4%
+of `fib_bench`'s cycles across three sites, so `__builtin_expect` toward the register case looked
+free. It did exactly what it was meant to -- branch misses fell 23%, 38.8M to 29.9M -- and cycles
+went **up** 2.44%. The misses were not the binding constraint, which also disposes of the theory
+that fib is misprediction-bound: at IPC 1.62 with 8.26B instructions, it is instruction-bound.
+
+The consequence for anyone picking this up: the remaining lever on call-heavy code is **fewer
+dispatches**, not a cheaper `lbl_call`. Seven dispatches per `fib` call (compare-and-branch, two
+subtracts, two calls, add, return) is the number to attack, and only through fusion.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
