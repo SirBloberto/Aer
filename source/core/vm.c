@@ -2308,6 +2308,22 @@ static bool __attribute__((noinline)) vm_call_module_dispatch(VM* vm, Chunk* c, 
    can spend unbounded time), not on every DISPATCH(), so the check costs nothing on the common
    unlimited path and stays cheap even when a budget is active. See aer_scheduler.c for the caller
    that actually uses a nonzero budget. */
+/* Opcodes that legitimately have no dispatch label: OP_AND/OP_OR/OP_PIPE are parser tags (&&, ||
+   and |> compile to jumps and desugared calls), and the four unary ops only ever appear as
+   OP_UNARY's operand tag. Anything else missing an entry is a bug -- see vm_run_slice. */
+static bool opcode_is_tag_only(Opcode op) {
+    switch (op) {
+        case OP_AND:
+        case OP_OR:
+        case OP_PIPE:
+        case OP_NEGATE:
+        case OP_NOT:
+        case OP_BITWISE_NOT:
+        case OP_TO_STR: return true;
+        default: return false;
+    }
+}
+
 VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     Chunk* c = vm->chunk;
     /* Hoisted once -- c->pool is only mutated at parse time, stable for the whole call. */
@@ -2595,6 +2611,21 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lte_int_boxed_jump_if_false,
         [OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gte_int_boxed_jump_if_false,
     };
+
+    /* A designated-initializer table leaves an opcode with no entry as NULL, so emitting one jumps
+       through a null pointer instead of failing near the mistake -- OP_BINARY sat in the enum in
+       exactly that state. Once per process, not per call: one predictable branch on a path that
+       runs per program (or per actor slice), never per dispatch. */
+    static bool dispatch_table_checked = false;
+    if (!dispatch_table_checked) {
+        dispatch_table_checked = true;
+        for (int op = 0; op < (int)OP_OPCODE_COUNT_MARKER; op++) {
+            if (dt[op] == NULL && !opcode_is_tag_only((Opcode)op)) {
+                fprintf(stderr, "aer: internal error: opcode %d has no dispatch label\n", op);
+                abort();
+            }
+        }
+    }
 
     DISPATCH();
 

@@ -241,6 +241,28 @@ void reg_free(int count) {
     if (P.next_temp_register < P.reserved_floor) P.next_temp_register = P.reserved_floor;
 }
 
+#ifdef AER_DEBUG_TOOLS
+/* Registers below reserved_floor are variables; at or above it they are the temp allocator's to
+   hand out. Breaking that hands a live variable's register to the next expression as scratch --
+   the failure mode is a variable silently reading back some unrelated intermediate value, never a
+   crash. Gated on the debug build so it costs nothing in a normal compile; CI runs the whole
+   bench/ and tests/ corpus through that build for check-opcode-coverage, so it is exercised. */
+static void assert_variables_below_floor(const char* where) {
+    for (int i = 0; i < P.var_count; i++) {
+        if (P.var_kind[i] != VAR_BOXED) continue; /* raw kinds index raw_ints/raw_reals, not registers */
+        if (P.var_regs[i] >= P.reserved_floor) {
+            fprintf(stderr,
+                    "aer: internal error: %s left variable slot %d in register %d, at or above the "
+                    "reserved floor %d\n",
+                    where, i, P.var_regs[i], P.reserved_floor);
+            abort();
+        }
+    }
+}
+#else
+#define assert_variables_below_floor(where) ((void)0)
+#endif
+
 /* Guard for RK16-wire opcodes: 32767 registers-or-constants is far beyond any real program, but
    silent truncation would corrupt the instruction rather than refuse to compile. */
 static bool rk16_fits(int rk) {
@@ -3392,6 +3414,7 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
         P.reserved_floor = saved_floor;
         if (P.next_temp_register < P.reserved_floor) P.next_temp_register = P.reserved_floor;
     }
+    assert_variables_below_floor("for-loop body");
 }
 
 /* No exit-time cleanup needed -- col_reg/idx_reg are ordinary registers. Reserves the loop
