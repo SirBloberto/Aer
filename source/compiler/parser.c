@@ -12,6 +12,9 @@
    VAR_BOXED on a mismatch; VAR_BOXED never promotes to RAW_*. */
 typedef enum { VAR_BOXED, VAR_RAW_INT, VAR_RAW_REAL } VarKind;
 
+/* No comparison emitted yet -- see Parser.last_cmp_offset. */
+#define NO_CMP_OFFSET ((unsigned int)-1)
+
 /* A call to a not-yet-registered name is optimistically assumed to be defined later in this
    same parse() call -- recorded here with a placeholder already emitted; func_register patches
    every pending entry once that name registers. Still-pending entries at parse()'s end were
@@ -89,6 +92,11 @@ typedef struct Parser {
     /* Highest temp register reached while compiling the loop condition currently being parsed --
        see parse_for_body for why the body must not be allowed to claim one of these. */
     int loop_cond_peak;
+
+    /* Offset of the last single-word comparison emitted, or NO_OFFSET. Lets emit_cond_jump_if_false
+       tell "the condition ends in a comparison" from "a word that happens to look like one" --
+       instruction lengths vary, so the last word cannot be identified by reading backwards. */
+    unsigned int last_cmp_offset;
 
     /* Nonzero while compiling an if/else branch -- disqualifies raw storage (see VarKind). */
     int branch_depth;
@@ -300,6 +308,7 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
         rk_rhs = materialize(c, rk_rhs);
         spilled++;
     }
+    P.last_cmp_offset = c->count;
     chunk_emit(c, PACK3(op, dest, pack_rk8(rk_lhs), pack_rk8(rk_rhs)));
     if (spilled) reg_free(spilled);
 }
@@ -314,19 +323,13 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
        below never fires. Keep the LOADK, fuse the compare with the branch: 3 dispatches become 2.
        Only when the LOADK's dest is a temp (>= reserved_floor) -- a named variable's register may
        be read again later, so assuming it dead is unsound. */
+    /* The comparison only has to be the LAST instruction of the condition, not the whole of it --
+       `x * x + y * y > 4.0` computes into raw slots first, and used to miss the fusion entirely
+       because the region was three words rather than two. Everything before it is kept. */
     unsigned int cmp_word_start = cond_start;
-    if (c->count - cond_start == 2) {
-        uint32_t loadk_w = c->code[cond_start];
-        if ((loadk_w & 0xFF) == OP_LOADK) {
-            uint32_t cmp_w = c->code[cond_start + 1];
-            Opcode cmp_op = (Opcode)(cmp_w & 0xFF);
-            bool is_raw_boxed_cmp = (cmp_op == OP_RAW_LT_INT_BOXED || cmp_op == OP_RAW_GT_INT_BOXED ||
-                                     cmp_op == OP_RAW_LTE_INT_BOXED || cmp_op == OP_RAW_GTE_INT_BOXED);
-            int loadk_dest = (int)UNPACK_A(loadk_w);
-            if (is_raw_boxed_cmp && (int)UNPACK_C(cmp_w) == loadk_dest && loadk_dest >= P.reserved_floor) {
-                cmp_word_start = cond_start + 1;
-            }
-        }
+    if (P.last_cmp_offset != NO_CMP_OFFSET && P.last_cmp_offset >= cond_start &&
+        P.last_cmp_offset == c->count - 1) {
+        cmp_word_start = P.last_cmp_offset;
     }
     if (c->count - cmp_word_start == 1) {
         uint32_t w = c->code[cmp_word_start];
@@ -343,6 +346,10 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
             case OP_RAW_GT_INT_BOXED: fused_op = OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE; break;
             case OP_RAW_LTE_INT_BOXED: fused_op = OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE; break;
             case OP_RAW_GTE_INT_BOXED: fused_op = OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE; break;
+            case OP_RAW_LT_REAL_BOXED: fused_op = OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE; break;
+            case OP_RAW_GT_REAL_BOXED: fused_op = OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE; break;
+            case OP_RAW_LTE_REAL_BOXED: fused_op = OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE; break;
+            case OP_RAW_GTE_REAL_BOXED: fused_op = OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE; break;
             default:
                 matched = false;
                 fused_op = OP_EQ_JUMP_IF_FALSE;
@@ -947,6 +954,7 @@ static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind
     if (is_temp(boxed_rk)) reg_free(1);
 
     int dest = reg_alloc();
+    P.last_cmp_offset = c->count;
     chunk_emit(c, PACK3(raw_op, dest, slot, boxed_rk));
     *out_rk = dest;
     return true;
@@ -4870,6 +4878,7 @@ bool parser_read_variable(VM* vm, Chunk* c, const char* name, AerVal* out) {
 
 void parser_reset(void) {
     reg_reset();
+    P.last_cmp_offset = NO_CMP_OFFSET;
     P.var_count = 0;
     P.global_count = 0;
     P.struct_count = 0;

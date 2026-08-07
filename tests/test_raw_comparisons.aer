@@ -198,4 +198,67 @@ assert(x[0] == true and x[1] == true, "raw real vs boxed at equality: both >= an
 x = raw_real_vs_boxed(9.0)
 assert(x[0] == false and x[1] == true, "raw real vs boxed below the bound")
 
+# ------------------------------------------------------------------ #
+# 6. A raw REAL local compared against a boxed value as a bare loop or  #
+#    if condition, so the compare fuses with its branch. The compare is #
+#    the LAST instruction of the condition rather than the whole of it, #
+#    which is the shape `x * x + y * y > 4.0` takes.                    #
+# ------------------------------------------------------------------ #
+
+function count_down_real_gt(floor_value):
+    rx = 10.0
+    steps = 0
+    for rx > floor_value:
+        rx -= 1.0
+        steps += 1
+    return steps
+
+assert(count_down_real_gt(4.0) == 6, "raw real `>` boxed as a loop condition")
+assert(count_down_real_gt(10.0) == 0, "raw real `>` loop does not run when already at the bound")
+
+function count_down_real_gte(floor_value):
+    rx = 10.0
+    steps = 0
+    for rx >= floor_value:
+        rx -= 1.0
+        steps += 1
+    return steps
+
+assert(count_down_real_gte(4.0) == 7, "raw real `>=` boxed as a loop condition includes the bound")
+
+function count_up_real_lt(ceiling):
+    rx = 1.0
+    steps = 0
+    for rx < ceiling:
+        rx += 1.0
+        steps += 1
+    return steps
+
+assert(count_up_real_lt(5.0) == 4, "raw real `<` boxed as a loop condition")
+
+function count_up_real_lte(ceiling):
+    rx = 1.0
+    steps = 0
+    for rx <= ceiling:
+        rx += 1.0
+        steps += 1
+    return steps
+
+assert(count_up_real_lte(5.0) == 5, "raw real `<=` boxed as a loop condition includes the bound")
+
+# The compare preceded by arithmetic -- the case the fusion used to miss because the condition was
+# more than one instruction long.
+function escape_steps(limit):
+    ex = 0.25
+    ey = 0.25
+    steps = 0
+    for ex * ex + ey * ey < limit:
+        ex += 0.25
+        ey += 0.25
+        steps += 1
+    return steps
+
+assert(escape_steps(100.0) == 28, "a compare at the end of a longer condition still fuses and is correct")
+assert(escape_steps(0.1) == 0, "and is false immediately when it should be")
+
 print("test_raw_comparisons.aer: all assertions passed.")

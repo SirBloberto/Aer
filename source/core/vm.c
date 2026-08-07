@@ -2693,6 +2693,10 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gt_int_boxed_jump_if_false,
         [OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lte_int_boxed_jump_if_false,
         [OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gte_int_boxed_jump_if_false,
+        [OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lt_real_boxed_jump_if_false,
+        [OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gt_real_boxed_jump_if_false,
+        [OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lte_real_boxed_jump_if_false,
+        [OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gte_real_boxed_jump_if_false,
         [OP_INTERP] = &&lbl_interp,
     };
 
@@ -5077,6 +5081,35 @@ lbl_raw_gte_real_boxed : {
     RAW_CMP_INT_BOXED_JUMP_IF_FALSE(gte, >=, ">=")
 
 #undef RAW_CMP_INT_BOXED_JUMP_IF_FALSE
+
+/* Real counterpart. An integer right-hand side promotes, matching OP_RAW_*_REAL_BOXED. */
+#define RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(name, op, opstr)                                                    \
+    lbl_raw_##name##_real_boxed_jump_if_false : {                                                            \
+        int slot = (int)UNPACK_B(op_word);                                                                   \
+        int reg = (int)UNPACK_C(op_word);                                                                    \
+        AerVal* rhs = &registers[reg];                                                                       \
+        int target = READ();                                                                                 \
+        bool cond;                                                                                           \
+        if (rhs->tag == TYPE_REAL)                                                                           \
+            cond = (raw_reals[slot] op rhs->as.d);                                                           \
+        else if (rhs->tag == TYPE_INTEGER) {                                                                 \
+            double rhs_d = (double)rhs->as.i;                                                                \
+            cond = (raw_reals[slot] op rhs_d);                                                               \
+        } else {                                                                                             \
+            SYNC_IP();                                                                                       \
+            error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs));                        \
+            cond = false;                                                                                    \
+        }                                                                                                    \
+        if (!cond) ip = (unsigned int)target;                                                                \
+        DISPATCH();                                                                                          \
+    }
+
+    RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(lt, <, "<")
+    RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(gt, >, ">")
+    RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(lte, <=, "<=")
+    RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(gte, >=, ">=")
+
+#undef RAW_CMP_REAL_BOXED_JUMP_IF_FALSE
 
 lbl_halt:
     SLICE_RETURN(VM_SLICE_DONE);

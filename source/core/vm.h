@@ -355,6 +355,13 @@ typedef enum {
     OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE,
     OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE,
     OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE,
+    /* Same fusion for a raw REAL local against a boxed value -- the shape `x*x + y*y > 4.0` in any
+       float loop, which was three dispatches (load the constant, compare, branch) against the int
+       path's two. */
+    OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE,
+    OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE,
+    OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE,
+    OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE,
 
     /* Builds one string from N parts in a single allocation. `"key_{n}"` used to compile to
        OP_LOADK + OP_TO_STR + OP_ADD -- three dispatches and two AerStrings, the second immediately
