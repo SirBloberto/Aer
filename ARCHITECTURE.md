@@ -841,7 +841,8 @@ Also worth knowing: `aer_format_int` divided by 10 in 64-bit arithmetic once per
 ARM has no 64-bit divide, so each digit was a libgcc call. Narrowing to `unsigned int` when the
 value fits -- as `aer_mod_int64` already did -- is another 4-4.6% on all four string benchmarks.
 
-Left unclosed: `small_dict_bench` remains a few percent behind Luau, and what is left is dict churn
+Left unclosed: `small_dict_bench` is level with Luau (2.58s against 2.60s, medians of 7) but still
+1.20x behind LuaJIT's interpreter, and what is left is dict churn
 -- 3.3M short-lived four-key dicts, with `pool_alloc`, `hashtable_put_hashed`, `hashtable_free` and
 `hashtable_key_dup` together about 30%. The obvious fix, borrowing constant-pool bytes for literal
 keys instead of copying them, has been attempted and reverted twice (see the `borrow`/`Retry dict
