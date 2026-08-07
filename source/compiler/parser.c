@@ -4810,6 +4810,23 @@ static void parse_statement(Chunk* c) {
 /* Isolates a fresh, independent program -- call exactly once per independent compile (a
    one-shot file run, a REPL session's startup, or one test case), never between statements of
    the same program. */
+/* See parser.h for why this exists rather than tests reading a register index directly. */
+bool parser_read_variable(VM* vm, Chunk* c, const char* name, AerVal* out) {
+    for (int i = P.var_count - 1; i >= 0; i--) {
+        AerVal entry = c->pool[P.var_names[i]];
+        if (aer_type(entry) != TYPE_STRING) continue;
+        AerString* s = aer_as_string(entry);
+        if (strlen(name) != s->length || memcmp(s->data, name, s->length) != 0) continue;
+        int slot = P.var_regs[i];
+        switch (P.var_kind[i]) {
+            case VAR_RAW_INT: *out = aer_int(vm->raw_ints[slot]); return true;
+            case VAR_RAW_REAL: *out = aer_real(vm->raw_reals[slot]); return true;
+            default: *out = vm->registers[slot]; return true;
+        }
+    }
+    return false;
+}
+
 void parser_reset(void) {
     reg_reset();
     P.var_count = 0;

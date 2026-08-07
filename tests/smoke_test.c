@@ -28,6 +28,16 @@ static void check(bool cond, const char* what) {
     else      { printf("FAIL: %s\n", what); failures++; }
 }
 
+/* A named variable's value after run_source(), wherever the compiler put it. Tests used to read a
+   hardcoded register index instead; the primitive pass then moved every int/real local into
+   raw_ints[]/raw_reals[] and 54 assertions began reading unrelated, never-written registers. Which
+   storage a variable earns is the compiler's choice to change, so tests ask by name. */
+static AerVal var_of(VM* vm, Chunk* c, const char* name) {
+    AerVal v;
+    if (!parser_read_variable(vm, c, name, &v)) return aer_null();
+    return v;
+}
+
 /* M5 slice 9 — compares a v3 register's string value against a C string, for interpolation tests. */
 static bool string_eq(AerVal v, const char* expected) {
     if (aer_type(v) != TYPE_STRING) return false;
@@ -592,8 +602,8 @@ int main(void) {
         bool ok = run_source(&c, &vm, "x = 2 + 3\ny = x * 4\n");
 
         check(ok, "real source 'x = 2 + 3; y = x * 4' compiled and ran via parse without error");
-        check(aer_as_int(register_get(&vm, 0)) == 5,  "x == 5 (register 0, first name assigned)");
-        check(aer_as_int(register_get(&vm, 1)) == 20, "y == 20 (register 1, second name assigned) — reads x back out of its own permanent register");
+        check(aer_as_int(var_of(&vm, &c, "x")) == 5,  "x == 5 (register 0, first name assigned)");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 20, "y == 20 (register 1, second name assigned) — reads x back out of its own permanent register");
 
         chunk_free(&c);
     }
@@ -607,7 +617,7 @@ int main(void) {
         bool ok = run_source(&c, &vm, "x = 10\nif x > 5:\n    y = 1\nelse:\n    y = 0\n");
 
         check(ok, "real source if/else (true branch) compiled and ran via parse without error");
-        check(aer_as_int(register_get(&vm, 1)) == 1, "y == 1 — the true branch ran (x=10 > 5)");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 1, "y == 1 — the true branch ran (x=10 > 5)");
 
         chunk_free(&c);
     }
@@ -618,7 +628,7 @@ int main(void) {
         bool ok = run_source(&c, &vm, "x = 3\nif x > 5:\n    y = 1\nelse:\n    y = 0\n");
 
         check(ok, "real source if/else (false branch) compiled and ran via parse without error");
-        check(aer_as_int(register_get(&vm, 1)) == 0, "y == 0 — the else branch ran (x=3 is not > 5)");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 0, "y == 0 — the else branch ran (x=3 is not > 5)");
 
         chunk_free(&c);
     }
@@ -630,11 +640,11 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "sum = 0\ni = 0\nfor i < 5:\n    sum = sum + i\n    i = i + 1\n");
+        bool ok = run_source(&c, &vm, "sum = 0\ni = 0\nfor i < 5:\n    sum += i\n    i += 1\n");
 
         check(ok, "real source 'for i < 5: sum = sum + i; i = i + 1' compiled and ran via parse without error");
-        check(aer_as_int(register_get(&vm, 0)) == 10, "sum == 10 after the real-source for-while loop");
-        check(aer_as_int(register_get(&vm, 1)) == 5,  "i == 5 — the loop consumed exactly 5 iterations, same boundary as Test 4's hand-driven version");
+        check(aer_as_int(var_of(&vm, &c, "sum")) == 10, "sum == 10 after the real-source for-while loop");
+        check(aer_as_int(var_of(&vm, &c, "i")) == 5,  "i == 5 — the loop consumed exactly 5 iterations, same boundary as Test 4's hand-driven version");
 
         chunk_free(&c);
     }
@@ -648,7 +658,7 @@ int main(void) {
         bool ok = run_source(&c, &vm, "function square(x):\n    return x * x\ny = square(6)\n");
 
         check(ok, "real source function definition + call ('function square(x): return x*x' then 'y = square(6)') ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 36, "y == 36 — the real-source call correctly returned the function's result");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 36, "y == 36 — the real-source call correctly returned the function's result");
 
         chunk_free(&c);
     }
@@ -668,7 +678,7 @@ int main(void) {
             "y = factorial(5)\n");
 
         check(ok, "real source recursive factorial(5) ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 120, "y == 120 — real-source recursion works end to end, same as Test 9's hand-driven version");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 120, "y == 120 — real-source recursion works end to end, same as Test 9's hand-driven version");
 
         chunk_free(&c);
     }
@@ -709,7 +719,7 @@ int main(void) {
         bool ok = run_source(&c, &vm, "arr = [10, 20, 30]\ny = arr[1]\n");
 
         check(ok, "real source array literal + indexing ('arr = [10,20,30]; y = arr[1]') ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 20, "y == 20 — arr[1] read back correctly through OP_INDEX_GET");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 20, "y == 20 — arr[1] read back correctly through OP_INDEX_GET");
 
         chunk_free(&c);
     }
@@ -723,7 +733,7 @@ int main(void) {
         bool ok = run_source(&c, &vm, "d = {\"a\": 1, \"b\": 2}\ny = d[\"b\"]\n");
 
         check(ok, "real source dict literal + indexing ('d = {\"a\":1,\"b\":2}; y = d[\"b\"]') ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 2, "y == 2 — d[\"b\"] read back correctly through OP_INDEX_GET");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 2, "y == 2 — d[\"b\"] read back correctly through OP_INDEX_GET");
 
         chunk_free(&c);
     }
@@ -737,7 +747,7 @@ int main(void) {
         bool ok = run_source(&c, &vm, "arr = [1, 2, 3]\narr[1] = 99\ny = arr[1]\n");
 
         check(ok, "real source indexed write ('arr[1] = 99') ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 99, "y == 99 — the write through OP_INDEX_SET is visible on the very same array");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 99, "y == 99 — the write through OP_INDEX_SET is visible on the very same array");
 
         chunk_free(&c);
     }
@@ -748,7 +758,7 @@ int main(void) {
         bool ok = run_source(&c, &vm, "matrix = [[1, 2], [3, 4]]\ny = matrix[1][0]\n");
 
         check(ok, "real source chained indexing ('matrix[1][0]' on a real-source array-of-arrays) ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 3, "y == 3 — matrix[1][0] resolved correctly through parse_primary's postfix '[...]' chain");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 3, "y == 3 — matrix[1][0] resolved correctly through parse_primary's postfix '[...]' chain");
 
         chunk_free(&c);
     }
@@ -761,10 +771,10 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "sum = 0\nfor x in [10, 20, 30]:\n    sum = sum + x\n");
+        bool ok = run_source(&c, &vm, "sum = 0\nfor x in [10, 20, 30]:\n    sum += x\n");
 
         check(ok, "real source 'for x in [10,20,30]: sum = sum + x' ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 60, "sum == 60 after the real-source for-in loop over a real-source array literal");
+        check(aer_as_int(var_of(&vm, &c, "sum")) == 60, "sum == 60 after the real-source for-in loop over a real-source array literal");
 
         chunk_free(&c);
     }
@@ -783,7 +793,7 @@ int main(void) {
             "total = p.x + p.y\n");
 
         check(ok, "real source struct def + instantiation + field reads ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 7, "total == 7 — p.x + p.y read back correctly through OP_FIELD_GET");
+        check(aer_as_int(var_of(&vm, &c, "total")) == 7, "total == 7 — p.x + p.y read back correctly through OP_FIELD_GET");
 
         chunk_free(&c);
     }
@@ -802,7 +812,7 @@ int main(void) {
             "total = p.x\n");
 
         check(ok, "real source field write ('p.x = 99') ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 99, "total == 99 — the write through OP_FIELD_SET is visible on the very same struct instance");
+        check(aer_as_int(var_of(&vm, &c, "total")) == 99, "total == 99 — the write through OP_FIELD_SET is visible on the very same struct instance");
 
         chunk_free(&c);
     }
@@ -821,7 +831,7 @@ int main(void) {
             "total = q.b\n");
 
         check(ok, "real source struct instantiation with an omitted trailing (defaulted) field ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 10, "total == 10 — q.b correctly took its declared default (5 was only supplied for 'a')");
+        check(aer_as_int(var_of(&vm, &c, "total")) == 10, "total == 10 — q.b correctly took its declared default (5 was only supplied for 'a')");
 
         chunk_free(&c);
     }
@@ -852,7 +862,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "x = 5\ny = -x\n");
         check(ok, "real source unary negate ('y = -x') ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == -5, "y == -5");
+        check(aer_as_int(var_of(&vm, &c, "y")) == -5, "y == -5");
         chunk_free(&c);
     }
     {
@@ -861,7 +871,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "x = true\ny = not x\n");
         check(ok, "real source unary not ('y = not x') ran without error");
-        check(aer_as_bool(register_get(&vm, 1)) == false, "y == false");
+        check(aer_as_bool(var_of(&vm, &c, "y")) == false, "y == false");
         chunk_free(&c);
     }
     {
@@ -870,7 +880,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "x = 5\ny = ~x\n");
         check(ok, "real source unary bitwise-not ('y = ~x') ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == -6, "y == -6 (~5 in two's complement)");
+        check(aer_as_int(var_of(&vm, &c, "y")) == -6, "y == -6 (~5 in two's complement)");
         chunk_free(&c);
     }
     {
@@ -879,7 +889,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "x = 5\ny = --x\n");
         check(ok, "real source chained unary ('y = --x', double negation) ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 5, "y == 5 — double negation cancels, proving parse_unary's self-recursion");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 5, "y == 5 — double negation cancels, proving parse_unary's self-recursion");
         chunk_free(&c);
     }
 
@@ -891,7 +901,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "y = true and true\n");
         check(ok, "'y = true and true' ran without error");
-        check(aer_as_bool(register_get(&vm, 0)) == true, "y == true");
+        check(aer_as_bool(var_of(&vm, &c, "y")) == true, "y == true");
         chunk_free(&c);
     }
     {
@@ -900,7 +910,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "y = true and false\n");
         check(ok, "'y = true and false' ran without error");
-        check(aer_as_bool(register_get(&vm, 0)) == false, "y == false");
+        check(aer_as_bool(var_of(&vm, &c, "y")) == false, "y == false");
         chunk_free(&c);
     }
     {
@@ -909,7 +919,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "y = false or true\n");
         check(ok, "'y = false or true' ran without error");
-        check(aer_as_bool(register_get(&vm, 0)) == true, "y == true");
+        check(aer_as_bool(var_of(&vm, &c, "y")) == true, "y == true");
         chunk_free(&c);
     }
     {
@@ -918,7 +928,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "y = false or false\n");
         check(ok, "'y = false or false' ran without error");
-        check(aer_as_bool(register_get(&vm, 0)) == false, "y == false");
+        check(aer_as_bool(var_of(&vm, &c, "y")) == false, "y == false");
         chunk_free(&c);
     }
 
@@ -930,7 +940,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "x = 5\nx += 3\nx *= 2\n");
         check(ok, "real source compound assignment ('x = 5; x += 3; x *= 2') ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 16, "x == 16 — (5 + 3) * 2");
+        check(aer_as_int(var_of(&vm, &c, "x")) == 16, "x == 16 — (5 + 3) * 2");
         chunk_free(&c);
     }
     {
@@ -939,7 +949,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "x = 6\nx = x & 3\n");
         check(ok, "real source bitwise and-with-reassign ('x = x & 3') ran without error — the compound '&=' spelling was deliberately removed");
-        check(aer_as_int(register_get(&vm, 0)) == 2, "x == 2 (6 & 3)");
+        check(aer_as_int(var_of(&vm, &c, "x")) == 2, "x == 2 (6 & 3)");
         chunk_free(&c);
     }
     {
@@ -958,7 +968,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "y = 6 & 3\n");
         check(ok, "real source bitwise AND expression ('y = 6 & 3') ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 2, "y == 2");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 2, "y == 2");
         chunk_free(&c);
     }
     {
@@ -967,7 +977,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "y = 1 << 4\n");
         check(ok, "real source left-shift expression ('y = 1 << 4') ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 16, "y == 16");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 16, "y == 16");
         chunk_free(&c);
     }
 
@@ -983,11 +993,11 @@ int main(void) {
             "for i < 10:\n"
             "    if i == 5:\n"
             "        break\n"
-            "    sum = sum + i\n"
-            "    i = i + 1\n");
+            "    sum += i\n"
+            "    i += 1\n");
         check(ok, "real source 'break' inside a for-while loop ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 10, "sum == 10 — 0+1+2+3+4, break fired exactly at i==5");
-        check(aer_as_int(register_get(&vm, 1)) == 5, "i == 5 — the loop exited via break, not the condition");
+        check(aer_as_int(var_of(&vm, &c, "sum")) == 10, "sum == 10 — 0+1+2+3+4, break fired exactly at i==5");
+        check(aer_as_int(var_of(&vm, &c, "i")) == 5, "i == 5 — the loop exited via break, not the condition");
         chunk_free(&c);
     }
 
@@ -1000,12 +1010,12 @@ int main(void) {
             "sum = 0\n"
             "i = 0\n"
             "for i < 5:\n"
-            "    i = i + 1\n"
+            "    i += 1\n"
             "    if i == 3:\n"
             "        continue\n"
-            "    sum = sum + i\n");
+            "    sum += i\n");
         check(ok, "real source 'continue' inside a for-while loop ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 12, "sum == 12 — 1+2+4+5, i==3's iteration skipped sum += i via continue");
+        check(aer_as_int(var_of(&vm, &c, "sum")) == 12, "sum == 12 — 1+2+4+5, i==3's iteration skipped sum += i via continue");
         chunk_free(&c);
     }
 
@@ -1019,9 +1029,9 @@ int main(void) {
             "for x in [1, 2, 3, 4, 5]:\n"
             "    if x == 4:\n"
             "        break\n"
-            "    sum = sum + x\n");
+            "    sum += x\n");
         check(ok, "real source 'break' inside a for-in loop ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 6, "sum == 6 — 1+2+3, break fired at x==4 before it was added");
+        check(aer_as_int(var_of(&vm, &c, "sum")) == 6, "sum == 6 — 1+2+3, break fired at x==4 before it was added");
         chunk_free(&c);
     }
 
@@ -1051,7 +1061,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "y = \"hello\"\n");
         check(ok, "real source plain string literal ('y = \"hello\"') ran without error");
-        check(string_eq(register_get(&vm, 0), "hello"), "y == \"hello\"");
+        check(string_eq(var_of(&vm, &c, "y"), "hello"), "y == \"hello\"");
         chunk_free(&c);
     }
 
@@ -1062,7 +1072,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "x = 5\ny = \"value is {x}\"\n");
         check(ok, "real source string interpolation ('y = \"value is {x}\"') ran without error");
-        check(string_eq(register_get(&vm, 1), "value is 5"), "y == \"value is 5\"");
+        check(string_eq(var_of(&vm, &c, "y"), "value is 5"), "y == \"value is 5\"");
         chunk_free(&c);
     }
 
@@ -1073,7 +1083,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "a = 1\nb = 2\ny = \"{a} and {b}\"\n");
         check(ok, "real source multi-interpolation ('y = \"{a} and {b}\"') ran without error");
-        check(string_eq(register_get(&vm, 2), "1 and 2"), "y == \"1 and 2\"");
+        check(string_eq(var_of(&vm, &c, "y"), "1 and 2"), "y == \"1 and 2\"");
         chunk_free(&c);
     }
 
@@ -1095,8 +1105,8 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "arr = [1, 2, 3]\ny = 2 in arr\nz = 9 in arr\n");
         check(ok, "real source 'in' ('2 in arr') ran without error");
-        check(aer_as_bool(register_get(&vm, 1)) == true,  "y == true — 2 is in arr");
-        check(aer_as_bool(register_get(&vm, 2)) == false, "z == false — 9 is not in arr");
+        check(aer_as_bool(var_of(&vm, &c, "y")) == true,  "y == true — 2 is in arr");
+        check(aer_as_bool(var_of(&vm, &c, "z")) == false, "z == false — 9 is not in arr");
         chunk_free(&c);
     }
 
@@ -1108,7 +1118,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "x = 5\ny = string(x)\n");
         check(ok, "real source 'string(x)' ran without error");
-        check(string_eq(register_get(&vm, 1), "5"), "y == \"5\"");
+        check(string_eq(var_of(&vm, &c, "y"), "5"), "y == \"5\"");
         chunk_free(&c);
     }
     {
@@ -1117,7 +1127,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "x = \"42\"\ny = integer(x)\n");
         check(ok, "real source 'integer(x)' ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 42, "y == 42");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 42, "y == 42");
         chunk_free(&c);
     }
     {
@@ -1126,7 +1136,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "x = 3\ny = float(x)\n");
         check(ok, "real source 'float(x)' ran without error");
-        check(aer_as_real(register_get(&vm, 1)) == 3.0, "y == 3.0");
+        check(aer_as_real(var_of(&vm, &c, "y")) == 3.0, "y == 3.0");
         chunk_free(&c);
     }
     {
@@ -1135,7 +1145,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "x = 1\ny = boolean(x)\n");
         check(ok, "real source 'boolean(x)' ran without error");
-        check(aer_as_bool(register_get(&vm, 1)) == true, "y == true");
+        check(aer_as_bool(var_of(&vm, &c, "y")) == true, "y == true");
         chunk_free(&c);
     }
 
@@ -1151,8 +1161,8 @@ int main(void) {
             "y = type(p) == \"Point\"\n"
             "z = type(p) == \"SomeOtherStruct\"\n");
         check(ok, "real source 'type(p) == \"Name\"' ran without error");
-        check(aer_as_bool(register_get(&vm, 1)) == true,  "y == true — p really is a Point");
-        check(aer_as_bool(register_get(&vm, 2)) == false, "z == false — p is not a SomeOtherStruct, no error");
+        check(aer_as_bool(var_of(&vm, &c, "y")) == true,  "y == true — p really is a Point");
+        check(aer_as_bool(var_of(&vm, &c, "z")) == false, "z == false — p is not a SomeOtherStruct, no error");
         chunk_free(&c);
     }
 
@@ -1163,7 +1173,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "function square(x):\n    return x * x\ny = 6 |> square()\n");
         check(ok, "real source 'y = 6 |> square()' ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 36, "y == 36 — piped value became square()'s only argument");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 36, "y == 36 — piped value became square()'s only argument");
         chunk_free(&c);
     }
 
@@ -1174,7 +1184,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "function add(a, b):\n    return a + b\ny = 3 |> add(4)\n");
         check(ok, "real source 'y = 3 |> add(4)' ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 7, "y == 7 — piped value became add()'s first argument, 4 the second");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 7, "y == 7 — piped value became add()'s first argument, 4 the second");
         chunk_free(&c);
     }
 
@@ -1197,7 +1207,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "import math\ny = math.sqrt(16.0)\n");
         check(ok, "real source 'import math' + 'y = math.sqrt(16.0)' ran without error");
-        check(aer_as_real(register_get(&vm, 0)) == 4.0, "y == 4.0");
+        check(aer_as_real(var_of(&vm, &c, "y")) == 4.0, "y == 4.0");
         chunk_free(&c);
     }
 
@@ -1209,7 +1219,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "import math\ny = math.pow(2, 10)\nmath.floor(3.7)\n");
         check(ok, "real source 'math.pow(2, 10)' + a bare 'math.floor(3.7)' statement ran without error");
-        check(aer_as_real(register_get(&vm, 0)) == 1024.0, "y == 1024.0");
+        check(aer_as_real(var_of(&vm, &c, "y")) == 1024.0, "y == 1024.0");
         chunk_free(&c);
     }
 
@@ -1232,10 +1242,10 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "n = 5\nsum = 0\nfor i in 0..n:\n    sum = sum + i\n");
+        bool ok = run_source(&c, &vm, "n = 5\nsum = 0\nfor i in 0..n:\n    sum += i\n");
         check(ok, "real source 'for i in 0..n: sum += i' ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 10, "sum == 10 — 0+1+2+3+4");
-        check(aer_as_int(register_get(&vm, 0)) == 5, "n == 5 — unchanged by the loop (cur_reg didn't alias n's register)");
+        check(aer_as_int(var_of(&vm, &c, "sum")) == 10, "sum == 10 — 0+1+2+3+4");
+        check(aer_as_int(var_of(&vm, &c, "n")) == 5, "n == 5 — unchanged by the loop (cur_reg didn't alias n's register)");
         chunk_free(&c);
     }
 
@@ -1245,18 +1255,18 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "sum = 0\nfor i in 0..10..2:\n    sum = sum + i\n");
+        bool ok = run_source(&c, &vm, "sum = 0\nfor i in 0..10..2:\n    sum += i\n");
         check(ok, "real source 'for i in 0..10..2:' ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 20, "sum == 20 — 0+2+4+6+8");
+        check(aer_as_int(var_of(&vm, &c, "sum")) == 20, "sum == 20 — 0+2+4+6+8");
         chunk_free(&c);
     }
     {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "sum = 0\nfor i in 5..0:\n    sum = sum + i\n");
+        bool ok = run_source(&c, &vm, "sum = 0\nfor i in 5..0:\n    sum += i\n");
         check(ok, "real source 'for i in 5..0:' (descending) ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 15, "sum == 15 — 5+4+3+2+1, direction inferred from bounds");
+        check(aer_as_int(var_of(&vm, &c, "sum")) == 15, "sum == 15 — 5+4+3+2+1, direction inferred from bounds");
         chunk_free(&c);
     }
 
@@ -1266,9 +1276,9 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "sum = 0\nfor i in 0..10:\n    if i == 5:\n        break\n    sum = sum + i\n");
+        bool ok = run_source(&c, &vm, "sum = 0\nfor i in 0..10:\n    if i == 5:\n        break\n    sum += i\n");
         check(ok, "real source 'break' inside a range for-loop ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 10, "sum == 10 — 0+1+2+3+4, break fired at i==5");
+        check(aer_as_int(var_of(&vm, &c, "sum")) == 10, "sum == 10 — 0+1+2+3+4, break fired at i==5");
         chunk_free(&c);
     }
 
@@ -1281,9 +1291,9 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "px, py, pz = 1, 2, 3\n");
         check(ok, "real source 'px, py, pz = 1, 2, 3' ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 1, "px == 1");
-        check(aer_as_int(register_get(&vm, 1)) == 2, "py == 2");
-        check(aer_as_int(register_get(&vm, 2)) == 3, "pz == 3");
+        check(aer_as_int(var_of(&vm, &c, "px")) == 1, "px == 1");
+        check(aer_as_int(var_of(&vm, &c, "py")) == 2, "py == 2");
+        check(aer_as_int(var_of(&vm, &c, "pz")) == 3, "pz == 3");
         chunk_free(&c);
     }
 
@@ -1295,8 +1305,8 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "arr = [10, 20]\na, b = arr\n");
         check(ok, "real source 'a, b = arr' (single array-valued RHS) ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 10, "a == 10 — arr[0]");
-        check(aer_as_int(register_get(&vm, 2)) == 20, "b == 20 — arr[1]");
+        check(aer_as_int(var_of(&vm, &c, "a")) == 10, "a == 10 — arr[0]");
+        check(aer_as_int(var_of(&vm, &c, "b")) == 20, "b == 20 — arr[1]");
         chunk_free(&c);
     }
 
@@ -1310,9 +1320,9 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "n = 5\na, b = n + 1, n + 2\n");
         check(ok, "real source destructuring with a live RHS temp ran without error");
-        check(aer_as_int(register_get(&vm, 0)) == 5, "n == 5 — unchanged");
-        check(aer_as_int(register_get(&vm, 1)) == 6, "a == 6 — n + 1");
-        check(aer_as_int(register_get(&vm, 2)) == 7, "b == 7 — n + 2");
+        check(aer_as_int(var_of(&vm, &c, "n")) == 5, "n == 5 — unchanged");
+        check(aer_as_int(var_of(&vm, &c, "a")) == 6, "a == 6 — n + 1");
+        check(aer_as_int(var_of(&vm, &c, "b")) == 7, "b == 7 — n + 2");
         chunk_free(&c);
     }
 
@@ -1323,7 +1333,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "arr = [1, 2, 3]\ny = length(arr)\n");
         check(ok, "real source 'y = length(arr)' ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 3, "y == 3");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 3, "y == 3");
         chunk_free(&c);
     }
     {
@@ -1332,7 +1342,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "import collection\narr = [1, 2]\ncollection.append(arr, 3)\ny = length(arr)\n");
         check(ok, "real source 'collection.append(arr, 3)' as a bare statement ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 3, "y == 3 — collection.append() grew the same array in place");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 3, "y == 3 — collection.append() grew the same array in place");
         chunk_free(&c);
     }
     {
@@ -1341,7 +1351,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "y = type(5)\n");
         check(ok, "real source 'y = type(5)' ran without error");
-        check(string_eq(register_get(&vm, 0), "integer"), "y == \"integer\"");
+        check(string_eq(var_of(&vm, &c, "y"), "integer"), "y == \"integer\"");
         chunk_free(&c);
     }
 
@@ -1368,8 +1378,8 @@ int main(void) {
             "struct Point:\n    x = 0\n    y = 0\n"
             "p = Point(1, 2)\np.x += 5\np.y *= 3\nrx = p.x\nry = p.y\n");
         check(ok, "real source 'p.x += 5' / 'p.y *= 3' ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 6, "rx == 6 — 1 + 5");
-        check(aer_as_int(register_get(&vm, 2)) == 6, "ry == 6 — 2 * 3");
+        check(aer_as_int(var_of(&vm, &c, "rx")) == 6, "rx == 6 — 1 + 5");
+        check(aer_as_int(var_of(&vm, &c, "ry")) == 6, "ry == 6 — 2 * 3");
         chunk_free(&c);
     }
 
@@ -1381,7 +1391,7 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "arr = [1, 2, 3]\narr[1] += 10\ny = arr[1]\n");
         check(ok, "real source 'arr[1] += 10' ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 12, "y == 12 — 2 + 10");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 12, "y == 12 — 2 + 10");
         chunk_free(&c);
     }
 
@@ -1408,8 +1418,8 @@ int main(void) {
             "function scaled(x, scale):\n    return x * scale\n"
             "y = scaled(4, SCALE)\n");
         check(ok, "the same computation works once the value is passed in as a parameter");
-        check(aer_as_int(register_get(&vm, 1)) == 40, "y == 40 — 4 * SCALE, passed in explicitly");
-        check(aer_as_int(register_get(&vm, 0)) == 10, "SCALE == 10 — unchanged by the call");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 40, "y == 40 — 4 * SCALE, passed in explicitly");
+        check(aer_as_int(var_of(&vm, &c, "SCALE")) == 10, "SCALE == 10 — unchanged by the call");
         chunk_free(&c);
     }
 
@@ -1437,8 +1447,8 @@ int main(void) {
             "function set_local():\n    z = 99\n    return z\n"
             "y = set_local()\n");
         check(ok, "a differently-named function-local works fine, unaffected by the unrelated top-level x");
-        check(aer_as_int(register_get(&vm, 1)) == 99, "y == 99 — set_local()'s own return value");
-        check(aer_as_int(register_get(&vm, 0)) == 1, "x == 1 at top level — untouched, set_local() never referenced it");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 99, "y == 99 — set_local()'s own return value");
+        check(aer_as_int(var_of(&vm, &c, "x")) == 1, "x == 1 at top level — untouched, set_local() never referenced it");
         chunk_free(&c);
     }
 
@@ -1454,18 +1464,18 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "n = 4\ntotal = 0\nfor i in 0..n:\n    for j in (i+1)..n:\n        total = total + 1\n");
+        bool ok = run_source(&c, &vm, "n = 4\ntotal = 0\nfor i in 0..n:\n    for j in (i+1)..n:\n        total += 1\n");
         check(ok, "real source nested range for-loops (inner bound depends on outer var) ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 6, "total == 6 — 4 choose 2 pairs; a wrong/hung result would mean the inner loop's own j corrupted the outer loop's i");
+        check(aer_as_int(var_of(&vm, &c, "total")) == 6, "total == 6 — 4 choose 2 pairs; a wrong/hung result would mean the inner loop's own j corrupted the outer loop's i");
         chunk_free(&c);
     }
     {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "n = 3\ntotal = 0\nfor i in 0..n:\n    for j in 0..n:\n        total = total + 1\n");
+        bool ok = run_source(&c, &vm, "n = 3\ntotal = 0\nfor i in 0..n:\n    for j in 0..n:\n        total += 1\n");
         check(ok, "real source nested range for-loops (independent bounds) ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 9, "total == 9 — 3*3, same aliasing hazard even when the inner loop doesn't depend on the outer var");
+        check(aer_as_int(var_of(&vm, &c, "total")) == 9, "total == 9 — 3*3, same aliasing hazard even when the inner loop doesn't depend on the outer var");
         chunk_free(&c);
     }
 
@@ -1485,9 +1495,9 @@ int main(void) {
         VM vm;
         bool ok = run_source(&c, &vm, "a = 2\nb = 3\narr = [a + b, 10, 20]\nx = arr[0]\ny = arr[1]\nz = arr[2]\n");
         check(ok, "real source array literal with a computed non-last item, read back fully, ran without error");
-        check(aer_as_int(register_get(&vm, 3)) == 5,  "x == 5 — arr[0], the computed (a + b) item");
-        check(aer_as_int(register_get(&vm, 4)) == 10, "y == 10 — arr[1], correctly NOT shifted into arr[0]'s old register gap");
-        check(aer_as_int(register_get(&vm, 5)) == 20, "z == 20 — arr[2], correctly still the last item");
+        check(aer_as_int(var_of(&vm, &c, "x")) == 5,  "x == 5 — arr[0], the computed (a + b) item");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 10, "y == 10 — arr[1], correctly NOT shifted into arr[0]'s old register gap");
+        check(aer_as_int(var_of(&vm, &c, "z")) == 20, "z == 20 — arr[2], correctly still the last item");
         chunk_free(&c);
     }
 
@@ -1512,11 +1522,11 @@ int main(void) {
             "f = p.y - 5\n"
             "g = p.x + p.y + a\n");
         check(ok, "real source fused struct-field binary ops (both operand orders) ran without error");
-        check(aer_as_int(register_get(&vm, 2)) == -7, "b == -7 — a - p.x, fused via OP_BINARY_FIELD (reg OP field)");
-        check(aer_as_int(register_get(&vm, 3)) == 80, "d == 80 — 100 - p.y, fused via OP_BINARY_FIELD (const OP field)");
-        check(aer_as_int(register_get(&vm, 4)) == 7,  "e == 7 — p.x - a, fused via OP_FIELD_BINARY (field OP reg)");
-        check(aer_as_int(register_get(&vm, 5)) == 15, "f == 15 — p.y - 5, fused via OP_FIELD_BINARY (field OP const)");
-        check(aer_as_int(register_get(&vm, 6)) == 33, "g == 33 — p.x + p.y + a: first '+' fuses (field OP field's own p.y read is untouched, p.x fuses as lhs), second '+' is the ordinary unfused path since its own lhs is now a fusion result, not a bare field-get");
+        check(aer_as_int(var_of(&vm, &c, "b")) == -7, "b == -7 — a - p.x, fused via OP_BINARY_FIELD (reg OP field)");
+        check(aer_as_int(var_of(&vm, &c, "d")) == 80, "d == 80 — 100 - p.y, fused via OP_BINARY_FIELD (const OP field)");
+        check(aer_as_int(var_of(&vm, &c, "e")) == 7,  "e == 7 — p.x - a, fused via OP_FIELD_BINARY (field OP reg)");
+        check(aer_as_int(var_of(&vm, &c, "f")) == 15, "f == 15 — p.y - 5, fused via OP_FIELD_BINARY (field OP const)");
+        check(aer_as_int(var_of(&vm, &c, "g")) == 33, "g == 33 — p.x + p.y + a: first '+' fuses (field OP field's own p.y read is untouched, p.x fuses as lhs), second '+' is the ordinary unfused path since its own lhs is now a fusion result, not a bare field-get");
         chunk_free(&c);
     }
 
@@ -1553,11 +1563,11 @@ int main(void) {
             "l1.mid.inner.v = 7\n"
             "q = l1.mid.inner.v\n");
         check(ok, "real source arbitrary-depth chained assignment ran without error");
-        check(aer_as_int(register_get(&vm, 2))  == 99,  "x == 99 — o.b[0].c = 99, a field->index->field chain write");
-        check(aer_as_int(register_get(&vm, 3))  == 100, "y == 100 — o.b[0].c += 1, compound assign at the chain's end");
-        check(aer_as_int(register_get(&vm, 4))  == 100, "w == 100 — arr[0].c independently reads the SAME object o.b[0] wrote through (aliasing, not a copy)");
-        check(aer_as_int(register_get(&vm, 6))  == 42,  "z == 42 — mat[0][1] = 42, a pure two-level index chain");
-        check(aer_as_int(register_get(&vm, 10)) == 7,   "q == 7 — l1.mid.inner.v = 7, a pure three-level field chain");
+        check(aer_as_int(var_of(&vm, &c, "x"))  == 99,  "x == 99 — o.b[0].c = 99, a field->index->field chain write");
+        check(aer_as_int(var_of(&vm, &c, "y"))  == 100, "y == 100 — o.b[0].c += 1, compound assign at the chain's end");
+        check(aer_as_int(var_of(&vm, &c, "w"))  == 100, "w == 100 — arr[0].c independently reads the SAME object o.b[0] wrote through (aliasing, not a copy)");
+        check(aer_as_int(var_of(&vm, &c, "z"))  == 42,  "z == 42 — mat[0][1] = 42, a pure two-level index chain");
+        check(aer_as_int(var_of(&vm, &c, "q")) == 7,   "q == 7 — l1.mid.inner.v = 7, a pure three-level field chain");
         chunk_free(&c);
     }
 
@@ -1582,9 +1592,9 @@ int main(void) {
             "for k in d:\n"
             "    sum_klen += length(k)\n");
         check(ok, "real source dict for-in iteration (both single-var key and k,v pair forms) ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 60, "sum_v == 60 — 10 + 20 + 30 via 'for k, v in d:'");
-        check(aer_as_int(register_get(&vm, 2)) == 3,  "count == 3 — one iteration per dict entry");
-        check(aer_as_int(register_get(&vm, 5)) == 3,  "sum_klen == 3 — 'a'+'b'+'c', each length 1, via 'for k in d:'");
+        check(aer_as_int(var_of(&vm, &c, "sum_v")) == 60, "sum_v == 60 — 10 + 20 + 30 via 'for k, v in d:'");
+        check(aer_as_int(var_of(&vm, &c, "count")) == 3,  "count == 3 — one iteration per dict entry");
+        check(aer_as_int(var_of(&vm, &c, "sum_klen")) == 3,  "sum_klen == 3 — 'a'+'b'+'c', each length 1, via 'for k in d:'");
         chunk_free(&c);
     }
 
@@ -1609,7 +1619,7 @@ int main(void) {
 
         bool ok2 = run_repl_line(&c, &vm, "y = x + 5\n");
         check(ok2, "REPL line 2 ('y = x + 5') ran without error, reading x from an earlier line");
-        check(aer_as_int(register_get(&vm, 1)) == 15, "y == 15 — x's value from line 1 correctly persisted across parse() calls");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 15, "y == 15 — x's value from line 1 correctly persisted across parse() calls");
 
         /* An incomplete expression ('z = 1 +' with nothing after it) is an IMMEDIATE parse-time
            error (caught mid-statement, well before any name-resolution ambiguity) — deliberately
@@ -1621,11 +1631,11 @@ int main(void) {
            still correct, behavior this test isn't about. */
         bool ok3 = run_repl_line(&c, &vm, "z = 1 +\nz = x + y\n");
         check(!ok3, "REPL line 3's first statement (an incomplete expression) correctly reports an error");
-        check(aer_as_int(register_get(&vm, 2)) == 25, "z == 25 — the SECOND statement on line 3 still compiled and ran despite the first one erroring (per-statement rollback/recovery, not a whole-call abort)");
+        check(aer_as_int(var_of(&vm, &c, "z")) == 25, "z == 25 — the SECOND statement on line 3 still compiled and ran despite the first one erroring (per-statement rollback/recovery, not a whole-call abort)");
 
         bool ok4 = run_repl_line(&c, &vm, "w = x + y + z\n");
         check(ok4, "REPL line 4 ran without error, proving line 3's error didn't corrupt later state");
-        check(aer_as_int(register_get(&vm, 3)) == 50, "w == 50 — 10 + 15 + 25, state fully intact after the earlier error");
+        check(aer_as_int(var_of(&vm, &c, "w")) == 50, "w == 50 — 10 + 15 + 25, state fully intact after the earlier error");
 
         bool ok5 = run_repl_line(&c, &vm, "arr = [1, 2, 3]\n");
         check(ok5, "REPL line 5 ('arr = [1, 2, 3]') ran without error");
@@ -1677,9 +1687,9 @@ int main(void) {
             "\n"
             "d = double_it(5)\n");
         check(ok, "real source mutual recursion (is_even/is_odd) and a one-directional forward reference (double_it/helper) both ran without error");
-        check(aer_as_bool(register_get(&vm, 0)) == true,  "a == true — is_even(10), via is_even's forward reference to is_odd");
-        check(aer_as_bool(register_get(&vm, 1)) == true,  "b == true — is_odd(7), via is_odd's ordinary (already-defined) call back to is_even");
-        check(aer_as_int(register_get(&vm, 2)) == 12,     "d == 12 — double_it(5) = helper(5) * 2 = 6 * 2, via a plain forward reference to a helper defined below it");
+        check(aer_as_bool(var_of(&vm, &c, "a")) == true,  "a == true — is_even(10), via is_even's forward reference to is_odd");
+        check(aer_as_bool(var_of(&vm, &c, "b")) == true,  "b == true — is_odd(7), via is_odd's ordinary (already-defined) call back to is_even");
+        check(aer_as_int(var_of(&vm, &c, "d")) == 12,     "d == 12 — double_it(5) = helper(5) * 2 = 6 * 2, via a plain forward reference to a helper defined below it");
         chunk_free(&c);
     }
     {
@@ -1698,8 +1708,8 @@ int main(void) {
         vm_init(&vm, &c);
         bool ok = run_repl_line(&c, &vm, "before = 1\nafter = 99\nnonexistent_function(1)\nafter = 2\n");
         check(!ok, "a call to a name never defined anywhere in the compile is still a clean, reported error (not a crash)");
-        check(aer_as_int(register_get(&vm, 0)) == 1,  "before == 1 — the statement BEFORE the unresolvable call still ran (compilation isn't aborted early, only the final result is)");
-        check(aer_as_int(register_get(&vm, 1)) == 99, "after == 99 (its pre-set value, NOT 2) — the VM safely halted the moment it reached the unresolvable call, so the later 'after = 2' never executed, instead of running (or crashing on) whatever came after it");
+        check(aer_as_int(var_of(&vm, &c, "before")) == 1,  "before == 1 — the statement BEFORE the unresolvable call still ran (compilation isn't aborted early, only the final result is)");
+        check(aer_as_int(var_of(&vm, &c, "after")) == 99, "after == 99 (its pre-set value, NOT 2) — the VM safely halted the moment it reached the unresolvable call, so the later 'after = 2' never executed, instead of running (or crashing on) whatever came after it");
         chunk_free(&c);
     }
 
@@ -1729,8 +1739,8 @@ int main(void) {
             "\n"
             "z = call_it(fn, 10)\n");
         check(ok, "real source functions-as-values (bare-name reference + call-through-variable, both top-level and through a parameter) ran without error");
-        check(aer_as_int(register_get(&vm, 1)) == 42, "y == 42 — fn(21) called through a local variable holding double's function value");
-        check(aer_as_int(register_get(&vm, 2)) == 20, "z == 20 — call_it(fn, 10) = fn(10), fn passed through as a parameter into a different function's body");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 42, "y == 42 — fn(21) called through a local variable holding double's function value");
+        check(aer_as_int(var_of(&vm, &c, "z")) == 20, "z == 20 — call_it(fn, 10) = fn(10), fn passed through as a parameter into a different function's body");
         chunk_free(&c);
     }
 

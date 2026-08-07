@@ -61,6 +61,11 @@ void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, 
 /* `[value; count]` repeat-literal construction; rk_count is RK-encoded. */
 void emit_array_repeat(Chunk* c, int dest_reg, int fill_reg, int narrow_flag, int rk_count);
 
+/* A variable's value by name, from wherever the compiler placed it (boxed register, raw int slot,
+   or raw real slot); false if never assigned. For tests: which storage a variable earns moves with
+   optimization work, so a test reading a fixed register index asserts on a non-contract. */
+bool parser_read_variable(VM* vm, Chunk* c, const char* name, AerVal* out);
+
 /* Reset every persistent compile table -- ONCE per independent program, never between
    statements of the same session (REPL persistence depends on it). */
 void parser_reset(void);
