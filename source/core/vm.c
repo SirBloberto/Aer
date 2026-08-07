@@ -206,12 +206,18 @@ void aer_gc_set_ceiling(unsigned int max_live_cells) {
     require_current_heap()->gc_live_cell_ceiling = max_live_cells;
 }
 
-/* Checked once per opcode from DISPATCH(); kept tiny and always_inline so the common case (nowhere near threshold) costs nothing beyond what's already inlined into the dispatch loop. gc_run_collection_cycle (the rare, actual-collection path) lives in gc.c. */
-static inline __attribute__((always_inline)) void gc_maybe_collect(VM* vm) {
+/* Split from gc_maybe_collect so the dispatch loop can put its own work (syncing vm->ip for error
+   reporting) on the collection path without paying for it on the far commoner "nowhere near
+   threshold" one -- see vm_run_slice's gc_maybe_collect shadow. */
+static inline __attribute__((always_inline)) bool gc_should_collect(VM* vm) {
     VmHeap* heap = &vm->heap;
-    if (heap->gc_suppress_depth > 0) return;
-    if (heap->pool_alloc_count < heap->minor_gc_threshold) return;
-    gc_run_collection_cycle(vm);
+    if (heap->gc_suppress_depth > 0) return false;
+    return heap->pool_alloc_count >= heap->minor_gc_threshold;
+}
+
+/* Called from every allocating opcode; kept tiny and always_inline so the common case costs nothing beyond what's already inlined into the dispatch loop. gc_run_collection_cycle (the rare, actual-collection path) lives in gc.c. */
+static inline __attribute__((always_inline)) void gc_maybe_collect(VM* vm) {
+    if (gc_should_collect(vm)) gc_run_collection_cycle(vm);
 }
 
 /* Embedding-facing introspection (include/aer.h); live_cells is a bookkeeping snapshot, not a fresh trace, so it undercounts unswept-but-garbage cells since the last cycle. Reads whichever heap is current -- see vm_gc_suppress's comment. */
@@ -2372,7 +2378,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     do {                                                                                                     \
         unsigned int op_ip = ip;                                                                             \
         op_word = READ();                                                                                    \
-        vm->ip = ip;                                                                                         \
         cur_op = (Opcode)(op_word & 0xFF);                                                                   \
         c->debug_hits[op_ip]++;                                                                              \
         goto* dt[cur_op];                                                                                    \
@@ -2383,11 +2388,44 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
 #define DISPATCH()                                                                                           \
     do {                                                                                                     \
         op_word = READ();                                                                                    \
-        vm->ip = ip;                                                                                         \
         cur_op = (Opcode)(op_word & 0xFF);                                                                   \
         goto* dt[cur_op];                                                                                    \
     } while (0)
 #endif
+
+/* DISPATCH() deliberately does not maintain vm->ip, but error() resolves the faulting source line
+   through it (lookup_runtime_line). These shadow, for this function's body only, every callee that
+   can reach a raise, so ip is synced on exactly those paths and nowhere else. A function-like macro
+   is not re-expanded inside its own expansion, so the parenthesised name calls the real function.
+   Anything absent here must be unable to raise -- adding a raise to one of those is a silent
+   wrong-line bug, which tests/error_lines.py exists to catch. All #undef'd after lbl_halt. */
+#define SYNC_IP() ((void)(vm->ip = ip))
+#define error(...) (SYNC_IP(), (error)(__VA_ARGS__))
+#define vm_binary_cold(...) (SYNC_IP(), (vm_binary_cold)(__VA_ARGS__))
+#define vm_index_get_compute(...) (SYNC_IP(), (vm_index_get_compute)(__VA_ARGS__))
+#define vm_index_set_compute(...) (SYNC_IP(), (vm_index_set_compute)(__VA_ARGS__))
+#define vm_in(...) (SYNC_IP(), (vm_in)(__VA_ARGS__))
+#define vm_cast(...) (SYNC_IP(), (vm_cast)(__VA_ARGS__))
+#define vm_to_str(...) (SYNC_IP(), (vm_to_str)(__VA_ARGS__))
+#define vm_slice_bounds(...) (SYNC_IP(), (vm_slice_bounds)(__VA_ARGS__))
+#define vm_call_builtin(...) (SYNC_IP(), (vm_call_builtin)(__VA_ARGS__))
+#define vm_call_value(...) (SYNC_IP(), (vm_call_value)(__VA_ARGS__))
+#define vm_call_module_dispatch(...) (SYNC_IP(), (vm_call_module_dispatch)(__VA_ARGS__))
+#define vm_call_resolve_specialization(...) (SYNC_IP(), (vm_call_resolve_specialization)(__VA_ARGS__))
+#define vm_resolve_field(...) (SYNC_IP(), (vm_resolve_field)(__VA_ARGS__))
+#define vm_resolve_field_by_shape(...) (SYNC_IP(), (vm_resolve_field_by_shape)(__VA_ARGS__))
+#define vm_check_narrow_field_write(...) (SYNC_IP(), (vm_check_narrow_field_write)(__VA_ARGS__))
+#define vm_typed_array_check(...) (SYNC_IP(), (vm_typed_array_check)(__VA_ARGS__))
+#define vm_default_value(...) (SYNC_IP(), (vm_default_value)(__VA_ARGS__))
+#define aer_make_string_copy(...) (SYNC_IP(), (aer_make_string_copy)(__VA_ARGS__))
+/* Only the collection path syncs: the threshold test runs on every allocating opcode. */
+#define gc_maybe_collect(v)                                                                                  \
+    do {                                                                                                     \
+        if (gc_should_collect(v)) {                                                                          \
+            SYNC_IP();                                                                                       \
+            gc_run_collection_cycle(v);                                                                      \
+        }                                                                                                    \
+    } while (0)
 
     static const void* const dt[] = {
         /* Unary ops have no entries -- only ever embedded as a tag inside OP_UNARY. OP_ADD..OP_IN ARE
@@ -4913,6 +4951,27 @@ lbl_halt:
     active_vm_for_errors = saved_active_vm;
     current_heap = saved_current_heap;
     return VM_SLICE_DONE;
+
+#undef SYNC_IP
+#undef error
+#undef vm_binary_cold
+#undef vm_index_get_compute
+#undef vm_index_set_compute
+#undef vm_in
+#undef vm_cast
+#undef vm_to_str
+#undef vm_slice_bounds
+#undef vm_call_builtin
+#undef vm_call_value
+#undef vm_call_module_dispatch
+#undef vm_call_resolve_specialization
+#undef vm_resolve_field
+#undef vm_resolve_field_by_shape
+#undef vm_check_narrow_field_write
+#undef vm_typed_array_check
+#undef vm_default_value
+#undef aer_make_string_copy
+#undef gc_maybe_collect
 }
 
 bool vm_run(VM* vm) {
