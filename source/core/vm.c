@@ -1088,18 +1088,6 @@ static AerVal vm_default_value(VM* vm, AerVal dflt) {
 /* Call setup                                                       */
 /* ------------------------------------------------------------------ */
 
-/* Republishes the current frame's pointers into the VM, for the readers outside vm_run_slice that
-   still expect them (register_get, parser_read_variable, vm_call_value). Reads the live CallFrame
-   rather than taking vm_run_slice's hoisted locals as arguments: those two are equal by
-   construction, and gcc 16.1 ICEs (tree-if-conv.cc factor_out_operators) if the locals are live
-   across a call at a return point in a function that large. */
-static void vm_publish_frame(VM* vm) {
-    CallFrame* f = &vm->call_stack[vm->call_depth];
-    vm->registers = f->registers;
-    vm->raw_ints = f->raw_ints;
-    vm->raw_reals = f->raw_reals;
-}
-
 bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsigned int return_ip) {
     if (arg_count < (int)fn->min_arity || arg_count > (int)fn->arity) {
         if (fn->min_arity == fn->arity)
@@ -2504,14 +2492,12 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
 /* Every exit from this function must restore all three, including the yield exits -- leaving
    runtime_error_unwind_target pointing at this frame's catch_point after the frame has returned
    makes the next error longjmp into dead stack, and leaving current_heap set sends the next
-   allocation into a heap this call no longer owns. It also republishes the frame pointers the body
-   only kept in locals -- see SYNC_FRAME. #undef'd after lbl_halt. */
+   allocation into a heap this call no longer owns. #undef'd after lbl_halt. */
 #define SLICE_RETURN(result)                                                                                 \
     do {                                                                                                     \
         runtime_error_unwind_target = saved_unwind_target;                                                   \
         active_vm_for_errors = saved_active_vm;                                                              \
         current_heap = saved_current_heap;                                                                   \
-        vm_publish_frame(vm);                                                                                \
         return (result);                                                                                     \
     } while (0)
     if (AER_SETJMP(catch_point) != 0) SLICE_RETURN(VM_SLICE_ERROR);
@@ -2583,11 +2569,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
    Anything absent here must be unable to raise -- adding a raise to one of those is a silent
    wrong-line bug, which tests/error_lines.py exists to catch. All #undef'd after lbl_halt. */
 #define SYNC_IP() ((void)(vm->ip = ip))
-/* Same deal for vm->registers/raw_ints/raw_reals: lbl_call/lbl_return keep only the hoisted locals
-   current, so the mirror is stale mid-slice. It is read by vm_call_value (shadowed below) and, once
-   this slice has exited, by setup_call on a module/actor VM -- hence the sync at every SLICE_RETURN.
-   The GC does NOT read it; it walks call_stack[0..call_depth] instead (mark_vm_roots, gc.c). */
-#define SYNC_FRAME() vm_publish_frame(vm)
 #define error(...) (SYNC_IP(), (error)(__VA_ARGS__))
 #define vm_binary_cold(...) (SYNC_IP(), (vm_binary_cold)(__VA_ARGS__))
 #define vm_index_get_compute(...) (SYNC_IP(), (vm_index_get_compute)(__VA_ARGS__))
@@ -3115,12 +3096,12 @@ lbl_call : {
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
     vm->call_depth++;
-    /* Straight off `callee`, whose fields were just written and are still in registers. The vm->
-       mirror is deliberately left stale here -- SYNC_FRAME republishes it at the few points anything
-       outside this function can observe it. */
-    registers = callee->registers;
-    raw_ints = callee->raw_ints;
-    raw_reals = callee->raw_reals;
+    vm->registers = vm->call_stack[vm->call_depth].registers;
+    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
+    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
+    registers = vm->registers; /* refresh the hoisted locals -- see their own comment above */
+    raw_ints = vm->raw_ints;
+    raw_reals = vm->raw_reals;
     ip = chosen_offset;
     if (max_instructions && --slice_budget == 0) {
         vm->ip = ip;
@@ -3138,9 +3119,7 @@ lbl_call_value : {
     int arg_count = (int)UNPACK_C(op_word);
     int callee_reg = (int)READ();
     /* vm_call_value writes vm->ip on success (or leaves it untouched on error) -- reload before
-       the next READ(). ip is already past callee_reg's word, the correct resume address. It also
-       reads vm->registers for the tail-call argument shuffle, so the mirror has to be current. */
-    SYNC_FRAME();
+       the next READ(). ip is already past callee_reg's word, the correct resume address. */
     vm_call_value(vm, registers[callee_reg], dest_reg, arg_reg_base, arg_count, cur_op == OP_TAIL_CALL_VALUE,
                   ip);
     ip = vm->ip;
@@ -3162,14 +3141,16 @@ lbl_return : {
     unsigned int return_ip = callee->return_ip;
     int dest_reg = callee->dest_reg;
     vm->call_depth--;
-    /* Must refresh the hoisted locals BEFORE the write below -- registers still pointed at the
-       callee's (now-popped) frame otherwise, corrupting whichever register of the CALLER's frame
-       happens to share dest_reg's index instead of writing the return value where the caller
-       actually expects it. */
-    CallFrame* caller = &vm->call_stack[vm->call_depth];
-    registers = caller->registers;
-    raw_ints = caller->raw_ints;
-    raw_reals = caller->raw_reals;
+    vm->registers = vm->call_stack[vm->call_depth].registers;
+    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
+    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
+    /* Must refresh the hoisted locals (see their own comment above) BEFORE the write below --
+       registers still pointed at the callee's (now-popped) frame otherwise, corrupting whichever
+       register of the CALLER's frame happens to share dest_reg's index instead of writing the
+       return value where the caller actually expects it. */
+    registers = vm->registers;
+    raw_ints = vm->raw_ints;
+    raw_reals = vm->raw_reals;
     registers[dest_reg] = result;
     ip = return_ip;
     DISPATCH();
