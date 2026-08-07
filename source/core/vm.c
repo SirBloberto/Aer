@@ -2326,12 +2326,18 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
        allocation back to whichever heap was active before it, once it returns. */
     VmHeap* saved_current_heap = current_heap;
     current_heap = &vm->heap;
-    if (AER_SETJMP(catch_point) != 0) {
-        runtime_error_unwind_target = saved_unwind_target;
-        active_vm_for_errors = saved_active_vm;
-        current_heap = saved_current_heap;
-        return VM_SLICE_ERROR;
-    }
+/* Every exit from this function must restore all three, including the yield exits -- leaving
+   runtime_error_unwind_target pointing at this frame's catch_point after the frame has returned
+   makes the next error longjmp into dead stack, and leaving current_heap set sends the next
+   allocation into a heap this call no longer owns. #undef'd after lbl_halt. */
+#define SLICE_RETURN(result)                                                                                 \
+    do {                                                                                                     \
+        runtime_error_unwind_target = saved_unwind_target;                                                   \
+        active_vm_for_errors = saved_active_vm;                                                              \
+        current_heap = saved_current_heap;                                                                   \
+        return (result);                                                                                     \
+    } while (0)
+    if (AER_SETJMP(catch_point) != 0) SLICE_RETURN(VM_SLICE_ERROR);
     Opcode cur_op;
     /* word0 -- opcode(8) plus up to 3 narrow packed fields (PACK3) or one 16-bit field
        (PACK_OP_A_W16), depending on cur_op's own fixed shape. Must survive past DISPATCH()'s own
@@ -2600,7 +2606,7 @@ lbl_jump : {
        (this jump's own operand is fully consumed), so yielding here is always resumable. */
     if (max_instructions && --slice_budget == 0) {
         vm->ip = ip;
-        return VM_SLICE_YIELDED;
+        SLICE_RETURN(VM_SLICE_YIELDED);
     }
     DISPATCH();
 }
@@ -2868,7 +2874,7 @@ lbl_call : {
            entry point, so a yield here always resumes at a valid instruction boundary. */
         if (max_instructions && --slice_budget == 0) {
             vm->ip = ip;
-            return VM_SLICE_YIELDED;
+            SLICE_RETURN(VM_SLICE_YIELDED);
         }
         DISPATCH();
     }
@@ -2915,7 +2921,7 @@ lbl_call : {
     ip = chosen_offset;
     if (max_instructions && --slice_budget == 0) {
         vm->ip = ip;
-        return VM_SLICE_YIELDED;
+        SLICE_RETURN(VM_SLICE_YIELDED);
     }
     DISPATCH();
 }
@@ -3355,7 +3361,7 @@ lbl_iter_range_loop : {
        it never goes through a plain OP_JUMP. */
     if (max_instructions && --slice_budget == 0) {
         vm->ip = ip;
-        return VM_SLICE_YIELDED;
+        SLICE_RETURN(VM_SLICE_YIELDED);
     }
     DISPATCH();
 }
@@ -4947,11 +4953,9 @@ lbl_raw_gte_real_boxed : {
 #undef RAW_CMP_INT_BOXED_JUMP_IF_FALSE
 
 lbl_halt:
-    runtime_error_unwind_target = saved_unwind_target;
-    active_vm_for_errors = saved_active_vm;
-    current_heap = saved_current_heap;
-    return VM_SLICE_DONE;
+    SLICE_RETURN(VM_SLICE_DONE);
 
+#undef SLICE_RETURN
 #undef SYNC_IP
 #undef error
 #undef vm_binary_cold
