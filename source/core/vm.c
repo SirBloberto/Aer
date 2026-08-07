@@ -568,13 +568,25 @@ static inline __attribute__((always_inline)) AerVal vm_promote_real(AerVal v) {
     return v;
 }
 
-/* AER integers are int64_t, but on 32-bit ARM a 64-bit modulo is a libgcc call roughly twice the
-   work of the 32-bit one, so narrow when both operands fit. rv != -1 is required, not incidental:
-   INT32_MIN % -1 overflows at 32-bit width while being perfectly fine at 64. */
+/* Floored, taking the divisor's sign, so `(a // b) * b + (a % b) == a` holds for negatives -- `//`
+   already floors and C's truncating % disagrees with it. Matches Lua and Python.
+   The int32 narrowing is a real win on 32-bit ARM, where a 64-bit modulo is a libgcc call. rv != -1
+   is required, not incidental: INT32_MIN % -1 overflows at 32-bit width but not at 64. */
 static inline int64_t aer_mod_int64(int64_t l, int64_t rv) {
+    int64_t r;
     if (rv != -1 && l >= INT32_MIN && l <= INT32_MAX && rv >= INT32_MIN && rv <= INT32_MAX)
-        return (int32_t)l % (int32_t)rv;
-    return l % rv;
+        r = (int32_t)l % (int32_t)rv;
+    else
+        r = l % rv;
+    if (r != 0 && ((r < 0) != (rv < 0))) r += rv;
+    return r;
+}
+
+/* Same flooring for reals, so `%` means one thing regardless of operand type. */
+static inline double aer_mod_double(double l, double rv) {
+    double r = fmod(l, rv);
+    if (r != 0.0 && ((r < 0.0) != (rv < 0.0))) r += rv;
+    return r;
 }
 
 /* ------------------------------------------------------------------ */
@@ -645,7 +657,7 @@ static inline AerVal vm_binary_fast(AerVal a, AerVal b, Opcode op, ValueType ta,
                     return aer_real(0.0);
                 }
                 return aer_real(floor(l / rv));
-            case OP_MOD: return aer_real(fmod(l, rv));
+            case OP_MOD: return aer_real(aer_mod_double(l, rv));
             case OP_EQ: return aer_bool(l == rv);
             case OP_NEQ: return aer_bool(l != rv);
             case OP_LT: return aer_bool(l < rv);
@@ -754,7 +766,7 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
                     return aer_real(0.0);
                 }
                 return aer_real(floor(l / rv));
-            case OP_MOD: return aer_real(fmod(l, rv));
+            case OP_MOD: return aer_real(aer_mod_double(l, rv));
             case OP_EQ: return aer_bool(l == rv);
             case OP_NEQ: return aer_bool(l != rv);
             case OP_LT: return aer_bool(l < rv);
@@ -2797,7 +2809,7 @@ lbl_is_result : {
                 *result = aer_int(aer_mod_int64(l, rv));
             }
         },
-        { *result = aer_real(fmod(l, rv)); })
+        { *result = aer_real(aer_mod_double(l, rv)); })
     BINARY_OP_INT_REAL(
         eq, OP_EQ, { *result = aer_bool(l == rv); }, { *result = aer_bool(l == rv); })
     BINARY_OP_INT_REAL(

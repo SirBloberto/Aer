@@ -39,6 +39,14 @@ jobs:
       - name: Run the test suite under UBSan
         run: make test-ubsan
 
+      # Agreement with an independent implementation catches semantic divergence the assert()
+      # suites cannot, since those only check what someone already thought to check.
+      - name: Install Lua for differential testing
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lua5.3
+
+      - name: Differential test against Lua
+        run: make test-differential LUA=lua5.3
+
       # A fixed seed plus the interpreter's own instruction budget makes this reproduce exactly:
       # the same seed yields the same findings on any machine, so a failure here is reproducible
       # locally rather than a runner-load artifact. timeout-minutes is belt-and-braces against a

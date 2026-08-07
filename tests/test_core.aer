@@ -37,6 +37,18 @@ assert(10 / 3 > 3.33 and 10 / 3 < 3.34, "true division always returns float")
 assert(10 // 3 == 3, "floor division")
 assert(-7 // 2 == -4, "floor division floors toward -inf, not toward zero")
 assert(10 % 3 == 1, "modulo")
+
+# `%` is floored, not truncated: it takes the DIVISOR's sign, so that `//` and `%` agree and
+# `(a // b) * b + (a % b) == a` holds for negative operands too. C's own % truncates and would
+# break that identity, which is what this used to do.
+assert(-7 // 3 == -3, "floor division rounds toward negative infinity")
+assert(-7 % 3 == 2, "modulo of a negative dividend takes the divisor's sign")
+assert(7 % -3 == -2, "modulo by a negative divisor takes the divisor's sign")
+assert(-7 % -3 == -1, "modulo with both operands negative")
+assert((-7 // 3) * 3 + (-7 % 3) == -7, "floor-div and modulo satisfy the division identity")
+assert((7 // -3) * -3 + (7 % -3) == 7, "the identity holds with a negative divisor too")
+assert(-6 % 3 == 0, "an exact negative division leaves no remainder, with no sign confusion")
+assert(-7.5 % 2.0 == 0.5, "real modulo is floored the same way as integer modulo")
 assert(2 + 2 == 4, "addition")
 assert(1 + 2.5 == 3.5, "integer promoted to float when mixed")
 

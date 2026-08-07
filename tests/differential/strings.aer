@@ -1,0 +1,61 @@
+import string
+import collection
+# Differential fixture — strings.lua computes the same values. Only strings and integers are
+# printed; see arithmetic.aer for why no floats appear directly.
+
+s = "Hello, World"
+
+print(length(s))
+print(string.upper(s))
+print(string.lower(s))
+print(string.trim("   padded   "))
+print(string.contains(s, "World"))
+print(string.contains(s, "world"))
+print(string.starts_with(s, "Hello"))
+print(string.ends_with(s, "World"))
+print(string.index_of(s, "o"))
+print(string.index_of(s, "zz"))
+print(string.replace(s, "World", "there"))
+print(string.repeat("ab", 3))
+
+# Slicing is 0-based and end-exclusive here; the Lua side uses the matching 1-based inclusive call.
+print(s[0:5])
+print(s[7:])
+print(s[:5])
+print(s[-5:])
+
+# Splitting and rejoining.
+parts = string.split("a,b,c,d", ",")
+print(length(parts))
+print(parts[0])
+print(parts[3])
+print(string.join(parts, "-"))
+
+# Concatenation and interpolation.
+n = 42
+print("n is " + string.upper("ok"))
+print("interp {n} and {s[0:5]}")
+
+# Character-level access and iteration.
+count = 0
+for ch in s:
+    if ch == "o":
+        count += 1
+print(count)
+
+# Sorting is compared as a joined string so the whole ordering is one line.
+words = ["pear", "Apple", "banana", "apple"]
+print(string.join(collection.sort(words), ","))
+
+nums = [5, 3, 9, 1, 7]
+sorted_nums = collection.sort(nums)
+digits = ""
+for v in sorted_nums:
+    digits = digits + "{v}"
+print(digits)
+
+# index_of over an array, and membership.
+print(collection.index_of(["x", "y", "z"], "y"))
+print(collection.index_of(["x", "y", "z"], "q"))
+print("y" in ["x", "y", "z"])
+print("q" in ["x", "y", "z"])

@@ -236,6 +236,12 @@ check-comments:
 check-opcode-coverage: debug-tools
 	python3 tools/check_opcode_coverage.py --binary binary/aer-debug$(EXE)
 
+# Runs the tests/differential/ pairs against a second implementation of the same semantics. Skips
+# itself when lua is absent so it never blocks a local run; CI always has it.
+LUA ?= lua
+test-differential: all
+	python3 tools/check_differential.py --binary binary/aer$(EXE) --lua $(LUA)
+
 check-style: check-format check-comments
 
 # Clean-builds both refs on the Pi and prints a per-benchmark delta table. Always use this rather

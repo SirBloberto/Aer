@@ -1,0 +1,81 @@
+import math
+# Differential fixture — the .lua alongside this file computes the same values and must print
+# byte-identical output. Every result is printed as an integer: float formatting differs between
+# the two languages for reasons that are not semantic, and would drown real divergence in noise.
+# Fractional results are scaled and floored instead.
+
+function scaled(x):
+    return math.floor(x * 1000000)
+
+# Integer arithmetic, including the boundaries where raw-slot storage kicks in.
+a = 7
+b = 3
+print(a + b)
+print(a - b)
+print(a * b)
+print(a // b)
+print(a % b)
+print(-a // b)
+print(-a % b)
+print(a // -b)
+print(a % -b)
+
+# Mixed and float arithmetic, scaled to integers.
+x = 7.5
+y = 2.5
+print(scaled(x + y))
+print(scaled(x - y))
+print(scaled(x * y))
+print(scaled(x / y))
+print(scaled(x / 3.0))
+print(scaled(a / b))
+
+# Precedence and associativity.
+print(2 + 3 * 4)
+print((2 + 3) * 4)
+print(2 * 3 + 4 * 5)
+print(100 - 10 - 5)
+print(scaled(1.0 / 2.0 / 2.0))
+
+# Comparison and equality across int/float.
+print(a > b)
+print(a < b)
+print(a >= 7)
+print(a <= 7)
+print(a == 7)
+print(a != 7)
+print(7 == 7.0)
+print(1 < 2)
+
+# Bitwise.
+print(12 & 10)
+print(12 | 10)
+print(12 ^ 10)
+print(1 << 10)
+print(1024 >> 3)
+
+# Larger magnitudes, still exact in 64-bit integers.
+big = 1000000007
+print(big * 3)
+print(big + big)
+print(big % 1000)
+
+# math module.
+print(math.floor(3.7))
+print(math.ceil(3.2))
+print(math.abs(-42))
+print(math.min(3, 9))
+print(math.max(3, 9))
+print(scaled(math.sqrt(2.0)))
+print(scaled(math.pow(2.0, 10.0)))
+
+# Accumulation in a loop -- the raw-slot path.
+total = 0
+for i in 0..100:
+    total += i * i
+print(total)
+
+ftotal = 0.0
+for i in 1..21:
+    ftotal += 1.0 / i
+print(scaled(ftotal))
