@@ -950,6 +950,55 @@ field-access matrix, and the `>`/`>=` halves of the raw compare families). Delet
 maintainability argument, which is a real one -- but it is a layout lottery, not a directed
 optimization, and anyone doing it should expect to measure a shuffle, not a speedup.
 
+### 5.16e The call path, a fourth time; and how many opcodes are actually redundant
+
+**`fib_bench` costs ~277 instructions per call** (8.26B instructions, 29.86M calls, 4.5 dispatches
+each). `perf annotate` puts it in frame maintenance rather than dispatch: `ldr r0, [sp, #44]`
+reloading `vm` at 4.73%, 16-byte `ldmia` copies at 4.43% and 2.27%, spills at `[sp, #148/296/328]`,
+and four `str.w [r3, #732..744]` writing the `vm->` mirror. `CallFrame` is 11 fields / 44 bytes, and
+**six of the eleven exist only to maintain the raw int/real side-stacks** -- which `fib` never uses.
+
+**Removing the mirror writes did not work (attempt 4).** `lbl_call` and `lbl_return` each wrote
+`vm->registers/raw_ints/raw_reals` and immediately read them back: 6 stores and 12 loads per
+call/return pair. Nothing needs them mid-slice -- the GC walks `call_stack[0..call_depth]`
+(`mark_vm_roots`), not the mirror. Deleting them bought `fib_bench` **0.36%** and cost eight other
+benchmarks 0.7-4.7% (`mandelbrot` +4.58%, `nbody` +4.69%, `struct_array_scan` +3.04%). The stores
+were never the expense; the compiler already handled them, and removing them perturbed register
+allocation across the whole function. Reverted.
+
+Two things survived it. `vm_resolve_field` read `vm->registers` on **every field access** and now
+takes the register base as an argument -- the indirection `vm_rk_ptr16` was already fixed for.
+And a portability note: gcc 16.1 **ICEs** (`tree-if-conv.cc`, `factor_out_operators`) if
+`vm_run_slice`'s hoisted locals are live across a call at a return point, so `vm_publish_frame` reads
+the live `CallFrame` instead of taking them as arguments.
+
+The conclusion after four attempts stands: **the call path is not micro-optimizable.** The remaining
+lever is fewer dispatches per call, which means fusion, which means a new opcode -- and 5.16d prices
+that at about 3%.
+
+**How much of the opcode table is actually redundant: four opcodes, not 76.** A census across
+`bench/` + `tests/` (per-opcode dispatch counts from the debug build) shows 76 of 153 dispatchable
+opcodes never fire in any benchmark. That number is misleading. Most are feature-bearing:
+`OP_TAIL_CALL`, `OP_DESTRUCTURE`, `OP_SLICE_GET` are language features the benchmarks happen not to
+use, and the int32 and bounds-checked corners of the field-access matrix are the symmetric halves of
+features that *are* hot (`OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED` alone runs 49.4M times in
+`nbody_large_packed_narrow`). Deleting the int32 half would not fall back to a narrow path -- there
+isn't one; `OP_FIELD_GET_RAW_INT` would read 8 bytes out of a 4-byte field -- so the parser would
+have to emit the generic boxed path, making `field: int32` a performance trap. That is a capability
+regression dressed up as a cleanup.
+
+What was genuinely redundant: the **raw-vs-raw `>` and `>=`** compares. Both operands are slots of
+the same kind, so `a > b` is `b < a` with the slots swapped, exactly the flip
+`try_emit_cmp_raw_boxed` already does for `boxed OP raw`. Removing `OP_RAW_GT_INT`,
+`OP_RAW_GTE_INT`, `OP_RAW_GT_REAL` and `OP_RAW_GTE_REAL` costs nothing and loses nothing: **153
+opcodes, down from 157**, instruction counts flat to 0.03% everywhere. (The `_BOXED` forms keep
+theirs -- a raw slot and a boxed value are not interchangeable.)
+
+And the performance answer, measured: instructions moved 0.00-0.03% on every benchmark, while
+**cycles moved `mandelbrot` -3.88% and `nbody` +2.21%**. Removing opcodes is a layout shuffle of
+roughly the same amplitude as adding one, in either direction. Trim for size and comprehension, which
+are real goals; do not trim expecting speed, and do not trim anything that carries a capability.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
