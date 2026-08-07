@@ -49,6 +49,11 @@ def load_seeds():
         # sorted() — glob order is filesystem-dependent, and an unsorted seed list made
         # --seed runs irreproducible across machines (same seed, different mutation targets).
         for path in sorted(glob.glob(pattern, recursive=True)):
+            # tests/error_lines/ fixtures each abort on their first statement by design, so they
+            # mutate into nothing useful — and admitting them would renumber every iteration of an
+            # existing --seed run, since rng.choice() indexes into this list.
+            if os.path.basename(os.path.dirname(path)) == "error_lines":
+                continue
             with open(path, "rb") as f:
                 data = f.read()
             if data:
