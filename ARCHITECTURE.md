@@ -813,6 +813,41 @@ deltas from -0.92% to +1.26%, while instruction counts over the same runs agree 
 Any cycles-based claim below about 1.5% on this hardware is unfalsifiable — use instruction counts
 as the gate, and treat `--event cycles` as a coarse sanity check only.
 
+### 5.16a Building an interpolated string once, and fusing a comparison that ends a condition
+
+Two changes that came out of comparing against Luau and LuaJIT's interpreter on equal-length
+benchmarks, both targeting dispatch count rather than the cost of a dispatch.
+
+**`OP_INTERP`.** `"key_{n}"` compiled to `OP_LOADK` + `OP_TO_STR` + `OP_ADD`: three dispatches and
+two `AerString`s, the second garbage the moment the lookup consuming it finished. An N-part
+interpolation was worse than linear -- a left-fold of `OP_ADD` means N-1 allocations and O(N²)
+copying. The opcode takes its parts as trailing RK16 words, so a constant segment stays a pool
+constant needing no load, and a non-string part is formatted straight into the result rather than
+through a throwaway string. `lookup_table_bench`'s key went from four dispatches to two.
+`dict_bench` -30.7%, `log_processing` -18.4%, `lookup_table_bench` -17.9%, `small_dict_bench`
+-7.4%, everything else within 0.02%. The builder is `noinline` -- its scratch would otherwise land
+in `vm_run_slice`'s frame, which §5.16b explains the cost of.
+
+**Fusing a comparison that merely *ends* a condition.** `emit_cond_jump_if_false` only fused when
+the comparison *was* the condition -- one word, or two with a constant load before it. Anything
+computed first missed, which is most real conditions: `p * p < n`, `x * x + y * y > 4.0`. It cannot
+just inspect the last word, because instruction lengths vary and reading backwards can land
+mid-instruction, so the two emitters that produce a comparison now record where they put it. Worth
+**-5.48% on sieve for no new opcodes**. Adding the four real compare-and-branch opcodes (only the
+int forms existed, so a float loop paid three dispatches where an int loop paid two) is a further
+-8.75% on mandelbrot.
+
+Also worth knowing: `aer_format_int` divided by 10 in 64-bit arithmetic once per digit, and 32-bit
+ARM has no 64-bit divide, so each digit was a libgcc call. Narrowing to `unsigned int` when the
+value fits -- as `aer_mod_int64` already did -- is another 4-4.6% on all four string benchmarks.
+
+Left unclosed: `small_dict_bench` remains a few percent behind Luau, and what is left is dict churn
+-- 3.3M short-lived four-key dicts, with `pool_alloc`, `hashtable_put_hashed`, `hashtable_free` and
+`hashtable_key_dup` together about 30%. The obvious fix, borrowing constant-pool bytes for literal
+keys instead of copying them, has been attempted and reverted twice (see the `borrow`/`Retry dict
+borrowed keys` commits); the second attempt fixed both flaws the first was reverted for and still
+did not land. A third attempt needs a new idea, not a retry.
+
 ### 5.16b Why `lbl_call` cannot be micro-optimized (measured, three ways)
 
 `fib_bench` runs 134.4M dispatches for 8.26B instructions -- 61.5 instructions per dispatch, against
