@@ -1,0 +1,119 @@
+#!/usr/bin/env aer
+# AER test suite — OP_INDEX_GET_INTERP, the fused `dict["key_{n}"]` read.
+#
+# The read formats its key into a stack buffer and hashes the bytes directly, while the matching
+# WRITE still goes through OP_INTERP and builds a real string. Those are two separate formatters, so
+# any disagreement between them makes a key that was just stored unfindable -- a silent wrong answer,
+# not a crash. Every case below stores through one path and reads back through the other.
+
+import collection
+
+# ------------------------------------------------------------------ #
+# 1. Round-trip through every part type the fast path formats itself.  #
+# ------------------------------------------------------------------ #
+
+d = {}
+i = 42
+r = 3.5
+b = true
+s = "tail"
+n = null
+
+d["int_{i}"] = "int-value"
+d["real_{r}"] = "real-value"
+d["bool_{b}"] = "bool-value"
+d["str_{s}"] = "str-value"
+d["null_{n}"] = "null-value"
+
+assert(d["int_{i}"] == "int-value", "integer part formats identically on the write and the fused read")
+assert(d["real_{r}"] == "real-value", "float part formats identically on the write and the fused read")
+assert(d["bool_{b}"] == "bool-value", "boolean part formats identically on the write and the fused read")
+assert(d["str_{s}"] == "str-value", "string part formats identically on the write and the fused read")
+assert(d["null_{n}"] == "null-value", "null part formats identically on the write and the fused read")
+
+# Negative and zero integers, which take aer_format_int's sign branch.
+neg = -17
+zero = 0
+d["n_{neg}"] = "negative"
+d["z_{zero}"] = "zero"
+assert(d["n_{neg}"] == "negative", "a negative integer part round-trips")
+assert(d["z_{zero}"] == "zero", "a zero integer part round-trips")
+
+# A real that renders with an exponent, and one that gains a trailing ".0".
+big = 1.0e20
+whole = 7.0
+d["e_{big}"] = "exponent"
+d["w_{whole}"] = "whole"
+assert(d["e_{big}"] == "exponent", "a float rendered in exponent form round-trips")
+assert(d["w_{whole}"] == "whole", "a whole-valued float keeps its .0 on both paths")
+
+# ------------------------------------------------------------------ #
+# 2. A missing key must read as null, not as some stale probe result.  #
+# ------------------------------------------------------------------ #
+
+missing = 99999
+assert(d["int_{missing}"] == null, "a key the table does not hold reads as null")
+assert(d["nothing_{i}"] == null, "a miss on a present-looking prefix still reads as null")
+
+# ------------------------------------------------------------------ #
+# 3. Shapes other than the single `prefix_{value}` the benchmark uses. #
+# ------------------------------------------------------------------ #
+
+a = 1
+c = 2
+d["{a}-{c}"] = "two-parts-no-prefix"
+assert(d["{a}-{c}"] == "two-parts-no-prefix", "an interpolation that starts with a value, not a literal")
+
+d["{a}{c}"] = "adjacent"
+assert(d["{a}{c}"] == "adjacent", "two adjacent values with no separator between them")
+assert(d["{a}-{c}"] != d["{a}{c}"], "the separator is part of the key, so the two stay distinct")
+
+expr_key_holder = {}
+expr_key_holder["sum_{a + c}"] = "computed"
+assert(expr_key_holder["sum_{a + c}"] == "computed", "an arithmetic expression inside the interpolation")
+
+# ------------------------------------------------------------------ #
+# 4. Keys past INTERP_KEY_MAX (256), which fall back to the allocating #
+#    builder -- the fallback must agree with the fast path exactly.    #
+# ------------------------------------------------------------------ #
+
+import string
+long_prefix = string.repeat("p", 400)
+long_dict = {}
+long_dict["{long_prefix}_{i}"] = "long-key-value"
+assert(length(long_prefix) == 400, "the prefix really is longer than the stack buffer")
+assert(long_dict["{long_prefix}_{i}"] == "long-key-value", "a key past INTERP_KEY_MAX round-trips via the fallback")
+assert(long_dict["{long_prefix}_{zero}"] == null, "a miss on an over-long key still reads as null")
+
+# Straddle the boundary: one key just under it, one just over.
+under = string.repeat("u", 250)
+over = string.repeat("o", 260)
+straddle = {}
+straddle["{under}"] = "under"
+straddle["{over}"] = "over"
+assert(straddle["{under}"] == "under", "a key just under the buffer limit takes the fast path correctly")
+assert(straddle["{over}"] == "over", "a key just over the buffer limit takes the fallback correctly")
+
+# ------------------------------------------------------------------ #
+# 5. Receivers that are not dicts must keep their old behaviour, since #
+#    the fused opcode is emitted before the type is known.             #
+# ------------------------------------------------------------------ #
+
+word = "abcdef"
+idx = 2
+assert(word[idx] == "c", "a plain string index is unaffected")
+
+arr = [10, 20, 30]
+assert(arr[idx] == 30, "a plain array index is unaffected")
+
+# The dict the key was never inserted into, reached through a variable rather than a literal.
+alias = d
+assert(alias["int_{i}"] == "int-value", "the fused read follows a dict through an alias")
+
+# Mutating between reads, so the probe cannot be caching anything.
+d["int_{i}"] = "replaced"
+assert(d["int_{i}"] == "replaced", "the fused read sees a value overwritten after the first read")
+collection.delete(d, "int_{i}")
+assert(d["int_{i}"] == null, "the fused read sees a key deleted after it was read")
+
+print("test_interp_dict_keys.aer: all assertions passed.")

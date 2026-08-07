@@ -12,8 +12,8 @@
    VAR_BOXED on a mismatch; VAR_BOXED never promotes to RAW_*. */
 typedef enum { VAR_BOXED, VAR_RAW_INT, VAR_RAW_REAL } VarKind;
 
-/* No comparison emitted yet -- see Parser.last_cmp_offset. */
-#define NO_CMP_OFFSET ((unsigned int)-1)
+/* Nothing emitted yet at a tracked offset -- see Parser.last_cmp_offset / last_interp_offset. */
+#define NO_OFFSET ((unsigned int)-1)
 
 /* A call to a not-yet-registered name is optimistically assumed to be defined later in this
    same parse() call -- recorded here with a placeholder already emitted; func_register patches
@@ -97,6 +97,11 @@ typedef struct Parser {
        tell "the condition ends in a comparison" from "a word that happens to look like one" --
        instruction lengths vary, so the last word cannot be identified by reading backwards. */
     unsigned int last_cmp_offset;
+
+    /* Same trick for the last OP_INTERP: emit_index_get folds one into OP_INDEX_GET_INTERP when the
+       interpolation it is indexing with is the instruction immediately before it. */
+    unsigned int last_interp_offset;
+    int last_interp_dest;
 
     /* Nonzero while compiling an if/else branch -- disqualifies raw storage (see VarKind). */
     int branch_depth;
@@ -323,7 +328,7 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
        `x * x + y * y > 4.0` computes into raw slots first, and used to miss the fusion entirely
        because the region was three words rather than two. Everything before it is kept. */
     unsigned int cmp_word_start = cond_start;
-    if (P.last_cmp_offset != NO_CMP_OFFSET && P.last_cmp_offset >= cond_start &&
+    if (P.last_cmp_offset != NO_OFFSET && P.last_cmp_offset >= cond_start &&
         P.last_cmp_offset == c->count - 1) {
         cmp_word_start = P.last_cmp_offset;
     }
@@ -413,7 +418,30 @@ void emit_array_new(Chunk* c, int dest_reg, int item_reg_base, int item_count) {
     chunk_emit(c, PACK3(OP_ARRAY_NEW, dest_reg, item_reg_base, item_count));
 }
 
+/* `h["key_{n}"]` builds a string only to hash it and drop it. When the index is an interpolation
+   this emitter just produced, fold the two into one opcode that hashes the bytes directly. Detected
+   by rollback like emit_cond_jump_if_false, so anything else falls through untouched. */
+static bool try_fuse_index_get_interp(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
+    if (P.last_interp_offset == NO_OFFSET || rk_idx != P.last_interp_dest) return false;
+    if (arr_reg == rk_idx) return false; /* the receiver is what we are about to stop writing */
+    uint32_t w = c->code[P.last_interp_offset];
+    if ((Opcode)(w & 0xFF) != OP_INTERP || (int)UNPACK_A(w) != rk_idx) return false;
+    unsigned int parts = UNPACK_B(w);
+    if (P.last_interp_offset + 1 + parts != c->count) return false; /* not the immediately preceding instruction */
+
+    uint32_t operands[INTERP_MAX_PARTS];
+    for (unsigned int i = 0; i < parts; i++)
+        operands[i] = c->code[P.last_interp_offset + 1 + i];
+    c->count = P.last_interp_offset;
+    chunk_emit(c, PACK3(OP_INDEX_GET_INTERP, dest_reg, arr_reg, (int)parts));
+    for (unsigned int i = 0; i < parts; i++)
+        chunk_emit(c, operands[i]);
+    P.last_interp_offset = NO_OFFSET;
+    return true;
+}
+
 void emit_index_get(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
+    if (try_fuse_index_get_interp(c, dest_reg, arr_reg, rk_idx)) return;
     rk_idx = box_if_raw(c, rk_idx);
     /* Same spill-to-register fallback as emit_binary. */
     if (!rk8_fits(rk_idx)) {
@@ -1443,6 +1471,8 @@ static int emit_interp(Chunk* c, const int* parts, int part_count) {
         if (is_temp(parts[i])) temps++;
     if (temps) reg_free(temps);
     int dest = reg_alloc();
+    P.last_interp_offset = c->count;
+    P.last_interp_dest = dest;
     chunk_emit(c, PACK2(OP_INTERP, dest, part_count));
     for (int i = 0; i < part_count; i++)
         chunk_emit(c, pack_rk16(parts[i]));
@@ -4872,7 +4902,8 @@ bool parser_read_variable(VM* vm, Chunk* c, const char* name, AerVal* out) {
 
 void parser_reset(void) {
     reg_reset();
-    P.last_cmp_offset = NO_CMP_OFFSET;
+    P.last_cmp_offset = NO_OFFSET;
+    P.last_interp_offset = NO_OFFSET;
     P.var_count = 0;
     P.global_count = 0;
     P.struct_count = 0;

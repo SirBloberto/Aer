@@ -372,6 +372,13 @@ typedef enum {
        Parts beyond INTERP_MAX_PARTS fall back to the old chain (parse_string_literal). */
     OP_INTERP, /* word0: dest_reg, part_count -- then part_count words, each one RK16 */
 
+    /* `dict["key_{n}"]` read: formats the key into a stack buffer, hashes and probes with it, and
+       never builds the AerString at all -- the string existed only to be hashed and discarded, and
+       hashtable_get_hashed already takes raw bytes. Falls back to OP_INTERP's builder plus the
+       general index path whenever the fast route cannot apply (non-dict receiver, a part that is
+       itself a collection, or a key past INTERP_KEY_MAX). Same operand shape as OP_INTERP. */
+    OP_INDEX_GET_INTERP, /* word0: dest_reg, obj_reg, part_count -- then part_count RK16 words */
+
     OP_OPCODE_COUNT_MARKER /* not a real opcode -- sizes the static assert below */
 } Opcode;
 _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — widen the opcode field");
@@ -572,6 +579,11 @@ static inline uint16_t pack_rk16(int rk) {
 /* Parts in one OP_INTERP. Bounds the builder's stack scratch; a longer interpolation compiles to
    the ordinary concatenate chain instead, which has no limit. */
 #define INTERP_MAX_PARTS 16
+
+/* Longest interpolated dict key OP_INDEX_GET_INTERP will build without allocating. Anything longer
+   falls back to the allocating path -- the buffer lives in a noinline helper's frame, never
+   vm_run_slice's (see 5.16b). */
+#define INTERP_KEY_MAX 256
 
 #define MAX_STRUCT_FIELDS 16
 

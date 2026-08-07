@@ -903,6 +903,57 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
 /* OP_INTERP's builder. noinline on purpose: its scratch would otherwise join vm_run_slice's
    already-3300-byte frame, and §5.16b records what added pressure there costs. A part is rendered
    into `scratch` only if it isn't already a string; unbounded content defers to vm_to_str. */
+/* Formats an interpolated dict key into a stack buffer and probes with the bytes, never building the
+   AerString. Returns false (leaving *out alone) when that cannot work, and the caller falls back.
+   Must format exactly as vm_interp_build does -- a key written through OP_INTERP and read back
+   through here would otherwise silently miss; tests/test_interp_dict_keys.aer guards that.
+   Owns the buffer and the probe so neither lands in vm_run_slice's frame (5.16b). */
+static __attribute__((noinline)) bool vm_dict_get_interp(AerDict* d, const AerVal* parts, unsigned int count,
+                                                         AerVal* out) {
+    char key[INTERP_KEY_MAX];
+    unsigned int at = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        AerVal v = parts[i];
+        const char* piece;
+        unsigned int piece_len;
+        char scratch[32];
+        switch (aer_type(v)) {
+            case TYPE_STRING: {
+                AerString* s = aer_as_string(v);
+                piece = s->data;
+                piece_len = s->length;
+                break;
+            }
+            case TYPE_INTEGER:
+                aer_format_int((long long)aer_as_int(v), scratch, sizeof(scratch));
+                piece = scratch;
+                piece_len = (unsigned int)strlen(scratch);
+                break;
+            case TYPE_REAL:
+                aer_format_real(aer_as_real(v), scratch, sizeof(scratch));
+                piece = scratch;
+                piece_len = (unsigned int)strlen(scratch);
+                break;
+            case TYPE_BOOLEAN:
+                piece = aer_as_bool(v) ? "true" : "false";
+                piece_len = aer_as_bool(v) ? 4u : 5u;
+                break;
+            case TYPE_NULL:
+                piece = "null";
+                piece_len = 4;
+                break;
+            default: return false; /* a collection part needs vm_to_str, which allocates */
+        }
+        if (at + piece_len > INTERP_KEY_MAX) return false;
+        memcpy(key + at, piece, piece_len);
+        at += piece_len;
+    }
+    unsigned int klen = hashtable_key_true_len(key, at);
+    AerVal* found = hashtable_get_hashed(&d->map, key, klen, hashtable_hash_bytes(key, klen));
+    *out = found ? *found : aer_null();
+    return true;
+}
+
 static __attribute__((noinline)) AerVal vm_interp_build(VM* vm, const AerVal* parts, unsigned int count) {
     const char* piece[INTERP_MAX_PARTS];
     unsigned int piece_len[INTERP_MAX_PARTS];
@@ -2698,6 +2749,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lte_real_boxed_jump_if_false,
         [OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gte_real_boxed_jump_if_false,
         [OP_INTERP] = &&lbl_interp,
+        [OP_INDEX_GET_INTERP] = &&lbl_index_get_interp,
     };
 
     /* A designated-initializer table leaves an opcode with no entry as NULL, so emitting one jumps
@@ -4634,6 +4686,24 @@ lbl_interp : {
     for (unsigned int i = 0; i < count; i++)
         parts[i] = *vm_rk_ptr16(registers, const_pool, READ());
     registers[dest] = vm_interp_build(vm, parts, count);
+    gc_maybe_collect(vm);
+    DISPATCH();
+}
+
+lbl_index_get_interp : {
+    int dest_reg = (int)UNPACK_A(op_word);
+    int obj_reg = (int)UNPACK_B(op_word);
+    unsigned int count = UNPACK_C(op_word);
+    AerVal parts[INTERP_MAX_PARTS];
+    for (unsigned int i = 0; i < count; i++)
+        parts[i] = *vm_rk_ptr16(registers, const_pool, READ());
+    AerVal obj = registers[obj_reg];
+    /* Every part is read before dest is written, so dest may alias a part's register -- emit_interp
+       deliberately reuses the lowest freed temp for it. */
+    if (aer_type(obj) == TYPE_DICT && vm_dict_get_interp(aer_as_dict(obj), parts, count, &registers[dest_reg]))
+        DISPATCH();
+    AerVal key = vm_interp_build(vm, parts, count);
+    vm_index_get_compute(obj, key, &registers[dest_reg]);
     gc_maybe_collect(vm);
     DISPATCH();
 }

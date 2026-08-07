@@ -35,8 +35,8 @@ typedef struct {
     int packed;
 } OpInfo;
 
-/* OP_INTERP is the last member of the Opcode enum (vm.h). */
-#define OP_INFO_MAX OP_INTERP
+/* OP_INDEX_GET_INTERP is the last member of the Opcode enum (vm.h). */
+#define OP_INFO_MAX OP_INDEX_GET_INTERP
 
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* OP_ADD..OP_IN: one opcode per operator, whole instruction in one word (PACK3 + RK8 pair) --
@@ -418,6 +418,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* Variable-length, but not OP_DEFINE_STRUCT's shape -- header word then part_count RK16
        words, one per part. Both walkers below special-case it. */
     [OP_INTERP] = {"OP_INTERP", "reg = one string built from N parts", {0}, false, 0, 2},
+    [OP_INDEX_GET_INTERP] =
+        {"OP_INDEX_GET_INTERP", "reg = dict[N-part key], key never allocated", {0}, false, 0, 3},
     [OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE] =
         {"OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi < rk) (tag-checked)", {0}, false, 1, 0},
     [OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE] =
@@ -567,6 +569,18 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
             fprintf(out, "%s", i ? ", " : "");
             if (RK16_IS_CONST(rk))
                 fprintf(out, "const:%u", (unsigned int)RK16_INDEX(rk));
+            else
+                fprintf(out, "reg%u", (unsigned int)RK16_INDEX(rk));
+        }
+        fprintf(out, "]");
+    } else if (op == OP_INDEX_GET_INTERP) {
+        unsigned int count = UNPACK_C(op_word);
+        fprintf(out, "  reg=%u  obj=r%u  parts=%u  [", UNPACK_A(op_word), UNPACK_B(op_word), count);
+        for (unsigned int i = 0; i < count; i++) {
+            uint32_t rk = c->code[pos++];
+            fprintf(out, "%s", i ? ", " : "");
+            if (RK16_IS_CONST(rk))
+                print_pool_value(out, c->pool[RK16_INDEX(rk)]);
             else
                 fprintf(out, "reg%u", (unsigned int)RK16_INDEX(rk));
         }
@@ -981,6 +995,8 @@ void aer_disassemble(Chunk* c, FILE* out) {
         unsigned int next;
         if (op == OP_INTERP) {
             next = offset + 1 + UNPACK_B(c->code[offset]);
+        } else if (op == OP_INDEX_GET_INTERP) {
+            next = offset + 1 + UNPACK_C(c->code[offset]);
         } else if (info->variable) {
             uint32_t header = c->code[offset];
             int field_count = (int)UNPACK_STRUCT_HEADER_COUNT(header);
