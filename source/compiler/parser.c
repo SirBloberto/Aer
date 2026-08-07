@@ -86,6 +86,10 @@ typedef struct Parser {
     int last_plain_index_src_param;
     Shape* last_plain_index_known_elem_shape;
 
+    /* Highest temp register reached while compiling the loop condition currently being parsed --
+       see parse_for_body for why the body must not be allowed to claim one of these. */
+    int loop_cond_peak;
+
     /* Nonzero while compiling an if/else branch -- disqualifies raw storage (see VarKind). */
     int branch_depth;
     /* Nonzero while compiling a function body -- lets parse_return reject a top-level return. */
@@ -226,6 +230,7 @@ int reg_alloc(void) {
     }
     int reg = P.next_temp_register++;
     track_peak(P.next_temp_register);
+    if (P.next_temp_register > P.loop_cond_peak) P.loop_cond_peak = P.next_temp_register;
     return reg;
 }
 
@@ -3348,12 +3353,36 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
     require(TOKEN_COLON, "expected ':' after for/while condition");
     if (parse_had_error) return;
 
+    /* The back-edge re-runs the condition, so every temp the condition writes is rewritten on each
+       iteration. Those registers are ordinarily freed the moment the condition is compiled, which
+       would let a shadowing assignment in the body ('total = f()' rebinding a raw local to a fresh
+       boxed register) claim one as a permanent variable and have the next condition evaluation
+       silently overwrite it. Holding the floor above them for the body's duration prevents that. */
     /* loop_top doubles as cond_start here -- it's already exactly "the bytecode offset the
        condition's own first instruction starts at" (the same reason the loop's own back-edge
-       jumps there to re-evaluate the condition each iteration). */
+       jumps there to re-evaluate the condition each iteration). Emitted BEFORE the floor is
+       raised below: its compare/branch fusion only fires when the preceding LOADK's destination is
+       a temp, so raising the floor first would silently disqualify every such loop. */
     unsigned int patch_exit = emit_cond_jump_if_false(c, rk_cond, loop_top);
 
+    int saved_floor = P.reserved_floor;
+    int raised_floor = saved_floor;
+    if (P.loop_cond_peak > P.reserved_floor) {
+        raised_floor = P.loop_cond_peak;
+        P.reserved_floor = raised_floor;
+        if (P.next_temp_register < P.reserved_floor) P.next_temp_register = P.reserved_floor;
+    }
+
     parse_loop_body(c, loop_top, patch_exit);
+
+    /* Only give the condition's registers back if the body claimed nothing above them. AER scopes
+       variables to the whole function, so a name first assigned inside the body outlives the loop
+       and its register must stay reserved -- lowering the floor past it would hand a live variable
+       out as a temp to the next statement. */
+    if (P.reserved_floor == raised_floor) {
+        P.reserved_floor = saved_floor;
+        if (P.next_temp_register < P.reserved_floor) P.next_temp_register = P.reserved_floor;
+    }
 }
 
 /* No exit-time cleanup needed -- col_reg/idx_reg are ordinary registers. Reserves the loop
@@ -3619,6 +3648,7 @@ static void parse_for_while(Chunk* c) {
             if (reg < 0) return;
         }
         unsigned int loop_top = c->count;
+        P.loop_cond_peak = P.next_temp_register;
         /* Resolves the postfix chain first, so `for cur.next:` works -- a bare-variable condition is
            unaffected, since the chain loop immediately returns unchanged. */
         int rk_chain = parse_postfix_chain(c, reg);
@@ -3627,6 +3657,7 @@ static void parse_for_while(Chunk* c) {
         return;
     }
     unsigned int loop_top = c->count;
+    P.loop_cond_peak = P.next_temp_register;
     int rk_cond = parse_binary(c, 0);
     parse_for_body(c, loop_top, rk_cond);
 }

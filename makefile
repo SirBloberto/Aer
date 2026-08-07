@@ -67,6 +67,8 @@ TESTS := tests/test_core.aer \
          tests/test_typed_array_chain2.aer \
          tests/test_narrow_fields.aer \
          tests/test_shape_specialization.aer \
+         tests/test_int_fields_specialized.aer \
+         tests/test_loop_cond_registers.aer \
          tests/test_loop_bound_hoisting.aer \
          tests/test_net.aer \
          tests/test_regex.aer \

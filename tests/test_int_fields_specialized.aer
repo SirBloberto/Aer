@@ -1,0 +1,164 @@
+#!/usr/bin/env aer
+# AER test suite — integer struct fields under shape specialization. The raw field-access opcode
+# family is a cross product of {bare struct, packed-array element} x {get, set, compound} x
+# {int64, int32, float32} x {checked, loop-bound-hoisted}, and the INT/INT32 half of it had no
+# coverage at all: every existing struct benchmark and test uses float fields, so nothing ever
+# emitted OP_FIELD_SET_RAW_INT, OP_INDEX_FIELD_GET_RAW_INT, their INT32 counterparts, or the
+# UNCHECKED forms. These paths read and write a field's raw storage at a compile-time-constant
+# offset with no tag ever materialized, so a defect gives a silently wrong number rather than a
+# crash. Every assertion below states the value the always-checked path would have produced.
+# Machine-checked via assert(): a clean run exits 0; any failure prints "ASSERT FAILED: ...".
+
+struct Counter:
+    hits = 0
+    misses = 0
+    weight = 0.0
+
+struct Narrow:
+    small = 0i
+    ratio = 0.0f
+
+# ------------------------------------------------------------------ #
+# 1. Bare struct, int64 fields: get / set / compound in a specialized  #
+#    body (the function is called enough times to trigger a recompile).#
+# ------------------------------------------------------------------ #
+
+function bump(c, n):
+    c.hits += n
+    c.misses = c.hits * 2
+    return c.hits
+
+total = 0
+c = Counter(0, 0, 1.5)
+i = 0
+for i < 60:
+    total = bump(c, 3)
+    i += 1
+
+assert(c.hits == 180, "int64 field compound-assign through 60 specialized calls: 60 * 3")
+assert(c.misses == 360, "int64 field plain assign from a computed int in the same specialized body")
+assert(total == 180, "the specialized body's return value agrees with the field it just wrote")
+assert(c.weight == 1.5, "an untouched real field on the same struct is unchanged by int-field writes")
+
+# ------------------------------------------------------------------ #
+# 2. Bare struct, narrow int32 + float32 fields, same three operations.#
+# ------------------------------------------------------------------ #
+
+function bump_narrow(nv, step):
+    nv.small += step
+    nv.ratio = nv.ratio + 0.5
+    return nv.small
+
+n = Narrow(0, 0.0)
+i = 0
+for i < 60:
+    r = bump_narrow(n, 2)
+    i += 1
+
+assert(n.small == 120, "narrow int32 field compound-assign through a specialized body: 60 * 2")
+assert(n.ratio == 30.0, "narrow float32 field plain assign in the same specialized body: 60 * 0.5")
+
+# ------------------------------------------------------------------ #
+# 3. Packed array of int-field structs: indexed get/set/compound in a  #
+#    specialized body, with the bound NOT provable (checked path).     #
+# ------------------------------------------------------------------ #
+
+function scan_checked(arr, count):
+    sum = 0
+    for i in 0..count:
+        arr[i].hits += 1
+        arr[i].misses = arr[i].hits + 10
+        sum += arr[i].misses
+    return sum
+
+counters = [Counter(5, 0, 2.0); 8]
+res = 0
+i = 0
+for i < 40:
+    res = scan_checked(counters, 8)
+    i += 1
+
+assert(counters[0].hits == 45, "packed-array int field compound-assign, checked path: 5 + 40 passes")
+assert(counters[7].hits == 45, "every element of the packed array advanced identically")
+assert(counters[3].misses == 55, "packed-array int field plain assign reads back the value just written")
+assert(res == 8 * 55, "the specialized body's accumulated sum matches the fields it wrote")
+
+# ------------------------------------------------------------------ #
+# 4. Same shape, but with the bound proven == length(arr) so the       #
+#    index checks are hoisted away (the UNCHECKED opcode family).      #
+# ------------------------------------------------------------------ #
+
+function scan_unchecked(arr):
+    count = length(arr)
+    sum = 0
+    for i in 0..count:
+        arr[i].hits += 2
+        arr[i].misses = arr[i].hits * 3
+        sum += arr[i].hits
+    return sum
+
+fresh = [Counter(1, 0, 0.0); 6]
+res2 = 0
+i = 0
+for i < 40:
+    res2 = scan_unchecked(fresh)
+    i += 1
+
+assert(fresh[0].hits == 81, "packed-array int field compound-assign, bound-hoisted path: 1 + 40 * 2")
+assert(fresh[5].hits == 81, "the last element is written correctly with bounds checks hoisted away")
+assert(fresh[2].misses == 243, "bound-hoisted plain assign matches what the checked path produces")
+assert(res2 == 6 * 81, "bound-hoisted accumulation over every element")
+
+# ------------------------------------------------------------------ #
+# 5. Packed array of NARROW int32/float32 fields, both bound forms.    #
+# ------------------------------------------------------------------ #
+
+function narrow_scan(arr):
+    count = length(arr)
+    sum = 0
+    for i in 0..count:
+        arr[i].small += 3
+        arr[i].ratio = arr[i].ratio + 1.5
+        sum += arr[i].small
+    return sum
+
+narrows = [Narrow(10, 0.0); 5]
+res3 = 0
+i = 0
+for i < 40:
+    res3 = narrow_scan(narrows)
+    i += 1
+
+assert(narrows[0].small == 130, "packed-array narrow int32 compound-assign: 10 + 40 * 3")
+assert(narrows[4].small == 130, "last narrow element written correctly")
+assert(narrows[1].ratio == 60.0, "packed-array narrow float32 assign: 40 * 1.5")
+assert(res3 == 5 * 130, "narrow-field accumulation over every element")
+
+# ------------------------------------------------------------------ #
+# 6. Negative and boundary values -- the raw int path is unchecked by  #
+#    design, so confirm ordinary negatives still round-trip exactly.   #
+# ------------------------------------------------------------------ #
+
+function subtract(ctr, amount):
+    ctr.hits -= amount
+    return ctr.hits
+
+neg = Counter(0, 0, 0.0)
+i = 0
+for i < 60:
+    r = subtract(neg, 7)
+    i += 1
+assert(neg.hits == -420, "int64 field compound-subtract into negative territory: -(60 * 7)")
+
+function narrow_subtract(nval, amount):
+    nval.small -= amount
+    return nval.small
+
+negn = Narrow(0, 0.0)
+i = 0
+for i < 60:
+    r = narrow_subtract(negn, 4)
+    i += 1
+assert(negn.small == -240, "narrow int32 field holds a negative value through the raw write path")
+
+print("test_int_fields_specialized.aer: all assertions passed.")

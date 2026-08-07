@@ -1,0 +1,111 @@
+#!/usr/bin/env aer
+# AER test suite — a `for <cond>:` loop's condition registers must survive its body.
+#
+# The back-edge re-runs the condition, so any temp the condition writes is rewritten every
+# iteration. Those temps were released as soon as the condition compiled, so a shadowing
+# assignment in the body (`total = f()`, which rebinds a raw-tracked local to a fresh boxed
+# register taken from the reserved floor) could claim one of them. The body's write then survived
+# only until the next condition evaluation, and since the condition runs once more on the way out,
+# the variable ended up holding the condition's own scratch value -- `total` read back the loop
+# bound. No crash, no error: just a silently wrong number, in a shape common enough that
+# `total = f(x)` inside `for i < n:` hit it every time.
+#
+# Compound assignment (`total += f()`) never had the bug, since it writes in place rather than
+# rebinding, which is why this went unnoticed. Machine-checked via assert().
+
+function ten_times(a):
+    return a * 10
+
+# ------------------------------------------------------------------ #
+# 1. The original failure: plain assign of a call result in the body.  #
+# ------------------------------------------------------------------ #
+
+total = 0
+i = 0
+for i < 3:
+    total = ten_times(2)
+    i += 1
+assert(total == 20, "plain assignment of a call result inside a while-loop keeps the call's value")
+assert(i == 3, "the loop counter still terminates the loop correctly")
+
+# The bound as a larger literal -- the wrong value used to be exactly this number.
+total2 = 0
+j = 0
+for j < 47:
+    total2 = ten_times(3)
+    j += 1
+assert(total2 == 30, "the body's value is not overwritten by the loop bound, whatever the bound is")
+
+# ------------------------------------------------------------------ #
+# 2. Compound assignment in the same shape (never broken -- guard it). #
+# ------------------------------------------------------------------ #
+
+acc = 0
+k = 0
+for k < 4:
+    acc += ten_times(1)
+    k += 1
+assert(acc == 40, "compound assignment accumulates across every iteration")
+
+# ------------------------------------------------------------------ #
+# 3. A variable first assigned inside the body outlives the loop --    #
+#    its register must not be handed out as a temp afterwards.         #
+# ------------------------------------------------------------------ #
+
+m = 0
+for m < 3:
+    created_inside = ten_times(5)
+    m += 1
+assert(created_inside == 50, "a name first assigned in the body holds its value after the loop ends")
+label = "after"
+assert(created_inside == 50, "and is not clobbered by a later statement's temporaries")
+assert(label == "after", "the later statement itself is unaffected")
+
+# ------------------------------------------------------------------ #
+# 4. Nested loops: the inner condition must not claim the outer's      #
+#    registers, nor vice versa.                                        #
+# ------------------------------------------------------------------ #
+
+outer_val = 0
+inner_val = 0
+a = 0
+for a < 3:
+    outer_val = ten_times(7)
+    b = 0
+    for b < 2:
+        inner_val = ten_times(9)
+        b += 1
+    a += 1
+assert(outer_val == 70, "the outer body's assignment survives both the inner loop and the outer condition")
+assert(inner_val == 90, "the inner body's assignment survives the inner condition")
+
+# ------------------------------------------------------------------ #
+# 5. A non-literal bound, so the condition's scratch holds a variable  #
+#    rather than a constant.                                           #
+# ------------------------------------------------------------------ #
+
+limit = 5
+got = 0
+p = 0
+for p < limit:
+    got = ten_times(4)
+    p += 1
+assert(got == 40, "a variable loop bound behaves the same as a literal one")
+assert(limit == 5, "the bound variable itself is not disturbed by the body")
+
+# ------------------------------------------------------------------ #
+# 6. String and struct results, not just integers -- the rebinding     #
+#    path is about register claiming, not about the value's type.      #
+# ------------------------------------------------------------------ #
+
+function name_of(n):
+    return "item{n}"
+
+text = ""
+q = 0
+for q < 3:
+    text = name_of(7)
+    q += 1
+assert(text == "item7", "a string-valued call result survives the loop condition too")
+
+print("test_loop_cond_registers.aer: all assertions passed.")
