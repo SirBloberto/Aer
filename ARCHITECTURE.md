@@ -920,6 +920,36 @@ the wrong way relative to real time, because the change traded instruction *coun
 wall-clock confirmation before it is believed, with a ref-against-itself control run to establish the
 noise floor first.
 
+### 5.16d What a new opcode actually costs, measured twice on one change
+
+`OP_INDEX_GET_INTERP` formats `dict["key_{n}"]` into a stack buffer and probes with the bytes
+instead of allocating an `AerString` to hash once and drop -- `hashtable_get_hashed` already takes
+raw bytes. **`dict_bench` -27.8% instructions, `lookup_table_bench` -16.7%**; in wall-clock 1.61s ->
+1.31s and 2.37s -> 2.01s.
+
+Getting there cost two measurements that matter more than the feature.
+
+**A local array in a label is paid for by every opcode.** The first version held
+`AerVal parts[INTERP_MAX_PARTS]` in the label -- 256 bytes onto `vm_run_slice`'s frame. `mandelbrot`
+went **+4.52%** and `nbody` +2.65% *in instructions*, on an opcode neither can reach, through
+register pressure in a 45KB function. Reading the RK16 words straight from the code array and giving
+both helpers their own scratch removed every one of those eight regressions and left the wins intact.
+This is the same reason `vm_interp_build` is `noinline`, and it is worth restating: **any scratch
+declared in a label is a tax on the whole interpreter.**
+
+**Where a label sits is worth percent.** Even with the frame fixed, `mandelbrot` costs **+3.1%
+wall-clock (2.54s -> 2.62s, medians of 7) at an identical instruction count** -- pure code placement.
+Moving the new label past the raw-compare block it had displaced recovered about a third of that. The
+rest is the price of the opcode existing at all.
+
+So the per-opcode cost is real, but it is *placement*, not size, and not the two things it is usually
+blamed on: 5.16 measures the icache miss rate at 0.02-0.10%, and 5.16b measures a deliberate 23% cut
+in branch misses making cycles *worse*. That matters for the standing question of whether to delete
+the ~76 dispatchable opcodes no benchmark reaches (the int32 and bounds-checked corners of the
+field-access matrix, and the `>`/`>=` halves of the raw compare families). Deleting them is a
+maintainability argument, which is a real one -- but it is a layout lottery, not a directed
+optimization, and anyone doing it should expect to measure a shuffle, not a speedup.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
