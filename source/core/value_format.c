@@ -36,6 +36,17 @@ void aer_format_int(long long v, char* buf, size_t bufsize) {
     }
     if (uv == 0) {
         buf[len++] = '0';
+    } else if (uv <= 0xFFFFFFFFULL) {
+        /* Narrowed to 32 bits whenever it fits, which is nearly always. A 64-bit /10 and %10 are a
+           libgcc call each on 32-bit ARM -- once per digit -- while the 32-bit forms compile to a
+           reciprocal multiply and no division at all. Same reasoning as aer_mod_int64 (vm.c). */
+        unsigned int u32 = (unsigned int)uv;
+        while (u32 > 0) {
+            tmp[pos++] = (char)('0' + (u32 % 10u));
+            u32 /= 10u;
+        }
+        while (pos > 0)
+            buf[len++] = tmp[--pos];
     } else {
         while (uv > 0) {
             tmp[pos++] = (char)('0' + (uv % 10));
