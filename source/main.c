@@ -27,6 +27,15 @@ static void help();
 static const char* debug_dump_path = NULL;
 #endif
 
+/* --max-instructions: 0 means unbounded, the default for every ordinary run. A budget turns "this
+   program does not terminate" into an exact, machine-independent fact instead of a wall-clock
+   guess -- see tests/fuzz.py, which is the only caller that sets one. */
+static unsigned int max_instructions = 0;
+static bool budget_exhausted = false;
+/* vm_run_slice's budget is per-call, so a large total is spent in chunks rather than passed whole. */
+#define INSTRUCTION_SLICE 1000000u
+#define EXIT_BUDGET_EXHAUSTED 3
+
 /* Interprets a K/M/G suffix as a cell-count multiplier (1,000 / 1,000,000 / 1,000,000,000) --
    aer_gc_set_ceiling() counts live *cells*, not bytes, and cell sizes differ per pool (a string
    cell isn't the size of a dict cell), so there is no accurate bytes-to-cells conversion available
@@ -65,6 +74,7 @@ int main(int argc, char** argv) {
         static const char no_net[] = "--no-net";
         static const char no_import[] = "--no-import";
         static const char mem_size[] = "--memory-size=";
+        static const char max_instr[] = "--max-instructions=";
 #ifdef AER_DEBUG_TOOLS
         static const char debug_path[] = "--debug-path=";
 #endif
@@ -76,6 +86,8 @@ int main(int argc, char** argv) {
             aer_set_import_enabled(false);
         } else if (strncmp(argv[i], mem_size, sizeof(mem_size) - 1) == 0) {
             aer_gc_set_ceiling(parse_memory_size(argv[i] + sizeof(mem_size) - 1));
+        } else if (strncmp(argv[i], max_instr, sizeof(max_instr) - 1) == 0) {
+            max_instructions = (unsigned int)strtoul(argv[i] + sizeof(max_instr) - 1, NULL, 10);
 #ifdef AER_DEBUG_TOOLS
         } else if (strncmp(argv[i], debug_path, sizeof(debug_path) - 1) == 0) {
             debug_dump_path = argv[i] + sizeof(debug_path) - 1;
@@ -100,6 +112,12 @@ int main(int argc, char** argv) {
         /* Everything after the script path belongs to the script, via io.args(). */
         aer_io_set_args(argc - 2, argv + 2);
         status = run_file(argv[1]) ? 0 : 1;
+        /* Distinct from a runtime error: the program was still running correctly, it just had not
+           finished. Its own exit code stays available for a program that both errored and ran long. */
+        if (budget_exhausted) {
+            fprintf(stderr, "aer: instruction budget of %u exhausted\n", max_instructions);
+            status = EXIT_BUDGET_EXHAUSTED;
+        }
     }
 
     /* Not load-bearing at process exit -- exercises the same teardown path an embedding host would use.
@@ -130,7 +148,23 @@ static void run() {
        an infinite loop instead of the syntax error it actually is. File mode refuses to run at all
        once parse() has flagged any statement as invalid; the REPL still runs the rest of the line. */
     if (mode == MODE_RUN && parse_had_error) return;
-    vm_run(&vm);
+    if (max_instructions == 0) {
+        vm_run(&vm);
+        return;
+    }
+    /* Budgeted run (--max-instructions). A slice yields at loop back-edges and calls, so resuming
+       in a loop is equivalent to an unbounded run until the budget is genuinely spent. */
+    unsigned int remaining = max_instructions;
+    for (;;) {
+        unsigned int step = remaining < INSTRUCTION_SLICE ? remaining : INSTRUCTION_SLICE;
+        VmSliceResult r = vm_run_slice(&vm, step);
+        if (r != VM_SLICE_YIELDED) return;
+        remaining -= step;
+        if (remaining == 0) {
+            budget_exhausted = true;
+            return;
+        }
+    }
 }
 
 /* Interactive REPL */
@@ -238,7 +272,8 @@ static void help() {
     printf(
         "  --no-import          Disable file-based import for this run (fixed stdlib modules still work)\n");
     printf(
-        "  --memory-size=<N>[K|M|G]  Cap live GC cells (not bytes) at N; suffix multiplies by 1e3/1e6/1e9\n");
+        "  --memory-size=<N>[K|M|G]  Cap live GC cells (not bytes) at N; suffix multiplies by 1e3/1e6/1e9\n"
+        "  --max-instructions=<N>    Stop after N instructions and exit 3; 0 (default) is unbounded\n");
 #ifdef AER_DEBUG_TOOLS
     printf("  --debug-path=<path>  Write a disassembly + hit-count/memory dump here after running\n");
     printf("                       <file> (\"-\" for stderr)\n");

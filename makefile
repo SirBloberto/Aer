@@ -190,7 +190,8 @@ asan: $(SOURCE)
 	@mkdir -p binary
 	gcc $(FLAGS) -fsanitize=address -fno-omit-frame-pointer -o binary/aer-asan$(EXE) $(SOURCE) -lm $(WINLIBS)
 
-# Fixed seed keeps CI deterministic; override for exploratory runs (FUZZ_SEED= FUZZ_ITERATIONS=5000).
+# A fixed seed plus the interpreter-enforced instruction budget makes a run reproduce exactly,
+# on any machine; override for exploratory runs (FUZZ_SEED= FUZZ_ITERATIONS=5000).
 FUZZ_ITERATIONS := 300
 FUZZ_SEED       := --seed 100
 

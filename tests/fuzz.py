@@ -6,17 +6,23 @@ result under a timeout. Goal: crashes/hangs (memory safety), not wrong output.
 Best run against an ASAN build (`make asan`/`make fuzz`) so non-crashing bugs
 still get caught. A meaningful hang RATE is expected and not by itself a
 finding: AER's loops are unrestricted, so mutating a comparison operator or a
-range bound/step in any seed (not just one fixture) can trivially produce a
-genuinely-infinite loop by AER's own semantics — the halting problem means no
-static check can rule this out in general. Slower hardware (e.g. a Raspberry
-Pi) also widens the gap between "genuinely infinite" and "just a lot of
-iterations", pushing more merely-slow mutations over the --seconds timeout
-without any interpreter bug involved. Before treating a "hang" as a real
-finding: check the saved tests/fuzz_crashes/ repro is minimal and
-seed-independent, and confirm it doesn't just take a while to run to
-completion under a generous timeout (`--seconds`) on the machine in question.
+range bound/step in any seed can trivially produce a genuinely-infinite loop by
+AER's own semantics — the halting problem means no static check can rule this
+out in general.
 
-Usage: python3 tests/fuzz.py [--iterations N] [--binary PATH] [--seconds S] [--seed N]
+"Hang" is decided by an instruction budget (--max-instructions, enforced by the
+interpreter itself), not by wall-clock. That makes it an exact property of the
+program — "did not halt within N instructions" — and identical on every machine,
+so a --seed run reproduces a hang set anywhere. A wall-clock limit could not: the
+same mutant flipped between hang and pass depending on how loaded the machine
+was, which made a fixed seed reproduce different results on different hardware.
+
+--seconds survives as a backstop only, for a mutant that blocks in a syscall
+(net.accept, reading stdin) and so never spends its budget. Those are reported
+separately as BLOCKED, since unlike a hang they are machine-dependent.
+
+Usage: python3 tests/fuzz.py [--iterations N] [--binary PATH] [--seconds S]
+                             [--max-instructions N] [--seed N]
 """
 import argparse
 import glob
@@ -104,21 +110,31 @@ def mutate_boundary_number(data, rng):
 MUTATORS = [mutate_byte_flip, mutate_delete_span, mutate_insert_token, mutate_boundary_number]
 
 
-def run_one(binary, data, timeout_s):
+# aer's own exit code for --max-instructions being spent (main.c).
+EXIT_BUDGET_EXHAUSTED = 3
+
+
+def run_one(binary, data, timeout_s, max_instructions):
     import tempfile
     fd, path = tempfile.mkstemp(suffix=".aer")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
+        argv = [binary, "--max-instructions=%d" % max_instructions, path]
         try:
-            proc = subprocess.run([binary, path], capture_output=True, timeout=timeout_s)
+            proc = subprocess.run(argv, capture_output=True, timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            return "hang", None
+            # The budget bounds computation, not blocking syscalls, so this still fires for a
+            # mutant parked in net.accept or reading stdin. Wall-clock, hence machine-dependent --
+            # which is why it is the backstop and not the primary signal.
+            return "blocked", None
         # A negative returncode means the process was killed by a signal
         # (segfault, abort, ASAN detection) — a clean parse/runtime error
         # exits 1 via a normal return, never a signal.
         if proc.returncode is not None and proc.returncode < 0:
             return "crash", proc
+        if proc.returncode == EXIT_BUDGET_EXHAUSTED:
+            return "hang", proc
         if proc.returncode not in (0, 1):
             return "crash", proc
         return "ok", proc
@@ -130,7 +146,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iterations", type=int, default=200)
     ap.add_argument("--binary", default=os.path.join(REPO_ROOT, "binary", "aer.exe" if os.name == "nt" else "aer"))
-    ap.add_argument("--seconds", type=float, default=8.0, help="per-run timeout")
+    ap.add_argument("--seconds", type=float, default=30.0,
+                    help="wall-clock backstop for mutants that block on a syscall")
+    ap.add_argument("--max-instructions", type=int, default=200_000_000,
+                    help="a run exceeding this counts as a hang; deterministic, unlike wall-clock")
     ap.add_argument("--seed", type=int, default=None, help="RNG seed, for reproducing a run")
     args = ap.parse_args()
 
@@ -147,6 +166,7 @@ def main():
 
     crashes = 0
     hangs = 0
+    blocked = 0
     start = time.time()
     for i in range(args.iterations):
         base = rng.choice(seeds)
@@ -154,7 +174,7 @@ def main():
         for _ in range(rng.randint(1, 3)):
             mutated = rng.choice(MUTATORS)(mutated, rng)
 
-        outcome, proc = run_one(args.binary, mutated, args.seconds)
+        outcome, proc = run_one(args.binary, mutated, args.seconds, args.max_instructions)
         if outcome == "crash":
             crashes += 1
             crash_path = os.path.join(CRASH_DIR, f"crash_{i}.aer")
@@ -170,9 +190,22 @@ def main():
             with open(hang_path, "wb") as f:
                 f.write(mutated)
             print(f"[HANG] iteration {i}, saved to {hang_path}")
+        elif outcome == "blocked":
+            blocked += 1
+            blocked_path = os.path.join(CRASH_DIR, f"blocked_{i}.aer")
+            with open(blocked_path, "wb") as f:
+                f.write(mutated)
+            print(f"[BLOCKED] iteration {i} exceeded {args.seconds}s of wall-clock without spending "
+                  f"its instruction budget, saved to {blocked_path}")
 
     elapsed = time.time() - start
-    print(f"\n{args.iterations} iterations in {elapsed:.1f}s — {crashes} crash(es), {hangs} hang(s)")
+    print(f"\n{args.iterations} iterations in {elapsed:.1f}s — {crashes} crash(es), "
+          f"{hangs} hang(s), {blocked} blocked")
+    # blocked is deliberately not a failure: it is the wall-clock backstop, so it varies with
+    # machine load and would make this gate flaky in exactly the way the budget was added to stop.
+    if blocked:
+        print(f"{blocked} run(s) hit the wall-clock backstop without spending their instruction "
+              f"budget — inspect them, but they are machine-dependent and do not fail this run")
     if crashes or hangs:
         print(f"Failing inputs saved under {CRASH_DIR}")
         sys.exit(1)
