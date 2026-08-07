@@ -102,8 +102,12 @@ int main(int argc, char** argv) {
         status = run_file(argv[1]) ? 0 : 1;
     }
 
-    /* Not load-bearing at process exit -- exercises the same teardown path an embedding host would use. */
+    /* Not load-bearing at process exit -- exercises the same teardown path an embedding host would use.
+       real_argv is freed here rather than left to the OS because io.args() borrows a slice of it, so it
+       has to outlive the script -- and because a report LeakSanitizer never prints clean is a report
+       nobody reads. */
     aer_module_free_all();
+    free(real_argv);
     aer_actor_free_all();
     return status;
 }
