@@ -813,6 +813,38 @@ deltas from -0.92% to +1.26%, while instruction counts over the same runs agree 
 Any cycles-based claim below about 1.5% on this hardware is unfalsifiable — use instruction counts
 as the gate, and treat `--event cycles` as a coarse sanity check only.
 
+### 5.17 String interning would not fix the dict benchmarks (measured, not built)
+
+Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
+hash plus `memcmp`. AER does not intern, which makes interning the obvious explanation for
+`dict_bench`/`lookup_table_bench` lagging, and the obvious thing to build next.
+
+Profiling says otherwise. `lookup_table_bench` (400k lookups over a 500-key table) on the Pi:
+
+| symbol | share | what it is |
+|---|---|---|
+| `vm_run_slice` | 30.9% | dispatch |
+| `aer_format_int` | 20.5% | the `{n % 500}` interpolation's int-to-string step |
+| `vm_index_get_compute` | 9.7% | the index path itself |
+| `aer_make_string_copy` | 8.8% | allocating the freshly built key |
+| `pool_alloc` | 5.0% | that allocation's cell |
+| `hashtable_get_hashed` | 4.5% | hashing and probing |
+| `memcmp` | 3.2% | the key comparison interning would remove |
+
+Building the key costs roughly 38% (`aer_format_int` + `aer_make_string_copy` + `pool_alloc` +
+`memcpy`); comparing it costs 3.2%. Worse, interning is not free on the construction side: every
+key here is a fresh string, so each one would still have to be hashed and probed against the intern
+table before it could be compared by pointer. The plausible ceiling is a few percent, against a
+change that touches `AerString` (whose `inline_buf` short-string optimization pulls the opposite
+way), the hashtable's key ownership, and the GC's treatment of the intern table all at once.
+
+`dict_bench` shows the same shape with `gc_collect` at 13.5% on top -- pressure from the same
+short-lived key strings.
+
+So the dict benchmarks are dominated by string *construction*, not string *comparison*, and the
+lever worth pulling is the interpolation/allocation path (§5.13 already took one pass at
+`aer_format_int` and it is still a fifth of this benchmark), not interning.
+
 ---
 
 ## 6. Known architectural limitations (current, unresolved)
