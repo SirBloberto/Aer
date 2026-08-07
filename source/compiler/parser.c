@@ -1023,6 +1023,9 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
 
     Opcode raw_op;
     bool is_cmp = false;
+    /* `a > b` is `b < a`: emitted as the LT/LTE opcode with the slots swapped, so the raw-vs-raw
+       family needs no GT/GTE members at all. */
+    bool swap_cmp = false;
     bool div_int_promotes_to_real =
         false; /* OP_DIV on two ints still yields a real, matching boxed semantics. */
     if (int_kind) {
@@ -1041,16 +1044,18 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
                 is_cmp = true;
                 break;
             case OP_GT:
-                raw_op = OP_RAW_GT_INT;
+                raw_op = OP_RAW_LT_INT;
                 is_cmp = true;
+                swap_cmp = true;
                 break;
             case OP_LTE:
                 raw_op = OP_RAW_LTE_INT;
                 is_cmp = true;
                 break;
             case OP_GTE:
-                raw_op = OP_RAW_GTE_INT;
+                raw_op = OP_RAW_LTE_INT;
                 is_cmp = true;
+                swap_cmp = true;
                 break;
             default: return false;
         }
@@ -1065,16 +1070,18 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
                 is_cmp = true;
                 break;
             case OP_GT:
-                raw_op = OP_RAW_GT_REAL;
+                raw_op = OP_RAW_LT_REAL;
                 is_cmp = true;
+                swap_cmp = true;
                 break;
             case OP_LTE:
                 raw_op = OP_RAW_LTE_REAL;
                 is_cmp = true;
                 break;
             case OP_GTE:
-                raw_op = OP_RAW_GTE_REAL;
+                raw_op = OP_RAW_LTE_REAL;
                 is_cmp = true;
+                swap_cmp = true;
                 break;
             default: return false; /* no raw MOD/FLOOR_DIV for real */
         }
@@ -1101,7 +1108,7 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
 
     if (is_cmp) {
         int dest = reg_alloc();
-        chunk_emit(c, PACK3(raw_op, dest, slot_lhs, slot_rhs));
+        chunk_emit(c, PACK3(raw_op, dest, swap_cmp ? slot_rhs : slot_lhs, swap_cmp ? slot_lhs : slot_rhs));
         *out_rk = dest;
         return true;
     }

@@ -222,13 +222,9 @@ typedef enum {
     OP_RAW_FMA_REAL,
     OP_RAW_FMS_REAL,
     OP_RAW_LT_INT,
-    OP_RAW_GT_INT,
     OP_RAW_LTE_INT,
-    OP_RAW_GTE_INT,
     OP_RAW_LT_REAL,
-    OP_RAW_GT_REAL,
     OP_RAW_LTE_REAL,
-    OP_RAW_GTE_REAL,
     OP_BOX_INT,
     OP_BOX_REAL,
     /* Raw-to-raw copy -- OP_MOVE's analog for raw slots. */

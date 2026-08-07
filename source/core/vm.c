@@ -2674,13 +2674,9 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_FMA_REAL] = &&lbl_raw_fma_real,
         [OP_RAW_FMS_REAL] = &&lbl_raw_fms_real,
         [OP_RAW_LT_INT] = &&lbl_raw_lt_int,
-        [OP_RAW_GT_INT] = &&lbl_raw_gt_int,
         [OP_RAW_LTE_INT] = &&lbl_raw_lte_int,
-        [OP_RAW_GTE_INT] = &&lbl_raw_gte_int,
         [OP_RAW_LT_REAL] = &&lbl_raw_lt_real,
-        [OP_RAW_GT_REAL] = &&lbl_raw_gt_real,
         [OP_RAW_LTE_REAL] = &&lbl_raw_lte_real,
-        [OP_RAW_GTE_REAL] = &&lbl_raw_gte_real,
         [OP_BOX_INT] = &&lbl_box_int,
         [OP_BOX_REAL] = &&lbl_box_real,
         [OP_RAW_MOVE_INT] = &&lbl_raw_move_int,
@@ -4939,13 +4935,9 @@ lbl_raw_div_real : {
 
     /* Comparisons produce a boxed boolean (no raw boolean type exists) -- dest is 7 bits, not 5. */
     RAW_CMP_INT(lt, <)
-    RAW_CMP_INT(gt, >)
     RAW_CMP_INT(lte, <=)
-    RAW_CMP_INT(gte, >=)
     RAW_CMP_REAL(lt, <)
-    RAW_CMP_REAL(gt, >)
     RAW_CMP_REAL(lte, <=)
-    RAW_CMP_REAL(gte, >=)
 
 /* The only bridge from raw storage back to a tagged AerVal register. */
 lbl_box_int : {
