@@ -21,6 +21,6 @@ function sieve(limit):
                     is_composite[multiple] = 1
     return count
 
-LIMIT = 10000000
+LIMIT = 13000000
 result = sieve(LIMIT)
 print("Primes up to {LIMIT}: {result}")

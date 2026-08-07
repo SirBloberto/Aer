@@ -41,7 +41,7 @@ local function process_lines(lines)
     return status_counts, path_counts, total_bytes
 end
 
-local N = 200000
+local N = 520000
 
 local start = os.clock()
 local lines = make_log_lines(N, STATUS_CODES, PATHS)

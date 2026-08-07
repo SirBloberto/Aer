@@ -124,7 +124,7 @@ bodies[4].mass = 5.15138902046611451e-05 * SOLAR_MASS
 start = time.now()
 offset_momentum(bodies, SOLAR_MASS)
 a = energy(bodies)
-for i in 0..500000:
+for i in 0..650000:
     advance(bodies, 0.01)
 a = energy(bodies)
 dur = time.now() - start

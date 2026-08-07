@@ -15,7 +15,7 @@ class Particle:
 
 
 N = 2000000
-PASSES = 50
+PASSES = 8
 
 
 def make_particles(n):

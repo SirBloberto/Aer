@@ -8,7 +8,7 @@ end
 local start = os.clock()
 local total = 0
 local n = 0
-while n < 400000 do
+while n < 8500000 do
     total = total + h["key_" .. (n % 500)]
     n = n + 1
 end

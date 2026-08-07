@@ -40,7 +40,7 @@ def process_lines(lines):
     return status_counts, path_counts, total_bytes
 
 
-N = 200000
+N = 520000
 
 start = time.perf_counter()
 lines = make_log_lines(N, STATUS_CODES, PATHS)

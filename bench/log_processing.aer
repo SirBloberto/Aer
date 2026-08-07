@@ -49,7 +49,7 @@ function process_lines(lines):
         i += 1
     return status_counts, path_counts, total_bytes
 
-N = 200000
+N = 520000
 
 start = time.now()
 lines = make_log_lines(N, STATUS_CODES, PATHS)

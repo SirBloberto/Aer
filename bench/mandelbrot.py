@@ -1,6 +1,6 @@
 import time
 
-SIZE = 800
+SIZE = 720
 MAX_ITER = 200
 
 def mandelbrot_point(cx, cy, max_iter):

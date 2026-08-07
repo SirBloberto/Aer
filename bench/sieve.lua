@@ -20,6 +20,6 @@ local function sieve(limit)
     return count
 end
 
-local LIMIT = 10000000
+local LIMIT = 13000000
 local result = sieve(LIMIT)
 print(string.format("Primes up to %d: %d", LIMIT, result))

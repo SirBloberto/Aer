@@ -1,13 +1,13 @@
 local start = os.clock()
 local h = {}
 local i = 0
-while i < 200000 do
+while i < 800000 do
     h["key_" .. i] = i
     i = i + 1
 end
 local sum = 0
 i = 0
-while i < 200000 do
+while i < 800000 do
     sum = sum + h["key_" .. i]
     i = i + 1
 end

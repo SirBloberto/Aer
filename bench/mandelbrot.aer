@@ -3,7 +3,7 @@ import time
 # Classic language-shootout Mandelbrot: pure floating-point arithmetic in tightly nested loops,
 # zero allocation after setup -- the "how fast is basic arithmetic" benchmark, deliberately
 # unlike nbody/sieve/dict in exercising neither struct/field access, GC pressure, nor hashing.
-SIZE = 800
+SIZE = 720
 MAX_ITER = 200
 
 # The two OUTER loops here are range-for (not manual `for x < limit:` while-loops), same fix as

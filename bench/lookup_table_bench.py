@@ -9,7 +9,7 @@ while i < 500:
 start = time.perf_counter()
 total = 0
 n = 0
-while n < 400000:
+while n < 8500000:
     total += h[f"key_{n % 500}"]
     n += 1
 dur = time.perf_counter() - start

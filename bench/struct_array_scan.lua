@@ -1,5 +1,5 @@
 local N = 2000000
-local PASSES = 50
+local PASSES = 8
 
 local function make_particles(n)
     local particles = {}

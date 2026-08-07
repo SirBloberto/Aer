@@ -1,7 +1,7 @@
 local start = os.clock()
 local total = 0
 local i = 0
-while i < 200000 do
+while i < 3300000 do
     local rec = { id = i, name = "item_" .. i, active = true, score = i * 2 }
     total = total + rec.id + rec.score
     i = i + 1

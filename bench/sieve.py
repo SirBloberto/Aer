@@ -15,6 +15,6 @@ def sieve(limit):
         p += 1
     return count
 
-LIMIT = 10000000
+LIMIT = 13000000
 result = sieve(LIMIT)
 print("Primes up to {}: {}".format(LIMIT, result))

@@ -10,7 +10,7 @@ total = 0
 # into one fused OP_ITER_RANGE_LOOP dispatch instead of 4 separate boxed ones -- same fix as
 # sieve.aer/struct_array_scan.aer/mandelbrot.aer's outer loops. Fixed, non-early-exit trip count,
 # same safe shape.
-for n in 0..400000:
+for n in 0..8500000:
     total += h["key_{n % 500}"]
 dur = time.now() - start
 print("500-key table, 400k repeated lookups: {dur}s, total={total}")

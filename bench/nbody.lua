@@ -115,7 +115,7 @@ end
 -- script at all (another sandboxing difference), so a CLI-configurable step count isn't portable
 -- across the interpreters this file is run under. 500000 matches bench/nbody.aer's own hardcoded
 -- timestep count exactly (the canonical 5-body/500,000-timestep shootout benchmark).
-local N = 500000
+local N = 650000
 local nbody = #bodies
 
 offsetMomentum(bodies, nbody)

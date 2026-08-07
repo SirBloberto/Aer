@@ -1,4 +1,4 @@
-local SIZE = 800
+local SIZE = 720
 local MAX_ITER = 200
 
 local function mandelbrot_point(cx, cy, max_iter)
