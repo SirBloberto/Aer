@@ -190,6 +190,26 @@ asan: $(SOURCE)
 	@mkdir -p binary
 	gcc $(FLAGS) -fsanitize=address -fno-omit-frame-pointer -o binary/aer-asan$(EXE) $(SOURCE) -lm $(WINLIBS)
 
+# UBSan catches what ASAN structurally cannot: misaligned loads (raw struct fields are read out of
+# a byte buffer at computed offsets), and invalid shifts/conversions. Signed overflow is EXCLUDED
+# deliberately -- AER's integers wrap by design and OP_RAW_ADD_INT never checks, so
+# -fsanitize=signed-integer-overflow would report the language working as specified.
+# halt_on_error makes a finding fail the run instead of printing and continuing.
+UBSAN_CHECKS := undefined
+UBSAN_SKIP   := signed-integer-overflow,shift-base
+
+ubsan: $(SOURCE)
+	@mkdir -p binary
+	gcc $(FLAGS) -fsanitize=$(UBSAN_CHECKS) -fno-sanitize=$(UBSAN_SKIP) \
+	    -fno-omit-frame-pointer -o binary/aer-ubsan$(EXE) $(SOURCE) -lm $(WINLIBS)
+
+# Runs the whole .aer suite under UBSan; any diagnostic aborts, so a clean run means no finding.
+test-ubsan: ubsan
+	@for t in $(TESTS); do \
+		echo "=== $$t ==="; \
+		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./binary/aer-ubsan$(EXE) $$t || exit 1; \
+	done
+
 # A fixed seed plus the interpreter-enforced instruction budget makes a run reproduce exactly,
 # on any machine; override for exploratory runs (FUZZ_SEED= FUZZ_ITERATIONS=5000).
 FUZZ_ITERATIONS := 300

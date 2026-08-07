@@ -34,6 +34,11 @@ jobs:
       - name: Check the formatter is idempotent on its own expected output
         run: make test-fmt
 
+      # Catches what ASAN structurally cannot -- misaligned loads especially, since raw struct
+      # fields are read out of a byte buffer at computed offsets.
+      - name: Run the test suite under UBSan
+        run: make test-ubsan
+
       # A fixed seed plus the interpreter's own instruction budget makes this reproduce exactly:
       # the same seed yields the same findings on any machine, so a failure here is reproducible
       # locally rather than a runner-load artifact. timeout-minutes is belt-and-braces against a
@@ -73,3 +78,29 @@ jobs:
 
       - name: Run register-VM smoke test
         run: make test-smoke
+
+  # ARM is the platform the performance work is actually validated on, and it has had regressions
+  # x86 could not see: the byte-aligned instruction encoding was a measured slowdown only here, and
+  # the packed-array change regressed 10-13% only here. Both were found by hand on a Raspberry Pi.
+  # This job deliberately does not measure performance -- a shared runner is far too noisy, which is
+  # what tools/bench.py and a real Pi are for -- but it does catch ARM-only breakage, which is the
+  # half that belongs in CI.
+  build-and-test-arm:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Run test suite
+        run: make test
+
+      - name: Run embedding smoke test
+        run: make test-embed
+
+      - name: Run register-VM smoke test
+        run: make test-smoke
+
+      - name: Run opcode encoding round-trip test
+        run: make test-roundtrip
