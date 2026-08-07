@@ -1432,6 +1432,21 @@ static int parse_interpolated_expr(Chunk* c, const char* text, unsigned int len)
 
 /* Literal segments and interpolated values concatenate via OP_ADD; interpolation's
    value-to-string step goes through OP_UNARY's folded-in OP_TO_STR. */
+/* One OP_INTERP over `parts`. The parts' temps are released before the destination is claimed so
+   it reuses the lowest of them, the same trick the concatenate chain used; safe because the opcode
+   reads every part before writing its destination. */
+static int emit_interp(Chunk* c, const int* parts, int part_count) {
+    int temps = 0;
+    for (int i = 0; i < part_count; i++)
+        if (is_temp(parts[i])) temps++;
+    if (temps) reg_free(temps);
+    int dest = reg_alloc();
+    chunk_emit(c, PACK2(OP_INTERP, dest, part_count));
+    for (int i = 0; i < part_count; i++)
+        chunk_emit(c, pack_rk16(parts[i]));
+    return dest;
+}
+
 static int parse_string_literal(Chunk* c) {
     AerString* ts = aer_as_string(token.value);
     char* s = ts->data;
@@ -1455,6 +1470,13 @@ static int parse_string_literal(Chunk* c) {
         return (int)pool_idx | RK_CONST_FLAG;
     }
 
+    /* Parts are collected as RK values and emitted as one OP_INTERP at the end -- one dispatch and
+       one allocation instead of a concatenate per part, each of which allocated a string that was
+       garbage by the next one. Beyond INTERP_MAX_PARTS the old left-fold chain still runs, so there
+       is no limit on how long an interpolation may be. */
+    int parts[INTERP_MAX_PARTS];
+    int part_count = 0;
+
     int result = -1; /* -1: no parts concatenated yet (a valid RK/register value is always >= 0) */
     unsigned int i = 0;
     while (i <= len) {
@@ -1470,14 +1492,14 @@ static int parse_string_literal(Chunk* c) {
         }
         if (i > seg_start) {
             int rk_seg = (int)pool_escaped_string(c, s + seg_start, i - seg_start) | RK_CONST_FLAG;
-            if (result < 0) {
-                result = materialize(c, rk_seg);
-            } else {
-                if (is_temp(result)) reg_free(1);
-                int dest = reg_alloc();
-                emit_binary(c, dest, OP_ADD, result, rk_seg);
-                result = dest;
+            /* A constant segment stays an RK constant -- OP_INTERP reads it straight from the pool,
+               so unlike the concatenate chain it never needs materializing into a register. */
+            if (part_count == INTERP_MAX_PARTS) {
+                int folded = emit_interp(c, parts, part_count);
+                part_count = 0;
+                parts[part_count++] = folded;
             }
+            parts[part_count++] = rk_seg;
         }
         if (i >= len) break;
 
@@ -1519,26 +1541,22 @@ static int parse_string_literal(Chunk* c) {
             i++;
             continue;
         }
-        int expr_reg = materialize(c, rk_expr);
-
-        /* Reuses expr_reg as the OP_TO_STR destination when it's already a temp, avoiding a stranded
-           dead temp (reg_free is LIFO). A non-temp expr_reg still gets a fresh destination. */
-        int str_dest = is_temp(expr_reg) ? expr_reg : reg_alloc();
-        chunk_emit(c, PACK3(OP_UNARY, str_dest, OP_TO_STR, pack_rk8(expr_reg)));
-
-        if (result < 0) {
-            result = str_dest;
-        } else {
-            if (is_temp(str_dest)) reg_free(1);
-            if (is_temp(result)) reg_free(1);
-            int dest = reg_alloc();
-            emit_binary(c, dest, OP_ADD, result, str_dest);
-            result = dest;
+        /* No OP_TO_STR: OP_INTERP formats an int/real/bool/null part directly into the result, so
+           the throwaway string that step used to allocate never exists. */
+        if (part_count == INTERP_MAX_PARTS) {
+            int folded = emit_interp(c, parts, part_count);
+            part_count = 0;
+            parts[part_count++] = folded;
         }
+        parts[part_count++] = rk16_fits(rk_expr) ? rk_expr : materialize(c, rk_expr);
         i++; /* skip '}' */
     }
 
-    if (result < 0) {
+    /* A string with no interpolation at all already returned above, so a single part here is a
+       single interpolated expression -- which still has to be converted, whatever its type. */
+    if (part_count > 0) {
+        result = emit_interp(c, parts, part_count);
+    } else {
         result = (int)chunk_add_pool(c, aer_make_string_copy("", 0)) | RK_CONST_FLAG;
     }
 

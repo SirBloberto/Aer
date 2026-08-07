@@ -356,6 +356,14 @@ typedef enum {
     OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE,
     OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE,
 
+    /* Builds one string from N parts in a single allocation. `"key_{n}"` used to compile to
+       OP_LOADK + OP_TO_STR + OP_ADD -- three dispatches and two AerStrings, the second immediately
+       garbage. Each part is a whole trailing word holding an RK16, so a constant segment needs no
+       OP_LOADK and a non-string part is formatted straight into the result rather than through a
+       throwaway string. Variable-length like OP_DEFINE_STRUCT: header word, then part_count words.
+       Parts beyond INTERP_MAX_PARTS fall back to the old chain (parse_string_literal). */
+    OP_INTERP, /* word0: dest_reg, part_count -- then part_count words, each one RK16 */
+
     OP_OPCODE_COUNT_MARKER /* not a real opcode -- sizes the static assert below */
 } Opcode;
 _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — widen the opcode field");
@@ -552,6 +560,10 @@ static inline uint16_t pack_rk16(int rk) {
 #define CALL_BUILTIN_PANIC 4
 /* The only way AER source constructs a Result -- lets user functions join |>'s short-circuit. */
 #define CALL_BUILTIN_RESULT 5
+
+/* Parts in one OP_INTERP. Bounds the builder's stack scratch; a longer interpolation compiles to
+   the ordinary concatenate chain instead, which has no limit. */
+#define INTERP_MAX_PARTS 16
 
 #define MAX_STRUCT_FIELDS 16
 

@@ -900,6 +900,77 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
     return aer_make_string(owned, len);
 }
 
+/* OP_INTERP's builder. noinline on purpose: its scratch would otherwise join vm_run_slice's
+   already-3300-byte frame, and §5.16b records what added pressure there costs. A part is rendered
+   into `scratch` only if it isn't already a string; unbounded content defers to vm_to_str. */
+static __attribute__((noinline)) AerVal vm_interp_build(VM* vm, const AerVal* parts, unsigned int count) {
+    const char* piece[INTERP_MAX_PARTS];
+    unsigned int piece_len[INTERP_MAX_PARTS];
+    char scratch[INTERP_MAX_PARTS][32];
+    /* Only for parts that had to become a real string first; kept alive until the copy is done. */
+    AerVal spilled[INTERP_MAX_PARTS];
+    unsigned int spill_count = 0;
+    unsigned int total = 0;
+
+    for (unsigned int i = 0; i < count; i++) {
+        AerVal v = parts[i];
+        switch (aer_type(v)) {
+            case TYPE_STRING: {
+                AerString* s = aer_as_string(v);
+                piece[i] = s->data;
+                piece_len[i] = s->length;
+                break;
+            }
+            case TYPE_INTEGER:
+                aer_format_int((long long)aer_as_int(v), scratch[i], sizeof(scratch[i]));
+                piece[i] = scratch[i];
+                piece_len[i] = (unsigned int)strlen(scratch[i]);
+                break;
+            case TYPE_REAL:
+                aer_format_real(aer_as_real(v), scratch[i], sizeof(scratch[i]));
+                piece[i] = scratch[i];
+                piece_len[i] = (unsigned int)strlen(scratch[i]);
+                break;
+            case TYPE_BOOLEAN:
+                piece[i] = aer_as_bool(v) ? "true" : "false";
+                piece_len[i] = aer_as_bool(v) ? 4u : 5u;
+                break;
+            case TYPE_NULL:
+                piece[i] = "null";
+                piece_len[i] = 4;
+                break;
+            default: {
+                /* vm_to_str allocates; hold the result so a collection triggered by a later part
+                   cannot reclaim bytes this one still points at. */
+                AerVal s = vm_to_str(vm, v);
+                spilled[spill_count++] = s;
+                piece[i] = aer_as_string(s)->data;
+                piece_len[i] = aer_as_string(s)->length;
+                break;
+            }
+        }
+        total += piece_len[i];
+    }
+
+    AerString* out = aer_string_alloc(total);
+    char* buf;
+    if (total <= AER_STRING_INLINE_MAX) {
+        buf = out->inline_buf;
+        out->data = buf;
+    } else {
+        buf = vm_string_payload_alloc(require_current_heap(), total);
+        out->data = buf;
+    }
+    unsigned int at = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        memcpy(buf + at, piece[i], piece_len[i]);
+        at += piece_len[i];
+    }
+    buf[total] = '\0';
+    (void)spilled;
+    return aer_string_val(out);
+}
+
 /* Resolves a[start:end] bounds against length `len`; either bound may be TYPE_NULL (defaults to 0/len). Clamps out-of-range bounds instead of erroring, Python-slice style. */
 /* ------------------------------------------------------------------ */
 /* Slices and default values                                        */
@@ -2622,6 +2693,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gt_int_boxed_jump_if_false,
         [OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lte_int_boxed_jump_if_false,
         [OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gte_int_boxed_jump_if_false,
+        [OP_INTERP] = &&lbl_interp,
     };
 
     /* A designated-initializer table leaves an opcode with no entry as NULL, so emitting one jumps
@@ -4551,6 +4623,17 @@ lbl_index_field_compound : {
 
 /* Keyed by unary_op, same tag convention as lbl_binary. Also folds in OP_TO_STR
    (interpolation's string conversion) via the shared vm_to_str(). */
+lbl_interp : {
+    int dest = (int)UNPACK_A(op_word);
+    unsigned int count = UNPACK_B(op_word);
+    AerVal parts[INTERP_MAX_PARTS];
+    for (unsigned int i = 0; i < count; i++)
+        parts[i] = *vm_rk_ptr16(registers, const_pool, READ());
+    registers[dest] = vm_interp_build(vm, parts, count);
+    gc_maybe_collect(vm);
+    DISPATCH();
+}
+
 lbl_unary : {
     int dest = (int)UNPACK_A(op_word);
     Opcode unary_op = (Opcode)UNPACK_B(op_word);

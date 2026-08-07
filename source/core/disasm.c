@@ -35,8 +35,8 @@ typedef struct {
     int packed;
 } OpInfo;
 
-/* OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE is the last member of the Opcode enum (vm.h). */
-#define OP_INFO_MAX OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE
+/* OP_INTERP is the last member of the Opcode enum (vm.h). */
+#define OP_INFO_MAX OP_INTERP
 
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* OP_ADD..OP_IN: one opcode per operator, whole instruction in one word (PACK3 + RK8 pair) --
@@ -407,6 +407,9 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_GT_JUMP_IF_FALSE] = {"OP_GT_JUMP_IF_FALSE", "jump if !(rk > rk)", {0}, false, 1, 0},
     [OP_LTE_JUMP_IF_FALSE] = {"OP_LTE_JUMP_IF_FALSE", "jump if !(rk <= rk)", {0}, false, 1, 0},
     [OP_GTE_JUMP_IF_FALSE] = {"OP_GTE_JUMP_IF_FALSE", "jump if !(rk >= rk)", {0}, false, 1, 0},
+    /* Variable-length, but not OP_DEFINE_STRUCT's shape -- header word then part_count RK16
+       words, one per part. Both walkers below special-case it. */
+    [OP_INTERP] = {"OP_INTERP", "reg = one string built from N parts", {0}, false, 0, 2},
     [OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE] =
         {"OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi < reg) (tag-checked)", {0}, false, 1, 0},
     [OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE] =
@@ -548,7 +551,19 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     fprintf(out, "%6u  %-47s  %s", offset, opcode_name(op), info->desc);
 
     unsigned int pos = offset + 1;
-    if (info->variable) {
+    if (op == OP_INTERP) {
+        unsigned int count = UNPACK_B(op_word);
+        fprintf(out, "  reg=%u  parts=%u  [", UNPACK_A(op_word), count);
+        for (unsigned int i = 0; i < count; i++) {
+            uint32_t rk = c->code[pos++];
+            fprintf(out, "%s", i ? ", " : "");
+            if (RK16_IS_CONST(rk))
+                fprintf(out, "const:%u", (unsigned int)RK16_INDEX(rk));
+            else
+                fprintf(out, "reg%u", (unsigned int)RK16_INDEX(rk));
+        }
+        fprintf(out, "]");
+    } else if (info->variable) {
         /* header word already decoded via op_word; then (name+default, type) pairs -- 2 words per field. */
         int name_idx = (int)UNPACK_STRUCT_HEADER_NAME(op_word);
         int field_count = (int)UNPACK_STRUCT_HEADER_COUNT(op_word);
@@ -951,7 +966,9 @@ void aer_disassemble(Chunk* c, FILE* out) {
         if (offset < c->debug_hits_cap) op_totals[op] += c->debug_hits[offset];
         const OpInfo* info = &op_info[op];
         unsigned int next;
-        if (info->variable) {
+        if (op == OP_INTERP) {
+            next = offset + 1 + UNPACK_B(c->code[offset]);
+        } else if (info->variable) {
             uint32_t header = c->code[offset];
             int field_count = (int)UNPACK_STRUCT_HEADER_COUNT(header);
             next = offset + 1 + (unsigned int)field_count * 2;

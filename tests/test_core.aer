@@ -77,6 +77,30 @@ assert(length("\r") == 1, "\\r decodes to one real byte, not a literal backslash
 assert("say \"hi\"" == "say " + "\"" + "hi" + "\"", "escaped double quote")
 assert("use \{name} to interpolate" == "use " + "\{" + "name}" + " to interpolate", "escaped brace suppresses interpolation")
 
+# Interpolation builds the whole string in one step (OP_INTERP), formatting each part in place
+# rather than converting it to a string and concatenating. These pin the part kinds it formats
+# itself, and the boundary where it stops folding parts into one instruction.
+assert("{1}" == "1", "a lone interpolated integer converts")
+assert("{2.5}" == "2.5", "a lone interpolated float converts")
+assert("{true}{false}" == "truefalse", "booleans format without a separating literal")
+assert("{null}" == "null", "null formats")
+assert("{[1, 2]}" == "[1, 2]", "an array part falls back to the recursive formatter")
+assert("a{1}b{2}c{3}d" == "a1b2c3d", "literal and expression parts alternate correctly")
+assert("{1}{2}{3}" == "123", "adjacent expression parts with no literal between them")
+
+# 20 parts, past the 16-part fold limit, so the builder flushes and continues -- the result must be
+# identical to the same string built by concatenation.
+many = "{1}{2}{3}{4}{5}{6}{7}{8}{9}{10}{11}{12}{13}{14}{15}{16}{17}{18}{19}{20}"
+assert(many == "1234567891011121314151617181920", "an interpolation past the fold limit still builds one correct string")
+assert(length(many) == 31, "and has the right length")
+
+# A part long enough to push the result past the 15-byte inline-string threshold, so the builder
+# takes its heap-payload path instead of the inline one.
+long_part = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+assert("<{long_part}>" == "<" + long_part + ">", "a result too long to store inline still builds correctly")
+assert(length("<{long_part}>") == 42, "and has the right length")
+
+
 # Interpolating an array/hashtable used to fall back to a terse
 # "<array[3]>"/"<hashtable[2]>" placeholder (vm_to_str's fixed-size buffer
 # couldn't hold recursive, unbounded content) even though print() already
