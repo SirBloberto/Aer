@@ -3522,19 +3522,18 @@ lbl_iter_range_prep : {
        rather than per iteration. Neither half is hypothetical: direction is inferred from the
        bounds, so `for i in 200..length(a)` on a short array descends off the end (this segfaulted
        before the check existed), and overflow in a computed start can wrap it negative. */
-    if (item_word & RANGE_PREP_GUARD_NONNEG) {
-        if (cur < 0) {
+    /* One unsigned compare covers both halves: rng_end is a length so it is never negative, and a
+       negative cur reinterprets as a huge unsigned, failing the same test. Splitting the cases
+       costs nothing because it only happens on the way to raising. */
+    if ((item_word & RANGE_PREP_GUARD_NONNEG) && (uint64_t)cur > (uint64_t)rng_end) {
+        if (cur < 0)
             error("Range start is negative (%lld) -- an index computation overflowed", (long long)cur);
-            ip = (unsigned int)empty_target;
-            DISPATCH();
-        }
-        if (cur > rng_end) {
+        else
             error("Range start %lld is past its end %lld, so this loop would count downwards out of "
                   "the collection it indexes",
                   (long long)cur, (long long)rng_end);
-            ip = (unsigned int)empty_target;
-            DISPATCH();
-        }
+        ip = (unsigned int)empty_target;
+        DISPATCH();
     }
     /* Precomputes the iteration count once (ceiling division, matching Lua's FORLOOP) instead of
        re-deriving it every dispatch. count==0 means empty range. */
