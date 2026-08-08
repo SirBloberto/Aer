@@ -19,21 +19,7 @@ endif
 # same source vectorizes with `make ARCH_FLAGS=-mcpu=native` (or -mcpu=cortex-a72, etc.) and doesn't
 # without it. Set ARCH_FLAGS yourself if you're building specifically for one known machine and
 # want that win; leave it unset for a build that has to run anywhere.
-# A PIE build reaches the computed-goto label table PC-relatively, so EVERY dispatch pays
-# `ldr rN,[pc,#imm]; add rN,pc` on top of the table load itself -- on ARM32 that is 4 instructions
-# where a fixed-address build needs 2. Measured on a Pi 4: binary_trees -4.26%, sieve -4.01%,
-# fib_bench -3.63%, dict_bench -1.67%, mandelbrot -0.60%, nbody -0.33%, nothing worse.
-#
-# The cost is that the executable image no longer gets ASLR. AER is not a sandbox (io/net are
-# capability toggles, not a security boundary), so this is the right default here -- but if you are
-# shipping AER somewhere that needs the hardening, build with NOPIE= to turn it back off.
-#
-# Probed rather than assumed: some toolchains are configured PIE-only and reject the flag.
-NOPIE := $(shell printf 'int main(void){return 0;}' > .nopie-probe.c 2>/dev/null && \
-                 $(CC) -fno-pie -no-pie .nopie-probe.c -o .nopie-probe 2>/dev/null && \
-                 echo '-fno-pie -no-pie'; rm -f .nopie-probe.c .nopie-probe .nopie-probe.exe)
-
-FLAGS := -O2 -g -flto -Wall -Wextra $(NOPIE) $(ARCH_FLAGS) -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities
+FLAGS := -O2 -g -flto -Wall -Wextra $(ARCH_FLAGS) -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities
 
 SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/stdlib/*.c source/utilities/*.c)
 OBJECT := $(patsubst source/%.c,object/%.o,$(SOURCE))

@@ -1051,6 +1051,25 @@ it removes; a load from an already-hot cache line is cheaper than recomputing an
 
 So the three separate stacks are load-bearing, not an oversight. The four raw-side fields stay.
 
+### 5.16g Non-PIE is worth 0.3-4.3%, and is deliberately not taken
+
+A PIE build reaches the computed-goto label table PC-relatively, so **every dispatch** pays
+`ldr rN,[pc,#imm]; add rN,pc` on top of the table load itself -- 4 ARM32 instructions where a
+fixed-address build needs 2. Building with `-fno-pie -no-pie` improves **every benchmark in the
+suite**: `binary_trees` -4.26%, `sieve` -4.01%, `fib_bench` -3.63%, `lookup_table_bench` -2.65%,
+`struct_array_scan` -2.09%, `log_processing` -1.75%, `dict_bench` -1.65%, `small_dict_bench` -1.22%,
+`mandelbrot` -0.60%, `nbody` -0.33%. Nothing gets worse. It is the only change measured here that
+helps all ten.
+
+It is still not the default, and there is no build switch for it. Two reasons, and the second is the
+binding one. It gives up ASLR on the executable image, which is a real hardening loss for a runtime
+that executes other people's code. And **both interpreters this project benchmarks against ship
+PIE** -- `luajit` and `luau` are each `pie executable` on the test machine -- so taking it would
+report a build-flag difference as an interpreter win. Same rules, or the number means nothing.
+
+Recorded because the underlying cost is real and worth knowing: on a computed-goto interpreter,
+position independence is a per-dispatch tax, not a one-off.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
