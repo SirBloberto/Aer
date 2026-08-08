@@ -906,8 +906,10 @@ typedef struct {
 
 /* Per-call register frame; lives in the VM struct so a nested module VM gets its own chain. */
 typedef struct {
-    /* Bump-pointer base into vm->register_stack -- a call is a pointer add, never an allocation. */
-    AerVal* registers;
+    /* Bump-pointer base into vm->register_stack -- a call is a pointer add, never an allocation.
+       _Alignas rounds sizeof(CallFrame) up to 64 (44 real bytes on 32-bit ARM, 57 on 64-bit); see
+       the power-of-two assert below for why that matters. */
+    _Alignas(64) AerVal* registers;
     /* Registers THIS frame reserved (callee's compile-time peak; FRAME_REGISTERS for frame 0) --
        read by the next push. */
     unsigned int frame_size;
@@ -929,6 +931,10 @@ typedef struct {
     unsigned int tail_calls_collapsed; /* tail calls collapsed into this frame since its last real push */
     bool synthetic_entry; /* true for a setup_call()-pushed frame -- return_ip isn't a real caller line */
 } CallFrame;
+/* Indexing call_stack[] is `base + depth * sizeof(CallFrame)`, and at 44 bytes that compiled to a
+   multiply plus a materialized constant per field on 32-bit ARM. A power of two makes it a shift. */
+_Static_assert((sizeof(CallFrame) & (sizeof(CallFrame) - 1)) == 0,
+               "CallFrame must stay a power of two -- see CALL_FRAME_PAD");
 /* Regression guard: raw_ints/raw_reals used to be fixed inline arrays here (RAW_REGISTERS_INT +
    RAW_REGISTERS_REAL int64_t/double slots each), costing every single frame ~550+ bytes whether or
    not that function used any raw locals at all. They're pointers into a shared VM-level bump-pointer
