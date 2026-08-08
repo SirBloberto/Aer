@@ -978,8 +978,18 @@ at 129 instructions**, and 19.3% in `lbl_return` at 43. Reading those 129 instru
 they were actually spending it on, and it was not the frame writes:
 
 - `CallFrame` was **44 bytes, not a power of two**, so `call_stack[depth]` compiled to a multiply --
-  two `mla`s per call -- instead of a shift. `_Alignas(64)` on the first member rounds it up:
-  **fib_bench -3.26% instructions, binary_trees -1.23%**, nothing else moved.
+  two `mla`s per call -- instead of a shift. Rounding it up to 64: **fib_bench -3.26% instructions,
+  binary_trees -1.23%**, nothing else moved.
+
+  **Correction, found later by UBSan.** This was first done with `_Alignas(64)` on the first member,
+  which gets the size but also raises the type's *alignment* -- and that requirement propagates to
+  `struct VM`. `aer_module.c` allocates module VMs with plain `xmalloc` (8-byte aligned on 32-bit
+  ARM), so **every module VM was undefined behaviour**, and `VM` is a complete type in the public
+  header, so any embedder calling `malloc(sizeof(VM))` hit the same trap silently. It now pads via an
+  anonymous union with a `char[64]` member: same 64-byte size, alignment left at the members' natural
+  8. That costs **fib_bench +0.87%, binary_trees +0.29%** of the win back, because the compiler can no
+  longer assume the frame array is 64-byte aligned. Paid deliberately -- a public struct that is UB to
+  heap-allocate is not a trade worth 0.87%.
 - A Thumb-2 `ldr` reaches a **12-bit displacement**, and `registers`/`raw_ints`/`raw_reals`/
   `call_depth` sat past 10000 bytes into `VM`, behind `heap`, `stack[256]` and `call_stack`. Moving
   just those four (16 bytes) to the front: another **-2.99% and -1.31%**.
