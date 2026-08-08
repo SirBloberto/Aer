@@ -972,9 +972,29 @@ And a portability note: gcc 16.1 **ICEs** (`tree-if-conv.cc`, `factor_out_operat
 `vm_run_slice`'s hoisted locals are live across a call at a return point, so `vm_publish_frame` reads
 the live `CallFrame` instead of taking them as arguments.
 
-The conclusion after four attempts stands: **the call path is not micro-optimizable.** The remaining
-lever is fewer dispatches per call, which means fusion, which means a new opcode -- and 5.16d prices
-that at about 3%.
+**What did work was the address arithmetic, not the instruction count.** Attributing `fib`'s profile
+per handler (segment `perf annotate` on the dispatch `bx`) put **36.3% of cycles in `lbl_call` alone,
+at 129 instructions**, and 19.3% in `lbl_return` at 43. Reading those 129 instructions showed what
+they were actually spending it on, and it was not the frame writes:
+
+- `CallFrame` was **44 bytes, not a power of two**, so `call_stack[depth]` compiled to a multiply --
+  two `mla`s per call -- instead of a shift. `_Alignas(64)` on the first member rounds it up:
+  **fib_bench -3.26% instructions, binary_trees -1.23%**, nothing else moved.
+- A Thumb-2 `ldr` reaches a **12-bit displacement**, and `registers`/`raw_ints`/`raw_reals`/
+  `call_depth` sat past 10000 bytes into `VM`, behind `heap`, `stack[256]` and `call_stack`. Moving
+  just those four (16 bytes) to the front: another **-2.99% and -1.31%**.
+
+Together: **fib_bench -6.2% instructions, -11.4% cycles, 2.65s -> 2.35s**, and `binary_trees` -2.5%
+instructions to 1.14s -- level with LuaJIT's interpreter (1.13s), from 4% behind.
+
+Note the shape of the displacement budget, because it bites: moving `call_stack` itself to the front
+bought `fib_bench` a further 5.79% and cost seven other benchmarks 0.4-3.8%. At 4096 bytes it fills
+the entire 12-bit window on its own and pushes `heap` -- which every allocating opcode touches --
+back out. Reverted. Only small, hot scalars are worth the front of that struct.
+
+What remains in `lbl_call` (now 114 instructions, 30.4%) is structural: the 16-byte `AerVal`
+argument copy (`ldmia`, 4.7%) and `vm` reloading from a stack spill in `lbl_return` (5.2%). Beyond
+those, the lever is fewer dispatches per call -- fusion, a new opcode, priced at about 3% by 5.16d.
 
 **How much of the opcode table is actually redundant: four opcodes, not 76.** A census across
 `bench/` + `tests/` (per-opcode dispatch counts from the debug build) shows 76 of 153 dispatchable
