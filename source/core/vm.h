@@ -945,11 +945,19 @@ _Static_assert(sizeof(CallFrame) <= 96,
                "VM-level raw_int_stack/raw_real_stack, not fixed inline per-frame arrays");
 
 typedef struct {
+    /* Deliberately first. A Thumb-2 `ldr` reaches a 12-bit unsigned displacement; anything past 4095
+       needs its offset materialized into a register first, and lbl_call touches five distinct
+       CallFrame fields, so with call_stack further down it paid five `movw`s per call. Everything
+       the dispatch loop touches per call/return goes here, before the two big arrays. */
+    CallFrame call_stack[VM_CALL_MAX];
+    /* Always point at call_stack[call_depth]'s arrays -- repointed together on call/return. */
+    AerVal* registers;
+    int64_t* raw_ints;
+    double* raw_reals;
+    int call_depth;
+
     Chunk* chunk;
     unsigned int ip;
-
-    /* This VM's own heap -- every pool it allocates from, independent of every other VM's. */
-    VmHeap heap;
 
     /* Per-VM capability toggles, seeded from the process-wide aer_io_enabled/aer_net_enabled
        defaults at vm_init AND every aer_run_source call (the REPL/embedding "run more code into an
@@ -962,12 +970,8 @@ typedef struct {
     AerVal stack[VM_STACK_MAX];
     int stack_top;
 
-    /* Always point at call_stack[call_depth]'s arrays -- repointed together on call/return. */
-    CallFrame call_stack[VM_CALL_MAX];
-    AerVal* registers;
-    int64_t* raw_ints;
-    double* raw_reals;
-    int call_depth;
+    /* This VM's own heap -- every pool it allocates from, independent of every other VM's. */
+    VmHeap heap;
 
     /* One shared register bank for the whole chain (calls bump a base pointer). Same worst-case
        size as a flat design, but the actually-touched working set is far smaller. */
