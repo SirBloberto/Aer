@@ -573,6 +573,11 @@ static inline __attribute__((always_inline)) AerVal vm_promote_real(AerVal v) {
    The int32 narrowing is a real win on 32-bit ARM, where a 64-bit modulo is a libgcc call. rv != -1
    is required, not incidental: INT32_MIN % -1 overflows at 32-bit width but not at 64. */
 static inline int64_t aer_mod_int64(int64_t l, int64_t rv) {
+    /* Both operands non-negative is the overwhelmingly common shape, and it is worth its own path
+       twice over on 32-bit ARM: the unsigned divide skips the sign handling libgcc's signed one does
+       around it, and a non-negative remainder never needs the flooring correction below. */
+    if (l >= 0 && rv > 0 && l <= (int64_t)UINT32_MAX && rv <= (int64_t)UINT32_MAX)
+        return (int64_t)((uint32_t)l % (uint32_t)rv);
     int64_t r;
     if (rv != -1 && l >= INT32_MIN && l <= INT32_MAX && rv >= INT32_MIN && rv <= INT32_MAX)
         r = (int32_t)l % (int32_t)rv;
