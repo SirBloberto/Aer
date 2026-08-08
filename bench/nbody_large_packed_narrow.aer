@@ -97,9 +97,12 @@ for i in 0..N:
 
 start = time.now()
 offset_momentum(bodies, N)
-a = energy(bodies)
+energy_before = energy(bodies)
 for step in 0..STEPS:
     advance(bodies, 0.01)
-a = energy(bodies)
+energy_after = energy(bodies)
 dur = time.now() - start
 print("Took: {dur}s")
+# Close encounters make this system chaotic, so float32 rounding diverges macroscopically over the
+# run -- only energy_before is comparable against the float64 variants, not energy_after.
+print("energy: {energy_before} -> {energy_after}")

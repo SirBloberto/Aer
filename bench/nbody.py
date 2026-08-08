@@ -117,4 +117,5 @@ def main(n, ref="sun"):
 
 
 if __name__ == "__main__":
-    main(int(sys.argv[1]))
+    # 650000 is the step count nbody.aer and nbody.lua also run.
+    main(int(sys.argv[1]) if len(sys.argv) > 1 else 650000)

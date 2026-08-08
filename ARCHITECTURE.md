@@ -1295,6 +1295,58 @@ the sharpest measurement yet of what 5.16h describes: this handler is at its reg
 limit, and anything added to it is paid for by every call in every program, executed or not. Adding
 to `lbl_call` needs a win larger than ~4% on the benchmark it targets before it breaks even.
 
+### 5.16m The module-call path: where nbody's 9.6% goes, and why it stays there
+
+`math.sqrt` is 9.6% of `nbody` across `vm_call_module_dispatch` + `aer_math_call` +
+`math_pop_double`, over 11.5M `OP_CALL_MODULE` dispatches -- roughly 80 instructions for a
+`double -> double`. Reading the whole path end to end:
+
+1. `lbl_call_module` reads three operand words, then `PUSH`es each argument onto `vm->stack` with a
+   bounds check;
+2. a `noinline` **seven-argument** call into `vm_call_module_dispatch`, which switches on `module_id`;
+3. `aer_math_call` matches `fn_id` down an if-chain, then `math_pop_double` pops (bounds-checked);
+4. `math_unary` switches on **the same `fn_id` a second time**;
+5. the result is pushed (bounds-checked), then `lbl_call_module` pops it back into a register.
+
+So the value travels **register -> vm->stack -> local double -> vm->stack -> register**: four
+bounds-checked 16-byte transfers where one move would do. Note the if-chain is *not* nbody's problem
+-- `FN_MATH_SQRT` is 0 and first in the chain, so it matches immediately.
+
+Costed before building, per the "measure before building" rule. The three changes available without
+touching the module ABI or adding an opcode: passing `c`/`module_idx`/`fn_idx` lazily (they are used
+only by the dynamic-host fallback and the not-found error, but 32-bit ARM puts the 5th argument
+onward on the stack) ~0.36%; hoisting the per-argument `PUSH` bounds check ~0.24%; collapsing the
+duplicate `fn_id` dispatch ~0.36%. **Combined ceiling ~0.95%**, and that assumes every saved
+instruction is real.
+
+That is below the 1% bar this step was given, so it was not built. What is left is the four stack
+round-trips, and removing those means either changing the module ABI so arguments pass in registers
+(every module function signature) or a fused opcode for 1-argument numeric math -- and 5.16i prices
+a new opcode at more than it returns. `nbody` already beats both comparison interpreters, so this is
+recorded rather than pursued.
+
+### 5.16n Five benchmarks measured a result nothing checked
+
+`nbody.aer`, the three `nbody_large_*` variants and `typed_array_bench` all computed a result into a
+variable and then printed only their timing. A benchmark whose output cannot change when its answer
+changes measures speed at the cost of being unable to notice a wrong answer -- and two ports had
+already been caught doing exactly that (`nbody.lua`'s 500x scale bug, and `nbody.py` raising
+`IndexError` on `sys.argv[1]` while scoring a bogus 0.28s in a five-way comparison).
+
+All five now print their result after the timing is captured, so validation costs the measurement
+nothing. `nbody.aer` matches `nbody.lua` to every digit Lua prints (`-0.169075164`/`-0.169096160`).
+
+The layout variants are the reason this mattered most: `nbody_large_boxed` and `nbody_large_packed`
+agree exactly (`-4.0182e-06 -> 30931.1`), which is the check that the packed representation computes
+what the boxed one does. `nbody_large_packed_narrow` agrees only on the *initial* energy
+(`-4.01819e-06`) and ends at `1.84e+07` against the float64 pair's `30931.1`. That is not a bug:
+1024 bodies over 20 steps have close encounters, and a `1/r^2` singularity amplifies float32 rounding
+macroscopically. Only the initial energy is comparable across field widths; the final one is a
+per-variant determinism check.
+
+`typed_array_bench` initially printed `xs[0]`, which its `xs[k] = k * 0.5` fill makes permanently
+`0.0` -- a checksum that could never fail. It prints `total` and `xs[N-1]` instead.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a

@@ -93,9 +93,10 @@ for i in 0..N:
 
 start = time.now()
 offset_momentum(bodies, N)
-a = energy(bodies)
+energy_before = energy(bodies)
 for step in 0..STEPS:
     advance(bodies, 0.01)
-a = energy(bodies)
+energy_after = energy(bodies)
 dur = time.now() - start
 print("Took: {dur}s")
+print("energy: {energy_before} -> {energy_after}")

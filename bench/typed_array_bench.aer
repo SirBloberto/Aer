@@ -28,3 +28,5 @@ for pass in 0..200:
     total = scale_and_accumulate(xs, 1.0000001)
 dur = time.now() - start
 print("Took: {dur}s")
+last = xs[N - 1]
+print("total={total}, xs[N-1]={last}")

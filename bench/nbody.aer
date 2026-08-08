@@ -123,9 +123,11 @@ bodies[4].mass = 5.15138902046611451e-05 * SOLAR_MASS
 
 start = time.now()
 offset_momentum(bodies, SOLAR_MASS)
-a = energy(bodies)
+energy_before = energy(bodies)
 for i in 0..650000:
     advance(bodies, 0.01)
-a = energy(bodies)
+energy_after = energy(bodies)
 dur = time.now() - start
+# Printed after the timing is captured so validating the result costs the measurement nothing.
 print("Took: {dur}s")
+print("energy: {energy_before} -> {energy_after}")
