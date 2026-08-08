@@ -2636,7 +2636,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_JUMP_IF_FALSE_REG] = &&lbl_jump_if_false_reg,
         [OP_CALL] = &&lbl_call,
         [OP_CALL_VALUE] = &&lbl_call_value,
-        [OP_TAIL_CALL] = &&lbl_call,
+        [OP_TAIL_CALL] = &&lbl_tail_call,
         [OP_TAIL_CALL_VALUE] = &&lbl_call_value,
         [OP_CALL_MODULE] = &&lbl_call_module,
         [OP_CALL_BUILTIN] = &&lbl_call_builtin,
@@ -3042,32 +3042,6 @@ lbl_call : {
        flat, function-agnostic ceiling. */
     unsigned int func_index = (unsigned int)READ();
     ChunkFunction* target_f = &functions[func_index];
-    /* Tail-call reuse -- the copy iterates with dest_i always <= source_i, the same
-       always-safe-forward-shift pattern memmove uses when dest <= src, so no overlap
-       special-casing is needed. */
-    if (cur_op == OP_TAIL_CALL) {
-        for (int i = 0; i < arg_count; i++)
-            registers[i] = registers[arg_reg_base + i];
-        ip = (unsigned int)callee_offset;
-        CallFrame* reused = &vm->call_stack[vm->call_depth];
-        reused->code_offset = (unsigned int)callee_offset; /* reused frame now runs a different function */
-        /* The reused frame's sizing belongs to whatever function last occupied it, and a tail call
-           can land on one with a different peak. Left stale, a later real call from inside this
-           frame computes its child's base from the wrong frame_size and overlaps still-live slots.
-           The base pointers are untouched -- same frame, same memory, only the claim changes. */
-        reused->frame_size = target_f->max_registers;
-        reused->raw_int_frame_size = target_f->max_raw_ints;
-        reused->raw_real_frame_size = target_f->max_raw_reals;
-        reused->tail_calls_collapsed++;
-        /* Every call (tail or not) is the other place a script can spend unbounded time
-           (recursion instead of a loop) -- checked once ip already points at the callee's real
-           entry point, so a yield here always resumes at a valid instruction boundary. */
-        if (max_instructions && --slice_budget == 0) {
-            vm->ip = ip;
-            SLICE_RETURN(VM_SLICE_YIELDED);
-        }
-        DISPATCH();
-    }
     if (vm->call_depth + 1 >= VM_CALL_MAX) {
         error("v3 call stack overflow");
         DISPATCH();
@@ -3121,6 +3095,40 @@ lbl_call : {
     raw_ints = vm->raw_ints;
     raw_reals = vm->raw_reals;
     ip = chosen_offset;
+    if (max_instructions && --slice_budget == 0) {
+        vm->ip = ip;
+        SLICE_RETURN(VM_SLICE_YIELDED);
+    }
+    DISPATCH();
+}
+
+/* Its own label rather than a branch inside lbl_call. OP_CALL and OP_TAIL_CALL used to share one,
+   so every ordinary call tested `cur_op == OP_TAIL_CALL` and carried this body in its live range --
+   35.5M ordinary calls across the benchmark suite against zero tail calls. Reuses the current frame
+   instead of pushing, so it needs none of lbl_call's sizing or base-pointer work. */
+lbl_tail_call : {
+    int arg_reg_base = (int)UNPACK_B(op_word);
+    int arg_count = (int)UNPACK_C(op_word);
+    int callee_offset = READ();
+    ChunkFunction* target_f = &functions[(unsigned int)READ()];
+    /* The copy iterates with dest_i always <= source_i, the same always-safe-forward-shift pattern
+       memmove uses when dest <= src, so no overlap special-casing is needed. */
+    for (int i = 0; i < arg_count; i++)
+        registers[i] = registers[arg_reg_base + i];
+    ip = (unsigned int)callee_offset;
+    CallFrame* reused = &vm->call_stack[vm->call_depth];
+    reused->code_offset = (unsigned int)callee_offset; /* reused frame now runs a different function */
+    /* The reused frame's sizing belongs to whatever function last occupied it, and a tail call can
+       land on one with a different peak. Left stale, a later real call from inside this frame
+       computes its child's base from the wrong frame_size and overlaps still-live slots. The base
+       pointers are untouched -- same frame, same memory, only the claim changes. */
+    reused->frame_size = target_f->max_registers;
+    reused->raw_int_frame_size = target_f->max_raw_ints;
+    reused->raw_real_frame_size = target_f->max_raw_reals;
+    reused->tail_calls_collapsed++;
+    /* Every call (tail or not) is the other place a script can spend unbounded time (recursion
+       instead of a loop) -- checked once ip already points at the callee's real entry point, so a
+       yield here always resumes at a valid instruction boundary. */
     if (max_instructions && --slice_budget == 0) {
         vm->ip = ip;
         SLICE_RETURN(VM_SLICE_YIELDED);
