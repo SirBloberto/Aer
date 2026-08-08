@@ -2519,6 +2519,9 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
        vm_call_resolve_specialization can grow the chunk mid-slice (it re-enters the parser), and it
        refreshes this immediately after. */
     const uint32_t* code = c->code;
+    /* Same deal, and it reallocs at the same one place: lbl_call indexes it on every single
+       call, and reaching it through c meant reloading c from its spill slot each time. */
+    ChunkFunction* functions = c->functions;
     /* Hoists the three pointers that are stable for the whole call and change only at the 3
        call/return sites below. vm->raw_reals' own reload was among the hottest instructions in the
        dispatch loop (perf annotate, nbody). The backing stacks are fixed-size inline VM arrays,
@@ -3038,7 +3041,7 @@ lbl_call : {
        callee's frame from its real max_registers/max_raw_ints/max_raw_reals peaks instead of a
        flat, function-agnostic ceiling. */
     unsigned int func_index = (unsigned int)READ();
-    ChunkFunction* target_f = &c->functions[func_index];
+    ChunkFunction* target_f = &functions[func_index];
     /* Tail-call reuse -- the copy iterates with dest_i always <= source_i, the same
        always-safe-forward-shift pattern memmove uses when dest <= src, so no overlap
        special-casing is needed. */
@@ -3091,7 +3094,8 @@ lbl_call : {
         chosen_max_registers = spec_registers;
         chosen_max_raw_ints = spec_raw_ints;
         chosen_max_raw_reals = spec_raw_reals;
-        code = c->code; /* compiling a specialized body can realloc it */
+        code = c->code; /* compiling a specialized body can realloc both */
+        functions = c->functions;
     }
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];
