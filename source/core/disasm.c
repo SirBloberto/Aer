@@ -35,8 +35,8 @@ typedef struct {
     int packed;
 } OpInfo;
 
-/* OP_SUB_RC is the last member of the Opcode enum (vm.h). */
-#define OP_INFO_MAX OP_SUB_RC
+/* OP_INDEX_GET_INTERP is the last member of the Opcode enum (vm.h). */
+#define OP_INFO_MAX OP_INDEX_GET_INTERP
 
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
     /* OP_ADD..OP_IN: one opcode per operator, whole instruction in one word (PACK3 + RK8 pair) --
@@ -416,7 +416,6 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_INTERP] = {"OP_INTERP", "reg = one string built from N parts", {0}, false, 0, 2},
     [OP_INDEX_GET_INTERP] =
         {"OP_INDEX_GET_INTERP", "reg = dict[N-part key], key never allocated", {0}, false, 0, 3},
-    [OP_SUB_RC] = {"OP_SUB_RC", "reg = reg - const (no rk decode)", {FLD_REG, FLD_REG, FLD_COUNT}, false, 0, 3},
     [OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE] =
         {"OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi < rk) (tag-checked)", {0}, false, 1, 0},
     [OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE] =

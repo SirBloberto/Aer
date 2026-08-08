@@ -2611,7 +2611,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
            real top-level dispatch targets (true single-level dispatch, PACK_BINARY). */
         [OP_ADD] = &&lbl_add,
         [OP_SUB] = &&lbl_sub,
-        [OP_SUB_RC] = &&lbl_sub_rc,
         [OP_MUL] = &&lbl_mul,
         [OP_DIV] = &&lbl_div,
         [OP_MOD] = &&lbl_mod,
@@ -2888,28 +2887,6 @@ lbl_is_result : {
         }                                                                                                    \
         DISPATCH();                                                                                          \
     }
-/* PROBE (5.16i): same body, but the operand kinds are compile-time known so neither operand pays
-   the RK8 register-vs-constant test. 16 of a binary op's 44 instructions were that decode. */
-#define BINARY_OP_INT_REAL_RC(NAME, OPENUM, INT_STMT, REAL_STMT)                                             \
-    lbl_##NAME##_rc : {                                                                                      \
-        int dest = (int)UNPACK_A(op_word);                                                                   \
-        AerVal* ra = &registers[UNPACK_B(op_word)];                                                          \
-        AerVal* rb = &const_pool[UNPACK_C(op_word)];                                                         \
-        ValueType ta = ra->tag, tb = rb->tag;                                                                \
-        AerVal* result = &registers[dest];                                                                   \
-        if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) {                                                      \
-            int64_t l = ra->as.i, rv = rb->as.i;                                                             \
-            INT_STMT                                                                                         \
-        } else if (ta == TYPE_REAL && tb == TYPE_REAL) {                                                     \
-            double l = ra->as.d, rv = rb->as.d;                                                              \
-            REAL_STMT                                                                                        \
-        } else {                                                                                             \
-            *result = vm_binary_cold(c, *ra, *rb, OPENUM, ta, tb);                                           \
-            gc_maybe_collect(vm);                                                                            \
-        }                                                                                                    \
-        DISPATCH();                                                                                          \
-    }
-
 /* Bitwise family never allocates in any branch, so no gc_maybe_collect at all. */
 #define BINARY_OP_INT_ONLY(NAME, OPENUM, INT_STMT)                                                           \
     lbl_##NAME : {                                                                                           \
@@ -2930,8 +2907,6 @@ lbl_is_result : {
     BINARY_OP_INT_REAL(
         add, OP_ADD, { *result = aer_int(l + rv); }, { *result = aer_real(l + rv); })
     BINARY_OP_INT_REAL(
-        sub, OP_SUB, { *result = aer_int(l - rv); }, { *result = aer_real(l - rv); })
-    BINARY_OP_INT_REAL_RC(
         sub, OP_SUB, { *result = aer_int(l - rv); }, { *result = aer_real(l - rv); })
     BINARY_OP_INT_REAL(
         mul, OP_MUL, { *result = aer_int(l * rv); }, { *result = aer_real(l * rv); })

@@ -1145,6 +1145,37 @@ by writing the interpreter in assembly and pinning BASE/PC/DISPATCH to fixed reg
 amount of C-level restructuring reproduces. Further progress here means removing hot uses one at a
 time -- worth 0.4-4.5% each and getting scarcer -- not another structural attempt.
 
+### 5.16i Per-operand-kind opcodes are not worth it (measured with a single probe)
+
+The standing hypothesis for closing the remaining gap to LuaJIT's interpreter was to split binary
+operators by operand kind, the way LuaJIT has `ADDVV`/`ADDVN`/`ADDNV`. The reasoning looked strong:
+disassembling a boxed subtract showed **44 instructions, of which 16 were RK operand decode** -- the
+register-vs-constant test, twice -- against only 6 doing the arithmetic. Removing that from the
+`fib_bench` shape (`n - 1`, `n - 2`, 29.9M executions) should have been worth ~7%.
+
+Rather than build the whole family (16-20 opcodes), one probe: `OP_SUB_RC`, a reg-minus-const
+subtract reading `registers[b]` and `const_pool[c]` directly. It compiled, gated clean at 154/154
+coverage, and fired 29,860,702 times in `fib_bench` -- exactly replacing `OP_SUB`.
+
+**`fib_bench` -1.95%. Nine other benchmarks regressed 0.5-4.7%** (`mandelbrot` +4.72%, `nbody`
++2.72%, `struct_array_scan` +1.98%). Net clearly negative, and reverted.
+
+Two things worth keeping from it:
+
+**The decode is not worth what it looks like.** 1.95% of 6.889B over 29.86M executions is **4.5
+instructions saved per subtract, not 16.** gcc had already collapsed most of that decode -- it is
+branchless `ite` predication that pipelines well, not 16 independent instructions. Reading an
+instruction count off a disassembly listing overestimated the real cost by 3.5x.
+
+**And the per-opcode tax is larger than the per-opcode win.** One addition cost nine unrelated
+benchmarks more than it gained on its target, which is the same ~3% layout roll 5.16d measured from
+the other direction. Scaling to 16-20 opcodes multiplies the tax while the wins stay confined to
+whichever shapes each one covers.
+
+So the last structural idea on the list is closed. LuaJIT's advantage here is not the opcode split by
+itself -- it is that a hand-written assembly interpreter pays no layout lottery and no register
+pressure, so the split is free for them and costs us more than it returns.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
