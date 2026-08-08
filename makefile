@@ -61,6 +61,7 @@ TESTS := tests/test_core.aer \
          tests/test_raw_const_cmp_fusion.aer \
          tests/test_interp_dict_keys.aer \
          tests/test_gc_raw_frames.aer \
+         tests/test_nonneg_range_start.aer \
          tests/test_struct_pool_tiers.aer \
          tests/test_primitive_pass.aer \
          tests/test_dict_pool_stress.aer \

@@ -48,7 +48,8 @@ unsigned int emit_iter_next_pair(Chunk* c, int col_reg, int idx_reg, int key_des
 
 /* Rotated range-for. cur/end/step MUST be loop-owned snapshot registers, never an alias to a
    variable's register. prep returns the empty-range exit patch offset. */
-unsigned int emit_iter_range_prep(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg);
+unsigned int emit_iter_range_prep(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg,
+                                  bool guard_nonneg);
 void emit_iter_range_loop(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg,
                           unsigned int body_target);
 

@@ -81,6 +81,12 @@ typedef struct Parser {
        standalone comment (git blame) for the full mechanism; consulted at '.field'/'[idx].field'
        emission sites to skip the generic runtime field-resolution path entirely. */
     Shape* reg_known_shape[FRAME_REGISTERS];
+    /* True when this register is PROVEN to hold a value >= 0 -- a non-negative literal, a loop
+       index already bounded by its array, a length(), or those combined with + * // %. Read by
+       the range-for bounds proof to accept a computed start. Conservative in one direction only:
+       a false negative just declines an optimisation, and a false POSITIVE is caught at runtime
+       by OP_ITER_RANGE_PREP's cur >= 0 guard, so this can never be a safety hole. */
+    bool reg_nonneg[FRAME_REGISTERS];
     Shape* reg_known_element_shape[FRAME_REGISTERS];
     /* Side-channel from the plain index-get site to parse_assignment's plain '=' handler -- see
        last_plain_index_dest_reg's original standalone comment (git blame) for why this is keyed
@@ -242,6 +248,7 @@ int reg_alloc(void) {
         return FRAME_REGISTERS - 1;
     }
     int reg = P.next_temp_register++;
+    P.reg_nonneg[reg] = false; /* a recycled register carries no proof from its last occupant */
     track_peak(P.next_temp_register);
     if (P.next_temp_register > P.loop_cond_peak) P.loop_cond_peak = P.next_temp_register;
     return reg;
@@ -298,6 +305,24 @@ static int materialize(Chunk* c, int rk);
 /* Forward-declared so emit_cond_jump_if_false (below) can come before it. */
 static bool is_temp(int rk);
 
+/* True when this operand is provably >= 0 -- see Parser.reg_nonneg. Raw slots are deliberately
+   not tracked; they take the ordinary path. */
+static bool rk_nonneg(Chunk* c, int rk) {
+    if (rk & RK_CONST_FLAG) {
+        AerVal v = c->pool[rk & ~RK_CONST_FLAG];
+        return aer_type(v) == TYPE_INTEGER && aer_as_int(v) >= 0;
+    }
+    if (rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
+    return rk >= 0 && rk < FRAME_REGISTERS && P.reg_nonneg[rk];
+}
+
+/* Non-negativity survives + * // and %, and only those: subtraction and left-shift can produce a
+   negative from non-negative operands. Overflow can too, which is why the range-for guard exists
+   rather than trying to reason about it here. */
+static bool binop_preserves_nonneg(Opcode op) {
+    return op == OP_ADD || op == OP_MUL || op == OP_FLOOR_DIV || op == OP_MOD;
+}
+
 static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
     rk_lhs = box_if_raw(c, rk_lhs);
     rk_rhs = box_if_raw(c, rk_rhs);
@@ -313,6 +338,8 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
         rk_rhs = materialize(c, rk_rhs);
         spilled++;
     }
+    if (dest >= 0 && dest < FRAME_REGISTERS)
+        P.reg_nonneg[dest] = binop_preserves_nonneg(op) && rk_nonneg(c, rk_lhs) && rk_nonneg(c, rk_rhs);
     P.last_cmp_offset = c->count;
     chunk_emit(c, PACK3(op, dest, pack_rk8(rk_lhs), pack_rk8(rk_rhs)));
     if (spilled) reg_free(spilled);
@@ -507,9 +534,13 @@ unsigned int emit_iter_next_pair(Chunk* c, int col_reg, int idx_reg, int key_des
 }
 
 /* Loop-rotated range-for pair, used only by parse_for_in's `for i in a..b..step:` form. */
-unsigned int emit_iter_range_prep(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg) {
+/* guard_nonneg rides in the item_dest word's spare high bits -- the register index needs 8 of its 32.
+   Set when the body was compiled with unchecked indexing on a proven non-negative start, so PREP
+   re-checks that once at loop entry; see RANGE_PREP_GUARD_NONNEG (vm.h). */
+unsigned int emit_iter_range_prep(Chunk* c, int cur_reg, int end_reg, int step_reg, int item_dest_reg,
+                                  bool guard_nonneg) {
     chunk_emit(c, PACK3(OP_ITER_RANGE_PREP, cur_reg, end_reg, step_reg));
-    chunk_emit(c, (uint32_t)item_dest_reg);
+    chunk_emit(c, (uint32_t)item_dest_reg | (guard_nonneg ? RANGE_PREP_GUARD_NONNEG : 0u));
     unsigned int patch_offset = c->count;
     chunk_emit(c, 0); /* placeholder -- patched once the loop's overall exit address is known */
     return patch_offset;
@@ -639,6 +670,7 @@ static bool index_safe_unchecked(int arr_reg, int idx_rk) {
 static void invalidate_register(int reg) {
     if (reg < 0) return;
     if (P.length_tracked_valid && reg == P.length_tracked_source_reg) P.length_tracked_valid = false;
+    if (reg < FRAME_REGISTERS) P.reg_nonneg[reg] = false;
     for (int i = 0; i < P.safe_loop_depth; i++) {
         if (P.safe_loop_item_regs[i] == reg) P.safe_loop_item_regs[i] = -1;
         if (P.safe_loop_array_regs[i] == reg) P.safe_loop_array_regs[i] = -1;
@@ -3500,7 +3532,6 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
        later `for i in 0..n:` would otherwise trust the stale leftover. */
     if (P.length_tracked_valid && loop_var_name == P.length_tracked_name) P.length_tracked_valid = false;
 
-    unsigned int start_code_begin = c->count;
     int rk_start = parse_binary(c, 0); /* the range's start, or the whole collection if no '..' follows */
 
     /* Direction is inferred at runtime from cur vs end, not step's sign. `..` is for-loop-specific
@@ -3533,52 +3564,12 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
                 }
             }
         }
-        bool start_safe = false;
-        if (bound_safe) {
-            if (rk_start & RK_CONST_FLAG) {
-                /* Any non-negative literal start is exactly as safe as the 0 case this originally
-                   only recognized -- the produced index sequence is still bounded below by this
-                   same non-negative constant, and bound_safe already proves the upper bound. Not
-                   just the common `for i in 0..n:` shape anymore -- covers `for p in 2..n:` (a
-                   sieve-of-Eratosthenes-shaped loop skipping the first couple of indices) too. */
-                AerVal startv = c->pool[rk_start & ~RK_CONST_FLAG];
-                start_safe = (aer_type(startv) == TYPE_INTEGER && aer_as_int(startv) >= 0);
-            } else if (!(rk_start & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) {
-                for (int si = 0; si < P.safe_loop_depth; si++) {
-                    if (P.safe_loop_item_regs[si] == rk_start &&
-                        P.safe_loop_array_regs[si] == bound_array_reg) {
-                        start_safe = true;
-                        break;
-                    }
-                }
-                /* Not a bare safe register -- check for exactly "safe_reg + non-negative-const",
-                   the one instruction a `(i+1)` start compiles to (emit_binary, parser.c). Decoded
-                   from the just-emitted word rather than matched syntactically, since this parser
-                   compiles expressions directly with no separate AST pass to inspect. */
-                if (!start_safe && c->count - start_code_begin == 1) {
-                    uint32_t w = c->code[start_code_begin];
-                    if ((w & 0xFF) == OP_ADD && (int)UNPACK_A(w) == rk_start) {
-                        uint8_t lhs8 = (uint8_t)UNPACK_B(w), rhs8 = (uint8_t)UNPACK_C(w);
-                        if (!RK8_IS_CONST(lhs8) && RK8_IS_CONST(rhs8)) {
-                            int lhs_reg = RK8_INDEX(lhs8);
-                            bool lhs_active_safe = false;
-                            for (int si = 0; si < P.safe_loop_depth; si++) {
-                                if (P.safe_loop_item_regs[si] == lhs_reg &&
-                                    P.safe_loop_array_regs[si] == bound_array_reg) {
-                                    lhs_active_safe = true;
-                                    break;
-                                }
-                            }
-                            if (lhs_active_safe) {
-                                AerVal rhsv = c->pool[RK8_INDEX(rhs8)];
-                                if (aer_type(rhsv) == TYPE_INTEGER && aer_as_int(rhsv) >= 0)
-                                    start_safe = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        /* bound_safe proves the upper bound (the end IS length(arr)); this proves the lower one. Any
+           expression the compiler can show is >= 0 will do -- see Parser.reg_nonneg, which replaced
+           three hand-decoded special cases (literal, bare safe register, and `safe_reg + const`
+           matched by inspecting the emitted OP_ADD word) with one composable predicate. It now also
+           covers `p*p`, `i*i+j`, `(p+1)*2` and anything else built from + * // %. */
+        bool start_safe = bound_safe && rk_nonneg(c, rk_start);
         bool this_loop_safe = bound_safe && start_safe && P.safe_loop_depth < LOOP_MAX;
 
         /* Snapshotted once, matching Lua/Python's range-for semantics -- a later mutation of the
@@ -3598,7 +3589,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
 
         /* Loop-rotated: PREP once before the loop, LOOP at the bottom of the body -- the one form
            whose continue must defer-patch instead of jumping to a known target. */
-        unsigned int patch_empty = emit_iter_range_prep(c, cur_reg, end_reg, step_reg, item_reg);
+        unsigned int patch_empty =
+            emit_iter_range_prep(c, cur_reg, end_reg, step_reg, item_reg, this_loop_safe);
 
         if (!loop_push_rotated()) {
             P.reserved_floor = saved_reserved_floor;
@@ -3611,6 +3603,9 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
             P.safe_loop_array_regs[P.safe_loop_depth] = bound_array_reg;
             P.safe_loop_item_regs[P.safe_loop_depth] = item_reg;
             P.safe_loop_depth++;
+            /* Accepting the loop required a non-negative start, and the step is positive, so
+               every value this register takes is >= 0. */
+            if (item_reg >= 0 && item_reg < FRAME_REGISTERS) P.reg_nonneg[item_reg] = true;
         }
         unsigned int body_start = c->count;
         parse_block(c);
@@ -4050,6 +4045,7 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
     P.last_length_call_result_reg = -1;
     P.last_length_call_arg_reg = -1;
     if (call_id == CALL_BUILTIN_LENGTH && arg_count == 1) {
+        if (dest >= 0 && dest < FRAME_REGISTERS) P.reg_nonneg[dest] = true; /* a count */
         int arg_orig_reg = base;
         if (arg_code_end - arg_code_begin == 1) {
             uint32_t w = c->code[arg_code_begin];

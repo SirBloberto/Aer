@@ -1,0 +1,134 @@
+#!/usr/bin/env aer
+# AER test suite — the range-for bounds proof over computed, provably non-negative starts.
+#
+# A range-for whose end is length(arr) and whose start is provably >= 0 lets its body index that
+# array with no runtime bounds check. The lower half of that proof used to recognise three hand-coded
+# shapes; it now tracks non-negativity per register (Parser.reg_nonneg) and composes over + * // %.
+# A wrong answer here is a silently out-of-bounds read or write, not a crash, so every case checks
+# the values it produced rather than just that it ran.
+
+# ------------------------------------------------------------------ #
+# 1. The shapes that already worked, which must keep working.          #
+# ------------------------------------------------------------------ #
+
+function fill_from(start_kind):
+    a = [0i; 10]
+    n = length(a)
+    if start_kind == 0:
+        for i in 0..n:
+            a[i] = 1
+    if start_kind == 1:
+        for i in 3..n:
+            a[i] = 1
+    if start_kind == 2:
+        for i in 0..n..2:
+            a[i] = 1
+    total = 0
+    for i in 0..n:
+        total += a[i]
+    return total
+
+assert(fill_from(0) == 10, "start 0 fills every slot")
+assert(fill_from(1) == 7, "a non-negative literal start skips the first three")
+assert(fill_from(2) == 5, "a stepped range fills every other slot")
+
+# ------------------------------------------------------------------ #
+# 2. Computed starts, which is what the predicate adds.                #
+# ------------------------------------------------------------------ #
+
+function squared_start(limit):
+    a = [0i; limit]
+    n = length(a)
+    count = 0
+    for p in 2..n:
+        if p * p < n:
+            for m in (p * p)..n..p:
+                a[m] = 1
+    for i in 0..n:
+        count += a[i]
+    return count
+
+# 4,6,8,9 are the composites below 10 reachable as p*p + k*p for p >= 2.
+assert(squared_start(10) == 4, "a `p*p` start indexes correctly, sieve-shaped")
+
+# Every start here is guarded to stay <= the end. A start past its end makes the range descend, and
+# a descending range over a collection it indexes unchecked is now a clean error, not a walk off the
+# end -- see tests/error_lines/range_start_past_end.aer.
+function sum_products(limit):
+    a = [0i; limit]
+    n = length(a)
+    for i in 0..n:
+        a[i] = i
+    total = 0
+    for i in 0..n:
+        if i * i < n:
+            for j in (i * i)..n:
+                total += a[j]
+        if i + 1 < n:
+            for k in (i + 1)..n:
+                total += 1
+        if i * 2 + 1 < n:
+            for m in (i * 2 + 1)..n:
+                total += 1
+    return total
+
+assert(sum_products(6) == 63, "products, sums and their combinations are all accepted as starts")
+
+function multiplied_pair(limit):
+    a = [0i; limit]
+    n = length(a)
+    seen = 0
+    for i in 0..n:
+        for j in 0..n:
+            if i * j < n:
+                for k in (i * j)..n:
+                    seen += 1
+    return seen
+
+assert(multiplied_pair(4) == 37, "a product of two different proven indices is a valid start")
+
+# ------------------------------------------------------------------ #
+# 3. Shapes the predicate must REFUSE — subtraction can go negative,   #
+#    so these must still take the checked path and still be correct.   #
+# ------------------------------------------------------------------ #
+
+function subtracted_start(limit):
+    a = [0i; limit]
+    n = length(a)
+    for i in 0..n:
+        a[i] = 2
+    total = 0
+    # n - 3 is non-negative here, but the compiler must not assume subtraction preserves that.
+    for i in (n - 3)..n:
+        total += a[i]
+    return total
+
+assert(subtracted_start(8) == 6, "a subtracted start still produces the right values")
+
+function negative_index_still_errors():
+    a = [0i; 4]
+    # Negative indexing counts from the end, exactly as before -- the proof must not have changed
+    # what a negative index MEANS on the ordinary checked path.
+    a[-1] = 9
+    return a[3]
+
+assert(negative_index_still_errors() == 9, "negative indexing on the checked path is unchanged")
+
+# ------------------------------------------------------------------ #
+# 4. length() is a count, so it is non-negative wherever it appears.   #
+# ------------------------------------------------------------------ #
+
+function length_derived():
+    a = [0i; 12]
+    n = length(a)
+    half = n // 2
+    total = 0
+    for i in half..n:
+        total += 1
+    for i in (n % 5)..n:
+        total += 1
+    return total
+
+assert(length_derived() == 6 + 10, "// and % of non-negative values stay non-negative")
+
+print("test_nonneg_range_start.aer: all assertions passed.")

@@ -3498,7 +3498,8 @@ lbl_iter_range_prep : {
     int cur_reg = (int)UNPACK_A(op_word);
     int end_reg = (int)UNPACK_B(op_word);
     int step_reg = (int)UNPACK_C(op_word);
-    int item_dest_reg = (int)READ();
+    uint32_t item_word = READ();
+    int item_dest_reg = RANGE_PREP_ITEM_REG(item_word);
     int empty_target = READ();
     AerVal cur_v = registers[cur_reg];
     AerVal end_v = registers[end_reg];
@@ -3515,6 +3516,25 @@ lbl_iter_range_prep : {
               "sign)");
         ip = (unsigned int)empty_target;
         DISPATCH();
+    }
+    /* The body indexes unchecked on a proof that every value lands in [0, length), which holds only
+       while the loop ascends from a non-negative start -- so verify that precondition once here
+       rather than per iteration. Neither half is hypothetical: direction is inferred from the
+       bounds, so `for i in 200..length(a)` on a short array descends off the end (this segfaulted
+       before the check existed), and overflow in a computed start can wrap it negative. */
+    if (item_word & RANGE_PREP_GUARD_NONNEG) {
+        if (cur < 0) {
+            error("Range start is negative (%lld) -- an index computation overflowed", (long long)cur);
+            ip = (unsigned int)empty_target;
+            DISPATCH();
+        }
+        if (cur > rng_end) {
+            error("Range start %lld is past its end %lld, so this loop would count downwards out of "
+                  "the collection it indexes",
+                  (long long)cur, (long long)rng_end);
+            ip = (unsigned int)empty_target;
+            DISPATCH();
+        }
     }
     /* Precomputes the iteration count once (ceiling division, matching Lua's FORLOOP) instead of
        re-deriving it every dispatch. count==0 means empty range. */

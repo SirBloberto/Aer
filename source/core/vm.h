@@ -574,6 +574,14 @@ static inline uint16_t pack_rk16(int rk) {
 
 /* Parts in one OP_INTERP. Bounds the builder's stack scratch; a longer interpolation compiles to
    the ordinary concatenate chain instead, which has no limit. */
+/* OP_ITER_RANGE_PREP's item_dest operand is a whole 32-bit word for what is an 8-bit register
+   index, so the spare high bits carry a flag. GUARD_NONNEG means this loop's body was compiled
+   with UNCHECKED indexing on the strength of a compile-time proof that the start is >= 0
+   (Parser.reg_nonneg), so PREP verifies that once here instead of the body checking every index.
+   Only reachable when integer overflow defeated the proof -- see 5.16k. */
+#define RANGE_PREP_GUARD_NONNEG 0x80000000u
+#define RANGE_PREP_ITEM_REG(w) ((int)((w)&0xFFu))
+
 #define INTERP_MAX_PARTS 16
 
 /* Longest interpolated dict key OP_INDEX_GET_INTERP will build without allocating. Anything longer

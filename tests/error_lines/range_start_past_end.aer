@@ -1,0 +1,10 @@
+# A range-for whose end is length(arr) lets its body index that array with no runtime bounds check,
+# on the compile-time proof that every value it yields lands in [0, length). That proof assumes the
+# loop ASCENDS. Direction is inferred from the bounds, so a start past the end makes it count
+# DOWNWARDS instead, straight off the end of the array -- which segfaulted silently until
+# OP_ITER_RANGE_PREP started checking the proof's own precondition once at loop entry.
+a = [0i; 2]
+n = length(a)
+for i in 200..n:
+    a[i] = 1   #!error: count downwards out of the collection
+print(a[0])
