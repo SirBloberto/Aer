@@ -3056,6 +3056,21 @@ lbl_call : {
     unsigned int chosen_max_raw_reals = target_f->max_raw_reals;
 
     if (!target_f->megamorphic && target_f->shape_sensitive_mask != 0) {
+        /* Hit test inlined, resolution left cold. A struct receiver whose shape matches what this
+           site saw last needs only the four cached numbers, but reaching them used to cost a
+           noinline nine-argument call on EVERY such call -- 6.4% of binary_trees, which calls one
+           shape-sensitive function per node. Packed arrays and arrays-of-structs fall through: the
+           latter re-verifies homogeneity per call by design. */
+        AerVal spec_arg = registers[arg_reg_base + __builtin_ctz(target_f->shape_sensitive_mask)];
+        CallSpecCacheEntry* site_entry =
+            (c->count <= c->call_spec_cache_cap) ? &c->call_spec_cache[ip - 3] : NULL;
+        if (site_entry && spec_arg.tag == TYPE_STRUCT &&
+            site_entry->last_shape == ((AerStruct*)spec_arg.as.ptr)->shape) {
+            chosen_offset = site_entry->last_code_offset;
+            chosen_max_registers = site_entry->last_max_registers;
+            chosen_max_raw_ints = site_entry->last_max_raw_ints;
+            chosen_max_raw_reals = site_entry->last_max_raw_reals;
+        } else {
         /* The out-params are scoped to this branch on purpose. Taking the address of the chosen_*
            locals themselves forces all four into memory for the WHOLE handler -- an address that
            escapes cannot live in a register -- so every ordinary call paid four stores and four
@@ -3070,6 +3085,7 @@ lbl_call : {
         chosen_max_raw_reals = spec_raw_reals;
         code = c->code; /* compiling a specialized body can realloc both */
         functions = c->functions;
+        }
     }
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];
