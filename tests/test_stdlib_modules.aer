@@ -102,6 +102,34 @@ assert(string.repeat("x", 0) == "", "string.repeat with count 0 is empty")
 assert(string.replace("foo bar foo", "foo", "baz") == "baz bar baz", "string.replace — multiple matches")
 assert(string.replace("aaa", "a", "bb") == "bbbbbb", "string.replace — replacement longer than the match")
 
+# split/replace/find search for the next match rather than testing every position (aer_bytes_find,
+# value.h). The boundaries are where a search rewrite goes wrong, so pin them: separators at the very
+# start and end produce empty segments, adjacent separators produce empty segments between them, and
+# a needle whose first byte matches but whose tail does not must not count as a hit.
+edge = string.split(",a,,b,", ",")
+assert(length(edge) == 5, "split: leading, adjacent and trailing separators all produce segments")
+assert(edge[0] == "" and edge[1] == "a" and edge[2] == "" and edge[3] == "b" and edge[4] == "",
+       "split: every one of those segments is in the right place")
+assert(length(string.split("abc", ",")) == 1 and string.split("abc", ",")[0] == "abc",
+       "split: no separator anywhere yields the whole string")
+assert(length(string.split("", ",")) == 1 and string.split("", ",")[0] == "",
+       "split: the empty string yields one empty segment")
+assert(length(string.split("aXXb", "XX")) == 2 and string.split("aXXb", "XX")[1] == "b",
+       "split: a multi-byte separator")
+multi = string.split("aXbXXc", "XX")
+assert(length(multi) == 2 and multi[0] == "aXb" and multi[1] == "c",
+       "split: a lone first byte of a multi-byte separator is not a match")
+assert(length(string.split("xxx", "x")) == 4, "split: every character being a separator")
+
+assert(string.replace("aXbXXc", "XX", "-") == "aXb-c", "replace: partial first-byte match is not replaced")
+assert(string.replace("abc", "z", "!") == "abc", "replace: no match leaves the string alone")
+assert(string.replace("aaa", "aa", "b") == "ba", "replace: overlapping candidates consume left to right")
+assert(string.replace("xay", "a", "") == "xy", "replace: an empty replacement deletes the match")
+assert(string.index_of("aXbXXc", "XX") == 3, "index_of: skips a lone first byte and finds the real match")
+assert(string.index_of("abc", "abcd") == -1, "index_of: a needle longer than the haystack is absent")
+assert(string.index_of("abc", "c") == 2, "index_of: a match at the very last byte")
+assert(not string.contains("aXb", "XX"), "contains: partial first-byte match is not a match")
+
 import time
 
 # Can't assert an exact value — sanity-check it's a plausible epoch second

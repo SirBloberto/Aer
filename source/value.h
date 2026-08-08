@@ -285,13 +285,31 @@ static inline AerResult* aer_as_result(AerVal v) {
     return (AerResult*)v.as.ptr;
 }
 
+/* Byte-index of needle at or after `from`, or haylen when there is no match. Searches rather than
+   scans: memchr jumps straight to each candidate first byte instead of asking "is it here?" at every
+   position. The per-position call into libc was the cost, not the comparison -- splitting a line on
+   " " used to make one memcmp call per character -- so this is O(matches) calls, not O(length), for
+   every needle length. Raw pointers so the stdlib's split/replace can share it. */
+static inline unsigned int aer_bytes_find(const char* hay, unsigned int haylen, const char* needle,
+                                          unsigned int nlen, unsigned int from) {
+    if (nlen == 0) return from < haylen ? from : haylen;
+    while (from + nlen <= haylen) {
+        const char* hit = (const char*)memchr(hay + from, (unsigned char)needle[0], haylen - nlen - from + 1);
+        if (!hit) break;
+        unsigned int at = (unsigned int)(hit - hay);
+        if (nlen == 1 || memcmp(hay + at + 1, needle + 1, nlen - 1) == 0) return at;
+        from = at + 1;
+    }
+    return haylen;
+}
+
 /* Byte-index of needle's first occurrence in hay, or -1; empty needle matches at 0. The one
    substring search behind string.contains/index_of and `in` on strings. */
 static inline int64_t aer_string_find(const AerString* hay, const AerString* needle) {
     if (needle->length == 0) return 0;
-    for (unsigned int i = 0; i + needle->length <= hay->length; i++)
-        if (memcmp(hay->data + i, needle->data, needle->length) == 0) return (int64_t)i;
-    return -1;
+    unsigned int at = aer_bytes_find(hay->data, hay->length, needle->data, needle->length, 0);
+    /* nlen >= 1 means a hit can never start at haylen, so that value is unambiguously "absent". */
+    return at == hay->length ? -1 : (int64_t)at;
 }
 
 /* Lexicographic byte order, length tiebreak -- the one ordering behind collection.sort and `<` on strings. */

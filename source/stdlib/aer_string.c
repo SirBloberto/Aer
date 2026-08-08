@@ -116,22 +116,18 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
         r->shape = NULL;
         r->generation = 0;
 
-        unsigned int seg_start = 0, i = 0;
-        while (i <= slen) {
-            bool at_sep = i + seplen <= slen && memcmp(s + i, sep, seplen) == 0;
-            if (at_sep || i == slen) {
-                unsigned int n = i - seg_start;
-                if (r->count >= r->capacity) {
-                    r->capacity *= 2;
-                    r->items = xrealloc(r->items, sizeof(AerVal) * r->capacity);
-                }
-                r->items[r->count++] = aer_make_string_copy(s + seg_start, n);
-                if (i == slen) break;
-                i += seplen;
-                seg_start = i;
-            } else {
-                i++;
+        /* aer_bytes_find returns slen when no separator remains, which is exactly where the final
+           segment ends -- so the trailing segment needs no special case. */
+        unsigned int seg_start = 0;
+        for (;;) {
+            unsigned int at = aer_bytes_find(s, slen, sep, seplen, seg_start);
+            if (r->count >= r->capacity) {
+                r->capacity *= 2;
+                r->items = xrealloc(r->items, sizeof(AerVal) * r->capacity);
             }
+            r->items[r->count++] = aer_make_string_copy(s + seg_start, at - seg_start);
+            if (at == slen) break;
+            seg_start = at + seplen;
         }
         vm_stack_push(vm, aer_array_val(r));
         return true;
@@ -219,26 +215,28 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
             return true;
         }
 
-        /* Count matches first so the output buffer is sized exactly once */
+        /* Count matches first so the output buffer is sized exactly once. Both passes search for the
+           next match rather than testing every position -- see aer_bytes_find (value.h). */
         unsigned int matches = 0;
-        for (unsigned int i = 0; i + os->length <= ss->length;) {
-            if (memcmp(ss->data + i, os->data, os->length) == 0) {
-                matches++;
-                i += os->length;
-            } else
-                i++;
+        for (unsigned int i = 0; i < ss->length;) {
+            unsigned int at = aer_bytes_find(ss->data, ss->length, os->data, os->length, i);
+            if (at == ss->length) break;
+            matches++;
+            i = at + os->length;
         }
         unsigned int total = ss->length - matches * os->length + matches * nsv->length;
         char* buf = xmalloc(total + 1);
         unsigned int pos = 0;
-        for (unsigned int i = 0; i < ss->length;) {
-            if (i + os->length <= ss->length && memcmp(ss->data + i, os->data, os->length) == 0) {
-                memcpy(buf + pos, nsv->data, nsv->length);
-                pos += nsv->length;
-                i += os->length;
-            } else {
-                buf[pos++] = ss->data[i++];
-            }
+        unsigned int i = 0;
+        while (i < ss->length) {
+            unsigned int at = aer_bytes_find(ss->data, ss->length, os->data, os->length, i);
+            unsigned int keep = at - i; /* the run before the match, or the whole tail when absent */
+            memcpy(buf + pos, ss->data + i, keep);
+            pos += keep;
+            if (at == ss->length) break;
+            memcpy(buf + pos, nsv->data, nsv->length);
+            pos += nsv->length;
+            i = at + os->length;
         }
         buf[total] = '\0';
         vm_stack_push(vm, aer_make_string(buf, total));
