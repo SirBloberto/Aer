@@ -152,7 +152,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
                    Each source entry's own .hash was already computed once at its original
                    insertion (cached right there in the dense array, not on any AerString) --
                    reused here instead of hashing the same bytes again. */
-                char* k = hashtable_key_dup(r->map.pools, d->map.dense[i].key, d->map.dense[i].length, NULL);
+                char* k = hashtable_key_dup_known(r->map.pools, d->map.dense[i].key, d->map.dense[i].length);
                 hashtable_put_hashed(&r->map, k, d->map.dense[i].length, d->map.dense[i].hash,
                                      d->map.dense[i].payload);
             }

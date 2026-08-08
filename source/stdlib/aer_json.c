@@ -346,7 +346,7 @@ static AerVal json_parse_object(JsonParser* p) {
         if (p->err) return aer_null();
 
         unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
-        char* k = hashtable_key_dup(d->map.pools, ks->data, klen, NULL);
+        char* k = hashtable_key_dup_known(d->map.pools, ks->data, klen);
         hashtable_put(&d->map, k, klen, val);
 
         json_skip_ws(p);

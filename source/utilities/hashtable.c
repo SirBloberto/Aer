@@ -109,13 +109,17 @@ unsigned int hashtable_key_true_len(const char* data, unsigned int len) {
     return true_len;
 }
 
-char* hashtable_key_dup(HashPools* pools, const char* data, unsigned int len, unsigned int* out_len) {
-    unsigned int true_len = hashtable_key_true_len(data, len);
+char* hashtable_key_dup_known(HashPools* pools, const char* data, unsigned int true_len) {
     char* k = key_alloc(pools, (size_t)true_len + 1);
     memcpy(k, data, true_len);
     k[true_len] = '\0';
-    if (out_len) *out_len = true_len;
     return k;
+}
+
+char* hashtable_key_dup(HashPools* pools, const char* data, unsigned int len, unsigned int* out_len) {
+    unsigned int true_len = hashtable_key_true_len(data, len);
+    if (out_len) *out_len = true_len;
+    return hashtable_key_dup_known(pools, data, true_len);
 }
 
 void hashtable_key_free(HashPools* pools, char* key, unsigned int len) {

@@ -2064,7 +2064,7 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         if (existing_idx >= 0) {
             d->map.dense[existing_idx].payload = val; /* update in place -- no allocation */
         } else {
-            char* k = hashtable_key_dup(d->map.pools, is->data, klen, NULL); /* klen already true length */
+            char* k = hashtable_key_dup_known(d->map.pools, is->data, klen);
             hashtable_put_hashed(&d->map, k, klen, khash, val);
         }
     } else if (aer_type(obj) == TYPE_STRING) {
@@ -3404,7 +3404,7 @@ lbl_dict_new : {
         AerString* ks = aer_as_string(key);
         unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
         uint64_t khash = hashtable_hash_bytes(ks->data, klen);
-        char* k = hashtable_key_dup(d->map.pools, ks->data, klen, NULL);
+        char* k = hashtable_key_dup_known(d->map.pools, ks->data, klen);
         hashtable_put_hashed(&d->map, k, klen, khash, val);
     }
     registers[dest_reg] = aer_dict_val(d);

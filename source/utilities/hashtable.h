@@ -88,6 +88,10 @@ uint64_t hashtable_hash_bytes(const char* key, unsigned int length);
    key will eventually be put into (or was removed from) -- a key duped from one HashPools and
    freed into another would corrupt both. */
 char* hashtable_key_dup(HashPools* pools, const char* data, unsigned int len, unsigned int* out_len);
+
+/* For callers that already hold hashtable_key_true_len's result: skips re-walking the key to find a
+   NUL that, by construction, is no longer there. `true_len` MUST already be truncated. */
+char* hashtable_key_dup_known(HashPools* pools, const char* data, unsigned int true_len);
 void hashtable_key_free(HashPools* pools, char* key, unsigned int len);
 
 /* The length hashtable_key_dup would truncate `data`/`len` to (first embedded NUL, or `len`

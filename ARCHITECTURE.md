@@ -1347,6 +1347,59 @@ per-variant determinism check.
 `typed_array_bench` initially printed `xs[0]`, which its `xs[k] = k * 0.5` fill makes permanently
 `0.0` -- a checksum that could never fail. It prints `total` and `xs[N-1]` instead.
 
+### 5.16o The dict benchmarks re-hash immutable strings (investigated, then built)
+
+`small_dict_bench` runs 8.38B instructions in 2.57s. Its profile is `vm_run_slice` 30.5%,
+`pool_alloc` 14.2%, `hashtable_put_hashed` 10.3%, `vm_index_get_compute` 8.4%, `hashtable_key_dup`
+6.1%, `hashtable_free` 5.0%. `hashtable_hash_bytes` appears nowhere because LTO inlines it into the
+first four.
+
+Every dict access recomputes the FNV hash of its key from bytes. The benchmark's keys are the string
+constants `"id"`, `"name"`, `"active"`, `"score"` -- values whose hash cannot change. Per iteration
+it hashes 17 bytes building the dict and 7 more reading it back; over 3.3M iterations that is ~79M
+byte-steps of a hash whose answer was already known. `perf annotate` confirms the loop body is
+`eor` + `umull` + `mla`: FNV's 64-bit multiply, which 32-bit ARM has no single instruction for.
+
+There is a second scan on the same bytes. `lbl_dict_new` computes `hashtable_key_true_len(...)` and
+passes the result to `hashtable_key_dup`, which calls `hashtable_key_true_len` **again** on the
+already-truncated length -- a walk that by construction can no longer find a NUL.
+
+**Why this is not the borrowed-keys idea that failed twice.** 5.16a records two attempts at pointing
+dict keys at constant-pool bytes, both reverted. Those changed *ownership*: a key's lifetime stopped
+matching the table that held it. Caching a hash changes no ownership at all. It memoizes a pure
+function of bytes that never change -- `aer_string_alloc` (`vm.c:333`) is the single site that
+allocates an `AerString`, and nothing anywhere writes `->data` or `->length` afterwards.
+
+`hashtable.h` already anticipates the caller: `hashtable_put_hashed`'s comment names "an `AerString`
+reused as a dict key many times" as its reason to exist. But it also requires the supplied hash to
+equal `hash_bytes(key, length)` **exactly**, "or this table's probe sequence silently disagrees with
+a plain `hashtable_get`/`put`'s, corrupting lookups" -- and `HashTableEntry.hash` is a `uint64_t`.
+
+**The field is not free, and the first version of this note was wrong to say so.**
+`sizeof(AerString)` is 28 on 32-bit ARM against a `stride = (elem_size + 7) & ~7` of 32, so there
+are exactly **4** spare bytes per string cell. A `uint64_t` needs 8, and its 8-byte alignment on
+ARM32 EABI pushes the struct to 40 -- **+25% on every string in the program**, not just dict keys,
+which `log_processing` would pay in full for no benefit.
+
+Three ways out, in preference order:
+
+1. **Narrow the hash to 32 bits everywhere.** FNV-1a's 32-bit form is the standard variant, so this
+   is not a quality compromise. It makes the cache field fit the existing padding for free, shrinks
+   `HashTableEntry` by 4 bytes as well, and independently makes *uncached* hashing cheaper: 32-bit
+   ARM has a single-instruction `mul` for it, against the `umull` + `mla` pair a 64-bit multiply
+   costs today. Blast radius is `hashtable.c`'s probe/compare paths and every `hashtable_*_hashed`
+   signature.
+2. Accept the 8 bytes and measure whether `log_processing`'s memory regression is tolerable.
+3. Shrink `AER_STRING_INLINE_MAX` to make room -- rejected, since 5.16's SSO work measured 15 as the
+   win and this would give it straight back.
+
+Either way the cache is lazy, with 0 meaning "not computed yet"; a key whose true hash is 0 just
+recomputes, which is correct and rare. It is consulted only when `true_len == length`, because a
+string with an embedded NUL hashes over its truncated prefix and the two lengths would disagree.
+
+The duplicated `hashtable_key_true_len` walk is separate from all of this, carries no trade-off, and
+is fixed independently.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
