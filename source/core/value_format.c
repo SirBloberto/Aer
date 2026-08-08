@@ -5,24 +5,28 @@
 #include "strbuf.h"
 #include "vm.h"
 
-void aer_format_real(double d, char* buf, size_t bufsize) {
-    snprintf(buf, bufsize, "%g", d);
+/* Returns the rendered length. Both formatters already know it, and every hot caller went on to
+   call strlen() on the buffer they had just filled -- 2.3% of lookup_table_bench on its own. */
+unsigned int aer_format_real(double d, char* buf, size_t bufsize) {
+    int written = snprintf(buf, bufsize, "%g", d);
+    size_t len = (written < 0) ? strlen(buf) : (size_t)written;
     /* Skip nan/inf spellings -- they should never get a trailing ".0". */
     if (!strpbrk(buf, ".eEnNiI")) {
-        size_t len = strlen(buf);
         if (len + 3 <= bufsize) {
             buf[len] = '.';
             buf[len + 1] = '0';
             buf[len + 2] = '\0';
+            len += 2;
         }
     }
+    return (unsigned int)len;
 }
 
 /* snprintf("%lld", ...) replacement: integer-to-string is hot for any script doing interpolation or
    print() with integers, and profiling a dict-heavy benchmark put printf internals at ~14% of
    cycles from this one conversion. bufsize is unchecked -- every caller passes >=64 bytes and
    int64's longest rendering is 20 bytes plus NUL. */
-void aer_format_int(long long v, char* buf, size_t bufsize) {
+unsigned int aer_format_int(long long v, char* buf, size_t bufsize) {
     (void)bufsize;
     char tmp[20];
     int pos = 0;
@@ -56,6 +60,7 @@ void aer_format_int(long long v, char* buf, size_t bufsize) {
             buf[len++] = tmp[--pos];
     }
     buf[len] = '\0';
+    return (unsigned int)len;
 }
 
 /* ------------------------------------------------------------------ */

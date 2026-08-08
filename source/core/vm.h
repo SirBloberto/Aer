@@ -1020,10 +1020,10 @@ unsigned int chunk_line_for_offset(Chunk* c, unsigned int offset);
 /* Formats a real guaranteeing a decimal point/exponent/nan-inf marker survives -- bare "%g"
    prints 42.0 as "42", which flips to integer through the JSON round-trip. The one shared site
    (vm.c, aer_json.c, disasm.c). */
-void aer_format_real(double d, char* buf, size_t bufsize);
+unsigned int aer_format_real(double d, char* buf, size_t bufsize);
 
 /* Fast snprintf("%lld", ...) replacement -- see its own comment, value_format.c. */
-void aer_format_int(long long v, char* buf, size_t bufsize);
+unsigned int aer_format_int(long long v, char* buf, size_t bufsize);
 
 /* Shared recursive rendering (value_format.c) behind print() and vm_to_str() (interpolation, +,
    etc.) -- one consistent representation, not a terse "<array[3]>" fallback. */

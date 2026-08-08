@@ -925,14 +925,12 @@ static __attribute__((noinline)) bool vm_dict_get_interp(AerDict* d, const uint3
                 break;
             }
             case TYPE_INTEGER:
-                aer_format_int((long long)aer_as_int(v), scratch, sizeof(scratch));
+                piece_len = aer_format_int((long long)aer_as_int(v), scratch, sizeof(scratch));
                 piece = scratch;
-                piece_len = (unsigned int)strlen(scratch);
                 break;
             case TYPE_REAL:
-                aer_format_real(aer_as_real(v), scratch, sizeof(scratch));
+                piece_len = aer_format_real(aer_as_real(v), scratch, sizeof(scratch));
                 piece = scratch;
-                piece_len = (unsigned int)strlen(scratch);
                 break;
             case TYPE_BOOLEAN:
                 piece = aer_as_bool(v) ? "true" : "false";
@@ -973,14 +971,12 @@ static __attribute__((noinline)) AerVal vm_interp_build(VM* vm, const AerVal* pa
                 break;
             }
             case TYPE_INTEGER:
-                aer_format_int((long long)aer_as_int(v), scratch[i], sizeof(scratch[i]));
+                piece_len[i] = aer_format_int((long long)aer_as_int(v), scratch[i], sizeof(scratch[i]));
                 piece[i] = scratch[i];
-                piece_len[i] = (unsigned int)strlen(scratch[i]);
                 break;
             case TYPE_REAL:
-                aer_format_real(aer_as_real(v), scratch[i], sizeof(scratch[i]));
+                piece_len[i] = aer_format_real(aer_as_real(v), scratch[i], sizeof(scratch[i]));
                 piece[i] = scratch[i];
-                piece_len[i] = (unsigned int)strlen(scratch[i]);
                 break;
             case TYPE_BOOLEAN:
                 piece[i] = aer_as_bool(v) ? "true" : "false";
