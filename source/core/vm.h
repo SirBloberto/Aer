@@ -375,6 +375,11 @@ typedef enum {
        itself a collection, or a key past INTERP_KEY_MAX). Same operand shape as OP_INTERP. */
     OP_INDEX_GET_INTERP, /* word0: dest_reg, obj_reg, part_count -- then part_count RK16 words */
 
+    /* PROBE (5.16i): OP_SUB where the compiler already knows the operands are a register and a pool
+       constant, so neither needs the RK8 register-vs-constant test at runtime. Plain 8-bit fields,
+       not RK8 -- the constant index gets the full 255 rather than RK8's 127. */
+    OP_SUB_RC, /* dest_reg, reg_a, const_index */
+
     OP_OPCODE_COUNT_MARKER /* not a real opcode -- sizes the static assert below */
 } Opcode;
 _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — widen the opcode field");

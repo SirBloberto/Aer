@@ -314,6 +314,17 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
         spilled++;
     }
     P.last_cmp_offset = c->count;
+    /* PROBE (5.16i): the operand kinds are known here, so a dedicated opcode lets the handler skip
+       the RK8 register-vs-constant test on both operands. Plain 8-bit fields give the constant the
+       full 255 rather than RK8's 127. */
+    if (op == OP_SUB && !(rk_lhs & RK_CONST_FLAG) && (rk_rhs & RK_CONST_FLAG)) {
+        int const_idx = rk_rhs & ~RK_CONST_FLAG;
+        if (rk_lhs <= 255 && const_idx <= 255) {
+            chunk_emit(c, PACK3(OP_SUB_RC, dest, rk_lhs, const_idx));
+            if (spilled) reg_free(spilled);
+            return;
+        }
+    }
     chunk_emit(c, PACK3(op, dest, pack_rk8(rk_lhs), pack_rk8(rk_rhs)));
     if (spilled) reg_free(spilled);
 }
