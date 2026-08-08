@@ -209,10 +209,15 @@ void aer_gc_set_ceiling(unsigned int max_live_cells) {
 /* Split from gc_maybe_collect so the dispatch loop can put its own work (syncing vm->ip for error
    reporting) on the collection path without paying for it on the far commoner "nowhere near
    threshold" one -- see vm_run_slice's gc_maybe_collect shadow. */
-static inline __attribute__((always_inline)) bool gc_should_collect(VM* vm) {
-    VmHeap* heap = &vm->heap;
+/* Takes the heap rather than the VM so vm_run_slice can hoist &vm->heap once instead of rederiving
+   it from vm at each of its 33 call sites -- reloading vm was ~10% of fib_bench's cycles. */
+static inline __attribute__((always_inline)) bool gc_should_collect_heap(const VmHeap* heap) {
     if (heap->gc_suppress_depth > 0) return false;
     return heap->pool_alloc_count >= heap->minor_gc_threshold;
+}
+
+static inline __attribute__((always_inline)) bool gc_should_collect(VM* vm) {
+    return gc_should_collect_heap(&vm->heap);
 }
 
 /* Called from every allocating opcode; kept tiny and always_inline so the common case costs nothing beyond what's already inlined into the dispatch loop. gc_run_collection_cycle (the rare, actual-collection path) lives in gc.c. */
@@ -2519,6 +2524,9 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
        vm_call_resolve_specialization can grow the chunk mid-slice (it re-enters the parser), and it
        refreshes this immediately after. */
     const uint32_t* code = c->code;
+    /* &vm->heap is fixed for the life of the VM. Hoisted so the 33 gc_maybe_collect sites test the
+       threshold without reloading vm -- vm's own spill slots were ~10% of fib_bench's cycles. */
+    VmHeap* slice_heap = &vm->heap;
     /* Hoists the three pointers that are stable for the whole call and change only at the 3
        call/return sites below. vm->raw_reals' own reload was among the hottest instructions in the
        dispatch loop (perf annotate, nbody). The backing stacks are fixed-size inline VM arrays,
@@ -2597,7 +2605,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
 /* Only the collection path syncs: the threshold test runs on every allocating opcode. */
 #define gc_maybe_collect(v)                                                                                  \
     do {                                                                                                     \
-        if (gc_should_collect(v)) {                                                                          \
+        if (gc_should_collect_heap(slice_heap)) {                                                            \
             SYNC_IP();                                                                                       \
             gc_run_collection_cycle(v);                                                                      \
         }                                                                                                    \
