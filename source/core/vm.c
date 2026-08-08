@@ -2522,9 +2522,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     /* Same deal, and it reallocs at the same one place: lbl_call indexes it on every single
        call, and reaching it through c meant reloading c from its spill slot each time. */
     ChunkFunction* functions = c->functions;
-    /* A fixed inline array in the VM, so its address never moves. lbl_call and lbl_return index
-       it several times each; reaching it through vm meant reloading vm from its spill slot. */
-    CallFrame* call_stack = vm->call_stack;
     /* Hoists the three pointers that are stable for the whole call and change only at the 3
        call/return sites below. vm->raw_reals' own reload was among the hottest instructions in the
        dispatch loop (perf annotate, nbody). The backing stacks are fixed-size inline VM arrays,
@@ -3052,7 +3049,7 @@ lbl_call : {
         for (int i = 0; i < arg_count; i++)
             registers[i] = registers[arg_reg_base + i];
         ip = (unsigned int)callee_offset;
-        CallFrame* reused = &call_stack[vm->call_depth];
+        CallFrame* reused = &vm->call_stack[vm->call_depth];
         reused->code_offset = (unsigned int)callee_offset; /* reused frame now runs a different function */
         /* The reused frame's sizing belongs to whatever function last occupied it, and a tail call
            can land on one with a different peak. Left stale, a later real call from inside this
@@ -3101,8 +3098,8 @@ lbl_call : {
         functions = c->functions;
     }
 
-    CallFrame* caller = &call_stack[vm->call_depth];
-    CallFrame* callee = &call_stack[vm->call_depth + 1];
+    CallFrame* caller = &vm->call_stack[vm->call_depth];
+    CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
     callee->registers = caller->registers + caller->frame_size;
     callee->frame_size = chosen_max_registers;
     callee->raw_ints = caller->raw_ints + caller->raw_int_frame_size;
@@ -3117,9 +3114,9 @@ lbl_call : {
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
     vm->call_depth++;
-    vm->registers = call_stack[vm->call_depth].registers;
-    vm->raw_ints = call_stack[vm->call_depth].raw_ints;
-    vm->raw_reals = call_stack[vm->call_depth].raw_reals;
+    vm->registers = vm->call_stack[vm->call_depth].registers;
+    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
+    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
     registers = vm->registers; /* refresh the hoisted locals -- see their own comment above */
     raw_ints = vm->raw_ints;
     raw_reals = vm->raw_reals;
@@ -3156,15 +3153,15 @@ lbl_call_value : {
    nested/recursive calls safe. */
 lbl_return : {
     int src_reg = (int)UNPACK_A(op_word);
-    CallFrame* callee = &call_stack[vm->call_depth];
+    CallFrame* callee = &vm->call_stack[vm->call_depth];
 
     AerVal result = callee->registers[src_reg];
     unsigned int return_ip = callee->return_ip;
     int dest_reg = callee->dest_reg;
     vm->call_depth--;
-    vm->registers = call_stack[vm->call_depth].registers;
-    vm->raw_ints = call_stack[vm->call_depth].raw_ints;
-    vm->raw_reals = call_stack[vm->call_depth].raw_reals;
+    vm->registers = vm->call_stack[vm->call_depth].registers;
+    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
+    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
     /* Must refresh the hoisted locals (see their own comment above) BEFORE the write below --
        registers still pointed at the callee's (now-popped) frame otherwise, corrupting whichever
        register of the CALLER's frame happens to share dest_reg's index instead of writing the

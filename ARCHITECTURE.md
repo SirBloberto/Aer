@@ -1122,9 +1122,28 @@ not help either, for the same reason: the hot half would still need the same val
 measures the icache miss rate at 0.02-0.10%, so the 45KB is not costing anything directly. Trim
 opcodes for comprehension; do not expect registers back.
 
-This looks like the floor for a C-compiled computed-goto interpreter on a 14-register ISA. LuaJIT
-avoids it by writing the interpreter in assembly and pinning BASE/PC/DISPATCH to fixed registers,
-which no amount of C-level restructuring reproduces.
+**So: can the spilling be fixed?** Partly, and the shape of the answer is precise. Removing a hot
+*use* of a spilled value helps; adding another hoisted *value* does not, because the live set is
+already saturated.
+
+| change | effect |
+|---|---|
+| hoist `c->code` (READ refetched it every dispatch) | 9 benchmarks improved, `fib_bench` **-2.02%** |
+| scope the address-taken specialization out-params | `fib_bench` **-4.53%** |
+| hoist `c->functions` (indexed on every call) | `fib_bench` **-0.43%** |
+| hoist `&vm->heap` for the 33 GC checks | 0.00% -- gcc already CSE-d it |
+| **hoist `vm->call_stack`** | **`fib_bench` +2.17%, `binary_trees` +0.86%** |
+
+That last row is the ceiling made visible. `vm->call_stack` is a fixed inline array whose address
+never moves, `lbl_call`/`lbl_return` index it repeatedly, and hoisting it is the identical trick that
+worked three rows above -- but it made things *worse*, because it became one more value competing for
+the same 14 registers and evicted something hotter. Trading a dereference for a live value only pays
+while a register is free, and there isn't one.
+
+That is the floor for a C-compiled computed-goto interpreter on a 14-register ISA. LuaJIT avoids it
+by writing the interpreter in assembly and pinning BASE/PC/DISPATCH to fixed registers, which no
+amount of C-level restructuring reproduces. Further progress here means removing hot uses one at a
+time -- worth 0.4-4.5% each and getting scarcer -- not another structural attempt.
 
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
