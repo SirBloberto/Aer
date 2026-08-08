@@ -1984,24 +1984,17 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
     }
 }
 
-/* Materializes OP_INTERP's RK16 operand words and builds the string. noinline and taking the raw
-   words rather than a materialized array is the whole point: 16 AerVals of scratch declared in a
-   label body is 256 bytes on vm_run_slice's frame, which every other opcode then pays for in
-   register pressure -- adding one such array measured +4.52% on mandelbrot (5.16d). */
-static __attribute__((noinline)) AerVal vm_interp_build_rk(VM* vm, const uint32_t* rks, unsigned int count,
-                                                           AerVal* registers, AerVal* const_pool) {
-    AerVal parts[INTERP_MAX_PARTS];
-    for (unsigned int i = 0; i < count; i++)
-        parts[i] = *vm_rk_ptr16(registers, const_pool, rks[i]);
-    return vm_interp_build(vm, parts, count);
-}
-
-/* vm_dict_get_interp's fallback: builds the key string for real, then takes the general index path. */
+/* vm_dict_get_interp's fallback: builds the key string for real, then takes the general index path.
+   Separate and noinline so its parts[] scratch stays out of vm_run_slice's frame. lbl_interp keeps
+   ITS parts[] inline on purpose -- hoisting that one out the same way measured worse (5.16h). */
 static __attribute__((noinline)) AerVal vm_index_get_interp_slow(VM* vm, AerVal obj, const uint32_t* rks,
                                                                  unsigned int count, AerVal* registers,
                                                                  AerVal* const_pool) {
+    AerVal parts[INTERP_MAX_PARTS];
+    for (unsigned int i = 0; i < count; i++)
+        parts[i] = *vm_rk_ptr16(registers, const_pool, rks[i]);
     AerVal out;
-    vm_index_get_compute(obj, vm_interp_build_rk(vm, rks, count, registers, const_pool), &out);
+    vm_index_get_compute(obj, vm_interp_build(vm, parts, count), &out);
     return out;
 }
 
@@ -4716,9 +4709,10 @@ lbl_index_field_compound : {
 lbl_interp : {
     int dest = (int)UNPACK_A(op_word);
     unsigned int count = UNPACK_B(op_word);
-    const uint32_t* rks = &code[ip];
-    ip += count;
-    registers[dest] = vm_interp_build_rk(vm, rks, count, registers, const_pool);
+    AerVal parts[INTERP_MAX_PARTS];
+    for (unsigned int i = 0; i < count; i++)
+        parts[i] = *vm_rk_ptr16(registers, const_pool, READ());
+    registers[dest] = vm_interp_build(vm, parts, count);
     gc_maybe_collect(vm);
     DISPATCH();
 }

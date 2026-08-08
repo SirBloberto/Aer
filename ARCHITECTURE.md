@@ -1070,6 +1070,32 @@ report a build-flag difference as an interpreter win. Same rules, or the number 
 Recorded because the underlying cost is real and worth knowing: on a computed-goto interpreter,
 position independence is a per-dispatch tax, not a one-off.
 
+### 5.16h Where the stack traffic actually is, and what did not reduce it
+
+Cycle-weighted inside `vm_run_slice`, loads are 64-86% and stores 7-17%, of which **stack spills are
+17-24%**: `fib_bench` 24.3%, `lookup_table_bench` 23.0%, `nbody` 17.5%. The load share itself is not
+a defect -- an interpreter is a load-dispatch-store machine and LuaJIT's is too -- but the spill
+share is the reducible part, and it is the largest single structural item left.
+
+One bite of it worked. `lbl_call` built four out-params for `vm_call_resolve_specialization` and
+**took their addresses**, which forces all four into memory for the whole handler no matter which
+path runs -- an escaping address cannot live in a register. Scoping those to the branch that uses
+them: `fib_bench` **-4.53%**, `binary_trees` -0.93%, and `lbl_call` went from 103 instructions with
+22 spill references to 92 with 17. Worth checking any hot handler for the same shape.
+
+What did **not** work, against expectation: hoisting `lbl_interp`'s `AerVal parts[16]` (256 bytes)
+out into a noinline helper, the same fix that was right for `OP_INDEX_GET_INTERP`. It moved nothing
+on the benchmarks that do not interpolate (`mandelbrot`, `fib_bench`, `binary_trees` all 0.00%) and
+cost the ones that do 1.2% (`dict_bench` +1.16%, `small_dict_bench` +1.23%) for the extra call and
+its five arguments. **gcc already overlaps locals whose live ranges do not overlap**, so a per-label
+array is not additive frame cost the way it looks -- 5.16d's +4.52% came from adding a *second* live
+array alongside an existing one, not from the array's size alone. Reverted.
+
+The remaining spill share is genuine register pressure: one 45KB function, 153 label bodies, ~14
+usable ARM registers, and about a dozen values live across the whole dispatch loop. Reducing it
+further means reducing what is live across dispatches, not another point fix. The address-taken
+pattern above is the one class worth grepping for.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
