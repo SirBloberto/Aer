@@ -2512,6 +2512,11 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
        touch. Synced at the end of every DISPATCH() and around vm_call_value (the only other
        write to this VM's ip). */
     unsigned int ip = vm->ip;
+    /* Hoisted like registers/raw_ints below: READ() ran `ldr [c]` to refetch c->code on EVERY
+       dispatch, since the compiler cannot prove nothing writes through c. Only
+       vm_call_resolve_specialization can grow the chunk mid-slice (it re-enters the parser), and it
+       refreshes this immediately after. */
+    const uint32_t* code = c->code;
     /* Hoists the three pointers that are stable for the whole call and change only at the 3
        call/return sites below. vm->raw_reals' own reload was among the hottest instructions in the
        dispatch loop (perf annotate, nbody). The backing stacks are fixed-size inline VM arrays,
@@ -2527,7 +2532,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
 #endif
     chunk_ensure_field_cache(c);
 
-#define READ() (c->code[ip++])
+#define READ() (code[ip++])
 #define PUSH(v)                                                                                              \
     do {                                                                                                     \
         if (vm->stack_top >= VM_STACK_MAX) {                                                                 \
@@ -3074,6 +3079,7 @@ lbl_call : {
     if (!target_f->megamorphic && target_f->shape_sensitive_mask != 0) {
         vm_call_resolve_specialization(c, target_f, registers, arg_reg_base, ip, &chosen_offset,
                                        &chosen_max_registers, &chosen_max_raw_ints, &chosen_max_raw_reals);
+        code = c->code; /* compiling a specialized body can realloc it */
     }
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];
@@ -5166,7 +5172,7 @@ lbl_index_get_interp : {
     int dest_reg = (int)UNPACK_A(op_word);
     int obj_reg = (int)UNPACK_B(op_word);
     unsigned int count = UNPACK_C(op_word);
-    const uint32_t* rks = &c->code[ip];
+    const uint32_t* rks = &code[ip];
     ip += count;
     AerVal obj = registers[obj_reg];
     if (aer_type(obj) == TYPE_DICT &&
