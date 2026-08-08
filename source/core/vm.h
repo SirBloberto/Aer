@@ -966,11 +966,14 @@ typedef struct {
     bool io_enabled;
     bool net_enabled;
 
-    /* Scratch argument channel for bridging out of the register convention (stdlib/module calls). */
+    CallFrame call_stack[VM_CALL_MAX];
+    /* Scratch argument channel for bridging out of the register convention (stdlib/module calls).
+       Deliberately AFTER call_stack: 4096 bytes in front of it pushed every CallFrame field past the
+       12-bit displacement window, costing lbl_call eight materialized constants per call. Nothing in
+       the dispatch loop's call path touches this array. */
     AerVal stack[VM_STACK_MAX];
     int stack_top;
 
-    CallFrame call_stack[VM_CALL_MAX];
 
     /* One shared register bank for the whole chain (calls bump a base pointer). Same worst-case
        size as a flat design, but the actually-touched working set is far smaller. */
