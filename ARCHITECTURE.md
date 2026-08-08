@@ -1263,6 +1263,38 @@ while `sieve` kept its -21.38%. So the cost is codegen shift from touching these
 guard's arithmetic (which would be ~3 instructions against the 10.5 per `PREP` the delta implies).
 Landed anyway: it buys a memory-safety fix and 21% on another benchmark.
 
+### 5.16l Taking lbl_call apart: what its 91 instructions are, and what moved them
+
+Attributing the handler instruction-by-instruction against source (`objdump -dS` over the range
+`perf` identifies as `lbl_call`) rather than guessing. What it is actually made of:
+
+- `add.w r6, r2, ip, lsl #6` -- the `CallFrame` power-of-two shift working as intended (5.16e).
+- `mov.w r3, #328` + `mla r5, r3, r5, r2` -- **`sizeof(ChunkFunction)` is 328, not a power of two**,
+  so `functions[func_index]` costs a materialized constant plus a multiply where a shift would do.
+  The same defect `CallFrame` had, still present one struct over.
+- `cmp.w ip, #35` + `beq.w` -- the tail-call test, on the hot path.
+- `str r2, [sp, #356]` at entry, reloaded at exit -- `dest_reg` spilled and re-read for nothing.
+- Six frame-field stores at offsets `#2024`-`#2044`, all inside the 12-bit window (5.16e's ordering
+  fix holding).
+
+**Splitting `OP_TAIL_CALL` into its own label: neutral.** `OP_CALL` and `OP_TAIL_CALL` shared
+`lbl_call`, so every ordinary call tested `cur_op == OP_TAIL_CALL` and carried the tail body in its
+live range -- and the suite runs **35.5M ordinary calls against zero tail calls**. Separating them
+measured `binary_trees` -0.21%, everything else 0.00%. Kept anyway: one label per opcode is simpler,
+and it costs nothing.
+
+**Inlining the specialization cache hit: reverted, and the most useful number here.**
+`vm_call_resolve_specialization` is `noinline` with nine parameters and ran on *every* call to a
+shape-sensitive function even when the per-site cache hit -- 6.4% of `binary_trees`. Inlining just
+the hit test for a struct receiver bought **`binary_trees` -4.63%** and cost **`fib_bench` +3.87%**,
+a net **+125M instructions** across the two.
+
+`fib_bench` never executes that code -- its `shape_sensitive_mask` is zero, so the branch is never
+taken. The 3.87% is the cost of roughly ten instructions merely *existing* inside `lbl_call`. That is
+the sharpest measurement yet of what 5.16h describes: this handler is at its register-allocation
+limit, and anything added to it is paid for by every call in every program, executed or not. Adding
+to `lbl_call` needs a win larger than ~4% on the benchmark it targets before it breaks even.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
