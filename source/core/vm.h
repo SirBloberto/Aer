@@ -398,15 +398,6 @@ _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — 
 #define RAW_REGISTERS_INT 32
 #define RAW_REGISTERS_REAL 32
 
-/* A frame's raw area measured in AerVal slots, since it shares register_stack with the boxed
-   registers. Raw slots are 8 bytes, AerVal is 16, so two raw slots fit one register slot. */
-#define RAW_SLOTS_AS_REGISTERS (((RAW_REGISTERS_INT + RAW_REGISTERS_REAL) + 1) / 2)
-/* The whole frame in AerVal slots, for a function with these compile-time peaks. */
-#define FRAME_STRIDE(regs, raw_ints, raw_reals) ((regs) + (((raw_ints) + (raw_reals) + 1) / 2))
-/* A frame's raw area, derived rather than stored -- see CallFrame.raw_int_count. */
-#define FRAME_RAW_INTS(f) ((int64_t*)((f)->registers + (f)->frame_size))
-#define FRAME_RAW_REALS(f) ((double*)(FRAME_RAW_INTS(f) + (f)->raw_int_count))
-
 /* Fixed-width, word-granular instruction encoding: every instruction is one or more 32-bit words,
    the shape (1-word, 2-word, ...) fixed per opcode at compile time -- never a variable byte count.
    See ARCHITECTURE.md §3.1-3.2 for the full field vocabulary (PACK3/PACK2/PACK1, RK8, RK16,
@@ -923,16 +914,15 @@ typedef struct {
        read by the next push. */
     unsigned int frame_size;
 
-    /* Raw unboxed scratch for the primitive pass lives in the SAME bank, immediately past the boxed
-       registers: raw_ints at registers[frame_size], then raw_reals after those. One bump pointer
-       instead of three -- a call used to load and store two more bases and two more sizes. Both are
-       8-byte, and registers[] is 16-byte aligned, so the split point is always aligned.
-
-       frame_size deliberately counts ONLY the boxed registers: it is the GC's scan bound
-       (mark_vm_roots, gc.c), and walking an int64 or a double as a tagged pointer would either
-       segfault or mark a bogus cell. tests/test_gc_raw_frames.aer polices that. */
-    unsigned int raw_int_count; /* locates raw_reals within the raw area */
-    unsigned int stride; /* whole frame in AerVal slots -- boxed registers plus the raw area */
+    /* Raw unboxed scratch for the primitive pass -- never GC-scanned, never crosses a call
+       boundary (only its boxed form does). Bump-pointer bases into vm->raw_int_stack/raw_real_stack
+       (mirrors registers/frame_size above) rather than fixed inline arrays -- a fixed array here
+       would cost every frame RAW_REGISTERS_INT+REAL slots regardless of whether that function uses
+       any raw locals at all. */
+    int64_t* raw_ints;
+    double* raw_reals;
+    unsigned int raw_int_frame_size;
+    unsigned int raw_real_frame_size;
 
     unsigned int return_ip; /* where to resume in the CALLER */
     int dest_reg; /* which of the CALLER's registers gets the return value */
@@ -945,6 +935,11 @@ typedef struct {
    multiply plus a materialized constant per field on 32-bit ARM. A power of two makes it a shift. */
 _Static_assert((sizeof(CallFrame) & (sizeof(CallFrame) - 1)) == 0,
                "CallFrame must stay a power of two -- see CALL_FRAME_PAD");
+/* Keep these OUT of register_stack. mark_vm_roots scans a frame's whole register range including
+   slots the callee has not written, which is safe only because register_stack has only ever held
+   AerVals; interleaved raw words let the GC read a double as a pointer. Tried, segfaulted, and
+   measured worse anyway -- see ARCHITECTURE 5.16f and tests/test_gc_raw_frames.aer. */
+
 /* Regression guard: raw_ints/raw_reals used to be fixed inline arrays here (RAW_REGISTERS_INT +
    RAW_REGISTERS_REAL int64_t/double slots each), costing every single frame ~550+ bytes whether or
    not that function used any raw locals at all. They're pointers into a shared VM-level bump-pointer
@@ -987,7 +982,11 @@ typedef struct {
 
     /* One shared register bank for the whole chain (calls bump a base pointer). Same worst-case
        size as a flat design, but the actually-touched working set is far smaller. */
-    AerVal register_stack[VM_CALL_MAX * (FRAME_REGISTERS + RAW_SLOTS_AS_REGISTERS)];
+    AerVal register_stack[VM_CALL_MAX * FRAME_REGISTERS];
+    /* Same bump-pointer-bank idea as register_stack, for raw_ints[]/raw_reals[] -- see CallFrame's
+       own comment for why this replaced per-frame fixed arrays. */
+    int64_t raw_int_stack[VM_CALL_MAX * RAW_REGISTERS_INT];
+    double raw_real_stack[VM_CALL_MAX * RAW_REGISTERS_REAL];
 } VM;
 
 /* Bounds-checked push/pop for native-module files, outside vm_run's PUSH()/POP() macros. */

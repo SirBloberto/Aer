@@ -1026,6 +1026,31 @@ And the performance answer, measured: instructions moved 0.00-0.03% on every ben
 roughly the same amplitude as adding one, in either direction. Trim for size and comprehension, which
 are real goals; do not trim expecting speed, and do not trim anything that carries a capability.
 
+### 5.16f Why the raw slots cannot share register_stack (a GC invariant, then a measurement)
+
+`lbl_call` maintains three bump pointers -- `registers`, `raw_ints`, `raw_reals` -- with three
+frame sizes, six of `CallFrame`'s eleven fields. Measuring the compiled handler put **4.53% of
+`fib_bench`'s cycles** in exactly those four raw-side stores and loads, so folding the raw slots into
+`register_stack` and deriving the two bases looked like a clean win: one bump pointer, four fewer
+fields, and better locality for `nbody`-shaped code that touches registers and raw slots in the same
+loop.
+
+It segfaults, and the reason is worth writing down because nothing else records it.
+**`mark_vm_roots` (gc.c) scans `[registers, registers + frame_size)` unconditionally**, including
+slots the callee has not written yet -- its own comment says "zero-init decodes as harmless
+TYPE_NULL". That is only true because `register_stack` has *only ever held valid AerVals*. Interleave
+raw `int64`/`double` words into the same bank and a later frame's register range can overlap a dead
+frame's raw area, so the collector reads a `double` as a tagged pointer. `tests/test_gc_raw_frames.aer`
+was written first, for exactly this, and caught it on the first run.
+
+The invariant can be restored by clearing a frame's raw area when it pops -- confirmed, it fixes the
+crash -- but that leaves the same hole on every error unwind and yield, since those skip `lbl_return`
+entirely. And it does not pay regardless: **`fib_bench` +2.02%, `binary_trees` +3.58%**, nothing
+improved. Deriving the two bases costs more arithmetic on every call *and* return than the four loads
+it removes; a load from an already-hot cache line is cheaper than recomputing an address.
+
+So the three separate stacks are load-bearing, not an oversight. The four raw-side fields stay.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
