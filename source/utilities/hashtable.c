@@ -131,8 +131,20 @@ uint64_t hashtable_hash_bytes(const char* key, unsigned int length) {
     return hash;
 }
 
+/* Dict keys are overwhelmingly short -- identifiers, "key_123", field names -- and at that size the
+   call into libc's memcmp (PLT hop, then its own SIMD prologue) costs more than the comparison
+   itself. Inline byte loop below the threshold, real memcmp above it. */
+#define HASH_KEY_INLINE_CMP_MAX 16u
+
 static bool hash_match(const HashTableEntry* entry, const char* key, unsigned int length) {
-    return entry->key && entry->length == length && memcmp(entry->key, key, length) == 0;
+    if (!entry->key || entry->length != length) return false;
+    if (length <= HASH_KEY_INLINE_CMP_MAX) {
+        const char* a = entry->key;
+        for (unsigned int i = 0; i < length; i++)
+            if (a[i] != key[i]) return false;
+        return true;
+    }
+    return memcmp(entry->key, key, length) == 0;
 }
 
 /* Alloc-new/copy/free-old once a tier is involved -- pools hand back a whole new cell, never grow
