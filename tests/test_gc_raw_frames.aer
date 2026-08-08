@@ -1,0 +1,133 @@
+#!/usr/bin/env aer
+# AER test suite — GC root scanning across frames that hold BOTH boxed registers and raw slots.
+#
+# Raw int/real slots are unboxed machine words living outside the GC's view; boxed registers are
+# scanned. A collection triggered deep in a recursion must scan every live frame's boxed registers
+# and must NOT walk its raw slots -- reading an int64 or a double as a tagged pointer either
+# segfaults or silently marks a bogus cell. Neither shows up as a wrong answer on its own, so every
+# case below keeps heap values live ACROSS the recursive call and re-checks them on the way out.
+
+import collection
+
+# ------------------------------------------------------------------ #
+# 1. Deep recursion with raw locals and a heap value live across the  #
+#    call, allocating hard enough to force collections mid-descent.   #
+# ------------------------------------------------------------------ #
+
+function descend(depth):
+    # Literal initialisers earn raw int/real slots; `tag`/`buf` stay boxed and must survive the call.
+    counter = 0
+    scale = 1.5
+    tag = "frame-{depth}"
+    buf = [depth, depth + 1, depth + 2]
+
+    counter += depth
+    scale = scale * 2.0
+
+    if depth > 0:
+        inner = descend(depth - 1)
+        # Everything below is read AFTER the nested call returned, so a collection during it that
+        # mistook this frame's raw slots for pointers, or missed its boxed ones, shows up here.
+        if inner != depth - 1:
+            return -1
+    if tag != "frame-{depth}":
+        return -2
+    if length(buf) != 3 or buf[0] != depth or buf[2] != depth + 2:
+        return -3
+    if counter != depth:
+        return -4
+    if scale != 3.0:
+        return -5
+    return depth
+
+assert(descend(30) == 30, "30 frames deep, each holding raw slots and heap values across the call")
+assert(descend(1) == 1, "the shallow case still round-trips")
+assert(descend(0) == 0, "and the base case, which never recurses")
+
+# ------------------------------------------------------------------ #
+# 2. The same shape, but allocating enough garbage per frame to make  #
+#    a collection land INSIDE the recursion rather than after it.     #
+# ------------------------------------------------------------------ #
+
+function churn(depth, per_frame):
+    keep = {"depth": depth}
+    total = 0
+    ratio = 0.5
+    i = 0
+    for i < per_frame:
+        junk = [i, i * 2, i * 3]
+        total += junk[1]
+        i += 1
+    if depth > 0:
+        if churn(depth - 1, per_frame) != depth - 1:
+            return -1
+    if keep["depth"] != depth:
+        return -2
+    if total != per_frame * (per_frame - 1):
+        return -3
+    if ratio != 0.5:
+        return -4
+    return depth
+
+assert(churn(20, 400) == 20, "collections landing mid-recursion leave every frame's roots intact")
+
+# ------------------------------------------------------------------ #
+# 3. Raw slots holding values whose bit patterns look like pointers.  #
+#    A double near 1e-308 and a large int are the shapes most likely  #
+#    to be mistaken for a heap address if the raw area were scanned.  #
+# ------------------------------------------------------------------ #
+
+function pointer_shaped(depth):
+    big = 140737488355328
+    tiny = 0.00000001
+    live = ["kept", depth]
+    if depth > 0:
+        if pointer_shaped(depth - 1) != depth - 1:
+            return -1
+    if big != 140737488355328:
+        return -2
+    if tiny != 0.00000001:
+        return -3
+    if live[0] != "kept" or live[1] != depth:
+        return -4
+    return depth
+
+assert(pointer_shaped(25) == 25, "raw slots holding pointer-shaped bit patterns are never traced")
+
+# ------------------------------------------------------------------ #
+# 4. A frame whose raw slots outnumber its boxed ones, so the raw     #
+#    area extends well past the scanned prefix.                       #
+# ------------------------------------------------------------------ #
+
+function raw_heavy(depth):
+    a = 1
+    b = 2
+    c = 3
+    d = 4
+    e = 5.5
+    f = 6.5
+    g = 7.5
+    h = 8.5
+    only_boxed = [depth]
+    a += depth
+    b += depth
+    c += depth
+    d += depth
+    e += 0.5
+    f += 0.5
+    g += 0.5
+    h += 0.5
+    if depth > 0:
+        if raw_heavy(depth - 1) != depth - 1:
+            return -1
+    if a != 1 + depth or d != 4 + depth:
+        return -2
+    if e != 6.0 or h != 9.0:
+        return -3
+    if only_boxed[0] != depth:
+        return -4
+    return depth
+
+assert(raw_heavy(20) == 20, "a raw-heavy frame's scanned prefix stops before its raw slots")
+
+print("test_gc_raw_frames.aer: all assertions passed.")
