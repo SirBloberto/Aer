@@ -2024,12 +2024,8 @@ static inline void vm_destructure_compute(AerVal src, AerVal* out0, AerVal* out1
 
 /* Shared by lbl_index_set and the fused index-set handlers -- same dispatch/bounds/errors.
    Caller must DISPATCH() immediately after. */
-/* switch rather than an if-else chain: a dense switch on the tag becomes a jump table, so no case
-   pays for the ones declared before it. TYPE_TYPED_ARRAY sat fourth, and sieve writes one 29.9M
-   times -- three failed tag compares per write. */
 static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal val) {
-    switch (aer_type(obj)) {
-    case TYPE_ARRAY: {
+    if (aer_type(obj) == TYPE_ARRAY) {
         AerArray* a = aer_as_array(obj);
         if (a->shape) {
             error("Struct fields are assigned with '.', not '[]'");
@@ -2051,9 +2047,7 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
            invalidates lbl_call's SPEC_KIND_ARRAY_OF_STRUCTS "already verified homogeneous"
            per-call-site cache (vm.c), which is keyed on (array pointer, generation, shape). */
         a->generation++;
-        break;
-    }
-    case TYPE_DICT: {
+    } else if (aer_type(obj) == TYPE_DICT) {
         if (aer_type(idx) != TYPE_STRING) {
             error("Hashtable key must be a string");
             return;
@@ -2073,10 +2067,9 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
             char* k = hashtable_key_dup(d->map.pools, is->data, klen, NULL); /* klen already true length */
             hashtable_put_hashed(&d->map, k, klen, khash, val);
         }
-        break;
-    }
-    case TYPE_STRING: error("Strings are immutable — cannot assign to an index"); break;
-    case TYPE_TYPED_ARRAY: {
+    } else if (aer_type(obj) == TYPE_STRING) {
+        error("Strings are immutable — cannot assign to an index");
+    } else if (aer_type(obj) == TYPE_TYPED_ARRAY) {
         AerTypedArray* ta = aer_as_typed_array(obj);
         if (aer_type(idx) != TYPE_INTEGER) {
             error("Array index must be an integer");
@@ -2091,9 +2084,8 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         if (!vm_typed_array_check(vm->chunk, ta->elem_kind, val)) return;
         unsigned int width = vm_typed_elem_width(ta->elem_kind);
         vm_typed_elem_write(ta->data + (size_t)i * width, ta->elem_kind, val);
-        break;
-    }
-    default: error("Cannot index type"); break;
+    } else {
+        error("Cannot index type");
     }
 }
 

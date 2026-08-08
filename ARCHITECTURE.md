@@ -1176,6 +1176,47 @@ So the last structural idea on the list is closed. LuaJIT's advantage here is no
 itself -- it is that a hand-written assembly interpreter pays no layout lottery and no register
 pressure, so the split is free for them and costs us more than it returns.
 
+### 5.16j A 21% win sitting in sieve, blocked by one unrecognised expression shape
+
+Profiling every benchmark **by function** rather than by opcode (the same lens that found the
+redundant `strlen` and the `memcmp` call) turns up one clear outlier:
+`vm_index_set_compute` is **28.67% of `sieve`**.
+
+The cause is a gap in the bounds proof, not a fundamental cost. `sieve` reads and writes the same
+array in the same nest:
+
+```
+for p in 2..n:                     -- read  is_composite[p]      -> OP_TYPED_INDEX_GET_UNCHECKED
+    for multiple in (p*p)..n..p:   -- write is_composite[m] = 1  -> OP_INDEX_SET  (generic!)
+```
+
+13.0M reads take the unchecked path; **29.9M writes do not**. `index_safe_unchecked` needs both
+`bound_safe` (the range end is the tracked `length(arr)`) and `start_safe`. Isolating it by variant:
+`p..n`, `p..n..p`, `2..n..p` and `2..n` **all** get the unchecked write -- steps and computed steps
+are fine. The only shape that fails is the computed start `p * p`, because `start_safe` recognises a
+non-negative literal, a bare enclosing-safe register, or `safe_reg + non-negative const` (an OP_ADD
+decode) -- but not an OP_MUL.
+
+Forcing it through with a throwaway parser hack that accepts `safe_reg * safe_reg`:
+**`sieve` -21.38% instructions, and nothing else moved past 0.02%.** The prize is real.
+
+**Why it was not shipped.** `p` is proven `0 <= p < count`, so `p*p >= 0` mathematically -- but
+`count` is `unsigned int`, so an index can reach 4.29e9 and `p*p` can overflow int64 to a negative
+start. Today that yields a clean "index out of bounds" from the checked path; with the unchecked
+opcode it is an out-of-bounds write. A 3-billion-element `int8` array is 3 GB -- remote, but
+reachable, and memory corruption is not an acceptable trade for a benchmark number.
+
+The fix that would close it properly: have `OP_ITER_RANGE_PREP` verify `cur >= 0` **once per loop**
+when the loop was compiled on this assumption, raising exactly the out-of-bounds error the checked
+path would have. One comparison per loop entry, not per iteration, and it needs a flag bit on PREP.
+That is a design change worth doing deliberately rather than bolting on.
+
+**Also measured and rejected on the way:** reordering `vm_index_set_compute`'s type dispatch.
+`TYPE_TYPED_ARRAY` sits fourth in its if-else chain, so every typed write appeared to pay three
+failed tag compares. Converting the chain to a jump-table `switch` moved `sieve` **+0.14%** -- i.e.
+nothing -- and regressed nine other benchmarks 0.5-4.7%. The dispatch was never the cost; the bounds
+check, the element-type validation and the write are. Reverted.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
