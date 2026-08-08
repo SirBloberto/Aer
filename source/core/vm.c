@@ -3077,8 +3077,18 @@ lbl_call : {
     unsigned int chosen_max_raw_reals = target_f->max_raw_reals;
 
     if (!target_f->megamorphic && target_f->shape_sensitive_mask != 0) {
-        vm_call_resolve_specialization(c, target_f, registers, arg_reg_base, ip, &chosen_offset,
-                                       &chosen_max_registers, &chosen_max_raw_ints, &chosen_max_raw_reals);
+        /* The out-params are scoped to this branch on purpose. Taking the address of the chosen_*
+           locals themselves forces all four into memory for the WHOLE handler -- an address that
+           escapes cannot live in a register -- so every ordinary call paid four stores and four
+           address computations for a path it never takes. */
+        unsigned int spec_offset = chosen_offset, spec_registers = chosen_max_registers;
+        unsigned int spec_raw_ints = chosen_max_raw_ints, spec_raw_reals = chosen_max_raw_reals;
+        vm_call_resolve_specialization(c, target_f, registers, arg_reg_base, ip, &spec_offset,
+                                       &spec_registers, &spec_raw_ints, &spec_raw_reals);
+        chosen_offset = spec_offset;
+        chosen_max_registers = spec_registers;
+        chosen_max_raw_ints = spec_raw_ints;
+        chosen_max_raw_reals = spec_raw_reals;
         code = c->code; /* compiling a specialized body can realloc it */
     }
 
