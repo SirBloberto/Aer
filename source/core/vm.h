@@ -914,30 +914,37 @@ typedef struct {
 
 /* Per-call register frame; lives in the VM struct so a nested module VM gets its own chain. */
 typedef struct {
-    /* Bump-pointer base into vm->register_stack -- a call is a pointer add, never an allocation.
-       _Alignas rounds sizeof(CallFrame) up to 64 (44 real bytes on 32-bit ARM, 57 on 64-bit); see
-       the power-of-two assert below for why that matters. */
-    _Alignas(64) AerVal* registers;
-    /* Registers THIS frame reserved (callee's compile-time peak; FRAME_REGISTERS for frame 0) --
-       read by the next push. */
-    unsigned int frame_size;
+    /* The anonymous union pads sizeof(CallFrame) up to 64 without raising its ALIGNMENT. _Alignas(64)
+       was the obvious way to get that size and is wrong: the requirement propagates to struct VM,
+       which aer_module.c -- and any embedder -- allocates with plain malloc, only 8-byte aligned.
+       Every module VM was undefined behaviour; UBSan caught it. Only the size matters here. */
+    union {
+        struct {
+            /* Bump-pointer base into vm->register_stack -- a call is a pointer add, not an
+               allocation. */
+            AerVal* registers;
+            /* Registers THIS frame reserved (callee's compile-time peak; FRAME_REGISTERS for frame
+               0) -- read by the next push. */
+            unsigned int frame_size;
 
-    /* Raw unboxed scratch for the primitive pass -- never GC-scanned, never crosses a call
-       boundary (only its boxed form does). Bump-pointer bases into vm->raw_int_stack/raw_real_stack
-       (mirrors registers/frame_size above) rather than fixed inline arrays -- a fixed array here
-       would cost every frame RAW_REGISTERS_INT+REAL slots regardless of whether that function uses
-       any raw locals at all. */
-    int64_t* raw_ints;
-    double* raw_reals;
-    unsigned int raw_int_frame_size;
-    unsigned int raw_real_frame_size;
+            /* Raw unboxed scratch for the primitive pass -- never GC-scanned, never crosses a call
+               boundary (only its boxed form does). Bump-pointer bases into
+               vm->raw_int_stack/raw_real_stack rather than fixed inline arrays, which would cost
+               every frame RAW_REGISTERS_INT+REAL slots whether or not it uses any raw locals. */
+            int64_t* raw_ints;
+            double* raw_reals;
+            unsigned int raw_int_frame_size;
+            unsigned int raw_real_frame_size;
 
-    unsigned int return_ip; /* where to resume in the CALLER */
-    int dest_reg; /* which of the CALLER's registers gets the return value */
+            unsigned int return_ip; /* where to resume in the CALLER */
+            int dest_reg; /* which of the CALLER's registers gets the return value */
 
-    unsigned int code_offset; /* this frame's entry point, for stack traces; unset on frame 0 */
-    unsigned int tail_calls_collapsed; /* tail calls collapsed into this frame since its last real push */
-    bool synthetic_entry; /* true for a setup_call()-pushed frame -- return_ip isn't a real caller line */
+            unsigned int code_offset; /* this frame's entry point, for stack traces; unset on frame 0 */
+            unsigned int tail_calls_collapsed; /* tail calls collapsed since this frame's last real push */
+            bool synthetic_entry; /* set by setup_call() -- return_ip isn't a real caller line */
+        };
+        char size_is_a_power_of_two[64];
+    };
 } CallFrame;
 /* Indexing call_stack[] is `base + depth * sizeof(CallFrame)`, and at 44 bytes that compiled to a
    multiply plus a materialized constant per field on 32-bit ARM. A power of two makes it a shift. */
