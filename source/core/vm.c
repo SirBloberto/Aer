@@ -424,10 +424,8 @@ void vm_init(VM* vm, Chunk* chunk) {
        else a fresh run needs is exactly what aer_vm_reset_for_reuse() already does. */
     vm->call_stack[0].registers = &vm->register_stack[0];
     vm->call_stack[0].frame_size = FRAME_REGISTERS;
-    vm->call_stack[0].raw_ints = &vm->raw_int_stack[0];
-    vm->call_stack[0].raw_reals = &vm->raw_real_stack[0];
-    vm->call_stack[0].raw_int_frame_size = RAW_REGISTERS_INT;
-    vm->call_stack[0].raw_real_frame_size = RAW_REGISTERS_REAL;
+    vm->call_stack[0].raw_int_count = RAW_REGISTERS_INT;
+    vm->call_stack[0].stride = FRAME_STRIDE(FRAME_REGISTERS, RAW_REGISTERS_INT, RAW_REGISTERS_REAL);
     aer_vm_reset_for_reuse(vm);
 }
 
@@ -481,8 +479,8 @@ void aer_vm_reset_for_reuse(VM* vm) {
     vm->stack_top = 0;
     vm->call_depth = 0;
     vm->registers = vm->call_stack[0].registers;
-    vm->raw_ints = vm->call_stack[0].raw_ints;
-    vm->raw_reals = vm->call_stack[0].raw_reals;
+    vm->raw_ints = FRAME_RAW_INTS(&vm->call_stack[0]);
+    vm->raw_reals = FRAME_RAW_REALS(&vm->call_stack[0]);
 }
 
 bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
@@ -1103,12 +1101,10 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
     }
     CallFrame* caller = &target->call_stack[target->call_depth];
     CallFrame* callee = &target->call_stack[target->call_depth + 1];
-    callee->registers = caller->registers + caller->frame_size;
+    callee->registers = caller->registers + caller->stride;
     callee->frame_size = fn->max_registers;
-    callee->raw_ints = caller->raw_ints + caller->raw_int_frame_size;
-    callee->raw_reals = caller->raw_reals + caller->raw_real_frame_size;
-    callee->raw_int_frame_size = fn->max_raw_ints;
-    callee->raw_real_frame_size = fn->max_raw_reals;
+    callee->raw_int_count = fn->max_raw_ints;
+    callee->stride = FRAME_STRIDE(fn->max_registers, fn->max_raw_ints, fn->max_raw_reals);
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = args[i];
     for (int i = arg_count; i < (int)fn->arity; i++)
@@ -1122,8 +1118,8 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
         ->call_depth++; /* same rooting rule as vm_call_value's non-tail branch (above) -- the defaults loop wrote into callee->registers[] before this point */
     gc_maybe_collect(target);
     target->registers = target->call_stack[target->call_depth].registers;
-    target->raw_ints = target->call_stack[target->call_depth].raw_ints;
-    target->raw_reals = target->call_stack[target->call_depth].raw_reals;
+    target->raw_ints = FRAME_RAW_INTS(&target->call_stack[target->call_depth]);
+    target->raw_reals = FRAME_RAW_REALS(&target->call_stack[target->call_depth]);
     target->ip = fn->code_offset;
     return true;
 }
@@ -1164,8 +1160,8 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
            last occupied this frame. Must be refreshed here too, not just on the non-tail push path
            above (which already sizes from f->max_registers/max_raw_ints/max_raw_reals). */
         reused->frame_size = f->max_registers;
-        reused->raw_int_frame_size = f->max_raw_ints;
-        reused->raw_real_frame_size = f->max_raw_reals;
+        reused->raw_int_count = f->max_raw_ints;
+        reused->stride = FRAME_STRIDE(f->max_registers, f->max_raw_ints, f->max_raw_reals);
         reused->tail_calls_collapsed++;
         return;
     }
@@ -1175,12 +1171,10 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     }
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
-    callee->registers = caller->registers + caller->frame_size;
+    callee->registers = caller->registers + caller->stride;
     callee->frame_size = f->max_registers;
-    callee->raw_ints = caller->raw_ints + caller->raw_int_frame_size;
-    callee->raw_reals = caller->raw_reals + caller->raw_real_frame_size;
-    callee->raw_int_frame_size = f->max_raw_ints;
-    callee->raw_real_frame_size = f->max_raw_reals;
+    callee->raw_int_count = f->max_raw_ints;
+    callee->stride = FRAME_STRIDE(f->max_registers, f->max_raw_ints, f->max_raw_reals);
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = caller->registers[arg_reg_base + i];
     for (int i = arg_count; i < (int)f->arity; i++)
@@ -1193,8 +1187,8 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     vm->call_depth++; /* the defaults loop above wrote into callee->registers[] BEFORE this point, when mark_vm_roots's 0..call_depth scan didn't yet cover that frame -- gc_maybe_collect() must run AFTER this increment, not before, or a collection could reclaim a fresh default array/dict as unreachable */
     gc_maybe_collect(vm);
     vm->registers = vm->call_stack[vm->call_depth].registers;
-    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
-    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
+    vm->raw_ints = FRAME_RAW_INTS(&vm->call_stack[vm->call_depth]);
+    vm->raw_reals = FRAME_RAW_REALS(&vm->call_stack[vm->call_depth]);
     vm->ip = f->code_offset;
 }
 
@@ -3046,8 +3040,8 @@ lbl_call : {
            frame computes its child's base from the wrong frame_size and overlaps still-live slots.
            The base pointers are untouched -- same frame, same memory, only the claim changes. */
         reused->frame_size = target_f->max_registers;
-        reused->raw_int_frame_size = target_f->max_raw_ints;
-        reused->raw_real_frame_size = target_f->max_raw_reals;
+        reused->raw_int_count = target_f->max_raw_ints;
+        reused->stride = FRAME_STRIDE(target_f->max_registers, target_f->max_raw_ints, target_f->max_raw_reals);
         reused->tail_calls_collapsed++;
         /* Every call (tail or not) is the other place a script can spend unbounded time
            (recursion instead of a loop) -- checked once ip already points at the callee's real
@@ -3078,12 +3072,10 @@ lbl_call : {
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
-    callee->registers = caller->registers + caller->frame_size;
+    callee->registers = caller->registers + caller->stride;
     callee->frame_size = chosen_max_registers;
-    callee->raw_ints = caller->raw_ints + caller->raw_int_frame_size;
-    callee->raw_reals = caller->raw_reals + caller->raw_real_frame_size;
-    callee->raw_int_frame_size = chosen_max_raw_ints;
-    callee->raw_real_frame_size = chosen_max_raw_reals;
+    callee->raw_int_count = chosen_max_raw_ints;
+    callee->stride = FRAME_STRIDE(chosen_max_registers, chosen_max_raw_ints, chosen_max_raw_reals);
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = caller->registers[arg_reg_base + i];
     callee->return_ip = ip; /* already past this instruction's operands -- the correct resume point */
@@ -3093,8 +3085,8 @@ lbl_call : {
     callee->synthetic_entry = false;
     vm->call_depth++;
     vm->registers = vm->call_stack[vm->call_depth].registers;
-    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
-    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
+    vm->raw_ints = FRAME_RAW_INTS(&vm->call_stack[vm->call_depth]);
+    vm->raw_reals = FRAME_RAW_REALS(&vm->call_stack[vm->call_depth]);
     registers = vm->registers; /* refresh the hoisted locals -- see their own comment above */
     raw_ints = vm->raw_ints;
     raw_reals = vm->raw_reals;
@@ -3136,10 +3128,15 @@ lbl_return : {
     AerVal result = callee->registers[src_reg];
     unsigned int return_ip = callee->return_ip;
     int dest_reg = callee->dest_reg;
+    /* DIAGNOSTIC: restore the "every register_stack slot holds a valid AerVal" invariant that the
+       GC's unconditional frame scan depends on (mark_vm_roots, gc.c). */
+    if (callee->stride > callee->frame_size)
+        memset(callee->registers + callee->frame_size, 0,
+               (callee->stride - callee->frame_size) * sizeof(AerVal));
     vm->call_depth--;
     vm->registers = vm->call_stack[vm->call_depth].registers;
-    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
-    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
+    vm->raw_ints = FRAME_RAW_INTS(&vm->call_stack[vm->call_depth]);
+    vm->raw_reals = FRAME_RAW_REALS(&vm->call_stack[vm->call_depth]);
     /* Must refresh the hoisted locals (see their own comment above) BEFORE the write below --
        registers still pointed at the callee's (now-popped) frame otherwise, corrupting whichever
        register of the CALLER's frame happens to share dest_reg's index instead of writing the
