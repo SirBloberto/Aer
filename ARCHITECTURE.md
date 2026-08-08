@@ -1091,10 +1091,40 @@ its five arguments. **gcc already overlaps locals whose live ranges do not overl
 array is not additive frame cost the way it looks -- 5.16d's +4.52% came from adding a *second* live
 array alongside an existing one, not from the array's size alone. Reverted.
 
-The remaining spill share is genuine register pressure: one 45KB function, 153 label bodies, ~14
-usable ARM registers, and about a dozen values live across the whole dispatch loop. Reducing it
-further means reducing what is live across dispatches, not another point fix. The address-taken
-pattern above is the one class worth grepping for.
+**What the spill slots actually hold.** Reading the prologue against the sampled slot offsets, the
+spilling is not spread across dozens of temporaries -- it is two values, each given several slots by
+the register allocator:
+
+| value | slots | share of `fib_bench` cycles |
+|---|---|---|
+| `vm` | sp+44, sp+72 | **10.4%** |
+| `c` (Chunk*) | sp+40, sp+52, sp+68 | **9.4%** |
+| `const_pool` | sp+48 | 3.1% |
+
+That is essentially all of it, out of a 3268-byte frame. Both are reloaded a few hundred times
+across the function because nearly every label needs one or the other, and neither survives in a
+register across 153 label bodies on a 14-register ISA.
+
+Three attempts to reduce it, all measured:
+
+- **Hoisting `&vm->heap`** so the 33 `gc_maybe_collect` sites test the threshold without touching
+  `vm`: **0.00% on every benchmark.** gcc was already CSE-ing the address through `always_inline`.
+  Reverted -- machinery for no gain.
+- **Register-allocation flags.** `-fira-region=one` +1.73% on fib, `-fsched-pressure` 0.00%,
+  `-fira-algorithm=priority` -0.65% on fib and nothing elsewhere, `--param=max-inline-insns-auto=8`
+  far worse. A lottery that would not generalise across compilers, same objection as `ARCH_FLAGS`.
+- **Shrinking the frame** (5.16h above): no effect, gcc overlaps non-overlapping label locals.
+
+And note what does *not* follow: **cutting opcodes will not help this.** Register allocation is
+driven by live ranges, not code size -- the dozen values live across every dispatch conflict with
+everything no matter how many labels exist. Splitting the interpreter into hot and cold halves does
+not help either, for the same reason: the hot half would still need the same values live. 5.16
+measures the icache miss rate at 0.02-0.10%, so the 45KB is not costing anything directly. Trim
+opcodes for comprehension; do not expect registers back.
+
+This looks like the floor for a C-compiled computed-goto interpreter on a 14-register ISA. LuaJIT
+avoids it by writing the interpreter in assembly and pinning BASE/PC/DISPATCH to fixed registers,
+which no amount of C-level restructuring reproduces.
 
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
