@@ -3579,22 +3579,6 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
                 }
             }
         }
-        /* TEMP MEASUREMENT HACK -- not for keeping. */
-        if (!start_safe && bound_safe && c->count - start_code_begin == 1) {
-            uint32_t w2 = c->code[start_code_begin];
-            if ((w2 & 0xFF) == OP_MUL && (int)UNPACK_A(w2) == rk_start) {
-                uint8_t l8 = (uint8_t)UNPACK_B(w2), r8 = (uint8_t)UNPACK_C(w2);
-                if (!RK8_IS_CONST(l8) && !RK8_IS_CONST(r8)) {
-                    bool ls = false, rs = false;
-                    for (int si = 0; si < P.safe_loop_depth; si++) {
-                        if (P.safe_loop_array_regs[si] != bound_array_reg) continue;
-                        if (P.safe_loop_item_regs[si] == RK8_INDEX(l8)) ls = true;
-                        if (P.safe_loop_item_regs[si] == RK8_INDEX(r8)) rs = true;
-                    }
-                    if (ls && rs) start_safe = true;
-                }
-            }
-        }
         bool this_loop_safe = bound_safe && start_safe && P.safe_loop_depth < LOOP_MAX;
 
         /* Snapshotted once, matching Lua/Python's range-for semantics -- a later mutation of the
