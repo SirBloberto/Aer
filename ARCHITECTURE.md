@@ -1397,8 +1397,13 @@ Either way the cache is lazy, with 0 meaning "not computed yet"; a key whose tru
 recomputes, which is correct and rare. It is consulted only when `true_len == length`, because a
 string with an embedded NUL hashes over its truncated prefix and the two lengths would disagree.
 
-The duplicated `hashtable_key_true_len` walk is separate from all of this, carries no trade-off, and
-is fixed independently.
+The duplicated `hashtable_key_true_len` walk is separate from all of this and carries no trade-off,
+so it was fixed on its own: `hashtable_key_dup_known` for callers already holding the truncated
+length. **`small_dict_bench` -5.51%, `dict_bench` -2.69%**, every other benchmark inside ±0.04% and
+all 15 outputs byte-identical. Larger than the raw byte count suggests -- the scan is a
+branch-per-byte loop, and removing it also unblocks the copy that follows it.
+
+That leaves the hash cache as the remaining lever here, still unbuilt pending the 32-bit decision.
 
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
