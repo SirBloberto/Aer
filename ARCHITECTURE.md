@@ -1217,6 +1217,42 @@ failed tag compares. Converting the chain to a jump-table `switch` moved `sieve`
 nothing -- and regressed nine other benchmarks 0.5-4.7%. The dispatch was never the cost; the bounds
 check, the element-type validation and the write are. Reverted.
 
+### 5.16k Proving range starts non-negative -- and the segfault that found
+
+`index_safe_unchecked` lets a range-for's body index without bounds checks when the range end IS
+`length(arr)` and the start is provably `>= 0`. The upper half was solid; the lower half was three
+hand-decoded shapes -- a literal, a bare enclosing-safe register, and `safe_reg + const` recognised
+by inspecting the emitted `OP_ADD` word. Anything else fell back to the generic path, which is why
+`sieve`'s `(p*p)..n..p` writes ran through `vm_index_set_compute` -- **28.67% of that benchmark**
+across 29.9M writes, while its reads on the same array in the same nest took the fast path.
+
+Replaced by a composable predicate rather than a fourth special case. `Parser.reg_nonneg` marks a
+register proven `>= 0` -- a non-negative constant, a bounded loop index, `length()`, or those
+combined with `+ * // %` -- propagated at the single `emit_binary` funnel, seeded at `reg_alloc` (so
+a recycled register carries no stale proof) and cleared by the existing `invalidate_register`. Not
+propagated through `-` or `<<`, which can go negative from non-negative operands. `start_safe`
+collapses to one call and the three special cases are **deleted**. **`sieve` -21.38%.**
+
+**It also fixed a segfault in shipped code, which the new tests found.** The proof assumed the loop
+ascends -- but direction is inferred from the bounds, so `for i in 200..length(a)` on a short array
+counts *downwards* from 200, straight off the end, writing unchecked. On the then-current `feature`
+that was 199 out-of-bounds writes and a reproducible `exit 139`. It had presumably been reachable
+since non-literal starts were first accepted.
+
+Both halves of the precondition are now verified **once per loop entry** in `OP_ITER_RANGE_PREP`,
+which already validates the bound types and rejects `step <= 0`. One unsigned compare covers both
+(`rng_end` is a length, so a negative `cur` reinterprets as a huge unsigned and fails the same test).
+The flag rides in the spare high bits of the `item_dest` operand -- an 8-bit register index in a
+32-bit word -- so no encoding growth and no new opcode. Overflow in a computed start is caught by
+that same check, which is what makes the predicate safe to extend with more operators later without
+a fresh safety argument.
+
+One caveat recorded honestly: `nbody` is **+0.50%**, over the usual 0.30% bar. Isolated by forcing
+the guard flag permanently off -- same code shape, guard never taken -- and `nbody` stayed +0.50%
+while `sieve` kept its -21.38%. So the cost is codegen shift from touching these files, not the
+guard's arithmetic (which would be ~3 instructions against the 10.5 per `PREP` the delta implies).
+Landed anyway: it buys a memory-safety fix and 21% on another benchmark.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
