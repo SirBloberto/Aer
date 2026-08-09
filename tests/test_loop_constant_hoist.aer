@@ -1,0 +1,233 @@
+#!/usr/bin/env aer
+import collection
+# AER test suite — loop-invariant raw constant hoisting.
+#
+# A literal used inside a loop is loaded into a raw slot once, in a preheader before the loop,
+# instead of being re-materialised every iteration. The slot is permanent for the loop's duration,
+# so the whole correctness question is slot allocation: a hoisted constant must never land on a
+# slot the loop itself rewrites. It once did, and nothing caught it but a hang -- `total += i * 2`
+# left its product in a temp slot, `i = i + 1` then hoisted its `1` into that same freed slot, and
+# `i` advanced by `i * 2` forever. Every case here therefore checks its arithmetic, and the shapes
+# that mix a scratch-producing statement with a hoisted constant are the ones that matter most.
+
+# ------------------------------------------------------------------ #
+# 1. The exact shape that hung: a temp-producing statement before a   #
+#    statement whose constant gets hoisted.                           #
+# ------------------------------------------------------------------ #
+
+function scratch_before_constant(limit):
+    total = 0
+    i = 0
+    for i < limit:
+        total += i * 2
+        i = i + 1
+    return total
+
+assert(scratch_before_constant(5) == 20, "2*(0+1+2+3+4)")
+assert(scratch_before_constant(1000) == 999000, "the same shape over a long trip count")
+assert(scratch_before_constant(0) == 0, "a loop that never runs still returns the initial value")
+
+# Several scratch values AND several constants competing for slots at once.
+function many_temps_and_constants(limit):
+    a = 0
+    b = 0
+    i = 0
+    for i < limit:
+        a += i * 3 + 7
+        b += i * 5 - 2
+        i = i + 1
+    return a * 1000 + b
+
+# i=0,1,2: a = 7 + 10 + 13 = 30; b = -2 + 3 + 8 = 9
+assert(many_temps_and_constants(3) == 30 * 1000 + 9, "multiple constants and temps coexist")
+
+# ------------------------------------------------------------------ #
+# 2. Reals, which use a separate slot space with the same hazard.     #
+# ------------------------------------------------------------------ #
+
+function real_constants(limit):
+    total = 0.0
+    x = 1.0
+    i = 0
+    for i < limit:
+        x = x * 2.0 + 0.5
+        total = total + x
+        i = i + 1
+    return total
+
+# x: 2.5, 5.5, 11.5 -> total 19.5
+assert(real_constants(3) == 19.5, "hoisted real constants survive a scratch-producing multiply")
+
+function mixed_int_and_real(limit):
+    acc = 0.0
+    i = 0
+    for i < limit:
+        acc = acc + i * 1.5
+        i = i + 2
+    return acc
+
+# i = 0, 2, 4 -> 0 + 3 + 6
+assert(mixed_int_and_real(5) == 9.0, "int and real constants hoist into their own slot spaces")
+
+# ------------------------------------------------------------------ #
+# 3. The same constant used repeatedly must load once and be shared;  #
+#    more distinct constants than the preheader holds must still be   #
+#    correct, just unhoisted past the limit.                          #
+# ------------------------------------------------------------------ #
+
+function repeated_constant(limit):
+    total = 0
+    i = 0
+    for i < limit:
+        total += 10
+        total += 10
+        total += 10
+        i = i + 1
+    return total
+
+assert(repeated_constant(4) == 120, "one constant used three times still totals correctly")
+
+function more_constants_than_fit(limit):
+    total = 0
+    i = 0
+    for i < limit:
+        total += 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9
+        i = i + 1
+    return total
+
+assert(more_constants_than_fit(3) == 135, "overflowing the preheader falls back, still correct")
+
+# ------------------------------------------------------------------ #
+# 4. Nesting. Each loop gets its own preheader, and an inner loop     #
+#    re-runs its own on every outer iteration.                        #
+# ------------------------------------------------------------------ #
+
+function nested(outer_limit, inner_limit):
+    total = 0
+    i = 0
+    for i < outer_limit:
+        j = 0
+        for j < inner_limit:
+            total += j * 2 + 1
+            j = j + 1
+        i = i + 1
+    return total
+
+# inner sum for j=0..2: 1 + 3 + 5 = 9, times 4 outer iterations
+assert(nested(4, 3) == 36, "an inner loop's preheader re-runs per outer iteration")
+
+function nested_shared_constant(limit):
+    total = 0
+    i = 0
+    for i < limit:
+        j = 0
+        for j < limit:
+            total += 2
+            j = j + 1
+        total += 2
+        i = i + 1
+    return total
+
+assert(nested_shared_constant(3) == 3 * 3 * 2 + 3 * 2, "the same literal in both loops is fine")
+
+# ------------------------------------------------------------------ #
+# 5. Range-for and for-in also reserve a preheader, so their bodies   #
+#    must be equally unaffected.                                      #
+# ------------------------------------------------------------------ #
+
+function range_form(limit):
+    total = 0
+    for i in 0..limit:
+        total += i * 2 + 1
+    return total
+
+assert(range_form(5) == 25, "range-for bodies hoist correctly")
+
+function range_form_stepped():
+    total = 0
+    for i in 0..10..3:
+        total += i * 100 + 1
+    return total
+
+# i = 0, 3, 6, 9
+assert(range_form_stepped() == 1800 + 4, "a stepped range-for is unaffected")
+
+function collection_form():
+    values = [3, 1, 4, 1, 5]
+    total = 0
+    for v in values:
+        total += v * 10 + 2
+    return total
+
+assert(collection_form() == 140 + 10, "for-in over a collection is unaffected")
+
+function empty_range_still_correct():
+    total = 7
+    for i in 0..0:
+        total += 100
+    return total
+
+assert(empty_range_still_correct() == 7, "an empty range runs the preheader but no iterations")
+
+# ------------------------------------------------------------------ #
+# 6. break/continue must not skip past the preheader on re-entry.     #
+# ------------------------------------------------------------------ #
+
+function with_continue(limit):
+    total = 0
+    i = 0
+    for i < limit:
+        i = i + 1
+        if i % 2 == 0:
+            continue
+        total += i * 10
+    return total
+
+# i = 1, 3, 5 contribute
+assert(with_continue(6) == 90, "continue re-enters the body, not the preheader")
+
+function with_break():
+    total = 0
+    i = 0
+    for i < 100:
+        i = i + 1
+        total += i * 2
+        if i == 4:
+            break
+    return total
+
+assert(with_break() == 2 + 4 + 6 + 8, "break leaves the loop with the right running total")
+
+# A loop re-entered from the outside must re-run its preheader each time.
+function reentered_loop(times):
+    grand = 0
+    t = 0
+    for t < times:
+        total = 0
+        i = 0
+        for i < 3:
+            total += i * 4 + 1
+            i = i + 1
+        grand += total
+        t = t + 1
+    return grand
+
+# inner: 1 + 5 + 9 = 15 each time
+assert(reentered_loop(3) == 45, "a re-entered loop reloads its own hoisted constants")
+
+# ------------------------------------------------------------------ #
+# 7. Large literals take the pool path rather than the int32          #
+#    immediate, and must hoist through it just the same.              #
+# ------------------------------------------------------------------ #
+
+function wide_literals(limit):
+    total = 0
+    i = 0
+    for i < limit:
+        total += 5000000000
+        i = i + 1
+    return total
+
+assert(wide_literals(3) == 15000000000, "a literal beyond int32 hoists via the pool path")
+
+print("test_loop_constant_hoist.aer: all assertions passed.")

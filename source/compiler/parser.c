@@ -41,6 +41,23 @@ typedef struct {
     int continue_patch_count;
 } LoopContext;
 
+/* A literal inside a loop is re-materialised every iteration, because the raw slot it lands in is
+   clobbered by whatever consumes it. Each loop reserves a preheader gap up front and fills it once
+   the body is parsed; uses need no rewriting, since the parser already knows the hoisted slot when
+   it emits the instruction that reads it. HOIST_MAX loads exactly fill the gap, so a loop using
+   fewer skips the rest with one OP_JUMP -- paid per loop ENTRY, against a load per ITERATION. */
+#define HOIST_MAX 4
+#define HOIST_GAP_WORDS (HOIST_MAX * 2)
+typedef struct {
+    unsigned int gap_offset;
+    int count;
+    bool is_int[HOIST_MAX];
+    bool from_pool[HOIST_MAX]; /* int too wide for OP_RAW_LOAD_INT's int32 immediate */
+    int64_t value[HOIST_MAX]; /* ints: the value itself, so dedup never depends on pool identity */
+    unsigned int pool_idx[HOIST_MAX];
+    int slot[HOIST_MAX];
+} LoopHoist;
+
 /* Every mutable global the compile functions share. P (below) is the live instance;
    parser_save_state/restore_state snapshot it wholesale for a nested compile. */
 typedef struct Parser {
@@ -137,6 +154,10 @@ typedef struct Parser {
     bool range_item_written[LOOP_MAX];
     int range_loop_depth;
 
+    /* One entry per enclosing loop, innermost last -- see LoopHoist and hoist_begin. */
+    LoopHoist hoist_stack[LOOP_MAX];
+    int hoist_depth;
+
     /* Top-level variable names, kept solely to detect a function body referencing one -- see
        var_names's own original comment (git blame) for the shadow-ban mechanism. */
     unsigned int global_names[FRAME_REGISTERS];
@@ -226,6 +247,7 @@ static int raw_real_reserve_one(void) {
 }
 
 void reg_reset(void) {
+    P.hoist_depth = 0;
     P.next_temp_register = 0;
     P.reserved_floor = 0;
     P.max_register_used = 0;
@@ -886,6 +908,90 @@ static RawKind rk_raw_kind(Chunk* c, int rk) {
     return RAWK_NONE;
 }
 
+/* Reserves this loop's preheader gap. Call immediately before the loop's own first instruction --
+   everything after the gap is either the condition (re-run per iteration) or the body, so the gap
+   dominates every use it can serve. Returns false when the nesting bound is reached, in which case
+   nothing hoists and hoist_end must be told so. */
+static bool hoist_begin(Chunk* c) {
+    if (P.hoist_depth >= LOOP_MAX) return false;
+    LoopHoist* h = &P.hoist_stack[P.hoist_depth++];
+    h->count = 0;
+    h->gap_offset = c->count;
+    for (int i = 0; i < HOIST_GAP_WORDS; i++) chunk_emit(c, 0);
+    return true;
+}
+
+/* Backfills the gap now the body has been parsed. after_gap is the loop's own first instruction --
+   the address the skip-jump targets when fewer than HOIST_MAX constants were hoisted. */
+static void hoist_end(Chunk* c, unsigned int after_gap, bool active) {
+    if (!active) return;
+    LoopHoist* h = &P.hoist_stack[--P.hoist_depth];
+    unsigned int w = h->gap_offset;
+    for (int i = 0; i < h->count; i++) {
+        if (!h->is_int[i]) {
+            c->code[w++] = PACK1(OP_RAW_LOAD_REAL, h->slot[i]);
+            c->code[w++] = h->pool_idx[i];
+        } else if (h->from_pool[i]) {
+            c->code[w++] = PACK1(OP_RAW_LOAD_INT_POOL, h->slot[i]);
+            c->code[w++] = h->pool_idx[i];
+        } else {
+            c->code[w++] = PACK1(OP_RAW_LOAD_INT, h->slot[i]);
+            c->code[w++] = (uint32_t)(int32_t)h->value[i];
+        }
+    }
+    if (w < h->gap_offset + HOIST_GAP_WORDS) {
+        c->code[w++] = OP_JUMP;
+        c->code[w] = after_gap;
+    }
+}
+
+/* Claims a slot above the function's temp high-water mark, not at the reserved floor. A temp is
+   freed at the end of its statement, so the floor would hand a hoisted constant the slot an earlier
+   statement in this same loop uses as scratch -- and that statement rewrites it every iteration.
+   Real bug: `total += i * 2` left its product in slot 3, `i = i + 1` hoisted its `1` into the freed
+   slot 3, and `i` advanced by `i * 2` forever. max_raw_*_used is the only counter that outlives a
+   statement. Slots skipped this way are never reused -- at most HOIST_MAX per loop. */
+static int hoist_reserve_int(void) {
+    int slot = P.max_raw_int_used > P.raw_int_reserved_floor ? P.max_raw_int_used
+                                                             : P.raw_int_reserved_floor;
+    if (slot >= RAW_REGISTERS_INT) return -1;
+    P.raw_int_reserved_floor = slot + 1;
+    P.raw_int_next_temp = P.raw_int_reserved_floor;
+    track_raw_int_peak(P.raw_int_reserved_floor);
+    return slot;
+}
+static int hoist_reserve_real(void) {
+    int slot = P.max_raw_real_used > P.raw_real_reserved_floor ? P.max_raw_real_used
+                                                               : P.raw_real_reserved_floor;
+    if (slot >= RAW_REGISTERS_REAL) return -1;
+    P.raw_real_reserved_floor = slot + 1;
+    P.raw_real_next_temp = P.raw_real_reserved_floor;
+    track_raw_real_peak(P.raw_real_reserved_floor);
+    return slot;
+}
+
+/* The hoisted slot for this constant in the innermost loop, reserving one on first use. -1 means
+   "not hoisted" -- no enclosing loop, this loop's gap is full, or the raw-slot budget is spent --
+   and the caller then emits the load inline exactly as before. */
+static int hoist_constant(bool is_int, int64_t value, unsigned int pool_idx, bool from_pool) {
+    if (P.hoist_depth <= 0) return -1;
+    LoopHoist* h = &P.hoist_stack[P.hoist_depth - 1];
+    for (int i = 0; i < h->count; i++) {
+        if (h->is_int[i] != is_int) continue;
+        if (is_int ? (h->value[i] == value) : (h->pool_idx[i] == pool_idx)) return h->slot[i];
+    }
+    if (h->count >= HOIST_MAX) return -1;
+    int slot = is_int ? hoist_reserve_int() : hoist_reserve_real();
+    if (slot < 0) return -1;
+    int i = h->count++;
+    h->is_int[i] = is_int;
+    h->from_pool[i] = from_pool;
+    h->value[i] = value;
+    h->pool_idx[i] = pool_idx;
+    h->slot[i] = slot;
+    return slot;
+}
+
 /* An already-raw operand's slot is reused directly; a literal loads into a fresh slot.
    Returns -1 on budget overflow (caller falls back to boxed). */
 static int raw_materialize(Chunk* c, int rk, RawKind kind) {
@@ -893,6 +999,8 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
         if (rk & RK_RAW_INT_FLAG) return rk & RK_RAW_SLOT_MASK;
         unsigned int pool_idx = rk & ~RK_CONST_FLAG;
         int64_t v = aer_as_int(c->pool[pool_idx]);
+        int hoisted = hoist_constant(true, v, pool_idx, !(v >= INT32_MIN && v <= INT32_MAX));
+        if (hoisted >= 0) return hoisted;
         int slot = raw_int_alloc();
         if (slot < 0) return -1;
         /* A literal outside the signed 32-bit range must go through the pool instead -- OP_RAW_LOAD_INT's
@@ -911,6 +1019,8 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
         if (rk & RK_RAW_REAL_FLAG) return rk & RK_RAW_SLOT_MASK;
         unsigned int pool_idx =
             rk & ~RK_CONST_FLAG; /* real literal already lives in the pool as a full double */
+        int hoisted = hoist_constant(false, 0, pool_idx, false);
+        if (hoisted >= 0) return hoisted;
         int slot = raw_real_alloc();
         if (slot < 0) return -1;
         chunk_emit(c, PACK1(OP_RAW_LOAD_REAL, slot));
@@ -3600,12 +3710,15 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         int saved_reserved_floor = P.reserved_floor;
         P.reserved_floor = P.next_temp_register;
 
+        bool hoisting = hoist_begin(c);
+        unsigned int prep_at = c->count;
         /* Loop-rotated: PREP once before the loop, LOOP at the bottom of the body -- the one form
            whose continue must defer-patch instead of jumping to a known target. */
         unsigned int patch_empty =
             emit_iter_range_prep(c, cur_reg, end_reg, step_reg, item_reg, this_loop_safe);
 
         if (!loop_push_rotated()) {
+            hoist_end(c, prep_at, hoisting);
             P.reserved_floor = saved_reserved_floor;
             P.next_temp_register = saved_reserved_floor;
             return;
@@ -3630,6 +3743,7 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         unsigned int body_start = c->count;
         parse_block(c);
         if (parse_had_error) {
+            hoist_end(c, prep_at, hoisting);
             if (range_tracked) P.range_loop_depth--;
             if (this_loop_safe) P.safe_loop_depth--;
             P.loop_depth--;
@@ -3651,6 +3765,7 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         unsigned int exit_pos = c->count;
         patch_jump(c, patch_empty, exit_pos);
         loop_pop_and_patch_rotated(c, exit_pos, loop_bottom);
+        hoist_end(c, prep_at, hoisting);
 
         P.reserved_floor = saved_reserved_floor;
         P.next_temp_register = saved_reserved_floor;
@@ -3671,10 +3786,12 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
     int saved_reserved_floor = P.reserved_floor;
     P.reserved_floor = P.next_temp_register;
 
+    bool hoisting = hoist_begin(c);
     unsigned int loop_top = c->count; /* the iterate opcode is its own back-edge target */
     unsigned int patch_exit = emit_iter_next_array(c, col_reg, idx_reg, item_reg);
 
     parse_loop_body(c, loop_top, patch_exit);
+    hoist_end(c, loop_top, hoisting);
 
     P.reserved_floor = saved_reserved_floor;
     P.next_temp_register = saved_reserved_floor;
@@ -3716,10 +3833,12 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
     int saved_reserved_floor = P.reserved_floor;
     P.reserved_floor = P.next_temp_register;
 
+    bool hoisting = hoist_begin(c);
     unsigned int loop_top = c->count;
     unsigned int patch_exit = emit_iter_next_pair(c, col_reg, idx_reg, key_reg, val_reg);
 
     parse_loop_body(c, loop_top, patch_exit);
+    hoist_end(c, loop_top, hoisting);
 
     P.reserved_floor = saved_reserved_floor;
     P.next_temp_register = saved_reserved_floor;
@@ -3758,6 +3877,7 @@ static void parse_for_while(Chunk* c) {
             reg = var_slot(c, name_idx);
             if (reg < 0) return;
         }
+        bool hoisting = hoist_begin(c);
         unsigned int loop_top = c->count;
         P.loop_cond_peak = P.next_temp_register;
         /* Resolves the postfix chain first, so `for cur.next:` works -- a bare-variable condition is
@@ -3765,12 +3885,15 @@ static void parse_for_while(Chunk* c) {
         int rk_chain = parse_postfix_chain(c, reg);
         int rk_cond = parse_binary_ops(c, 0, rk_chain, c->count);
         parse_for_body(c, loop_top, rk_cond);
+        hoist_end(c, loop_top, hoisting);
         return;
     }
+    bool hoisting = hoist_begin(c);
     unsigned int loop_top = c->count;
     P.loop_cond_peak = P.next_temp_register;
     int rk_cond = parse_binary(c, 0);
     parse_for_body(c, loop_top, rk_cond);
+    hoist_end(c, loop_top, hoisting);
 }
 
 /* Checked before the normal identifier/call/assignment path -- a module name isn't a
