@@ -1895,6 +1895,23 @@ measured. The table above it shows the same value as an *addition* to r8 costing
 true: the base pin is worth roughly nothing either way, and the dispatch pin is worth 1.72%, so
 trading one for the other loses the difference.
 
+**Re-measured after 5.16w**, since merging `code` and `ip` into one pointer removed a live value
+from the hot path and could have made a second reservation affordable:
+
+| variant | nbody | sieve | mandel | fib | dict | log | struct_scan | mean |
+|---|---|---|---|---|---|---|---|---|
+| dispatch base only | — | — | — | — | — | — | — | **0.00%** |
+| + `pc` in r4 | -2.09% | +0.88% | -6.52% | +0.66% | +0.42% | +0.01% | +2.05% | **-0.66%** |
+| + `raw_reals` in r4 | -2.06% | +1.26% | -3.80% | -0.44% | +0.99% | +1.15% | -0.38% | **-0.47%** |
+| + `registers` in r4 | +0.23% | +2.24% | +0.32% | +0.44% | +0.87% | +0.81% | +0.32% | +0.74% |
+| r8 = `pc` instead | +1.87% | +6.60% | +3.13% | +1.12% | +0.32% | -0.01% | +4.86% | **+2.56%** |
+
+The occupant question is settled twice over: `r8` holds the dispatch base, and giving it to `pc`
+instead costs +2.56%. The *second* pin question did move -- `pc` in r4 is -0.66% where the best
+addition before was +0.14% -- but it is a trade, not a win, buying `mandelbrot` -6.52% with
+`struct_array_scan` +2.05%. It is also measured against a tree without 5.16x's hoist, which changes
+the instruction mix it depends on. Left open, to be re-measured rather than banked.
+
 ### 5.16w The program counter is a pointer: dispatch is five instructions
 
 5.16s measured dispatch at eight instructions, three of which did no work, and 5.16t's `r8` pin
@@ -1951,7 +1968,60 @@ Cycles agree and in one case exceed it: `struct_array_scan` -8.13%, `sieve` -3.8
 -2.14%, `nbody` -1.81%. The fuzzer is incidental corroboration -- the four runs that previously hit
 its 30-second wall-clock backstop now finish inside it.
 
-### 5.16x Loop-invariant raw constants are worth hoisting; the dead copies are not
+### 5.16x Hoisting loop-invariant raw constants, and what the preheader costs
+
+A literal used inside a loop is re-materialised into a raw slot every iteration, because the slot it
+lands in is clobbered by whatever consumes it. `mandelbrot` reloaded `2.0` and `1` 24.9M times each;
+`dict_bench`'s `i = i + 1` reloaded `1` 800,000 times.
+
+The first design considered was a post-emit pass that decodes the loop's emitted range. That was
+over-engineered, and the objection raised against it -- that it makes the parser a fourth source of
+truth about instruction encoding -- does not apply to what was actually built. **The parser already
+knows the hoisted slot at the moment it emits the instruction that reads it**, so no decoding, no
+operand table and no liveness analysis is needed. Each loop reserves a fixed preheader gap, and
+`raw_materialize` (the single choke point every raw constant load passes through) returns a hoisted
+slot instead of emitting a load. The gap is backfilled once the body is parsed.
+
+**Slot allocation is the entire correctness question, and getting it wrong does not fail loudly.**
+A temp is freed at the end of its statement, so reserving hoisted slots at the raw floor hands a
+constant the slot an *earlier statement in the same loop* uses as scratch -- and that statement
+rewrites it every iteration. `total += i * 2` left its product in slot 3, `i = i + 1` then hoisted
+its `1` into the freed slot 3, and `i` advanced by `i * 2` forever. The symptom was a hang, not a
+wrong answer. Hoisted slots now come from `max_raw_*_used`, the function's temp high-water mark and
+the only counter that outlives an individual statement.
+
+| benchmark | delta | | benchmark | delta |
+|---|---|---|---|---|
+| `mandelbrot` | **-9.12%** | | `struct_array_scan` | -0.29% |
+| `small_dict_bench` | -1.30% | | `sieve` | -0.21% |
+| `dict_bench` | -1.07% | | `nbody` | **+0.55%** |
+| `log_processing` | -0.76% | | rest | ±0.05% |
+
+**Dispatch share badly overestimated this.** The pattern was 13.33% of `dict_bench`'s dispatches and
+16.41% of `typed_elementwise`'s, which predicted wins an order of magnitude larger than the -1.07%
+and -0.05% measured. A raw constant load is among the cheapest opcodes there is -- five instructions
+of dispatch plus two of work -- while these benchmarks' totals are dominated by hashing, allocation
+and field access. Removing a tenth of the *dispatches* removes a hundredth of the *instructions*
+when the removed dispatches are the cheap ones. Dispatch counts are the right tool for finding
+waste and the wrong one for sizing it.
+
+**The preheader is not free.** A loop that hoists nothing still pays one skip-jump per loop ENTRY,
+to step over the unused gap. `nbody` hoists nothing and has inner loops entered millions of times,
+which is the whole of its +0.55%. Gating the preheader to the while form recovers that exactly
+(8.916B, against 8.916B before the hoist existed) but gives back 0.40% of `mandelbrot` and 0.21% of
+`sieve`, because range-for bodies do hoist -- just less often, since range-for already subsumes the
+single most common loop constant, the increment. The gate was rejected: it buys 0.05% on average by
+making an optimisation silently unavailable in one loop form, which is a permanent behavioural wart
+standing in for a fixable implementation limit.
+
+**The fix is exact-size insertion, and 5.16w just made it reachable.** The skip-jump exists only
+because the gap is reserved before its size is known. Inserting exactly the right number of words
+instead would require moving the loop body, which absolute jump targets forbid -- but the program
+counter is now a pointer, which is the precondition for PC-relative jumps. Relative jumps make a
+loop body position-independent, which makes exact-size preheader insertion a memmove, and shrinks
+the jump encoding as a side effect. That is the path forward, not a wider gap.
+
+### 5.16y Loop-invariant raw constants are worth hoisting; the dead copies are not
 
 `mandelbrot`'s inner loop spends 4 of its 14 dispatches on work that does nothing:
 
