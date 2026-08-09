@@ -1729,14 +1729,42 @@ provably miscompiling (a parser pointer holding `&dt`), and there is no way to e
 same corruption is not happening silently in the uninstrumented build. It passes every test, fuzzes
 clean and produces byte-identical output; so did the version that was definitely wrong.
 
-**Conclusion: this win is not safely reachable with this toolchain.** Reverted for the second time,
-and it should not be attempted a third without either a compiler that honours the reservation under
-sanitizers, or an interpreter written in assembly where the register allocation is ours to make --
-which is precisely what LuaJIT does, and a large part of why its dispatch is cheaper.
+**That conclusion was wrong, and was reached by reverting instead of diagnosing.** Two experiments
+found the real cause:
 
-With `-no-pie` also off the table by choice, dispatch stays as it is. The remaining route to the same
-instructions is not to make dispatch cheaper but to **dispatch less often** -- which is the codegen
-work in 5.16r, where 25.3% of `mandelbrot`'s dispatches are copies and constant reloads.
+- Building the UBSan binary **without `-flto`** passes every test. LTO is the culprit, not the pin.
+- `parser.c`'s assembly still contained `r8` uses despite including the declaration -- so GCC's LTO
+  simply **does not honour a source-level `register asm("r8")` reservation** across translation
+  units, no matter how visible the declaration is.
+
+The fix is to state the reservation where LTO cannot ignore it: **`-ffixed-r8`**, a codegen-level
+flag rather than a source declaration. With `-flto` *and* `-ffixed-r8`, the build that segfaulted
+passes. The two are a matched pair and neither is correct alone -- the makefile sets them together,
+ARM-only, and says so.
+
+Verified: UBSan clean on the previously-failing test and others, `MALLOC_CHECK_=3` clean on the
+normal build, 150 fuzz iterations with no crashes, all 15 benchmark outputs byte-identical.
+
+**Net effect, against a clean baseline:**
+
+| improved | | regressed | |
+|---|---|---|---|
+| sieve | **-4.55%** | lookup_table_bench | +1.05% |
+| mandelbrot | **-3.85%** | small_dict_bench | +0.75% |
+| nbody | -1.33% | dict_bench | +0.64% |
+| fib_bench | -1.07% | | |
+| struct_array_scan | -1.03% | | |
+| binary_trees | -0.98% | | |
+
+The split is exactly the mechanism: benchmarks that dispatch heavily win, and the three that spend
+their time in hashing and allocation pay for a register now reserved program-wide. `-ffixed-r8`
+costs 0.4-2.5% on its own; the dispatch saving more than covers it where dispatch dominates.
+
+**On fairness**, since 5.16g rejected `-no-pie` on exactly that ground: this is a different kind of
+change. `-no-pie` alters the shipped binary's security properties, and the interpreters compared
+against ship PIE. `-ffixed-r8` is an implementation choice about AER's own source; the binary stays
+PIE. Pinning interpreter state in fixed registers is standard practice -- LuaJIT pins four
+(`BASE`, `PC`, `DISPATCH`, `KBASE`) by writing its interpreter in assembly. This pins one, from C.
 
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
