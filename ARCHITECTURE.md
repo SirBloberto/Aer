@@ -1403,7 +1403,33 @@ length. **`small_dict_bench` -5.51%, `dict_bench` -2.69%**, every other benchmar
 all 15 outputs byte-identical. Larger than the raw byte count suggests -- the scan is a
 branch-per-byte loop, and removing it also unblocks the copy that follows it.
 
-That leaves the hash cache as the remaining lever here, still unbuilt pending the 32-bit decision.
+**The hash cache was then built, taking option 1.** `HashValue` is a `uint32_t` and
+`hashtable_hash_bytes` is FNV-1a's 32-bit form; `AerString.hash` memoizes a key's hash with 0
+meaning not-yet-computed, populated through `hashtable_string_hash`.
+
+| benchmark | instructions |
+|---|---|
+| small_dict_bench | **-10.14%** |
+| lookup_table_bench | -3.35% |
+| log_processing | -2.46% |
+| dict_bench | -1.48% |
+| binary_trees | -1.15% |
+| struct_array_scan | -0.62% |
+| fib_bench | **+0.43%** |
+
+All 15 benchmark outputs byte-identical, UBSan clean, 300 fuzz iterations with no crash or hang.
+
+The "free field" claim was checked rather than assumed: `sizeof(AerString)` goes 28 -> 32 while the
+pool's rounded stride stays **32**, and `log_processing`'s peak RSS is identical to the byte
+(84048 KB both sides). `HashTableEntry` also loses 4 bytes.
+
+`fib_bench` is kept despite crossing the 0.30% revert line, which needs justifying. It contains no
+dict or string work at all -- one `print` -- so the extra instructions cannot be the cache doing
+work. It is the register-allocation shift 5.16l describes: changing code anywhere in `vm_run_slice`
+re-allocates registers across all 153 label bodies, and `fib_bench`'s hot `lbl_call` pays for it.
+The decisive measurement is that the extra instructions cost no time -- **cycles are lower** in the
+new build (4.278B against 4.308B) at 1.57 IPC against 1.60. The instruction gate and the outcome it
+proxies for disagree here, and where that happens the gate is the thing that is wrong.
 
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 

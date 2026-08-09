@@ -1,0 +1,47 @@
+# AerString caches its key hash after the first dict access; these pin that a cached hash stays
+# correct across reuse, updates, other tables, and delete/reinsert.
+
+import collection
+
+k = "score"
+d = {"id": 1, "score": 2}
+
+assert(d[k] == 2, "cached hit")
+assert(d[k] == 2, "repeat hit")
+assert(d["score"] == 2, "literal key")
+
+d["score"] = 99
+assert(d[k] == 99, "after update")
+
+other = {"score": 7, "id": 8}
+assert(other[k] == 7, "other dict")
+assert(other["id"] == 8, "other dict id")
+
+# Same bytes reached by two different routes must hash alike.
+built = "sco" + "re"
+assert(d[built] == 99, "concatenated key")
+
+# `\0` is not an escape in AER, so this is six literal characters -- the truncated-key path that
+# opts out of the hash cache is reachable only from C callers, not from script.
+backslash_key = "ab\0cd"
+n = {}
+n[backslash_key] = 5
+assert(length(backslash_key) == 6, "backslash zero is not an escape")
+assert(n[backslash_key] == 5, "backslash key round-trips")
+
+many = {}
+i = 0
+for i < 200:
+    many["key_{i}"] = i
+    i += 1
+assert(many["key_0"] == 0, "churn first")
+assert(many["key_199"] == 199, "churn last")
+assert(length(many) == 200, "churn count")
+
+# Deleting and reinserting must not resurrect a stale hash.
+collection.delete(many, "key_5")
+assert(length(many) == 199, "after delete")
+many["key_5"] = 500
+assert(many["key_5"] == 500, "reinsert")
+
+print("test_dict_key_hash_cache.aer: all assertions passed.")
