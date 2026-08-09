@@ -2021,7 +2021,42 @@ counter is now a pointer, which is the precondition for PC-relative jumps. Relat
 loop body position-independent, which makes exact-size preheader insertion a memmove, and shrinks
 the jump encoding as a side effect. That is the path forward, not a wider gap.
 
-### 5.16y Loop-invariant raw constants are worth hoisting; the dead copies are not
+### 5.16y PC-relative jumps: built, measured, reverted -- and the clearest lottery evidence yet
+
+5.16w removed the `code` rebuild from *dispatch*, but every taken branch still did `pc = code +
+target`, and `code` is spilled -- so each branch paid a stack reload. Making control-flow targets
+signed deltas from the word after the operand turns that into `pc += delta`, removing the reload
+outright. The prediction was a win on anything branch-heavy: `sieve` is 56% loop control, `fib_bench`
+22%, `mandelbrot` 14%.
+
+It was built and it worked. `patch_jump` became the single choke point for the new encoding, with
+`patch_call_target` split out for the one genuinely absolute case (a call's `callee_offset` is a
+function entry, not intra-function control flow). Every jump-like operand in the instruction set is
+the last word read before its branch, which is what lets one base serve all sixteen VM sites. Full
+gate green, all 16 benchmark outputs identical, disassembly byte-identical once it resolved deltas
+back to targets.
+
+**The mechanism did exactly what it was supposed to and the result was still worse.** Stack reloads
+of `code` inside `vm_run_slice` fell from **291 to 142**. Instructions:
+
+| benchmark | delta | | benchmark | delta |
+|---|---|---|---|---|
+| `fib_bench` | **+0.87%** | | `mandelbrot` | +0.05% |
+| `sieve` | **+0.53%** | | `nbody` | -0.25% |
+| everything else | within ±0.22% | | | |
+
+Removing 149 stack reloads made the program execute *more* instructions. This is 5.16q's rule with
+the mechanism fully instrumented on both ends: an edit to `vm_run_slice` reshuffles register
+allocation across all 153 label bodies, and the reshuffle routinely outweighs the work removed --
+even when the work removed is measured, real, and exactly where the profile said it was.
+
+Reverted. The secondary motivations do not carry it either: relative jumps would make loop bodies
+relocatable and so allow the exact-size preheader 5.16x wants, but that is worth `nbody`'s +0.55% on
+one benchmark, against +0.87% and +0.53% here. A smaller jump encoding remains a real future prize,
+since deltas are small enough to pack into word0 -- but that is a *different* change, and it must be
+justified by the packing, not by the addressing.
+
+### 5.16z Loop-invariant raw constants are worth hoisting; the dead copies are not
 
 `mandelbrot`'s inner loop spends 4 of its 14 dispatches on work that does nothing:
 
