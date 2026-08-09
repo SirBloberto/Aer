@@ -1423,13 +1423,48 @@ The "free field" claim was checked rather than assumed: `sizeof(AerString)` goes
 pool's rounded stride stays **32**, and `log_processing`'s peak RSS is identical to the byte
 (84048 KB both sides). `HashTableEntry` also loses 4 bytes.
 
-`fib_bench` is kept despite crossing the 0.30% revert line, which needs justifying. It contains no
-dict or string work at all -- one `print` -- so the extra instructions cannot be the cache doing
-work. It is the register-allocation shift 5.16l describes: changing code anywhere in `vm_run_slice`
-re-allocates registers across all 153 label bodies, and `fib_bench`'s hot `lbl_call` pays for it.
-The decisive measurement is that the extra instructions cost no time -- **cycles are lower** in the
-new build (4.278B against 4.308B) at 1.57 IPC against 1.60. The instruction gate and the outcome it
-proxies for disagree here, and where that happens the gate is the thing that is wrong.
+`fib_bench` is kept despite crossing the 0.30% revert line. It contains no dict or string work at
+all -- one `print` -- so the extra instructions cannot be the cache doing work; it is the
+register-allocation shift 5.16l describes, where changing code anywhere in `vm_run_slice`
+re-allocates registers across all 153 label bodies and `fib_bench`'s hot `lbl_call` pays for it.
+
+**A correction.** This section originally justified keeping it with "cycles are lower in the new
+build (4.278B against 4.308B)". That evidence does not survive 5.16p: cycle measurements at
+`--runs 3` carried a head-favouring ordering bias plus ~4% noise, so a 0.7% cycle difference
+measured that way was indistinguishable from nothing. The change is kept on the strength of the
+six instruction wins and the mechanism above, not on that cycle reading.
+
+### 5.16p The benchmark harness was biased toward `head`, and cycles need seven runs
+
+Found while trying to adjudicate a change whose instruction and cycle counts disagreed. Running
+`tools/bench.py --base HEAD --head HEAD` -- the same commit against itself, where every delta must
+be zero -- reported **six improvements and no regressions**, up to `fib_bench` **-5.15%**.
+
+Two separate defects, both now closed:
+
+**1. Ordering bias (fixed).** `measure()` ran every base sample, then every head sample. Any drift
+over the measurement window -- frequency ramp, page-cache warming, thermal -- landed entirely on
+whichever side ran first, which was always base. Instructions are deterministic and were never
+affected; cycles were, systematically and in one direction. `measure_pair()` now interleaves
+base/head within each run, and the same control scatters both ways instead of favouring head.
+
+**2. Cycle noise is far larger than assumed.** Even interleaved, a self-control at `--runs 3` still
+shows `fib_bench` +3.77% on identical code. At `--runs 7` it falls to ±0.8%. `perf stat -r 5` on one
+binary reports instructions at ±0.00% and cycles at ±0.90%, so this is inherent run-to-run variance,
+not the harness.
+
+The working rules this establishes:
+
+| metric | runs | resolves |
+|---|---|---|
+| instructions | 3 | ±0.03% -- the gate |
+| cycles | **7+** | ~±0.8%, so only effects above ~1.5% |
+| cycles | 3 | **nothing** -- do not quote it |
+
+The older "cycles spread ±0.4% ref-against-itself" note that several sections lean on was measured
+before this and is optimistic by roughly an order of magnitude at `--runs 3`. Any conclusion in this
+document that rests on a sub-1.5% cycle difference at low run counts should be treated as unproven;
+5.16o has been corrected on exactly that basis.
 
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 

@@ -44,18 +44,33 @@ def deploy(host, ref, path):
         sys.exit("build at %s reported errors -- aborting rather than measuring a broken tree" % ref)
 
 
-def measure(host, path, name, runs, event):
-    """Minimum of `runs` counts -- the least noise-inflated sample, not a mean."""
-    best = None
+def sample(host, path, name, event):
+    r = ssh(host, "cd %s && perf stat -e %s ./binary/aer bench/%s.aer 2>&1 >/dev/null"
+            % (path, event, name))
+    m = re.search(r"^\s*([0-9,]+)\s+%s" % re.escape(event), r.stdout + r.stderr, re.M)
+    return int(m.group(1).replace(",", "")) if m else None
+
+
+def measure_pair(host, name, runs, event):
+    """Minimum of `runs` counts each -- the least noise-inflated sample, not a mean.
+
+    Base and head are INTERLEAVED, not measured in two blocks. Running one side to completion
+    first hands any drift over the measurement window (frequency ramp, page-cache warming,
+    thermal) entirely to whichever side went first. That is invisible on instructions, which are
+    deterministic, but on cycles it silently favoured head: a base-against-itself control reported
+    six improvements and zero regressions, up to 5.15%, on identical code.
+    """
+    best_b = best_h = None
     for _ in range(runs):
-        r = ssh(host, "cd %s && perf stat -e %s ./binary/aer bench/%s.aer 2>&1 >/dev/null"
-                % (path, event, name))
-        m = re.search(r"^\s*([0-9,]+)\s+%s" % re.escape(event), r.stdout + r.stderr, re.M)
-        if not m:
-            return None
-        v = int(m.group(1).replace(",", ""))
-        best = v if best is None else min(best, v)
-    return best
+        for path, which in (("~/bench-base", "b"), ("~/bench-head", "h")):
+            v = sample(host, path, name, event)
+            if v is None:
+                return None, None
+            if which == "b":
+                best_b = v if best_b is None else min(best_b, v)
+            else:
+                best_h = v if best_h is None else min(best_h, v)
+    return best_b, best_h
 
 
 def main():
@@ -80,8 +95,7 @@ def main():
     print("-" * 62)
     regressions, improvements = [], []
     for name in names:
-        b = measure(args.host, "~/bench-base", name, args.runs, args.event)
-        h = measure(args.host, "~/bench-head", name, args.runs, args.event)
+        b, h = measure_pair(args.host, name, args.runs, args.event)
         if b is None or h is None:
             print("%-22s %14s %14s %9s" % (name, "?", "?", "FAILED"))
             continue
