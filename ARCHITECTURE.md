@@ -2036,8 +2036,7 @@ the last word read before its branch, which is what lets one base serve all sixt
 gate green, all 16 benchmark outputs identical, disassembly byte-identical once it resolved deltas
 back to targets.
 
-**The mechanism did exactly what it was supposed to and the result was still worse.** Stack reloads
-of `code` inside `vm_run_slice` fell from **291 to 142**. Instructions:
+It measured worse. Instructions:
 
 | benchmark | delta | | benchmark | delta |
 |---|---|---|---|---|
@@ -2045,10 +2044,30 @@ of `code` inside `vm_run_slice` fell from **291 to 142**. Instructions:
 | `sieve` | **+0.53%** | | `nbody` | -0.25% |
 | everything else | within ±0.22% | | | |
 
-Removing 149 stack reloads made the program execute *more* instructions. This is 5.16q's rule with
-the mechanism fully instrumented on both ends: an edit to `vm_run_slice` reshuffles register
-allocation across all 153 label bodies, and the reshuffle routinely outweighs the work removed --
-even when the work removed is measured, real, and exactly where the profile said it was.
+**And the reason is not the register lottery, though it looked like it at first.** Counting loads
+from one stack slot before and after suggested the reload had been removed -- but the frame layout
+changed, so that compared two different variables. Aligning the full histograms shows what actually
+happened:
+
+| | baseline | relative |
+|---|---|---|
+| hot slots (loads) | `44:157  48:291  56:97  68:57  72:62` | `40:157  44:291  48:142  56:98  68:57  72:62` |
+| total `ldr [sp]` | **972** | **1064** |
+
+The two hottest spills merely shifted down four bytes, unchanged in frequency. The relative build has
+**one more spilled value than the baseline** -- the new slot 48, loaded 142 times -- and 92 more
+stack loads overall.
+
+The cause is a liveness change, not an allocation coin-flip. `pc = code + target` is a *pure write*:
+`pc`'s previous value is dead, so the branch does not extend its live range. `pc += delta` is a
+read-modify-write, which keeps `pc` live across every branch. Meanwhile `code` was not freed at all
+-- `SYNC_IP` still needs it for `vm->ip = pc - code`, as do the six absolute sites. So the change
+added a liveness constraint without removing a value, and in a function where 153 label bodies share
+one register file, that cost more than the load it deleted.
+
+This is worth more than the -0.87% it cost, because it names something 5.16q could only describe as
+a lottery: **removing an instruction from a hot path is not the same as removing a value from the
+live set, and only the second reliably helps here.**
 
 Reverted. The secondary motivations do not carry it either: relative jumps would make loop bodies
 relocatable and so allow the exact-size preheader 5.16x wants, but that is worth `nbody`'s +0.55% on
