@@ -1596,6 +1596,62 @@ packed-array parameter, so it never gets one. Both prior attempts at unboxing nu
 measured on `fib`, which unboxes nothing useful -- 12.1% of `mandelbrot`'s dispatches say that was
 the wrong benchmark to judge it on.
 
+### 5.16s Dispatch is eight instructions, and three of them do no work
+
+Disassembling the tail of any label body gives the same eight:
+
+```
+ldr.w  fp, [sl, r9, lsl #2]   ; op_word = code[ip]
+add.w  r9, r9, #1             ; ip++
+ldr.w  r3, [pc, #3008]        ; <-- GOT offset for the dispatch table
+uxtb.w ip, fp                 ; cur_op = op_word & 0xFF
+add    r3, pc                 ; <-- rebuild the table base from PC
+ldr.w  r3, [r3, ip, lsl #2]   ; target = dt[cur_op]
+orr.w  r3, r3, #1             ; <-- set the Thumb bit
+bx     r3
+```
+
+Four instructions are the actual work (fetch, advance, mask, load target). The other four are the
+branch itself plus **three that exist only because of how the address is formed**: two rebuilding the
+dispatch table's base from `pc` on *every single dispatch*, and one setting the Thumb bit.
+
+This is a large share of everything the interpreter does. `mandelbrot` executes ~414M dispatches
+against 8.82B instructions, so **dispatch is roughly 37% of its total instruction count** -- the
+single biggest line item anywhere in this document.
+
+**The two PC-relative instructions are the PIE tax, measured directly:**
+
+| benchmark | non-PIE | PIE | delta |
+|---|---|---|---|
+| mandelbrot | 8.404B | 8.821B | **-4.73%** |
+| nbody | 9.342B | 9.672B | **-3.41%** |
+| sieve | 6.313B | 6.495B | **-2.80%** |
+| fib_bench | 6.814B | 6.979B | **-2.36%** |
+
+That is consistent with 5.16g's older 0.3-4.3% range but now has a mechanism behind it rather than
+just a number: position-independent code cannot keep a static table's address as a link-time
+constant, and the register allocator (5.16q) has nothing spare to cache it in, so it is rebuilt
+per dispatch.
+
+`orr.w r3, r3, #1` **survives in the non-PIE build**, so the Thumb-bit fixup is not a PIC artifact --
+it is how GCC materialises `&&label` addresses on Thumb-2, and C offers no way to pre-set it in the
+table.
+
+**This is a decision, not a fix.** 5.16g declined non-PIE on fairness, and that argument is
+unchanged: LuaJIT and Luau on the test machine are both `pie executable`, so a non-PIE AER would win
+comparisons partly on build flags. The two questions are separable, and only the second is
+technical:
+
+- *For cross-language benchmarking*: stay PIE, or every published number needs an asterisk.
+- *For what ships to users*: 2.4-4.7% is real, and costs ASLR.
+
+**Would removing rarely-used opcodes help?** Reasoned, not measured: no. Computed-goto replicates the
+dispatch sequence at every label, so the BTB cost is set by the number of *hot* dispatch sites, which
+deleting cold opcodes does not change. It would shrink code size, and 5.16 already measured that
+interpreter code size is not an icache problem here. 5.16d's finding that *adding* opcodes hurts is
+about the new label bodies competing for prediction resources, which does not run in reverse for
+opcodes that never execute.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
