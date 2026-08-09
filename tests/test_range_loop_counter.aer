@@ -1,0 +1,216 @@
+#!/usr/bin/env aer
+import collection
+# AER test suite — the range-for counter's storage.
+#
+# OP_ITER_RANGE_LOOP keeps its counter in the loop variable's own register whenever the parser
+# proved the body never writes that register, and in a separate snapshot register when it can't.
+# Both halves have to produce identical iteration, so every case here checks the values it saw
+# rather than just that it ran. A body that assigns its loop variable must not disturb iteration.
+
+# ------------------------------------------------------------------ #
+# 1. The ordinary shape — body never writes the loop variable.        #
+# ------------------------------------------------------------------ #
+
+function sum_to(n):
+    total = 0
+    for i in 0..n:
+        total += i
+    return total
+
+assert(sum_to(10) == 45, "an ascending range sums its own values")
+assert(sum_to(1) == 0, "a one-element range yields only the start")
+assert(sum_to(0) == 0, "an empty range runs no iterations")
+
+function stepped(a, b, step):
+    seen = []
+    for i in a..b..step:
+        collection.append(seen, i)
+    return seen
+
+assert(string(stepped(0, 10, 3)) == "[0, 3, 6, 9]", "a stepped range advances by the step")
+assert(string(stepped(10, 0, 3)) == "[10, 7, 4, 1]", "direction comes from the bounds, not the step's sign")
+assert(string(stepped(5, 5, 1)) == "[]", "start == end is empty")
+
+function descending():
+    seen = []
+    for i in 5..0:
+        collection.append(seen, i)
+    return seen
+
+assert(string(descending()) == "[5, 4, 3, 2, 1]", "a descending range counts down, end-exclusive")
+
+# ------------------------------------------------------------------ #
+# 2. Bodies that DO write the loop variable. Assigning it must not    #
+#    change how many times the loop runs or what the next iteration   #
+#    starts from — the counter is the loop's own, not the variable's. #
+# ------------------------------------------------------------------ #
+
+function assigns_loop_var():
+    seen = []
+    for i in 0..4:
+        collection.append(seen, i)
+        i = 100
+        collection.append(seen, i)
+    return seen
+
+assert(string(assigns_loop_var()) == "[0, 100, 1, 100, 2, 100, 3, 100]",
+       "assigning the loop variable is visible for the rest of that iteration only")
+
+function compound_assigns_loop_var():
+    seen = []
+    for i in 0..4:
+        i += 50
+        collection.append(seen, i)
+    return seen
+
+assert(string(compound_assigns_loop_var()) == "[50, 51, 52, 53]",
+       "a compound assignment to the loop variable also cannot disturb iteration")
+
+function assigns_a_different_type():
+    seen = []
+    for i in 0..3:
+        i = "replaced"
+        collection.append(seen, i)
+    return seen
+
+assert(string(assigns_a_different_type()) == "[\"replaced\", \"replaced\", \"replaced\"]",
+       "even a type change to the loop variable leaves iteration alone")
+
+# Only the branch that runs assigns it, so the write is conditional at runtime but unconditional
+# as far as the compiler can tell — iteration must still be unaffected either way.
+function assigns_under_a_branch():
+    total = 0
+    for i in 0..6:
+        if i == 3:
+            i = 0
+        total += i
+    return total
+
+assert(assigns_under_a_branch() == 0 + 1 + 2 + 0 + 4 + 5, "a conditional write is handled the same")
+
+# ------------------------------------------------------------------ #
+# 3. Nesting, including an inner loop that reuses the outer's name —  #
+#    the inner loop writes that register every iteration, so the      #
+#    outer one must not treat it as untouched.                        #
+# ------------------------------------------------------------------ #
+
+function nested_distinct_names():
+    total = 0
+    for i in 0..4:
+        for j in 0..3:
+            total += i * j
+    return total
+
+assert(nested_distinct_names() == 18, "nested ranges with distinct names")
+
+function nested_shared_name():
+    count = 0
+    for i in 0..4:
+        for i in 0..3:
+            count += 1
+    return count
+
+assert(nested_shared_name() == 12, "an inner loop reusing the outer's name still runs 4 x 3 times")
+
+function nested_shared_name_over_collection():
+    letters = ["a", "b"]
+    count = 0
+    for i in 0..3:
+        for i in letters:
+            count += 1
+    return count
+
+assert(nested_shared_name_over_collection() == 6, "an inner for-in over a collection reuses it too")
+
+# ------------------------------------------------------------------ #
+# 4. Early exits. break leaves the loop with the variable at its last #
+#    value; continue must still take the advance-and-check path.      #
+# ------------------------------------------------------------------ #
+
+function breaks_early():
+    last = -1
+    for i in 0..100:
+        last = i
+        if i == 7:
+            break
+    return last
+
+assert(breaks_early() == 7, "break stops on the iteration it runs in")
+
+function continues():
+    total = 0
+    for i in 0..10:
+        if i % 2 == 0:
+            continue
+        total += i
+    return total
+
+assert(continues() == 1 + 3 + 5 + 7 + 9, "continue skips the rest of the body, not the advance")
+
+function continues_after_assigning():
+    total = 0
+    for i in 0..6:
+        i = i * 10
+        if i == 30:
+            continue
+        total += i
+    return total
+
+assert(continues_after_assigning() == 0 + 10 + 20 + 40 + 50,
+       "continue from a body that reassigned the loop variable resumes from the real counter")
+
+# ------------------------------------------------------------------ #
+# 5. The variable after the loop ends, and re-entry from an outer     #
+#    loop, which must re-run the prep every time.                     #
+# ------------------------------------------------------------------ #
+
+function value_after_loop():
+    i = -1
+    touched = 0
+    for i in 0..5:
+        touched += 1
+    return i
+
+assert(value_after_loop() == 4, "the loop variable keeps its last value after the loop")
+
+function reentered():
+    seen = []
+    for outer in 0..3:
+        for i in 0..2:
+            collection.append(seen, i)
+    return seen
+
+assert(string(reentered()) == "[0, 1, 0, 1, 0, 1]", "an inner loop restarts from its own start each time")
+
+# ------------------------------------------------------------------ #
+# 6. Unchecked indexing still composes with all of the above — the    #
+#    bounds proof keys on the loop variable's register, which the     #
+#    fused counter shares.                                            #
+# ------------------------------------------------------------------ #
+
+function indexed_scan():
+    a = [0i; 8]
+    n = length(a)
+    for i in 0..n:
+        a[i] = i * 2
+    total = 0
+    for i in 0..n:
+        total += a[i]
+    return total
+
+assert(indexed_scan() == 56, "unchecked indexing over a proven bound is unchanged")
+
+function indexed_scan_with_written_var():
+    a = [0i; 6]
+    n = length(a)
+    for i in 0..n:
+        a[i] = i
+        i = 999
+    total = 0
+    for i in 0..n:
+        total += a[i]
+    return total
+
+assert(indexed_scan_with_written_var() == 15, "indexing before a write to the loop variable is safe")
+
+print("test_range_loop_counter.aer: all assertions passed.")

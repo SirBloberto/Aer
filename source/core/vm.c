@@ -3571,27 +3571,27 @@ lbl_iter_range_prep : {
 }
 
 /* Runs at the bottom of the loop body. end_reg/step_reg hold PREP's repurposed countdown/signed
-   step, not the original bound -- so no fresh comparison against the original limit is ever
-   needed (Lua's FORLOOP shape). Advances cur_reg by the already-signed step; on exhaustion,
-   falls through leaving cur_reg/item_dest_reg at their last value. body_target is always a
-   resolved address, never a patch placeholder. No re-validation -- PREP already checked once and
-   the snapshot can't have changed. No gc_maybe_collect -- aer_int is a plain construction. */
+   step, not the original bound, so no comparison against the original limit is ever needed (Lua's
+   FORLOOP shape); on exhaustion it falls through leaving cur_reg/item_dest_reg at their last value.
+   cur/remaining/step are written value-only -- PREP validated all three as integers and they are
+   loop-owned snapshots, so nothing can have retagged them. body_target is always a resolved
+   address, never a patch placeholder. No gc_maybe_collect -- nothing here allocates. */
 lbl_iter_range_loop : {
     int cur_reg = (int)UNPACK_A(op_word);
     int remaining_reg = (int)UNPACK_B(op_word);
     int signed_step_reg = (int)UNPACK_C(op_word);
     int item_dest_reg = (int)READ();
     int body_target = READ();
-    int64_t remaining = aer_as_int(registers[remaining_reg]);
+    int64_t remaining = registers[remaining_reg].as.i;
     if (remaining == 0) {
         DISPATCH(); /* exhausted -- fall through to the exit code, cur_reg/item_dest_reg untouched */
     }
-    int64_t signed_step = aer_as_int(registers[signed_step_reg]);
-    int64_t new_cur = aer_as_int(registers[cur_reg]) + signed_step;
-    AerVal new_cur_v = aer_int(new_cur);
-    registers[cur_reg] = new_cur_v;
-    registers[item_dest_reg] = new_cur_v;
-    registers[remaining_reg] = aer_int(remaining - 1);
+    int64_t new_cur = registers[cur_reg].as.i + registers[signed_step_reg].as.i;
+    registers[cur_reg].as.i = new_cur;
+    registers[remaining_reg].as.i = remaining - 1;
+    /* Equal when the parser proved this loop's body never writes the loop variable, so cur_reg IS
+       item_dest_reg and the store above already published this iteration's value. */
+    if (cur_reg != item_dest_reg) registers[item_dest_reg] = aer_int(new_cur);
     ip = (unsigned int)body_target;
     /* range-for's own dedicated back-edge -- lbl_jump's check doesn't cover this loop shape since
        it never goes through a plain OP_JUMP. */

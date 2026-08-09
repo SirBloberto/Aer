@@ -130,6 +130,13 @@ typedef struct Parser {
     int safe_loop_array_regs[LOOP_MAX];
     int safe_loop_depth;
 
+    /* Range-for loop variables currently in scope, innermost last, with whether the loop's own body
+       ever writes one. A body that never does lets OP_ITER_RANGE_LOOP carry its counter IN the loop
+       variable's register rather than a second one -- see parse_for_in's fused_counter. */
+    int range_item_regs[LOOP_MAX];
+    bool range_item_written[LOOP_MAX];
+    int range_loop_depth;
+
     /* Top-level variable names, kept solely to detect a function body referencing one -- see
        var_names's own original comment (git blame) for the shadow-ban mechanism. */
     unsigned int global_names[FRAME_REGISTERS];
@@ -668,9 +675,9 @@ static bool index_safe_unchecked(int arr_reg, int idx_rk) {
 /* Call at every site that changes what `reg` holds. Poisons any safe_loop_item/array_regs entry
    keyed on reg as EITHER the index or the array -- missing the array half means trusting a
    register number regardless of what it now holds, an out-of-bounds read through the _UNCHECKED
-   opcodes, which have no runtime check to fall back on. Also clears length_tracked_valid if reg is
-   the parameter it depends on. Overwrites with -1 rather than removing, so parse_for_in's
-   push/pop depth counting is untouched and a dead slot can never be resurrected. */
+   opcodes, which have no runtime check to fall back on. Overwrites with -1 rather than removing,
+   so parse_for_in's push/pop depth counting is untouched and a dead slot can never be resurrected.
+   The length_tracked_valid and range_item_written updates ride along for the same reason. */
 static void invalidate_register(int reg) {
     if (reg < 0) return;
     if (P.length_tracked_valid && reg == P.length_tracked_source_reg) P.length_tracked_valid = false;
@@ -679,6 +686,8 @@ static void invalidate_register(int reg) {
         if (P.safe_loop_item_regs[i] == reg) P.safe_loop_item_regs[i] = -1;
         if (P.safe_loop_array_regs[i] == reg) P.safe_loop_array_regs[i] = -1;
     }
+    for (int i = 0; i < P.range_loop_depth; i++)
+        if (P.range_item_regs[i] == reg) P.range_item_written[i] = true;
 }
 
 /* Compile-time field lookup against a known Shape, resolving offset and type from the Shape's own
@@ -3611,9 +3620,17 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
                every value this register takes is >= 0. */
             if (item_reg >= 0 && item_reg < FRAME_REGISTERS) P.reg_nonneg[item_reg] = true;
         }
+        /* Same push/pop discipline as safe_loop_* above; invalidate_register does the recording. */
+        bool range_tracked = P.range_loop_depth < LOOP_MAX;
+        if (range_tracked) {
+            P.range_item_regs[P.range_loop_depth] = item_reg;
+            P.range_item_written[P.range_loop_depth] = false;
+            P.range_loop_depth++;
+        }
         unsigned int body_start = c->count;
         parse_block(c);
         if (parse_had_error) {
+            if (range_tracked) P.range_loop_depth--;
             if (this_loop_safe) P.safe_loop_depth--;
             P.loop_depth--;
             P.reserved_floor = saved_reserved_floor;
@@ -3621,9 +3638,15 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
             return;
         }
         if (this_loop_safe) P.safe_loop_depth--;
+        bool body_wrote_item = !range_tracked || P.range_item_written[P.range_loop_depth - 1];
+        if (range_tracked) P.range_loop_depth--;
 
         unsigned int loop_bottom = c->count;
-        emit_iter_range_loop(c, cur_reg, end_reg, step_reg, item_reg, body_start);
+        /* PREP already left the start value in item_reg, so when the body never writes that register
+           the loop's counter can live there and LOOP maintains one register instead of two. PREP's
+           own cur operand stays cur_reg either way -- it only ever reads it. */
+        emit_iter_range_loop(c, body_wrote_item ? cur_reg : item_reg, end_reg, step_reg, item_reg,
+                             body_start);
 
         unsigned int exit_pos = c->count;
         patch_jump(c, patch_empty, exit_pos);
