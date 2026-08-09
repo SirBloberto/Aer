@@ -468,7 +468,9 @@ unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int a
     chunk_emit(c, PACK3(OP_CALL, dest_reg, arg_reg_base, arg_count));
     unsigned int patch_offset = c->count;
     chunk_emit(c, (uint32_t)callee_offset);
-    chunk_emit(c, (uint32_t)func_index);
+    /* A BYTE offset, not an index: ChunkFunction is 328 bytes, so `&functions[i]` compiled to a
+       multiply on every single call. The scale is known here and never at runtime. */
+    chunk_emit(c, (uint32_t)(func_index * sizeof(ChunkFunction)));
     return patch_offset;
 }
 
@@ -1361,14 +1363,15 @@ static void func_register(Chunk* c, unsigned int name_idx, unsigned int offset, 
     unsigned int new_func_index = c->function_count - 1;
 
     /* Swap-remove each match (order doesn't matter), leaving only genuinely unresolved entries.
-       Patches both the callee_offset word (emit_call's returned patch_offset) and the func_index
-       word immediately after it (emit_call always emits them back-to-back) -- a forward-referenced
-       call can't know its target's function index at emission time any more than it can know its
-       code offset. */
+       Patches both the callee_offset word (emit_call's returned patch_offset) and the function's
+       byte-offset word immediately after it (emit_call always emits them back-to-back) -- a
+       forward-referenced call can't know its target's position at emission time any more than it
+       can know its code offset. Must match emit_call's scaling exactly. */
     for (int i = 0; i < P.pending_count;) {
         if (P.pending_calls[i].name_idx == name_idx) {
             patch_call_target(c, P.pending_calls[i].patch_offset, offset);
-            c->code[P.pending_calls[i].patch_offset + 1] = new_func_index;
+            c->code[P.pending_calls[i].patch_offset + 1] =
+                (uint32_t)(new_func_index * sizeof(ChunkFunction));
             P.pending_calls[i] = P.pending_calls[--P.pending_count];
         } else {
             i++;

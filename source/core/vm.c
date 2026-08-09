@@ -3052,12 +3052,13 @@ lbl_call : {
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
     int callee_offset = READ();
-    /* func_index is the target's index into c->functions[] -- always present (emit_call always
-       emits it, patched in later by func_register for a forward reference), letting this size the
-       callee's frame from its real max_registers/max_raw_ints/max_raw_reals peaks instead of a
-       flat, function-agnostic ceiling. */
-    unsigned int func_index = (unsigned int)READ();
-    ChunkFunction* target_f = &functions[func_index];
+    /* The target's BYTE offset into c->functions[] -- always present (emit_call always emits it,
+       patched in later by func_register for a forward reference), letting this size the callee's
+       frame from its real max_registers/max_raw_ints/max_raw_reals peaks instead of a flat,
+       function-agnostic ceiling. A byte offset rather than an index because ChunkFunction is not a
+       power of two, so indexing cost a multiply on every call. */
+    unsigned int func_byte_offset = (unsigned int)READ();
+    ChunkFunction* target_f = (ChunkFunction*)((char*)functions + func_byte_offset);
     if (vm->call_depth + 1 >= VM_CALL_MAX) {
         error("v3 call stack overflow");
         DISPATCH();
@@ -3129,7 +3130,8 @@ lbl_tail_call : {
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
     int callee_offset = READ();
-    ChunkFunction* target_f = &functions[(unsigned int)READ()];
+    /* Same byte-offset operand as lbl_call's -- emit_call produces both. */
+    ChunkFunction* target_f = (ChunkFunction*)((char*)functions + (unsigned int)READ());
     /* The copy iterates with dest_i always <= source_i, the same always-safe-forward-shift pattern
        memmove uses when dest <= src, so no overlap special-casing is needed. */
     for (int i = 0; i < arg_count; i++)

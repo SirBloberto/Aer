@@ -2147,6 +2147,51 @@ premise was a misreading: that is a DWARF *location* for a parameter live only n
 other locals read "optimized out" because they have location *lists*, not because they are absent.
 Going below 922 needs those lists decoded properly, not inferred from a summary line.
 
+### 5.16yb The call path, and a multiply hiding in every call
+
+`fib_bench` is 44.4% `OP_CALL` + `OP_RETURN` and is the only benchmark that loses to LuaJIT `-joff`
+on *both* platforms by the same margin (0.72x on ARM, 0.69x on x86-64) -- every other benchmark
+shifts a uniform ~20% between them. A platform-independent loss is a design cost, not a codegen one,
+so the call path is where the remaining structural work is.
+
+Working backwards from the totals: `fib_bench` runs 134.4M dispatches for 6.84B instructions, of
+which ~29.9M are calls and ~29.9M returns. That puts the call/return pair near **96 instructions**,
+about 83% of everything the benchmark executes. Disassembling `lbl_call` shows the first thing it
+does:
+
+```
+mov.w  r3, #328          ; sizeof(ChunkFunction)
+mla    r1, r3, r1, r2    ; &functions[func_index]
+```
+
+`ChunkFunction` is 328 bytes, which is not a power of two, so resolving the callee cost a **multiply
+on every call** -- and it is entirely avoidable, because the parser knows the index at compile time
+and the scale never varies. `emit_call` now emits a byte offset instead, and both `lbl_call` and
+`lbl_tail_call` index with an add.
+
+| benchmark | delta | | benchmark | delta |
+|---|---|---|---|---|
+| `fib_bench` | **-0.43%** | | everything else | within ±0.01% |
+| `binary_trees` | -0.11% | | | |
+
+Exactly the shape the change predicts: it touches call-heavy code and nothing else. It also recovers
+`fib_bench`'s +0.44% from 5.16ya precisely (6.874B -> 6.844B, its pre-5.16ya figure), so the two
+changes together improve eight benchmarks and regress none.
+
+**What the disassembly says is left.** The call path still writes eleven `CallFrame` fields per call,
+three of which (`code_offset`, `tail_calls_collapsed`, `synthetic_entry`) exist only for stack traces
+and tail-call accounting. It also stores `vm->registers`/`raw_ints`/`raw_reals` on every call *and*
+every return, then immediately reloads them into the hoisted locals -- six stores and six loads per
+pair maintaining a cache whose only consumers are cold, since `mark_vm_roots` already scans
+`call_stack[f].registers` rather than `vm->registers`. And `vm` itself is the hottest spill in the
+whole interpreter (stack slot 44, 270 reload sites).
+
+The structural item beyond those is the argument copy. AER gives the callee a fresh window
+(`callee->registers = caller->registers + caller->frame_size`) and copies arguments into it; Lua
+overlaps the windows so the arguments are already in place and the copy disappears. That is the
+change most likely to matter for `fib_bench`, and also the one that touches frame layout, GC root
+ranges and the parser's register allocation at once.
+
 ### 5.16z Numeric specialization, third look: declined on arithmetic rather than measurement
 
 `OP_RAW_ADD_REAL_BOXED` is 13.6% of `mandelbrot`'s dispatches -- `cx` and `cy` staying boxed across

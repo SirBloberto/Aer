@@ -190,7 +190,8 @@ int main(void) {
         check((w0 & 0xFF) == OP_CALL && UNPACK_A(w0) == 5 && UNPACK_B(w0) == 6 && UNPACK_C(w0) == 2,
               "emit_call: word0 (dest, arg_base, arg_count) round-trips");
         check(c.code[patch_offset] == 12345, "emit_call: word1 (callee_offset) round-trips");
-        check(c.code[patch_offset + 1] == 7, "emit_call: word2 (func_index) round-trips");
+        check(c.code[patch_offset + 1] == 7 * sizeof(ChunkFunction),
+              "emit_call: word2 is the function's BYTE offset, so lbl_call needs no multiply");
         chunk_free(&c);
     }
 
