@@ -1547,9 +1547,10 @@ SIZE=60, is 15 opcodes and at least four are avoidable:
 Three distinct codegen defects, none of which is a VM problem:
 
 1. **No loop-invariant hoisting of raw constant loads.** `raw_materialize` (`parser.c:877`) allocates
-   a fresh slot and emits a load at *every* use of a literal, with no memoization. `sieve` has one
-   such load at **664,579 hits**. Fixing it needs the load emitted before the loop, so it is
-   loop-structure work, not just a cache.
+   a fresh slot and emits a load at *every* use of a literal, with no memoization. Fixing it needs
+   the load emitted before the loop, so it is loop-structure work, not just a cache. (`sieve` also
+   has such a load at 664,579 hits, but that is only **1.2%** of its dispatches -- it is dominated by
+   typed-array ops. This defect is concentrated in `mandelbrot`, not general.)
 2. **Dead copies survive.** `y_new`/`x_new` are written to temps and then moved into `y`/`x`. Both
    sources are dead at that point, so the arithmetic could target `y`/`x` directly and both moves
    disappear. Needs liveness the single-pass parser does not currently keep.
@@ -1559,9 +1560,41 @@ Three distinct codegen defects, none of which is a VM problem:
    (`fib` unboxes nothing useful), which is why both previous attempts measured it on the wrong
    benchmark.
 
-Together items 1 and 2 are 4 of 15 opcodes -- **~27% of the loop's dispatches** -- and both are pure
-parser changes that cannot perturb `vm_run_slice`'s register allocation, which 5.16q shows is the
-thing that has defeated every recent VM-side attempt.
+Counting executed dispatches rather than loop text confirms it. Of `mandelbrot`'s 2.87M dispatches:
+
+| opcode | count | share |
+|---|---|---|
+| `OP_RAW_MOVE_REAL` | 354,516 | **12.3%** |
+| `OP_RAW_ADD_REAL_BOXED` | 347,316 | **12.1%** |
+| `OP_RAW_LOAD_REAL` | 195,258 | 6.8% |
+| `OP_RAW_LOAD_INT` | 178,050 | 6.2% |
+
+Copies plus constant reloads are **25.3% of everything it executes**, and none of it is the VM's
+fault -- these are dispatches the compiler chose to emit.
+
+**What fixing them actually requires, and why it is a design step.** The parser emits as it parses,
+in one pass, and both fixes need information a single pass does not have:
+
+- *Dead-copy elimination* needs liveness. `y = y_new` is a copy the programmer wrote; the parser
+  already targets expression results directly at their destination slot, so these moves are not
+  parser sloppiness. Removing them means knowing `y_new` is dead after the copy, which needs a
+  backward scan over the function's emitted code.
+- *Loop-invariant hoisting* needs the load emitted before the loop header, but the literal is not
+  known until the body is parsed -- so it needs either a pre-pass or relocation of already-emitted
+  words with jump patching.
+
+Both are naturally expressed as a **small post-emit pass over one function's bytecode**, which is
+tractable precisely because raw slots are function-local and statically allocated: the pass would
+work on a dense, closed set of slots rather than general aliasable memory. That is a real addition to
+a compiler whose stated virtue is being easy to understand, and should be judged on that basis and
+not only on the percentage.
+
+The third defect is cheaper to reach: the raw-param specialization machinery **already exists**
+(`vm.c:2327`, `parser_specialize_function`) and is merely gated behind a `SpecEntry`, which only
+exists for shape-sensitive functions. `mandelbrot_point(cx, cy, max_iter)` has no struct or
+packed-array parameter, so it never gets one. Both prior attempts at unboxing numeric params were
+measured on `fib`, which unboxes nothing useful -- 12.1% of `mandelbrot`'s dispatches say that was
+the wrong benchmark to judge it on.
 
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
