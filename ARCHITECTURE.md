@@ -1760,6 +1760,13 @@ The split is exactly the mechanism: benchmarks that dispatch heavily win, and th
 their time in hashing and allocation pay for a register now reserved program-wide. `-ffixed-r8`
 costs 0.4-2.5% on its own; the dispatch saving more than covers it where dispatch dominates.
 
+The obvious worry -- that a program-wide reservation quietly taxes the *compiler*, which every
+program runs and which no benchmark isolated -- was checked and is **not** borne out. AER parses on
+the fly, so every benchmark already pays its own parse cost; it is simply swamped by loops running
+billions of iterations. `bench/compile_bound.aer` (6600 lines of declarations, almost no runtime
+work) makes parsing the dominant term instead, and across the pin it measures **-0.00%**. The
+regressions are specific to hashing and allocation, not general to the front end.
+
 **On fairness**, since 5.16g rejected `-no-pie` on exactly that ground: this is a different kind of
 change. `-no-pie` alters the shipped binary's security properties, and the interpreters compared
 against ship PIE. `-ffixed-r8` is an implementation choice about AER's own source; the binary stays
