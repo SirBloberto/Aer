@@ -2397,6 +2397,41 @@ restricting the pass to the raw-slot opcode family and bailing out of any loop c
 outside it, with a generated coverage check so a newly added opcode cannot silently fall outside
 the table.
 
+### 5.16ye One dispatch site or 153: measured, and the answer is per-benchmark
+
+5.16yd showed cycles are dominated by mispredictions on the computed-goto dispatch, and that
+`mandelbrot` swings 25% on layout alone. The obvious lever is the *number* of dispatch sites:
+`DISPATCH()` expands at the end of every handler, so ~153 indirect branches compete for a
+Cortex-A72's finite indirect-predictor entries. `-DAER_SHARED_DISPATCH` builds the opposite endpoint
+-- one shared site, verified in the disassembly as exactly 1 `bx` against 153.
+
+| benchmark | instructions | cycles | branch-misses |
+|---|---|---|---|
+| `mandelbrot` | +6.78% | **-13.50%** | **-90.51%** |
+| `binary_trees` | +1.91% | -1.08% | -7.67% |
+| `fib_bench` | +2.98% | -3.39% | +47.08% |
+| `dict_bench` | +0.98% | +0.21% | +2.97% |
+| `nbody` | +5.28% | +16.00% | +152% |
+| `struct_array_scan` | +4.27% | +13.73% | **+2299%** |
+| `sieve` | +3.82% | +21.31% | **+810%** |
+
+**Replication stays**, and the classic reason holds: a per-opcode branch lets the predictor learn
+which opcode tends to follow which, and collapsing that costs `sieve` and `struct_array_scan`
+enormously. Instructions rise everywhere too, since a shared site adds a jump per dispatch.
+
+**But `mandelbrot` loses 90% of its mispredictions by having fewer sites**, and that is the same
+fact as its 25.58% layout band: its hot loop cycles a handful of dispatch sites that collide with
+*each other*, and any layout shift re-rolls whether they do. Replication helps a loop with a varied
+opcode mix and hurts one with a tight mix, which is why no single answer wins.
+
+That reframes what "partial replication" would have to do. The tempting version -- share the cold
+tail, keep hot opcodes replicated -- targets the wrong end: cold opcodes are not what alias on
+`mandelbrot`, its hot ones are. Freeing predictor entries by sharing the tail is still worth a
+measurement, but this data says not to expect it to fix the benchmark that needs it most.
+
+The knob stays as opt-in measurement tooling, never part of a normal build, on the same footing as
+`make pgo` and `debug-tools`.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a

@@ -2579,12 +2579,20 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
 #else
 /* Full 8-bit mask -- opcode is unambiguously its own byte now (OP_OPCODE_COUNT_MARKER's static
    assert guarantees <=256), no reason to ever mask narrower. */
+/* Replicated on purpose: expanding this at the end of every handler gives each opcode its own
+   indirect branch, so the predictor learns per-opcode successor patterns instead of one shared
+   branch guessing among 153 targets. Whether that beats a single site is a predictor CAPACITY
+   question, not a settled one -- AER_SHARED_DISPATCH builds the other endpoint to measure. */
+#ifdef AER_SHARED_DISPATCH
+#define DISPATCH() goto shared_dispatch
+#else
 #define DISPATCH()                                                                                           \
     do {                                                                                                     \
         op_word = READ();                                                                                    \
         cur_op = (Opcode)(op_word & 0xFF);                                                                   \
         goto* DT_AT(cur_op);                                                                                 \
     } while (0)
+#endif
 #endif
 
 /* DISPATCH() deliberately does not maintain vm->ip, but error() resolves the faulting source line
@@ -2808,6 +2816,13 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     }
 
     DISPATCH();
+
+#ifdef AER_SHARED_DISPATCH
+shared_dispatch:
+    op_word = READ();
+    cur_op = (Opcode)(op_word & 0xFF);
+    goto* DT_AT(cur_op);
+#endif
 
 lbl_jump : {
     int target = READ();
