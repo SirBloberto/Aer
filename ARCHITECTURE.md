@@ -1497,12 +1497,71 @@ straight back into the hoisted locals -- while `callee` already pointed at that 
 the recompute is strictly less work. It measured `fib_bench` **+0.86%** instructions, and at
 `--runs 7` cycles agreed: mandelbrot +2.15%, lookup_table +5.01%, fib +0.44%. Reverted.
 
+**The rest of the hoisted set was then ablated too, to settle which locals earn their register:**
+
+| un-hoisted | result |
+|---|---|
+| `raw_ints` + `raw_reals` | `fib` -4.28% but `sieve` +1.99%, `nbody` +0.72% -- a trade, not a win |
+| `functions` | `fib` **+0.43%**, everything else flat |
+| `const_pool` | **all ten benchmarks regress** (nbody +2.35%, sieve +2.00%, fib +1.93%, mandelbrot +1.51%) |
+
+So the hoists are not excess baggage -- every one of them is load-bearing, and the two that look
+most redundant (`functions`, used only by `lbl_call`; `raw_*`, used by 18 of 153 labels) are the only
+ones where un-hoisting is even arguable. **This closes the "reduce what we pin" line of enquiry.**
+
 Together with 5.16e attempt 4 and 5.16h, that is four independent attempts. The pattern is now firm
 enough to state as a rule: **in `vm_run_slice`, removing work and freeing registers are not the same
 as going faster.** Any edit reshuffles allocation across all 153 labels, and the reshuffle routinely
 outweighs the work removed -- in both directions, unpredictably. Micro-editing this function is a
 lottery; the productive changes have all been *addressing* changes (5.16e's power-of-two frame,
 5.10's struct layout) or work removed *outside* it (5.16o's key scan, 5.16n's string search).
+
+### 5.16r The compute-bound gap is codegen, not the VM
+
+Against LuaJIT `-joff` in instructions: `fib` 1.99x, but `nbody` **1.04x** and `mandelbrot`
+**1.05x** -- and on those two AER uses *fewer* cycles (nbody 5.56B vs 6.41B, mandelbrot 4.62B vs
+5.14B) at higher IPC. Arithmetic dispatch is not where compute-bound work is losing.
+
+What is losing is what the compiler *emits*. `mandelbrot`'s inner loop, 173,658 iterations at
+SIZE=60, is 15 opcodes and at least four are avoidable:
+
+```
+17  OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE   rawi0 < reg2
+19  OP_RAW_MUL_REAL     rawr2 = rawr0 * rawr0        x2 = x*x
+20  OP_RAW_MUL_REAL     rawr3 = rawr1 * rawr1        y2 = y*y
+21  OP_RAW_ADD_REAL     rawr4 = rawr2 + rawr3
+22  OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE  rawr4 > 4.0
+26  OP_RAW_LOAD_REAL    rawr4 = 2.0                  <-- loop-invariant, reloaded 173k times
+28  OP_RAW_MUL_REAL     rawr4 = rawr4 * rawr0
+29  OP_RAW_MUL_REAL     rawr4 = rawr4 * rawr1
+30  OP_RAW_ADD_REAL_BOXED  rawr4 += reg1             <-- cy is a boxed param: tag check per iteration
+31  OP_RAW_SUB_REAL     rawr5 = rawr2 - rawr3
+32  OP_RAW_ADD_REAL_BOXED  rawr5 += reg0             <-- cx likewise
+33  OP_RAW_MOVE_REAL    rawr1 = rawr4                <-- y = y_new
+34  OP_RAW_MOVE_REAL    rawr0 = rawr5                <-- x = x_new
+35  OP_RAW_LOAD_INT     rawi1 = 1                    <-- loop-invariant, reloaded 173k times
+37  OP_RAW_ADD_INT      rawi0 = rawi0 + rawi1
+38  OP_JUMP -> 17
+```
+
+Three distinct codegen defects, none of which is a VM problem:
+
+1. **No loop-invariant hoisting of raw constant loads.** `raw_materialize` (`parser.c:877`) allocates
+   a fresh slot and emits a load at *every* use of a literal, with no memoization. `sieve` has one
+   such load at **664,579 hits**. Fixing it needs the load emitted before the loop, so it is
+   loop-structure work, not just a cache.
+2. **Dead copies survive.** `y_new`/`x_new` are written to temps and then moved into `y`/`x`. Both
+   sources are dead at that point, so the arithmetic could target `y`/`x` directly and both moves
+   disappear. Needs liveness the single-pass parser does not currently keep.
+3. **Parameters stay boxed inside the hot loop.** `cx`/`cy` are read through
+   `OP_RAW_ADD_REAL_BOXED`, paying a tag check per iteration. This is the one case where the
+   twice-reverted raw-param specialization would genuinely pay -- and note it is *not* `fib`'s shape
+   (`fib` unboxes nothing useful), which is why both previous attempts measured it on the wrong
+   benchmark.
+
+Together items 1 and 2 are 4 of 15 opcodes -- **~27% of the loop's dispatches** -- and both are pure
+parser changes that cannot perturb `vm_run_slice`'s register allocation, which 5.16q shows is the
+thing that has defeated every recent VM-side attempt.
 
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
