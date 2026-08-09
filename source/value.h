@@ -143,10 +143,15 @@ _Static_assert(offsetof(struct AerFunction, gc_state) == 0, "pool.c assumes gc_s
 /* Strings up to AER_STRING_INLINE_MAX live in inline_buf, longer ones in an owned buffer; `data`
    points at whichever, so readers never branch and only construction/free_string care. */
 #define AER_STRING_INLINE_MAX 15
+/* `hash` memoizes this string's key hash (0 = not computed yet; a key whose real hash is 0 simply
+   recomputes). Valid only when the key's true length equals `length` -- a string holding an embedded
+   NUL hashes over its truncated prefix, and the two would disagree. It occupies padding the string
+   pool's 8-byte-rounded stride was already reserving, so it costs no memory. */
 struct AerString {
     unsigned char gc_state;
     unsigned int length;
     char* data;
+    unsigned int hash;
     char inline_buf[AER_STRING_INLINE_MAX + 1];
 };
 _Static_assert(offsetof(struct AerString, gc_state) == 0, "pool.c assumes gc_state is byte 0");

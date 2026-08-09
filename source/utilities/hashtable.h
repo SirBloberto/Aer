@@ -21,6 +21,11 @@ typedef struct {
     bool initialized;
 } HashPools;
 
+/* FNV-1a's 32-bit form. Narrow on purpose: it lets AerString memoize a key's hash in padding the
+   string pool already rounds up to, and 32-bit ARM multiplies it with one `mul` rather than the
+   `umull`+`mla` pair a 64-bit multiply needs. */
+typedef uint32_t HashValue;
+
 /* Idempotent -- safe to call every time a HashPools might not be initialized yet. */
 void hashtable_pools_init(HashPools* pools);
 
@@ -33,7 +38,7 @@ void hashtable_pools_init(HashPools* pools);
 typedef struct {
     char* key;
     unsigned int length;
-    uint64_t hash;
+    HashValue hash;
     AerVal payload;
 } HashTableEntry;
 
@@ -70,17 +75,17 @@ void hashtable_reserve(HashTable* t, unsigned int expected_count);
    own hash_bytes() call. `hash` MUST equal hash_bytes(key, length) exactly, or this table's probe
    sequence silently disagrees with a plain hashtable_get/put's, corrupting lookups. The plain
    versions are defined in terms of these, not the other way around. */
-void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value);
-AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length, uint64_t hash);
+void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, HashValue hash, AerVal value);
+AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length, HashValue hash);
 
 /* Same probe as hashtable_get_hashed, but returns the entry's dense-array index (or -1) instead of
    a payload pointer -- see its own comment, hashtable.c, for why the GC's write barrier needs this. */
-int hashtable_get_index_hashed(HashTable* t, const char* key, unsigned int length, uint64_t hash);
+int hashtable_get_index_hashed(HashTable* t, const char* key, unsigned int length, HashValue hash);
 
 /* The exact hash function every HashTable in this codebase uses -- exposed so a caller can
    precompute (and cache) a hash to pass to the _hashed calls above, using the identical algorithm
    this file's own internal hash_key() already used before this existed. */
-uint64_t hashtable_hash_bytes(const char* key, unsigned int length);
+HashValue hashtable_hash_bytes(const char* key, unsigned int length);
 
 /* Every owned key copy must go through this pair (they use `pools`' size-class pools, and the pool
    lookup needs alloc size == free size). Truncates at the first embedded NUL; `len` is the
@@ -99,5 +104,14 @@ void hashtable_key_free(HashPools* pools, char* key, unsigned int len);
    insert -- rather than going through hashtable_key_dup, which only reports it after copying --
    calls this directly. */
 unsigned int hashtable_key_true_len(const char* data, unsigned int len);
+
+/* An AerString used as a dict key, hashed once and remembered. Strings are immutable after
+   aer_string_alloc, so the memo can never go stale; see AerString.hash for why the truncated case
+   opts out rather than caching a hash the key's own length disagrees with. */
+static inline HashValue hashtable_string_hash(AerString* s, unsigned int true_len) {
+    if (true_len != s->length) return hashtable_hash_bytes(s->data, true_len);
+    if (s->hash == 0) s->hash = hashtable_hash_bytes(s->data, true_len);
+    return s->hash;
+}
 
 #endif

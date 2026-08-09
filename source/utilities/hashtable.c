@@ -126,11 +126,11 @@ void hashtable_key_free(HashPools* pools, char* key, unsigned int len) {
     key_free(pools, key, (size_t)len + 1);
 }
 
-uint64_t hashtable_hash_bytes(const char* key, unsigned int length) {
-    uint64_t hash = 0xcbf29ce484222325ULL;
+HashValue hashtable_hash_bytes(const char* key, unsigned int length) {
+    HashValue hash = 0x811c9dc5u;
     for (unsigned int i = 0; i < length; i++) {
         hash ^= (unsigned char)key[i];
-        hash *= 0x100000001b3ULL;
+        hash *= 0x01000193u;
     }
     return hash;
 }
@@ -179,7 +179,7 @@ void hashtable_put(HashTable* t, char* key, unsigned int length, AerVal value) {
     hashtable_put_hashed(t, key, length, hashtable_hash_bytes(key, length), value);
 }
 
-void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, uint64_t hash, AerVal value) {
+void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, HashValue hash, AerVal value) {
     if (!t->sparse) {
         t->sparse = sparse_array_alloc(t->pools, HASHTABLE_INIT_SIZE);
         t->capacity = HASHTABLE_INIT_SIZE;
@@ -212,7 +212,7 @@ AerVal* hashtable_get(HashTable* t, const char* key, unsigned int length) {
     return hashtable_get_hashed(t, key, length, hashtable_hash_bytes(key, length));
 }
 
-AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length, uint64_t hash) {
+AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length, HashValue hash) {
     if (!t->sparse) return NULL;
     for (unsigned int i = 0; i < t->capacity; i++) {
         unsigned int slot = t->sparse[(hash + i) & (t->capacity - 1)];
@@ -226,7 +226,7 @@ AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length,
    pointer -- the GC's dict write barrier (gc_barrier_dict, gc.c) needs to know exactly which dense
    slot a write will land in BEFORE the write happens (an update reuses an existing slot; a fresh
    key always lands at the current t->count, appended). -1 if not found. */
-int hashtable_get_index_hashed(HashTable* t, const char* key, unsigned int length, uint64_t hash) {
+int hashtable_get_index_hashed(HashTable* t, const char* key, unsigned int length, HashValue hash) {
     if (!t->sparse) return -1;
     for (unsigned int i = 0; i < t->capacity; i++) {
         unsigned int slot = t->sparse[(hash + i) & (t->capacity - 1)];
@@ -240,7 +240,7 @@ int hashtable_get_index_hashed(HashTable* t, const char* key, unsigned int lengt
    entry's own cached hash -- no key comparison needed, since a fresh sparse array being rebuilt
    from scratch can never already contain the index being placed. Never rehashes itself. */
 static void sparse_place(HashTable* t, unsigned int dense_idx) {
-    uint64_t hash = t->dense[dense_idx].hash;
+    HashValue hash = t->dense[dense_idx].hash;
     for (unsigned int i = 0; i < t->capacity; i++) {
         unsigned int* slot = &t->sparse[(hash + i) & (t->capacity - 1)];
         if (*slot == SPARSE_EMPTY) {
@@ -318,7 +318,7 @@ void hashtable_reserve(HashTable* t, unsigned int expected_count) {
    the last entry into the vacated slot. */
 void hashtable_remove(HashTable* t, const char* key, unsigned int length) {
     if (!t->sparse) return;
-    uint64_t hash = hashtable_hash_bytes(key, length);
+    HashValue hash = hashtable_hash_bytes(key, length);
 
     unsigned int found_slot = t->capacity;
     unsigned int removed_idx = 0;
@@ -352,7 +352,7 @@ void hashtable_remove(HashTable* t, const char* key, unsigned int length) {
     unsigned int last = t->count - 1;
     if (removed_idx != last) {
         t->dense[removed_idx] = t->dense[last];
-        uint64_t moved_hash = t->dense[removed_idx].hash;
+        HashValue moved_hash = t->dense[removed_idx].hash;
         for (unsigned int i = 0; i < t->capacity; i++) {
             unsigned int probe = (unsigned int)((moved_hash + i) & (t->capacity - 1));
             if (t->sparse[probe] == last) {

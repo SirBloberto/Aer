@@ -332,6 +332,7 @@ static AerString* aer_string_alloc(unsigned int length) {
     vm_heap_init(heap);
     AerString* s = heap_alloc(heap, &heap->string_pool);
     s->length = length;
+    s->hash = 0;
     return s;
 }
 
@@ -691,7 +692,7 @@ static AerVal vm_in(AerVal a, AerVal b) {
         AerString* as = aer_as_string(a);
         unsigned int klen = hashtable_key_true_len(as->data, as->length);
         return aer_bool(hashtable_get_hashed(&aer_as_dict(b)->map, as->data, klen,
-                                             hashtable_hash_bytes(as->data, klen)) != NULL);
+                                             hashtable_string_hash(as, klen)) != NULL);
     }
     if (aer_type(b) == TYPE_ARRAY) {
         AerArray* arr = aer_as_array(b);
@@ -1916,7 +1917,7 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         AerString* is = aer_as_string(idx);
         unsigned int klen = hashtable_key_true_len(is->data, is->length);
         AerVal* found = hashtable_get_hashed(&aer_as_dict(obj)->map, is->data, klen,
-                                             hashtable_hash_bytes(is->data, klen));
+                                             hashtable_string_hash(is, klen));
         if (!found) {
             *out = aer_null();
             return;
@@ -2054,7 +2055,7 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         }
         AerString* is = aer_as_string(idx);
         unsigned int klen = hashtable_key_true_len(is->data, is->length);
-        uint64_t khash = hashtable_hash_bytes(is->data, klen);
+        HashValue khash = hashtable_string_hash(is, klen);
         AerDict* d = aer_as_dict(obj);
         /* Resolved BEFORE the write, not after -- an update reuses this exact dense index, a fresh
            key always lands at d->map.count (see gc_barrier_dict's own comment, gc.c). */
@@ -3403,7 +3404,7 @@ lbl_dict_new : {
         }
         AerString* ks = aer_as_string(key);
         unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
-        uint64_t khash = hashtable_hash_bytes(ks->data, klen);
+        HashValue khash = hashtable_string_hash(ks, klen);
         char* k = hashtable_key_dup_known(d->map.pools, ks->data, klen);
         hashtable_put_hashed(&d->map, k, klen, khash, val);
     }
