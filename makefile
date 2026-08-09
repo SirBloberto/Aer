@@ -19,7 +19,16 @@ endif
 # same source vectorizes with `make ARCH_FLAGS=-mcpu=native` (or -mcpu=cortex-a72, etc.) and doesn't
 # without it. Set ARCH_FLAGS yourself if you're building specifically for one known machine and
 # want that win; leave it unset for a build that has to run anywhere.
-FLAGS := -O2 -g -flto -Wall -Wextra $(ARCH_FLAGS) -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities
+# The dispatch base is pinned to r8 on ARM (see error.h). The source-level `register asm("r8")`
+# declaration is NOT enough on its own: -flto ignores it and hands r8 to other translation units,
+# which corrupted the heap (ARCHITECTURE 5.16t). -ffixed-r8 is a codegen-level reservation LTO does
+# honour, so the two are a matched pair -- never set one without the other.
+HOST_ARCH := $(shell uname -m 2>/dev/null)
+ifneq (,$(filter arm% aarch32,$(HOST_ARCH)))
+PIN_FLAGS := -ffixed-r8
+endif
+
+FLAGS := -O2 -g -flto -Wall -Wextra $(PIN_FLAGS) $(ARCH_FLAGS) -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities
 
 SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/stdlib/*.c source/utilities/*.c)
 OBJECT := $(patsubst source/%.c,object/%.o,$(SOURCE))
