@@ -5062,9 +5062,9 @@ bool parser_read_variable(VM* vm, Chunk* c, const char* name, AerVal* out) {
         if (strlen(name) != s->length || memcmp(s->data, name, s->length) != 0) continue;
         int slot = P.var_regs[i];
         switch (P.var_kind[i]) {
-            case VAR_RAW_INT: *out = aer_int(vm->raw_ints[slot]); return true;
-            case VAR_RAW_REAL: *out = aer_real(vm->raw_reals[slot]); return true;
-            default: *out = vm->registers[slot]; return true;
+            case VAR_RAW_INT: *out = aer_int(vm->call_stack[vm->call_depth].raw_ints[slot]); return true;
+            case VAR_RAW_REAL: *out = aer_real(vm->call_stack[vm->call_depth].raw_reals[slot]); return true;
+            default: *out = vm->call_stack[vm->call_depth].registers[slot]; return true;
         }
     }
     return false;

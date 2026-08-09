@@ -2178,13 +2178,30 @@ Exactly the shape the change predicts: it touches call-heavy code and nothing el
 `fib_bench`'s +0.44% from 5.16ya precisely (6.874B -> 6.844B, its pre-5.16ya figure), so the two
 changes together improve eight benchmarks and regress none.
 
-**What the disassembly says is left.** The call path still writes eleven `CallFrame` fields per call,
-three of which (`code_offset`, `tail_calls_collapsed`, `synthetic_entry`) exist only for stack traces
-and tail-call accounting. It also stores `vm->registers`/`raw_ints`/`raw_reals` on every call *and*
-every return, then immediately reloads them into the hoisted locals -- six stores and six loads per
-pair maintaining a cache whose only consumers are cold, since `mark_vm_roots` already scans
-`call_stack[f].registers` rather than `vm->registers`. And `vm` itself is the hottest spill in the
-whole interpreter (stack slot 44, 270 reload sites).
+**A cache with no reader.** The `VM` struct mirrored the active frame's `registers`/`raw_ints`/
+`raw_reals`, updated on every call *and* every return and then immediately reloaded into the hoisted
+locals -- six stores and six loads per call/return pair. Nothing hot read it: `mark_vm_roots` scans
+`call_stack[f].registers`, and the only other consumers were a test accessor, a REPL variable dump,
+and `vm_call_value`'s tail path, all of which can read the frame directly. The three fields were
+deleted outright and every reader now goes to `call_stack[call_depth]`; `lbl_call` and `lbl_return`
+already hold the relevant `CallFrame*`, so refreshing the locals costs three loads off a pointer
+in hand instead of three loads plus three stores through the VM.
+
+| benchmark | delta | | benchmark | delta |
+|---|---|---|---|---|
+| `fib_bench` | **-5.25%** | | everything else | within ±0.16% |
+| `binary_trees` | **-1.83%** | | | |
+
+The largest single instruction win on `fib_bench` in this section, and again exactly the predicted
+shape -- call-heavy benchmarks collect it, nothing else moves, nothing regresses. Worth noting what
+made it findable: the field's own comment justified its position in the struct ("touched on every
+call and return") as if that were a reason to keep it fast, when it was a reason to ask why it
+existed.
+
+**What is left.** The call path still writes eleven `CallFrame` fields per call, three of which
+(`code_offset`, `tail_calls_collapsed`, `synthetic_entry`) serve only stack traces and tail-call
+accounting. And `vm` itself is the hottest spill in the interpreter (stack slot 44, 270 reload
+sites).
 
 The structural item beyond those is the argument copy. AER gives the callee a fresh window
 (`callee->registers = caller->registers + caller->frame_size`) and copies arguments into it; Lua

@@ -965,12 +965,11 @@ _Static_assert(sizeof(CallFrame) <= 96,
                "VM-level raw_int_stack/raw_real_stack, not fixed inline per-frame arrays");
 
 typedef struct {
-    /* First, and only these four. A Thumb-2 `ldr` reaches a 12-bit displacement, so a field past
-       4095 bytes needs its offset materialized into a register first. These are touched on every
-       call and return; call_stack itself is 4096 bytes and cannot fit the window alongside heap. */
-    AerVal* registers;
-    int64_t* raw_ints;
-    double* raw_reals;
+    /* First. A Thumb-2 `ldr` reaches a 12-bit displacement, so a field past 4095 bytes needs its
+       offset materialized into a register first, and call_stack itself is 4096 bytes. The active
+       frame's registers/raw_ints/raw_reals used to be mirrored here too; they were a cache with no
+       hot reader -- mark_vm_roots scans call_stack[f].registers, not the mirror -- so keeping it
+       current cost three stores per call and three per return to serve only cold consumers. */
     int call_depth;
 
     Chunk* chunk;

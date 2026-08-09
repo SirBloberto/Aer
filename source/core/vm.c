@@ -150,7 +150,7 @@ static void* heap_alloc(VmHeap* heap, Pool* p) {
 /* Test-only (tests/smoke_test.c) -- reads a register from whichever frame is active, per VM
    instance so a nested module VM stays isolated. */
 AerVal register_get(VM* vm, int slot) {
-    return vm->registers[slot];
+    return vm->call_stack[vm->call_depth].registers[slot];
 }
 
 /* RK16: 1 flag + 15 index bits, the wire form most RK operands use. Returns a pointer into the
@@ -486,9 +486,6 @@ void vm_free(VM* vm) {
 void aer_vm_reset_for_reuse(VM* vm) {
     vm->stack_top = 0;
     vm->call_depth = 0;
-    vm->registers = vm->call_stack[0].registers;
-    vm->raw_ints = vm->call_stack[0].raw_ints;
-    vm->raw_reals = vm->call_stack[0].raw_reals;
 }
 
 bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
@@ -1128,9 +1125,6 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
     target
         ->call_depth++; /* same rooting rule as vm_call_value's non-tail branch (above) -- the defaults loop wrote into callee->registers[] before this point */
     gc_maybe_collect(target);
-    target->registers = target->call_stack[target->call_depth].registers;
-    target->raw_ints = target->call_stack[target->call_depth].raw_ints;
-    target->raw_reals = target->call_stack[target->call_depth].raw_reals;
     target->ip = fn->code_offset;
     return true;
 }
@@ -1157,10 +1151,11 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
        the copy can't invalidate it. Args copied before defaults, so no source register is
        overwritten before it's read. */
     if (is_tail_call) {
+        AerVal* cur = vm->call_stack[vm->call_depth].registers;
         for (int i = 0; i < arg_count; i++)
-            vm->registers[i] = vm->registers[arg_reg_base + i];
+            cur[i] = cur[arg_reg_base + i];
         for (int i = arg_count; i < (int)f->arity; i++)
-            vm->registers[i] = vm_default_value(vm, f->defaults[i - f->min_arity]);
+            cur[i] = vm_default_value(vm, f->defaults[i - f->min_arity]);
         gc_maybe_collect(
             vm); /* defaults just written into the CURRENT frame (tail call, call_depth unchanged) -- already rooted */
         vm->ip = f->code_offset;
@@ -1199,9 +1194,6 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     callee->synthetic_entry = false;
     vm->call_depth++; /* the defaults loop above wrote into callee->registers[] BEFORE this point, when mark_vm_roots's 0..call_depth scan didn't yet cover that frame -- gc_maybe_collect() must run AFTER this increment, not before, or a collection could reclaim a fresh default array/dict as unreachable */
     gc_maybe_collect(vm);
-    vm->registers = vm->call_stack[vm->call_depth].registers;
-    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
-    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
     vm->ip = f->code_offset;
 }
 
@@ -2545,13 +2537,13 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     /* Same deal, and it reallocs at the same one place: lbl_call indexes it on every single
        call, and reaching it through c meant reloading c from its spill slot each time. */
     ChunkFunction* functions = c->functions;
-    /* Hoists the three pointers that are stable for the whole call and change only at the 3
-       call/return sites below. vm->raw_reals' own reload was among the hottest instructions in the
-       dispatch loop (perf annotate, nbody). The backing stacks are fixed-size inline VM arrays,
-       never reallocated, so caching them across dispatches is safe. */
-    AerVal* registers = vm->registers;
-    int64_t* raw_ints = vm->raw_ints;
-    double* raw_reals = vm->raw_reals;
+    /* The active frame's three windows, hoisted: stable for the whole call, refreshed only at the
+       3 call/return sites below. Reloading them per opcode was among the hottest instructions in
+       the dispatch loop (perf annotate, nbody). The backing stacks are fixed-size inline VM
+       arrays, never reallocated, so caching them across dispatches is safe. */
+    AerVal* registers = vm->call_stack[vm->call_depth].registers;
+    int64_t* raw_ints = vm->call_stack[vm->call_depth].raw_ints;
+    double* raw_reals = vm->call_stack[vm->call_depth].raw_reals;
     /* Only ever read/decremented at the handful of yield-checkpoints below; never touched when
        max_instructions is 0. */
     unsigned int slice_budget = max_instructions;
@@ -3121,12 +3113,12 @@ lbl_call : {
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
     vm->call_depth++;
-    vm->registers = vm->call_stack[vm->call_depth].registers;
-    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
-    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
-    registers = vm->registers; /* refresh the hoisted locals -- see their own comment above */
-    raw_ints = vm->raw_ints;
-    raw_reals = vm->raw_reals;
+    /* Straight off the frame this handler already built -- the VM-level copies were a cache with no
+       hot reader (mark_vm_roots scans call_stack[f].registers, not these), so maintaining them cost
+       three stores here and three more on every return. */
+    registers = callee->registers;
+    raw_ints = callee->raw_ints;
+    raw_reals = callee->raw_reals;
     pc = code + chosen_offset;
     if (max_instructions && --slice_budget == 0) {
         vm->ip = (unsigned int)(pc - code);
@@ -3183,11 +3175,11 @@ lbl_call_value : {
     vm_call_value(vm, registers[callee_reg], dest_reg, arg_reg_base, arg_count, cur_op == OP_TAIL_CALL_VALUE,
                   (unsigned int)(pc - code));
     pc = code + vm->ip;
-    /* vm_call_value also reassigns vm->registers/raw_ints/raw_reals for a non-tail call (unchanged
-       for a tail call) -- refresh the hoisted locals either way, see their own comment above. */
-    registers = vm->registers;
-    raw_ints = vm->raw_ints;
-    raw_reals = vm->raw_reals;
+    /* vm_call_value may have pushed a frame (non-tail) or reused this one (tail) -- refresh from
+       whichever is now current, either way. */
+    registers = vm->call_stack[vm->call_depth].registers;
+    raw_ints = vm->call_stack[vm->call_depth].raw_ints;
+    raw_reals = vm->call_stack[vm->call_depth].raw_reals;
     DISPATCH();
 }
 
@@ -3201,16 +3193,13 @@ lbl_return : {
     unsigned int return_ip = callee->return_ip;
     int dest_reg = callee->dest_reg;
     vm->call_depth--;
-    vm->registers = vm->call_stack[vm->call_depth].registers;
-    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
-    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
-    /* Must refresh the hoisted locals (see their own comment above) BEFORE the write below --
-       registers still pointed at the callee's (now-popped) frame otherwise, corrupting whichever
-       register of the CALLER's frame happens to share dest_reg's index instead of writing the
-       return value where the caller actually expects it. */
-    registers = vm->registers;
-    raw_ints = vm->raw_ints;
-    raw_reals = vm->raw_reals;
+    /* Refreshed BEFORE the write below -- registers still pointed at the callee's (now-popped)
+       frame otherwise, corrupting whichever register of the CALLER's frame happens to share
+       dest_reg's index instead of writing the return value where the caller expects it. */
+    CallFrame* caller = &vm->call_stack[vm->call_depth];
+    registers = caller->registers;
+    raw_ints = caller->raw_ints;
+    raw_reals = caller->raw_reals;
     registers[dest_reg] = result;
     pc = code + return_ip;
     DISPATCH();
