@@ -1773,6 +1773,54 @@ against ship PIE. `-ffixed-r8` is an implementation choice about AER's own sourc
 PIE. Pinning interpreter state in fixed registers is standard practice -- LuaJIT pins four
 (`BASE`, `PC`, `DISPATCH`, `KBASE`) by writing its interpreter in assembly. This pins one, from C.
 
+### 5.16u The range-for counter, and why the loop variable stays boxed
+
+`for i in 1..100000000: total += i` compiles `total` into a raw unboxed slot but leaves `i` in an
+ordinary tagged register, so the body uses `OP_RAW_ADD_INT_BOXED` — a tag check per iteration. The
+obvious fix is to give the loop variable a raw slot too. **It is the wrong fix**, and the reason is
+worth recording because the idea keeps looking attractive.
+
+Raw slots are not addressable as index operands. `index_safe_unchecked` (parser.c) rejects a
+raw-flagged index outright, and `emit_index_get` packs its index as RK8, which encodes a register or
+a constant and has no third case. So a raw loop variable would emit an `OP_BOX_INT` at *every*
+`a[i]` and simultaneously forfeit the bounds-proof elision of §5.15 — trading one predictable tag
+check for a whole extra dispatch plus a restored runtime bounds check, on exactly the array-scanning
+loops (`sieve`, `struct_array_scan`, `nbody`) the change was meant to help. Making it pay would mean
+raw-index variants of the whole index-get/set family, which §5.16d already measured as a losing
+trade. The tag check stays.
+
+What was actually costing something sat one level up, in `OP_ITER_RANGE_LOOP` itself. It maintained
+*two* registers per iteration — a private counter and the loop variable it publishes to — each
+written as a full 16-byte tagged store. The second register exists only because a body is allowed to
+assign its own loop variable, which (Lua's numeric-for semantics, which AER matches) must not disturb
+iteration.
+
+The parser can settle that question for free. `LOOP` is emitted *after* the body, so by the time it
+is built the parser already knows whether the body ever wrote that register — `invalidate_register`
+is called at every site that changes what a register holds, which is the same choke point the
+bounds proof and `length_tracked_valid` already depend on. When nothing wrote it, the loop variable
+*is* the counter and the two collapse into one. `PREP` needs no change at all in either case: it
+only ever reads its `cur` operand, so it can keep pointing at the start snapshot while `LOOP` points
+at the loop variable. No new opcode, no flag bit, no patching — just a different operand.
+
+Alongside it, `cur`/`remaining`/`step` are now written value-only (`.as.i`) rather than as full
+tagged stores. `PREP` validated all three as integers and they are loop-owned snapshots that
+`arg_materialize` guarantees nothing else can alias, so no tag can have changed under them.
+
+Instructions, Pi, `--runs 3`:
+
+| benchmark | delta |
+|---|---|
+| `sieve` | **-6.25%** |
+| `struct_array_scan` | -1.44% |
+| `lookup_table_bench` | -1.28% |
+| `nbody` | -1.00% |
+| everything else | within ±0.05% |
+
+On cycles `sieve` confirms at -3.1 to -3.9%. `nbody` first read +2.28% and then +0.69% on a repeat,
+which is the §5.16p noise floor talking, not a result — a reminder that a single cycle sample is
+still not evidence even at seven runs.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
