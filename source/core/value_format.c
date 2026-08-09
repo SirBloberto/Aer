@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "error.h"
 #include "hashtable.h"
 #include "strbuf.h"
 #include "vm.h"
