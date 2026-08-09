@@ -1895,7 +1895,63 @@ measured. The table above it shows the same value as an *addition* to r8 costing
 true: the base pin is worth roughly nothing either way, and the dispatch pin is worth 1.72%, so
 trading one for the other loses the difference.
 
-### 5.16w Loop-invariant raw constants are worth hoisting; the dead copies are not
+### 5.16w The program counter is a pointer: dispatch is five instructions
+
+5.16s measured dispatch at eight instructions, three of which did no work, and 5.16t's `r8` pin
+removed two of them. Re-disassembling afterwards showed seven, not six -- the pin had also pushed
+`code` out of a register and onto the stack, so every dispatch now began by reloading it:
+
+```
+ldr    r3, [sp, #44]        <- `code`, reloaded from a stack slot, every dispatch
+ldr.w  fp, [r3, sl, lsl #2] <- op_word = code[ip]
+add.w  sl, sl, #1           <- ip++
+uxtb.w ip, fp
+ldr.w  r3, [r8, ip, lsl #2]
+orr.w  r3, r3, #1
+bx     r3
+```
+
+Giving `code` a register of its own does not fix this: 5.16v measured pinning it at **+2.38%**, worse
+than reserving nothing. The register budget cannot afford a fourth resident.
+
+The fix is to stop needing two values. `ip` was an offset into `code`, so every fetch had to
+reconstruct an address from a base and a scaled index. As a moving pointer -- which is what Lua and
+LuaJIT both use -- the fetch is one post-indexed load, and `code` is no longer read on the hot path
+at all:
+
+```
+ldr.w  fp, [r9], #4         <- op_word = *pc++
+uxtb.w ip, fp
+ldr.w  r3, [r8, ip, lsl #2]
+orr.w  r3, r3, #1
+bx     r3
+```
+
+Three instructions become one. `vm->ip` stays an offset, because everything outside `vm_run_slice`
+-- error line lookup, `CallFrame.return_ip`, yields, `debug_hits[]` -- wants a stable index into a
+buffer that can move. The conversions sit at the boundary: `pc = code + target` at a jump,
+`(unsigned int)(pc - code)` at a sync.
+
+**The one real hazard is aliasing, and it has exactly one site.** `vm_call_resolve_specialization`
+re-enters the parser, which can `realloc` the chunk and move `code` out from under `pc`. That call
+already refreshed `code`; it now converts to an offset before and re-derives `pc` after. Nothing
+else in the function can grow the chunk, which is what makes a raw pointer safe to hold across
+2,700 lines of handler bodies.
+
+Instructions, Pi:
+
+| benchmark | delta | | benchmark | delta |
+|---|---|---|---|---|
+| `nbody` | **-5.63%** | | `dict_bench` | -1.14% |
+| `mandelbrot` | **-5.44%** | | `fib_bench` | -0.87% |
+| `struct_array_scan` | **-4.84%** | | `lookup_table_bench` | -0.70% |
+| `sieve` | **-2.49%** | | everything else | within ±0.3% |
+
+Cycles agree and in one case exceed it: `struct_array_scan` -8.13%, `sieve` -3.86%, `mandelbrot`
+-2.14%, `nbody` -1.81%. The fuzzer is incidental corroboration -- the four runs that previously hit
+its 30-second wall-clock backstop now finish inside it.
+
+### 5.16x Loop-invariant raw constants are worth hoisting; the dead copies are not
 
 `mandelbrot`'s inner loop spends 4 of its 14 dispatches on work that does nothing:
 

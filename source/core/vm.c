@@ -1240,9 +1240,11 @@ vm_resolve_field_by_shape(Chunk* c, unsigned int site, Shape* shape, int field_i
 /* Resolves struct_reg's field to an (AerStruct*, slot, offset, ftype, narrow) tuple, delegating the
    shape+cache lookup above. Shared by every field-access opcode. False (error reported) if not a
    struct instance or no such field. */
-static inline __attribute__((always_inline)) bool
-vm_resolve_field(AerVal* registers, Chunk* c, unsigned int site, int struct_reg, int field_idx, AerStruct** out_s,
-                 int* out_slot, unsigned int* out_offset, ValueType* out_ftype, bool* out_narrow) {
+static inline __attribute__((always_inline)) bool vm_resolve_field(AerVal* registers, Chunk* c,
+                                                                   unsigned int site, int struct_reg,
+                                                                   int field_idx, AerStruct** out_s,
+                                                                   int* out_slot, unsigned int* out_offset,
+                                                                   ValueType* out_ftype, bool* out_narrow) {
     AerVal* obj = &registers[struct_reg];
     if (obj->tag != TYPE_STRUCT) {
         error("'.' field access requires a struct instance");
@@ -1916,8 +1918,8 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         }
         AerString* is = aer_as_string(idx);
         unsigned int klen = hashtable_key_true_len(is->data, is->length);
-        AerVal* found = hashtable_get_hashed(&aer_as_dict(obj)->map, is->data, klen,
-                                             hashtable_string_hash(is, klen));
+        AerVal* found =
+            hashtable_get_hashed(&aer_as_dict(obj)->map, is->data, klen, hashtable_string_hash(is, klen));
         if (!found) {
             *out = aer_null();
             return;
@@ -2511,15 +2513,17 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
        needs are read via READ() directly in the handler body, same as the original design's own
        trailing-word convention. */
     uint32_t op_word;
-    /* Hoisted local for vm->ip -- every jump/call/READ() would otherwise reload/store it on every
-       touch. Synced at the end of every DISPATCH() and around vm_call_value (the only other
-       write to this VM's ip). */
-    unsigned int ip = vm->ip;
     /* Hoisted like registers/raw_ints below: READ() ran `ldr [c]` to refetch c->code on EVERY
        dispatch, since the compiler cannot prove nothing writes through c. Only
        vm_call_resolve_specialization can grow the chunk mid-slice (it re-enters the parser), and it
        refreshes this immediately after. */
     const uint32_t* code = c->code;
+    /* The program counter is a moving pointer, not a `code` + offset pair: READ() is then a single
+       post-indexed load instead of a base reload, an index-scaled load and a separate increment.
+       Only vm_call_resolve_specialization can realloc `code` mid-slice, and it converts to an
+       offset and back across that one call. vm->ip stays an offset, which is what everything
+       outside this function -- error lines, return addresses, yields -- expects. */
+    const uint32_t* pc = code + vm->ip;
     /* Same deal, and it reallocs at the same one place: lbl_call indexes it on every single
        call, and reaching it through c meant reloading c from its spill slot each time. */
     ChunkFunction* functions = c->functions;
@@ -2538,7 +2542,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
 #endif
     chunk_ensure_field_cache(c);
 
-#define READ() (code[ip++])
+#define READ() (*pc++)
 #define PUSH(v)                                                                                              \
     do {                                                                                                     \
         if (vm->stack_top >= VM_STACK_MAX) {                                                                 \
@@ -2556,11 +2560,11 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
    fault, so DISPATCH() itself never needs to poll anything. */
 #define DISPATCH()                                                                                           \
     do {                                                                                                     \
-        unsigned int op_ip = ip;                                                                             \
+        unsigned int op_ip = (unsigned int)(pc - code);                                                      \
         op_word = READ();                                                                                    \
         cur_op = (Opcode)(op_word & 0xFF);                                                                   \
         c->debug_hits[op_ip]++;                                                                              \
-        goto* DT_AT(cur_op);                                                                                    \
+        goto* DT_AT(cur_op);                                                                                 \
     } while (0)
 #else
 /* Full 8-bit mask -- opcode is unambiguously its own byte now (OP_OPCODE_COUNT_MARKER's static
@@ -2569,17 +2573,17 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     do {                                                                                                     \
         op_word = READ();                                                                                    \
         cur_op = (Opcode)(op_word & 0xFF);                                                                   \
-        goto* DT_AT(cur_op);                                                                                    \
+        goto* DT_AT(cur_op);                                                                                 \
     } while (0)
 #endif
 
 /* DISPATCH() deliberately does not maintain vm->ip, but error() resolves the faulting source line
    through it (lookup_runtime_line). These shadow, for this function's body only, every callee that
-   can reach a raise, so ip is synced on exactly those paths and nowhere else. A function-like macro
+   can reach a raise, so vm->ip is synced on exactly those paths and nowhere else. A function-like macro
    is not re-expanded inside its own expansion, so the parenthesised name calls the real function.
    Anything absent here must be unable to raise -- adding a raise to one of those is a silent
    wrong-line bug, which tests/error_lines.py exists to catch. All #undef'd after lbl_halt. */
-#define SYNC_IP() ((void)(vm->ip = ip))
+#define SYNC_IP() ((void)(vm->ip = (unsigned int)(pc - code)))
 #define error(...) (SYNC_IP(), (error)(__VA_ARGS__))
 #define vm_binary_cold(...) (SYNC_IP(), (vm_binary_cold)(__VA_ARGS__))
 #define vm_index_get_compute(...) (SYNC_IP(), (vm_index_get_compute)(__VA_ARGS__))
@@ -2797,12 +2801,12 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
 
 lbl_jump : {
     int target = READ();
-    ip = (unsigned int)target;
+    pc = code + target;
     /* Every loop's back-edge (while/for/plain jump alike) goes through here -- the one checkpoint
-       that bounds an AER-level loop's slice length. ip already points at a complete instruction
+       that bounds an AER-level loop's slice length. pc already points at a complete instruction
        (this jump's own operand is fully consumed), so yielding here is always resumable. */
     if (max_instructions && --slice_budget == 0) {
-        vm->ip = ip;
+        vm->ip = (unsigned int)(pc - code);
         SLICE_RETURN(VM_SLICE_YIELDED);
     }
     DISPATCH();
@@ -3007,7 +3011,7 @@ lbl_is_result : {
         } else {                                                                                             \
             cond = vm_truthy(vm_binary_cold(c, *ra, *rb, OPENUM, ta, tb));                                   \
         }                                                                                                    \
-        if (!cond) ip = (unsigned int)target;                                                                \
+        if (!cond) pc = code + target;                                                                       \
         DISPATCH();                                                                                          \
     }
 
@@ -3032,7 +3036,7 @@ lbl_in : {
 lbl_jump_if_false_reg : {
     int reg = (int)UNPACK_A(op_word);
     int target = READ();
-    if (!vm_truthy(registers[reg])) ip = (unsigned int)target;
+    if (!vm_truthy(registers[reg])) pc = code + target;
     DISPATCH();
 }
 
@@ -3069,13 +3073,15 @@ lbl_call : {
            address computations for a path it never takes. */
         unsigned int spec_offset = chosen_offset, spec_registers = chosen_max_registers;
         unsigned int spec_raw_ints = chosen_max_raw_ints, spec_raw_reals = chosen_max_raw_reals;
-        vm_call_resolve_specialization(c, target_f, registers, arg_reg_base, ip, &spec_offset,
+        unsigned int resume_at = (unsigned int)(pc - code);
+        vm_call_resolve_specialization(c, target_f, registers, arg_reg_base, resume_at, &spec_offset,
                                        &spec_registers, &spec_raw_ints, &spec_raw_reals);
         chosen_offset = spec_offset;
         chosen_max_registers = spec_registers;
         chosen_max_raw_ints = spec_raw_ints;
         chosen_max_raw_reals = spec_raw_reals;
         code = c->code; /* compiling a specialized body can realloc both */
+        pc = code + resume_at; /* ...which can move the buffer out from under pc */
         functions = c->functions;
     }
 
@@ -3089,7 +3095,8 @@ lbl_call : {
     callee->raw_real_frame_size = chosen_max_raw_reals;
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = caller->registers[arg_reg_base + i];
-    callee->return_ip = ip; /* already past this instruction's operands -- the correct resume point */
+    callee->return_ip =
+        (unsigned int)(pc - code); /* already past this instruction's operands -- the correct resume point */
     callee->dest_reg = dest_reg;
     callee->code_offset = chosen_offset;
     callee->tail_calls_collapsed = 0;
@@ -3101,9 +3108,9 @@ lbl_call : {
     registers = vm->registers; /* refresh the hoisted locals -- see their own comment above */
     raw_ints = vm->raw_ints;
     raw_reals = vm->raw_reals;
-    ip = chosen_offset;
+    pc = code + chosen_offset;
     if (max_instructions && --slice_budget == 0) {
-        vm->ip = ip;
+        vm->ip = (unsigned int)(pc - code);
         SLICE_RETURN(VM_SLICE_YIELDED);
     }
     DISPATCH();
@@ -3122,7 +3129,7 @@ lbl_tail_call : {
        memmove uses when dest <= src, so no overlap special-casing is needed. */
     for (int i = 0; i < arg_count; i++)
         registers[i] = registers[arg_reg_base + i];
-    ip = (unsigned int)callee_offset;
+    pc = code + callee_offset;
     CallFrame* reused = &vm->call_stack[vm->call_depth];
     reused->code_offset = (unsigned int)callee_offset; /* reused frame now runs a different function */
     /* The reused frame's sizing belongs to whatever function last occupied it, and a tail call can
@@ -3134,10 +3141,10 @@ lbl_tail_call : {
     reused->raw_real_frame_size = target_f->max_raw_reals;
     reused->tail_calls_collapsed++;
     /* Every call (tail or not) is the other place a script can spend unbounded time (recursion
-       instead of a loop) -- checked once ip already points at the callee's real entry point, so a
+       instead of a loop) -- checked once pc already points at the callee's real entry point, so a
        yield here always resumes at a valid instruction boundary. */
     if (max_instructions && --slice_budget == 0) {
-        vm->ip = ip;
+        vm->ip = (unsigned int)(pc - code);
         SLICE_RETURN(VM_SLICE_YIELDED);
     }
     DISPATCH();
@@ -3152,10 +3159,10 @@ lbl_call_value : {
     int arg_count = (int)UNPACK_C(op_word);
     int callee_reg = (int)READ();
     /* vm_call_value writes vm->ip on success (or leaves it untouched on error) -- reload before
-       the next READ(). ip is already past callee_reg's word, the correct resume address. */
+       the next READ(). pc is already past callee_reg's word, the correct resume address. */
     vm_call_value(vm, registers[callee_reg], dest_reg, arg_reg_base, arg_count, cur_op == OP_TAIL_CALL_VALUE,
-                  ip);
-    ip = vm->ip;
+                  (unsigned int)(pc - code));
+    pc = code + vm->ip;
     /* vm_call_value also reassigns vm->registers/raw_ints/raw_reals for a non-tail call (unchanged
        for a tail call) -- refresh the hoisted locals either way, see their own comment above. */
     registers = vm->registers;
@@ -3185,7 +3192,7 @@ lbl_return : {
     raw_ints = vm->raw_ints;
     raw_reals = vm->raw_reals;
     registers[dest_reg] = result;
-    ip = return_ip;
+    pc = code + return_ip;
     DISPATCH();
 }
 
@@ -3431,7 +3438,7 @@ lbl_iter_next_array : {
         /* Single-variable `for k in dict:` yields keys. */
         AerVal key;
         if (!vm_dict_next_key(aer_as_dict(col), &idx, &key)) {
-            ip = (unsigned int)end_target;
+            pc = code + end_target;
             DISPATCH();
         }
         registers[item_dest_reg] = key;
@@ -3443,7 +3450,7 @@ lbl_iter_next_array : {
         /* Yields one-character strings, same shape as dict-key iteration. */
         AerString* cs = aer_as_string(col);
         if ((uint64_t)idx >= cs->length) {
-            ip = (unsigned int)end_target;
+            pc = code + end_target;
             DISPATCH();
         }
         registers[item_dest_reg] = aer_make_string_copy(
@@ -3458,7 +3465,7 @@ lbl_iter_next_array : {
            iteration works exactly like an ordinary array's. */
         AerTypedArray* ta = aer_as_typed_array(col);
         if ((uint64_t)idx >= ta->count) {
-            ip = (unsigned int)end_target;
+            pc = code + end_target;
             DISPATCH();
         }
         unsigned int width = vm_typed_elem_width(ta->elem_kind);
@@ -3472,7 +3479,7 @@ lbl_iter_next_array : {
     }
     AerArray* a = aer_as_array(col);
     if ((uint64_t)idx >= a->count) {
-        ip = (unsigned int)end_target;
+        pc = code + end_target;
         DISPATCH();
     }
     registers[item_dest_reg] = a->items[idx];
@@ -3490,14 +3497,14 @@ lbl_iter_next_pair : {
     AerVal col = registers[col_reg];
     if (aer_type(col) != TYPE_DICT) {
         error("for k, v requires a hashtable");
-        ip = (unsigned int)end_target;
+        pc = code + end_target;
         DISPATCH();
     }
     AerDict* d = aer_as_dict(col);
     int64_t idx = aer_as_int(registers[idx_reg]);
     AerVal key;
     if (!vm_dict_next_key(d, &idx, &key)) {
-        ip = (unsigned int)end_target;
+        pc = code + end_target;
         DISPATCH();
     }
     registers[key_dest_reg] = key;
@@ -3522,14 +3529,14 @@ lbl_iter_range_prep : {
     if (aer_type(cur_v) != TYPE_INTEGER || aer_type(end_v) != TYPE_INTEGER ||
         aer_type(step_v) != TYPE_INTEGER) {
         error("Range bounds and step must be integers");
-        ip = (unsigned int)empty_target;
+        pc = code + empty_target;
         DISPATCH();
     }
     int64_t cur = aer_as_int(cur_v), rng_end = aer_as_int(end_v), step = aer_as_int(step_v);
     if (step <= 0) {
         error("Range step must be a positive integer (direction is inferred from the bounds, not the step's "
               "sign)");
-        ip = (unsigned int)empty_target;
+        pc = code + empty_target;
         DISPATCH();
     }
     /* The body indexes unchecked on a proof that every value lands in [0, length), which holds only
@@ -3547,7 +3554,7 @@ lbl_iter_range_prep : {
             error("Range start %lld is past its end %lld, so this loop would count downwards out of "
                   "the collection it indexes",
                   (long long)cur, (long long)rng_end);
-        ip = (unsigned int)empty_target;
+        pc = code + empty_target;
         DISPATCH();
     }
     /* Precomputes the iteration count once (ceiling division, matching Lua's FORLOOP) instead of
@@ -3558,7 +3565,7 @@ lbl_iter_range_prep : {
        and short re-entered loops pay that cost often enough for it to be a real win. */
     int64_t count = (step == 1) ? diff : (diff + step - 1) / step;
     if (count == 0) {
-        ip = (unsigned int)empty_target;
+        pc = code + empty_target;
         DISPATCH();
     }
     /* end_reg/step_reg repurposed for this loop's life -- arg_materialize's snapshot guarantees
@@ -3592,11 +3599,11 @@ lbl_iter_range_loop : {
     /* Equal when the parser proved this loop's body never writes the loop variable, so cur_reg IS
        item_dest_reg and the store above already published this iteration's value. */
     if (cur_reg != item_dest_reg) registers[item_dest_reg] = aer_int(new_cur);
-    ip = (unsigned int)body_target;
+    pc = code + body_target;
     /* range-for's own dedicated back-edge -- lbl_jump's check doesn't cover this loop shape since
        it never goes through a plain OP_JUMP. */
     if (max_instructions && --slice_budget == 0) {
-        vm->ip = ip;
+        vm->ip = (unsigned int)(pc - code);
         SLICE_RETURN(VM_SLICE_YIELDED);
     }
     DISPATCH();
@@ -3648,7 +3655,7 @@ lbl_struct_new : {
 
 /* Reads struct_reg from a register instead of popping the stack. */
 lbl_field_get : {
-    unsigned int site = ip - 1;
+    unsigned int site = (unsigned int)(pc - code) - 1;
     int dest_reg = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
     int field_idx = (int)READ();
@@ -3668,7 +3675,7 @@ lbl_field_get : {
    OP_FIELD_BINARY's, vm.h, for why that's exact, not an approximation, for every operator that
    reaches here). */
 lbl_field_binary : {
-    unsigned int site = ip - 1;
+    unsigned int site = (unsigned int)(pc - code) - 1;
     int dest_reg = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
     Opcode bin_op = (Opcode)UNPACK_C(op_word);
@@ -3697,7 +3704,7 @@ lbl_field_binary : {
    reads it, computes, type-checks, and writes back, instead of the two full field resolutions
    (OP_FIELD_BINARY's read + a separate OP_FIELD_SET's write) this used to compile to. */
 lbl_field_compound : {
-    unsigned int site = ip - 1;
+    unsigned int site = (unsigned int)(pc - code) - 1;
     int struct_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
@@ -3792,7 +3799,7 @@ lbl_print_repl : {
 
 /* gc_barrier_struct is the write barrier every mutating struct field-set needs. */
 lbl_field_set : {
-    unsigned int site = ip - 1;
+    unsigned int site = (unsigned int)(pc - code) - 1;
     int struct_reg = (int)UNPACK_A(op_word);
     AerVal* val = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     int field_idx = (int)READ();
@@ -3801,7 +3808,8 @@ lbl_field_set : {
     unsigned int foffset;
     ValueType declared;
     bool narrow;
-    if (!vm_resolve_field(registers, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &declared, &narrow))
+    if (!vm_resolve_field(registers, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &declared,
+                          &narrow))
         DISPATCH();
     /* Enforced once here (the only place a field's value changes), trusted everywhere else
        including the fused fast path. TYPE_ANY means untyped. */
@@ -4536,7 +4544,7 @@ lbl_array_repeat : {
    functions are untyped). The non-packed branch reproduces the plain index+field path exactly,
    just without needing a scratch register for the intermediate. */
 lbl_index_field_get : {
-    unsigned int site = ip - 1;
+    unsigned int site = (unsigned int)(pc - code) - 1;
     int dest_reg = (int)UNPACK_A(op_word);
     int obj_reg = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
@@ -4588,7 +4596,7 @@ lbl_index_field_get : {
 
 /* Mirror of lbl_index_field_get -- same dual dispatch, same reason no scratch register is needed. */
 lbl_index_field_set : {
-    unsigned int site = ip - 1;
+    unsigned int site = (unsigned int)(pc - code) - 1;
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t field_val_word = READ();
@@ -4659,7 +4667,7 @@ lbl_index_field_set : {
    back) -- exactly the nbody-style `bodies[j].vx += dx * mi` pattern, twice resolved for one
    logical operation. */
 lbl_index_field_compound : {
-    unsigned int site = ip - 1;
+    unsigned int site = (unsigned int)(pc - code) - 1;
     int obj_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_idx_word = READ();
@@ -5175,7 +5183,7 @@ lbl_raw_gte_real_boxed : {
             error("Cannot apply '" opstr "' to integer and %s", vm_type_name(c, *rhs));                      \
             cond = false;                                                                                    \
         }                                                                                                    \
-        if (!cond) ip = (unsigned int)target;                                                                \
+        if (!cond) pc = code + target;                                                                       \
         DISPATCH();                                                                                          \
     }
 
@@ -5203,7 +5211,7 @@ lbl_raw_gte_real_boxed : {
             error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs));                        \
             cond = false;                                                                                    \
         }                                                                                                    \
-        if (!cond) ip = (unsigned int)target;                                                                \
+        if (!cond) pc = code + target;                                                                       \
         DISPATCH();                                                                                          \
     }
 
@@ -5222,8 +5230,8 @@ lbl_index_get_interp : {
     int dest_reg = (int)UNPACK_A(op_word);
     int obj_reg = (int)UNPACK_B(op_word);
     unsigned int count = UNPACK_C(op_word);
-    const uint32_t* rks = &code[ip];
-    ip += count;
+    const uint32_t* rks = pc;
+    pc += count;
     AerVal obj = registers[obj_reg];
     if (aer_type(obj) == TYPE_DICT &&
         vm_dict_get_interp(aer_as_dict(obj), rks, count, registers, const_pool, &registers[dest_reg]))
