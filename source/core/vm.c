@@ -1194,9 +1194,9 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     callee->synthetic_entry = false;
     vm->call_depth++; /* the defaults loop above wrote into callee->registers[] BEFORE this point, when mark_vm_roots's 0..call_depth scan didn't yet cover that frame -- gc_maybe_collect() must run AFTER this increment, not before, or a collection could reclaim a fresh default array/dict as unreachable */
     gc_maybe_collect(vm);
-    vm->registers = vm->call_stack[vm->call_depth].registers;
-    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
-    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
+    vm->registers = callee->registers;
+    vm->raw_ints = callee->raw_ints;
+    vm->raw_reals = callee->raw_reals;
     vm->ip = f->code_offset;
 }
 
@@ -3089,12 +3089,14 @@ lbl_call : {
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
     vm->call_depth++;
-    vm->registers = vm->call_stack[vm->call_depth].registers;
-    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
-    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
-    registers = vm->registers; /* refresh the hoisted locals -- see their own comment above */
-    raw_ints = vm->raw_ints;
-    raw_reals = vm->raw_reals;
+    /* `callee` is already this frame -- re-deriving it through vm->call_stack[vm->call_depth] costs
+       a reload of call_depth and a shift-add per field, then reads the mirror straight back. */
+    registers = callee->registers;
+    raw_ints = callee->raw_ints;
+    raw_reals = callee->raw_reals;
+    vm->registers = registers;
+    vm->raw_ints = raw_ints;
+    vm->raw_reals = raw_reals;
     ip = chosen_offset;
     if (max_instructions && --slice_budget == 0) {
         vm->ip = ip;
@@ -3168,16 +3170,17 @@ lbl_return : {
     unsigned int return_ip = callee->return_ip;
     int dest_reg = callee->dest_reg;
     vm->call_depth--;
-    vm->registers = vm->call_stack[vm->call_depth].registers;
-    vm->raw_ints = vm->call_stack[vm->call_depth].raw_ints;
-    vm->raw_reals = vm->call_stack[vm->call_depth].raw_reals;
     /* Must refresh the hoisted locals (see their own comment above) BEFORE the write below --
        registers still pointed at the callee's (now-popped) frame otherwise, corrupting whichever
        register of the CALLER's frame happens to share dest_reg's index instead of writing the
        return value where the caller actually expects it. */
-    registers = vm->registers;
-    raw_ints = vm->raw_ints;
-    raw_reals = vm->raw_reals;
+    CallFrame* caller = callee - 1;
+    registers = caller->registers;
+    raw_ints = caller->raw_ints;
+    raw_reals = caller->raw_reals;
+    vm->registers = registers;
+    vm->raw_ints = raw_ints;
+    vm->raw_reals = raw_reals;
     registers[dest_reg] = result;
     ip = return_ip;
     DISPATCH();
