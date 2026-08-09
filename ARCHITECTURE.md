@@ -2245,6 +2245,43 @@ instructions, take changes that remove real work, and read a cycles swing on a l
 as evidence about *this build*, not about the change. What sank this one was not the +15% -- it was
 that instructions showed no work removed to pay for it.
 
+### 5.16yd How big the layout lottery actually is: measured, and it is enormous
+
+That whole argument rested on an unmeasured "several percent". `tools/layout_sweep.py` measures it:
+it builds the *same commit* at several code offsets (`-DAER_LAYOUT_PAD=N`, which shifts every
+following address) and reports how far each benchmark moves with **no source difference at all**.
+
+Five layouts, `HEAD` against itself:
+
+| benchmark | spread across layouts, identical source |
+|---|---|
+| `mandelbrot` | **25.58%** |
+| `fib_bench` | **5.84%** |
+| `nbody` | 3.08% |
+| `binary_trees` | 0.62% |
+| `sieve` | 0.60% |
+
+`mandelbrot`'s cycle count varies by a quarter on identical code. Any single-build cycle comparison
+on it is meaningless, and some numbers quoted earlier in this document sit inside their benchmark's
+band: 5.16yb's `fib_bench` -5.7% is smaller than fib's own 5.84% lottery, so it is not evidence that
+change helped on cycles -- its -0.43% on *instructions* is the real result. `sieve` -3.86% and
+`binary_trees` movements above ~1% are well outside their bands and can be trusted.
+
+**Sensitivity is a property of the benchmark, not the machine.** `sieve` and `binary_trees` barely
+move; `mandelbrot` moves 25%. The plausible reason is how concentrated the hot loop's opcode mix is:
+a loop cycling a handful of dispatch sites lives or dies on whether those few collide in the
+predictor, while a loop spread across many sites averages its own luck out. That also explains why
+5.16d's "adding an opcode taxes everything" and 5.16q's "register allocation lottery" were both real
+observations of one underlying effect that neither could pin down from a single build.
+
+Practical consequences, superseding the cycle guidance in 5.16p:
+
+- **Instructions remain the gate.** Near-immunity to layout is why they are trustworthy, not a
+  limitation.
+- **A single-build cycle comparison is worth nothing on a layout-sensitive benchmark.** Run
+  `layout_sweep.py` and compare the median against the measured band.
+- **Quote the band alongside the median.** A median inside it says which build got lucky.
+
 `OP_RAW_ADD_REAL_BOXED` is 13.6% of `mandelbrot`'s dispatches -- `cx` and `cy` staying boxed across
 518,400 calls -- so binding a shape-less function's numeric parameters as raw locals keeps looking
 like the obvious win. It has been built twice and reverted twice. This time it was costed before
