@@ -48,10 +48,20 @@ def find(names, host):
 
 
 def time_once(argv, host, remote_dir):
-    """Wall-clock seconds for one run, or None if it failed."""
+    """Wall-clock seconds for one run, or None if it failed.
+
+    Under --host the clock runs ON the remote machine, not here. Timing the ssh call instead would
+    fold connection setup into every measurement -- and since that constant lands on both sides of
+    a ratio, it would quietly drag every result toward 1.00x.
+    """
     if host:
-        remote = "cd %s && %s" % (remote_dir, " ".join(argv))
-        argv = ["ssh", host, remote]
+        remote = ("cd %s && start=$(date +%%s%%N); %s >/dev/null 2>&1; rc=$?; end=$(date +%%s%%N); "
+                  "echo $rc $(( (end-start)/1000000 ))" % (remote_dir, " ".join(argv)))
+        p = subprocess.run(["ssh", host, remote], capture_output=True, text=True)
+        parts = p.stdout.split()
+        if p.returncode != 0 or len(parts) != 2 or parts[0] != "0":
+            return None
+        return int(parts[1]) / 1000.0
     start = time.perf_counter()
     p = subprocess.run(argv, capture_output=True, text=True)
     elapsed = time.perf_counter() - start
