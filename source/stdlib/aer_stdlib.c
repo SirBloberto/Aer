@@ -1,4 +1,5 @@
 #include <string.h>
+#include "error.h"
 #include "aer_stdlib.h"
 
 bool aer_stdlib_is_native_module(const char* name, unsigned int len) {

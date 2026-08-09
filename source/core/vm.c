@@ -2560,7 +2560,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         op_word = READ();                                                                                    \
         cur_op = (Opcode)(op_word & 0xFF);                                                                   \
         c->debug_hits[op_ip]++;                                                                              \
-        goto* dt[cur_op];                                                                                    \
+        goto* DT_AT(cur_op);                                                                                    \
     } while (0)
 #else
 /* Full 8-bit mask -- opcode is unambiguously its own byte now (OP_OPCODE_COUNT_MARKER's static
@@ -2569,7 +2569,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     do {                                                                                                     \
         op_word = READ();                                                                                    \
         cur_op = (Opcode)(op_word & 0xFF);                                                                   \
-        goto* dt[cur_op];                                                                                    \
+        goto* DT_AT(cur_op);                                                                                    \
     } while (0)
 #endif
 
@@ -2771,6 +2771,12 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INTERP] = &&lbl_interp,
         [OP_INDEX_GET_INTERP] = &&lbl_index_get_interp,
     };
+#ifdef AER_PINNED_DISPATCH
+    aer_dispatch_base = dt;
+#define DT_AT(op) (aer_dispatch_base[(op)])
+#else
+#define DT_AT(op) (dt[(op)])
+#endif
 
     /* A designated-initializer table leaves an opcode with no entry as NULL, so emitting one jumps
        through a null pointer instead of failing near the mistake -- OP_BINARY sat in the enum in
@@ -5230,6 +5236,7 @@ lbl_index_get_interp : {
 lbl_halt:
     SLICE_RETURN(VM_SLICE_DONE);
 
+#undef DT_AT
 #undef SLICE_RETURN
 #undef SYNC_IP
 #undef error
