@@ -3106,9 +3106,15 @@ lbl_call : {
         chosen_max_registers = spec_registers;
         chosen_max_raw_ints = spec_raw_ints;
         chosen_max_raw_reals = spec_raw_reals;
-        code = c->code; /* compiling a specialized body can realloc both */
-        pc = code + resume_at; /* ...which can move the buffer out from under pc */
+        /* Compiling a specialized body can realloc any of the chunk's growable arrays, so every
+           hoisted pointer into them is refreshed here. const_pool looks safe -- a recompile of the
+           same source finds every constant already interned -- but chunk_add_pool dedups
+           TYPE_FUNCTION on code_offset, and a specialized body's function expressions sit at NEW
+           offsets. A callee containing a lambda therefore appends, and can move the pool. */
+        code = c->code;
+        pc = code + resume_at;
         functions = c->functions;
+        const_pool = c->pool;
     }
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];

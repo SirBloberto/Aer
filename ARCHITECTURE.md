@@ -2432,6 +2432,48 @@ measurement, but this data says not to expect it to fix the benchmark that needs
 The knob stays as opt-in measurement tooling, never part of a normal build, on the same footing as
 `make pgo` and `debug-tools`.
 
+### 5.16yf A use-after-free found by reading the call path, not by a test
+
+`vm_run_slice` hoists `c->pool` into `const_pool`, and a shape-specializing recompile runs the
+parser again while that local is live. `lbl_call` already refreshed `code` and `functions` across
+that call, with a comment saying a recompile "can realloc both" -- so the question is why `pool` was
+not in that list.
+
+The reasoning that makes it look safe is real but incomplete. `chunk_add_pool` dedups by value, so
+recompiling the same source interns nothing new and cannot grow the pool. **Except for
+`TYPE_FUNCTION`, which dedups on `code_offset`** -- and a specialized body's function expressions
+are emitted at *new* offsets. A shape-sensitive function containing a lambda therefore appends on
+its first specialized call, and `chunk_pool_append` reallocs, leaving `const_pool` pointing at freed
+memory for the rest of the slice.
+
+Reachable in ordinary code -- a function that reads a struct field (making it shape-sensitive) and
+assigns a `function(...)` expression is nothing unusual:
+
+```
+function shape_fn(p, k):
+    g = function(a):
+        return a * 2
+    return p.x + p.y + g(k)
+```
+
+**Demonstrated, not just argued.** `tests/test_spec_pool_realloc.aer` exercises the path but passes
+either way on a normal build, because the pool usually has spare capacity at the moment of
+specialization. Forcing `chunk_pool_append` to realloc on *every* append makes the unfixed build
+fail immediately:
+
+```
+Error: Cannot apply '*' to integer and Ã@
+```
+
+-- a constant read out of freed memory. With the one-line fix, all assertions pass under the same
+stress. The test stays as a canary: it covers a combination (specialization plus a lambda in the
+same body) that nothing else did, and it will catch a regression whenever the pool does happen to
+grow at that moment.
+
+Worth noting how this surfaced: not from a failing test, but from reading `lbl_call` while looking
+for something else and asking why one hoisted pointer was refreshed and another was not. The
+comment next to the refresh said "can realloc both", and *both* was the bug.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
