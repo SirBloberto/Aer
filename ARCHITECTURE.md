@@ -1652,6 +1652,58 @@ interpreter code size is not an icache problem here. 5.16d's finding that *addin
 about the new label bodies competing for prediction resources, which does not run in reverse for
 opcodes that never execute.
 
+### 5.16t Pinning the dispatch base: the largest win measured here, and why it is reverted
+
+5.16s identified two of dispatch's eight instructions as rebuilding the table's base from `pc`
+because no register was free to cache it. Giving GCC one explicitly --
+`register const void* const* aer_dispatch_base asm("r8")`, chosen because r8 is callee-saved under
+AAPCS -- removed exactly those two instructions. The disassembly confirms it: dispatch became
+`uxtb` + `ldr [r8, ip, lsl #2]` + `orr` + `bx`, with 408 sites using r8 as the base.
+
+**Every benchmark improved, with no regressions -- the only change measured here that has ever done
+that:**
+
+| benchmark | instructions |
+|---|---|
+| sieve | **-6.13%** |
+| mandelbrot | **-4.23%** |
+| nbody | -2.94% |
+| fib_bench | -2.56% |
+| struct_array_scan | -2.09% |
+| binary_trees | -1.39% |
+| small_dict_bench | -1.72% |
+| lookup_table_bench | -0.86% |
+| log_processing | -0.56% |
+| dict_bench | -0.49% |
+
+All 15 outputs byte-identical, 250 fuzz iterations clean, `error_lines.py` clean, actor and
+scheduler tests clean.
+
+**It still had to be reverted: it corrupts the heap.** `make test-ubsan` segfaults, and the backtrace
+is unambiguous -- `free()` called on `&dt` itself:
+
+```
+#8  __GI___libc_free (mem=0x4e7a60 <dt>)
+#9  parser_restore_state (s=0x4e7a60 <dt>) at source/compiler/parser.c:4963
+    r8  0x6
+```
+
+A parser pointer had been given the dispatch base's value. The cause is `-flto`: the declaration
+lived in `vm.c`, so only that translation unit reserved r8, while `parser.c` and the rest used it as
+an ordinary callee-saved register. LTO then merges and inlines across that boundary, and the two
+assumptions collide. GCC's own rule for global register variables -- the declaration must be visible
+to *every* translation unit -- is not satisfiable here without putting it in a header that all 29
+source files include (three do not even include `error.h`, the closest thing to a universal one).
+
+So the choice is not "is 2-6% worth it" but **"is reserving a register program-wide, in every
+translation unit including the parser and stdlib, worth it"** -- which taxes code that never
+dispatches, and makes the reservation part of the project's ABI. That is a design decision, not an
+optimization, and it is left to be taken deliberately rather than smuggled in behind a measurement.
+The measurement above is what it would be worth.
+
+The plainer alternative remains `-no-pie` (5.16s: 2.4-4.7%), which needs no ABI change and is
+declined on benchmark-fairness grounds rather than technical ones.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
