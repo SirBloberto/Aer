@@ -17,9 +17,12 @@ import re
 import subprocess
 import sys
 
+# compile_bound is deliberately unlike the rest: it is dominated by PARSING, not by the loop that
+# follows. Every other benchmark measures steady-state execution of already-compiled code, so a
+# change that taxes the compiler (reserving a register program-wide, say) was invisible here.
 BENCHMARKS = [
     "nbody", "log_processing", "dict_bench", "small_dict_bench", "lookup_table_bench",
-    "sieve", "mandelbrot", "binary_trees", "fib_bench", "struct_array_scan",
+    "sieve", "mandelbrot", "binary_trees", "fib_bench", "struct_array_scan", "compile_bound",
 ]
 
 
