@@ -1908,9 +1908,30 @@ from the hot path and could have made a second reservation affordable:
 
 The occupant question is settled twice over: `r8` holds the dispatch base, and giving it to `pc`
 instead costs +2.56%. The *second* pin question did move -- `pc` in r4 is -0.66% where the best
-addition before was +0.14% -- but it is a trade, not a win, buying `mandelbrot` -6.52% with
-`struct_array_scan` +2.05%. It is also measured against a tree without 5.16x's hoist, which changes
-the instruction mix it depends on. Left open, to be re-measured rather than banked.
+addition before was +0.14%.
+
+Re-measured again after 5.16x's hoist, which changes the instruction mix these depend on:
+
+| variant | nbody | sieve | mandel | fib | dict | log | struct_scan | mean |
+|---|---|---|---|---|---|---|---|---|
+| + `raw_reals` in r4 | -2.07% | +1.24% | -3.82% | -0.44% | +0.93% | +1.09% | -0.39% | **-0.49%** |
+| + `pc` in r4 | -2.11% | +0.89% | -5.78% | +0.65% | +0.57% | +0.08% | +2.11% | **-0.51%** |
+| + `registers` in r4 | +0.20% | +2.24% | +0.35% | +0.44% | +0.88% | +0.81% | +0.35% | +0.75% |
+
+The hoist barely moved them, so the result is stable. The two candidates tie on mean and differ
+entirely in shape: `pc` buys a bigger `mandelbrot` but regresses `struct_array_scan` +2.11%, while
+`raw_reals` wins four benchmarks including three compute-heavy ones and spends its cost on the
+hashing/allocation side. Neither is free -- both reserve a register program-wide, and both regress
+`sieve`. This is a values question (concentrated compute wins against broad small regressions), not
+a measurement question, and it is recorded here rather than banked so the trade stays visible.
+
+**On x86-64 the whole question is moot**, and for two independent reasons. `r8` there is a *volatile*
+argument register under both Win64 and System V -- clobbered by every libc call -- so the ARM
+register would be the wrong one anyway; a pin would have to use `rbx` or `r12`-`r15`. More to the
+point, nothing needs pinning: x86-64 has a memory-indirect jump, so dispatch compiles to
+`jmp *(%rbx,%rax,8)` with the table base already resident and no Thumb-bit fixup. The 5.16s problem
+-- rebuilding a PIC table base every dispatch, on a machine with no spare register to cache it in --
+is an ARM32 problem, which is why the pin is `#if defined(__arm__)` and why it needs no counterpart.
 
 ### 5.16w The program counter is a pointer: dispatch is five instructions
 
@@ -2075,7 +2096,43 @@ one benchmark, against +0.87% and +0.53% here. A smaller jump encoding remains a
 since deltas are small enough to pack into word0 -- but that is a *different* change, and it must be
 justified by the packing, not by the addressing.
 
-### 5.16z Loop-invariant raw constants are worth hoisting; the dead copies are not
+### 5.16z Numeric specialization, third look: declined on arithmetic rather than measurement
+
+`OP_RAW_ADD_REAL_BOXED` is 13.6% of `mandelbrot`'s dispatches -- `cx` and `cy` staying boxed across
+518,400 calls -- so binding a shape-less function's numeric parameters as raw locals keeps looking
+like the obvious win. It has been built twice and reverted twice. This time it was costed before
+being built, and the arithmetic explains both earlier failures without needing a third.
+
+The working hypothesis was that 5.16x's hoist would rescue it: attempt 2's post-mortem blamed
+compared constants being raw-materialised once a parameter went raw, which defeats compare-and-branch
+fusion, and a hoisted constant costs one load per loop entry instead of one per iteration. **The
+hypothesis is wrong on both halves.** The parser has kept compared literals boxed since 2026-08-02
+(`lhs_is_slot && rhs_is_const`, parse_binary_ops), which is a day *before* attempt 2 was measured --
+so that fix was already in place and did not save it. And the real blocker is not constants at all.
+
+`mandelbrot`'s hot loop compiles its condition to a single fused dispatch:
+
+```
+OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE   rawi=0  rk=reg2  -> 17     [25.4M hits]
+```
+
+`iter` is *already* raw; `max_iter` is the boxed operand, and the fusion exists only for the
+raw-vs-**boxed** shape. Specialization would make `max_iter` raw too, turning that one dispatch into
+`OP_RAW_LT_INT` plus `OP_JUMP_IF_FALSE_REG` -- **+25.4M dispatches**, at roughly 10-15 instructions
+each. Against that, the two `OP_RAW_ADD_REAL_BOXED` become `OP_RAW_ADD_REAL`, which changes no
+dispatch count at all and saves only a tag check, about two instructions on 49.8M executions. The
+trade is ~250-380M instructions spent to save ~100M, on a 7.28B baseline -- a few percent worse,
+which is what attempt 2 measured (+7.4%).
+
+So specialization does not fail because of an implementation detail. It fails because **making an
+operand raw removes it from the one comparison shape that fuses**, and it buys back only a tag check.
+
+The unlock is a package, not a patch. Raw-vs-raw fused compares would close the gap, and `vm.h`
+records them as measured earning nothing -- but that measurement was taken in a codebase where
+nothing *produces* raw-vs-raw comparisons, because parameters stay boxed. Each change is worthless
+alone and they have only ever been evaluated alone. A fourth attempt should build both or neither.
+
+### 5.16aa Loop-invariant raw constants are worth hoisting; the dead copies are not
 
 `mandelbrot`'s inner loop spends 4 of its 14 dispatches on work that does nothing:
 
