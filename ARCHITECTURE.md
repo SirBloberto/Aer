@@ -1466,6 +1466,44 @@ before this and is optimistic by roughly an order of magnitude at `--runs 3`. An
 document that rests on a sub-1.5% cycle difference at low run counts should be treated as unproven;
 5.16o has been corrected on exactly that basis.
 
+### 5.16q Two more attempts on `vm_run_slice`'s register pressure, both reverted
+
+`fib_bench` runs ~234 instructions per call against LuaJIT `-joff`'s ~117, and `perf annotate` blames
+spill traffic rather than dispatch: **25.16% of its samples are stack-slot loads/stores**, with
+`vm` (8.79%), `registers` (6.27%) and `const_pool` (4.43%) -- **19.5% between them** -- reloaded from
+`[sp,#44]`, `[sp,#40]`, `[sp,#48]`. All three are already hoisted into locals; the allocator spills
+them anyway, because ~10 long-lived pointers compete across 153 label bodies on an ISA with ~11
+allocatable registers. The hottest single instruction is the RK8 const-flag test, which GCC compiles
+into a *conditional reload of a base pointer from the stack* on every operand decode.
+
+**Attempt 1: un-hoist `raw_ints`/`raw_reals` to free two registers.** Only the ~18 `lbl_raw_*`
+labels use them, and `fib` uses none at all (its bytecode has zero raw opcodes -- verified with
+`--debug-path`). The full ablation, in instructions:
+
+| variant | fib | sieve | nbody | mandelbrot | binary_trees |
+|---|---|---|---|---|---|
+| both un-hoisted | **-4.28%** | +1.99% | +0.72% | -0.37% | -1.10% |
+| `raw_reals` only | -2.57% | +0.01% | +2.15% | **+3.45%** | -0.95% |
+| `raw_ints` only | -0.86% | +0.01% | -0.01% | +0.57% | -0.15% |
+
+Freeing *one* register produced a worse allocation than freeing two -- the middle row is the worst of
+the three. Reverted: the best variant still trades `sieve` +1.99% and `nbody` +0.72% for `fib`, which
+is chasing one synthetic call microbenchmark at the suite's expense.
+
+**Attempt 2: stop re-deriving the frame pointer the call path already holds.** `lbl_call`,
+`lbl_return` and `vm_call_value`'s tail-call setup each finished by reading
+`vm->call_stack[vm->call_depth]` three times to refill the `vm->` mirror, then read the mirror
+straight back into the hoisted locals -- while `callee` already pointed at that exact frame. Removing
+the recompute is strictly less work. It measured `fib_bench` **+0.86%** instructions, and at
+`--runs 7` cycles agreed: mandelbrot +2.15%, lookup_table +5.01%, fib +0.44%. Reverted.
+
+Together with 5.16e attempt 4 and 5.16h, that is four independent attempts. The pattern is now firm
+enough to state as a rule: **in `vm_run_slice`, removing work and freeing registers are not the same
+as going faster.** Any edit reshuffles allocation across all 153 labels, and the reshuffle routinely
+outweighs the work removed -- in both directions, unpredictably. Micro-editing this function is a
+lottery; the productive changes have all been *addressing* changes (5.16e's power-of-two frame,
+5.10's struct layout) or work removed *outside* it (5.16o's key scan, 5.16n's string search).
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
