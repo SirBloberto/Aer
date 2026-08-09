@@ -319,8 +319,12 @@ static bool rk_nonneg(Chunk* c, int rk) {
 /* Non-negativity survives + * // and %, and only those: subtraction and left-shift can produce a
    negative from non-negative operands. Overflow can too, which is why the range-for guard exists
    rather than trying to reason about it here. */
+/* Every binary operator whose result is >= 0 whenever both operands are, which is the whole set --
+   not a sampling of it. The three exclusions are exclusions on their merits: SUB goes negative,
+   LSHIFT can shift a positive value into the sign bit, and DIV yields a real rather than an index. */
 static bool binop_preserves_nonneg(Opcode op) {
-    return op == OP_ADD || op == OP_MUL || op == OP_FLOOR_DIV || op == OP_MOD;
+    return op == OP_ADD || op == OP_MUL || op == OP_FLOOR_DIV || op == OP_MOD ||
+           op == OP_BITWISE_AND || op == OP_BITWISE_OR || op == OP_BITWISE_XOR || op == OP_RSHIFT;
 }
 
 static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
