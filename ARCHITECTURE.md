@@ -1821,6 +1821,55 @@ On cycles `sieve` confirms at -3.1 to -3.9%. `nbody` first read +2.28% and then 
 which is the §5.16p noise floor talking, not a result — a reminder that a single cycle sample is
 still not evidence even at seven runs.
 
+### 5.16v The pinning matrix: r8 is the only one worth having
+
+5.16t pinned the dispatch base in `r8` and closed with the open question of whether LuaJIT's other
+three (`BASE`, `KBASE`, `PC`) were worth the same treatment. They are not. Every remaining
+candidate was built and measured, alone and in combination, since 5.16q established that freeing
+registers is not additive — the allocator's response to two reservations is not the sum of its
+response to each.
+
+`registers`, `const_pool` and `ip` differ from the dispatch base in one way that decides the
+implementation: the base holds one value for the process's life, so a nested `vm_run_slice`
+overwriting it is harmless, while all three of these change per invocation. Each therefore needs an
+entry save and an exit restore, exactly like `runtime_error_unwind_target`/`active_vm_for_errors`/
+`current_heap` already do. The pin was confirmed honoured, not silently ignored, by disassembly:
+with `-ffixed-r4` the prologue's `stmdb sp!, {r5, r6, r7, r9, sl, fp, lr}` no longer saves `r4`.
+
+Instructions vs. the r8-only baseline, Pi:
+
+| variant | nbody | sieve | mandel | fib | dict | log | struct_scan | mean |
+|---|---|---|---|---|---|---|---|---|
+| `BASE` (r4) | -0.57% | -0.30% | +0.29% | -0.00% | +0.86% | +0.87% | -0.18% | **+0.14%** |
+| `KBASE` (r5) | +0.27% | +0.69% | -0.04% | +0.86% | +0.91% | +1.29% | +1.33% | **+0.76%** |
+| `BASE`+`KBASE` | -0.44% | +0.35% | -0.38% | -2.39% | +1.75% | +1.35% | +0.62% | **+0.12%** |
+| `PC` (r6) | +2.92% | +2.35% | +3.99% | +2.16% | +1.05% | +1.40% | +1.74% | **+2.23%** |
+| `BASE`+`PC` | +3.31% | +5.00% | +4.30% | +2.15% | +2.04% | +2.01% | +1.88% | **+2.96%** |
+| all three | — | — | — | — | — | — | — | **does not compile** |
+
+`PC` is the clearest loss and the most instructive one. `ip` is incremented on every single
+dispatch, which is exactly the profile that makes it *want* a scratch register with good addressing
+modes — forcing it into a fixed callee-saved slot while simultaneously denying that register to
+every other function in the program is a loss on both ends.
+
+`BASE`+`KBASE` is the only combination with a real win in it, `fib_bench` -2.39%, and it is a
+textbook non-additive one: `BASE` alone moves fib -0.00% and `KBASE` alone +0.86%, yet together they
+find an allocation neither reaches. It still does not clear the bar. The win is on the one
+synthetic, call-overhead-dominated benchmark, paid for by `dict_bench` +1.75% and `log_processing`
++1.35% — the two most realistic workloads in the suite.
+
+Pinning all three on top of `r8` does not merely regress, it **fails to build**: `source/terminal.c:180:
+error: unable to find a register to spill`. That is the concrete form of the ARM32 register-budget
+argument. With `r8` plus three more reserved, roughly seven allocatable registers remain, and
+ordinary C in a file that has nothing to do with the interpreter can no longer be compiled at all.
+It is also the direct answer to "LuaJIT pins four, why don't we": LuaJIT can, because it hand-writes
+its interpreter in assembly and pays the cost in exactly one function. A C compiler applies
+`-ffixed` to the whole program, so the reservation is charged against every function whether it
+benefits or not.
+
+`r8` earned its keep because dispatch touches it on every opcode and nothing else in the program
+wanted it that badly. Nothing else clears that bar. **Pinning is closed at one register.**
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
