@@ -2460,6 +2460,19 @@ static bool __attribute__((noinline)) vm_call_module_dispatch(VM* vm, Chunk* c, 
     return handled;
 }
 
+/* Measurement-only: shifts every following function's address, so a benchmark can be run across
+   several deliberately different code layouts instead of the single one a build happens to produce.
+   Interpreter cycle counts swing several percent purely on how vm_run_slice's ~153 dispatch sites
+   alias in the branch-target buffer (5.16yc), which is not attributable to any source change -- and
+   comparing one layout against one layout silently folds that in. Never defined by a normal build. */
+#ifdef AER_LAYOUT_PAD
+#define AER_PAD_STR2(x) #x
+#define AER_PAD_STR(x) AER_PAD_STR2(x)
+__attribute__((used, noinline)) static void aer_layout_pad_fn(void) {
+    __asm__ volatile(".space " AER_PAD_STR(AER_LAYOUT_PAD));
+}
+#endif
+
 /* max_instructions == 0 means unlimited (every existing caller via the vm_run() wrapper below) --
    the budget decrement only happens at loop-back-edge and call opcodes (the only places a script
    can spend unbounded time), not on every DISPATCH(), so the check costs nothing on the common
