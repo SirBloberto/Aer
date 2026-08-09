@@ -2214,18 +2214,36 @@ Cycles said otherwise, twice:
 | `binary_trees` | +0.99% | +1.24% |
 | `struct_array_scan` | +0.41% | -0.22% |
 
-Flat instructions with a large cycles jump is an IPC collapse, and the mechanism is locality. The
-raw-numeric-variant axis is re-derived on *every* specialized call rather than cached, so
-`entry->raw_param_count` and the `raw_variant_*` fields are read per call. Inline, they shared cache
-lines with the `max_registers`/`max_raw_*`/`shape_sensitive_mask` fields `lbl_call` already touches.
-Behind a pointer they became a second, distant heap object -- an extra line per call on exactly the
-functions that call most. Reverted.
+The obvious explanation is locality -- an extra cache line per specialized call -- and **the counters
+refute it**. `nbody`, inline vs out-of-line: cache-misses *fell*, 80,384 to 71,720, on a benchmark
+whose entire working set is five bodies. It was never memory-bound.
 
-**The methodological point outlives the change.** Instruction count is the gate for nearly everything
-in this document because it repeats to 0.03% where cycles do not, and that gate is *blind to
-locality*. A struct-layout change moves bytes, not instructions. Anything that alters what shares a
-cache line -- field reordering, splitting hot from cold, boxing a table behind a pointer -- has to be
-judged on cycles, and instructions will cheerfully report it as free.
+The cost is branch mispredictions:
+
+| | cycles | instructions | IPC | branch-misses |
+|---|---|---|---|---|
+| inline | 4.72B | 8.909B | 1.89 | **13.5M** |
+| out of line | 5.52B | 8.909B | 1.61 | **45.7M** |
+
+3.4x the mispredictions, +32.2M of them, which at ~15-20 cycles each accounts for essentially the
+whole +804M gap. The same signature explains the rest of this session's cycle movements, in both
+directions -- 5.16yb's byte-offset change took `fib_bench` from 23.9M mispredictions to 12.3M
+(-5.7% cycles) while pushing `binary_trees` from 5.0M to 7.3M (+2.9% cycles), on instruction counts
+that barely moved either way.
+
+This is 5.16d's opcode tax and 5.16q's "register allocation lottery" seen from underneath: neither is
+really about opcodes or registers. Any edit to `vm_run_slice` shifts the addresses of 153 label
+bodies, which changes how the computed-goto dispatch aliases in the branch target buffer, and 36-53%
+of all mispredictions land on that dispatch. The effect is large, chaotic with respect to the source
+change that triggered it, and not attributable to anything the edit actually does.
+
+**Which is an argument FOR the instruction gate, not against it.** Cycles here are real work plus a
+layout lottery worth several percent per benchmark, and the lottery cannot be steered -- an edit
+cannot be designed to alias favourably, and its aliasing will change again with the next edit.
+Instructions measure the part that is actually attributable and durable. So the rule stands: gate on
+instructions, take changes that remove real work, and read a cycles swing on a layout-perturbing edit
+as evidence about *this build*, not about the change. What sank this one was not the +15% -- it was
+that instructions showed no work removed to pay for it.
 
 `OP_RAW_ADD_REAL_BOXED` is 13.6% of `mandelbrot`'s dispatches -- `cx` and `cy` staying boxed across
 518,400 calls -- so binding a shape-less function's numeric parameters as raw locals keeps looking
