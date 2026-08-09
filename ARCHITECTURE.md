@@ -1715,9 +1715,28 @@ live at the cost of whatever `mandelbrot`'s hot loop wanted more. This is 5.16q'
 rules out the polite version of the fix: the win is only available by *taking* a register, not by
 asking for one or making space.
 
-So the three options are exactly: reserve r8 program-wide (an ABI change, taxing every translation
-unit), build `-no-pie` (5.16s: 2.4-4.7%, no ABI change, declined on benchmark-fairness grounds
-rather than technical ones), or leave dispatch as it is.
+**The program-wide reservation was then done properly, and still fails.** The declaration was moved
+into `error.h` -- the one header every translation unit that links the VM already includes, the
+smoke/embed tests included -- and the two library sources that lacked it (`value_format.c`,
+`aer_stdlib.c`) were given it. The pin demonstrably took effect: dispatch compiles to
+`ldr.w r3, [r8, ip, lsl #2]` with no `pc` arithmetic. The x86 build, the full test gate and the
+comment check all pass.
+
+`make test-ubsan` **still segfaults.** So visibility in every TU was necessary but not sufficient,
+and the failure is not the LTO-inlining story alone. Whatever the residual cause -- the sanitizer
+runtime, or GCC declining to honour the reservation under instrumentation -- the first version was
+provably miscompiling (a parser pointer holding `&dt`), and there is no way to establish that the
+same corruption is not happening silently in the uninstrumented build. It passes every test, fuzzes
+clean and produces byte-identical output; so did the version that was definitely wrong.
+
+**Conclusion: this win is not safely reachable with this toolchain.** Reverted for the second time,
+and it should not be attempted a third without either a compiler that honours the reservation under
+sanitizers, or an interpreter written in assembly where the register allocation is ours to make --
+which is precisely what LuaJIT does, and a large part of why its dispatch is cheaper.
+
+With `-no-pie` also off the table by choice, dispatch stays as it is. The remaining route to the same
+instructions is not to make dispatch cheaper but to **dispatch less often** -- which is the codegen
+work in 5.16r, where 25.3% of `mandelbrot`'s dispatches are copies and constant reloads.
 
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
