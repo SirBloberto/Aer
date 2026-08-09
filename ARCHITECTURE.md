@@ -1701,8 +1701,23 @@ dispatches, and makes the reservation part of the project's ABI. That is a desig
 optimization, and it is left to be taken deliberately rather than smuggled in behind a measurement.
 The measurement above is what it would be worth.
 
-The plainer alternative remains `-no-pie` (5.16s: 2.4-4.7%), which needs no ABI change and is
-declined on benchmark-fairness grounds rather than technical ones.
+**Two safe versions were then tried, and neither works.** The obvious hope is that the allocator
+would keep the base itself if simply asked, or if given room:
+
+| variant | sieve | mandelbrot | nbody | fib |
+|---|---|---|---|---|
+| `const void* const* dtb = dt;` as a plain local | **-4.50%** | **+5.20%** | +2.03% | -0.86% |
+| the same, plus un-hoisting `c` to free a register | -4.50% | +5.19% | +2.10% | -0.86% |
+
+Freeing a register changed **nothing** -- the two rows are the same measurement. GCC does not spend a
+freed register on the dispatch base; it had already decided, and naming `dtb` only forces the base
+live at the cost of whatever `mandelbrot`'s hot loop wanted more. This is 5.16q's rule again, and it
+rules out the polite version of the fix: the win is only available by *taking* a register, not by
+asking for one or making space.
+
+So the three options are exactly: reserve r8 program-wide (an ABI change, taxing every translation
+unit), build `-no-pie` (5.16s: 2.4-4.7%, no ABI change, declined on benchmark-fairness grounds
+rather than technical ones), or leave dispatch as it is.
 
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
