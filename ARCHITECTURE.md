@@ -2192,7 +2192,40 @@ overlaps the windows so the arguments are already in place and the copy disappea
 change most likely to matter for `fib_bench`, and also the one that touches frame layout, GC root
 ranges and the parser's register allocation at once.
 
-### 5.16z Numeric specialization, third look: declined on arithmetic rather than measurement
+### 5.16yc Shrinking ChunkFunction 328 -> 60 bytes: instruction-neutral, cycles-catastrophic
+
+`ChunkFunction` is 328 bytes, of which `SpecEntry specializations[SPEC_MAX]` is **272 -- 83% of the
+struct** -- for a table most functions never use, since only a shape-sensitive parameter triggers
+specialization at all. Moving it behind a lazily-allocated pointer (fixed at `SPEC_MAX` entries and
+never grown, so the `SpecEntry*` that `CallSpecCacheEntry` caches stays stable) takes the struct to
+**60 bytes**, fits it in one cache line, and drops peak RSS on `bench/compile_bound.aer` from 3040 KB
+to 2892 KB.
+
+Instructions said it was free. Every benchmark landed within ±0.04%, including the three that lean
+hardest on specialization (`nbody` +0.02%, `struct_array_scan` +0.04%, `binary_trees` -0.03%) --
+all inside the 0.03% repeatability floor.
+
+Cycles said otherwise, twice:
+
+| benchmark | run 1 | run 2 |
+|---|---|---|
+| `nbody` | **+13.18%** | **+24.64%** |
+| `fib_bench` | +6.24% | +5.91% |
+| `binary_trees` | +0.99% | +1.24% |
+| `struct_array_scan` | +0.41% | -0.22% |
+
+Flat instructions with a large cycles jump is an IPC collapse, and the mechanism is locality. The
+raw-numeric-variant axis is re-derived on *every* specialized call rather than cached, so
+`entry->raw_param_count` and the `raw_variant_*` fields are read per call. Inline, they shared cache
+lines with the `max_registers`/`max_raw_*`/`shape_sensitive_mask` fields `lbl_call` already touches.
+Behind a pointer they became a second, distant heap object -- an extra line per call on exactly the
+functions that call most. Reverted.
+
+**The methodological point outlives the change.** Instruction count is the gate for nearly everything
+in this document because it repeats to 0.03% where cycles do not, and that gate is *blind to
+locality*. A struct-layout change moves bytes, not instructions. Anything that alters what shares a
+cache line -- field reordering, splitting hot from cold, boxing a table behind a pointer -- has to be
+judged on cycles, and instructions will cheerfully report it as free.
 
 `OP_RAW_ADD_REAL_BOXED` is 13.6% of `mandelbrot`'s dispatches -- `cx` and `cy` staying boxed across
 518,400 calls -- so binding a shape-less function's numeric parameters as raw locals keeps looking
