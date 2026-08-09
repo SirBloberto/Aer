@@ -1922,8 +1922,15 @@ The hoist barely moved them, so the result is stable. The two candidates tie on 
 entirely in shape: `pc` buys a bigger `mandelbrot` but regresses `struct_array_scan` +2.11%, while
 `raw_reals` wins four benchmarks including three compute-heavy ones and spends its cost on the
 hashing/allocation side. Neither is free -- both reserve a register program-wide, and both regress
-`sieve`. This is a values question (concentrated compute wins against broad small regressions), not
-a measurement question, and it is recorded here rather than banked so the trade stays visible.
+`sieve`.
+
+**Both declined.** A -0.5% mean is thin payment for a permanent program-wide reservation, and the
+same precedent that reverted PGO, SSO twice and `OP_MOD_POW2_INT` applies to a trade this shaped.
+The stronger reason is that pinning treats the symptom: the allocator spills `raw_reals` because the
+live set exceeds the register file, and 5.16ya has since shown that *shrinking the live set* helps
+broadly where reserving a register helps narrowly and costs everywhere. Reserving a register now
+would also make the next live-set reduction harder to evaluate, since it would be measured against
+an artificially constrained allocator. Revisit only if a live-set reduction stops being available.
 
 **On x86-64 the whole question is moot**, and for two independent reasons. `r8` there is a *volatile*
 argument register under both Win64 and System V -- clobbered by every libc call -- so the ARM
@@ -2095,6 +2102,50 @@ relocatable and so allow the exact-size preheader 5.16x wants, but that is worth
 one benchmark, against +0.87% and +0.53% here. A smaller jump encoding remains a real future prize,
 since deltas are small enough to pack into word0 -- but that is a *different* change, and it must be
 justified by the packing, not by the addressing.
+
+### 5.16ya The same change, landed: relative jumps paired with a pointer-valued error PC
+
+5.16y's post-mortem named the defect precisely enough to fix it. Relative jumps added liveness --
+`pc += delta` is a read-modify-write where `pc = code + target` was a pure write -- without removing
+a value, because `SYNC_IP` still needed `code` for `vm->ip = pc - code` at 21 sites. Removing an
+instruction from a hot path is not the same as removing a value from the live set.
+
+So remove the value. `SYNC_IP` now stores a pointer, `VM.error_pc`, read only by `lookup_runtime_line`
+-- a cold path that can afford `vm->chunk->code` itself. `vm->ip` stays an offset and is written at
+only the four yield sites, because an offset is what *survives*: a yield resumes after the caller may
+have reparsed (the REPL does exactly this), and a stored pointer would dangle across the chunk growth
+that follows. The durable representation and the hot-path representation want to be different things,
+which is why one field could not serve both.
+
+With both halves, `code` drops from ~312 references to ~10, all cold:
+
+| build | `vm_run_slice` instructions | `ldr [sp]` sites |
+|---|---|---|
+| before | 13453 | 972 |
+| relative jumps alone (5.16y) | 13483 | 1064 |
+| **both together** | **13070** | **922** |
+
+The identical jump change that regressed six benchmarks now improves eight of eleven:
+
+| benchmark | delta | | benchmark | delta |
+|---|---|---|---|---|
+| `struct_array_scan` | **-1.21%** | | `small_dict_bench` | -0.61% |
+| `sieve` | **-1.05%** | | `dict_bench` | -0.10% |
+| `binary_trees` | **-0.96%** | | `mandelbrot` | -0.06% |
+| `log_processing` | -0.82% | | `fib_bench` | **+0.44%** |
+| `nbody` | -0.63% | | rest | ±0.00% |
+
+`fib_bench` is the lone regression and the exception proves the rule: its calls take the absolute
+path (`callee_offset`, `return_ip`), so it pays the allocation reshuffle without collecting the
+branch benefit.
+
+**A failed follow-up, recorded because the reasoning was wrong rather than the idea.** Five stack
+slots hold 70% of the remaining 922 reloads. `gdb`'s `info scope` reports `max_instructions is a
+variable in $r1`, which looked like a whole register held for four back-edge checks that never fire;
+folding it into the budget with a `UINT_MAX` sentinel measured 922 -> 926 and freed nothing. The
+premise was a misreading: that is a DWARF *location* for a parameter live only near entry, and the
+other locals read "optimized out" because they have location *lists*, not because they are absent.
+Going below 922 needs those lists decoded properly, not inferred from a summary line.
 
 ### 5.16z Numeric specialization, third look: declined on arithmetic rather than measurement
 
