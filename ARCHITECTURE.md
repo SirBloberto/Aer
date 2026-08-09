@@ -2198,10 +2198,15 @@ made it findable: the field's own comment justified its position in the struct (
 call and return") as if that were a reason to keep it fast, when it was a reason to ask why it
 existed.
 
-**What is left.** The call path still writes eleven `CallFrame` fields per call, three of which
-(`code_offset`, `tail_calls_collapsed`, `synthetic_entry`) serve only stack traces and tail-call
-accounting. And `vm` itself is the hottest spill in the interpreter (stack slot 44, 270 reload
-sites).
+**The three cold fields are not worth chasing.** `code_offset`, `tail_calls_collapsed` and
+`synthetic_entry` serve only stack traces and tail-call accounting, and two of them are zeroed on
+every ordinary push -- so making them an aligned, same-width, adjacent pair should let one `strd`
+replace two stores. Tried: GCC emitted no `strd` at all (checked by disassembling `lbl_call`), and
+the measurement agreed at -0.01% / +0.00%. Reverted, since it also cost a `bool` its honest type.
+The eleven frame writes compile to eleven separate `str.w`; coalescing them is not something the
+source can ask for from here.
+
+`vm` itself remains the hottest spill in the interpreter (stack slot 44, 270 reload sites).
 
 The structural item beyond those is the argument copy. AER gives the callee a fresh window
 (`callee->registers = caller->registers + caller->frame_size`) and copies arguments into it; Lua
