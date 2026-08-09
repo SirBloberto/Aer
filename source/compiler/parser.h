@@ -16,6 +16,9 @@ void reg_free(int count);
 /* Emits with a 0 placeholder target and returns its offset for patch_jump. */
 unsigned int emit_jump_if_false_reg(Chunk* c, int reg);
 void patch_jump(Chunk* c, unsigned int patch_offset, unsigned int target);
+/* Absolute counterpart of patch_jump, for a call's callee_offset -- see parser.c. */
+void patch_call_target(Chunk* c, unsigned int patch_offset, unsigned int target);
+void emit_jump_target(Chunk* c, unsigned int target);
 
 /* callee_offset must be known at the call site (no patch step) -- lay out the callee first. */
 unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count,

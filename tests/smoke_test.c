@@ -231,7 +231,7 @@ int main(void) {
         /* i = i + 1 — writes directly into register 1, no new allocation. */
         chunk_emit(&c, PACK3(OP_ADD, 1, pack_rk8(1), pack_rk8((int)pool_one | RK_CONST_FLAG)));
 
-        chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
+        chunk_emit(&c, OP_JUMP); emit_jump_target(&c, loop_start);
 
         patch_jump(&c, exit_patch, c.count);
         chunk_emit(&c, OP_HALT);
@@ -457,7 +457,7 @@ int main(void) {
         /* i = i + 1 */
         chunk_emit(&c, PACK3(OP_ADD, 4, pack_rk8(4), pack_rk8((int)pool_one | RK_CONST_FLAG)));
 
-        chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
+        chunk_emit(&c, OP_JUMP); emit_jump_target(&c, loop_start);
         patch_jump(&c, exit_patch, c.count);
 
         /* After 200 throwaway allocations, read reg 3's surviving array back out, then mutate and
@@ -577,7 +577,7 @@ int main(void) {
         /* sum = sum + item */
         chunk_emit(&c, PACK3(OP_ADD, 5, pack_rk8(5), pack_rk8(6)));
 
-        chunk_emit(&c, OP_JUMP); chunk_emit(&c, (int)loop_start);
+        chunk_emit(&c, OP_JUMP); emit_jump_target(&c, loop_start);
         patch_jump(&c, exit_patch, c.count);
         chunk_emit(&c, OP_HALT);
 

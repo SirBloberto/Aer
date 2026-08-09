@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "vm.h"
-#include "parser.h"   /* patch_jump */
+#include "parser.h"   /* patch_jump, patch_call_target */
 
 static int failures = 0;
 
@@ -92,8 +92,12 @@ int main(void) {
         unsigned int patch_offset = c.count;
         chunk_emit(&c, 0);
         check(c.count - patch_offset == 1, "JUMP_TARGET: reserves exactly 1 word");
-        patch_jump(&c, patch_offset, 4000000000U);   /* beyond INT32_MAX, well within uint32 */
-        check(c.code[patch_offset] == 4000000000U, "JUMP_TARGET: patch_jump's blind overwrite round-trips a large word value");
+        patch_jump(&c, patch_offset, 2000000000U);
+        check((int)(patch_offset + 1) + (int)(int32_t)c.code[patch_offset] == 2000000000,
+              "JUMP_TARGET: a far forward delta resolves back to its target");
+        patch_jump(&c, patch_offset, 0);
+        check((int)(patch_offset + 1) + (int)(int32_t)c.code[patch_offset] == 0,
+              "JUMP_TARGET: a backward delta sign-extends and resolves back to its target");
         chunk_free(&c);
     }
 
@@ -171,8 +175,8 @@ int main(void) {
         unsigned int patch_offset = c.count;
         chunk_emit(&c, 0);
         check(c.count - patch_offset == 1, "OP_CALL: callee_offset reserves exactly 1 word");
-        patch_jump(&c, patch_offset, 4000000000U);
-        check(c.code[patch_offset] == 4000000000U, "OP_CALL: patch_jump's blind overwrite round-trips a large word offset");
+        patch_call_target(&c, patch_offset, 4000000000U);
+        check(c.code[patch_offset] == 4000000000U, "OP_CALL: patch_call_target stores an absolute offset verbatim");
         check(c.code[patch_offset - 1] & 0xFF, "OP_CALL: opcode byte sits exactly 1 word before callee_offset, as emit_call/the OP_HALT forward-ref-failure patch site rely on");
         chunk_free(&c);
     }

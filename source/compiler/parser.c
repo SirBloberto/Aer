@@ -440,8 +440,22 @@ unsigned int emit_jump_if_false_reg(Chunk* c, int reg) {
     return patch_offset;
 }
 
+/* Control-flow targets are a signed delta from the word AFTER the operand -- exactly where pc sits
+   once the VM has READ() it -- so a branch is `pc += delta` and never rebuilds `code`. Every
+   jump-like operand in the instruction set is the last word read before its branch, which is what
+   lets one base serve them all. */
 void patch_jump(Chunk* c, unsigned int patch_offset, unsigned int target) {
+    c->code[patch_offset] = (uint32_t)(int32_t)((int64_t)target - (int64_t)patch_offset - 1);
+}
+
+/* A call's callee_offset is an absolute function entry, not intra-function control flow. */
+void patch_call_target(Chunk* c, unsigned int patch_offset, unsigned int target) {
     c->code[patch_offset] = (uint32_t)target;
+}
+
+/* Emits an already-known jump target in the same encoding patch_jump writes. */
+void emit_jump_target(Chunk* c, unsigned int target) {
+    chunk_emit(c, (uint32_t)(int32_t)((int64_t)target - (int64_t)c->count - 1));
 }
 
 /* Returns the callee_offset word's offset for a forward-referencing call to patch later
@@ -586,7 +600,7 @@ void emit_iter_range_loop(Chunk* c, int cur_reg, int end_reg, int step_reg, int 
                           unsigned int body_target) {
     chunk_emit(c, PACK3(OP_ITER_RANGE_LOOP, cur_reg, end_reg, step_reg));
     chunk_emit(c, (uint32_t)item_dest_reg);
-    chunk_emit(c, (uint32_t)body_target);
+    emit_jump_target(c, body_target);
 }
 
 void emit_struct_new(Chunk* c, int dest_reg, unsigned int type_name_pool_idx, int arg_reg_base,
@@ -941,7 +955,7 @@ static void hoist_end(Chunk* c, unsigned int after_gap, bool active) {
     }
     if (w < h->gap_offset + HOIST_GAP_WORDS) {
         c->code[w++] = OP_JUMP;
-        c->code[w] = after_gap;
+        c->code[w] = (uint32_t)(int32_t)((int64_t)after_gap - (int64_t)w - 1);
     }
 }
 
@@ -1353,7 +1367,7 @@ static void func_register(Chunk* c, unsigned int name_idx, unsigned int offset, 
        code offset. */
     for (int i = 0; i < P.pending_count;) {
         if (P.pending_calls[i].name_idx == name_idx) {
-            patch_jump(c, P.pending_calls[i].patch_offset, offset);
+            patch_call_target(c, P.pending_calls[i].patch_offset, offset);
             c->code[P.pending_calls[i].patch_offset + 1] = new_func_index;
             P.pending_calls[i] = P.pending_calls[--P.pending_count];
         } else {
@@ -3587,7 +3601,7 @@ static void parse_loop_body(Chunk* c, unsigned int loop_top, unsigned int patch_
     }
 
     chunk_emit(c, OP_JUMP);
-    chunk_emit(c, (int)loop_top);
+    emit_jump_target(c, loop_top);
     patch_jump(c, patch_exit, c->count);
     loop_pop_and_patch(c, c->count);
 }
@@ -4932,7 +4946,7 @@ static void parse_continue(Chunk* c) {
             c,
             0); /* placeholder -- patched by loop_pop_and_patch_rotated once OP_ITER_RANGE_LOOP's own position is known */
     } else {
-        chunk_emit(c, (int)ctx->top); /* known at compile time -- no patch needed */
+        emit_jump_target(c, ctx->top); /* known at compile time -- no patch needed */
     }
 }
 

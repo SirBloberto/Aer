@@ -250,8 +250,13 @@ void vm_set_active_error_vm(VM* vm) {
 }
 
 static unsigned int lookup_runtime_line(void) {
-    if (!active_vm_for_errors) return 0;
-    return chunk_line_for_offset(active_vm_for_errors->chunk, active_vm_for_errors->ip);
+    VM* vm = active_vm_for_errors;
+    if (!vm) return 0;
+    /* error_pc is only ever set while that same chunk is executing, so resolving it here is safe --
+       and this path is cold, so reloading chunk->code costs nothing. Falls back to ip for a VM that
+       has not entered vm_run_slice yet. */
+    if (!vm->error_pc || !vm->chunk) return chunk_line_for_offset(vm->chunk, vm->ip);
+    return chunk_line_for_offset(vm->chunk, (unsigned int)(vm->error_pc - vm->chunk->code));
 }
 
 static const char* lookup_runtime_filename(void) {
@@ -2583,7 +2588,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
    is not re-expanded inside its own expansion, so the parenthesised name calls the real function.
    Anything absent here must be unable to raise -- adding a raise to one of those is a silent
    wrong-line bug, which tests/error_lines.py exists to catch. All #undef'd after lbl_halt. */
-#define SYNC_IP() ((void)(vm->ip = (unsigned int)(pc - code)))
+#define SYNC_IP() ((void)(vm->error_pc = pc))
 #define error(...) (SYNC_IP(), (error)(__VA_ARGS__))
 #define vm_binary_cold(...) (SYNC_IP(), (vm_binary_cold)(__VA_ARGS__))
 #define vm_index_get_compute(...) (SYNC_IP(), (vm_index_get_compute)(__VA_ARGS__))
@@ -2801,7 +2806,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
 
 lbl_jump : {
     int target = READ();
-    pc = code + target;
+    pc += (int32_t)target;
     /* Every loop's back-edge (while/for/plain jump alike) goes through here -- the one checkpoint
        that bounds an AER-level loop's slice length. pc already points at a complete instruction
        (this jump's own operand is fully consumed), so yielding here is always resumable. */
@@ -3011,7 +3016,7 @@ lbl_is_result : {
         } else {                                                                                             \
             cond = vm_truthy(vm_binary_cold(c, *ra, *rb, OPENUM, ta, tb));                                   \
         }                                                                                                    \
-        if (!cond) pc = code + target;                                                                       \
+        if (!cond) pc += (int32_t)target;                                                                    \
         DISPATCH();                                                                                          \
     }
 
@@ -3036,7 +3041,7 @@ lbl_in : {
 lbl_jump_if_false_reg : {
     int reg = (int)UNPACK_A(op_word);
     int target = READ();
-    if (!vm_truthy(registers[reg])) pc = code + target;
+    if (!vm_truthy(registers[reg])) pc += (int32_t)target;
     DISPATCH();
 }
 
@@ -3438,7 +3443,7 @@ lbl_iter_next_array : {
         /* Single-variable `for k in dict:` yields keys. */
         AerVal key;
         if (!vm_dict_next_key(aer_as_dict(col), &idx, &key)) {
-            pc = code + end_target;
+            pc += (int32_t)end_target;
             DISPATCH();
         }
         registers[item_dest_reg] = key;
@@ -3450,7 +3455,7 @@ lbl_iter_next_array : {
         /* Yields one-character strings, same shape as dict-key iteration. */
         AerString* cs = aer_as_string(col);
         if ((uint64_t)idx >= cs->length) {
-            pc = code + end_target;
+            pc += (int32_t)end_target;
             DISPATCH();
         }
         registers[item_dest_reg] = aer_make_string_copy(
@@ -3465,7 +3470,7 @@ lbl_iter_next_array : {
            iteration works exactly like an ordinary array's. */
         AerTypedArray* ta = aer_as_typed_array(col);
         if ((uint64_t)idx >= ta->count) {
-            pc = code + end_target;
+            pc += (int32_t)end_target;
             DISPATCH();
         }
         unsigned int width = vm_typed_elem_width(ta->elem_kind);
@@ -3479,7 +3484,7 @@ lbl_iter_next_array : {
     }
     AerArray* a = aer_as_array(col);
     if ((uint64_t)idx >= a->count) {
-        pc = code + end_target;
+        pc += (int32_t)end_target;
         DISPATCH();
     }
     registers[item_dest_reg] = a->items[idx];
@@ -3497,14 +3502,14 @@ lbl_iter_next_pair : {
     AerVal col = registers[col_reg];
     if (aer_type(col) != TYPE_DICT) {
         error("for k, v requires a hashtable");
-        pc = code + end_target;
+        pc += (int32_t)end_target;
         DISPATCH();
     }
     AerDict* d = aer_as_dict(col);
     int64_t idx = aer_as_int(registers[idx_reg]);
     AerVal key;
     if (!vm_dict_next_key(d, &idx, &key)) {
-        pc = code + end_target;
+        pc += (int32_t)end_target;
         DISPATCH();
     }
     registers[key_dest_reg] = key;
@@ -3529,14 +3534,14 @@ lbl_iter_range_prep : {
     if (aer_type(cur_v) != TYPE_INTEGER || aer_type(end_v) != TYPE_INTEGER ||
         aer_type(step_v) != TYPE_INTEGER) {
         error("Range bounds and step must be integers");
-        pc = code + empty_target;
+        pc += (int32_t)empty_target;
         DISPATCH();
     }
     int64_t cur = aer_as_int(cur_v), rng_end = aer_as_int(end_v), step = aer_as_int(step_v);
     if (step <= 0) {
         error("Range step must be a positive integer (direction is inferred from the bounds, not the step's "
               "sign)");
-        pc = code + empty_target;
+        pc += (int32_t)empty_target;
         DISPATCH();
     }
     /* The body indexes unchecked on a proof that every value lands in [0, length), which holds only
@@ -3554,7 +3559,7 @@ lbl_iter_range_prep : {
             error("Range start %lld is past its end %lld, so this loop would count downwards out of "
                   "the collection it indexes",
                   (long long)cur, (long long)rng_end);
-        pc = code + empty_target;
+        pc += (int32_t)empty_target;
         DISPATCH();
     }
     /* Precomputes the iteration count once (ceiling division, matching Lua's FORLOOP) instead of
@@ -3565,7 +3570,7 @@ lbl_iter_range_prep : {
        and short re-entered loops pay that cost often enough for it to be a real win. */
     int64_t count = (step == 1) ? diff : (diff + step - 1) / step;
     if (count == 0) {
-        pc = code + empty_target;
+        pc += (int32_t)empty_target;
         DISPATCH();
     }
     /* end_reg/step_reg repurposed for this loop's life -- arg_materialize's snapshot guarantees
@@ -3599,7 +3604,7 @@ lbl_iter_range_loop : {
     /* Equal when the parser proved this loop's body never writes the loop variable, so cur_reg IS
        item_dest_reg and the store above already published this iteration's value. */
     if (cur_reg != item_dest_reg) registers[item_dest_reg] = aer_int(new_cur);
-    pc = code + body_target;
+    pc += (int32_t)body_target;
     /* range-for's own dedicated back-edge -- lbl_jump's check doesn't cover this loop shape since
        it never goes through a plain OP_JUMP. */
     if (max_instructions && --slice_budget == 0) {
@@ -5183,7 +5188,7 @@ lbl_raw_gte_real_boxed : {
             error("Cannot apply '" opstr "' to integer and %s", vm_type_name(c, *rhs));                      \
             cond = false;                                                                                    \
         }                                                                                                    \
-        if (!cond) pc = code + target;                                                                       \
+        if (!cond) pc += (int32_t)target;                                                                    \
         DISPATCH();                                                                                          \
     }
 
@@ -5211,7 +5216,7 @@ lbl_raw_gte_real_boxed : {
             error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs));                        \
             cond = false;                                                                                    \
         }                                                                                                    \
-        if (!cond) pc = code + target;                                                                       \
+        if (!cond) pc += (int32_t)target;                                                                    \
         DISPATCH();                                                                                          \
     }
 

@@ -10,7 +10,7 @@ typedef enum {
     FLD_END, /* marks the end of an opcode's operand list */
     FLD_POOL, /* pool index -- resolve and print the constant's own value */
     FLD_NAME, /* pool index known to be a TYPE_STRING name -- print just the string, no quotes */
-    FLD_JUMP, /* absolute code offset this instruction may jump to */
+    FLD_JUMP, /* signed delta to the branch target, from the word after this operand */
     FLD_COUNT, /* a raw integer (arg count, item count, arity...) */
     FLD_BINOP, /* an Opcode value used as an operand (bin_op in a fused op) */
     FLD_CAST, /* CAST_INTEGER/CAST_FLOAT/CAST_BOOLEAN */
@@ -467,6 +467,12 @@ static const char* opcode_name(int op) {
     return (op >= 0 && op <= OP_INFO_MAX && op_info[op].name) ? op_info[op].name : "?";
 }
 
+/* Jump operands are stored relative (patch_jump, parser.c); print where they land, since a raw
+   delta is unreadable beside the absolute offsets in the left-hand column. */
+static void print_jump(FILE* out, uint32_t delta, unsigned int base) {
+    fprintf(out, "  -> %d", (int)base + (int)(int32_t)delta);
+}
+
 /* Prints one already-extracted field value -- the caller has already pulled it out of whichever
    word/sub-field it lives in. */
 static void print_field(FILE* out, Chunk* c, Field kind, int word) {
@@ -615,17 +621,17 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
                op == OP_GT_JUMP_IF_FALSE || op == OP_LTE_JUMP_IF_FALSE || op == OP_GTE_JUMP_IF_FALSE) {
         print_rk8(out, c, UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
-        print_field(out, c, FLD_JUMP, (int)c->code[pos++]);
+        print_jump(out, c->code[pos], pos + 1), pos++;
     } else if (op == OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE || op == OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE ||
                op == OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE || op == OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE) {
         print_rawi(out, (int)UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
-        print_field(out, c, FLD_JUMP, (int)c->code[pos++]);
+        print_jump(out, c->code[pos], pos + 1), pos++;
     } else if (op == OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE || op == OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE ||
                op == OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE || op == OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE) {
         print_rawr(out, (int)UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
-        print_field(out, c, FLD_JUMP, (int)c->code[pos++]);
+        print_jump(out, c->code[pos], pos + 1), pos++;
     } else if (op == OP_INDEX_GET || op == OP_TYPED_INDEX_GET_UNCHECKED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
@@ -737,8 +743,8 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
-        int target = (int)c->code[pos++];
-        print_field(out, c, FLD_JUMP, target);
+        print_jump(out, c->code[pos], pos + 1);
+        pos++;
     } else if (op == OP_ITER_NEXT_PAIR || op == OP_ITER_RANGE_PREP || op == OP_ITER_RANGE_LOOP) {
         /* 3 regs in word0, a 4th register its own trailing word, then a dedicated target word. */
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
@@ -746,8 +752,8 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
         int fourth_reg = (int)c->code[pos++];
         print_field(out, c, FLD_REG, fourth_reg);
-        int target = (int)c->code[pos++];
-        print_field(out, c, FLD_JUMP, target);
+        print_jump(out, c->code[pos], pos + 1);
+        pos++;
     } else if (op == OP_CALL_VALUE || op == OP_TAIL_CALL_VALUE) {
         /* callee_reg is never a patched target, so nothing else trails. */
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
@@ -933,7 +939,10 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         }
         for (; i < MAX_FIELDS && info->fields[i] != FLD_END; i++) {
             int word = (int)c->code[pos++];
-            print_field(out, c, info->fields[i], word);
+            if (info->fields[i] == FLD_JUMP)
+                print_jump(out, (uint32_t)word, pos);
+            else
+                print_field(out, c, info->fields[i], word);
         }
     }
 

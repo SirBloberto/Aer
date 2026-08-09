@@ -975,6 +975,12 @@ typedef struct {
 
     Chunk* chunk;
     unsigned int ip;
+    /* Where the currently-executing instruction is, for runtime error line lookup ONLY. A pointer
+       rather than an offset because vm_run_slice writes it at every site that can raise, and an
+       offset would force `code` to stay live across all of them just to do the subtraction. `ip`
+       stays the offset: it is what SURVIVES, across a yield/resume and across the reparse a REPL
+       line performs in between, which would leave any stored pointer dangling. */
+    const uint32_t* error_pc;
 
     /* This VM's own heap -- every pool it allocates from, independent of every other VM's. */
     VmHeap heap;
