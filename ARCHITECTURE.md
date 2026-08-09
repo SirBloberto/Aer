@@ -1870,6 +1870,90 @@ benefits or not.
 `r8` earned its keep because dispatch touches it on every opcode and nothing else in the program
 wanted it that badly. Nothing else clears that bar. **Pinning is closed at one register.**
 
+The obvious follow-up — if only one register is worth reserving, is the dispatch base the right
+thing to put in it? — was measured the same way, each variant reserving exactly one register with
+the dispatch pin removed:
+
+| occupant of r8 | nbody | sieve | mandel | fib | dict | log | struct_scan | mean |
+|---|---|---|---|---|---|---|---|---|
+| dispatch base (current) | — | — | — | — | — | — | — | **0.00%** |
+| `raw_reals` | -0.42% | +5.41% | +0.34% | +0.21% | +0.35% | +0.57% | +0.14% | **+0.94%** |
+| nothing pinned at all | +1.36% | +5.09% | +3.99% | +1.08% | -0.65% | +0.13% | +1.03% | **+1.72%** |
+| `raw_ints` | +1.98% | +5.33% | +2.75% | +1.08% | -0.13% | +0.31% | +1.47% | **+1.83%** |
+| `code` | +2.01% | +4.56% | +4.32% | +1.94% | +0.69% | +0.83% | +2.29% | **+2.38%** |
+| `const_pool` | +3.43% | +5.81% | +4.27% | +1.95% | +0.42% | +0.90% | +1.85% | **+2.66%** |
+| `registers` | +4.64% | +7.30% | +10.09% | +1.73% | +1.22% | +1.12% | +3.48% | **+4.23%** |
+
+Four of the six alternatives are worse than reserving nothing at all, which is the whole finding in
+one line: a program-wide reservation only repays its cost if the value occupying it is touched on
+literally every dispatch. Anything touched merely *often* loses, because the reservation is charged
+against every function in the program while the benefit accrues to one loop.
+
+`registers` is the sharpest illustration. It is LuaJIT's `BASE`, it is the single most-referenced
+value in `vm_run_slice`, and as a *replacement* for the dispatch base it is the worst option
+measured. The table above it shows the same value as an *addition* to r8 costing +0.14%. Both are
+true: the base pin is worth roughly nothing either way, and the dispatch pin is worth 1.72%, so
+trading one for the other loses the difference.
+
+### 5.16w Loop-invariant raw constants are worth hoisting; the dead copies are not
+
+`mandelbrot`'s inner loop spends 4 of its 14 dispatches on work that does nothing:
+
+```
+26  RAW_LOAD_REAL  r4 = 2.0        <- reloaded every iteration, 24.9M times
+28  RAW_MUL_REAL   r4 = r4 * r0
+33  RAW_MOVE_REAL  r1 = r4         <- y = y_new
+34  RAW_MOVE_REAL  r0 = r5         <- x = x_new
+35  RAW_LOAD_INT   r1 = 1          <- reloaded every iteration, 24.9M times
+37  RAW_ADD_INT    r0 = r0 + r1
+```
+
+These are two separable problems and the evidence separates them cleanly. Dispatch shares:
+
+| benchmark | constant loads | dead copies |
+|---|---|---|
+| `typed_elementwise` | 16.41% | 0.00% |
+| `dict_bench` | 13.33% | 0.00% |
+| `mandelbrot` | 12.85% | 12.32% |
+| `small_dict_bench` | 10.00% | 0.00% |
+| `log_processing` | 7.84% | 0.00% |
+| `struct_array_scan`, `sieve` | ~1% | 0.00% |
+| `lookup_table`, `fib`, `nbody`, `binary_trees` | 0.00% | 0.00% |
+
+**The dead copies are mandelbrot-only** — 12.32% there and exactly zero everywhere else. They come
+from a source-level `y = y_new; x = x_new` swap the programmer wrote, and eliminating them needs
+real liveness analysis to prove the producing instruction can target the destination directly.
+Narrow benefit, the harder half of the work, and the half where a wrong answer miscompiles
+silently. Not worth it.
+
+**The constant loads are general** — five benchmarks between 7.8% and 16.4%, including the three
+most realistic workloads in the suite. The pattern is one shape, and it is the same shape in every
+case: a literal used inside a loop is re-materialised into a scratch raw slot on every iteration,
+because the slot is clobbered by the instruction that consumes it. `dict_bench` is `i = i + 1`:
+
+```
+16  RAW_LOAD_INT  rawi1 = 1              [800,000 hits]
+18  RAW_ADD_INT   rawi0 = rawi0 + rawi1  [800,000 hits]
+19  JUMP -> 8                            [800,000 hits]
+```
+
+It survives in exactly the loops range-for does not cover. Every benchmark at 0.00% uses range-for,
+where the increment lives inside `OP_ITER_RANGE_LOOP` and no separate load is emitted at all; every
+benchmark above 7% has a manual `for cond:` loop. So the pattern looks rare only if the sample
+happens to be range-for-shaped — a static count over all 83 `.aer` files in the repo finds it in 47
+of them.
+
+Two routes were weighed. Immediate-operand opcodes (`OP_RAW_ADD_INT_K` and friends) fold the
+constant into the arithmetic instruction and need no analysis at all, but spend opcode surface,
+which 5.16d measured as a real branch-misprediction tax on every program whether it uses them or
+not — the same trade `OP_MOD_POW2_INT` was reverted for. A post-emit hoist costs no dispatch
+surface but makes the parser decode instructions it did not just emit, which means a fourth source
+of truth about instruction encoding alongside `emit_*`, the VM labels, and `disasm.c`. The first
+three disagree loudly; a parser that disagrees miscompiles quietly. That risk is containable by
+restricting the pass to the raw-slot opcode family and bailing out of any loop containing an opcode
+outside it, with a generated coverage check so a newly added opcode cannot silently fall outside
+the table.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
