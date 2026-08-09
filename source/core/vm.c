@@ -2474,6 +2474,20 @@ static bool opcode_is_tag_only(Opcode op) {
     }
 }
 
+/* Dispatch reads the table's base on every opcode, and under PIC that base is not a link-time
+   constant -- GCC rebuilds it from `pc` (an `ldr [pc]` plus an `add pc`) on every single dispatch,
+   because 5.16q's register pressure leaves nothing to cache it in. Pinning it costs one register
+   and removes both instructions from what is ~37% of all executed instructions. r8 is callee-saved
+   under AAPCS, so libc and any translation unit that cannot see this declaration preserve it for
+   us, and longjmp restores it with the other callee-saved registers. */
+#if defined(__arm__) && defined(__GNUC__) && !defined(__clang__)
+#define AER_PINNED_DISPATCH 1
+register const void* const* aer_dispatch_base asm("r8");
+#define DT_AT(op) (aer_dispatch_base[(op)])
+#else
+#define DT_AT(op) (dt[(op)])
+#endif
+
 VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     Chunk* c = vm->chunk;
     /* Hoisted once -- c->pool is only mutated at parse time, stable for the whole call. */
@@ -2560,7 +2574,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         op_word = READ();                                                                                    \
         cur_op = (Opcode)(op_word & 0xFF);                                                                   \
         c->debug_hits[op_ip]++;                                                                              \
-        goto* dt[cur_op];                                                                                    \
+        goto* DT_AT(cur_op);                                                                                    \
     } while (0)
 #else
 /* Full 8-bit mask -- opcode is unambiguously its own byte now (OP_OPCODE_COUNT_MARKER's static
@@ -2569,7 +2583,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     do {                                                                                                     \
         op_word = READ();                                                                                    \
         cur_op = (Opcode)(op_word & 0xFF);                                                                   \
-        goto* dt[cur_op];                                                                                    \
+        goto* DT_AT(cur_op);                                                                                    \
     } while (0)
 #endif
 
@@ -2771,6 +2785,9 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INTERP] = &&lbl_interp,
         [OP_INDEX_GET_INTERP] = &&lbl_index_get_interp,
     };
+#ifdef AER_PINNED_DISPATCH
+    aer_dispatch_base = dt;
+#endif
 
     /* A designated-initializer table leaves an opcode with no entry as NULL, so emitting one jumps
        through a null pointer instead of failing near the mistake -- OP_BINARY sat in the enum in
