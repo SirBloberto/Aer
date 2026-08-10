@@ -2401,6 +2401,68 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
     }
 }
 
+/* A numeric-only function has no shape to key on, so the whole decision is whether every argument
+   arrived with the types the variant was compiled for -- read straight from the argument registers,
+   needing neither the site cache nor the shape table. specializations[0] holds it; shape stays NULL
+   because nothing ever looks this entry up by shape. */
+static void __attribute__((noinline))
+vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
+                        unsigned int* chosen_offset, unsigned int* chosen_max_registers,
+                        unsigned int* chosen_max_raw_ints, unsigned int* chosen_max_raw_reals) {
+    int cand_regs[SPEC_MAX_RAW_PARAMS];
+    ValueType cand_types[SPEC_MAX_RAW_PARAMS];
+    int cand_count = 0;
+    for (unsigned int pi = 0; pi < target_f->arity && cand_count < SPEC_MAX_RAW_PARAMS; pi++) {
+        ValueType pt = aer_type(registers[arg_reg_base + pi]);
+        if (pt != TYPE_INTEGER && pt != TYPE_REAL) return;
+        cand_regs[cand_count] = (int)pi;
+        cand_types[cand_count] = pt;
+        cand_count++;
+    }
+    if (cand_count == 0) return;
+
+    if (!target_f->specializations) target_f->specializations = xcalloc(SPEC_MAX, sizeof(SpecEntry));
+    SpecEntry* entry = &target_f->specializations[0];
+    if (entry->raw_param_count < 0) return; /* permanently declined for this function */
+
+    if (entry->raw_param_count == cand_count) {
+        for (int k = 0; k < cand_count; k++)
+            if (entry->raw_param_regs[k] != cand_regs[k] || entry->raw_param_types[k] != cand_types[k])
+                return; /* a different numeric signature than the one compiled -- stay boxed */
+        *chosen_offset = entry->raw_variant_code_offset;
+        *chosen_max_registers = entry->raw_variant_max_registers;
+        *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
+        *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
+        return;
+    }
+    if (entry->raw_param_count != 0) return;
+
+    SpecEntry variant;
+    if (!parser_specialize_function(c, target_f, NULL, SPEC_KIND_STRUCT, -1, &variant, cand_regs,
+                                    cand_types, cand_count)) {
+        entry->raw_param_count = -1;
+        return;
+    }
+#ifdef AER_DEBUG_TOOLS
+    chunk_ensure_debug_hits(c);
+#endif
+    chunk_ensure_field_cache(c);
+    chunk_ensure_call_spec_cache(c);
+    entry->raw_variant_code_offset = variant.code_offset;
+    entry->raw_variant_max_registers = variant.max_registers;
+    entry->raw_variant_max_raw_ints = variant.max_raw_ints;
+    entry->raw_variant_max_raw_reals = variant.max_raw_reals;
+    for (int k = 0; k < cand_count; k++) {
+        entry->raw_param_regs[k] = cand_regs[k];
+        entry->raw_param_types[k] = cand_types[k];
+    }
+    entry->raw_param_count = cand_count;
+    *chosen_offset = entry->raw_variant_code_offset;
+    *chosen_max_registers = entry->raw_variant_max_registers;
+    *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
+    *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
+}
+
 /* The monomorphic case, split off so it does not pay for the full resolver's frame: that one is
    sized for the raw-variant block's candidate arrays and so also carries a stack-protector canary,
    both on every call regardless of which path runs. Split here rather than at the call site because
@@ -2411,6 +2473,11 @@ vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* regist
                                unsigned int ip, unsigned int* chosen_offset,
                                unsigned int* chosen_max_registers, unsigned int* chosen_max_raw_ints,
                                unsigned int* chosen_max_raw_reals) {
+    if (target_f->shape_sensitive_mask == SHAPE_MASK_NUMERIC_ONLY) {
+        vm_call_resolve_numeric(c, target_f, registers, arg_reg_base, chosen_offset, chosen_max_registers,
+                                chosen_max_raw_ints, chosen_max_raw_reals);
+        return;
+    }
     unsigned int site = ip - 3;
     /* arity 1 with a non-zero mask puts the shape-sensitive parameter at index 0, and leaves the
        raw-variant block inert (it skips that one parameter and there is no other), so a site-cache
@@ -4914,36 +4981,43 @@ lbl_raw_load_real : {
    extremely hot opcodes for a code-size win already confirmed not to matter (icache misses are
    16-140x rarer than dcache misses on every workload measured this session). #undef'd right after
    the last family that needs them. */
+/* A raw right-hand operand: the RK8 const flag picks the raw constant table instead of the slot
+   bank, so a literal needs neither an OP_RAW_LOAD nor a slot of its own. Only the right operand,
+   and only one predictable branch -- an operand's kind is fixed in the bytecode, so a given site
+   always takes the same side. Raw slot indices stop at 31 and can never collide with the flag. */
+#define RAW_I(x) (RK8_IS_CONST(x) ? rawk_i[RK8_INDEX(x)] : raw_ints[x])
+#define RAW_D(x) (RK8_IS_CONST(x) ? rawk_d[RK8_INDEX(x)] : raw_reals[x])
+
 #define RAW_ARITH_INT(name, op)                                                                              \
     lbl_raw_##name##_int : {                                                                                 \
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
-        int b = (int)UNPACK_C(op_word);                                                                      \
-        raw_ints[dest] = raw_ints[a] op raw_ints[b];                                                         \
+        unsigned int b = UNPACK_C(op_word);                                                                  \
+        raw_ints[dest] = raw_ints[a] op RAW_I(b);                                                            \
         DISPATCH();                                                                                          \
     }
 #define RAW_ARITH_REAL(name, op)                                                                             \
     lbl_raw_##name##_real : {                                                                                \
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
-        int b = (int)UNPACK_C(op_word);                                                                      \
-        raw_reals[dest] = raw_reals[a] op raw_reals[b];                                                      \
+        unsigned int b = UNPACK_C(op_word);                                                                  \
+        raw_reals[dest] = raw_reals[a] op RAW_D(b);                                                          \
         DISPATCH();                                                                                          \
     }
 #define RAW_CMP_INT(name, op)                                                                                \
     lbl_raw_##name##_int : {                                                                                 \
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
-        int b = (int)UNPACK_C(op_word);                                                                      \
-        registers[dest] = aer_bool(raw_ints[a] op raw_ints[b]);                                              \
+        unsigned int b = UNPACK_C(op_word);                                                                  \
+        registers[dest] = aer_bool(raw_ints[a] op RAW_I(b));                                                 \
         DISPATCH();                                                                                          \
     }
 #define RAW_CMP_REAL(name, op)                                                                               \
     lbl_raw_##name##_real : {                                                                                \
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
-        int b = (int)UNPACK_C(op_word);                                                                      \
-        registers[dest] = aer_bool(raw_reals[a] op raw_reals[b]);                                            \
+        unsigned int b = UNPACK_C(op_word);                                                                  \
+        registers[dest] = aer_bool(raw_reals[a] op RAW_D(b));                                                \
         DISPATCH();                                                                                          \
     }
 /* A runtime tag check decides: matching type accumulates in place (safe every iteration, the
@@ -5009,8 +5083,8 @@ lbl_raw_load_real : {
 lbl_raw_div_int : {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
-    int b = (int)UNPACK_C(op_word);
-    int64_t rv = raw_ints[b];
+    unsigned int b = UNPACK_C(op_word);
+    int64_t rv = RAW_I(b);
     if (rv == 0) {
         error("Division by zero");
         raw_reals[dest] = 0.0;
@@ -5022,8 +5096,8 @@ lbl_raw_div_int : {
 lbl_raw_mod_int : {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
-    int b = (int)UNPACK_C(op_word);
-    int64_t rv = raw_ints[b];
+    unsigned int b = UNPACK_C(op_word);
+    int64_t rv = RAW_I(b);
     if (rv == 0) {
         error("Modulo by zero");
         raw_ints[dest] = 0;
@@ -5035,8 +5109,8 @@ lbl_raw_mod_int : {
 lbl_raw_floor_div_int : {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
-    int b = (int)UNPACK_C(op_word);
-    int64_t rv = raw_ints[b];
+    unsigned int b = UNPACK_C(op_word);
+    int64_t rv = RAW_I(b);
     if (rv == 0) {
         error("Division by zero");
         raw_ints[dest] = 0;
@@ -5058,8 +5132,8 @@ lbl_raw_floor_div_int : {
     lbl_raw_##name##_real : {                                                                                \
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
-        int b = (int)UNPACK_C(op_word);                                                                      \
-        raw_reals[dest] = raw_reals[dest] op(raw_reals[a] * raw_reals[b]);                                   \
+        unsigned int b = UNPACK_C(op_word);                                                                  \
+        raw_reals[dest] = raw_reals[dest] op(raw_reals[a] * RAW_D(b));                                       \
         DISPATCH();                                                                                          \
     }
     RAW_FUSED_MULACC_REAL(fma, +)
@@ -5069,8 +5143,8 @@ lbl_raw_floor_div_int : {
 lbl_raw_div_real : {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
-    int b = (int)UNPACK_C(op_word);
-    double rv = raw_reals[b];
+    unsigned int b = UNPACK_C(op_word);
+    double rv = RAW_D(b);
     if (rv == 0.0) {
         error("Division by zero");
         raw_reals[dest] = 0.0;
@@ -5267,19 +5341,19 @@ lbl_raw_load_int_pool : {
 
 /* Both operands raw: no tag, no table, no error path -- the comparison is the two loads the
    hardware would do anyway. */
-#define RAW_CMP_JUMP_IF_FALSE(name, bank, op)                                                                \
+#define RAW_CMP_JUMP_IF_FALSE(name, bank, rhs, op)                                                           \
     lbl_raw_##name##_jump_if_false : {                                                                       \
         int a = (int)UNPACK_B(op_word);                                                                      \
-        int b = (int)UNPACK_C(op_word);                                                                      \
+        unsigned int b = UNPACK_C(op_word);                                                                  \
         int target = READ();                                                                                 \
-        if (!(bank[a] op bank[b])) pc += (int32_t)target;                                                     \
+        if (!(bank[a] op rhs(b))) pc += (int32_t)target;                                                     \
         DISPATCH();                                                                                          \
     }
 
-    RAW_CMP_JUMP_IF_FALSE(lt_int, raw_ints, <)
-    RAW_CMP_JUMP_IF_FALSE(lte_int, raw_ints, <=)
-    RAW_CMP_JUMP_IF_FALSE(lt_real, raw_reals, <)
-    RAW_CMP_JUMP_IF_FALSE(lte_real, raw_reals, <=)
+    RAW_CMP_JUMP_IF_FALSE(lt_int, raw_ints, RAW_I, <)
+    RAW_CMP_JUMP_IF_FALSE(lte_int, raw_ints, RAW_I, <=)
+    RAW_CMP_JUMP_IF_FALSE(lt_real, raw_reals, RAW_D, <)
+    RAW_CMP_JUMP_IF_FALSE(lte_real, raw_reals, RAW_D, <=)
 
 #undef RAW_CMP_JUMP_IF_FALSE
 

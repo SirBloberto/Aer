@@ -121,6 +121,12 @@ typedef struct Parser {
        instruction lengths vary, so the last word cannot be identified by reading backwards. */
     unsigned int last_cmp_offset;
 
+    /* How many times the body being compiled had to reach for a raw-vs-BOXED opcode -- a raw local
+       composed with a value the compiler could not prove numeric. Nonzero means binding this
+       function's numeric parameters as raw locals would turn real work raw, which is the whole
+       trigger for a numeric specialization (see SHAPE_MASK_NUMERIC_ONLY, vm.h). */
+    unsigned int raw_boxed_emits;
+
     /* Same trick for the last OP_INTERP: emit_index_get folds one into OP_INDEX_GET_INTERP when the
        interpolation it is indexing with is the instruction immediately before it. */
     unsigned int last_interp_offset;
@@ -1097,6 +1103,7 @@ static bool try_emit_arith_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind ki
        comment) -- no runtime type restriction beyond what the boxed path itself already allows. */
     if (is_temp(boxed_rk)) reg_free(1);
 
+    P.raw_boxed_emits++;
     *out_rk = RK_RAW_REAL_FLAG | dest;
     return true;
 }
@@ -1184,6 +1191,7 @@ static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind
     int dest = reg_alloc();
     P.last_cmp_offset = c->count;
     chunk_emit(c, PACK3(raw_op, dest, slot, pack_rk8(boxed_rk)));
+    if (!(boxed_rk & RK_CONST_FLAG)) P.raw_boxed_emits++;
     *out_rk = dest;
     return true;
 }
@@ -1291,8 +1299,25 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     }
 
     int slot_lhs = raw_materialize(c, rk_lhs, kind_lhs);
-    int slot_rhs = raw_materialize(c, rk_rhs, kind_lhs); /* same kind, confirmed above */
-    if (slot_lhs < 0 || slot_rhs < 0) return false; /* raw-slot budget exhausted: fall back to boxed */
+    if (slot_lhs < 0) return false; /* raw-slot budget exhausted: fall back to boxed */
+
+    /* A literal right operand rides in the instruction as a raw-constant index instead of being
+       loaded into a slot of its own. Only the right one: the swap form moves it to the left, where
+       the operand field is a bare slot index with no room to say otherwise. */
+    int rhs_field = -1;
+    if (!swap_cmp && (rk_rhs & RK_CONST_FLAG)) {
+        int const_rk;
+        if (rawk_const_rk(c, rk_rhs, kind_lhs, &const_rk)) {
+            unsigned int idx = (unsigned int)(const_rk & ~RK_CONST_FLAG);
+            if (idx <= RK8_INDEX_MASK) rhs_field = (int)(RK8_CONST_FLAG | idx);
+        }
+    }
+    int slot_rhs = -1;
+    if (rhs_field < 0) {
+        slot_rhs = raw_materialize(c, rk_rhs, kind_lhs); /* same kind, confirmed above */
+        if (slot_rhs < 0) return false;
+        rhs_field = slot_rhs;
+    }
 
     /* Free-then-allocate, RHS then LHS -- only frees a slot that was actually a temp. */
     int floor_now = int_kind ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
@@ -1312,20 +1337,20 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     if (is_cmp) {
         int dest = reg_alloc();
         P.last_cmp_offset = c->count;
-        chunk_emit(c, PACK3(raw_op, dest, swap_cmp ? slot_rhs : slot_lhs, swap_cmp ? slot_lhs : slot_rhs));
+        chunk_emit(c, PACK3(raw_op, dest, swap_cmp ? slot_rhs : slot_lhs, swap_cmp ? slot_lhs : rhs_field));
         *out_rk = dest;
         return true;
     }
     if (div_int_promotes_to_real) {
         int dest = raw_real_alloc();
         if (dest < 0) return false; /* extremely unlikely right after freeing 2 int slots, but stay safe */
-        chunk_emit(c, PACK3(raw_op, dest, slot_lhs, slot_rhs));
+        chunk_emit(c, PACK3(raw_op, dest, slot_lhs, rhs_field));
         *out_rk = RK_RAW_REAL_FLAG | dest;
         return true;
     }
     int dest = int_kind ? raw_int_alloc() : raw_real_alloc();
     if (dest < 0) return false;
-    chunk_emit(c, PACK3(raw_op, dest, slot_lhs, slot_rhs));
+    chunk_emit(c, PACK3(raw_op, dest, slot_lhs, rhs_field));
     *out_rk = (int_kind ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest;
     return true;
 }
@@ -4721,8 +4746,10 @@ static void parse_function(Chunk* c) {
     unsigned int this_func_idx = c->function_count - 1;
 
     unsigned int captured_max_registers, captured_max_raw_ints, captured_max_raw_reals;
+    unsigned int raw_boxed_before = P.raw_boxed_emits;
     parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0, &captured_max_registers,
                         &captured_max_raw_ints, &captured_max_raw_reals);
+    unsigned int raw_boxed_in_body = P.raw_boxed_emits - raw_boxed_before;
 
     /* Fold P.shape_sensitive_param[] into one bitmask; retain the source span (owned copy, see
        ChunkFunction.source_span's own comment) only when it's actually needed -- the common case
@@ -4730,8 +4757,9 @@ static void parse_function(Chunk* c) {
        already restored P.shape_sensitive_param/P.current_param_count's OWN inputs, but not the fold-in
        -- reads them here, right after the call, before anything else can touch them. */
     unsigned int shape_mask = 0;
-    for (int i = 0; i < param_count && i < 32; i++)
+    for (int i = 0; i < param_count && i < 31; i++)
         if (P.shape_sensitive_param[i]) shape_mask |= (1u << i);
+    if (shape_mask == 0 && param_count > 0 && raw_boxed_in_body > 0) shape_mask = SHAPE_MASK_NUMERIC_ONLY;
     c->functions[this_func_idx].shape_sensitive_mask = shape_mask;
     if (shape_mask != 0) {
         const char* span_end = current_source_cursor();

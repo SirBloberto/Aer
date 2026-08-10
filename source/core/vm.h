@@ -712,6 +712,11 @@ typedef struct {
        compile; folded in at function-exit, same moment max_registers/max_raw_ints/max_raw_reals are
        captured. Zero means this function is never specialized, and lbl_call skips the lookup. */
     unsigned int shape_sensitive_mask;
+/* Set instead of a parameter bit when no parameter is shape-sensitive but the body composed a raw
+   local with a boxed value -- work that goes raw once the numeric parameters do. It rides in this
+   mask rather than a field of its own so lbl_call's gate stays the one already-fetched test it is;
+   parameter bits are capped at 31 to keep the top one free. */
+#define SHAPE_MASK_NUMERIC_ONLY (1u << 31)
     /* Owned copy of the source text spanning from '(' through the end of the body -- NULL unless
        shape_sensitive_mask != 0. Needed to re-invoke the parser later (long after the original
        parse() call returned) with a specific parameter's Shape substituted in as compile-time-known.

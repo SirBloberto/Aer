@@ -541,6 +541,22 @@ static void print_rk8_rawr(FILE* out, Chunk* c, uint32_t rk) {
         fprintf(out, "  rk=reg%u", rk & RK8_INDEX_MASK);
 }
 
+/* The pure-raw families' right operand: the same const flag, but a non-const one is a raw slot
+   rather than a boxed register. */
+static void print_rawk_i(FILE* out, Chunk* c, uint32_t rk) {
+    if (rk & RK8_CONST_FLAG)
+        fprintf(out, "  rawi_const=%lld", (long long)c->rawk_i[rk & RK8_INDEX_MASK]);
+    else
+        fprintf(out, "  rawi=%u", rk);
+}
+
+static void print_rawk_d(FILE* out, Chunk* c, uint32_t rk) {
+    if (rk & RK8_CONST_FLAG)
+        fprintf(out, "  rawr_const=%g", c->rawk_d[rk & RK8_INDEX_MASK]);
+    else
+        fprintf(out, "  rawr=%u", rk);
+}
+
 /* Raw-slot printers -- kept separate so a dump reader can tell int=/real= from reg=/rk=. */
 static void print_rawi(FILE* out, int slot) {
     fprintf(out, "  rawi=%d", slot);
@@ -658,11 +674,11 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_jump(out, c->code[pos], pos + 1), pos++;
     } else if (op == OP_RAW_LT_INT_JUMP_IF_FALSE || op == OP_RAW_LTE_INT_JUMP_IF_FALSE) {
         print_rawi(out, (int)UNPACK_B(op_word));
-        print_rawi(out, (int)UNPACK_C(op_word));
+        print_rawk_i(out, c, UNPACK_C(op_word));
         print_jump(out, c->code[pos], pos + 1), pos++;
     } else if (op == OP_RAW_LT_REAL_JUMP_IF_FALSE || op == OP_RAW_LTE_REAL_JUMP_IF_FALSE) {
         print_rawr(out, (int)UNPACK_B(op_word));
-        print_rawr(out, (int)UNPACK_C(op_word));
+        print_rawk_d(out, c, UNPACK_C(op_word));
         print_jump(out, c->code[pos], pos + 1), pos++;
     } else if (op == OP_INDEX_GET || op == OP_TYPED_INDEX_GET_UNCHECKED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
@@ -869,20 +885,20 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         else
             print_rawi(out, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
-        print_rawi(out, (int)UNPACK_C(op_word));
+        print_rawk_i(out, c, UNPACK_C(op_word));
     } else if (op == OP_RAW_ADD_REAL || op == OP_RAW_SUB_REAL || op == OP_RAW_MUL_REAL ||
                op == OP_RAW_DIV_REAL || op == OP_RAW_FMA_REAL || op == OP_RAW_FMS_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
-        print_rawr(out, (int)UNPACK_C(op_word));
+        print_rawk_d(out, c, UNPACK_C(op_word));
     } else if (op == OP_RAW_LT_INT || op == OP_RAW_LTE_INT) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
-        print_rawi(out, (int)UNPACK_C(op_word));
+        print_rawk_i(out, c, UNPACK_C(op_word));
     } else if (op == OP_RAW_LT_REAL || op == OP_RAW_LTE_REAL) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
-        print_rawr(out, (int)UNPACK_C(op_word));
+        print_rawk_d(out, c, UNPACK_C(op_word));
     } else if (op == OP_BOX_INT) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
