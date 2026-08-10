@@ -2860,6 +2860,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_TYPED_INDEX_SET_RAW_INT] = &&lbl_typed_index_set_raw_int,
         [OP_TYPED_INDEX_SET_RAW_REAL] = &&lbl_typed_index_set_raw_real,
         [OP_RAW_MATH_REAL] = &&lbl_raw_math_real,
+        [OP_RAW_INT_TO_REAL] = &&lbl_raw_int_to_real,
+        [OP_RAW_REAL_TO_INT] = &&lbl_raw_real_to_int,
         [OP_CALL_RAW_INT] = &&lbl_call_raw_int,
         [OP_CALL_RAW_REAL] = &&lbl_call_raw_real,
         [OP_RETURN_RAW_INT] = &&lbl_return_raw_int,
@@ -5257,6 +5259,16 @@ lbl_cast : {
     int cast_type = (int)UNPACK_B(op_word);
     AerVal v = *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     registers[dest] = vm_cast(v, cast_type);
+    DISPATCH();
+}
+
+lbl_raw_int_to_real : {
+    raw_reals[UNPACK_A(op_word)] = (double)raw_ints[UNPACK_B(op_word)];
+    DISPATCH();
+}
+
+lbl_raw_real_to_int : {
+    raw_ints[UNPACK_A(op_word)] = (int64_t)raw_reals[UNPACK_B(op_word)];
     DISPATCH();
 }
 

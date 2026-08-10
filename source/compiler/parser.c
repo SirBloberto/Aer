@@ -1924,6 +1924,29 @@ static int parse_string_literal(Chunk* c) {
    OP_UNARY/OP_TO_STR (string, cast_type < 0 --
    there's no CAST_STRING id since OP_TO_STR already existed as its own opcode before casting did). */
 static int emit_primitive_cast(Chunk* c, int cast_type, int lhs) {
+    /* `float(i)` on a raw int is a hardware conversion, not a reason to build an AerVal and tear it
+       apart again. Only between the two raw kinds -- a cast from anything else still needs the
+       general opcode's type dispatch. */
+    RawKind src_kind = rk_raw_kind(c, lhs);
+    if ((cast_type == CAST_FLOAT && src_kind == RAWK_INT) ||
+        (cast_type == CAST_INTEGER && src_kind == RAWK_REAL)) {
+        bool to_real = (cast_type == CAST_FLOAT);
+        int src = raw_materialize(c, lhs, src_kind);
+        if (src >= 0) {
+            int floor_now = to_real ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+            if (src >= floor_now) {
+                if (to_real)
+                    raw_int_free(1);
+                else
+                    raw_real_free(1);
+            }
+            int dest = to_real ? raw_real_alloc() : raw_int_alloc();
+            if (dest >= 0) {
+                chunk_emit(c, PACK3(to_real ? OP_RAW_INT_TO_REAL : OP_RAW_REAL_TO_INT, dest, src, 0));
+                return (to_real ? RK_RAW_REAL_FLAG : RK_RAW_INT_FLAG) | dest;
+            }
+        }
+    }
     lhs = box_if_raw(c, lhs);
     if (is_temp(lhs)) reg_free(1);
     int dest = reg_alloc();
@@ -4500,18 +4523,24 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         if (parse_had_error) return 0;
         bool is_int = (P.variant_kind == RAWK_INT);
         bool ret_int = (P.variant_return_kind == RAWK_INT);
-        if (P.variant_return_kind != RAWK_NONE && rk_raw_kind(c, rk_arg) == P.variant_kind) {
+        bool ret_raw = (P.variant_return_kind != RAWK_NONE);
+        if (rk_raw_kind(c, rk_arg) == P.variant_kind) {
             int arg_slot = raw_materialize(c, rk_arg, P.variant_kind);
-            int dest_slot = ret_int ? raw_int_alloc() : raw_real_alloc();
+            /* A result that is not numeric at all -- make_tree returns a struct -- still gets its
+               argument handed over raw; only the result comes back in a register. */
+            int dest_slot = !ret_raw ? reg_alloc() : ret_int ? raw_int_alloc() : raw_real_alloc();
             if (arg_slot >= 0 && dest_slot >= 0) {
                 chunk_emit(c, PACK3(is_int ? OP_CALL_RAW_INT : OP_CALL_RAW_REAL, dest_slot, arg_slot, 1));
                 chunk_emit(c, P.variant_offset);
                 chunk_emit(c, (uint32_t)(func_index * sizeof(ChunkFunction)));
-                chunk_emit(c, ret_int ? 1u : 2u);
+                chunk_emit(c, !ret_raw ? 0u : ret_int ? 1u : 2u);
+                if (!ret_raw) return dest_slot;
                 return (ret_int ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest_slot;
             }
             if (dest_slot >= 0) {
-                if (ret_int)
+                if (!ret_raw)
+                    reg_free(1);
+                else if (ret_int)
                     raw_int_free(1);
                 else
                     raw_real_free(1);

@@ -457,6 +457,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_CALL_RAW_REAL] =
         {"OP_CALL_RAW_REAL", "recursive numeric call, real args/result stay raw", {0}, false, 2, 0},
     [OP_RAW_MATH_REAL] = {"OP_RAW_MATH_REAL", "rawr = math fn(rawr), never boxed"},
+    [OP_RAW_INT_TO_REAL] = {"OP_RAW_INT_TO_REAL", "rawr = (real)rawi"},
+    [OP_RAW_REAL_TO_INT] = {"OP_RAW_REAL_TO_INT", "rawi = (int)rawr, truncating"},
     [OP_RETURN_RAW_INT] = {"OP_RETURN_RAW_INT", "return rawi (boxes if the caller wants boxed)"},
     [OP_RETURN_RAW_REAL] = {"OP_RETURN_RAW_REAL", "return rawr (boxes if the caller wants boxed)"},
 };
@@ -715,6 +717,12 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         }
         fprintf(out, "  n=%u", UNPACK_C(op_word));
         fprintf(out, "  -> %u", c->code[pos]), pos += 2;
+    } else if (op == OP_RAW_INT_TO_REAL) {
+        print_rawr(out, (int)UNPACK_A(op_word));
+        print_rawi(out, (int)UNPACK_B(op_word));
+    } else if (op == OP_RAW_REAL_TO_INT) {
+        print_rawi(out, (int)UNPACK_A(op_word));
+        print_rawr(out, (int)UNPACK_B(op_word));
     } else if (op == OP_RAW_MATH_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));

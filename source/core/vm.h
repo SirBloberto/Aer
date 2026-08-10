@@ -393,6 +393,11 @@ typedef enum {
        tag-checked back out by whatever consumed it. word0 = PACK3(op, dest_slot, src_slot, fn_id).
        Only the functions aer_math_fn_is_raw_real accepts; floor/ceil/round return integers. */
     OP_RAW_MATH_REAL,
+    /* `float(i)` / `int(x)` between the two raw banks -- a hardware conversion that used to box its
+       operand just to reach OP_CAST's type dispatch. int() truncates toward zero, matching OP_CAST's
+       own rule. */
+    OP_RAW_INT_TO_REAL,
+    OP_RAW_REAL_TO_INT,
 
     OP_CALL_RAW_INT,
     OP_CALL_RAW_REAL,
