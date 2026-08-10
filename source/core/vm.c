@@ -1612,20 +1612,6 @@ AerVal vm_struct_field_read(AerStruct* s, unsigned int slot) {
     return vm_packed_slot_read(p, ftype);
 }
 
-void vm_struct_field_write(AerStruct* s, unsigned int slot, AerVal v) {
-    ValueType ftype = s->shape->field_types[slot];
-    unsigned int offset = s->shape->field_offsets[slot];
-    unsigned char* p = s->fields + offset;
-    if (ftype == TYPE_ANY) {
-        memcpy(p, &v, sizeof(AerVal));
-        return;
-    }
-    if (s->shape->field_narrow[slot]) {
-        vm_typed_elem_write(p, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32, v);
-        return;
-    }
-    vm_packed_slot_write(p, ftype, v);
-}
 
 /* Natural literal shape, not exact-tag matching (unlike a typed struct field's OP_FIELD_SET) --
    `arr[i] = 5` into a float32 array shouldn't require writing `5.0`. int32/int64 variants still
@@ -3693,10 +3679,15 @@ lbl_struct_new : {
     AerStruct* s = heap_alloc(&vm->heap, struct_pool_for_size(&vm->heap, shape->instance_bytes));
     s->shape = shape;
     s->fields = (unsigned char*)s + sizeof(AerStruct);
-    for (int i = 0; i < arg_count; i++)
-        vm_struct_field_write(s, (unsigned int)i, registers[arg_reg_base + i]);
+    /* The _at form, with the shape already in hand: vm_struct_field_write re-reads s->shape twice
+       per field through a non-inlinable external call, and this loop runs for every field of every
+       construction -- 8.19% of bench/binary_trees.aer sat in it. */
+    for (unsigned int i = 0; i < (unsigned int)arg_count; i++)
+        vm_struct_field_write_at(s, shape->field_offsets[i], shape->field_types[i],
+                                 shape->field_narrow[i], registers[arg_reg_base + i]);
     for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
-        vm_struct_field_write(s, i, vm_default_value(vm, shape->field_defaults[i]));
+        vm_struct_field_write_at(s, shape->field_offsets[i], shape->field_types[i],
+                                 shape->field_narrow[i], vm_default_value(vm, shape->field_defaults[i]));
     registers[dest_reg] = aer_struct_val(s);
     gc_maybe_collect(
         vm); /* pool_alloc(&struct_pools[tier]) above, plus any vm_default_value array/dict defaults -- all rooted now that the struct itself is stored */

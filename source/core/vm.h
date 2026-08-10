@@ -610,7 +610,7 @@ struct Shape {
        static knowledge, never read from the instance) unless field_narrow marks it 4 instead, an
        untyped (TYPE_ANY) field stays a full boxed AerVal (16 bytes), since it can hold any value
        including a reference type the GC must trace. Computed once in OP_DEFINE_STRUCT's handler,
-       right after field_types/field_narrow are known. See vm_struct_field_read/vm_struct_field_write. */
+       right after field_types/field_narrow are known. See vm_struct_field_read. */
     unsigned int field_offsets[MAX_STRUCT_FIELDS];
     unsigned int instance_bytes; /* total size of the fields buffer -- sum of every field's width above */
 };
@@ -634,7 +634,6 @@ _Static_assert(offsetof(struct AerStruct, gc_state) == 0, "pool.c assumes gc_sta
    opcode in vm.c plus json.encode's struct-serialization branch (aer_json.c), which is why these
    aren't file-static. */
 AerVal vm_struct_field_read(AerStruct* s, unsigned int slot);
-void vm_struct_field_write(AerStruct* s, unsigned int slot, AerVal v);
 
 /* Byte width of one element: 4 for int32/float32, 8 for int64/float64. Not file-static -- gc.c's
    free_typed_array needs it too, to recompute a dying typed array's data-buffer size (count is

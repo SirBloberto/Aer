@@ -2629,6 +2629,40 @@ money is in the handlers.
 *cold* path and split out with `noinline` for exactly that reason, so 6.63% means it is not cold at
 all for struct-passing code.
 
+### 5.16yk Struct construction wrote its fields the slow way
+
+Next entry down the same profile: `vm_struct_field_write` at 8.19% of `bench/binary_trees.aer`.
+`lbl_struct_new` called it once per field of every construction, and it is an *externally linked*
+function that re-derives `s->shape` twice per call:
+
+```c
+ValueType ftype = s->shape->field_types[slot];
+unsigned int offset = s->shape->field_offsets[slot];
+```
+
+An inline counterpart already existed -- `vm_struct_field_write_at`, taking offset/type/narrow
+precomputed -- used by every field-SET opcode but not by construction, which is the one place that
+writes *every* field. And `lbl_struct_new` already holds `shape`, so the two dependent loads per
+field were re-deriving something it had in a register.
+
+| benchmark | instructions |
+|---|---|
+| `binary_trees` | **-5.15%** |
+| `struct_array_scan` | **-2.84%** |
+| everything else | within ±0.08% |
+
+`vm_struct_field_write` had no callers left afterwards and was deleted.
+
+Worth recording the measurement trap: on x86-64 wall-clock this read `dict_bench` **+9.09%**, well
+outside its 2.97% layout band, which looked like a real regression. Instructions -- immune to both
+layout and machine drift -- say -0.00%. The x86 bands from 5.16yd bound *layout* variance, not
+background load, and a 9-run minimum did not filter it. Instructions remain the gate on both
+platforms; the x86 laboratory is better than ARM's, not perfect.
+
+Both wins in this section came from the same place: a hot loop calling a general helper that
+re-derives what the caller already knows. Neither is exotic, and neither is in the dispatch path
+that most of section 5.16 is about.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
