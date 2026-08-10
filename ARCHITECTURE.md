@@ -2748,6 +2748,62 @@ So the win is narrow and real: the allocation-heavy benchmark, and nothing else 
 direction. Kept because +0.25% instructions buys -1.4% cycles where allocation dominates, and costs
 no measured cycles anywhere else.
 
+### 5.16yo What a call actually costs, measured rather than inferred
+
+Dividing a benchmark's instructions by its dispatch count needs an assumed cost for every *other*
+opcode, and that assumption silently carries the whole answer — it produced a "150-180 instructions
+per call" figure here that was wrong and that then mis-explained two separate failures. Derive
+per-construct costs from a ladder of microbenchmarks differing by exactly one construct instead.
+
+Each of these is a 20M-iteration loop; the delta is the construct (Pi, `perf stat instructions`):
+
+| construct | instructions |
+|---|---|
+| base loop (`total += 1`) | 57.1 / iter |
+| **one CALL+RETURN, 1 arg** (`id(id(1))` minus `id(1)`) | **116.0** |
+| each additional argument passed | ~13 |
+| shape-sensitive call minus plain call | +108 |
+| **boxed tag-checked operand minus raw operand** | **+3.0, and 0 cycles** |
+
+The last row's instruction figure is solid; **its cycle figure does not generalize, and the
+microbenchmark that produced it is a trap worth recording.** `OP_RAW_ADD_INT` versus
+`OP_RAW_ADD_INT_BOXED` over structurally identical loops measured 1,142,618,051 vs 1,202,481,029
+instructions but **identical cycles** (464.9M vs 464.7M, min of 3) — inviting the conclusion that a
+boxed operand is free and a raw constant table would be pointless.
+
+That conclusion is unsupported. The counters say why:
+
+| workload | IPC | branch-misses |
+|---|---|---|
+| mandelbrot | 1.46 | 51,870,508 |
+| nbody | 1.89 | 15,082,929 |
+| fib_bench | 1.78 | 12,329,346 |
+| **the microbenchmark** | **2.59** | **14,070** |
+
+A two-opcode loop is perfectly predictable, so its dispatch never mispredicts and it runs at 2.59
+IPC with idle issue slots for the extra instructions to fill. Every real benchmark sits at 1.46-1.89
+IPC with millions of misses, where the bubbles come from misprediction *flushes* rather than
+dependency stalls — and a flush discards work rather than leaving a slot for it. The regimes are not
+comparable in either direction.
+
+**A microbenchmark built to isolate one construct also isolates it from the branch behaviour that
+dominates the real workload.** Instruction deltas from such a ladder are trustworthy; cycle deltas
+are only trustworthy at a misprediction rate resembling the target. Whether unboxing numeric
+constants pays is therefore still open, not closed.
+
+Where a call's 116 instructions go, from `perf annotate` on a call-dominated loop:
+
+| | share | |
+|---|---|---|
+| `callee->registers = caller->registers + caller->frame_size` | 9.71% | now reads the hoisted base |
+| `AerVal result = callee->registers[src_reg]` (return) | 9.99% | 16-byte load |
+| argument-copy **loop header** | 7.43% | more than the copy it performs |
+| argument copy body | 4.79% | |
+| remaining `CallFrame` field writes | ~7.4% | |
+
+`CallFrame` setup is ~17% of a call and the argument-copy loop scaffolding costs more than the
+single 16-byte move it makes at arity 1 — both still open.
+
 `vm_struct_field_write` had no callers left afterwards and was deleted.
 
 Worth recording the measurement trap: on x86-64 wall-clock this read `dict_bench` **+9.09%**, well
