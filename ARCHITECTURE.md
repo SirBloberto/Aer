@@ -2715,6 +2715,39 @@ needs O(1) state from a bare pointer, which a side table only gives back via a
 `(ptr - slab_base) / stride` division on a non-power-of-2 stride. The in-cell byte is what makes the
 *barrier* cheap, and the barrier runs far more often than the sweep.
 
+### 5.16yn The same prefetch, on a serial chain, does work
+
+5.16ym's test predicted where prefetching *would* pay: a chain the hardware cannot overlap with
+itself. `pool_alloc` is that shape. It pops a cell and immediately reads that cell's next-pointer to
+re-head the free list — and a free cell has been untouched since the sweep that freed it, so the
+walk is `head -> next -> next`, one exposed miss per allocation. perf puts **61% of `pool_alloc` on
+that single load**.
+
+Issuing the next pop's load before returning gives it the whole of the caller's initialization to
+complete in. The first version re-read `free_slab_head` behind a branch; prefetching the value
+already in hand one line above is the same effect for a fraction of the cost:
+
+| | instructions, `binary_trees` |
+|---|---|
+| re-read `free_slab_head` | +0.57% |
+| prefetch the value in hand | **+0.25%** |
+
+This trades instructions for cycles, so cycles decide it. Across **5 layouts x 5 runs**:
+
+| benchmark | median cycles | lottery | |
+|---|---|---|---|
+| `binary_trees` | **-1.43%** | 0.55% | all five layouts negative |
+| `log_processing` | +0.32% | 1.88% | within the lottery |
+
+`log_processing` is the cautionary half. At 3 layouts it read **-1.78%** on one variant and
+**+2.19%** on the other — a sign flip on nearly identical code. Widening to 5 layouts x 5 runs
+collapsed it to noise. A cycle result that changes sign between variants is measuring the layout,
+not the change; widen the sweep before believing either number.
+
+So the win is narrow and real: the allocation-heavy benchmark, and nothing else resolved in either
+direction. Kept because +0.25% instructions buys -1.4% cycles where allocation dominates, and costs
+no measured cycles anywhere else.
+
 `vm_struct_field_write` had no callers left afterwards and was deleted.
 
 Worth recording the measurement trap: on x86-64 wall-clock this read `dict_bench` **+9.09%**, well
