@@ -2275,6 +2275,8 @@ vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* regist
                     found = &target_f->specializations[i];
                     break;
                 }
+            if (!found && target_f->specialization_count < SPEC_MAX && !target_f->specializations)
+                target_f->specializations = xcalloc(SPEC_MAX, sizeof(SpecEntry));
             if (!found && target_f->specialization_count < SPEC_MAX) {
                 SpecEntry fresh;
                 if (parser_specialize_function(c, target_f, observed, kind, param_index, &fresh, NULL, NULL,

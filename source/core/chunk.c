@@ -38,6 +38,7 @@ void chunk_free(Chunk* c) {
        everything, not rely on process exit. */
     for (unsigned int i = 0; i < c->function_count; i++) {
         free(c->functions[i].defaults);
+        free(c->functions[i].specializations);
         free(c->functions[i].source_span);
     }
     free(c->functions);
@@ -159,6 +160,7 @@ void chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offse
     f->source_span = NULL;
     f->source_span_len = 0;
     f->source_span_line = 0;
+    f->specializations = NULL; /* allocated on first specialization -- see ChunkFunction */
     f->specialization_count = 0;
     f->megamorphic = false;
 }

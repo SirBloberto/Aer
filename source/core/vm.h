@@ -722,7 +722,11 @@ typedef struct {
        CallSpecCacheEntry first, then this table on a miss) before recompiling for a never-before-seen
        shape. megamorphic permanently stops specializing once the table fills, falling back to the
        generic body via code_offset above for every further call. */
-    SpecEntry specializations[SPEC_MAX];
+    /* NULL until this function first specializes, which most never do. Inline, the SPEC_MAX
+       entries were 83% of this struct (272 of 328 bytes) and spread every ChunkFunction across six
+       cache lines for the handful of fields lbl_call reads per call. Allocated once at full
+       SPEC_MAX size and never grown, so the SpecEntry* CallSpecCacheEntry caches stays valid. */
+    SpecEntry* specializations;
     int specialization_count;
     bool megamorphic;
 } ChunkFunction;

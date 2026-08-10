@@ -2214,58 +2214,38 @@ overlaps the windows so the arguments are already in place and the copy disappea
 change most likely to matter for `fib_bench`, and also the one that touches frame layout, GC root
 ranges and the parser's register allocation at once.
 
-### 5.16yc Shrinking ChunkFunction 328 -> 60 bytes: instruction-neutral, cycles-catastrophic
+### 5.16yc Shrinking ChunkFunction 328 -> 60 bytes: reverted, then taken once measurable
 
-`ChunkFunction` is 328 bytes, of which `SpecEntry specializations[SPEC_MAX]` is **272 -- 83% of the
-struct** -- for a table most functions never use, since only a shape-sensitive parameter triggers
-specialization at all. Moving it behind a lazily-allocated pointer (fixed at `SPEC_MAX` entries and
-never grown, so the `SpecEntry*` that `CallSpecCacheEntry` caches stays stable) takes the struct to
-**60 bytes**, fits it in one cache line, and drops peak RSS on `bench/compile_bound.aer` from 3040 KB
-to 2892 KB.
+`SpecEntry specializations[SPEC_MAX]` is 272 of `ChunkFunction`'s 328 bytes -- **83% of the struct**
+-- for a table most functions never use, since only a shape-sensitive parameter triggers
+specialization. Behind a lazily-allocated pointer (fixed at `SPEC_MAX`, never grown, so the
+`SpecEntry*` `CallSpecCacheEntry` caches stays stable) the struct becomes **60 bytes**, fits one
+cache line, and drops peak RSS on `bench/compile_bound.aer` from 3040 KB to 2892 KB.
 
-Instructions said it was free. Every benchmark landed within ±0.04%, including the three that lean
-hardest on specialization (`nbody` +0.02%, `struct_array_scan` +0.04%, `binary_trees` -0.03%) --
-all inside the 0.03% repeatability floor.
+It was reverted first time round. Instructions said free (every benchmark within ±0.04%), but ARM
+cycles said `nbody` +13.18%, then +24.64% on a repeat. The write-up blamed cache locality; the
+counters refuted that -- cache-misses *fell*, 80,384 to 71,720, on a benchmark whose working set is
+five bodies. The cost was branch mispredictions, 13.5M to 45.7M, and the rule applied was: reject a
+change whose instructions show no work removed, whichever way its cycle luck fell.
 
-Cycles said otherwise, twice:
+**The rule was right and the measurement was noise.** 5.16yd then measured the layout band and 5.16yh
+found A32. Re-measured against both, the same change reads:
 
-| benchmark | run 1 | run 2 |
-|---|---|---|
-| `nbody` | **+13.18%** | **+24.64%** |
-| `fib_bench` | +6.24% | +5.91% |
-| `binary_trees` | +0.99% | +1.24% |
-| `struct_array_scan` | +0.41% | -0.22% |
+| | `nbody` | `mandelbrot` | `fib_bench` | `sieve` | `binary_trees` |
+|---|---|---|---|---|---|
+| ARM Thumb-2, first build | +13.2% / +24.6% | -- | -- | -- | -- |
+| ARM Thumb-2, later build | **-2.20%** | +3.53% | +8.98% | -0.04% | -0.28% |
+| ARM A32 | -0.73% | **-0.44%** | +3.58% | -0.31% | -0.17% |
+| x86-64 | -0.21% | -0.45% | -0.42% | -2.55% | -1.15% |
 
-The obvious explanation is locality -- an extra cache line per specialized call -- and **the counters
-refute it**. `nbody`, inline vs out-of-line: cache-misses *fell*, 80,384 to 71,720, on a benchmark
-whose entire working set is five bodies. It was never memory-bound.
+The same comparison read +24.64% and -2.20% on two Thumb-2 builds. That is the lottery, not the
+change. Under A32 the `mandelbrot` regression disappears and `fib_bench`'s +3.58% sits inside its own
+5.84% band; on x86-64, where bands are 0.7-4.4%, six of seven benchmarks improve slightly.
+Instructions remain neutral everywhere (+0.00% to +0.04%).
 
-The cost is branch mispredictions:
-
-| | cycles | instructions | IPC | branch-misses |
-|---|---|---|---|---|
-| inline | 4.72B | 8.909B | 1.89 | **13.5M** |
-| out of line | 5.52B | 8.909B | 1.61 | **45.7M** |
-
-3.4x the mispredictions, +32.2M of them, which at ~15-20 cycles each accounts for essentially the
-whole +804M gap. The same signature explains the rest of this session's cycle movements, in both
-directions -- 5.16yb's byte-offset change took `fib_bench` from 23.9M mispredictions to 12.3M
-(-5.7% cycles) while pushing `binary_trees` from 5.0M to 7.3M (+2.9% cycles), on instruction counts
-that barely moved either way.
-
-This is 5.16d's opcode tax and 5.16q's "register allocation lottery" seen from underneath: neither is
-really about opcodes or registers. Any edit to `vm_run_slice` shifts the addresses of 153 label
-bodies, which changes how the computed-goto dispatch aliases in the branch target buffer, and 36-53%
-of all mispredictions land on that dispatch. The effect is large, chaotic with respect to the source
-change that triggered it, and not attributable to anything the edit actually does.
-
-**Which is an argument FOR the instruction gate, not against it.** Cycles here are real work plus a
-layout lottery worth several percent per benchmark, and the lottery cannot be steered -- an edit
-cannot be designed to alias favourably, and its aliasing will change again with the next edit.
-Instructions measure the part that is actually attributable and durable. So the rule stands: gate on
-instructions, take changes that remove real work, and read a cycles swing on a layout-perturbing edit
-as evidence about *this build*, not about the change. What sank this one was not the +15% -- it was
-that instructions showed no work removed to pay for it.
+**Taken.** Not as a speed win -- it is instruction-neutral and honestly reported as such -- but
+because 83% of a struct devoted to a table most instances never allocate is worse code, and the only
+evidence against it turned out to be an artifact of the noisiest measurement in this document.
 
 ### 5.16yd How big the layout lottery actually is: measured, and it is enormous
 
