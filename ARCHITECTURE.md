@@ -2555,6 +2555,56 @@ because most of this binary is one enormous function whose Thumb-2 encoding was 
 machine it is copied to, and A32 does not exist on Cortex-M. It is safe on every `arm-linux-gnueabihf`
 target, where it is the single largest win in this section. Build with `make ARCH_FLAGS=-marm`.
 
+### 5.16yi Is -marm fair, and is there an x86-64 equivalent? Both answered by rebuilding
+
+5.16g rejected `-no-pie` on fairness, so `-marm` deserved the same scrutiny rather than an
+assertion. It could not be settled by inspecting the distro binaries -- they are stripped, and three
+successive tells each measured something else: the ELF entry point reports the C runtime (Thumb on
+armhf even in an A32 build), conditional-suffix counts match Thumb IT-blocks too, and `ldr pc, [...]`
+matches PLT stubs, which are A32 in every ARM binary regardless.
+
+So Lua 5.4.6 was rebuilt from source **twice, same source, only the ISA differing**:
+
+| benchmark | Lua Thumb-2 | Lua A32 | delta |
+|---|---|---|---|
+| `nbody` | 5.21s | 4.88s | -6.33% |
+| `mandelbrot` | 2.98s | 3.02s | +1.34% |
+| `fib_bench` | 2.34s | 2.34s | 0.00% |
+| `sieve` | 5.62s | 5.61s | -0.18% |
+| `dict_bench` | 3.92s | 4.00s | +2.04% |
+| `binary_trees` | 1.76s | 1.75s | -0.57% |
+
+**Lua barely moves.** The flag is equally available to it and buys it almost nothing, while AER gains
+up to 27% -- because AER's dispatch is 153 replicated computed-goto sites, each paying the Thumb
+mode-bit fixup once. The asymmetry is AER's architecture meeting the ISA, not a rigged comparison,
+and any interpreter built the same way would collect the same win. It is also unlike `-no-pie` in the
+way that mattered there: no security property changes and the binary stays PIE.
+
+With the ISA stated for both sides (`lua-best` = the better of Lua's two builds):
+
+| benchmark | aer T2 | **aer A32** | lua best | luajit -joff | A32 vs LJ |
+|---|---|---|---|---|---|
+| `mandelbrot` | 2.71s | **2.03s** | 2.99s | 2.84s | **1.40x** |
+| `struct_array_scan` | 3.17s | 3.02s | 8.05s | 6.81s | 2.25x |
+| `dict_bench` | 1.23s | 1.23s | 3.93s | 2.57s | 2.09x |
+| `sieve` | 2.06s | 2.06s | 5.62s | 3.79s | 1.84x |
+| `nbody` | 2.70s | 2.56s | 4.83s | 3.40s | 1.33x |
+| `binary_trees` | 1.04s | 1.06s | 1.69s | 1.16s | 1.09x |
+| `lookup_table_bench` | 1.62s | 1.67s | 4.31s | 1.70s | 1.02x |
+| `fib_bench` | 2.11s | 1.92s | 2.26s | 1.51s | 0.79x |
+
+**There is no x86-64 equivalent, and the reason is that there is nothing to fix.** x86-64 dispatch is
+already `jmp *(%rbx,%rax,8)` -- one instruction, table base resident, no mode bit -- against ARM's
+five. The measurable levers there are ordinary compiler flags: `-O3` is worth a consistent ~2.7%
+(-1.79/-2.79/-3.25% on `mandelbrot` and -2.66/-3.76/-1.89% on `fib_bench` across three layouts), and
+`-march=native` another 1-5% at the cost of a binary that no longer runs anywhere. `-O3` is NOT a
+universal default: on ARM it is mixed (`nbody` -2.44% but `fib_bench` +0.47%, `sieve` +0.29%).
+
+One incidental finding worth more than either flag: **the layout lottery is an ARM problem.** The same
+sweep that moves `mandelbrot` 25.58% on ARM moves it 1.1% on x86-64 (0.609-0.616s across three
+offsets). A larger BTB and better indirect prediction absorb what ARM's cannot -- which is why
+5.16yd's warning about single-build cycle comparisons applies to the Pi and not to the desktop.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
