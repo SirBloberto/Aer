@@ -1,6 +1,7 @@
 #include "parser.h"
 #include <stdlib.h>
 #include <string.h>
+#include "aer_stdlib.h"
 #include "error.h"
 #include "lexer.h"
 
@@ -456,8 +457,12 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
             case OP_RAW_GTE_REAL_BOXED: fused_op = OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE; break;
             case OP_RAW_LT_INT: fused_op = OP_RAW_LT_INT_JUMP_IF_FALSE; break;
             case OP_RAW_LTE_INT: fused_op = OP_RAW_LTE_INT_JUMP_IF_FALSE; break;
+            case OP_RAW_EQ_INT: fused_op = OP_RAW_EQ_INT_JUMP_IF_FALSE; break;
+            case OP_RAW_NEQ_INT: fused_op = OP_RAW_NEQ_INT_JUMP_IF_FALSE; break;
             case OP_RAW_LT_REAL: fused_op = OP_RAW_LT_REAL_JUMP_IF_FALSE; break;
             case OP_RAW_LTE_REAL: fused_op = OP_RAW_LTE_REAL_JUMP_IF_FALSE; break;
+            case OP_RAW_EQ_REAL: fused_op = OP_RAW_EQ_REAL_JUMP_IF_FALSE; break;
+            case OP_RAW_NEQ_REAL: fused_op = OP_RAW_NEQ_REAL_JUMP_IF_FALSE; break;
             default:
                 matched = false;
                 fused_op = OP_EQ_JUMP_IF_FALSE;
@@ -1331,6 +1336,14 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
                 is_cmp = true;
                 swap_cmp = true;
                 break;
+            case OP_EQ:
+                raw_op = OP_RAW_EQ_INT;
+                is_cmp = true;
+                break;
+            case OP_NEQ:
+                raw_op = OP_RAW_NEQ_INT;
+                is_cmp = true;
+                break;
             default: return false;
         }
     } else {
@@ -1356,6 +1369,14 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
                 raw_op = OP_RAW_LTE_REAL;
                 is_cmp = true;
                 swap_cmp = true;
+                break;
+            case OP_EQ:
+                raw_op = OP_RAW_EQ_REAL;
+                is_cmp = true;
+                break;
+            case OP_NEQ:
+                raw_op = OP_RAW_NEQ_REAL;
+                is_cmp = true;
                 break;
             default: return false; /* no raw MOD/FLOOR_DIV for real */
         }
@@ -4208,10 +4229,32 @@ static int parse_module_call(Chunk* c) {
     require(TOKEN_OPEN_PARENTHESE, "expected '(' after module function name");
     if (parse_had_error) return 0;
 
+    unsigned int args_start = c->count;
     int arg_reg_base;
     int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after module call arguments");
     if (parse_had_error) return 0;
+
+    /* `math.sqrt(<raw real>)` boxed its argument only because the module calling convention wanted
+       an AerVal, and the box is the whole of what the argument compiled to. Undo it and go raw at
+       both ends -- same rewrite-what-was-just-emitted test the other raw fusions use. */
+    if (arg_count == 1 && module_id == CALL_MODULE_MATH && aer_math_fn_is_raw_real(fn_id) &&
+        c->count - args_start == 1) {
+        uint32_t w = c->code[args_start];
+        if ((Opcode)(w & 0xFF) == OP_BOX_REAL && (int)UNPACK_A(w) == arg_reg_base) {
+            int src_slot = (int)UNPACK_B(w);
+            c->count = args_start; /* discard the box */
+            reg_free(1); /* the argument register it wrote is no longer needed */
+            int dest_slot = raw_real_alloc();
+            if (dest_slot >= 0) {
+                chunk_emit(c, PACK3(OP_RAW_MATH_REAL, dest_slot, src_slot, (unsigned int)fn_id));
+                return RK_RAW_REAL_FLAG | dest_slot;
+            }
+            /* No slot left -- put the box back and fall through to the ordinary module call. */
+            reg_alloc();
+            chunk_emit(c, w);
+        }
+    }
 
     int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
     if (arg_count > 1) reg_free(arg_count - 1);

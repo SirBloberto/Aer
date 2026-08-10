@@ -17,6 +17,53 @@ static bool math_pop_double(VM* vm, const char* name, double* out) {
    what each computes and what its domain allows, rather than eleven near-identical blocks that can
    drift apart. Raises its own error and returns false on a domain violation; *out is meaningful
    only on true. abs and the 0-/2-arg functions aren't this shape and stay inline below. */
+/* The real-returning half of math_unary, without the AerVal. Only these: floor/ceil/round yield an
+   integer, so they have no place to land in a real slot. Same domain errors, same results. */
+bool aer_math_unary_raw(int fn_id, double x, double* out) {
+    switch (fn_id) {
+        case FN_MATH_SQRT:
+            if (x < 0) {
+                error("sqrt() requires a non-negative number");
+                return false;
+            }
+            *out = sqrt(x);
+            return true;
+        case FN_MATH_SIN: *out = sin(x); return true;
+        case FN_MATH_COS: *out = cos(x); return true;
+        case FN_MATH_TAN: *out = tan(x); return true;
+        case FN_MATH_EXP: *out = exp(x); return true;
+        case FN_MATH_LOG:
+            if (x <= 0) {
+                error("log() requires a positive number");
+                return false;
+            }
+            *out = log(x);
+            return true;
+        case FN_MATH_LOG2:
+            if (x <= 0) {
+                error("log2() requires a positive number");
+                return false;
+            }
+            *out = log2(x);
+            return true;
+        case FN_MATH_LOG10:
+            if (x <= 0) {
+                error("log10() requires a positive number");
+                return false;
+            }
+            *out = log10(x);
+            return true;
+        default: return false;
+    }
+}
+
+/* Which fn_ids aer_math_unary_raw handles -- the parser's test before it may emit OP_RAW_MATH_REAL. */
+bool aer_math_fn_is_raw_real(int fn_id) {
+    return fn_id == FN_MATH_SQRT || fn_id == FN_MATH_SIN || fn_id == FN_MATH_COS ||
+           fn_id == FN_MATH_TAN || fn_id == FN_MATH_EXP || fn_id == FN_MATH_LOG ||
+           fn_id == FN_MATH_LOG2 || fn_id == FN_MATH_LOG10;
+}
+
 static bool math_unary(int fn_id, double x, AerVal* out) {
     switch (fn_id) {
         case FN_MATH_SQRT:

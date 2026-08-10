@@ -225,6 +225,13 @@ typedef enum {
     OP_RAW_LTE_INT,
     OP_RAW_LT_REAL,
     OP_RAW_LTE_REAL,
+    /* Equality has no ordering to flip, so unlike GT/GTE it cannot fold into another member -- and
+       without it a raw value that only ever gets compared (`flags[p] == 0`) was boxed purely to
+       reach the general comparison. */
+    OP_RAW_EQ_INT,
+    OP_RAW_NEQ_INT,
+    OP_RAW_EQ_REAL,
+    OP_RAW_NEQ_REAL,
     OP_BOX_INT,
     OP_BOX_REAL,
     /* Raw-to-raw copy -- OP_MOVE's analog for raw slots. */
@@ -358,8 +365,12 @@ typedef enum {
        operators. Word0 B/C are the two slots; the jump target trails. */
     OP_RAW_LT_INT_JUMP_IF_FALSE,
     OP_RAW_LTE_INT_JUMP_IF_FALSE,
+    OP_RAW_EQ_INT_JUMP_IF_FALSE,
+    OP_RAW_NEQ_INT_JUMP_IF_FALSE,
     OP_RAW_LT_REAL_JUMP_IF_FALSE,
     OP_RAW_LTE_REAL_JUMP_IF_FALSE,
+    OP_RAW_EQ_REAL_JUMP_IF_FALSE,
+    OP_RAW_NEQ_REAL_JUMP_IF_FALSE,
 
     /* A typed array's elements are already unboxed bytes -- reading one into a register built an
        AerVal for the sole purpose of being tag-checked and torn apart again by the next opcode.
@@ -377,6 +388,12 @@ typedef enum {
        always already compiled when this runs; no lazy-compile fallback exists or is needed.
        word0 = PACK3(op, dest_raw_slot, arg_slot_base, arg_count); then the variant's code offset,
        the function's byte offset, and the result kind (independent of the argument kind). */
+    /* `math.sqrt(x)` and its real-returning siblings on a raw real, with no AerVal at either end --
+       the argument used to be boxed for the module calling convention and the result immediately
+       tag-checked back out by whatever consumed it. word0 = PACK3(op, dest_slot, src_slot, fn_id).
+       Only the functions aer_math_fn_is_raw_real accepts; floor/ceil/round return integers. */
+    OP_RAW_MATH_REAL,
+
     OP_CALL_RAW_INT,
     OP_CALL_RAW_REAL,
     /* Returns a raw slot. Boxes into the caller's register when the frame was entered by an

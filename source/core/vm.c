@@ -2859,6 +2859,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_TYPED_INDEX_GET_RAW_REAL] = &&lbl_typed_index_get_raw_real,
         [OP_TYPED_INDEX_SET_RAW_INT] = &&lbl_typed_index_set_raw_int,
         [OP_TYPED_INDEX_SET_RAW_REAL] = &&lbl_typed_index_set_raw_real,
+        [OP_RAW_MATH_REAL] = &&lbl_raw_math_real,
         [OP_CALL_RAW_INT] = &&lbl_call_raw_int,
         [OP_CALL_RAW_REAL] = &&lbl_call_raw_real,
         [OP_RETURN_RAW_INT] = &&lbl_return_raw_int,
@@ -2904,6 +2905,10 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_LTE_INT] = &&lbl_raw_lte_int,
         [OP_RAW_LT_REAL] = &&lbl_raw_lt_real,
         [OP_RAW_LTE_REAL] = &&lbl_raw_lte_real,
+        [OP_RAW_EQ_INT] = &&lbl_raw_eq_int,
+        [OP_RAW_NEQ_INT] = &&lbl_raw_neq_int,
+        [OP_RAW_EQ_REAL] = &&lbl_raw_eq_real,
+        [OP_RAW_NEQ_REAL] = &&lbl_raw_neq_real,
         [OP_BOX_INT] = &&lbl_box_int,
         [OP_BOX_REAL] = &&lbl_box_real,
         [OP_RAW_MOVE_INT] = &&lbl_raw_move_int,
@@ -2987,6 +2992,10 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_LTE_INT_JUMP_IF_FALSE] = &&lbl_raw_lte_int_jump_if_false,
         [OP_RAW_LT_REAL_JUMP_IF_FALSE] = &&lbl_raw_lt_real_jump_if_false,
         [OP_RAW_LTE_REAL_JUMP_IF_FALSE] = &&lbl_raw_lte_real_jump_if_false,
+        [OP_RAW_EQ_INT_JUMP_IF_FALSE] = &&lbl_raw_eq_int_jump_if_false,
+        [OP_RAW_NEQ_INT_JUMP_IF_FALSE] = &&lbl_raw_neq_int_jump_if_false,
+        [OP_RAW_EQ_REAL_JUMP_IF_FALSE] = &&lbl_raw_eq_real_jump_if_false,
+        [OP_RAW_NEQ_REAL_JUMP_IF_FALSE] = &&lbl_raw_neq_real_jump_if_false,
         [OP_INTERP] = &&lbl_interp,
         [OP_INDEX_GET_INTERP] = &&lbl_index_get_interp,
     };
@@ -3496,6 +3505,17 @@ lbl_return_raw_real : {
     else
         raw_ints[dest_reg] = (int64_t)result;
     pc = code + return_ip;
+    DISPATCH();
+}
+
+/* On a domain error aer_math_unary_raw has already raised it and longjmped, so the store is only
+   reached with a real result. */
+lbl_raw_math_real : {
+    int dest = (int)UNPACK_A(op_word);
+    int src = (int)UNPACK_B(op_word);
+    double out;
+    SYNC_IP();
+    if (aer_math_unary_raw((int)UNPACK_C(op_word), raw_reals[src], &out)) raw_reals[dest] = out;
     DISPATCH();
 }
 
@@ -5439,8 +5459,12 @@ lbl_raw_div_real : {
     /* Comparisons produce a boxed boolean (no raw boolean type exists) -- dest is 7 bits, not 5. */
     RAW_CMP_INT(lt, <)
     RAW_CMP_INT(lte, <=)
+    RAW_CMP_INT(eq, ==)
+    RAW_CMP_INT(neq, !=)
     RAW_CMP_REAL(lt, <)
     RAW_CMP_REAL(lte, <=)
+    RAW_CMP_REAL(eq, ==)
+    RAW_CMP_REAL(neq, !=)
 
 /* The only bridge from raw storage back to a tagged AerVal register. */
 lbl_box_int : {
@@ -5635,8 +5659,12 @@ lbl_raw_load_int_pool : {
 
     RAW_CMP_JUMP_IF_FALSE(lt_int, raw_ints, RAW_I, <)
     RAW_CMP_JUMP_IF_FALSE(lte_int, raw_ints, RAW_I, <=)
+    RAW_CMP_JUMP_IF_FALSE(eq_int, raw_ints, RAW_I, ==)
+    RAW_CMP_JUMP_IF_FALSE(neq_int, raw_ints, RAW_I, !=)
     RAW_CMP_JUMP_IF_FALSE(lt_real, raw_reals, RAW_D, <)
     RAW_CMP_JUMP_IF_FALSE(lte_real, raw_reals, RAW_D, <=)
+    RAW_CMP_JUMP_IF_FALSE(eq_real, raw_reals, RAW_D, ==)
+    RAW_CMP_JUMP_IF_FALSE(neq_real, raw_reals, RAW_D, !=)
 
 #undef RAW_CMP_JUMP_IF_FALSE
 

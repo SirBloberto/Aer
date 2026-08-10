@@ -13,6 +13,11 @@ bool aer_stdlib_is_native_module(const char* name, unsigned int len);
 /* Each pops arg_count args and pushes one result if fn_id belongs to that module (true);
    an unmatched fn_id/arg_count returns false with an untouched stack. */
 bool aer_math_call(VM* vm, int fn_id, int arg_count);
+
+/* The real-returning unary math functions, straight from a double to a double -- OP_RAW_MATH_REAL's
+   implementation, and the parser's test for which functions it may emit that for. */
+bool aer_math_unary_raw(int fn_id, double x, double* out);
+bool aer_math_fn_is_raw_real(int fn_id);
 bool aer_random_call(VM* vm, int fn_id, int arg_count);
 bool aer_string_call(VM* vm, int fn_id, int arg_count);
 bool aer_time_call(VM* vm, int fn_id, int arg_count);

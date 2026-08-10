@@ -1,5 +1,6 @@
 #!/usr/bin/env aer
 import collection
+import math
 # AER test suite — tail-call optimization, call-site/LOAD-STORE inline
 # caching, and compile-time opcode fusion (compound assignment and
 # array-index-get). Ground-truth coverage these optimizations must
@@ -478,5 +479,31 @@ for y <= y_limit:
     y_sum += y
     y += 1.0
 assert(y_sum == 6.0, "the <= form of a raw-vs-raw float comparison includes its bound")
+
+# Equality between two raw locals fuses with its branch too -- it has no ordering to flip, so
+# unlike >/>= it cannot ride on another member of the family and needs its own opcode.
+eq_hits = 0
+ex = 0.0
+ex_target = 2.0
+for ex < 5.0:
+    if ex == ex_target:
+        eq_hits += 1
+    ex += 1.0
+assert(eq_hits == 1, "a raw-vs-raw float equality fuses with its branch and matches exactly once")
+
+neq_hits = 0
+ni = 0
+ni_skip = 3
+for ni < 6:
+    if ni != ni_skip:
+        neq_hits += 1
+    ni += 1
+assert(neq_hits == 5, "the != form of a raw-vs-raw integer comparison fuses and excludes exactly one value")
+
+# math.sqrt on a raw float stays raw at both ends (OP_RAW_MATH_REAL) rather than boxing its
+# argument for the module calling convention and boxing the result straight back.
+sq = 16.0
+assert(math.sqrt(sq) * 2.0 == 8.0, "a math call on a raw float feeds raw arithmetic without boxing")
+assert(math.sqrt(2.0) > 1.414 and math.sqrt(2.0) < 1.415, "its result is still the real square root")
 
 print("test_perf_fusion.aer: all assertions passed.")

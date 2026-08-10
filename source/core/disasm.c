@@ -220,6 +220,10 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_RAW_LTE_INT] = {"OP_RAW_LTE_INT", "reg = rawi <= rawi"},
     [OP_RAW_LT_REAL] = {"OP_RAW_LT_REAL", "reg = rawr < rawr"},
     [OP_RAW_LTE_REAL] = {"OP_RAW_LTE_REAL", "reg = rawr <= rawr"},
+    [OP_RAW_EQ_INT] = {"OP_RAW_EQ_INT", "reg = rawi == rawi"},
+    [OP_RAW_NEQ_INT] = {"OP_RAW_NEQ_INT", "reg = rawi != rawi"},
+    [OP_RAW_EQ_REAL] = {"OP_RAW_EQ_REAL", "reg = rawr == rawr"},
+    [OP_RAW_NEQ_REAL] = {"OP_RAW_NEQ_REAL", "reg = rawr != rawr"},
     [OP_BOX_INT] = {"OP_BOX_INT", "reg = box(rawi)"},
     [OP_BOX_REAL] = {"OP_BOX_REAL", "reg = box(rawr)"},
     [OP_RAW_MOVE_INT] = {"OP_RAW_MOVE_INT", "rawi = rawi"},
@@ -438,6 +442,13 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
         {"OP_RAW_LT_REAL_JUMP_IF_FALSE", "jump if !(rawr < rawr)", {0}, false, 1, 0},
     [OP_RAW_LTE_REAL_JUMP_IF_FALSE] =
         {"OP_RAW_LTE_REAL_JUMP_IF_FALSE", "jump if !(rawr <= rawr)", {0}, false, 1, 0},
+    [OP_RAW_EQ_INT_JUMP_IF_FALSE] = {"OP_RAW_EQ_INT_JUMP_IF_FALSE", "jump if !(rawi == rawi)", {0}, false, 1, 0},
+    [OP_RAW_NEQ_INT_JUMP_IF_FALSE] =
+        {"OP_RAW_NEQ_INT_JUMP_IF_FALSE", "jump if !(rawi != rawi)", {0}, false, 1, 0},
+    [OP_RAW_EQ_REAL_JUMP_IF_FALSE] =
+        {"OP_RAW_EQ_REAL_JUMP_IF_FALSE", "jump if !(rawr == rawr)", {0}, false, 1, 0},
+    [OP_RAW_NEQ_REAL_JUMP_IF_FALSE] =
+        {"OP_RAW_NEQ_REAL_JUMP_IF_FALSE", "jump if !(rawr != rawr)", {0}, false, 1, 0},
     [OP_TYPED_INDEX_GET_RAW_INT] = {"OP_TYPED_INDEX_GET_RAW_INT", "rawi = typed_arr[rk], never boxed"},
     [OP_TYPED_INDEX_GET_RAW_REAL] = {"OP_TYPED_INDEX_GET_RAW_REAL", "rawr = typed_arr[rk], never boxed"},
     [OP_TYPED_INDEX_SET_RAW_INT] = {"OP_TYPED_INDEX_SET_RAW_INT", "typed_arr[rk] = rawi, never boxed"},
@@ -445,6 +456,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_CALL_RAW_INT] = {"OP_CALL_RAW_INT", "recursive numeric call, int args/result stay raw", {0}, false, 2, 0},
     [OP_CALL_RAW_REAL] =
         {"OP_CALL_RAW_REAL", "recursive numeric call, real args/result stay raw", {0}, false, 2, 0},
+    [OP_RAW_MATH_REAL] = {"OP_RAW_MATH_REAL", "rawr = math fn(rawr), never boxed"},
     [OP_RETURN_RAW_INT] = {"OP_RETURN_RAW_INT", "return rawi (boxes if the caller wants boxed)"},
     [OP_RETURN_RAW_REAL] = {"OP_RETURN_RAW_REAL", "return rawr (boxes if the caller wants boxed)"},
 };
@@ -679,11 +691,13 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rawr(out, (int)UNPACK_B(op_word));
         print_rk8_rawr(out, c, UNPACK_C(op_word));
         print_jump(out, c->code[pos], pos + 1), pos++;
-    } else if (op == OP_RAW_LT_INT_JUMP_IF_FALSE || op == OP_RAW_LTE_INT_JUMP_IF_FALSE) {
+    } else if (op == OP_RAW_LT_INT_JUMP_IF_FALSE || op == OP_RAW_LTE_INT_JUMP_IF_FALSE ||
+               op == OP_RAW_EQ_INT_JUMP_IF_FALSE || op == OP_RAW_NEQ_INT_JUMP_IF_FALSE) {
         print_rawi(out, (int)UNPACK_B(op_word));
         print_rawk_i(out, c, UNPACK_C(op_word));
         print_jump(out, c->code[pos], pos + 1), pos++;
-    } else if (op == OP_RAW_LT_REAL_JUMP_IF_FALSE || op == OP_RAW_LTE_REAL_JUMP_IF_FALSE) {
+    } else if (op == OP_RAW_LT_REAL_JUMP_IF_FALSE || op == OP_RAW_LTE_REAL_JUMP_IF_FALSE ||
+               op == OP_RAW_EQ_REAL_JUMP_IF_FALSE || op == OP_RAW_NEQ_REAL_JUMP_IF_FALSE) {
         print_rawr(out, (int)UNPACK_B(op_word));
         print_rawk_d(out, c, UNPACK_C(op_word));
         print_jump(out, c->code[pos], pos + 1), pos++;
@@ -701,6 +715,10 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         }
         fprintf(out, "  n=%u", UNPACK_C(op_word));
         fprintf(out, "  -> %u", c->code[pos]), pos += 2;
+    } else if (op == OP_RAW_MATH_REAL) {
+        print_rawr(out, (int)UNPACK_A(op_word));
+        print_rawr(out, (int)UNPACK_B(op_word));
+        fprintf(out, "  fn_id=%u", UNPACK_C(op_word));
     } else if (op == OP_RETURN_RAW_INT) {
         print_rawi(out, (int)UNPACK_A(op_word));
     } else if (op == OP_RETURN_RAW_REAL) {
@@ -926,11 +944,13 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
         print_rawk_d(out, c, UNPACK_C(op_word));
-    } else if (op == OP_RAW_LT_INT || op == OP_RAW_LTE_INT) {
+    } else if (op == OP_RAW_LT_INT || op == OP_RAW_LTE_INT || op == OP_RAW_EQ_INT ||
+               op == OP_RAW_NEQ_INT) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
         print_rawk_i(out, c, UNPACK_C(op_word));
-    } else if (op == OP_RAW_LT_REAL || op == OP_RAW_LTE_REAL) {
+    } else if (op == OP_RAW_LT_REAL || op == OP_RAW_LTE_REAL || op == OP_RAW_EQ_REAL ||
+               op == OP_RAW_NEQ_REAL) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
         print_rawk_d(out, c, UNPACK_C(op_word));
