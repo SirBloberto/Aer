@@ -432,6 +432,14 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_RAW_GT_REAL_BOXED] = {"OP_RAW_GT_REAL_BOXED", "reg = rawr > rk (tag-checked)"},
     [OP_RAW_LTE_REAL_BOXED] = {"OP_RAW_LTE_REAL_BOXED", "reg = rawr <= rk (tag-checked)"},
     [OP_RAW_GTE_REAL_BOXED] = {"OP_RAW_GTE_REAL_BOXED", "reg = rawr >= rk (tag-checked)"},
+    [OP_RAW_LT_INT_JUMP_IF_FALSE] =
+        {"OP_RAW_LT_INT_JUMP_IF_FALSE", "jump if !(rawi < rawi)", {0}, false, 1, 0},
+    [OP_RAW_LTE_INT_JUMP_IF_FALSE] =
+        {"OP_RAW_LTE_INT_JUMP_IF_FALSE", "jump if !(rawi <= rawi)", {0}, false, 1, 0},
+    [OP_RAW_LT_REAL_JUMP_IF_FALSE] =
+        {"OP_RAW_LT_REAL_JUMP_IF_FALSE", "jump if !(rawr < rawr)", {0}, false, 1, 0},
+    [OP_RAW_LTE_REAL_JUMP_IF_FALSE] =
+        {"OP_RAW_LTE_REAL_JUMP_IF_FALSE", "jump if !(rawr <= rawr)", {0}, false, 1, 0},
 };
 
 static const char* cast_name(int k) {
@@ -647,6 +655,14 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
                op == OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE || op == OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE) {
         print_rawr(out, (int)UNPACK_B(op_word));
         print_rk8_rawr(out, c, UNPACK_C(op_word));
+        print_jump(out, c->code[pos], pos + 1), pos++;
+    } else if (op == OP_RAW_LT_INT_JUMP_IF_FALSE || op == OP_RAW_LTE_INT_JUMP_IF_FALSE) {
+        print_rawi(out, (int)UNPACK_B(op_word));
+        print_rawi(out, (int)UNPACK_C(op_word));
+        print_jump(out, c->code[pos], pos + 1), pos++;
+    } else if (op == OP_RAW_LT_REAL_JUMP_IF_FALSE || op == OP_RAW_LTE_REAL_JUMP_IF_FALSE) {
+        print_rawr(out, (int)UNPACK_B(op_word));
+        print_rawr(out, (int)UNPACK_C(op_word));
         print_jump(out, c->code[pos], pos + 1), pos++;
     } else if (op == OP_INDEX_GET || op == OP_TYPED_INDEX_GET_UNCHECKED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));

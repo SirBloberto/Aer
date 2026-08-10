@@ -360,6 +360,15 @@ typedef enum {
     OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE,
     OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE,
 
+    /* The same fusion where BOTH operands are raw slots -- `iter < max_iter` once max_iter is a raw
+       parameter rather than a boxed one. No GT/GTE members: the raw-vs-raw family emits `a > b` as
+       `b < a` with the slots already swapped (try_emit_binary_raw, parser.c), so four cover eight
+       operators. Word0 B/C are the two slots; the jump target trails. */
+    OP_RAW_LT_INT_JUMP_IF_FALSE,
+    OP_RAW_LTE_INT_JUMP_IF_FALSE,
+    OP_RAW_LT_REAL_JUMP_IF_FALSE,
+    OP_RAW_LTE_REAL_JUMP_IF_FALSE,
+
     /* Builds one string from N parts in a single allocation. `"key_{n}"` used to compile to
        OP_LOADK + OP_TO_STR + OP_ADD -- three dispatches and two AerStrings, the second immediately
        garbage. Each part is a whole trailing word holding an RK16, so a constant segment needs no

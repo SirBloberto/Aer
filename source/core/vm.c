@@ -2825,6 +2825,11 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gt_real_boxed_jump_if_false,
         [OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lte_real_boxed_jump_if_false,
         [OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gte_real_boxed_jump_if_false,
+
+        [OP_RAW_LT_INT_JUMP_IF_FALSE] = &&lbl_raw_lt_int_jump_if_false,
+        [OP_RAW_LTE_INT_JUMP_IF_FALSE] = &&lbl_raw_lte_int_jump_if_false,
+        [OP_RAW_LT_REAL_JUMP_IF_FALSE] = &&lbl_raw_lt_real_jump_if_false,
+        [OP_RAW_LTE_REAL_JUMP_IF_FALSE] = &&lbl_raw_lte_real_jump_if_false,
         [OP_INTERP] = &&lbl_interp,
         [OP_INDEX_GET_INTERP] = &&lbl_index_get_interp,
     };
@@ -5259,6 +5264,24 @@ lbl_raw_load_int_pool : {
     RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(gte, >=, ">=")
 
 #undef RAW_CMP_REAL_BOXED_JUMP_IF_FALSE
+
+/* Both operands raw: no tag, no table, no error path -- the comparison is the two loads the
+   hardware would do anyway. */
+#define RAW_CMP_JUMP_IF_FALSE(name, bank, op)                                                                \
+    lbl_raw_##name##_jump_if_false : {                                                                       \
+        int a = (int)UNPACK_B(op_word);                                                                      \
+        int b = (int)UNPACK_C(op_word);                                                                      \
+        int target = READ();                                                                                 \
+        if (!(bank[a] op bank[b])) pc += (int32_t)target;                                                     \
+        DISPATCH();                                                                                          \
+    }
+
+    RAW_CMP_JUMP_IF_FALSE(lt_int, raw_ints, <)
+    RAW_CMP_JUMP_IF_FALSE(lte_int, raw_ints, <=)
+    RAW_CMP_JUMP_IF_FALSE(lt_real, raw_reals, <)
+    RAW_CMP_JUMP_IF_FALSE(lte_real, raw_reals, <=)
+
+#undef RAW_CMP_JUMP_IF_FALSE
 
 /* The operand words are read by the helpers straight out of the instruction stream rather than into
    a local array -- 16 AerVals of scratch here would grow vm_run_slice's frame for every opcode

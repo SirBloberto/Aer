@@ -411,6 +411,10 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
             case OP_RAW_GT_REAL_BOXED: fused_op = OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE; break;
             case OP_RAW_LTE_REAL_BOXED: fused_op = OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE; break;
             case OP_RAW_GTE_REAL_BOXED: fused_op = OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE; break;
+            case OP_RAW_LT_INT: fused_op = OP_RAW_LT_INT_JUMP_IF_FALSE; break;
+            case OP_RAW_LTE_INT: fused_op = OP_RAW_LTE_INT_JUMP_IF_FALSE; break;
+            case OP_RAW_LT_REAL: fused_op = OP_RAW_LT_REAL_JUMP_IF_FALSE; break;
+            case OP_RAW_LTE_REAL: fused_op = OP_RAW_LTE_REAL_JUMP_IF_FALSE; break;
             default:
                 matched = false;
                 fused_op = OP_EQ_JUMP_IF_FALSE;
@@ -1307,6 +1311,7 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
 
     if (is_cmp) {
         int dest = reg_alloc();
+        P.last_cmp_offset = c->count;
         chunk_emit(c, PACK3(raw_op, dest, swap_cmp ? slot_rhs : slot_lhs, swap_cmp ? slot_lhs : slot_rhs));
         *out_rk = dest;
         return true;

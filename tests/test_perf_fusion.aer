@@ -461,4 +461,22 @@ function cb_sieve(limit):
     return count
 assert(cb_sieve(30) == 10, "sieve-shaped nested-loop comparisons (p*p<=limit, i<=limit) all fuse and still count primes correctly")
 
+# Both operands raw locals, so the comparison fuses with no boxed side at all.
+# Floats specifically: an int bound would keep the loop on the int opcodes.
+x = 0.0
+x_limit = 4.0
+x_steps = 0
+for x < x_limit:
+    x_steps += 1
+    x += 0.5
+assert(x_steps == 8, "a float loop bounded by another float local fuses raw-vs-raw and runs the exact trip count")
+
+y = 0.0
+y_limit = 3.0
+y_sum = 0.0
+for y <= y_limit:
+    y_sum += y
+    y += 1.0
+assert(y_sum == 6.0, "the <= form of a raw-vs-raw float comparison includes its bound")
+
 print("test_perf_fusion.aer: all assertions passed.")
