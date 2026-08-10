@@ -109,6 +109,12 @@ void* pool_alloc(Pool* p) {
         if (p->slab_young_count[i] == 0)
             pool_link_young(p, i); /* 0 -> 1 transition -- rejoin the young thread */
         p->slab_young_count[i]++; /* exact and unconditional -- this slab is known for certain */
+        /* The next call's first act is to read the next free cell's own next-pointer, and a free
+           cell has been untouched since the sweep that freed it -- a serial head->next->next chain
+           of misses, one per allocation, each fully exposed. Starting it here buys it the whole of
+           the caller's initialization. Prefetching the value already in hand rather than re-reading
+           free_slab_head skips this slab's exhaustion (rare, and NULL prefetches harmlessly). */
+        __builtin_prefetch(p->slab_free_list[i]);
         return cell;
     }
     /* Falls through to the pool-wide free list -- in practice only ever populated by hashtable.c's
