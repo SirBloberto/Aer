@@ -58,6 +58,8 @@ typedef struct {
     int slot[HOIST_MAX];
 } LoopHoist;
 
+typedef enum { RAWK_NONE, RAWK_INT, RAWK_REAL } RawKind;
+
 /* Every mutable global the compile functions share. P (below) is the live instance;
    parser_save_state/restore_state snapshot it wholesale for a nested compile. */
 typedef struct Parser {
@@ -133,6 +135,23 @@ typedef struct Parser {
        vm.h). -1 outside any function body. */
     int current_func_idx;
     bool self_call_seen;
+
+    /* Set only while compiling a numeric variant whose parameters are ALL raw of one kind, sitting
+       in slots 0..n-1 -- the shape OP_CALL_RAW_* can encode. A self-call under those conditions
+       passes and returns scalars; anything else falls back to the ordinary boxed call.
+       variant_kind is RAWK_NONE when no such variant is in progress. */
+    RawKind variant_kind;
+    int variant_param_count;
+    unsigned int variant_offset;
+    /* What a raw self-call in this variant may take its RESULT as. A function's return kind is
+       independent of its parameter kind (recursive_raw_sum takes an int and returns a real), and is
+       not knowable while first compiling the body -- so the variant compiles once to discover it,
+       then recompiles with this set. RAWK_NONE means the result comes back boxed. */
+    RawKind variant_return_kind;
+    /* What the body currently compiling hands back: -1 none yet, 0 boxed or mixed, 1 int, 2 real.
+       Tracked as returns are emitted rather than scanned off the bytecode afterwards -- instruction
+       lengths vary, so a linear word scan can read an operand as an opcode. */
+    int body_return_kind;
 
     /* Same trick for the last OP_INTERP: emit_index_get folds one into OP_INDEX_GET_INTERP when the
        interpolation it is indexing with is the instruction immediately before it. */
@@ -503,7 +522,13 @@ unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int a
     return patch_offset;
 }
 
+/* 0 for a boxed return; mixing kinds also collapses to 0. */
+static void note_return_kind(int kind) {
+    P.body_return_kind = (P.body_return_kind < 0 || P.body_return_kind == kind) ? kind : 0;
+}
+
 void emit_return(Chunk* c, int src_reg) {
+    note_return_kind(0);
     chunk_emit(c, PACK1(OP_RETURN, src_reg));
 }
 
@@ -937,7 +962,6 @@ static bool var_lookup_rk(unsigned int name_idx, int* out_rk) {
     return false;
 }
 
-typedef enum { RAWK_NONE, RAWK_INT, RAWK_REAL } RawKind;
 
 /* The ONE gate deciding whether an expression can compose as raw: an already-raw operand, or a
    compile-time int/real literal. A call result, container read, string, or struct/array/dict is
@@ -4421,6 +4445,41 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
             current_source_cursor(); /* captured NOW -- before the arg list below consumes past it */
     }
 
+    /* A one-argument recursive call inside a numeric variant can hand the argument over as a
+       scalar. Decided before the argument is parsed, since the parser cannot back up -- but nothing
+       is lost if the argument turns out not to be raw, because the boxed emit below is reached with
+       the same single register either way. Arity 1 only: more arguments would have to land in
+       CONSECUTIVE raw slots, and moving them there costs exactly what the boxing it replaces does. */
+    if (P.variant_kind != RAWK_NONE && is_func && func_arity == 1 && func_min_arity == 1 &&
+        (int)func_index == P.current_func_idx) {
+        int rk_arg = parse_binary(c, 0);
+        require(TOKEN_CLOSE_PARENTHESE, "expected ')' after call arguments");
+        if (parse_had_error) return 0;
+        bool is_int = (P.variant_kind == RAWK_INT);
+        bool ret_int = (P.variant_return_kind == RAWK_INT);
+        if (P.variant_return_kind != RAWK_NONE && rk_raw_kind(c, rk_arg) == P.variant_kind) {
+            int arg_slot = raw_materialize(c, rk_arg, P.variant_kind);
+            int dest_slot = ret_int ? raw_int_alloc() : raw_real_alloc();
+            if (arg_slot >= 0 && dest_slot >= 0) {
+                chunk_emit(c, PACK3(is_int ? OP_CALL_RAW_INT : OP_CALL_RAW_REAL, dest_slot, arg_slot, 1));
+                chunk_emit(c, P.variant_offset);
+                chunk_emit(c, (uint32_t)(func_index * sizeof(ChunkFunction)));
+                chunk_emit(c, ret_int ? 1u : 2u);
+                return (ret_int ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest_slot;
+            }
+            if (dest_slot >= 0) {
+                if (ret_int)
+                    raw_int_free(1);
+                else
+                    raw_real_free(1);
+            }
+        }
+        int arg_reg = materialize(c, rk_arg);
+        int dest_reg = arg_reg; /* the call writes its result over its own argument register */
+        emit_call(c, dest_reg, func_offset, arg_reg, 1, func_index);
+        return dest_reg;
+    }
+
     /* Usually a no-op check, not a copy -- see arg_materialize's own comment. */
     int arg_reg_base;
     int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
@@ -4538,10 +4597,22 @@ static void parse_return(Chunk* c) {
             if (orig_op == OP_CALL || orig_op == OP_CALL_VALUE) {
                 int tail_op = (orig_op == OP_CALL) ? OP_TAIL_CALL : OP_TAIL_CALL_VALUE;
                 c->code[op_slot] = (c->code[op_slot] & ~0xFFU) | (uint32_t)tail_op;
+                note_return_kind(0); /* the tail call's own return decides, and it hands back boxed */
                 return;
             }
         }
 
+        /* A raw result returns as a scalar rather than being boxed first -- the return opcodes box
+           themselves when the caller is an ordinary one, so this is safe in any function. */
+        RawKind ret_kind = rk_raw_kind(c, rk_first);
+        if (ret_kind != RAWK_NONE) {
+            int slot = raw_materialize(c, rk_first, ret_kind);
+            if (slot >= 0) {
+                note_return_kind(ret_kind == RAWK_INT ? 1 : 2);
+                chunk_emit(c, PACK1(ret_kind == RAWK_INT ? OP_RETURN_RAW_INT : OP_RETURN_RAW_REAL, slot));
+                return;
+            }
+        }
         int reg = materialize(c, rk_first);
         emit_return(c, reg);
         return;
@@ -4744,10 +4815,15 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     P.function_depth--;
 
     if (!parse_had_error) {
-        /* Implicit 'return null' if control falls off the end. */
+        /* Implicit 'return null' if control falls off the end. Deliberately not counted in
+           body_return_kind: it is a safety net, not one of the body's real results, and counting it
+           would make every function look like it returns mixed kinds. A caller that asked for a raw
+           result and actually reaches this errors at the return rather than reading null as 0. */
+        int saved_return_kind = P.body_return_kind;
         int rk_null = (int)chunk_add_pool(c, aer_null()) | RK_CONST_FLAG;
         int reg_null = materialize(c, rk_null);
         emit_return(c, reg_null);
+        P.body_return_kind = saved_return_kind;
     }
 
     *out_max_registers = (unsigned int)P.max_register_used;
@@ -4886,10 +4962,72 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     unsigned int max_registers = 0, max_raw_ints = 0, max_raw_reals = 0;
     int slots[SPEC_MAX_RAW_PARAMS];
     for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++) slots[k] = -1;
+    /* OP_CALL_RAW_* can only address one bank and a contiguous run, so a mixed-kind or partially
+       bound signature stays on the boxed call. Parameters reserve their slots before anything else
+       compiles, so `raw_param_regs[k] == k` is exactly "all of them, in order". */
+    P.current_func_idx = (int)(target_f - c->functions);
+    P.variant_kind = RAWK_NONE;
+    if (raw_param_count > 0 && raw_param_count == (int)target_f->arity) {
+        bool uniform = true;
+        for (int k = 0; k < raw_param_count; k++)
+            if (raw_param_types[k] != raw_param_types[0] || raw_param_regs[k] != k) uniform = false;
+        if (uniform) {
+            P.variant_kind = (raw_param_types[0] == TYPE_INTEGER) ? RAWK_INT : RAWK_REAL;
+            P.variant_param_count = raw_param_count;
+            P.variant_offset = new_offset;
+        }
+    }
+    P.variant_return_kind = RAWK_NONE;
+    P.body_return_kind = -1;
     if (!parse_had_error) {
         parse_function_body(c, param_names, param_count, param_index, shape,
                             kind == SPEC_KIND_ARRAY_OF_STRUCTS, raw_param_regs, raw_param_types,
                             raw_param_count, &max_registers, &max_raw_ints, &max_raw_reals, slots);
+    }
+    /* A self-call cannot know its own result's kind while the body is still compiling, and its
+       returns are boxed precisely BECAUSE it boxed -- fib's `fib(n-1) + fib(n-2)` looks like a
+       boxed return on a pass where the calls were boxed. So the kind is guessed and then checked
+       against what the recompiled body actually returns; a guess that does not hold is discarded,
+       leaving the boxed compile. Both guesses are tried, and only at specialization time. */
+    if (!parse_had_error && P.variant_kind != RAWK_NONE && P.self_call_seen) {
+        RawKind guesses[2] = {RAWK_INT, RAWK_REAL};
+        if (P.body_return_kind == 2) guesses[0] = RAWK_REAL, guesses[1] = RAWK_INT;
+        for (int g = 0; g < 2; g++) {
+            c->count = new_offset;
+            lexer_restore_state(saved_lexer);
+            saved_lexer = lexer_save_state();
+            lexer_begin_span(target_f->source_span, target_f->source_span_len, target_f->source_span_line);
+            lex();
+            parse_function_signature(c, param_names, param_defaults, &param_count, &min_param_count);
+            P.variant_return_kind = guesses[g];
+            P.body_return_kind = -1;
+            for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++) slots[k] = -1;
+            max_registers = max_raw_ints = max_raw_reals = 0;
+            parse_function_body(c, param_names, param_count, param_index, shape,
+                                kind == SPEC_KIND_ARRAY_OF_STRUCTS, raw_param_regs, raw_param_types,
+                                raw_param_count, &max_registers, &max_raw_ints, &max_raw_reals, slots);
+            RawKind got = (P.body_return_kind == 1) ? RAWK_INT
+                          : (P.body_return_kind == 2) ? RAWK_REAL
+                                                      : RAWK_NONE;
+            if (!parse_had_error && got == guesses[g]) break;
+            if (g == 1) { /* neither held -- rebuild the boxed body, which always compiles */
+                parse_had_error = false;
+                c->count = new_offset;
+                lexer_restore_state(saved_lexer);
+                saved_lexer = lexer_save_state();
+                lexer_begin_span(target_f->source_span, target_f->source_span_len,
+                                 target_f->source_span_line);
+                lex();
+                parse_function_signature(c, param_names, param_defaults, &param_count, &min_param_count);
+                P.variant_return_kind = RAWK_NONE;
+                for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++) slots[k] = -1;
+                max_registers = max_raw_ints = max_raw_reals = 0;
+                parse_function_body(c, param_names, param_count, param_index, shape,
+                                    kind == SPEC_KIND_ARRAY_OF_STRUCTS, raw_param_regs, raw_param_types,
+                                    raw_param_count, &max_registers, &max_raw_ints, &max_raw_reals, slots);
+            }
+            parse_had_error = false;
+        }
     }
     bool ok = !parse_had_error;
 

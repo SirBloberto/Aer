@@ -371,6 +371,19 @@ typedef enum {
     OP_TYPED_INDEX_SET_RAW_INT,
     OP_TYPED_INDEX_SET_RAW_REAL,
 
+    /* A recursive call from inside a numeric variant, handing raw slots over and taking one back --
+       the last place a numeric body had to build an AerVal just to cross a frame boundary. Only
+       emitted INTO a variant body and only for a call to that same function, so the variant is
+       always already compiled when this runs; no lazy-compile fallback exists or is needed.
+       word0 = PACK3(op, dest_raw_slot, arg_slot_base, arg_count); then the variant's code offset,
+       the function's byte offset, and the result kind (independent of the argument kind). */
+    OP_CALL_RAW_INT,
+    OP_CALL_RAW_REAL,
+    /* Returns a raw slot. Boxes into the caller's register when the frame was entered by an
+       ordinary call instead (dest_raw_kind == 0), so the same body serves both entry points. */
+    OP_RETURN_RAW_INT,
+    OP_RETURN_RAW_REAL,
+
     /* Builds one string from N parts in a single allocation. `"key_{n}"` used to compile to
        OP_LOADK + OP_TO_STR + OP_ADD -- three dispatches and two AerStrings, the second immediately
        garbage. Each part is a whole trailing word holding an RK16, so a constant segment needs no
@@ -980,6 +993,11 @@ typedef struct {
 
             unsigned int return_ip; /* where to resume in the CALLER */
             int dest_reg; /* which of the CALLER's registers gets the return value */
+            /* 0 = dest_reg names a boxed register, the ordinary case. 1/2 = it names a raw int/real
+               slot instead, because this frame was entered by OP_CALL_RAW_* -- the return then
+               moves a scalar rather than building an AerVal. Both return opcodes handle both, so a
+               body entered either way is correct. */
+            unsigned char dest_raw_kind;
 
             unsigned int code_offset; /* this frame's entry point, for stack traces; unset on frame 0 */
             unsigned int tail_calls_collapsed; /* tail calls collapsed since this frame's last real push */

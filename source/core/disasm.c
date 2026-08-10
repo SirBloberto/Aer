@@ -442,6 +442,11 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_TYPED_INDEX_GET_RAW_REAL] = {"OP_TYPED_INDEX_GET_RAW_REAL", "rawr = typed_arr[rk], never boxed"},
     [OP_TYPED_INDEX_SET_RAW_INT] = {"OP_TYPED_INDEX_SET_RAW_INT", "typed_arr[rk] = rawi, never boxed"},
     [OP_TYPED_INDEX_SET_RAW_REAL] = {"OP_TYPED_INDEX_SET_RAW_REAL", "typed_arr[rk] = rawr, never boxed"},
+    [OP_CALL_RAW_INT] = {"OP_CALL_RAW_INT", "recursive numeric call, int args/result stay raw", {0}, false, 2, 0},
+    [OP_CALL_RAW_REAL] =
+        {"OP_CALL_RAW_REAL", "recursive numeric call, real args/result stay raw", {0}, false, 2, 0},
+    [OP_RETURN_RAW_INT] = {"OP_RETURN_RAW_INT", "return rawi (boxes if the caller wants boxed)"},
+    [OP_RETURN_RAW_REAL] = {"OP_RETURN_RAW_REAL", "return rawr (boxes if the caller wants boxed)"},
 };
 
 static const char* cast_name(int k) {
@@ -686,6 +691,20 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
+    } else if (op == OP_CALL_RAW_INT || op == OP_CALL_RAW_REAL) {
+        if (op == OP_CALL_RAW_INT) {
+            print_rawi(out, (int)UNPACK_A(op_word));
+            print_rawi(out, (int)UNPACK_B(op_word));
+        } else {
+            print_rawr(out, (int)UNPACK_A(op_word));
+            print_rawr(out, (int)UNPACK_B(op_word));
+        }
+        fprintf(out, "  n=%u", UNPACK_C(op_word));
+        fprintf(out, "  -> %u", c->code[pos]), pos += 2;
+    } else if (op == OP_RETURN_RAW_INT) {
+        print_rawi(out, (int)UNPACK_A(op_word));
+    } else if (op == OP_RETURN_RAW_REAL) {
+        print_rawr(out, (int)UNPACK_A(op_word));
     } else if (op == OP_TYPED_INDEX_GET_RAW_INT || op == OP_TYPED_INDEX_GET_RAW_REAL) {
         if (op == OP_TYPED_INDEX_GET_RAW_INT)
             print_rawi(out, (int)UNPACK_A(op_word));

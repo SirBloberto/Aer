@@ -269,6 +269,29 @@ for tlx_k <= 50:
     tlx_k += 1
 assert(recursive_raw_sum(50) == expected, "50 levels of recursion, each with its own live raw int + raw real local, all isolated correctly via the shared bump-pointer raw stack")
 
+# A recursive numeric function passes its argument and result as raw scalars (OP_CALL_RAW_*),
+# so the int and float forms must each still produce exactly what the boxed version did.
+function raw_call_int(n):
+    if n <= 0:
+        return 0
+    return n + raw_call_int(n - 1)
+assert(raw_call_int(10) == 55, "an int-parameter recursive call passing and returning raw scalars still sums correctly")
+assert(raw_call_int(0) == 0, "its base case returns raw without recursing")
+
+function raw_call_real(x):
+    if x <= 0.0:
+        return 0.0
+    return x + raw_call_real(x - 1.0)
+assert(raw_call_real(4.0) == 10.0, "a float-parameter recursive call passing and returning raw scalars still sums correctly")
+
+# The parameter is int but the result is a float -- the call site must take the result from the
+# float bank, not truncate it into the int one.
+function raw_call_int_to_real(n):
+    if n <= 0:
+        return 0.5
+    return 1.5 + raw_call_int_to_real(n - 1)
+assert(raw_call_int_to_real(3) == 5.0, "a raw call whose result kind differs from its parameter kind keeps the result exact")
+
 # ------------------------------------------------------------------ #
 # Raw locals live across an OP_CALL_VALUE boundary (call through a     #
 # variable, not a direct named call like recursive_raw_sum above) --   #

@@ -1122,6 +1122,7 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
         memset(&callee->registers[fn->arity], 0, (fn->max_registers - fn->arity) * sizeof(AerVal));
     callee->return_ip = return_ip;
     callee->dest_reg = 0;
+    callee->dest_raw_kind = 0;
     callee->code_offset = fn->code_offset;
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = true;
@@ -1199,6 +1200,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         memset(&callee->registers[f->arity], 0, (f->max_registers - f->arity) * sizeof(AerVal));
     callee->return_ip = return_ip;
     callee->dest_reg = dest_reg;
+    callee->dest_raw_kind = 0;
     callee->code_offset = f->code_offset;
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
@@ -2857,6 +2859,10 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_TYPED_INDEX_GET_RAW_REAL] = &&lbl_typed_index_get_raw_real,
         [OP_TYPED_INDEX_SET_RAW_INT] = &&lbl_typed_index_set_raw_int,
         [OP_TYPED_INDEX_SET_RAW_REAL] = &&lbl_typed_index_set_raw_real,
+        [OP_CALL_RAW_INT] = &&lbl_call_raw_int,
+        [OP_CALL_RAW_REAL] = &&lbl_call_raw_real,
+        [OP_RETURN_RAW_INT] = &&lbl_return_raw_int,
+        [OP_RETURN_RAW_REAL] = &&lbl_return_raw_real,
         [OP_DESTRUCTURE] = &&lbl_destructure,
         [OP_SLICE_GET] = &&lbl_slice_get,
         [OP_DICT_NEW] = &&lbl_dict_new,
@@ -3337,6 +3343,7 @@ lbl_call : {
     callee->return_ip =
         (unsigned int)(pc - code); /* already past this instruction's operands -- the correct resume point */
     callee->dest_reg = dest_reg;
+    callee->dest_raw_kind = 0;
     callee->code_offset = chosen_offset;
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
@@ -3420,6 +3427,7 @@ lbl_return : {
     AerVal result = callee->registers[src_reg];
     unsigned int return_ip = callee->return_ip;
     int dest_reg = callee->dest_reg;
+    unsigned char dest_raw_kind = callee->dest_raw_kind;
     vm->call_depth--;
     /* Refreshed BEFORE the write below -- registers still pointed at the callee's (now-popped)
        frame otherwise, corrupting whichever register of the CALLER's frame happens to share
@@ -3428,10 +3436,117 @@ lbl_return : {
     registers = caller->registers;
     raw_ints = caller->raw_ints;
     raw_reals = caller->raw_reals;
-    registers[dest_reg] = result;
+    /* A raw-expecting caller (OP_CALL_RAW_*) can still reach an ordinary return -- the same body
+       serves both entry points, and only some of its returns may be raw. */
+    if (dest_raw_kind == 0)
+        registers[dest_reg] = result;
+    else if (result.tag != TYPE_INTEGER && result.tag != TYPE_REAL)
+        /* Reached by falling off the end of a function a raw call site expected a number from --
+           the caller has nowhere to put a non-number, and reading null as 0 would turn what used to
+           be a clear error into a wrong answer. */
+        error("Expected a number back from this call, got %s", vm_type_name(c, result));
+    else if (dest_raw_kind == 1)
+        raw_ints[dest_reg] = (result.tag == TYPE_REAL) ? (int64_t)result.as.d : result.as.i;
+    else
+        raw_reals[dest_reg] = (result.tag == TYPE_INTEGER) ? (double)result.as.i : result.as.d;
     pc = code + return_ip;
     DISPATCH();
 }
+
+/* The raw counterparts. Boxing here (dest_raw_kind == 0) is the ordinary case for a variant body
+   entered from a plain call site, not a fallback. */
+lbl_return_raw_int : {
+    int src = (int)UNPACK_A(op_word);
+    CallFrame* callee = &vm->call_stack[vm->call_depth];
+    int64_t result = callee->raw_ints[src];
+    unsigned int return_ip = callee->return_ip;
+    int dest_reg = callee->dest_reg;
+    unsigned char dest_raw_kind = callee->dest_raw_kind;
+    vm->call_depth--;
+    CallFrame* caller = &vm->call_stack[vm->call_depth];
+    registers = caller->registers;
+    raw_ints = caller->raw_ints;
+    raw_reals = caller->raw_reals;
+    if (dest_raw_kind == 1)
+        raw_ints[dest_reg] = result;
+    else if (dest_raw_kind == 0)
+        registers[dest_reg] = aer_int(result);
+    else
+        raw_reals[dest_reg] = (double)result;
+    pc = code + return_ip;
+    DISPATCH();
+}
+
+lbl_return_raw_real : {
+    int src = (int)UNPACK_A(op_word);
+    CallFrame* callee = &vm->call_stack[vm->call_depth];
+    double result = callee->raw_reals[src];
+    unsigned int return_ip = callee->return_ip;
+    int dest_reg = callee->dest_reg;
+    unsigned char dest_raw_kind = callee->dest_raw_kind;
+    vm->call_depth--;
+    CallFrame* caller = &vm->call_stack[vm->call_depth];
+    registers = caller->registers;
+    raw_ints = caller->raw_ints;
+    raw_reals = caller->raw_reals;
+    if (dest_raw_kind == 2)
+        raw_reals[dest_reg] = result;
+    else if (dest_raw_kind == 0)
+        registers[dest_reg] = aer_real(result);
+    else
+        raw_ints[dest_reg] = (int64_t)result;
+    pc = code + return_ip;
+    DISPATCH();
+}
+
+/* Recursive call inside a numeric variant: arguments move raw slot to raw slot and the result comes
+   back the same way. No resolver -- the target is this same function's variant, already compiled
+   (this opcode only exists inside it), and its frame sizes come straight off the SpecEntry the
+   variant was recorded in. Registers still need clearing: a variant body uses boxed registers too,
+   and mark_vm_roots traces every one below frame_size. */
+#define CALL_RAW(kindname, bank)                                                                    \
+    lbl_call_raw_##kindname : {                                                                              \
+        int dest_slot = (int)UNPACK_A(op_word);                                                              \
+        int arg_slot_base = (int)UNPACK_B(op_word);                                                          \
+        int arg_count = (int)UNPACK_C(op_word);                                                              \
+        unsigned int variant_offset = (unsigned int)READ();                                                  \
+        unsigned int func_byte_offset = (unsigned int)READ();                                                \
+        unsigned int ret_kind = (unsigned int)READ();                                                        \
+        ChunkFunction* target_f = (ChunkFunction*)((char*)functions + func_byte_offset);                     \
+        if (vm->call_depth + 1 >= VM_CALL_MAX) {                                                             \
+            error("v3 call stack overflow");                                                                 \
+            DISPATCH();                                                                                      \
+        }                                                                                                    \
+        const SpecEntry* e = &target_f->specializations[0];                                                  \
+        CallFrame* caller = &vm->call_stack[vm->call_depth];                                                 \
+        CallFrame* callee = &vm->call_stack[vm->call_depth + 1];                                             \
+        callee->registers = registers + caller->frame_size;                                                  \
+        callee->frame_size = e->raw_variant_max_registers;                                                   \
+        callee->raw_ints = raw_ints + caller->raw_int_frame_size;                                            \
+        callee->raw_reals = raw_reals + caller->raw_real_frame_size;                                         \
+        callee->raw_int_frame_size = e->raw_variant_max_raw_ints;                                            \
+        callee->raw_real_frame_size = e->raw_variant_max_raw_reals;                                          \
+        for (int i = 0; i < arg_count; i++)                                                                  \
+            callee->bank[i] = bank[arg_slot_base + i];                                                       \
+        memset(callee->registers, 0, e->raw_variant_max_registers * sizeof(AerVal));                         \
+        callee->return_ip = (unsigned int)(pc - code);                                                       \
+        callee->dest_reg = dest_slot;                                                                        \
+        callee->dest_raw_kind = (unsigned char)ret_kind;                                                     \
+        callee->code_offset = variant_offset;                                                                \
+        callee->tail_calls_collapsed = 0;                                                                    \
+        callee->synthetic_entry = false;                                                                     \
+        vm->call_depth++;                                                                                    \
+        registers = callee->registers;                                                                       \
+        raw_ints = callee->raw_ints;                                                                         \
+        raw_reals = callee->raw_reals;                                                                       \
+        pc = code + variant_offset;                                                                          \
+        DISPATCH();                                                                                          \
+    }
+
+    CALL_RAW(int, raw_ints)
+    CALL_RAW(real, raw_reals)
+
+#undef CALL_RAW
 
 /* Bridges to the same stack-based stdlib dispatch lbl_call_module uses. */
 lbl_call_module : {
