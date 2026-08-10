@@ -2199,10 +2199,11 @@ static void chunk_ensure_call_spec_cache(Chunk* c) {
    its icache cost without executing it. noinline is required: a static function with one call site
    is a prime candidate for LTO to inline right back in. */
 static void __attribute__((noinline))
-vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
-                               unsigned int ip, unsigned int* chosen_offset,
-                               unsigned int* chosen_max_registers, unsigned int* chosen_max_raw_ints,
-                               unsigned int* chosen_max_raw_reals) {
+vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* registers,
+                                    int arg_reg_base, unsigned int ip, unsigned int* chosen_offset,
+                                    unsigned int* chosen_max_registers,
+                                    unsigned int* chosen_max_raw_ints,
+                                    unsigned int* chosen_max_raw_reals) {
     unsigned int site =
         ip - 3; /* this instruction's own word0 offset -- ip already advanced past all 3 words by now */
     /* Lowest set bit -- which argument register carries the shape-sensitive parameter. Only
@@ -2398,6 +2399,34 @@ vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* regist
             }
         }
     }
+}
+
+/* The monomorphic case, split off so it does not pay for the full resolver's frame: that one is
+   sized for the raw-variant block's candidate arrays and so also carries a stack-protector canary,
+   both on every call regardless of which path runs. Split here rather than at the call site because
+   growing lbl_call reshuffles register allocation across all 153 label bodies -- measured at +6.93%
+   cycles on nbody, whose lbl_call is cold, for a call-site version of exactly this test. */
+static void __attribute__((noinline))
+vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
+                               unsigned int ip, unsigned int* chosen_offset,
+                               unsigned int* chosen_max_registers, unsigned int* chosen_max_raw_ints,
+                               unsigned int* chosen_max_raw_reals) {
+    unsigned int site = ip - 3;
+    /* arity 1 with a non-zero mask puts the shape-sensitive parameter at index 0, and leaves the
+       raw-variant block inert (it skips that one parameter and there is no other), so a site-cache
+       hit is the whole answer. */
+    if (target_f->arity == 1 && site < c->call_spec_cache_cap &&
+        aer_type(registers[arg_reg_base]) == TYPE_STRUCT &&
+        c->call_spec_cache[site].last_shape == aer_as_struct(registers[arg_reg_base])->shape) {
+        const CallSpecCacheEntry* hit = &c->call_spec_cache[site];
+        *chosen_offset = hit->last_code_offset;
+        *chosen_max_registers = hit->last_max_registers;
+        *chosen_max_raw_ints = hit->last_max_raw_ints;
+        *chosen_max_raw_reals = hit->last_max_raw_reals;
+        return;
+    }
+    vm_call_resolve_specialization_full(c, target_f, registers, arg_reg_base, ip, chosen_offset,
+                                        chosen_max_registers, chosen_max_raw_ints, chosen_max_raw_reals);
 }
 
 /* lbl_call_module's cold path, split for the same reason as vm_call_resolve_specialization: inlined
