@@ -1117,6 +1117,9 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
         callee->registers[i] = args[i];
     for (int i = arg_count; i < (int)fn->arity; i++)
         callee->registers[i] = vm_default_value(target, fn->defaults[i - fn->min_arity]);
+    /* Same reason as lbl_call's own clear -- everything below frame_size gets traced. */
+    if (fn->arity < fn->max_registers)
+        memset(&callee->registers[fn->arity], 0, (fn->max_registers - fn->arity) * sizeof(AerVal));
     callee->return_ip = return_ip;
     callee->dest_reg = 0;
     callee->code_offset = fn->code_offset;
@@ -1168,6 +1171,10 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         reused->frame_size = f->max_registers;
         reused->raw_int_frame_size = f->max_raw_ints;
         reused->raw_real_frame_size = f->max_raw_reals;
+        /* Growing the reused frame exposes registers the previous occupant never wrote, which
+           mark_vm_roots would still trace -- same clear as the two push paths. */
+        if (f->arity < f->max_registers)
+            memset(&reused->registers[f->arity], 0, (f->max_registers - f->arity) * sizeof(AerVal));
         reused->tail_calls_collapsed++;
         return;
     }
@@ -1187,6 +1194,9 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         callee->registers[i] = caller->registers[arg_reg_base + i];
     for (int i = arg_count; i < (int)f->arity; i++)
         callee->registers[i] = vm_default_value(vm, f->defaults[i - f->min_arity]);
+    /* Same reason as lbl_call's own clear -- everything below frame_size gets traced. */
+    if (f->arity < f->max_registers)
+        memset(&callee->registers[f->arity], 0, (f->max_registers - f->arity) * sizeof(AerVal));
     callee->return_ip = return_ip;
     callee->dest_reg = dest_reg;
     callee->code_offset = f->code_offset;
@@ -1304,6 +1314,46 @@ static inline AerVal vm_typed_elem_read(unsigned char* slot, TypedArrayElemKind 
         }
     }
     return aer_null();
+}
+
+/* vm_typed_elem_read's unboxed counterparts -- same widening rules, no AerVal built. */
+static inline double vm_typed_elem_read_real(unsigned char* slot, TypedArrayElemKind kind) {
+    switch (kind) {
+        case TYPED_ELEM_INT32: {
+            int32_t v;
+            memcpy(&v, slot, 4);
+            return (double)v;
+        }
+        case TYPED_ELEM_FLOAT32: {
+            float v;
+            memcpy(&v, slot, 4);
+            return (double)v;
+        }
+        case TYPED_ELEM_INT64: {
+            int64_t v;
+            memcpy(&v, slot, 8);
+            return (double)v;
+        }
+        case TYPED_ELEM_FLOAT64: {
+            double v;
+            memcpy(&v, slot, 8);
+            return v;
+        }
+    }
+    return 0.0;
+}
+
+/* Only the integer kinds -- a float element read into an int slot would silently truncate, so the
+   caller falls back to the boxed path instead (see lbl_typed_index_get_raw_int). */
+static inline int64_t vm_typed_elem_read_int(unsigned char* slot, TypedArrayElemKind kind) {
+    if (kind == TYPED_ELEM_INT32) {
+        int32_t v;
+        memcpy(&v, slot, 4);
+        return v;
+    }
+    int64_t v;
+    memcpy(&v, slot, 8);
+    return v;
 }
 
 /* Caller must already have validated v against kind -- see vm_typed_array_check. int32 in
@@ -2194,6 +2244,22 @@ static void chunk_ensure_call_spec_cache(Chunk* c) {
     memset(c->call_spec_cache + old_cap, 0, sizeof(CallSpecCacheEntry) * (c->call_spec_cache_cap - old_cap));
 }
 
+/* Writes the arguments a variant binds raw straight into the callee's raw bank. The arguments have
+   already been read to choose the variant, and their types already checked against what it was
+   compiled for, so this is the whole of what the per-parameter prologue opcodes used to do. */
+static inline void vm_bind_raw_params(const SpecEntry* e, AerVal* registers, int arg_reg_base,
+                                      int64_t* callee_raw_ints, double* callee_raw_reals) {
+    for (int k = 0; k < e->raw_param_count; k++) {
+        int slot = e->raw_param_slots[k];
+        if (slot < 0) continue; /* budget ran out for this one -- it stayed boxed */
+        AerVal v = registers[arg_reg_base + e->raw_param_regs[k]];
+        if (e->raw_param_types[k] == TYPE_INTEGER)
+            callee_raw_ints[slot] = v.as.i;
+        else
+            callee_raw_reals[slot] = (v.tag == TYPE_INTEGER) ? (double)v.as.i : v.as.d;
+    }
+}
+
 /* lbl_call's cold path, split out because inlining it made lbl_call ~572 machine instructions --
    by far the largest handler in vm_run_slice, next-largest under 40 -- so every ordinary call paid
    its icache cost without executing it. noinline is required: a static function with one call site
@@ -2203,7 +2269,8 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                                     int arg_reg_base, unsigned int ip, unsigned int* chosen_offset,
                                     unsigned int* chosen_max_registers,
                                     unsigned int* chosen_max_raw_ints,
-                                    unsigned int* chosen_max_raw_reals) {
+                                    unsigned int* chosen_max_raw_reals, int64_t* callee_raw_ints,
+                                    double* callee_raw_reals) {
     unsigned int site =
         ip - 3; /* this instruction's own word0 offset -- ip already advanced past all 3 words by now */
     /* Lowest set bit -- which argument register carries the shape-sensitive parameter. Only
@@ -2360,6 +2427,7 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                     *chosen_max_registers = entry->raw_variant_max_registers;
                     *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
                     *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
+                    vm_bind_raw_params(entry, registers, arg_reg_base, callee_raw_ints, callee_raw_reals);
                 } else if (entry->raw_param_count == 0) {
                     /* Never attempted for THIS entry -- try to compile it now. A failure here
                        (raw_ints/raw_reals budget exhausted -- realistic, since this shape's own
@@ -2384,10 +2452,14 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                             entry->raw_param_types[k] = cand_types[k];
                         }
                         entry->raw_param_count = cand_count;
+                        for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++)
+                            entry->raw_param_slots[k] = variant.raw_param_slots[k];
                         *chosen_offset = entry->raw_variant_code_offset;
                         *chosen_max_registers = entry->raw_variant_max_registers;
                         *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
                         *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
+                        vm_bind_raw_params(entry, registers, arg_reg_base, callee_raw_ints,
+                                           callee_raw_reals);
                     } else {
                         entry->raw_param_count = -1;
                     }
@@ -2408,13 +2480,17 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
 static void __attribute__((noinline))
 vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
                         unsigned int* chosen_offset, unsigned int* chosen_max_registers,
-                        unsigned int* chosen_max_raw_ints, unsigned int* chosen_max_raw_reals) {
+                        unsigned int* chosen_max_raw_ints, unsigned int* chosen_max_raw_reals,
+                        int64_t* callee_raw_ints, double* callee_raw_reals) {
     int cand_regs[SPEC_MAX_RAW_PARAMS];
     ValueType cand_types[SPEC_MAX_RAW_PARAMS];
     int cand_count = 0;
+    /* Binds whichever parameters arrived numeric and leaves the rest boxed -- a collection
+       parameter alongside a scalar one (scale_and_accumulate(nums, factor)) is an ordinary shape,
+       and bailing on it left the scalar boxed through the whole body. */
     for (unsigned int pi = 0; pi < target_f->arity && cand_count < SPEC_MAX_RAW_PARAMS; pi++) {
         ValueType pt = aer_type(registers[arg_reg_base + pi]);
-        if (pt != TYPE_INTEGER && pt != TYPE_REAL) return;
+        if (pt != TYPE_INTEGER && pt != TYPE_REAL) continue;
         cand_regs[cand_count] = (int)pi;
         cand_types[cand_count] = pt;
         cand_count++;
@@ -2433,6 +2509,7 @@ vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, in
         *chosen_max_registers = entry->raw_variant_max_registers;
         *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
         *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
+        vm_bind_raw_params(entry, registers, arg_reg_base, callee_raw_ints, callee_raw_reals);
         return;
     }
     if (entry->raw_param_count != 0) return;
@@ -2457,10 +2534,12 @@ vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, in
         entry->raw_param_types[k] = cand_types[k];
     }
     entry->raw_param_count = cand_count;
+    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++) entry->raw_param_slots[k] = variant.raw_param_slots[k];
     *chosen_offset = entry->raw_variant_code_offset;
     *chosen_max_registers = entry->raw_variant_max_registers;
     *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
     *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
+    vm_bind_raw_params(entry, registers, arg_reg_base, callee_raw_ints, callee_raw_reals);
 }
 
 /* The monomorphic case, split off so it does not pay for the full resolver's frame: that one is
@@ -2472,10 +2551,12 @@ static void __attribute__((noinline))
 vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
                                unsigned int ip, unsigned int* chosen_offset,
                                unsigned int* chosen_max_registers, unsigned int* chosen_max_raw_ints,
-                               unsigned int* chosen_max_raw_reals) {
+                               unsigned int* chosen_max_raw_reals, int64_t* callee_raw_ints,
+                               double* callee_raw_reals) {
     if (target_f->shape_sensitive_mask == SHAPE_MASK_NUMERIC_ONLY) {
         vm_call_resolve_numeric(c, target_f, registers, arg_reg_base, chosen_offset, chosen_max_registers,
-                                chosen_max_raw_ints, chosen_max_raw_reals);
+                                chosen_max_raw_ints, chosen_max_raw_reals, callee_raw_ints,
+                                callee_raw_reals);
         return;
     }
     unsigned int site = ip - 3;
@@ -2493,7 +2574,8 @@ vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* regist
         return;
     }
     vm_call_resolve_specialization_full(c, target_f, registers, arg_reg_base, ip, chosen_offset,
-                                        chosen_max_registers, chosen_max_raw_ints, chosen_max_raw_reals);
+                                        chosen_max_registers, chosen_max_raw_ints, chosen_max_raw_reals,
+                                        callee_raw_ints, callee_raw_reals);
 }
 
 /* lbl_call_module's cold path, split for the same reason as vm_call_resolve_specialization: inlined
@@ -2771,6 +2853,10 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INDEX_SET] = &&lbl_index_set,
         [OP_TYPED_INDEX_GET_UNCHECKED] = &&lbl_typed_index_get_unchecked,
         [OP_TYPED_INDEX_SET_UNCHECKED] = &&lbl_typed_index_set_unchecked,
+        [OP_TYPED_INDEX_GET_RAW_INT] = &&lbl_typed_index_get_raw_int,
+        [OP_TYPED_INDEX_GET_RAW_REAL] = &&lbl_typed_index_get_raw_real,
+        [OP_TYPED_INDEX_SET_RAW_INT] = &&lbl_typed_index_set_raw_int,
+        [OP_TYPED_INDEX_SET_RAW_REAL] = &&lbl_typed_index_set_raw_real,
         [OP_DESTRUCTURE] = &&lbl_destructure,
         [OP_SLICE_GET] = &&lbl_slice_get,
         [OP_DICT_NEW] = &&lbl_dict_new,
@@ -2874,8 +2960,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED] = &&lbl_index_field_compound_raw_int32_unchecked,
         [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED] = &&lbl_index_field_compound_raw_float32_unchecked,
 
-        [OP_UNBOX_PARAM_INT] = &&lbl_unbox_param_int,
-        [OP_UNBOX_PARAM_REAL] = &&lbl_unbox_param_real,
 
         [OP_EQ_JUMP_IF_FALSE] = &&lbl_eq_jump_if_false,
         [OP_NEQ_JUMP_IF_FALSE] = &&lbl_neq_jump_if_false,
@@ -3210,7 +3294,9 @@ lbl_call : {
         unsigned int spec_raw_ints = chosen_max_raw_ints, spec_raw_reals = chosen_max_raw_reals;
         unsigned int resume_at = (unsigned int)(pc - code);
         vm_call_resolve_specialization(c, target_f, registers, arg_reg_base, resume_at, &spec_offset,
-                                       &spec_registers, &spec_raw_ints, &spec_raw_reals);
+                                       &spec_registers, &spec_raw_ints, &spec_raw_reals,
+                                       raw_ints + vm->call_stack[vm->call_depth].raw_int_frame_size,
+                                       raw_reals + vm->call_stack[vm->call_depth].raw_real_frame_size);
         chosen_offset = spec_offset;
         chosen_max_registers = spec_registers;
         chosen_max_raw_ints = spec_raw_ints;
@@ -3241,6 +3327,13 @@ lbl_call : {
     callee->raw_real_frame_size = chosen_max_raw_reals;
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = registers[arg_reg_base + i];
+    /* mark_vm_roots traces every register below frame_size, so the ones this call does not fill are
+       whatever a previously popped, deeper frame left there -- pointers to objects that may since
+       have been collected. Clearing them is what makes the frame safe to trace at all; (AerVal){0}
+       is null by construction (value.h), so this is a memset rather than a store loop. */
+    if ((unsigned int)arg_count < chosen_max_registers)
+        memset(&callee->registers[arg_count], 0,
+               (chosen_max_registers - (unsigned int)arg_count) * sizeof(AerVal));
     callee->return_ip =
         (unsigned int)(pc - code); /* already past this instruction's operands -- the correct resume point */
     callee->dest_reg = dest_reg;
@@ -3480,6 +3573,95 @@ lbl_typed_index_set_unchecked : {
     int64_t i = aer_as_int(*idx);
     unsigned int width = vm_typed_elem_width(ta->elem_kind);
     vm_typed_elem_write(ta->data + (size_t)i * width, ta->elem_kind, *val);
+    DISPATCH();
+}
+
+/* The non-typed-array receiver goes through the ordinary boxed compute and then unboxes, so these
+   stay correct on any value -- a plain array of reals, a string index, a dict -- and only the
+   typed-array case skips the AerVal entirely. A non-numeric result is the same error the raw
+   arithmetic that consumes this slot would have raised one opcode later. */
+lbl_typed_index_get_raw_real : {
+    int dest = (int)UNPACK_A(op_word);
+    int arr_reg = (int)UNPACK_B(op_word);
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
+    AerVal obj = registers[arr_reg];
+    if (aer_type(obj) == TYPE_TYPED_ARRAY) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        unsigned int width = vm_typed_elem_width(ta->elem_kind);
+        raw_reals[dest] = vm_typed_elem_read_real(ta->data + (size_t)aer_as_int(*idx) * width, ta->elem_kind);
+        DISPATCH();
+    }
+    AerVal v;
+    vm_index_get_compute(obj, *idx, &v);
+    if (v.tag == TYPE_REAL)
+        raw_reals[dest] = v.as.d;
+    else if (v.tag == TYPE_INTEGER)
+        raw_reals[dest] = (double)v.as.i;
+    else
+        error("Expected a number from this index, got %s", vm_type_name(c, v));
+    if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);
+    DISPATCH();
+}
+
+lbl_typed_index_get_raw_int : {
+    int dest = (int)UNPACK_A(op_word);
+    int arr_reg = (int)UNPACK_B(op_word);
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
+    AerVal obj = registers[arr_reg];
+    if (aer_type(obj) == TYPE_TYPED_ARRAY) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        if (ta->elem_kind == TYPED_ELEM_INT32 || ta->elem_kind == TYPED_ELEM_INT64) {
+            unsigned int width = vm_typed_elem_width(ta->elem_kind);
+            raw_ints[dest] = vm_typed_elem_read_int(ta->data + (size_t)aer_as_int(*idx) * width, ta->elem_kind);
+            DISPATCH();
+        }
+    }
+    AerVal v;
+    vm_index_get_compute(obj, *idx, &v);
+    if (v.tag == TYPE_INTEGER)
+        raw_ints[dest] = v.as.i;
+    else
+        error("Expected an integer from this index, got %s", vm_type_name(c, v));
+    if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);
+    DISPATCH();
+}
+
+lbl_typed_index_set_raw_real : {
+    int arr_reg = (int)UNPACK_A(op_word);
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
+    int src = (int)UNPACK_C(op_word);
+    AerVal obj = registers[arr_reg];
+    if (aer_type(obj) == TYPE_TYPED_ARRAY) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        if (ta->elem_kind == TYPED_ELEM_FLOAT32 || ta->elem_kind == TYPED_ELEM_FLOAT64) {
+            unsigned char* p = ta->data + (size_t)aer_as_int(*idx) * vm_typed_elem_width(ta->elem_kind);
+            if (ta->elem_kind == TYPED_ELEM_FLOAT64)
+                memcpy(p, &raw_reals[src], 8);
+            else {
+                float fv = (float)raw_reals[src];
+                memcpy(p, &fv, 4);
+            }
+            DISPATCH();
+        }
+    }
+    vm_index_set_compute(vm, obj, *idx, aer_real(raw_reals[src]));
+    DISPATCH();
+}
+
+lbl_typed_index_set_raw_int : {
+    int arr_reg = (int)UNPACK_A(op_word);
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
+    int src = (int)UNPACK_C(op_word);
+    AerVal obj = registers[arr_reg];
+    if (aer_type(obj) == TYPE_TYPED_ARRAY) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        /* int32 range is enforced, never truncated -- vm_typed_array_check's own contract. */
+        if (ta->elem_kind == TYPED_ELEM_INT64) {
+            memcpy(ta->data + (size_t)aer_as_int(*idx) * 8, &raw_ints[src], 8);
+            DISPATCH();
+        }
+    }
+    vm_index_set_compute(vm, obj, *idx, aer_int(raw_ints[src]));
     DISPATCH();
 }
 
@@ -4588,20 +4770,6 @@ lbl_index_field_compound_raw_float32_unchecked : {
    raw-bound parameter, at the very start of a specialized body's "raw-numeric variant"; lbl_call
    already proved the argument's runtime type before choosing to jump here, so there's nothing left
    to check. */
-lbl_unbox_param_int : {
-    int slot = (int)UNPACK_A(op_word);
-    int reg = (int)UNPACK_B(op_word);
-    raw_ints[slot] = aer_as_int(registers[reg]);
-    DISPATCH();
-}
-
-lbl_unbox_param_real : {
-    int slot = (int)UNPACK_A(op_word);
-    int reg = (int)UNPACK_B(op_word);
-    raw_reals[slot] = aer_as_real(registers[reg]);
-    DISPATCH();
-}
-
 /* `[value; count]` -- replaces the old `Type[count]` (OP_PACKED_ARRAY_NEW) entirely. fill_reg has
    already been evaluated exactly once by the parser's own codegen; this handler just branches on
    its RUNTIME type. Eligibility (every field a fixed primitive) is checked here for the same reason

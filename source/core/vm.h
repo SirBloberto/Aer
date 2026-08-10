@@ -324,14 +324,6 @@ typedef enum {
     OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED,
     OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED,
 
-    /* Emitted once per raw-bound parameter at the start of a raw-numeric variant: reads the boxed
-       AerVal the caller placed in that register -- the calling convention always copies arguments
-       boxed -- and copies its payload into a raw slot. No tag check needed, unlike every other
-       raw-vs-boxed opcode: lbl_call already proved the type before jumping here. The rest of the
-       body then treats it as an ordinary raw local. */
-    OP_UNBOX_PARAM_INT,
-    OP_UNBOX_PARAM_REAL,
-
     /* A bare comparison forming an entire if/while condition collapses with its
        OP_JUMP_IF_FALSE_REG into one dispatch -- the boolean was only ever read once, immediately.
        Only the 6 plain boxed comparisons (raw ones have faster opcodes already) and only when
@@ -368,6 +360,16 @@ typedef enum {
     OP_RAW_LTE_INT_JUMP_IF_FALSE,
     OP_RAW_LT_REAL_JUMP_IF_FALSE,
     OP_RAW_LTE_REAL_JUMP_IF_FALSE,
+
+    /* A typed array's elements are already unboxed bytes -- reading one into a register built an
+       AerVal for the sole purpose of being tag-checked and torn apart again by the next opcode.
+       These move the element between the array and a raw slot directly. The receiver is still
+       checked: anything but a typed array (or a non-numeric element) falls back to the general
+       boxed path, so these are safe on any value, just fast on the one that matters. */
+    OP_TYPED_INDEX_GET_RAW_INT,
+    OP_TYPED_INDEX_GET_RAW_REAL,
+    OP_TYPED_INDEX_SET_RAW_INT,
+    OP_TYPED_INDEX_SET_RAW_REAL,
 
     /* Builds one string from N parts in a single allocation. `"key_{n}"` used to compile to
        OP_LOADK + OP_TO_STR + OP_ADD -- three dispatches and two AerStrings, the second immediately
@@ -683,6 +685,10 @@ typedef struct {
     int raw_param_count;
     int raw_param_regs[SPEC_MAX_RAW_PARAMS];
     ValueType raw_param_types[SPEC_MAX_RAW_PARAMS];
+    /* Which raw slot each bound parameter landed in, so the resolver can unbox the arguments
+       straight into the callee's bank -- it already reads them all to choose this variant. -1 means
+       the slot budget ran out for that one parameter and it stayed boxed. */
+    int raw_param_slots[SPEC_MAX_RAW_PARAMS];
     unsigned int raw_variant_code_offset;
     unsigned int raw_variant_max_registers;
     unsigned int raw_variant_max_raw_ints;

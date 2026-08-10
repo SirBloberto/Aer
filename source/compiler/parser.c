@@ -127,6 +127,13 @@ typedef struct Parser {
        trigger for a numeric specialization (see SHAPE_MASK_NUMERIC_ONLY, vm.h). */
     unsigned int raw_boxed_emits;
 
+    /* Index of the function whose body is compiling, and whether that body calls itself. A
+       recursive numeric function is the one shape where binding parameters raw loses: its raw
+       values exist only to be re-boxed as the next call's arguments (see SHAPE_MASK_NUMERIC_ONLY,
+       vm.h). -1 outside any function body. */
+    int current_func_idx;
+    bool self_call_seen;
+
     /* Same trick for the last OP_INTERP: emit_index_get folds one into OP_INDEX_GET_INTERP when the
        interpolation it is indexing with is the instruction immediately before it. */
     unsigned int last_interp_offset;
@@ -362,6 +369,11 @@ static bool binop_preserves_nonneg(Opcode op) {
            op == OP_BITWISE_AND || op == OP_BITWISE_OR || op == OP_BITWISE_XOR || op == OP_RSHIFT;
 }
 
+/* A plain register below the parameter count -- parameters occupy the frame's first registers. */
+static bool rk_param(int rk) {
+    return !(rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) && rk < P.current_param_count;
+}
+
 static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
     rk_lhs = box_if_raw(c, rk_lhs);
     rk_rhs = box_if_raw(c, rk_rhs);
@@ -381,6 +393,12 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
         P.reg_nonneg[dest] = binop_preserves_nonneg(op) && rk_nonneg(c, rk_lhs) && rk_nonneg(c, rk_rhs);
     P.last_cmp_offset = c->count;
     chunk_emit(c, PACK3(op, dest, pack_rk8(rk_lhs), pack_rk8(rk_rhs)));
+    /* A parameter reaching the fully boxed path is the clearest sign binding it raw would pay --
+       and the only sign at all for a body with no raw local for the _BOXED family to catch. Only
+       arithmetic and ordering: equality and `in` are defined on every type, so they say nothing
+       about whether the operand is a number. */
+    if ((op <= OP_FLOOR_DIV || (op >= OP_LT && op <= OP_GTE)) && (rk_param(rk_lhs) || rk_param(rk_rhs)))
+        P.raw_boxed_emits++;
     if (spilled) reg_free(spilled);
 }
 
@@ -475,6 +493,7 @@ void emit_jump_target(Chunk* c, unsigned int target) {
    ceiling. */
 unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count,
                        unsigned int func_index) {
+    if ((int)func_index == P.current_func_idx) P.self_call_seen = true;
     chunk_emit(c, PACK3(OP_CALL, dest_reg, arg_reg_base, arg_count));
     unsigned int patch_offset = c->count;
     chunk_emit(c, (uint32_t)callee_offset);
@@ -690,7 +709,7 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
                                 Shape* hint_shape, bool hint_is_element_shape, const int* raw_param_regs,
                                 const ValueType* raw_param_types, int raw_param_count,
                                 unsigned int* out_max_registers, unsigned int* out_max_raw_ints,
-                                unsigned int* out_max_raw_reals);
+                                unsigned int* out_max_raw_reals, int* out_raw_param_slots);
 
 /* reg is the parameter's own register (0..P.current_param_count-1) OR a register whose value is
    known (via P.alias_source_param) to have come from indexing that parameter -- either way, marks
@@ -1123,6 +1142,26 @@ static bool rawk_const_rk(Chunk* c, int rk, RawKind kind, int* out_rk) {
         idx = rawk_real_of_pool(c, pool_idx);
     }
     *out_rk = (int)(RK_CONST_FLAG | idx);
+    return true;
+}
+
+/* Rewrites a just-emitted typed index get into its raw form, so an element feeding raw arithmetic
+   never becomes an AerVal at all. Only when that get is the whole of the operand's emitted code --
+   the same "inspect what was just compiled" test compare fusion and FMA fusion already use. Safe to
+   fail after rewriting: emit_binary's own box_if_raw handles a raw operand on the boxed path. */
+static bool try_rewrite_index_get_raw(Chunk* c, int* rk, unsigned int start, RawKind want) {
+    if (want == RAWK_NONE || c->count - start != 1) return false;
+    if (*rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
+    uint32_t w = c->code[start];
+    if ((Opcode)(w & 0xFF) != OP_TYPED_INDEX_GET_UNCHECKED || (int)UNPACK_A(w) != *rk) return false;
+
+    bool is_int = (want == RAWK_INT);
+    int slot = is_int ? raw_int_alloc() : raw_real_alloc();
+    if (slot < 0) return false;
+    if (is_temp(*rk)) reg_free(1);
+    c->code[start] = PACK3(is_int ? OP_TYPED_INDEX_GET_RAW_INT : OP_TYPED_INDEX_GET_RAW_REAL, slot,
+                           UNPACK_B(w), UNPACK_C(w));
+    *rk = (is_int ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | slot;
     return true;
 }
 
@@ -2609,6 +2648,14 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             }
         }
 
+        /* One operand already raw makes the other's wanted kind known, which is the only thing a
+           typed element read was missing to be read raw in the first place. */
+        RawKind kind_l = rk_raw_kind(c, lhs), kind_r = rk_raw_kind(c, rhs);
+        if (kind_l != RAWK_NONE && kind_r == RAWK_NONE)
+            try_rewrite_index_get_raw(c, &rhs, rhs_start, kind_l);
+        else if (kind_r != RAWK_NONE && kind_l == RAWK_NONE)
+            try_rewrite_index_get_raw(c, &lhs, lhs_start, kind_r);
+
         /* Tries a native raw op first (both provably int/real); false means not raw-composable, and
            lhs/rhs still need the ordinary free/emit_binary treatment. */
         int raw_result;
@@ -2955,6 +3002,10 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             int rk_rhs = parse_binary(c, 0);
             if (parse_had_error) return;
             RawKind rhs_kind = rk_raw_kind(c, rk_rhs);
+            /* The target's kind is the wanted kind, so `total += nums[i]` reads the element raw
+               rather than boxing it for a tag check one opcode later. */
+            if (rhs_kind == RAWK_NONE && try_rewrite_index_get_raw(c, &rk_rhs, rhs_start, cur_kind))
+                rhs_kind = cur_kind;
 
             /* Fuses the RHS's just-emitted OP_RAW_MUL_REAL with this ADD/SUB into one FMA/FMS
                dispatch. Only when the RHS was exactly one raw MUL writing the slot rk_rhs points
@@ -3418,6 +3469,28 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         if (pending_is_field) {
             emit_field_set(c, obj_reg, pending_field_idx, rk_val);
         } else if (index_safe_unchecked(obj_reg, pending_rk_idx)) {
+            /* An already-raw value stores straight out of its slot -- boxing it here only to have
+               the store tear the AerVal apart again is the whole cost this avoids. */
+            RawKind val_kind = rk_raw_kind(c, rk_val);
+            if (val_kind != RAWK_NONE) {
+                int slot = raw_materialize(c, rk_val, val_kind);
+                if (slot >= 0) {
+                    chunk_emit(c, PACK3(val_kind == RAWK_INT ? OP_TYPED_INDEX_SET_RAW_INT
+                                                             : OP_TYPED_INDEX_SET_RAW_REAL,
+                                        obj_reg, pack_rk8(pending_rk_idx), slot));
+                    int floor_now =
+                        (val_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+                    if (slot >= floor_now) {
+                        if (val_kind == RAWK_INT)
+                            raw_int_free(1);
+                        else
+                            raw_real_free(1);
+                    }
+                    if (!pending_is_field && is_temp(pending_rk_idx)) reg_free(1);
+                    if (!obj_is_base) reg_free(1);
+                    return;
+                }
+            }
             /* pending_rk_idx already guaranteed a plain register by index_safe_unchecked -- always
                fits RK8 directly. rk_val can be anything, so it still needs emit_index_set's own
                box/spill handling, just with the opcode swapped. */
@@ -4512,7 +4585,7 @@ static int parse_function_expr(Chunk* c) {
 
     unsigned int captured_max_registers, captured_max_raw_ints, captured_max_raw_reals;
     parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0, &captured_max_registers,
-                        &captured_max_raw_ints, &captured_max_raw_reals);
+                        &captured_max_raw_ints, &captured_max_raw_reals, NULL);
 
     patch_jump(c, patch, c->count);
 
@@ -4580,12 +4653,12 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
    everything it touches. hint_param_reg/hint_shape seed one parameter's shape for this compile
    only; hint_is_element_shape picks the table: false means the parameter IS the struct/packed
    array, true means it is a plain array and hint_shape describes `param[idx]`. raw_param_regs/
-   types/count bind those parameters as raw locals -- see OP_UNBOX_PARAM_INT/REAL (vm.h) for why. */
+   types/count bind those parameters as raw locals, reported back in out_raw_param_slots. */
 static void parse_function_body(Chunk* c, unsigned int* param_names, int param_count, int hint_param_reg,
                                 Shape* hint_shape, bool hint_is_element_shape, const int* raw_param_regs,
                                 const ValueType* raw_param_types, int raw_param_count,
                                 unsigned int* out_max_registers, unsigned int* out_max_raw_ints,
-                                unsigned int* out_max_raw_reals) {
+                                unsigned int* out_max_raw_reals, int* out_raw_param_slots) {
     unsigned int saved_var_names[FRAME_REGISTERS];
     int saved_var_regs[FRAME_REGISTERS];
     VarKind saved_var_kind[FRAME_REGISTERS];
@@ -4649,14 +4722,13 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
             if (raw_param_regs[k] != i) continue;
             bool is_int = raw_param_types[k] == TYPE_INTEGER;
             int slot = is_int ? raw_int_reserve_one() : raw_real_reserve_one();
+            if (out_raw_param_slots) out_raw_param_slots[k] = slot;
             if (slot >= 0) {
                 /* var_slot just appended P.var_count-1 as this parameter's own (boxed) entry --
-                   rebind THAT SAME entry to the raw slot instead, exactly as an ordinary local's
-                   first raw-eligible assignment would, just applied after the fact rather than at
-                   the point of declaration (a parameter has no "first assignment" of its own to
-                   hook -- binding time IS its first assignment, conceptually). */
-                Opcode unbox_op = is_int ? OP_UNBOX_PARAM_INT : OP_UNBOX_PARAM_REAL;
-                chunk_emit(c, PACK2(unbox_op, slot, i));
+                   rebind THAT SAME entry to the raw slot instead, as an ordinary local's first
+                   raw-eligible assignment would; binding time IS a parameter's first assignment.
+                   No prologue opcode writes the slot: the resolver does, having already read every
+                   argument to choose this variant (vm_bind_raw_params, vm.c). */
                 P.var_regs[P.var_count - 1] = slot;
                 P.var_kind[P.var_count - 1] = is_int ? VAR_RAW_INT : VAR_RAW_REAL;
             }
@@ -4747,9 +4819,15 @@ static void parse_function(Chunk* c) {
 
     unsigned int captured_max_registers, captured_max_raw_ints, captured_max_raw_reals;
     unsigned int raw_boxed_before = P.raw_boxed_emits;
+    int saved_func_idx = P.current_func_idx;
+    bool saved_self_call = P.self_call_seen;
+    P.current_func_idx = (int)this_func_idx;
+    P.self_call_seen = false;
     parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0, &captured_max_registers,
-                        &captured_max_raw_ints, &captured_max_raw_reals);
+                        &captured_max_raw_ints, &captured_max_raw_reals, NULL);
     unsigned int raw_boxed_in_body = P.raw_boxed_emits - raw_boxed_before;
+    P.current_func_idx = saved_func_idx;
+    P.self_call_seen = saved_self_call;
 
     /* Fold P.shape_sensitive_param[] into one bitmask; retain the source span (owned copy, see
        ChunkFunction.source_span's own comment) only when it's actually needed -- the common case
@@ -4806,10 +4884,12 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
 
     unsigned int new_offset = c->count;
     unsigned int max_registers = 0, max_raw_ints = 0, max_raw_reals = 0;
+    int slots[SPEC_MAX_RAW_PARAMS];
+    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++) slots[k] = -1;
     if (!parse_had_error) {
         parse_function_body(c, param_names, param_count, param_index, shape,
                             kind == SPEC_KIND_ARRAY_OF_STRUCTS, raw_param_regs, raw_param_types,
-                            raw_param_count, &max_registers, &max_raw_ints, &max_raw_reals);
+                            raw_param_count, &max_registers, &max_raw_ints, &max_raw_reals, slots);
     }
     bool ok = !parse_had_error;
 
@@ -4823,6 +4903,7 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     out_entry->max_registers = max_registers;
     out_entry->max_raw_ints = max_raw_ints;
     out_entry->max_raw_reals = max_raw_reals;
+    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++) out_entry->raw_param_slots[k] = slots[k];
     if (raw_param_count == 0) {
         /* Ordinary shape-only compile -- a freshly-created SpecEntry (see lbl_call, vm.c) needs its
            OWN raw-variant bookkeeping starting from a well-defined "never attempted" state (0),
@@ -5135,6 +5216,7 @@ void parser_reset(void) {
     reg_reset();
     P.last_cmp_offset = NO_OFFSET;
     P.last_interp_offset = NO_OFFSET;
+    P.current_func_idx = -1; /* 0 is a real function index, so zeroed is not "outside a body" */
     P.var_count = 0;
     P.global_count = 0;
     P.struct_count = 0;
@@ -5162,6 +5244,7 @@ ParserState* parser_save_state(void) {
     s->p = P;
     P = (Parser){
         0}; /* zeroes everything reg_reset() would, plus every other field -- see this function's own comment above */
+    P.current_func_idx = -1; /* 0 is a real function index, so zeroed is not "outside a body" */
     /* struct_names is the exception to "reset before its next read": struct definitions are a
        program-wide fact, never re-derived by a nested recompile, and a specialized body may
        construct any of them. With an empty table is_struct_name cannot tell `SomeStruct(...)` from

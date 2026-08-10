@@ -1874,9 +1874,12 @@ int main(void) {
             "    return p.x\n"
             "function not_sensitive(n):\n"
             "    return n + 1\n"
+            "function no_numerics(s):\n"
+            "    return s\n"
             "v = Vec(5.0)\n"
             "r = get_x(v)\n"
-            "s = not_sensitive(3)\n");
+            "s = not_sensitive(3)\n"
+            "t = no_numerics(\"hi\")\n");
         check(ok, "a struct-field-accessing function and a plain one both compile and run without error");
 
         ChunkFunction* get_x = chunk_find_function(&c, "get_x");
@@ -1897,10 +1900,19 @@ int main(void) {
         ChunkFunction* not_sensitive = chunk_find_function(&c, "not_sensitive");
         check(not_sensitive != NULL, "not_sensitive is registered in the function table");
         if (not_sensitive) {
-            check(not_sensitive->shape_sensitive_mask == 0,
-                  "not_sensitive's parameter is never used for field access, so its mask stays 0");
-            check(not_sensitive->source_span == NULL && not_sensitive->source_span_len == 0,
-                  "a non-shape-sensitive function retains no source span at all -- no cost paid for the common case");
+            check((not_sensitive->shape_sensitive_mask & ~SHAPE_MASK_NUMERIC_ONLY) == 0,
+                  "not_sensitive's parameter is never used for field access, so no per-parameter shape bit is set");
+            check(not_sensitive->shape_sensitive_mask == SHAPE_MASK_NUMERIC_ONLY,
+                  "but composing that parameter with a number marks it for numeric specialization instead");
+        }
+
+        ChunkFunction* no_numerics = chunk_find_function(&c, "no_numerics");
+        check(no_numerics != NULL, "no_numerics is registered in the function table");
+        if (no_numerics) {
+            check(no_numerics->shape_sensitive_mask == 0,
+                  "a function that neither reads a field nor composes a parameter numerically stays unmarked");
+            check(no_numerics->source_span == NULL && no_numerics->source_span_len == 0,
+                  "an unmarked function retains no source span at all -- no cost paid for the common case");
         }
 
         chunk_free(&c);
