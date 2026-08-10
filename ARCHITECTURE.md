@@ -2651,6 +2651,70 @@ field were re-deriving something it had in a register.
 | `struct_array_scan` | **-2.84%** |
 | everything else | within ±0.08% |
 
+### 5.16yl A major collection was walking the whole heap twice
+
+`gc_count_live_cells` walks every cell of every slab of every pool to size the next minor threshold.
+`gc_run_collection_cycle` called it immediately after a major — and a major sweep *already* visits
+every cell and decides each one's fate, so the answer was recomputed from scratch by a second full
+pass over data the first pass had just touched.
+
+`pool_sweep` now accumulates survivors into an optional out-param on a major pass. Equivalence was
+checked under a temporary assertion comparing the swept count against the separate walk on every
+benchmark that majors, with a **negative control** (forcing the assertion true) confirming it
+actually executed rather than silently passing — `binary_trees`, `struct_array_scan` and
+`log_processing` fire it; `nbody` never majors at all.
+
+The size of the win is worth recording carefully, because instructions and cycles disagree:
+
+| measure | `binary_trees` |
+|---|---|
+| instructions | **-0.15%** |
+| cell visits removed | **893,387** over 32 majors |
+| profile share before | 2.32% |
+
+Both are right. The walk reads one byte per cell striding by `stride`, so nearly every visit is a
+cache miss for 1/stride of the line fetched — a large share of *cycles* off a small share of
+*instructions*. The deterministic cell-visit count reconciles them: ~893K visits at ~4.5
+instructions each is ~4M against a 2.68B program, exactly the -0.15% measured.
+
+`cache-misses` could not size the cycle side. A **base-vs-base self-control** at `--runs 5` moved
+-5.45% to +12.12% across benchmarks, which swallows the -9.39% the change appeared to show. That
+counter needs far more runs than instructions to resolve anything; do not quote it at low run counts.
+
+`gc_count_live_cells` stays for the two callers with no collection to piggyback on: `aer_gc_stats`,
+and the memory-ceiling check after a *minor* (a minor deliberately never inspects old cells, so it
+cannot produce a whole-heap count).
+
+### 5.16ym Prefetching the sweep walk did nothing, and the reason generalizes
+
+With the redundant walk gone, `gc_collect` is 9.65% of `binary_trees` and **63% of that sits on two
+instructions** — the `*state & POOL_FREE` load in `pool_sweep`'s major branch (46.5%) and in its
+minor branch (16.5%). A fixed-stride walk missing cache on every cell looked like the textbook case
+for a software prefetch, especially since ARM's prefetcher does not reliably latch a ~40-byte stride.
+
+Issuing the miss eight cells early measured, across three code layouts:
+
+| benchmark | median cycles | lottery band |
+|---|---|---|
+| `binary_trees` | -0.29% | 0.91% |
+| `struct_array_scan` | +0.35% | 0.57% |
+| `log_processing` | -0.06% | 1.63% |
+
+Every result inside the layout lottery. Reverted.
+
+The reason is worth keeping: **the sweep's iterations are independent**, so the out-of-order engine
+already runs many of those misses concurrently. Prefetching cannot add memory-level parallelism that
+the loop already has; it only helps when the miss chain is *serial*. That is a general test to apply
+before reaching for `__builtin_prefetch` again — and it points at `pool_alloc`, whose free-list pop
+(`head -> next`, 61% of that function on one dependent load) is exactly the serial shape prefetching
+does help.
+
+Removing the state byte from the cell into a dense side bitmap would cut what the sweep touches by a
+factor of `stride`, but it is not obviously a win: `pool_is_young(ptr)` on the write-barrier path
+needs O(1) state from a bare pointer, which a side table only gives back via a
+`(ptr - slab_base) / stride` division on a non-power-of-2 stride. The in-cell byte is what makes the
+*barrier* cheap, and the barrier runs far more often than the sweep.
+
 `vm_struct_field_write` had no callers left afterwards and was deleted.
 
 Worth recording the measurement trap: on x86-64 wall-clock this read `dict_bench` **+9.09%**, well
