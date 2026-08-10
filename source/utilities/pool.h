@@ -93,6 +93,10 @@ bool pool_is_remembered(void* cell);
 void pool_mark_remembered(void* cell);
 
 /* Walks every carved-out cell; free-listed cells are always skipped, and if young_only, old cells too (a minor collection assumes old cells are live). Unmarked cells go to on_free then the free-list; marked cells are promoted with their mark bit cleared for next cycle. */
-void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell));
+/* live_out, when non-NULL on a MAJOR pass, accumulates the cells that survive. A major already
+   visits every cell and decides each one's fate, so counting there costs a increment and saves the
+   separate full-heap pass gc_count_live_cells would otherwise make right afterwards. Meaningless on
+   a minor pass, which deliberately never looks at old cells. */
+void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell), unsigned int* live_out);
 
 #endif

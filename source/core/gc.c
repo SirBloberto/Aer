@@ -1,4 +1,4 @@
-#include <stdlib.h>
+﻿#include <stdlib.h>
 #include "error.h"
 #include "hashtable.h"
 #include "pool.h"
@@ -326,7 +326,7 @@ void gc_finalize_all_pools(VmHeap* heap) {
    heap, so there is no other VM's state to fan out into (file-modules and actors used to be marked
    here too, since they all shared one heap; each now collects itself the same way, whenever ITS
    OWN gc_maybe_collect fires). */
-static void gc_collect(VM* vm, bool minor) {
+static void gc_collect(VM* vm, bool minor, unsigned int* live_out) {
     VmHeap* heap = &vm->heap;
 
     mark_vm_roots(heap, vm, minor);
@@ -420,7 +420,7 @@ static void gc_collect(VM* vm, bool minor) {
     mark_drain(heap, minor);
 
     for (size_t i = 0; i < POOL_TABLE_COUNT; i++)
-        pool_sweep(pool_at(heap, pool_table[i].offset), minor, pool_table[i].on_free);
+        pool_sweep(pool_at(heap, pool_table[i].offset), minor, pool_table[i].on_free, live_out);
 }
 
 /* ------------------------------------------------------------------ */
@@ -435,7 +435,8 @@ static void gc_reset_alloc_counts(VmHeap* heap) {
     heap->pool_alloc_count = 0;
 }
 
-/* Shared by aer_gc_stats (vm.c) and gc_run_collection_cycle's own ceiling check below -- one place walking all pools' cell state, not two. */
+/* A full walk of every pool. A major sweep reports its own live count as it goes, so this is only
+   for callers with no collection to piggyback on: aer_gc_stats, and the ceiling check after a minor. */
 unsigned int gc_count_live_cells(VmHeap* heap) {
     unsigned int total = 0;
     for (size_t t = 0; t < POOL_TABLE_COUNT; t++) {
@@ -451,9 +452,6 @@ unsigned int gc_count_live_cells(VmHeap* heap) {
     return total;
 }
 
-/* A major collection's own sweep is already O(total heap size) -- gc_count_live_cells right after
-   one is a second such pass, but only once per major (majors are the rare event; see
-   gc_run_collection_cycle), not once per allocation or per minor. */
 #define AER_MINOR_THRESHOLD_CAP (4u * 1024 * 1024)
 
 /* Rescales minor_gc_threshold to the live set, capped, floored at minor_gc_threshold_floor. A small
@@ -472,7 +470,7 @@ static void gc_rescale_minor_threshold(VmHeap* heap, unsigned int live) {
 void gc_run_collection_cycle(VM* vm) {
     VmHeap* heap = &vm->heap;
     heap->gc_ever_collected = true;
-    gc_collect(vm, true);
+    gc_collect(vm, true, NULL);
     heap->minor_collections_run++;
     gc_reset_alloc_counts(heap);
 
@@ -480,26 +478,26 @@ void gc_run_collection_cycle(VM* vm) {
     unsigned int live = 0;
     bool live_known = false;
     if (++heap->minor_since_major >= heap->major_gc_every_n_minor) {
-        gc_collect(vm, false);
+        gc_collect(vm, false, &live);
         heap->major_collections_run++;
         heap->minor_since_major = 0;
         major_ran = true;
-        live = gc_count_live_cells(heap);
         live_known = true;
         gc_rescale_minor_threshold(heap, live);
     }
 
     /* Checked once per opcode, not per allocation -- a ceiling'd host can slip slightly past it. */
     if (heap->gc_live_cell_ceiling == 0) return;
-    if (!live_known) live = gc_count_live_cells(heap);
+    if (!live_known) live = gc_count_live_cells(heap); /* a minor did not visit the old cells, so it owes a full walk */
     if (live <= heap->gc_live_cell_ceiling) return;
     if (!major_ran) {
-        gc_collect(vm, false);
+        live = 0;
+        gc_collect(vm, false, &live);
         heap->major_collections_run++;
         heap->minor_since_major = 0;
-        live = gc_count_live_cells(heap);
         gc_rescale_minor_threshold(heap, live);
         if (live <= heap->gc_live_cell_ceiling) return;
     }
     error("Memory ceiling exceeded: %u live cells (limit %u)", live, heap->gc_live_cell_ceiling);
 }
+

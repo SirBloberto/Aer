@@ -180,7 +180,7 @@ void pool_mark_remembered(void* cell) {
 /* Leaves every surviving cell mark-free (the promote branch clears it), and pool_alloc zeroes the
    state byte of every cell it hands out -- together that is what makes a separate pre-mark clearing
    pass unnecessary. Don't add one back: it would be a pure no-op scan of the whole heap. */
-void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell)) {
+void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell), unsigned int* live_out) {
     if (young_only) {
         /* Walk ONLY the slabs the young thread says still have >=1 young cell -- O(live young
            slabs), not O(slab_count). slab_young_count[i] alone only let the per-CELL scan skip a
@@ -225,6 +225,7 @@ void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell)) {
             bool was_young = (*state & POOL_OLD) == 0;
             if (*state & POOL_MARKED) {
                 *state = (unsigned char)((*state & ~POOL_MARKED) | POOL_OLD); /* survived -> promote */
+                if (live_out) (*live_out)++;
             } else {
                 on_free(cell);
                 pool_free_at(p, cell, i);
