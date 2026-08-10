@@ -3154,14 +3154,17 @@ lbl_call : {
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
-    callee->registers = caller->registers + caller->frame_size;
+    /* registers/raw_ints/raw_reals are the hoisted copies of this same frame's three bases -- every
+       site that changes frames reassigns them together -- so reading them back out of `caller` is
+       four redundant dependent loads on the hottest path in the interpreter. */
+    callee->registers = registers + caller->frame_size;
     callee->frame_size = chosen_max_registers;
-    callee->raw_ints = caller->raw_ints + caller->raw_int_frame_size;
-    callee->raw_reals = caller->raw_reals + caller->raw_real_frame_size;
+    callee->raw_ints = raw_ints + caller->raw_int_frame_size;
+    callee->raw_reals = raw_reals + caller->raw_real_frame_size;
     callee->raw_int_frame_size = chosen_max_raw_ints;
     callee->raw_real_frame_size = chosen_max_raw_reals;
     for (int i = 0; i < arg_count; i++)
-        callee->registers[i] = caller->registers[arg_reg_base + i];
+        callee->registers[i] = registers[arg_reg_base + i];
     callee->return_ip =
         (unsigned int)(pc - code); /* already past this instruction's operands -- the correct resume point */
     callee->dest_reg = dest_reg;
