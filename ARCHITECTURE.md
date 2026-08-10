@@ -2474,6 +2474,45 @@ Worth noting how this surfaced: not from a failing test, but from reading `lbl_c
 for something else and asking why one hoisted pointer was refreshed and another was not. The
 comment next to the refresh said "can realloc both", and *both* was the bug.
 
+### 5.16yg Outlining cold handlers, and what code alignment actually buys
+
+If mispredictions come from dispatch sites aliasing, the tempting fix is to shrink the code between
+them -- outline the ~130 cold opcode bodies so the hot ones pack together. Two cheaper experiments
+answer that before committing to a 130-handler refactor.
+
+**GCC's own hot/cold splitting does nothing here.** `-freorder-blocks-and-partition` left
+`vm_run_slice` at exactly 13048 instructions, byte for byte. Under `-flto` with a computed-goto
+loop there is no profile and no basic-block frequency to act on, so the compiler cannot separate hot
+from cold. Manual outlining would be the only route, and this says nothing else will do it for free.
+
+**Alignment does produce a real, reproducible effect -- and it is a trade, not a win.**
+`-falign-jumps=64`, swept across five code offsets so the layout lottery cannot fake it:
+
+| benchmark | deltas across layouts | verdict |
+|---|---|---|
+| `fib_bench` | -8.76, -5.44, -5.51, -5.36, -5.21% | **consistent -5.4%** |
+| `nbody` | +0.90, +1.42, +3.03% | consistent +1.8% |
+| `binary_trees` | +1.71, +0.67, +0.45% | consistent +0.9% |
+| `mandelbrot` | +0.37, +0.23, +2.19% | +0.9% |
+| `struct_array_scan` | +1.06, +0.41, -1.43% | neutral |
+| `sieve` | +0.28, +0.22, -0.33% | neutral |
+
+`fib_bench` improves on every single layout, and the aligned builds are also markedly more stable
+(3.67-3.68B against a 3.885-3.914B spread). That is a genuine effect on call-heavy code, and it cost
+402 instructions of padding to get. Everything loop-heavy pays for it.
+
+**Declined as a default**, on the same footing as PGO and the register pins in 5.16v: a concentrated
+win against broad small losses, on a knob any user with a call-heavy workload can set themselves.
+Recorded rather than deleted so it is not re-derived.
+
+**Which answers the outlining question.** Alignment is the cheap proxy for "does moving code around
+reduce mispredictions in a directed way", and the answer is: it produces consistent, workload-
+specific effects, helping tight call sequences and hurting tight loops -- not a uniform improvement.
+Outlining would be another intervention of exactly that shape, at far higher cost, with no reason to
+expect a different distribution. The only lever measured so far that reduces mispredictions
+unconditionally is reducing the NUMBER of dispatches, which is what fusion, the constant hoist and
+the range-loop work already do.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
