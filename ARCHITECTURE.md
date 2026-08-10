@@ -2513,6 +2513,48 @@ expect a different distribution. The only lever measured so far that reduces mis
 unconditionally is reducing the NUMBER of dispatches, which is what fusion, the constant hoist and
 the range-loop work already do.
 
+### 5.16yh The Thumb-bit fixup was not irreducible -- it was Thumb
+
+5.16s catalogued dispatch as eight instructions, three doing no work, and called the Thumb-bit
+`orr r3, r3, #1` unfixable: it survives a non-PIE build, so it is not a PIC artifact, and C offers no
+way to pre-set bit 0 in a table of `&&label` values. Every later entry repeated that. The word doing
+the work in "irreducible" was doing too much: it is irreducible *within Thumb-2*.
+
+`-marm` builds the interpreter as A32, where a branch target needs no mode bit at all. Instructions,
+against the Thumb-2 default:
+
+| benchmark | instructions | cycles | branch-misses |
+|---|---|---|---|
+| `mandelbrot` | **-7.24%** | **-27.46%** | **-97.47%** |
+| `fib_bench` | **-6.94%** | -10.23% | -55.26% |
+| `nbody` | -5.00% | -2.84% | -6.69% |
+| `struct_array_scan` | -3.96% | -5.51% | -8.02% |
+| `binary_trees` | -1.96% | +1.05% | -0.32% |
+| `sieve` | -1.88% | -1.54% | -1.23% |
+| `dict_bench` | -1.25% | +0.51% | +1.79% |
+| `log_processing` | -0.75% | +3.79% | +10.95% |
+
+**Instructions improve on every benchmark**, which is the part that needs no defending -- instruction
+counts are layout-immune. The cycle wins were then swept across code offsets, because `mandelbrot`'s
+own layout band is 25.58% and a single -27% reading would sit inside it: `mandelbrot` measures
+-27.34%, -25.46%, -27.09% and `fib_bench` -4.82%, -5.10%, -5.76%, with `log_processing` the only
+consistent loser at +0.12%, +3.95%, +0.79%. The A32 builds are also far more stable
+(`mandelbrot` 3.60-3.74B against Thumb-2's 4.94-5.03B).
+
+`mandelbrot` losing **97% of its branch mispredictions** is the same fact 5.16ye and 5.16yd kept
+circling. Its hot loop cycles a handful of dispatch sites that alias destructively in Thumb-2, where
+instruction lengths vary and site addresses land unevenly; A32's uniform 4-byte encoding spreads them
+predictably and the collisions stop. That also explains why the benchmark with the widest layout band
+is the one A32 helps most -- the band and the misprediction rate were always the same phenomenon.
+
+Cost: binary size 1209 KB -> 1269 KB, under 5%, far below A32's usual 20-30% density penalty --
+because most of this binary is one enormous function whose Thumb-2 encoding was already dominated by
+32-bit `.w` instructions.
+
+**Not made default here**, because `ARCH_FLAGS` is deliberately empty so a build runs on whatever
+machine it is copied to, and A32 does not exist on Cortex-M. It is safe on every `arm-linux-gnueabihf`
+target, where it is the single largest win in this section. Build with `make ARCH_FLAGS=-marm`.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a

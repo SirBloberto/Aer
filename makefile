@@ -19,6 +19,11 @@ endif
 # same source vectorizes with `make ARCH_FLAGS=-mcpu=native` (or -mcpu=cortex-a72, etc.) and doesn't
 # without it. Set ARCH_FLAGS yourself if you're building specifically for one known machine and
 # want that win; leave it unset for a build that has to run anywhere.
+# On 32-bit ARM Linux, ARCH_FLAGS=-marm is worth more than anything else here: A32 branch
+# targets carry no Thumb mode bit, so dispatch loses an instruction it cannot lose in Thumb-2.
+# Instructions drop on every benchmark and mandelbrot loses 27% of its cycles / 97% of its branch
+# mispredictions (ARCHITECTURE 5.16yh). Not the default only because A32 does not exist on
+# Cortex-M, and ARCH_FLAGS is meant to keep a build portable to whatever machine it is copied to.
 # The dispatch base is pinned to r8 on ARM (see error.h). The source-level `register asm("r8")`
 # declaration is NOT enough on its own: -flto ignores it and hands r8 to other translation units,
 # which corrupted the heap (ARCHITECTURE 5.16t). -ffixed-r8 is a codegen-level reservation LTO does
