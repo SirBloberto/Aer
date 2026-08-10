@@ -2523,6 +2523,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     Chunk* c = vm->chunk;
     /* Hoisted once -- c->pool is only mutated at parse time, stable for the whole call. */
     AerVal* const_pool = c->pool;
+    int64_t* rawk_i = c->rawk_i;
+    double* rawk_d = c->rawk_d;
     /* Installs this call's error catch point, saving the previous one so nested vm_run calls
        catch their own errors and unwind no further than here; restored on every return. */
     AerJmpBuf catch_point;
@@ -3150,6 +3152,8 @@ lbl_call : {
         pc = code + resume_at;
         functions = c->functions;
         const_pool = c->pool;
+        rawk_i = c->rawk_i;
+        rawk_d = c->rawk_d;
     }
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];
@@ -4894,8 +4898,8 @@ lbl_raw_load_int : {
 
 lbl_raw_load_real : {
     int dest = (int)UNPACK_A(op_word);
-    unsigned int pool_idx = (unsigned int)READ();
-    raw_reals[dest] = const_pool[pool_idx].as.d;
+    unsigned int idx = (unsigned int)READ();
+    raw_reals[dest] = rawk_d[idx];
     DISPATCH();
 }
 
@@ -5126,117 +5130,68 @@ lbl_raw_move_real : {
 
 lbl_raw_load_int_pool : {
     int dest = (int)UNPACK_A(op_word);
-    unsigned int pool_idx = (unsigned int)READ();
-    raw_ints[dest] = const_pool[pool_idx].as.i;
+    unsigned int idx = (unsigned int)READ();
+    raw_ints[dest] = rawk_i[idx];
     DISPATCH();
 }
 
-/* rhs may legitimately be TYPE_REAL against an int raw slot (e.g. comparing against
-   time.now()'s real result) -- the ordinary boxed comparison this replaces promotes int<->real
-   too, so a hard type check here would be a real regression. */
-lbl_raw_lt_int_boxed : {
-    int dest = (int)UNPACK_A(op_word);
-    int slot = (int)UNPACK_B(op_word);
-    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    if (rhs->tag == TYPE_INTEGER)
-        registers[dest] = aer_bool(raw_ints[slot] < rhs->as.i);
-    else if (rhs->tag == TYPE_REAL)
-        registers[dest] = aer_bool((double)raw_ints[slot] < rhs->as.d);
-    else
-        error("Cannot apply '<' to integer and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
+/* A const-flagged operand indexes rawk_i (Chunk.rawk_i) -- the opcode names the type, so the
+   constant needs no tag and no encoding bit to say where it lives. Only a register operand still
+   carries one, and it may legitimately be TYPE_REAL against an int raw slot (e.g. time.now()'s
+   real result) -- the ordinary boxed comparison this replaces promotes int<->real too. */
+#define RAW_CMP_INT_BOXED(name, op, opstr)                                                                   \
+    lbl_raw_##name##_int_boxed : {                                                                           \
+        int dest = (int)UNPACK_A(op_word);                                                                   \
+        int slot = (int)UNPACK_B(op_word);                                                                   \
+        unsigned int rk = UNPACK_C(op_word);                                                                 \
+        if (RK8_IS_CONST(rk)) {                                                                              \
+            registers[dest] = aer_bool(raw_ints[slot] op rawk_i[RK8_INDEX(rk)]);                             \
+            DISPATCH();                                                                                      \
+        }                                                                                                    \
+        AerVal* rhs = &registers[rk];                                                                        \
+        if (rhs->tag == TYPE_INTEGER)                                                                        \
+            registers[dest] = aer_bool(raw_ints[slot] op rhs->as.i);                                         \
+        else if (rhs->tag == TYPE_REAL)                                                                      \
+            registers[dest] = aer_bool((double)raw_ints[slot] op rhs->as.d);                                 \
+        else                                                                                                 \
+            error("Cannot apply '" opstr "' to integer and %s", vm_type_name(c, *rhs));                      \
+        DISPATCH();                                                                                          \
+    }
 
-lbl_raw_gt_int_boxed : {
-    int dest = (int)UNPACK_A(op_word);
-    int slot = (int)UNPACK_B(op_word);
-    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    if (rhs->tag == TYPE_INTEGER)
-        registers[dest] = aer_bool(raw_ints[slot] > rhs->as.i);
-    else if (rhs->tag == TYPE_REAL)
-        registers[dest] = aer_bool((double)raw_ints[slot] > rhs->as.d);
-    else
-        error("Cannot apply '>' to integer and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
+    RAW_CMP_INT_BOXED(lt, <, "<")
+    RAW_CMP_INT_BOXED(gt, >, ">")
+    RAW_CMP_INT_BOXED(lte, <=, "<=")
+    RAW_CMP_INT_BOXED(gte, >=, ">=")
 
-lbl_raw_lte_int_boxed : {
-    int dest = (int)UNPACK_A(op_word);
-    int slot = (int)UNPACK_B(op_word);
-    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    if (rhs->tag == TYPE_INTEGER)
-        registers[dest] = aer_bool(raw_ints[slot] <= rhs->as.i);
-    else if (rhs->tag == TYPE_REAL)
-        registers[dest] = aer_bool((double)raw_ints[slot] <= rhs->as.d);
-    else
-        error("Cannot apply '<=' to integer and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
+#undef RAW_CMP_INT_BOXED
 
-lbl_raw_gte_int_boxed : {
-    int dest = (int)UNPACK_A(op_word);
-    int slot = (int)UNPACK_B(op_word);
-    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    if (rhs->tag == TYPE_INTEGER)
-        registers[dest] = aer_bool(raw_ints[slot] >= rhs->as.i);
-    else if (rhs->tag == TYPE_REAL)
-        registers[dest] = aer_bool((double)raw_ints[slot] >= rhs->as.d);
-    else
-        error("Cannot apply '>=' to integer and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
+/* Real counterpart; an integer register rhs promotes, and an integer literal was already widened
+   into rawk_d at parse time. */
+#define RAW_CMP_REAL_BOXED(name, op, opstr)                                                                  \
+    lbl_raw_##name##_real_boxed : {                                                                          \
+        int dest = (int)UNPACK_A(op_word);                                                                   \
+        int slot = (int)UNPACK_B(op_word);                                                                   \
+        unsigned int rk = UNPACK_C(op_word);                                                                 \
+        if (RK8_IS_CONST(rk)) {                                                                              \
+            registers[dest] = aer_bool(raw_reals[slot] op rawk_d[RK8_INDEX(rk)]);                            \
+            DISPATCH();                                                                                      \
+        }                                                                                                    \
+        AerVal* rhs = &registers[rk];                                                                        \
+        if (rhs->tag == TYPE_REAL)                                                                           \
+            registers[dest] = aer_bool(raw_reals[slot] op rhs->as.d);                                        \
+        else if (rhs->tag == TYPE_INTEGER)                                                                   \
+            registers[dest] = aer_bool(raw_reals[slot] op(double) rhs->as.i);                                \
+        else                                                                                                 \
+            error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs));                        \
+        DISPATCH();                                                                                          \
+    }
 
-lbl_raw_lt_real_boxed : {
-    int dest = (int)UNPACK_A(op_word);
-    int slot = (int)UNPACK_B(op_word);
-    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    if (rhs->tag == TYPE_REAL)
-        registers[dest] = aer_bool(raw_reals[slot] < rhs->as.d);
-    else if (rhs->tag == TYPE_INTEGER)
-        registers[dest] = aer_bool(raw_reals[slot] < (double)rhs->as.i);
-    else
-        error("Cannot apply '<' to float and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
+    RAW_CMP_REAL_BOXED(lt, <, "<")
+    RAW_CMP_REAL_BOXED(gt, >, ">")
+    RAW_CMP_REAL_BOXED(lte, <=, "<=")
+    RAW_CMP_REAL_BOXED(gte, >=, ">=")
 
-lbl_raw_gt_real_boxed : {
-    int dest = (int)UNPACK_A(op_word);
-    int slot = (int)UNPACK_B(op_word);
-    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    if (rhs->tag == TYPE_REAL)
-        registers[dest] = aer_bool(raw_reals[slot] > rhs->as.d);
-    else if (rhs->tag == TYPE_INTEGER)
-        registers[dest] = aer_bool(raw_reals[slot] > (double)rhs->as.i);
-    else
-        error("Cannot apply '>' to float and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
-
-lbl_raw_lte_real_boxed : {
-    int dest = (int)UNPACK_A(op_word);
-    int slot = (int)UNPACK_B(op_word);
-    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    if (rhs->tag == TYPE_REAL)
-        registers[dest] = aer_bool(raw_reals[slot] <= rhs->as.d);
-    else if (rhs->tag == TYPE_INTEGER)
-        registers[dest] = aer_bool(raw_reals[slot] <= (double)rhs->as.i);
-    else
-        error("Cannot apply '<=' to float and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
-
-lbl_raw_gte_real_boxed : {
-    int dest = (int)UNPACK_A(op_word);
-    int slot = (int)UNPACK_B(op_word);
-    AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    if (rhs->tag == TYPE_REAL)
-        registers[dest] = aer_bool(raw_reals[slot] >= rhs->as.d);
-    else if (rhs->tag == TYPE_INTEGER)
-        registers[dest] = aer_bool(raw_reals[slot] >= (double)rhs->as.i);
-    else
-        error("Cannot apply '>=' to float and %s", vm_type_name(c, *rhs));
-    DISPATCH();
-}
+#undef RAW_CMP_REAL_BOXED
 
 /* OP_LT_JUMP_IF_FALSE's fusion scoped to the raw-boxed int family; see vm.h for why the other three
    were dropped. rhs may legitimately be TYPE_REAL against an int raw slot, as the unfused opcode
@@ -5245,8 +5200,13 @@ lbl_raw_gte_real_boxed : {
 #define RAW_CMP_INT_BOXED_JUMP_IF_FALSE(name, op, opstr)                                                     \
     lbl_raw_##name##_int_boxed_jump_if_false : {                                                             \
         int slot = (int)UNPACK_B(op_word);                                                                   \
-        AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));                                  \
+        unsigned int rk = UNPACK_C(op_word);                                                                 \
         int target = READ();                                                                                 \
+        if (RK8_IS_CONST(rk)) {                                                                              \
+            if (!(raw_ints[slot] op rawk_i[RK8_INDEX(rk)])) pc += (int32_t)target;                           \
+            DISPATCH();                                                                                      \
+        }                                                                                                    \
+        AerVal* rhs = &registers[rk];                                                                        \
         bool cond;                                                                                           \
         if (rhs->tag == TYPE_INTEGER)                                                                        \
             cond = (raw_ints[slot] op rhs->as.i);                                                            \
@@ -5271,8 +5231,13 @@ lbl_raw_gte_real_boxed : {
 #define RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(name, op, opstr)                                                    \
     lbl_raw_##name##_real_boxed_jump_if_false : {                                                            \
         int slot = (int)UNPACK_B(op_word);                                                                   \
-        AerVal* rhs = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));                                  \
+        unsigned int rk = UNPACK_C(op_word);                                                                 \
         int target = READ();                                                                                 \
+        if (RK8_IS_CONST(rk)) {                                                                              \
+            if (!(raw_reals[slot] op rawk_d[RK8_INDEX(rk)])) pc += (int32_t)target;                          \
+            DISPATCH();                                                                                      \
+        }                                                                                                    \
+        AerVal* rhs = &registers[rk];                                                                        \
         bool cond;                                                                                           \
         if (rhs->tag == TYPE_REAL)                                                                           \
             cond = (raw_reals[slot] op rhs->as.d);                                                           \

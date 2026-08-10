@@ -517,6 +517,22 @@ static void print_rk8(FILE* out, Chunk* c, uint32_t rk) {
         fprintf(out, "  rk=reg%u", rk & RK8_INDEX_MASK);
 }
 
+/* The raw families read a const-flagged RK8 out of rawk_i/rawk_d instead of pool[] -- same bit,
+   different table, so their operands need their own printers. */
+static void print_rk8_rawi(FILE* out, Chunk* c, uint32_t rk) {
+    if (rk & RK8_CONST_FLAG)
+        fprintf(out, "  rk=rawi_const:%lld", (long long)c->rawk_i[rk & RK8_INDEX_MASK]);
+    else
+        fprintf(out, "  rk=reg%u", rk & RK8_INDEX_MASK);
+}
+
+static void print_rk8_rawr(FILE* out, Chunk* c, uint32_t rk) {
+    if (rk & RK8_CONST_FLAG)
+        fprintf(out, "  rk=rawr_const:%g", c->rawk_d[rk & RK8_INDEX_MASK]);
+    else
+        fprintf(out, "  rk=reg%u", rk & RK8_INDEX_MASK);
+}
+
 /* Raw-slot printers -- kept separate so a dump reader can tell int=/real= from reg=/rk=. */
 static void print_rawi(FILE* out, int slot) {
     fprintf(out, "  rawi=%d", slot);
@@ -625,12 +641,12 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     } else if (op == OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE || op == OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE ||
                op == OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE || op == OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE) {
         print_rawi(out, (int)UNPACK_B(op_word));
-        print_rk8(out, c, UNPACK_C(op_word));
+        print_rk8_rawi(out, c, UNPACK_C(op_word));
         print_jump(out, c->code[pos], pos + 1), pos++;
     } else if (op == OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE || op == OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE ||
                op == OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE || op == OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE) {
         print_rawr(out, (int)UNPACK_B(op_word));
-        print_rk8(out, c, UNPACK_C(op_word));
+        print_rk8_rawr(out, c, UNPACK_C(op_word));
         print_jump(out, c->code[pos], pos + 1), pos++;
     } else if (op == OP_INDEX_GET || op == OP_TYPED_INDEX_GET_UNCHECKED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
@@ -828,9 +844,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         fprintf(out, "  imm=%d", imm);
     } else if (op == OP_RAW_LOAD_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
-        unsigned int pool_idx = c->code[pos++];
-        fprintf(out, "  val=");
-        print_pool_value(out, c->pool[pool_idx]);
+        fprintf(out, "  val=%g", c->rawk_d[c->code[pos++]]);
     } else if (op == OP_RAW_ADD_INT || op == OP_RAW_SUB_INT || op == OP_RAW_MUL_INT || op == OP_RAW_DIV_INT ||
                op == OP_RAW_MOD_INT || op == OP_RAW_FLOOR_DIV_INT) {
         /* OP_RAW_DIV_INT alone writes raw_reals[] (int/int division promotes) -- dest printer differs. */
@@ -914,19 +928,17 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
             print_rawr(out, slot);
     } else if (op == OP_RAW_LOAD_INT_POOL) {
         print_rawi(out, (int)UNPACK_A(op_word));
-        unsigned int pool_idx = c->code[pos++];
-        fprintf(out, "  val=");
-        print_pool_value(out, c->pool[pool_idx]);
+        fprintf(out, "  val=%lld", (long long)c->rawk_i[c->code[pos++]]);
     } else if (op == OP_RAW_LT_INT_BOXED || op == OP_RAW_GT_INT_BOXED || op == OP_RAW_LTE_INT_BOXED ||
                op == OP_RAW_GTE_INT_BOXED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
-        print_rk8(out, c, UNPACK_C(op_word));
+        print_rk8_rawi(out, c, UNPACK_C(op_word));
     } else if (op == OP_RAW_LT_REAL_BOXED || op == OP_RAW_GT_REAL_BOXED || op == OP_RAW_LTE_REAL_BOXED ||
                op == OP_RAW_GTE_REAL_BOXED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
-        print_rk8(out, c, UNPACK_C(op_word));
+        print_rk8_rawr(out, c, UNPACK_C(op_word));
     } else {
         /* Generic path -- the handful of opcodes whose fields all fit the plain PACK3 shape
            (op+up to 3 byte fields) with nothing trailing, or nothing at all. */

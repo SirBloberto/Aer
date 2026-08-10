@@ -786,6 +786,16 @@ typedef struct {
     AerVal* pool; /* constants and variable names -- all deduplicated by value */
     unsigned int pool_count, pool_cap;
 
+    /* Numeric constants as raw scalars, for the raw opcode families. Those opcodes name their
+       operand type (OP_RAW_LT_INT_BOXED is int by construction), so a const-flagged operand can
+       index these directly -- no tag to check, and no encoding bit spent saying so. Kept separate
+       from pool[] rather than replacing entries in it: a literal reached by both a raw and a boxed
+       path needs both forms, and RK8's 7 index bits make a dense numeric-only table reach further. */
+    int64_t* rawk_i;
+    unsigned int rawk_i_count, rawk_i_cap;
+    double* rawk_d;
+    unsigned int rawk_d_count, rawk_d_cap;
+
     /* name -> pool index, for O(1) dedup of TYPE_STRING pool entries (chunk_add_pool, vm.c); owns an independent copy of each key. */
     HashTable name_index;
 
@@ -1063,6 +1073,11 @@ void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb);
 void vm_print_value(Chunk* c, AerVal v, bool in_collection);
 
 unsigned int chunk_add_pool(Chunk* c, AerVal v);
+
+/* Interned index into Chunk.rawk_i/rawk_d -- see their comment on Chunk. */
+unsigned int chunk_add_rawk_int(Chunk* c, int64_t v);
+unsigned int chunk_add_rawk_real(Chunk* c, double v);
+
 Shape* chunk_find_shape(Chunk* c, const char* name);
 
 /* `defaults` is taken by ownership, never copied. */

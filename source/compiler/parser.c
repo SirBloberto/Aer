@@ -54,7 +54,7 @@ typedef struct {
     bool is_int[HOIST_MAX];
     bool from_pool[HOIST_MAX]; /* int too wide for OP_RAW_LOAD_INT's int32 immediate */
     int64_t value[HOIST_MAX]; /* ints: the value itself, so dedup never depends on pool identity */
-    unsigned int pool_idx[HOIST_MAX];
+    unsigned int rawk_idx[HOIST_MAX];
     int slot[HOIST_MAX];
 } LoopHoist;
 
@@ -946,10 +946,10 @@ static void hoist_end(Chunk* c, unsigned int after_gap, bool active) {
     for (int i = 0; i < h->count; i++) {
         if (!h->is_int[i]) {
             c->code[w++] = PACK1(OP_RAW_LOAD_REAL, h->slot[i]);
-            c->code[w++] = h->pool_idx[i];
+            c->code[w++] = h->rawk_idx[i];
         } else if (h->from_pool[i]) {
             c->code[w++] = PACK1(OP_RAW_LOAD_INT_POOL, h->slot[i]);
-            c->code[w++] = h->pool_idx[i];
+            c->code[w++] = h->rawk_idx[i];
         } else {
             c->code[w++] = PACK1(OP_RAW_LOAD_INT, h->slot[i]);
             c->code[w++] = (uint32_t)(int32_t)h->value[i];
@@ -989,12 +989,12 @@ static int hoist_reserve_real(void) {
 /* The hoisted slot for this constant in the innermost loop, reserving one on first use. -1 means
    "not hoisted" -- no enclosing loop, this loop's gap is full, or the raw-slot budget is spent --
    and the caller then emits the load inline exactly as before. */
-static int hoist_constant(bool is_int, int64_t value, unsigned int pool_idx, bool from_pool) {
+static int hoist_constant(bool is_int, int64_t value, unsigned int rawk_idx, bool from_pool) {
     if (P.hoist_depth <= 0) return -1;
     LoopHoist* h = &P.hoist_stack[P.hoist_depth - 1];
     for (int i = 0; i < h->count; i++) {
         if (h->is_int[i] != is_int) continue;
-        if (is_int ? (h->value[i] == value) : (h->pool_idx[i] == pool_idx)) return h->slot[i];
+        if (is_int ? (h->value[i] == value) : (h->rawk_idx[i] == rawk_idx)) return h->slot[i];
     }
     if (h->count >= HOIST_MAX) return -1;
     int slot = is_int ? hoist_reserve_int() : hoist_reserve_real();
@@ -1003,9 +1003,16 @@ static int hoist_constant(bool is_int, int64_t value, unsigned int pool_idx, boo
     h->is_int[i] = is_int;
     h->from_pool[i] = from_pool;
     h->value[i] = value;
-    h->pool_idx[i] = pool_idx;
+    h->rawk_idx[i] = rawk_idx;
     h->slot[i] = slot;
     return slot;
+}
+
+/* Widens an integer literal on the way in, matching what the raw real opcodes did at runtime when
+   they still read a tagged pool entry. */
+static unsigned int rawk_real_of_pool(Chunk* c, unsigned int pool_idx) {
+    AerVal v = c->pool[pool_idx];
+    return chunk_add_rawk_real(c, aer_type(v) == TYPE_INTEGER ? (double)aer_as_int(v) : aer_as_real(v));
 }
 
 /* An already-raw operand's slot is reused directly; a literal loads into a fresh slot.
@@ -1013,34 +1020,34 @@ static int hoist_constant(bool is_int, int64_t value, unsigned int pool_idx, boo
 static int raw_materialize(Chunk* c, int rk, RawKind kind) {
     if (kind == RAWK_INT) {
         if (rk & RK_RAW_INT_FLAG) return rk & RK_RAW_SLOT_MASK;
-        unsigned int pool_idx = rk & ~RK_CONST_FLAG;
-        int64_t v = aer_as_int(c->pool[pool_idx]);
-        int hoisted = hoist_constant(true, v, pool_idx, !(v >= INT32_MIN && v <= INT32_MAX));
+        int64_t v = aer_as_int(c->pool[rk & ~RK_CONST_FLAG]);
+        bool wide = !(v >= INT32_MIN && v <= INT32_MAX);
+        unsigned int rawk_idx = wide ? chunk_add_rawk_int(c, v) : 0;
+        int hoisted = hoist_constant(true, v, rawk_idx, wide);
         if (hoisted >= 0) return hoisted;
         int slot = raw_int_alloc();
         if (slot < 0) return -1;
-        /* A literal outside the signed 32-bit range must go through the pool instead -- OP_RAW_LOAD_INT's
+        /* A literal outside the signed 32-bit range needs the side table -- OP_RAW_LOAD_INT's
            immediate is a full int32 now (the old 20-bit immediate's truncation bug -- `i < 20000000`
-           silently becoming 77056 -- is closed outright, not just widened again), but AER integers are
-           64-bit, so a value beyond INT32_MAX/MIN still needs the pool fallback. */
-        if (v >= INT32_MIN && v <= INT32_MAX) {
+           silently becoming 77056 -- is closed outright, not just widened again), but AER integers
+           are 64-bit. */
+        if (!wide) {
             chunk_emit(c, PACK1(OP_RAW_LOAD_INT, slot));
             chunk_emit(c, (uint32_t)(int32_t)v);
         } else {
             chunk_emit(c, PACK1(OP_RAW_LOAD_INT_POOL, slot));
-            chunk_emit(c, (uint32_t)pool_idx);
+            chunk_emit(c, rawk_idx);
         }
         return slot;
     } else {
         if (rk & RK_RAW_REAL_FLAG) return rk & RK_RAW_SLOT_MASK;
-        unsigned int pool_idx =
-            rk & ~RK_CONST_FLAG; /* real literal already lives in the pool as a full double */
-        int hoisted = hoist_constant(false, 0, pool_idx, false);
+        unsigned int rawk_idx = rawk_real_of_pool(c, rk & ~RK_CONST_FLAG);
+        int hoisted = hoist_constant(false, 0, rawk_idx, false);
         if (hoisted >= 0) return hoisted;
         int slot = raw_real_alloc();
         if (slot < 0) return -1;
         chunk_emit(c, PACK1(OP_RAW_LOAD_REAL, slot));
-        chunk_emit(c, (uint32_t)pool_idx);
+        chunk_emit(c, rawk_idx);
         return slot;
     }
 }
@@ -1090,6 +1097,24 @@ static bool try_emit_arith_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind ki
     return true;
 }
 
+/* Re-points a const-flagged RK at whichever raw constant table `kind` names. An int-kind opcode
+   takes only an integer literal: promoting a real one would need the comparison rewritten around
+   its fractional part, so it declines and the caller keeps the boxed form. */
+static bool rawk_const_rk(Chunk* c, int rk, RawKind kind, int* out_rk) {
+    unsigned int pool_idx = (unsigned int)(rk & ~RK_CONST_FLAG);
+    AerVal v = c->pool[pool_idx];
+    unsigned int idx;
+    if (kind == RAWK_INT) {
+        if (aer_type(v) != TYPE_INTEGER) return false;
+        idx = chunk_add_rawk_int(c, aer_as_int(v));
+    } else {
+        if (aer_type(v) != TYPE_REAL && aer_type(v) != TYPE_INTEGER) return false;
+        idx = rawk_real_of_pool(c, pool_idx);
+    }
+    *out_rk = (int)(RK_CONST_FLAG | idx);
+    return true;
+}
+
 /* Raw-vs-boxed ordering comparisons only (vm.h) -- a raw loop counter almost always compares
    against a non-raw bound (a parameter). Requires the raw side to ALREADY be a raw slot, not
    merely raw-composable: a bare literal would re-materialize a fresh OP_RAW_LOAD every
@@ -1103,6 +1128,9 @@ static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind
 
     if (!(raw_rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) return false;
     if (boxed_rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
+    /* These opcodes read a const-flagged operand from the raw table, never from pool[], so a
+       literal they can't represent there has to fall back to the fully boxed comparison. */
+    if ((boxed_rk & RK_CONST_FLAG) && !rawk_const_rk(c, boxed_rk, kind, &boxed_rk)) return false;
     if (!rk8_fits(boxed_rk)) return false;
 
     /* `boxed OP raw` is `raw (flip) OP boxed` -- LT/GT and LTE/GTE swap. */

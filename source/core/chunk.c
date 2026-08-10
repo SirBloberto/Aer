@@ -27,6 +27,8 @@ void chunk_free(Chunk* c) {
     free(c->source_filename);
     free(c->code);
     free(c->pool);
+    free(c->rawk_i);
+    free(c->rawk_d);
     hashtable_free(&c->name_index);
     free(c->line_mark_offsets);
     free(c->line_mark_lines);
@@ -128,6 +130,32 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
             return i;
     }
     return chunk_pool_append(c, v);
+}
+
+/* Linear-scanned like chunk_add_pool's non-string path: these tables hold only the numeric
+   literals a raw opcode compares or accumulates against, so they stay far smaller than pool[]. */
+unsigned int chunk_add_rawk_int(Chunk* c, int64_t v) {
+    for (unsigned int i = 0; i < c->rawk_i_count; i++)
+        if (c->rawk_i[i] == v) return i;
+    if (c->rawk_i_count >= c->rawk_i_cap) {
+        c->rawk_i_cap = c->rawk_i_cap ? c->rawk_i_cap * 2 : 8;
+        c->rawk_i = xrealloc(c->rawk_i, sizeof(int64_t) * c->rawk_i_cap);
+    }
+    c->rawk_i[c->rawk_i_count] = v;
+    return c->rawk_i_count++;
+}
+
+/* memcmp, not ==: -0.0 == 0.0 but they are not interchangeable constants, and NaN != itself would
+   append a fresh entry on every occurrence. */
+unsigned int chunk_add_rawk_real(Chunk* c, double v) {
+    for (unsigned int i = 0; i < c->rawk_d_count; i++)
+        if (memcmp(&c->rawk_d[i], &v, sizeof(double)) == 0) return i;
+    if (c->rawk_d_count >= c->rawk_d_cap) {
+        c->rawk_d_cap = c->rawk_d_cap ? c->rawk_d_cap * 2 : 8;
+        c->rawk_d = xrealloc(c->rawk_d, sizeof(double) * c->rawk_d_cap);
+    }
+    c->rawk_d[c->rawk_d_count] = v;
+    return c->rawk_d_count++;
 }
 
 /* Newest-first so a redeclared struct (e.g. re-running a REPL block) shadows the old one for new lookups, without invalidating instances still pointing at the old Shape. */
