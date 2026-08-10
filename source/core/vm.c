@@ -2183,6 +2183,22 @@ static void chunk_ensure_field_cache(Chunk* c) {
     memset(c->field_cache + old_cap, 0, sizeof(FieldCacheEntry) * (c->field_cache_cap - old_cap));
 }
 
+/* Resolves a struct name to its Shape, memoised on the name's pool index -- see Chunk.shape_by_name.
+   A miss falls through to the same newest-first scan as before, so a redeclared struct still wins. */
+static Shape* chunk_shape_for_pool_idx(Chunk* c, unsigned int pool_idx) {
+    if (pool_idx < c->shape_by_name_cap && c->shape_by_name[pool_idx]) return c->shape_by_name[pool_idx];
+    Shape* s = chunk_find_shape(c, aer_as_string(c->pool[pool_idx])->data);
+    if (!s) return NULL;
+    if (pool_idx >= c->shape_by_name_cap) {
+        unsigned int old = c->shape_by_name_cap;
+        c->shape_by_name_cap = c->pool_count > pool_idx + 1 ? c->pool_count : pool_idx + 1;
+        c->shape_by_name = xrealloc(c->shape_by_name, sizeof(Shape*) * c->shape_by_name_cap);
+        memset(c->shape_by_name + old, 0, sizeof(Shape*) * (c->shape_by_name_cap - old));
+    }
+    c->shape_by_name[pool_idx] = s;
+    return s;
+}
+
 /* Same idiom, for lbl_call's shape-specialization per-site dispatch cache (see its own comment). */
 static void chunk_ensure_call_spec_cache(Chunk* c) {
     if (c->count <= c->call_spec_cache_cap) return;
@@ -2871,6 +2887,8 @@ lbl_define_struct : {
         c->shapes = xrealloc(c->shapes, sizeof(Shape*) * c->shape_cap);
     }
     c->shapes[c->shape_count++] = shape;
+    /* A redeclare must not keep resolving to the Shape it shadows -- see Chunk.shape_by_name. */
+    if (c->shape_by_name) memset(c->shape_by_name, 0, sizeof(Shape*) * c->shape_by_name_cap);
     DISPATCH();
 }
 
@@ -3649,7 +3667,7 @@ lbl_struct_new : {
     int arg_count = (int)UNPACK_C(op_word);
     int type_name_pool_idx = (int)READ();
     const char* name = aer_as_string(c->pool[type_name_pool_idx])->data;
-    Shape* shape = chunk_find_shape(c, name);
+    Shape* shape = chunk_shape_for_pool_idx(c, (unsigned int)type_name_pool_idx);
     if (!shape) {
         error("'%s' is not defined", name);
         DISPATCH();

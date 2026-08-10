@@ -819,6 +819,15 @@ typedef struct {
     CallSpecCacheEntry* call_spec_cache;
     unsigned int call_spec_cache_cap;
 
+    /* Struct-name -> Shape*, keyed by the name's POOL index rather than the call site, since
+       chunk_add_pool dedups strings and every site building the same struct shares that index.
+       Without it every single struct construction re-ran chunk_find_shape's newest-first scan with
+       a strcmp per shape -- 1.63% of bench/binary_trees.aer was strcmp alone. Cleared wholesale
+       when a shape is registered (a redeclare must not keep resolving to the older Shape); struct
+       definitions are rare and constructions are not, which is the whole trade. */
+    Shape** shape_by_name;
+    unsigned int shape_by_name_cap;
+
 #ifdef AER_DEBUG_TOOLS
     /* Per-word dispatch counters (debug-tools only); only opcode words increment. */
     uint64_t* debug_hits;

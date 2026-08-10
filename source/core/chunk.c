@@ -48,6 +48,7 @@ void chunk_free(Chunk* c) {
     /* Not each entry's shape -- every populated slot's Shape* is owned by c->shapes, never separately owned. */
     free(c->field_cache);
     free(c->call_spec_cache);
+    free(c->shape_by_name);
 #ifdef AER_DEBUG_TOOLS
     free(c->debug_hits);
 #endif

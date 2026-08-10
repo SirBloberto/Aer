@@ -2585,6 +2585,50 @@ sweep that moves `mandelbrot` 25.58% on ARM moves it 1.1% on x86-64 (0.609-0.616
 offsets). A larger BTB and better indirect prediction absorb what ARM's cannot -- which is why
 5.16yd's warning about single-build cycle comparisons applies to the Pi and not to the desktop.
 
+### 5.16yj Every struct construction was doing a linear scan with strcmp
+
+`binary_trees` sits at 0.86x against LuaJIT `-joff`, and a whole session of dispatch and call-path
+work never touched it -- its dispatch share is 6.1%, so all of that aimed at the wrong 6%. Profiling
+it instead of reasoning about it:
+
+| symbol | share |
+|---|---|
+| `vm_run_slice` | 57.64% |
+| `gc_collect` | 8.75% |
+| `vm_struct_field_write` | 8.19% |
+| `vm_call_resolve_specialization` | 6.63% |
+| `pool_alloc` | 3.90% |
+| **`strcmp`** | **1.63%** |
+
+`strcmp` has no business appearing at all. `lbl_struct_new` resolved its type by calling
+`chunk_find_shape(c, name)` -- a newest-first linear scan over every shape, with a `strcmp` per
+shape -- **on every single struct construction**. `binary_trees` allocates millions of nodes, so
+that is millions of string comparisons to answer a question that is constant at each call site.
+
+The name arrives as a pool index, and `chunk_add_pool` dedups strings, so one cache keyed by pool
+index serves every site building the same struct -- smaller than a per-site cache and shared across
+them. A shape registration clears it wholesale, since a redeclare must stop resolving to the Shape
+it shadows; definitions are rare and constructions are not, which is the entire trade.
+
+| benchmark | x86-64 wall | ARM instructions |
+|---|---|---|
+| `binary_trees` | **-10.27%** | **-4.22%** |
+| `dict_bench` | -3.86% | +0.01% |
+| `nbody` | -3.18% | +0.11% |
+| `struct_array_scan` | -0.56% | -1.18% |
+| `mandelbrot` | -0.21% | -0.01% |
+| `fib_bench` | +0.44% | -0.00% |
+
+`binary_trees` -10.27% is well clear of its 4.40% layout band, and `nbody`/`dict_bench` clear theirs
+too. This is the largest single win of the session and it came from the part of the system nothing
+had profiled -- the work *inside* opcodes rather than the dispatch between them. Dispatch is 12.3%
+of instructions suite-wide and as little as 2.5% on the allocation-heavy benchmarks; the remaining
+money is in the handlers.
+
+`vm_call_resolve_specialization` at 6.63% is the next thread to pull: it is documented as `lbl_call`'s
+*cold* path and split out with `noinline` for exactly that reason, so 6.63% means it is not cold at
+all for struct-passing code.
+
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
