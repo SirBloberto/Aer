@@ -157,8 +157,8 @@ AerVal register_get(VM* vm, int slot) {
    hoisted const_pool/registers, not a copy. Takes registers directly rather than re-deriving from
    a VM*: that re-fetch, through a pointer the compiler cannot prove is unaliased inside this
    computed-goto function, measured ~4.5% more instructions on fib_bench. */
-static inline AerVal* vm_rk_ptr16(AerVal* registers, AerVal* const_pool, uint32_t rk16) {
-    if (rk16 & RK16_CONST_FLAG) return &const_pool[rk16 & RK16_INDEX_MASK];
+static inline AerVal* vm_rk_ptr16(AerVal* registers, AerVal* pool, uint32_t rk16) {
+    if (rk16 & RK16_CONST_FLAG) return &pool[rk16 & RK16_INDEX_MASK];
     return &registers[rk16 & RK16_INDEX_MASK];
 }
 
@@ -167,8 +167,8 @@ static inline AerVal* vm_rk_ptr16(AerVal* registers, AerVal* const_pool, uint32_
    OP_UNARY, OP_CAST). A branch-free variant (per-frame pool window) was tried and reverted -- it
    made calls slower; Lua/V8 accept this branch too and make calls free instead (register_stack).
    Takes registers directly -- see vm_rk_ptr16's own comment just above for why. */
-static inline AerVal* vm_rk_ptr8(AerVal* registers, AerVal* const_pool, uint32_t rk8) {
-    if (rk8 & RK8_CONST_FLAG) return &const_pool[rk8 & RK8_INDEX_MASK];
+static inline AerVal* vm_rk_ptr8(AerVal* registers, AerVal* pool, uint32_t rk8) {
+    if (rk8 & RK8_CONST_FLAG) return &pool[rk8 & RK8_INDEX_MASK];
     return &registers[rk8 & RK8_INDEX_MASK];
 }
 
@@ -917,11 +917,11 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
    through here would otherwise silently miss; tests/test_interp_dict_keys.aer guards that.
    Owns the buffer and the probe so neither lands in vm_run_slice's frame (5.16b). */
 static __attribute__((noinline)) bool vm_dict_get_interp(AerDict* d, const uint32_t* rks, unsigned int count,
-                                                         AerVal* registers, AerVal* const_pool, AerVal* out) {
+                                                         AerVal* registers, AerVal* pool, AerVal* out) {
     char key[INTERP_KEY_MAX];
     unsigned int at = 0;
     for (unsigned int i = 0; i < count; i++) {
-        AerVal v = *vm_rk_ptr16(registers, const_pool, rks[i]);
+        AerVal v = *vm_rk_ptr16(registers, pool, rks[i]);
         const char* piece;
         unsigned int piece_len;
         char scratch[32];
@@ -2027,10 +2027,10 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
    ITS parts[] inline on purpose -- hoisting that one out the same way measured worse (5.16h). */
 static __attribute__((noinline)) AerVal vm_index_get_interp_slow(VM* vm, AerVal obj, const uint32_t* rks,
                                                                  unsigned int count, AerVal* registers,
-                                                                 AerVal* const_pool) {
+                                                                 AerVal* pool) {
     AerVal parts[INTERP_MAX_PARTS];
     for (unsigned int i = 0; i < count; i++)
-        parts[i] = *vm_rk_ptr16(registers, const_pool, rks[i]);
+        parts[i] = *vm_rk_ptr16(registers, pool, rks[i]);
     AerVal out;
     vm_index_get_compute(obj, vm_interp_build(vm, parts, count), &out);
     return out;
@@ -2676,7 +2676,11 @@ static bool opcode_is_tag_only(Opcode op) {
 VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     Chunk* c = vm->chunk;
     /* Hoisted once -- c->pool is only mutated at parse time, stable for the whole call. */
-    AerVal* const_pool = c->pool;
+/* Deliberately not a hoisted local. Every use is on a boxed path, while keeping it in a
+   register costs the raw paths one they need more -- the same trade that made hoisting
+   rawk_i/rawk_d expensive. `c` is live regardless, and reading through it also means a
+   specialization recompile that moves the pool needs no refresh here. */
+#define const_pool (c->pool)
     /* Installs this call's error catch point, saving the previous one so nested vm_run calls
        catch their own errors and unwind no further than here; restored on every return. */
     AerJmpBuf catch_point;
@@ -3303,7 +3307,6 @@ lbl_call : {
         code = c->code;
         pc = code + resume_at;
         functions = c->functions;
-        const_pool = c->pool;
     }
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];
