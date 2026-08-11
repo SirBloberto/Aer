@@ -48,32 +48,53 @@ def deploy(host, ref, path):
 
 
 def sample(host, path, name, event):
-    r = ssh(host, "cd %s && perf stat -e %s ./binary/aer bench/%s.aer 2>&1 >/dev/null"
-            % (path, event, name))
-    m = re.search(r"^\s*([0-9,]+)\s+%s" % re.escape(event), r.stdout + r.stderr, re.M)
-    return int(m.group(1).replace(",", "")) if m else None
+    """One run's (event count, peak RSS in KB). /usr/bin/time wraps perf rather than the other way
+       round, so the RSS reported is the interpreter's own high-water mark, not perf's."""
+    r = ssh(host, "cd %s && /usr/bin/time -f 'MAXRSS %%M' perf stat -e %s ./binary/aer bench/%s.aer"
+                  " 2>&1 >/dev/null" % (path, event, name))
+    out = r.stdout + r.stderr
+    m = re.search(r"^\s*([0-9,]+)\s+%s" % re.escape(event), out, re.M)
+    rss = re.search(r"^MAXRSS (\d+)", out, re.M)
+    if not m:
+        return None
+    return int(m.group(1).replace(",", "")), int(rss.group(1)) if rss else 0
 
 
 def measure_pair(host, name, runs, event):
-    """Minimum of `runs` counts each -- the least noise-inflated sample, not a mean.
-
-    Base and head are INTERLEAVED, not measured in two blocks. Running one side to completion
-    first hands any drift over the measurement window (frequency ramp, page-cache warming,
-    thermal) entirely to whichever side went first. That is invisible on instructions, which are
-    deterministic, but on cycles it silently favoured head: a base-against-itself control reported
-    six improvements and zero regressions, up to 5.15%, on identical code.
-    """
-    best_b = best_h = None
+    """Every run's samples for both sides, base and head INTERLEAVED rather than in two blocks.
+    Running one side to completion first hands any drift over the measurement window (frequency
+    ramp, page-cache warming, thermal) entirely to whichever side went first. That is invisible on
+    instructions, which are deterministic, but on cycles it silently favoured head: a
+    base-against-itself control reported six improvements and zero regressions, up to 5.15%, on
+    identical code."""
+    b, h = [], []
     for _ in range(runs):
-        for path, which in (("~/bench-base", "b"), ("~/bench-head", "h")):
-            v = sample(host, path, name, event)
-            if v is None:
+        for path, into in (("~/bench-base", b), ("~/bench-head", h)):
+            s = sample(host, path, name, event)
+            if s is None:
                 return None, None
-            if which == "b":
-                best_b = v if best_b is None else min(best_b, v)
-            else:
-                best_h = v if best_h is None else min(best_h, v)
-    return best_b, best_h
+            into.append(s)
+    return b, h
+
+
+def mean(xs):
+    return sum(xs) / float(len(xs))
+
+
+def spread(xs):
+    """Peak-to-peak as a percentage of the mean -- what a reader needs to know before believing a
+       delta, and honest about a 2-run sample in a way a standard deviation would not be."""
+    m = mean(xs)
+    return (max(xs) - min(xs)) * 100.0 / m if m else 0.0
+
+
+def human(n):
+    """3 significant digits with a magnitude suffix: raw 11-digit counts are unreadable side by
+       side, and no decision here has ever turned on the last six of them."""
+    for limit, suffix in ((1e9, "G"), (1e6, "M"), (1e3, "K")):
+        if abs(n) >= limit:
+            return "%.2f%s" % (n / limit, suffix)
+    return "%.0f" % n
 
 
 def main():
@@ -94,25 +115,33 @@ def main():
     deploy(args.host, args.base, "~/bench-base")
     deploy(args.host, args.head, "~/bench-head")
 
-    print("\n%-22s %14s %14s %9s" % ("benchmark", "base", "head", "delta"))
-    print("-" * 62)
+    print("\n%-20s %8s %8s %9s %7s %8s %8s" %
+          ("benchmark", "base", "head", "delta", "spread", "mem", "mem Δ"))
+    print("-" * 76)
     regressions, improvements = [], []
     for name in names:
         b, h = measure_pair(args.host, name, args.runs, args.event)
         if b is None or h is None:
-            print("%-22s %14s %14s %9s" % (name, "?", "?", "FAILED"))
+            print("%-20s %8s %8s %9s" % (name, "?", "?", "FAILED"))
             continue
-        pct = (h - b) * 100.0 / b
+        bc, hc = [s[0] for s in b], [s[0] for s in h]
+        bm, hm = [s[1] for s in b], [s[1] for s in h]
+        pct = (mean(hc) - mean(bc)) * 100.0 / mean(bc)
+        mem_pct = (mean(hm) - mean(bm)) * 100.0 / mean(bm) if mean(bm) else 0.0
+        # the noisier side is the one that decides whether a delta means anything
+        sp = max(spread(bc), spread(hc))
         flag = ""
         if pct > args.threshold:
             flag = "  <-- REGRESSION"
             regressions.append((name, pct))
         elif pct < -args.threshold:
             improvements.append((name, pct))
-        print("%-22s %14d %14d %+8.2f%%%s" % (name, b, h, pct, flag))
+        print("%-20s %8s %8s %+8.2f%% %6.2f%% %8s %+7.1f%%%s" %
+              (name, human(mean(bc)), human(mean(hc)), pct, sp,
+               human(mean(hm) * 1024), mem_pct, flag))
 
-    print("-" * 62)
-    print("base=%s  head=%s  runs=%d (min)  threshold=%.2f%%  event=%s"
+    print("-" * 76)
+    print("base=%s  head=%s  runs=%d (mean)  threshold=%.2f%%  event=%s"
           % (args.base, args.head, args.runs, args.threshold, args.event))
     for name, pct in improvements:
         print("  improved: %-20s %+.2f%%" % (name, pct))
