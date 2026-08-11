@@ -1,0 +1,46 @@
+import time
+
+# Column-oriented analytics scan, the shape a Parquet row group gets processed in: each column is
+# its own typed array, a predicate rejects most rows, and the survivors feed a grouped aggregate.
+# Unlike typed_elementwise (cache-resident, compute-bound) this is deliberately larger than L3, so
+# it measures a streaming scan the way a real query engine meets one -- and unlike struct_array_scan
+# it is columnar, touching only the columns the query names.
+
+N = 4000000
+GROUPS = 8
+
+region = [0i; N]
+quantity = [0i; N]
+price = [0.0; N]
+discount = [0.0; N]
+
+i = 0
+for i < N:
+    region[i] = i % GROUPS
+    quantity[i] = (i % 50) + 1
+    price[i] = float(i % 1000) * 0.5 + 1.0
+    discount[i] = float(i % 20) * 0.01
+    i += 1
+
+# SELECT region, SUM(price * quantity * (1 - discount)), COUNT(*)
+# FROM sales WHERE quantity > 10 AND price < 400 GROUP BY region
+revenue = [0.0; GROUPS]
+counts = [0; GROUPS]
+
+start = time.now()
+matched = 0
+rows = length(quantity)
+for i in 0..rows:
+    q = quantity[i]
+    p = price[i]
+    if q > 10 and p < 400.0:
+        g = region[i]
+        revenue[g] = revenue[g] + p * float(q) * (1.0 - discount[i])
+        counts[g] = counts[g] + 1
+        matched += 1
+dur = time.now() - start
+
+total = 0.0
+for gi in 0..GROUPS:
+    total += revenue[gi]
+print("columnar {N} rows: {dur}s, matched={matched}, revenue={total}")
