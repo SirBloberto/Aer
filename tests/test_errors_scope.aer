@@ -86,4 +86,27 @@ for i in 0..3:
 # by tests/embed_smoke_test.c instead, where a host can inspect vm_run()'s
 # return value without killing the test run itself.
 
+# ------------------------------------------------------------------ #
+# 28. A name first bound inside a range-for body outlives the loop      #
+# ------------------------------------------------------------------ #
+
+# Regression: range-for and for-in restored the reserved floor
+# unconditionally at loop end, handing a variable the body had claimed back
+# to the temp allocator. The next temp-heavy expression then overwrote it,
+# so `tag` read back 3 (a stray temp) instead of "kept". The while-form loop
+# already guarded this; these two did not.
+tags = [7; 3]
+for ti in 0..3:
+    tag_kept = "kept"
+tnums = [1, 2, 3]
+tmix = [tnums[0] + tnums[1], tnums[1] + tnums[2], tnums[0] * tnums[2]]
+assert(tag_kept == "kept", "range-for body variable survives later temps")
+assert(tmix[1] == 5, "the temps that used to clobber it still compute")
+
+for tv in tags:
+    tag_each = "seen"
+tmix2 = [tnums[0] + tnums[2], tnums[2] * tnums[2]]
+assert(tag_each == "seen", "for-in body variable survives later temps")
+assert(tmix2[1] == 9, "for-in temps still compute")
+
 print("test_errors_scope.aer: all assertions passed.")

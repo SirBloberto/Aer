@@ -3871,6 +3871,7 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
            Restored to the pre-loop watermark once the loop's bytecode is emitted. */
         int saved_reserved_floor = P.reserved_floor;
         P.reserved_floor = P.next_temp_register;
+        int raised_reserved_floor = P.reserved_floor;
 
         bool hoisting = hoist_begin(c);
         unsigned int prep_at = c->count;
@@ -3929,8 +3930,14 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         loop_pop_and_patch_rotated(c, exit_pos, loop_bottom);
         hoist_end(c, prep_at, hoisting);
 
-        P.reserved_floor = saved_reserved_floor;
-        P.next_temp_register = saved_reserved_floor;
+        /* Conditional for the same reason the while-form's restore is: a name first assigned in the
+           body outlives the loop, so lowering past its register would hand a live variable to the
+           next statement as a temp. */
+        if (P.reserved_floor == raised_reserved_floor) {
+            P.reserved_floor = saved_reserved_floor;
+            P.next_temp_register = saved_reserved_floor;
+        }
+        assert_variables_below_floor("range-for body");
         return;
     }
 
@@ -3947,6 +3954,7 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
        compiles, same as the range branch. */
     int saved_reserved_floor = P.reserved_floor;
     P.reserved_floor = P.next_temp_register;
+    int raised_reserved_floor = P.reserved_floor;
 
     bool hoisting = hoist_begin(c);
     unsigned int loop_top = c->count; /* the iterate opcode is its own back-edge target */
@@ -3955,8 +3963,11 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
     parse_loop_body(c, loop_top, patch_exit);
     hoist_end(c, loop_top, hoisting);
 
-    P.reserved_floor = saved_reserved_floor;
-    P.next_temp_register = saved_reserved_floor;
+    if (P.reserved_floor == raised_reserved_floor) {
+        P.reserved_floor = saved_reserved_floor;
+        P.next_temp_register = saved_reserved_floor;
+    }
+    assert_variables_below_floor("for-in body");
 }
 
 /* Dict-only at runtime -- reserves both loop variables' registers before compiling the
