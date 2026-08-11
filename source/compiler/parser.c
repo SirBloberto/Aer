@@ -447,14 +447,6 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
             case OP_GT: fused_op = OP_GT_JUMP_IF_FALSE; break;
             case OP_LTE: fused_op = OP_LTE_JUMP_IF_FALSE; break;
             case OP_GTE: fused_op = OP_GTE_JUMP_IF_FALSE; break;
-            case OP_RAW_LT_INT_BOXED: fused_op = OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE; break;
-            case OP_RAW_GT_INT_BOXED: fused_op = OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE; break;
-            case OP_RAW_LTE_INT_BOXED: fused_op = OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE; break;
-            case OP_RAW_GTE_INT_BOXED: fused_op = OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE; break;
-            case OP_RAW_LT_REAL_BOXED: fused_op = OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE; break;
-            case OP_RAW_GT_REAL_BOXED: fused_op = OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE; break;
-            case OP_RAW_LTE_REAL_BOXED: fused_op = OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE; break;
-            case OP_RAW_GTE_REAL_BOXED: fused_op = OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE; break;
             case OP_RAW_LT_INT: fused_op = OP_RAW_LT_INT_JUMP_IF_FALSE; break;
             case OP_RAW_LTE_INT: fused_op = OP_RAW_LTE_INT_JUMP_IF_FALSE; break;
             case OP_RAW_EQ_INT: fused_op = OP_RAW_EQ_INT_JUMP_IF_FALSE; break;
@@ -1194,76 +1186,6 @@ static bool try_rewrite_index_get_raw(Chunk* c, int* rk, unsigned int start, Raw
     return true;
 }
 
-/* Raw-vs-boxed ordering comparisons only (vm.h) -- a raw loop counter almost always compares
-   against a non-raw bound (a parameter). Requires the raw side to ALREADY be a raw slot, not
-   merely raw-composable: a bare literal would re-materialize a fresh OP_RAW_LOAD every
-   iteration, paying more than the boxed RK path it replaces. */
-static bool try_emit_cmp_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind_lhs, int rk_rhs,
-                                   RawKind kind_rhs, int* out_rk) {
-    bool lhs_raw = (kind_lhs != RAWK_NONE);
-    int raw_rk = lhs_raw ? rk_lhs : rk_rhs;
-    RawKind kind = lhs_raw ? kind_lhs : kind_rhs;
-    int boxed_rk = lhs_raw ? rk_rhs : rk_lhs;
-
-    if (!(raw_rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) return false;
-    if (boxed_rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
-    /* These opcodes read a const-flagged operand from the raw table, never from pool[], so a
-       literal they can't represent there has to fall back to the fully boxed comparison. */
-    if ((boxed_rk & RK_CONST_FLAG) && !rawk_const_rk(c, boxed_rk, kind, &boxed_rk)) return false;
-    if (!rk8_fits(boxed_rk)) return false;
-
-    /* `boxed OP raw` is `raw (flip) OP boxed` -- LT/GT and LTE/GTE swap. */
-    Opcode effective_op = op;
-    if (!lhs_raw) {
-        switch (op) {
-            case OP_LT: effective_op = OP_GT; break;
-            case OP_GT: effective_op = OP_LT; break;
-            case OP_LTE: effective_op = OP_GTE; break;
-            case OP_GTE: effective_op = OP_LTE; break;
-            default: return false;
-        }
-    }
-
-    bool int_kind = (kind == RAWK_INT);
-    Opcode raw_op;
-    if (int_kind) {
-        switch (effective_op) {
-            case OP_LT: raw_op = OP_RAW_LT_INT_BOXED; break;
-            case OP_GT: raw_op = OP_RAW_GT_INT_BOXED; break;
-            case OP_LTE: raw_op = OP_RAW_LTE_INT_BOXED; break;
-            case OP_GTE: raw_op = OP_RAW_GTE_INT_BOXED; break;
-            default: return false;
-        }
-    } else {
-        switch (effective_op) {
-            case OP_LT: raw_op = OP_RAW_LT_REAL_BOXED; break;
-            case OP_GT: raw_op = OP_RAW_GT_REAL_BOXED; break;
-            case OP_LTE: raw_op = OP_RAW_LTE_REAL_BOXED; break;
-            case OP_GTE: raw_op = OP_RAW_GTE_REAL_BOXED; break;
-            default: return false;
-        }
-    }
-
-    int slot = raw_materialize(c, raw_rk, kind);
-    if (slot < 0) return false; /* raw-slot budget exhausted: fall back to boxed */
-
-    int floor_now = int_kind ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
-    if (slot >= floor_now) {
-        if (int_kind)
-            raw_int_free(1);
-        else
-            raw_real_free(1);
-    }
-    if (is_temp(boxed_rk)) reg_free(1);
-
-    int dest = reg_alloc();
-    P.last_cmp_offset = c->count;
-    chunk_emit(c, PACK3(raw_op, dest, slot, pack_rk8(boxed_rk)));
-    if (!(boxed_rk & RK_CONST_FLAG)) P.raw_boxed_emits++;
-    *out_rk = dest;
-    return true;
-}
-
 /* Returns false if the operator has no raw-native form or the operand kinds mismatch, and the
    caller falls back to the boxed path. Only ADD/SUB/MUL/DIV/MOD/FLOOR_DIV and the 4 ordering
    comparisons are raw-native -- EQ/NEQ/bitwise/AND/OR/IN always stay boxed, deliberately. */
@@ -1271,32 +1193,11 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     RawKind kind_lhs = rk_raw_kind(c, rk_lhs);
     RawKind kind_rhs = rk_raw_kind(c, rk_rhs);
 
-    /* rk_raw_kind calls a bare literal raw-composable, which is right for arithmetic but wrong for
-       a comparison against an already-raw operand: raw-materializing it costs an OP_RAW_LOAD every
-       iteration, while the raw-vs-boxed compare takes it as a constant-pool operand for free. */
-    if ((op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE) && kind_lhs != RAWK_NONE &&
-        kind_lhs == kind_rhs) {
-        bool lhs_is_slot = (rk_lhs & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) != 0;
-        bool rhs_is_slot = (rk_rhs & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) != 0;
-        bool lhs_is_const = (rk_lhs & RK_CONST_FLAG) != 0;
-        bool rhs_is_const = (rk_rhs & RK_CONST_FLAG) != 0;
-        /* Declines only when the constant overruns RK8's 7-bit index, and then the OP_LOADK spill
-           puts it back in range for the second attempt below. */
-        if (lhs_is_slot && rhs_is_const) {
-            if (try_emit_cmp_raw_boxed(c, op, rk_lhs, kind_lhs, rk_rhs, RAWK_NONE, out_rk)) return true;
-            rk_rhs = materialize(c, rk_rhs);
-            kind_rhs = RAWK_NONE;
-        } else if (rhs_is_slot && lhs_is_const) {
-            if (try_emit_cmp_raw_boxed(c, op, rk_lhs, RAWK_NONE, rk_rhs, kind_rhs, out_rk)) return true;
-            rk_lhs = materialize(c, rk_lhs);
-            kind_lhs = RAWK_NONE;
-        }
-    }
-
-    if ((kind_lhs == RAWK_NONE) != (kind_rhs == RAWK_NONE)) {
-        if (try_emit_arith_raw_boxed(c, op, rk_lhs, kind_lhs, rk_rhs, kind_rhs, out_rk)) return true;
-        return try_emit_cmp_raw_boxed(c, op, rk_lhs, kind_lhs, rk_rhs, kind_rhs, out_rk);
-    }
+    /* One raw operand against a genuinely boxed one: only the in-place accumulate has a raw form.
+       A comparison in that shape goes through the ordinary boxed opcodes -- the literal bound it
+       used to exist for now rides in the raw opcode's own operand as a raw constant. */
+    if ((kind_lhs == RAWK_NONE) != (kind_rhs == RAWK_NONE))
+        return try_emit_arith_raw_boxed(c, op, rk_lhs, kind_lhs, rk_rhs, kind_rhs, out_rk);
     if (kind_lhs == RAWK_NONE || kind_rhs == RAWK_NONE || kind_lhs != kind_rhs) return false;
     bool int_kind = (kind_lhs == RAWK_INT);
 
@@ -4524,6 +4425,9 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         bool is_int = (P.variant_kind == RAWK_INT);
         bool ret_int = (P.variant_return_kind == RAWK_INT);
         bool ret_raw = (P.variant_return_kind != RAWK_NONE);
+        /* Recorded here as well as in emit_call: the raw form below never reaches it, and without
+           this the first pass looks non-recursive and the result-kind search never runs. */
+        P.self_call_seen = true;
         if (rk_raw_kind(c, rk_arg) == P.variant_kind) {
             int arg_slot = raw_materialize(c, rk_arg, P.variant_kind);
             /* A result that is not numeric at all -- make_tree returns a struct -- still gets its

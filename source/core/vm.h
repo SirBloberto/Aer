@@ -254,14 +254,6 @@ typedef enum {
     /* Raw-vs-boxed comparison producing a boxed boolean -- removes the OP_BOX_INT that dominated
        `for i <= limit:`-shaped loops. Not in-place. The boxed operand is RK8, so a literal bound
        (`x*x + y*y > 4.0`) is read from the pool rather than reloaded into a register each pass. */
-    OP_RAW_LT_INT_BOXED,
-    OP_RAW_GT_INT_BOXED,
-    OP_RAW_LTE_INT_BOXED,
-    OP_RAW_GTE_INT_BOXED,
-    OP_RAW_LT_REAL_BOXED,
-    OP_RAW_GT_REAL_BOXED,
-    OP_RAW_LTE_REAL_BOXED,
-    OP_RAW_GTE_REAL_BOXED,
     /* Pool fallback for literals outside the old 20-bit immediate; kept as a distinct opcode
        (rather than widening OP_RAW_LOAD_INT's own immediate) since the fixed-width redesign below
        gives OP_RAW_LOAD_INT a full 32-bit immediate anyway -- this opcode now only exists for
@@ -347,17 +339,9 @@ typedef enum {
        comparison opcodes were measured earning nothing against the branch-predictor cost every
        added opcode imposes. Operand layout is the raw-boxed int opcode's own word0 B/C verbatim,
        plus a trailing jump-target word. */
-    OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE,
-    OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE,
-    OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE,
-    OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE,
     /* Same fusion for a raw REAL local against a boxed value -- the shape `x*x + y*y > 4.0` in any
        float loop, which was three dispatches (load the constant, compare, branch) against the int
        path's two. */
-    OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE,
-    OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE,
-    OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE,
-    OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE,
 
     /* The same fusion where BOTH operands are raw slots -- `iter < max_iter` once max_iter is a raw
        parameter rather than a boxed one. No GT/GTE members: the raw-vs-raw family emits `a > b` as

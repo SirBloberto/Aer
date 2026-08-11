@@ -405,35 +405,11 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_GT_JUMP_IF_FALSE] = {"OP_GT_JUMP_IF_FALSE", "jump if !(rk > rk)", {0}, false, 1, 0},
     [OP_LTE_JUMP_IF_FALSE] = {"OP_LTE_JUMP_IF_FALSE", "jump if !(rk <= rk)", {0}, false, 1, 0},
     [OP_GTE_JUMP_IF_FALSE] = {"OP_GTE_JUMP_IF_FALSE", "jump if !(rk >= rk)", {0}, false, 1, 0},
-    [OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr < rk) (tag-checked)", {0}, false, 1, 0},
-    [OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr > rk) (tag-checked)", {0}, false, 1, 0},
-    [OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr <= rk) (tag-checked)", {0}, false, 1, 0},
-    [OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE", "jump if !(rawr >= rk) (tag-checked)", {0}, false, 1, 0},
     /* Variable-length, but not OP_DEFINE_STRUCT's shape -- header word then part_count RK16
        words, one per part. Both walkers below special-case it. */
     [OP_INTERP] = {"OP_INTERP", "reg = one string built from N parts", {0}, false, 0, 2},
     [OP_INDEX_GET_INTERP] =
         {"OP_INDEX_GET_INTERP", "reg = dict[N-part key], key never allocated", {0}, false, 0, 3},
-    [OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi < rk) (tag-checked)", {0}, false, 1, 0},
-    [OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi > rk) (tag-checked)", {0}, false, 1, 0},
-    [OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi <= rk) (tag-checked)", {0}, false, 1, 0},
-    [OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE] =
-        {"OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE", "jump if !(rawi >= rk) (tag-checked)", {0}, false, 1, 0},
-    [OP_RAW_LT_INT_BOXED] = {"OP_RAW_LT_INT_BOXED", "reg = rawi < rk (tag-checked)"},
-    [OP_RAW_GT_INT_BOXED] = {"OP_RAW_GT_INT_BOXED", "reg = rawi > rk (tag-checked)"},
-    [OP_RAW_LTE_INT_BOXED] = {"OP_RAW_LTE_INT_BOXED", "reg = rawi <= rk (tag-checked)"},
-    [OP_RAW_GTE_INT_BOXED] = {"OP_RAW_GTE_INT_BOXED", "reg = rawi >= rk (tag-checked)"},
-    [OP_RAW_LT_REAL_BOXED] = {"OP_RAW_LT_REAL_BOXED", "reg = rawr < rk (tag-checked)"},
-    [OP_RAW_GT_REAL_BOXED] = {"OP_RAW_GT_REAL_BOXED", "reg = rawr > rk (tag-checked)"},
-    [OP_RAW_LTE_REAL_BOXED] = {"OP_RAW_LTE_REAL_BOXED", "reg = rawr <= rk (tag-checked)"},
-    [OP_RAW_GTE_REAL_BOXED] = {"OP_RAW_GTE_REAL_BOXED", "reg = rawr >= rk (tag-checked)"},
     [OP_RAW_LT_INT_JUMP_IF_FALSE] =
         {"OP_RAW_LT_INT_JUMP_IF_FALSE", "jump if !(rawi < rawi)", {0}, false, 1, 0},
     [OP_RAW_LTE_INT_JUMP_IF_FALSE] =
@@ -543,22 +519,6 @@ static void print_rk8(FILE* out, Chunk* c, uint32_t rk) {
         fprintf(out, "  rk=const:");
         print_pool_value(out, c->pool[rk & RK8_INDEX_MASK]);
     } else
-        fprintf(out, "  rk=reg%u", rk & RK8_INDEX_MASK);
-}
-
-/* The raw families read a const-flagged RK8 out of rawk_i/rawk_d instead of pool[] -- same bit,
-   different table, so their operands need their own printers. */
-static void print_rk8_rawi(FILE* out, Chunk* c, uint32_t rk) {
-    if (rk & RK8_CONST_FLAG)
-        fprintf(out, "  rk=rawi_const:%lld", (long long)c->rawk_i[rk & RK8_INDEX_MASK]);
-    else
-        fprintf(out, "  rk=reg%u", rk & RK8_INDEX_MASK);
-}
-
-static void print_rk8_rawr(FILE* out, Chunk* c, uint32_t rk) {
-    if (rk & RK8_CONST_FLAG)
-        fprintf(out, "  rk=rawr_const:%g", c->rawk_d[rk & RK8_INDEX_MASK]);
-    else
         fprintf(out, "  rk=reg%u", rk & RK8_INDEX_MASK);
 }
 
@@ -682,16 +642,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
                op == OP_GT_JUMP_IF_FALSE || op == OP_LTE_JUMP_IF_FALSE || op == OP_GTE_JUMP_IF_FALSE) {
         print_rk8(out, c, UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
-        print_jump(out, c->code[pos], pos + 1), pos++;
-    } else if (op == OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE || op == OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE ||
-               op == OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE || op == OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE) {
-        print_rawi(out, (int)UNPACK_B(op_word));
-        print_rk8_rawi(out, c, UNPACK_C(op_word));
-        print_jump(out, c->code[pos], pos + 1), pos++;
-    } else if (op == OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE || op == OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE ||
-               op == OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE || op == OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE) {
-        print_rawr(out, (int)UNPACK_B(op_word));
-        print_rk8_rawr(out, c, UNPACK_C(op_word));
         print_jump(out, c->code[pos], pos + 1), pos++;
     } else if (op == OP_RAW_LT_INT_JUMP_IF_FALSE || op == OP_RAW_LTE_INT_JUMP_IF_FALSE ||
                op == OP_RAW_EQ_INT_JUMP_IF_FALSE || op == OP_RAW_NEQ_INT_JUMP_IF_FALSE) {
@@ -1018,16 +968,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     } else if (op == OP_RAW_LOAD_INT_POOL) {
         print_rawi(out, (int)UNPACK_A(op_word));
         fprintf(out, "  val=%lld", (long long)c->rawk_i[c->code[pos++]]);
-    } else if (op == OP_RAW_LT_INT_BOXED || op == OP_RAW_GT_INT_BOXED || op == OP_RAW_LTE_INT_BOXED ||
-               op == OP_RAW_GTE_INT_BOXED) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rawi(out, (int)UNPACK_B(op_word));
-        print_rk8_rawi(out, c, UNPACK_C(op_word));
-    } else if (op == OP_RAW_LT_REAL_BOXED || op == OP_RAW_GT_REAL_BOXED || op == OP_RAW_LTE_REAL_BOXED ||
-               op == OP_RAW_GTE_REAL_BOXED) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rawr(out, (int)UNPACK_B(op_word));
-        print_rk8_rawr(out, c, UNPACK_C(op_word));
     } else {
         /* Generic path -- the handful of opcodes whose fields all fit the plain PACK3 shape
            (op+up to 3 byte fields) with nothing trailing, or nothing at all. */

@@ -2924,14 +2924,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_ADD_REAL_BOXED_TO] = &&lbl_raw_add_real_boxed_to,
         [OP_RAW_MUL_REAL_BOXED_TO] = &&lbl_raw_mul_real_boxed_to,
         [OP_RAW_LOAD_INT_POOL] = &&lbl_raw_load_int_pool,
-        [OP_RAW_LT_INT_BOXED] = &&lbl_raw_lt_int_boxed,
-        [OP_RAW_GT_INT_BOXED] = &&lbl_raw_gt_int_boxed,
-        [OP_RAW_LTE_INT_BOXED] = &&lbl_raw_lte_int_boxed,
-        [OP_RAW_GTE_INT_BOXED] = &&lbl_raw_gte_int_boxed,
-        [OP_RAW_LT_REAL_BOXED] = &&lbl_raw_lt_real_boxed,
-        [OP_RAW_GT_REAL_BOXED] = &&lbl_raw_gt_real_boxed,
-        [OP_RAW_LTE_REAL_BOXED] = &&lbl_raw_lte_real_boxed,
-        [OP_RAW_GTE_REAL_BOXED] = &&lbl_raw_gte_real_boxed,
 
         [OP_INDEX_FIELD_GET_RAW_INT] = &&lbl_index_field_get_raw_int,
         [OP_INDEX_FIELD_GET_RAW_REAL] = &&lbl_index_field_get_raw_real,
@@ -2981,14 +2973,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_LTE_JUMP_IF_FALSE] = &&lbl_lte_jump_if_false,
         [OP_GTE_JUMP_IF_FALSE] = &&lbl_gte_jump_if_false,
 
-        [OP_RAW_LT_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lt_int_boxed_jump_if_false,
-        [OP_RAW_GT_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gt_int_boxed_jump_if_false,
-        [OP_RAW_LTE_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lte_int_boxed_jump_if_false,
-        [OP_RAW_GTE_INT_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gte_int_boxed_jump_if_false,
-        [OP_RAW_LT_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lt_real_boxed_jump_if_false,
-        [OP_RAW_GT_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gt_real_boxed_jump_if_false,
-        [OP_RAW_LTE_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_lte_real_boxed_jump_if_false,
-        [OP_RAW_GTE_REAL_BOXED_JUMP_IF_FALSE] = &&lbl_raw_gte_real_boxed_jump_if_false,
 
         [OP_RAW_LT_INT_JUMP_IF_FALSE] = &&lbl_raw_lt_int_jump_if_false,
         [OP_RAW_LTE_INT_JUMP_IF_FALSE] = &&lbl_raw_lte_int_jump_if_false,
@@ -5532,131 +5516,6 @@ lbl_raw_load_int_pool : {
     raw_ints[dest] = rawk_i[idx];
     DISPATCH();
 }
-
-/* A const-flagged operand indexes rawk_i (Chunk.rawk_i) -- the opcode names the type, so the
-   constant needs no tag and no encoding bit to say where it lives. Only a register operand still
-   carries one, and it may legitimately be TYPE_REAL against an int raw slot (e.g. time.now()'s
-   real result) -- the ordinary boxed comparison this replaces promotes int<->real too. */
-#define RAW_CMP_INT_BOXED(name, op, opstr)                                                                   \
-    lbl_raw_##name##_int_boxed : {                                                                           \
-        int dest = (int)UNPACK_A(op_word);                                                                   \
-        int slot = (int)UNPACK_B(op_word);                                                                   \
-        unsigned int rk = UNPACK_C(op_word);                                                                 \
-        if (RK8_IS_CONST(rk)) {                                                                              \
-            registers[dest] = aer_bool(raw_ints[slot] op rawk_i[RK8_INDEX(rk)]);                             \
-            DISPATCH();                                                                                      \
-        }                                                                                                    \
-        AerVal* rhs = &registers[rk];                                                                        \
-        if (rhs->tag == TYPE_INTEGER)                                                                        \
-            registers[dest] = aer_bool(raw_ints[slot] op rhs->as.i);                                         \
-        else if (rhs->tag == TYPE_REAL)                                                                      \
-            registers[dest] = aer_bool((double)raw_ints[slot] op rhs->as.d);                                 \
-        else                                                                                                 \
-            error("Cannot apply '" opstr "' to integer and %s", vm_type_name(c, *rhs));                      \
-        DISPATCH();                                                                                          \
-    }
-
-    RAW_CMP_INT_BOXED(lt, <, "<")
-    RAW_CMP_INT_BOXED(gt, >, ">")
-    RAW_CMP_INT_BOXED(lte, <=, "<=")
-    RAW_CMP_INT_BOXED(gte, >=, ">=")
-
-#undef RAW_CMP_INT_BOXED
-
-/* Real counterpart; an integer register rhs promotes, and an integer literal was already widened
-   into rawk_d at parse time. */
-#define RAW_CMP_REAL_BOXED(name, op, opstr)                                                                  \
-    lbl_raw_##name##_real_boxed : {                                                                          \
-        int dest = (int)UNPACK_A(op_word);                                                                   \
-        int slot = (int)UNPACK_B(op_word);                                                                   \
-        unsigned int rk = UNPACK_C(op_word);                                                                 \
-        if (RK8_IS_CONST(rk)) {                                                                              \
-            registers[dest] = aer_bool(raw_reals[slot] op rawk_d[RK8_INDEX(rk)]);                            \
-            DISPATCH();                                                                                      \
-        }                                                                                                    \
-        AerVal* rhs = &registers[rk];                                                                        \
-        if (rhs->tag == TYPE_REAL)                                                                           \
-            registers[dest] = aer_bool(raw_reals[slot] op rhs->as.d);                                        \
-        else if (rhs->tag == TYPE_INTEGER)                                                                   \
-            registers[dest] = aer_bool(raw_reals[slot] op(double) rhs->as.i);                                \
-        else                                                                                                 \
-            error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs));                        \
-        DISPATCH();                                                                                          \
-    }
-
-    RAW_CMP_REAL_BOXED(lt, <, "<")
-    RAW_CMP_REAL_BOXED(gt, >, ">")
-    RAW_CMP_REAL_BOXED(lte, <=, "<=")
-    RAW_CMP_REAL_BOXED(gte, >=, ">=")
-
-#undef RAW_CMP_REAL_BOXED
-
-/* OP_LT_JUMP_IF_FALSE's fusion scoped to the raw-boxed int family; see vm.h for why the other three
-   were dropped. rhs may legitimately be TYPE_REAL against an int raw slot, as the unfused opcode
-   already allows. On a real type mismatch error() longjmps before `cond` is read -- it exists only
-   to keep the compiler quiet about a possibly-unread variable. */
-#define RAW_CMP_INT_BOXED_JUMP_IF_FALSE(name, op, opstr)                                                     \
-    lbl_raw_##name##_int_boxed_jump_if_false : {                                                             \
-        int slot = (int)UNPACK_B(op_word);                                                                   \
-        unsigned int rk = UNPACK_C(op_word);                                                                 \
-        int target = READ();                                                                                 \
-        if (RK8_IS_CONST(rk)) {                                                                              \
-            if (!(raw_ints[slot] op rawk_i[RK8_INDEX(rk)])) pc += (int32_t)target;                           \
-            DISPATCH();                                                                                      \
-        }                                                                                                    \
-        AerVal* rhs = &registers[rk];                                                                        \
-        bool cond;                                                                                           \
-        if (rhs->tag == TYPE_INTEGER)                                                                        \
-            cond = (raw_ints[slot] op rhs->as.i);                                                            \
-        else if (rhs->tag == TYPE_REAL)                                                                      \
-            cond = ((double)raw_ints[slot] op rhs->as.d);                                                    \
-        else {                                                                                               \
-            error("Cannot apply '" opstr "' to integer and %s", vm_type_name(c, *rhs));                      \
-            cond = false;                                                                                    \
-        }                                                                                                    \
-        if (!cond) pc += (int32_t)target;                                                                    \
-        DISPATCH();                                                                                          \
-    }
-
-    RAW_CMP_INT_BOXED_JUMP_IF_FALSE(lt, <, "<")
-    RAW_CMP_INT_BOXED_JUMP_IF_FALSE(gt, >, ">")
-    RAW_CMP_INT_BOXED_JUMP_IF_FALSE(lte, <=, "<=")
-    RAW_CMP_INT_BOXED_JUMP_IF_FALSE(gte, >=, ">=")
-
-#undef RAW_CMP_INT_BOXED_JUMP_IF_FALSE
-
-/* Real counterpart. An integer right-hand side promotes, matching OP_RAW_*_REAL_BOXED. */
-#define RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(name, op, opstr)                                                    \
-    lbl_raw_##name##_real_boxed_jump_if_false : {                                                            \
-        int slot = (int)UNPACK_B(op_word);                                                                   \
-        unsigned int rk = UNPACK_C(op_word);                                                                 \
-        int target = READ();                                                                                 \
-        if (RK8_IS_CONST(rk)) {                                                                              \
-            if (!(raw_reals[slot] op rawk_d[RK8_INDEX(rk)])) pc += (int32_t)target;                          \
-            DISPATCH();                                                                                      \
-        }                                                                                                    \
-        AerVal* rhs = &registers[rk];                                                                        \
-        bool cond;                                                                                           \
-        if (rhs->tag == TYPE_REAL)                                                                           \
-            cond = (raw_reals[slot] op rhs->as.d);                                                           \
-        else if (rhs->tag == TYPE_INTEGER) {                                                                 \
-            double rhs_d = (double)rhs->as.i;                                                                \
-            cond = (raw_reals[slot] op rhs_d);                                                               \
-        } else {                                                                                             \
-            SYNC_IP();                                                                                       \
-            error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs));                        \
-            cond = false;                                                                                    \
-        }                                                                                                    \
-        if (!cond) pc += (int32_t)target;                                                                    \
-        DISPATCH();                                                                                          \
-    }
-
-    RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(lt, <, "<")
-    RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(gt, >, ">")
-    RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(lte, <=, "<=")
-    RAW_CMP_REAL_BOXED_JUMP_IF_FALSE(gte, >=, ">=")
-
-#undef RAW_CMP_REAL_BOXED_JUMP_IF_FALSE
 
 /* Both operands raw: no tag, no table, no error path -- the comparison is the two loads the
    hardware would do anyway. */
