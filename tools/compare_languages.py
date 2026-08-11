@@ -8,7 +8,10 @@ skipped rather than failing the run, so this works on a machine with only some o
 
 Wall-clock, not instructions: the point is how AER compares to another language on the same
 machine, and `perf` cannot count a different interpreter's work in comparable units. Each timing
-is the MINIMUM of --runs executions, which is the least noise-inflated sample rather than a mean.
+is the MEAN of --runs executions, printed with the peak-to-peak spread beside it -- wall-clock is
+the shakiest thing measured anywhere in this repo, and a ratio means nothing without knowing how
+much the machine moved under it. Peak memory comes from /usr/bin/time, so it is reported when the
+run is remote or on a POSIX box and shown as '-' otherwise.
 
 Usage:
   python3 tools/compare_languages.py                       # every benchmark, every interpreter found
@@ -48,39 +51,59 @@ def find(names, host):
 
 
 def time_once(argv, host, remote_dir):
-    """Wall-clock seconds for one run, or None if it failed.
+    """(wall-clock seconds, peak RSS in KB) for one run, or None if it failed. RSS is 0 where it
+    cannot be measured -- /usr/bin/time is a POSIX thing, so a local Windows run reports time only.
 
     Under --host the clock runs ON the remote machine, not here. Timing the ssh call instead would
     fold connection setup into every measurement -- and since that constant lands on both sides of
-    a ratio, it would quietly drag every result toward 1.00x.
+    a ratio, it would quietly drag every result toward 1.00x. The timing stays date-based rather
+    than /usr/bin/time's own %e, which rounds to 10ms and would flatten the quicker benchmarks.
     """
     if host:
-        remote = ("cd %s && start=$(date +%%s%%N); %s >/dev/null 2>&1; rc=$?; end=$(date +%%s%%N); "
-                  "echo $rc $(( (end-start)/1000000 ))" % (remote_dir, " ".join(argv)))
+        remote = ("cd %s && start=$(date +%%s%%N); "
+                  "/usr/bin/time -f '%%M' -o /tmp/aerbench.mem %s >/dev/null 2>&1; rc=$?; "
+                  "end=$(date +%%s%%N); "
+                  "echo $rc $(( (end-start)/1000000 )) $(cat /tmp/aerbench.mem 2>/dev/null || echo 0)"
+                  % (remote_dir, " ".join(argv)))
         p = subprocess.run(["ssh", host, remote], capture_output=True, text=True)
         parts = p.stdout.split()
-        if p.returncode != 0 or len(parts) != 2 or parts[0] != "0":
+        if p.returncode != 0 or len(parts) < 3 or parts[0] != "0":
             return None
-        return int(parts[1]) / 1000.0
+        return int(parts[1]) / 1000.0, int(parts[2])
     start = time.perf_counter()
     p = subprocess.run(argv, capture_output=True, text=True)
     elapsed = time.perf_counter() - start
-    return elapsed if p.returncode == 0 else None
+    return (elapsed, 0) if p.returncode == 0 else None
 
 
-def best_of(argv, runs, host, remote_dir):
-    best = None
+def measure(argv, runs, host, remote_dir):
+    """(mean seconds, peak-to-peak spread as a percentage, mean peak RSS in KB).
+
+    The mean rather than the best sample: the minimum hides how noisy a machine was, and on
+    wall-clock that matters -- it is the shakiest thing measured here. The spread beside it is what
+    tells a reader whether a 1.05x is a result or a shrug.
+    """
+    ts, ms = [], []
     for _ in range(runs):
-        t = time_once(argv, host, remote_dir)
-        if t is None:
+        r = time_once(argv, host, remote_dir)
+        if r is None:
             return None
-        best = t if best is None else min(best, t)
-    return best
+        ts.append(r[0])
+        ms.append(r[1])
+    avg = sum(ts) / len(ts)
+    return avg, (max(ts) - min(ts)) * 100.0 / avg if avg else 0.0, sum(ms) / float(len(ms))
+
+
+def mem(kb):
+    """Peak RSS, or '-' where the platform could not report it."""
+    if not kb:
+        return "-"
+    return "%.0fM" % (kb / 1024.0) if kb >= 1024 else "%.0fK" % kb
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--runs", type=int, default=3, help="timings per benchmark; the minimum is kept")
+    ap.add_argument("--runs", type=int, default=3, help="timings per benchmark; the mean is reported")
     ap.add_argument("--only", default="", help="comma-separated benchmark subset")
     ap.add_argument("--aer", default="binary/aer", help="path to the aer executable")
     ap.add_argument("--host", default="", help="run everything over ssh on this host instead")
@@ -117,37 +140,45 @@ def main():
                  % ", ".join(r[0] for r in RUNTIMES))
 
     cols = [label for label, _, _, _ in available]
-    print("\n%-22s %9s %s" % ("benchmark", "aer", " ".join("%18s" % c for c in cols)))
-    print("-" * (32 + 19 * len(cols)))
+    width = 32 + 8 + 15 * len(cols)
+    print("\n%-20s %8s %6s %7s %s"
+          % ("benchmark", "aer", "±", "mem", " ".join("%15s" % c for c in cols)))
+    print("-" * width)
 
     ratio_totals = {c: [] for c in cols}
+    mem_totals = {c: [] for c in cols}
     for name in names:
         # Forward slashes deliberately: valid on Windows too, and --host sends these
         # straight to a POSIX shell where a backslash from os.path.join would not resolve.
         aer_src = "bench/" + name + ".aer"
-        t_aer = best_of([aer, aer_src], args.runs, args.host, args.remote_dir)
-        if t_aer is None:
-            print("%-22s %9s  (aer run failed)" % (name, "?"))
+        a = measure([aer, aer_src], args.runs, args.host, args.remote_dir)
+        if a is None:
+            print("%-20s %8s  (aer run failed)" % (name, "?"))
             continue
+        t_aer, sp_aer, m_aer = a
         cells = []
         for label, exe, prefix, suffix in available:
             src = "bench/" + name + suffix
             exists = (subprocess.run(["ssh", args.host, "test -f %s/%s" % (args.remote_dir, src)]).returncode == 0
                       if args.host else os.path.exists(src))
             if not exists:
-                cells.append("%18s" % "-")
+                cells.append("%15s" % "-")
                 continue
-            t = best_of([exe] + prefix + [src], args.runs, args.host, args.remote_dir)
-            if t is None:
-                cells.append("%18s" % "failed")
+            r = measure([exe] + prefix + [src], args.runs, args.host, args.remote_dir)
+            if r is None:
+                cells.append("%15s" % "failed")
                 continue
-            ratio = t / t_aer
+            ratio = r[0] / t_aer
             ratio_totals[label].append(ratio)
-            cells.append("%18s" % ("%.3fs  %.2fx" % (t, ratio)))
-        print("%-22s %8.3fs %s" % (name, t_aer, " ".join(cells)))
+            if m_aer and r[2]:
+                mem_totals[label].append(r[2] / m_aer)
+            cells.append("%15s" % ("%.2fx %s" % (ratio, mem(r[2]))))
+        print("%-20s %7.2fs %5.1f%% %7s %s"
+              % (name, t_aer, sp_aer, mem(m_aer), " ".join(cells)))
 
-    print("-" * (32 + 19 * len(cols)))
-    print("ratio > 1.00x means AER is faster on that row. runs=%d (min), wall-clock." % args.runs)
+    print("-" * width)
+    print("ratio > 1.00x means AER is faster on that row; the value beside it is that runtime's")
+    print("peak memory. runs=%d (mean), '±' is peak-to-peak spread, wall-clock." % args.runs)
     for label in cols:
         rs = ratio_totals[label]
         if not rs:
@@ -159,7 +190,15 @@ def main():
         for r in rs:
             geo *= r
         geo **= 1.0 / len(rs)
-        print("  vs %-14s %.2fx geomean over %d benchmarks, AER faster on %d" % (label, geo, len(rs), wins))
+        ms = mem_totals[label]
+        mem_note = ""
+        if ms:
+            gm = 1.0
+            for r in ms:
+                gm *= r
+            mem_note = ", %.2fx memory" % (gm ** (1.0 / len(ms)))
+        print("  vs %-14s %.2fx geomean over %d benchmarks, AER faster on %d%s"
+              % (label, geo, len(rs), wins, mem_note))
 
 
 if __name__ == "__main__":
