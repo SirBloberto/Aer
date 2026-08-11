@@ -149,12 +149,7 @@ typedef struct Parser {
        not knowable while first compiling the body -- so the variant compiles once to discover it,
        then recompiles with this set. RAWK_NONE means the result comes back boxed. */
     RawKind variant_return_kind;
-    /* Where each OP_CALL_RAW_* in the body being compiled put its frame-sizes word. The callee is
-       this same function, so its sizes are only known once the body finishes -- patched in then,
-       which keeps them out of the instruction stream's way rather than chasing
-       target_f->specializations[0] on every call. */
-    unsigned int raw_call_sites[FRAME_REGISTERS];
-    int raw_call_site_count;
+
     /* What the body currently compiling hands back: -1 none yet, 0 boxed or mixed, 1 int, 2 real.
        Tracked as returns are emitted rather than scanned off the bytecode afterwards -- instruction
        lengths vary, so a linear word scan can read an operand as an opcode. */
@@ -4432,9 +4427,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
             if (arg_slot >= 0 && dest_slot >= 0) {
                 chunk_emit(c, PACK3(is_int ? OP_CALL_RAW_INT : OP_CALL_RAW_REAL, dest_slot, arg_slot, 1));
                 chunk_emit(c, P.variant_offset);
-                if (P.raw_call_site_count < FRAME_REGISTERS)
-                    P.raw_call_sites[P.raw_call_site_count++] = c->count;
-                chunk_emit(c, 0); /* frame sizes -- patched once the body's peaks are known */
+                chunk_emit(c, (uint32_t)(func_index * sizeof(ChunkFunction)));
                 chunk_emit(c, !ret_raw ? 0u : ret_int ? 1u : 2u);
                 if (!ret_raw) return dest_slot;
                 return (ret_int ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest_slot;
@@ -4750,7 +4743,6 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     P.last_length_call_result_reg = -1;
     P.last_length_call_arg_reg = -1;
     P.safe_loop_depth = 0;
-    P.raw_call_site_count = 0;
 
     P.function_depth++;
     for (int i = 0; i < param_count; i++) {
@@ -4804,14 +4796,7 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     *out_max_registers = (unsigned int)P.max_register_used;
     *out_max_raw_ints = (unsigned int)P.max_raw_int_used;
     *out_max_raw_reals = (unsigned int)P.max_raw_real_used;
-    /* The recursive calls this body emitted target this same body, so only now are the frame sizes
-       they need known. Writing them into the instruction saves every call a walk from the function
-       table to its SpecEntry just to read three numbers. */
-    uint32_t sizes = ((uint32_t)P.max_register_used & 0xFF) |
-                     (((uint32_t)P.max_raw_int_used & 0xFF) << 8) |
-                     (((uint32_t)P.max_raw_real_used & 0xFF) << 16);
-    for (int i = 0; i < P.raw_call_site_count; i++) c->code[P.raw_call_sites[i]] = sizes;
-    P.raw_call_site_count = 0;
+
 
     P.var_count = saved_var_count;
     memcpy(P.var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
