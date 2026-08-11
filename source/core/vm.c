@@ -2515,6 +2515,9 @@ vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, in
         return;
     }
     if (entry->raw_param_count != 0) return;
+    /* Warm up first -- see numeric_call_count (vm.h). Counted here rather than in lbl_call so an
+       ordinary call pays nothing for it. */
+    if (++target_f->numeric_call_count < NUMERIC_SPECIALIZE_AFTER) return;
 
     SpecEntry variant;
     if (!parser_specialize_function(c, target_f, NULL, SPEC_KIND_STRUCT, -1, &variant, cand_regs,

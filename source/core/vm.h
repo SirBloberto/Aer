@@ -733,6 +733,12 @@ typedef struct {
    mask rather than a field of its own so lbl_call's gate stays the one already-fetched test it is;
    parameter bits are capped at 31 to keep the top one free. */
 #define SHAPE_MASK_NUMERIC_ONLY (1u << 31)
+    /* Calls seen so far, counted only for a numeric-only function and only until it specializes.
+       Compiling a variant re-parses the body, so doing it on the first call is a straight loss for
+       a function called once -- and a file of many small functions each called once is a realistic
+       shape, not a contrived one (bench/compile_bound.aer). */
+    unsigned int numeric_call_count;
+#define NUMERIC_SPECIALIZE_AFTER 16
     /* Owned copy of the source text spanning from '(' through the end of the body -- NULL unless
        shape_sensitive_mask != 0. Needed to re-invoke the parser later (long after the original
        parse() call returned) with a specific parameter's Shape substituted in as compile-time-known.

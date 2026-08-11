@@ -132,10 +132,15 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
     return chunk_pool_append(c, v);
 }
 
-/* Linear-scanned like chunk_add_pool's non-string path: these tables hold only the numeric
-   literals a raw opcode compares or accumulates against, so they stay far smaller than pool[]. */
+/* Linear-scanned like chunk_add_pool's non-string path, but bounded: a program with hundreds of
+   distinct numeric literals would otherwise make interning quadratic. The bound is the RK8 operand
+   range, so every constant an opcode can actually address by index is still deduplicated -- past
+   that a duplicate only costs a table slot, since no operand could have named it anyway. */
+#define RAWK_DEDUP_SCAN 128
+
 unsigned int chunk_add_rawk_int(Chunk* c, int64_t v) {
-    for (unsigned int i = 0; i < c->rawk_i_count; i++)
+    unsigned int scan = c->rawk_i_count < RAWK_DEDUP_SCAN ? c->rawk_i_count : RAWK_DEDUP_SCAN;
+    for (unsigned int i = 0; i < scan; i++)
         if (c->rawk_i[i] == v) return i;
     if (c->rawk_i_count >= c->rawk_i_cap) {
         c->rawk_i_cap = c->rawk_i_cap ? c->rawk_i_cap * 2 : 8;
@@ -148,7 +153,8 @@ unsigned int chunk_add_rawk_int(Chunk* c, int64_t v) {
 /* memcmp, not ==: -0.0 == 0.0 but they are not interchangeable constants, and NaN != itself would
    append a fresh entry on every occurrence. */
 unsigned int chunk_add_rawk_real(Chunk* c, double v) {
-    for (unsigned int i = 0; i < c->rawk_d_count; i++)
+    unsigned int scan = c->rawk_d_count < RAWK_DEDUP_SCAN ? c->rawk_d_count : RAWK_DEDUP_SCAN;
+    for (unsigned int i = 0; i < scan; i++)
         if (memcmp(&c->rawk_d[i], &v, sizeof(double)) == 0) return i;
     if (c->rawk_d_count >= c->rawk_d_cap) {
         c->rawk_d_cap = c->rawk_d_cap ? c->rawk_d_cap * 2 : 8;
@@ -191,6 +197,7 @@ void chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offse
     f->source_span_line = 0;
     f->specializations = NULL; /* allocated on first specialization -- see ChunkFunction */
     f->specialization_count = 0;
+    f->numeric_call_count = 0;
     f->megamorphic = false;
 }
 
