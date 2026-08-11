@@ -50,9 +50,35 @@ def find(names, host):
     return None
 
 
+def _peak_rss_windows(proc):
+    """Peak working set of an exited child, in KB. Windows keeps the counters readable through the
+       process handle after exit, which subprocess holds until the object is collected."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PMC(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+    counters = PMC()
+    counters.cb = ctypes.sizeof(PMC)
+    try:
+        if ctypes.WinDLL("psapi").GetProcessMemoryInfo(int(proc._handle), ctypes.byref(counters),
+                                                       counters.cb):
+            return counters.PeakWorkingSetSize // 1024
+    except Exception:
+        pass
+    return 0
+
+
 def time_once(argv, host, remote_dir):
     """(wall-clock seconds, peak RSS in KB) for one run, or None if it failed. RSS is 0 where it
-    cannot be measured -- /usr/bin/time is a POSIX thing, so a local Windows run reports time only.
+    cannot be measured: /usr/bin/time supplies it remotely, GetProcessMemoryInfo locally on
+    Windows, and a local POSIX run reports time only (getrusage would give a running maximum across
+    every child, not this one's).
 
     Under --host the clock runs ON the remote machine, not here. Timing the ssh call instead would
     fold connection setup into every measurement -- and since that constant lands on both sides of
@@ -71,9 +97,12 @@ def time_once(argv, host, remote_dir):
             return None
         return int(parts[1]) / 1000.0, int(parts[2])
     start = time.perf_counter()
-    p = subprocess.run(argv, capture_output=True, text=True)
+    proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.wait()
     elapsed = time.perf_counter() - start
-    return (elapsed, 0) if p.returncode == 0 else None
+    if proc.returncode != 0:
+        return None
+    return elapsed, (_peak_rss_windows(proc) if os.name == "nt" else 0)
 
 
 def measure(argv, runs, host, remote_dir):
@@ -140,7 +169,7 @@ def main():
                  % ", ".join(r[0] for r in RUNTIMES))
 
     cols = [label for label, _, _, _ in available]
-    width = 32 + 8 + 15 * len(cols)
+    width = 50 + 16 * len(cols)
     print("\n%-20s %8s %6s %7s %s"
           % ("benchmark", "aer", "±", "mem", " ".join("%15s" % c for c in cols)))
     print("-" * width)
@@ -153,7 +182,7 @@ def main():
         aer_src = "bench/" + name + ".aer"
         a = measure([aer, aer_src], args.runs, args.host, args.remote_dir)
         if a is None:
-            print("%-20s %8s  (aer run failed)" % (name, "?"))
+            print("%-26s %8s  (aer run failed)" % (name, "?"))
             continue
         t_aer, sp_aer, m_aer = a
         cells = []
@@ -173,8 +202,11 @@ def main():
             if m_aer and r[2]:
                 mem_totals[label].append(r[2] / m_aer)
             cells.append("%15s" % ("%.2fx %s" % (ratio, mem(r[2]))))
-        print("%-20s %7.2fs %5.1f%% %7s %s"
-              % (name, t_aer, sp_aer, mem(m_aer), " ".join(cells)))
+        # A wall-clock row that moved this much between runs cannot support a ratio; say so rather
+        # than let it be read as a result. Short benchmarks on a busy desktop are the usual cause.
+        noisy = "  <-- noisy, raise --runs" if sp_aer > 5.0 else ""
+        print("%-26s %7.2fs %5.1f%% %7s %s%s"
+              % (name, t_aer, sp_aer, mem(m_aer), " ".join(cells), noisy))
 
     print("-" * width)
     print("ratio > 1.00x means AER is faster on that row; the value beside it is that runtime's")
