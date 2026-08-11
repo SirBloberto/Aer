@@ -1102,52 +1102,6 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
     }
 }
 
-/* Raw-vs-boxed ADD/MUL, real only. Commutative ops only -- SUB/DIV are order-sensitive and their
-   common shape puts the raw operand where this can't help. Reuses the existing OP_RAW_*_REAL_BOXED
-   opcodes, which promote an integer boxed operand to real.
-   Real only, deliberately: the INT variants can't promote the same way, since int+real must promote
-   the whole result to real and that cannot be done in place into a raw_ints[] slot. A raw int
-   composing with a boxed operand falls through to the boxed path. */
-static bool try_emit_arith_raw_boxed(Chunk* c, Opcode op, int rk_lhs, RawKind kind_lhs, int rk_rhs,
-                                     RawKind kind_rhs, int* out_rk) {
-    if (op != OP_ADD && op != OP_MUL) return false;
-    bool lhs_raw = (kind_lhs != RAWK_NONE);
-    int raw_rk = lhs_raw ? rk_lhs : rk_rhs;
-    RawKind kind = lhs_raw ? kind_lhs : kind_rhs;
-    int boxed_rk = lhs_raw ? rk_rhs : rk_lhs;
-    if (kind != RAWK_REAL) return false;
-    /* A literal boxed operand or (impossible here, defensive) a raw one: simpler to let the fully
-       boxed fallback handle it than special-case materializing a literal into a register first. */
-    if (boxed_rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG | RK_CONST_FLAG)) return false;
-
-    int slot = raw_materialize(c, raw_rk, kind);
-    if (slot < 0) return false; /* raw-slot budget exhausted: fall back to boxed */
-
-    /* A temp raw_rk can double as dest -- nothing reads it again -- so use the in-place _BOXED
-       opcode. A named raw local's slot cannot: mutating it corrupts the local for later use, so
-       the non-destructive _TO variant reads it and writes a fresh dest instead. */
-    int dest;
-    Opcode raw_op;
-    if (slot >= P.raw_real_reserved_floor) {
-        dest = slot;
-        raw_op = (op == OP_ADD) ? OP_RAW_ADD_REAL_BOXED : OP_RAW_MUL_REAL_BOXED;
-        chunk_emit(c, PACK3(raw_op, dest, boxed_rk, 0));
-    } else {
-        dest = raw_real_alloc();
-        if (dest < 0) return false;
-        raw_op = (op == OP_ADD) ? OP_RAW_ADD_REAL_BOXED_TO : OP_RAW_MUL_REAL_BOXED_TO;
-        chunk_emit(c, PACK3(raw_op, dest, slot, boxed_rk));
-    }
-    /* boxed_rk is confirmed a plain register above (no RAW/CONST flag) -- nothing to materialize.
-       Both opcode families promote an integer boxed operand to real (see this function's own
-       comment) -- no runtime type restriction beyond what the boxed path itself already allows. */
-    if (is_temp(boxed_rk)) reg_free(1);
-
-    P.raw_boxed_emits++;
-    *out_rk = RK_RAW_REAL_FLAG | dest;
-    return true;
-}
-
 /* Re-points a const-flagged RK at whichever raw constant table `kind` names. An int-kind opcode
    takes only an integer literal: promoting a real one would need the comparison rewritten around
    its fractional part, so it declines and the caller keeps the boxed form. */
@@ -1193,11 +1147,34 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     RawKind kind_lhs = rk_raw_kind(c, rk_lhs);
     RawKind kind_rhs = rk_raw_kind(c, rk_rhs);
 
-    /* One raw operand against a genuinely boxed one: only the in-place accumulate has a raw form.
-       A comparison in that shape goes through the ordinary boxed opcodes -- the literal bound it
-       used to exist for now rides in the raw opcode's own operand as a raw constant. */
-    if ((kind_lhs == RAWK_NONE) != (kind_rhs == RAWK_NONE))
-        return try_emit_arith_raw_boxed(c, op, rk_lhs, kind_lhs, rk_rhs, kind_rhs, out_rk);
+    /* One raw operand and one whose type nothing has proven: check the boxed side once into a raw
+       slot and let the rest be ordinary raw arithmetic, so the result stays raw and a local built
+       this way never has to shadow. Arithmetic only -- these operators reject a non-number on
+       either side anyway, so erroring at the unbox says the same thing one opcode earlier, which is
+       not true of equality (`5 == "5"` is false, not an error). */
+    if ((kind_lhs == RAWK_NONE) != (kind_rhs == RAWK_NONE) &&
+        (op == OP_ADD || op == OP_SUB || op == OP_MUL)) {
+        bool lhs_raw = (kind_lhs != RAWK_NONE);
+        int boxed_rk = lhs_raw ? rk_rhs : rk_lhs;
+        /* Real only. An integer raw side composed with a boxed real must promote the whole result
+           to real, which an int slot cannot hold -- OP_UNBOX_REAL widens an integer the same way
+           the boxed arithmetic does, so only that direction is safe here. */
+        if ((lhs_raw ? kind_lhs : kind_rhs) == RAWK_REAL &&
+            !(boxed_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) {
+            int tmp = raw_real_alloc();
+            if (tmp >= 0) {
+                chunk_emit(c, PACK3(OP_UNBOX_REAL, tmp, boxed_rk, 0));
+                if (is_temp(boxed_rk)) reg_free(1);
+                if (lhs_raw) {
+                    rk_rhs = RK_RAW_REAL_FLAG | tmp;
+                    kind_rhs = RAWK_REAL;
+                } else {
+                    rk_lhs = RK_RAW_REAL_FLAG | tmp;
+                    kind_lhs = RAWK_REAL;
+                }
+            }
+        }
+    }
     if (kind_lhs == RAWK_NONE || kind_rhs == RAWK_NONE || kind_lhs != kind_rhs) return false;
     bool int_kind = (kind_lhs == RAWK_INT);
 
@@ -3022,24 +2999,34 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                    path below instead of leaving the variable half-updated. */
             }
 
-            /* An ordinary boxed RHS (e.g. nbody.aer's `e += 0.5 * bim * (...)`) accumulates directly into
-               the existing raw slot with a runtime tag check instead of shadowing -- no shadow, no
+            /* An ordinary boxed RHS (e.g. nbody.aer's `e += 0.5 * bim * (...)`) is checked once into
+               a raw slot and then accumulated with ordinary raw arithmetic -- no shadow, no
                allocation, safe every loop iteration. A provably-mismatched kind still shadows. */
             if (native_op_exists && rhs_kind == RAWK_NONE) {
+                bool int_kind = (cur_kind == RAWK_INT);
                 int dest_slot = P.var_regs[existing_idx];
                 int boxed_reg = materialize(c, rk_rhs);
-                Opcode raw_op;
-                if (cur_kind == RAWK_INT)
-                    raw_op = (boxed_op == OP_ADD)   ? OP_RAW_ADD_INT_BOXED
-                             : (boxed_op == OP_SUB) ? OP_RAW_SUB_INT_BOXED
-                                                    : OP_RAW_MUL_INT_BOXED;
-                else
-                    raw_op = (boxed_op == OP_ADD)   ? OP_RAW_ADD_REAL_BOXED
-                             : (boxed_op == OP_SUB) ? OP_RAW_SUB_REAL_BOXED
-                                                    : OP_RAW_MUL_REAL_BOXED;
-                chunk_emit(c, PACK3(raw_op, dest_slot, boxed_reg, 0));
+                int tmp = int_kind ? raw_int_alloc() : raw_real_alloc();
+                if (tmp >= 0) {
+                    chunk_emit(c, PACK3(int_kind ? OP_UNBOX_INT : OP_UNBOX_REAL, tmp, boxed_reg, 0));
+                    Opcode raw_op;
+                    if (int_kind)
+                        raw_op = (boxed_op == OP_ADD)   ? OP_RAW_ADD_INT
+                                 : (boxed_op == OP_SUB) ? OP_RAW_SUB_INT
+                                                        : OP_RAW_MUL_INT;
+                    else
+                        raw_op = (boxed_op == OP_ADD)   ? OP_RAW_ADD_REAL
+                                 : (boxed_op == OP_SUB) ? OP_RAW_SUB_REAL
+                                                        : OP_RAW_MUL_REAL;
+                    chunk_emit(c, PACK3(raw_op, dest_slot, dest_slot, tmp));
+                    if (int_kind)
+                        raw_int_free(1);
+                    else
+                        raw_real_free(1);
+                    if (is_temp(boxed_reg)) reg_free(1);
+                    return;
+                }
                 if (is_temp(boxed_reg)) reg_free(1);
-                return;
             }
 
             /* Boxes the current raw value, then performs the compound op -- unlike plain assignment's

@@ -226,18 +226,10 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_RAW_NEQ_REAL] = {"OP_RAW_NEQ_REAL", "reg = rawr != rawr"},
     [OP_BOX_INT] = {"OP_BOX_INT", "reg = box(rawi)"},
     [OP_BOX_REAL] = {"OP_BOX_REAL", "reg = box(rawr)"},
+    [OP_UNBOX_INT] = {"OP_UNBOX_INT", "rawi = unbox(reg) (tag-checked)"},
+    [OP_UNBOX_REAL] = {"OP_UNBOX_REAL", "rawr = unbox(reg) (tag-checked)"},
     [OP_RAW_MOVE_INT] = {"OP_RAW_MOVE_INT", "rawi = rawi"},
     [OP_RAW_MOVE_REAL] = {"OP_RAW_MOVE_REAL", "rawr = rawr"},
-    [OP_RAW_ADD_INT_BOXED] = {"OP_RAW_ADD_INT_BOXED", "rawi += reg (tag-checked)"},
-    [OP_RAW_SUB_INT_BOXED] = {"OP_RAW_SUB_INT_BOXED", "rawi -= reg (tag-checked)"},
-    [OP_RAW_MUL_INT_BOXED] = {"OP_RAW_MUL_INT_BOXED", "rawi *= reg (tag-checked)"},
-    [OP_RAW_ADD_REAL_BOXED] = {"OP_RAW_ADD_REAL_BOXED", "rawr += reg (tag-checked)"},
-    [OP_RAW_SUB_REAL_BOXED] = {"OP_RAW_SUB_REAL_BOXED", "rawr -= reg (tag-checked)"},
-    [OP_RAW_MUL_REAL_BOXED] = {"OP_RAW_MUL_REAL_BOXED", "rawr *= reg (tag-checked)"},
-    [OP_RAW_ADD_REAL_BOXED_TO] = {"OP_RAW_ADD_REAL_BOXED_TO",
-                                  "rawr = rawr + reg (tag-checked, non-destructive)"},
-    [OP_RAW_MUL_REAL_BOXED_TO] = {"OP_RAW_MUL_REAL_BOXED_TO",
-                                  "rawr = rawr * reg (tag-checked, non-destructive)"},
     [OP_RAW_LOAD_INT_POOL] = {"OP_RAW_LOAD_INT_POOL", "rawi = pool constant", {0}, false, 1, 0},
 
     /* Shape-specialized field access -- see vm.h's own comment on this opcode family. All fully
@@ -918,22 +910,18 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     } else if (op == OP_BOX_REAL) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
+    } else if (op == OP_UNBOX_INT) {
+        print_rawi(out, (int)UNPACK_A(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
+    } else if (op == OP_UNBOX_REAL) {
+        print_rawr(out, (int)UNPACK_A(op_word));
+        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
     } else if (op == OP_RAW_MOVE_INT) {
         print_rawi(out, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
     } else if (op == OP_RAW_MOVE_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
-    } else if (op == OP_RAW_ADD_INT_BOXED || op == OP_RAW_SUB_INT_BOXED || op == OP_RAW_MUL_INT_BOXED) {
-        print_rawi(out, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-    } else if (op == OP_RAW_ADD_REAL_BOXED || op == OP_RAW_SUB_REAL_BOXED || op == OP_RAW_MUL_REAL_BOXED) {
-        print_rawr(out, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-    } else if (op == OP_RAW_ADD_REAL_BOXED_TO || op == OP_RAW_MUL_REAL_BOXED_TO) {
-        print_rawr(out, (int)UNPACK_A(op_word));
-        print_rawr(out, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
     } else if (op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_REAL ||
                op == OP_FIELD_COMPOUND_RAW_INT32 || op == OP_FIELD_COMPOUND_RAW_FLOAT32) {
         bool is_int = (op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_INT32);

@@ -234,26 +234,17 @@ typedef enum {
     OP_RAW_NEQ_REAL,
     OP_BOX_INT,
     OP_BOX_REAL,
+    /* The bridge the other way: a register whose type nothing has proven, checked once and dropped
+       into a raw slot so everything after it is ordinary raw arithmetic. Two opcodes covering every
+       boxed-to-raw crossing, in place of a per-operator family that only ever served one of them.
+       UNBOX_REAL takes an integer too, matching what the boxed arithmetic would have done. */
+    OP_UNBOX_INT,
+    OP_UNBOX_REAL,
     /* Raw-to-raw copy -- OP_MOVE's analog for raw slots. */
     OP_RAW_MOVE_INT,
     OP_RAW_MOVE_REAL,
     /* In-place accumulation of a BOXED value into a raw slot (`e += <boxed expr>`); runtime tag
        check, ADD/SUB/MUL only. */
-    OP_RAW_ADD_INT_BOXED,
-    OP_RAW_SUB_INT_BOXED,
-    OP_RAW_MUL_INT_BOXED,
-    OP_RAW_ADD_REAL_BOXED,
-    OP_RAW_SUB_REAL_BOXED,
-    OP_RAW_MUL_REAL_BOXED,
-    /* Non-destructive form of the _BOXED family: raw_reals[dest] = raw_reals[src] <op> unbox(reg),
-       leaving src untouched. Used where the raw operand is a permanent slot that must survive, which
-       the in-place family would need a defensive OP_RAW_MOVE_REAL to protect. Real only, matching
-       the promotion restriction; ADD/MUL only, since nothing emits an order-sensitive variant. */
-    OP_RAW_ADD_REAL_BOXED_TO,
-    OP_RAW_MUL_REAL_BOXED_TO,
-    /* Raw-vs-boxed comparison producing a boxed boolean -- removes the OP_BOX_INT that dominated
-       `for i <= limit:`-shaped loops. Not in-place. The boxed operand is RK8, so a literal bound
-       (`x*x + y*y > 4.0`) is read from the pool rather than reloaded into a register each pass. */
     /* Pool fallback for literals outside the old 20-bit immediate; kept as a distinct opcode
        (rather than widening OP_RAW_LOAD_INT's own immediate) since the fixed-width redesign below
        gives OP_RAW_LOAD_INT a full 32-bit immediate anyway -- this opcode now only exists for
@@ -826,7 +817,7 @@ typedef struct {
     unsigned int pool_count, pool_cap;
 
     /* Numeric constants as raw scalars, for the raw opcode families. Those opcodes name their
-       operand type (OP_RAW_LT_INT_BOXED is int by construction), so a const-flagged operand can
+       operand type (OP_RAW_LT_INT is int by construction), so a const-flagged operand can
        index these directly -- no tag to check, and no encoding bit spent saying so. Kept separate
        from pool[] rather than replacing entries in it: a literal reached by both a raw and a boxed
        path needs both forms, and RK8's 7 index bits make a dense numeric-only table reach further. */

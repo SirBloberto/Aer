@@ -2913,16 +2913,10 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_NEQ_REAL] = &&lbl_raw_neq_real,
         [OP_BOX_INT] = &&lbl_box_int,
         [OP_BOX_REAL] = &&lbl_box_real,
+        [OP_UNBOX_INT] = &&lbl_unbox_int,
+        [OP_UNBOX_REAL] = &&lbl_unbox_real,
         [OP_RAW_MOVE_INT] = &&lbl_raw_move_int,
         [OP_RAW_MOVE_REAL] = &&lbl_raw_move_real,
-        [OP_RAW_ADD_INT_BOXED] = &&lbl_raw_add_int_boxed,
-        [OP_RAW_SUB_INT_BOXED] = &&lbl_raw_sub_int_boxed,
-        [OP_RAW_MUL_INT_BOXED] = &&lbl_raw_mul_int_boxed,
-        [OP_RAW_ADD_REAL_BOXED] = &&lbl_raw_add_real_boxed,
-        [OP_RAW_SUB_REAL_BOXED] = &&lbl_raw_sub_real_boxed,
-        [OP_RAW_MUL_REAL_BOXED] = &&lbl_raw_mul_real_boxed,
-        [OP_RAW_ADD_REAL_BOXED_TO] = &&lbl_raw_add_real_boxed_to,
-        [OP_RAW_MUL_REAL_BOXED_TO] = &&lbl_raw_mul_real_boxed_to,
         [OP_RAW_LOAD_INT_POOL] = &&lbl_raw_load_int_pool,
 
         [OP_INDEX_FIELD_GET_RAW_INT] = &&lbl_index_field_get_raw_int,
@@ -5319,60 +5313,6 @@ lbl_raw_load_real : {
         registers[dest] = aer_bool(raw_reals[a] op RAW_D(b));                                                \
         DISPATCH();                                                                                          \
     }
-/* A runtime tag check decides: matching type accumulates in place (safe every iteration, the
-   slot's identity never changes); mismatched type is the same runtime error vm_binary_cold gives. */
-#define RAW_ARITH_INT_BOXED(name, op, opstr)                                                                 \
-    lbl_raw_##name##_int_boxed : {                                                                           \
-        int slot = (int)UNPACK_A(op_word);                                                                   \
-        int reg = (int)UNPACK_B(op_word);                                                                    \
-        AerVal* rhs = &registers[reg];                                                                       \
-        if (rhs->tag != TYPE_INTEGER) {                                                                      \
-            error("Cannot apply '" opstr "' to integer and %s", vm_type_name(c, *rhs));                      \
-            DISPATCH();                                                                                      \
-        }                                                                                                    \
-        raw_ints[slot] op## = rhs->as.i;                                                                     \
-        DISPATCH();                                                                                          \
-    }
-/* An integer rhs promotes to real here (vm_promote_real's own rule) instead of erroring -- matches
-   the fully-boxed path's own int/real mixing semantics (vm_binary_cold/fast), which this opcode is
-   otherwise a drop-in replacement for. Without this, `real_value OP boxed_int_expr` (extremely
-   common -- any loop counter or other plain int composed with a real, e.g. `i * 0.10`) would
-   incorrectly reject a completely ordinary mixed-numeric expression the boxed path already
-   supports. Only int/real mix; any other type still errors exactly as before. */
-#define RAW_ARITH_REAL_BOXED(name, op, opstr)                                                                \
-    lbl_raw_##name##_real_boxed : {                                                                          \
-        int slot = (int)UNPACK_A(op_word);                                                                   \
-        int reg = (int)UNPACK_B(op_word);                                                                    \
-        AerVal* rhs = &registers[reg];                                                                       \
-        if (rhs->tag == TYPE_REAL)                                                                           \
-            raw_reals[slot] op## = rhs->as.d;                                                                \
-        else if (rhs->tag == TYPE_INTEGER)                                                                   \
-            raw_reals[slot] op## = (double)rhs->as.i;                                                        \
-        else                                                                                                 \
-            error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs));                        \
-        DISPATCH();                                                                                          \
-    }
-/* Non-destructive counterpart of RAW_ARITH_REAL_BOXED -- (dest, src_raw, boxed_reg) instead of
-   (slot, reg) in-place. src_raw is read-only here, letting a caller compose a permanent raw local
-   with a boxed value into a FRESH slot without a defensive OP_RAW_MOVE_REAL first (see
-   try_emit_arith_raw_boxed, parser.c). Error messages say '+'/'*' rather than the compound forms
-   since this is always a general expression, never a compound assignment -- opstr is passed
-   un-suffixed for exactly that reason (contrast RAW_ARITH_REAL_BOXED's "+="/"-="/"*="). */
-#define RAW_ARITH_REAL_BOXED_TO(name, op, opstr)                                                             \
-    lbl_raw_##name##_real_boxed_to : {                                                                       \
-        int dest = (int)UNPACK_A(op_word);                                                                   \
-        int src = (int)UNPACK_B(op_word);                                                                    \
-        int reg = (int)UNPACK_C(op_word);                                                                    \
-        AerVal* rhs = &registers[reg];                                                                       \
-        if (rhs->tag == TYPE_REAL)                                                                           \
-            raw_reals[dest] = raw_reals[src] op rhs->as.d;                                                   \
-        else if (rhs->tag == TYPE_INTEGER)                                                                   \
-            raw_reals[dest] = raw_reals[src] op(double) rhs->as.i;                                           \
-        else                                                                                                 \
-            error("Cannot apply '" opstr "' to float and %s", vm_type_name(c, *rhs));                        \
-        DISPATCH();                                                                                          \
-    }
-
     RAW_ARITH_INT(add, +)
     RAW_ARITH_INT(sub, -)
     RAW_ARITH_INT(mul, *)
@@ -5477,6 +5417,30 @@ lbl_box_real : {
     DISPATCH();
 }
 
+/* The error wording says the operator, not "unbox", because that is what the source line reads as
+   and what the boxed arithmetic this replaces reported. */
+lbl_unbox_int : {
+    int dest = (int)UNPACK_A(op_word);
+    AerVal* v = &registers[UNPACK_B(op_word)];
+    if (v->tag == TYPE_INTEGER)
+        raw_ints[dest] = v->as.i;
+    else
+        error("Cannot apply this operator to integer and %s", vm_type_name(c, *v));
+    DISPATCH();
+}
+
+lbl_unbox_real : {
+    int dest = (int)UNPACK_A(op_word);
+    AerVal* v = &registers[UNPACK_B(op_word)];
+    if (v->tag == TYPE_REAL)
+        raw_reals[dest] = v->as.d;
+    else if (v->tag == TYPE_INTEGER)
+        raw_reals[dest] = (double)v->as.i;
+    else
+        error("Cannot apply this operator to float and %s", vm_type_name(c, *v));
+    DISPATCH();
+}
+
 lbl_raw_move_int : {
     int dest = (int)UNPACK_A(op_word);
     int src = (int)UNPACK_B(op_word);
@@ -5491,24 +5455,10 @@ lbl_raw_move_real : {
     DISPATCH();
 }
 
-    RAW_ARITH_INT_BOXED(add, +, "+=")
-    RAW_ARITH_INT_BOXED(sub, -, "-=")
-    RAW_ARITH_INT_BOXED(mul, *, "*=")
-
-    RAW_ARITH_REAL_BOXED(add, +, "+=")
-    RAW_ARITH_REAL_BOXED(sub, -, "-=")
-    RAW_ARITH_REAL_BOXED(mul, *, "*=")
-
-    RAW_ARITH_REAL_BOXED_TO(add, +, "+")
-    RAW_ARITH_REAL_BOXED_TO(mul, *, "*")
-
 #undef RAW_ARITH_INT
 #undef RAW_ARITH_REAL
 #undef RAW_CMP_INT
 #undef RAW_CMP_REAL
-#undef RAW_ARITH_INT_BOXED
-#undef RAW_ARITH_REAL_BOXED
-#undef RAW_ARITH_REAL_BOXED_TO
 
 lbl_raw_load_int_pool : {
     int dest = (int)UNPACK_A(op_word);
