@@ -1118,8 +1118,8 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
     for (int i = arg_count; i < (int)fn->arity; i++)
         callee->registers[i] = vm_default_value(target, fn->defaults[i - fn->min_arity]);
     /* Same reason as lbl_call's own clear -- everything below frame_size gets traced. */
-    if (fn->arity < fn->max_registers)
-        memset(&callee->registers[fn->arity], 0, (fn->max_registers - fn->arity) * sizeof(AerVal));
+    for (unsigned int i = fn->arity; i < fn->max_registers; i++)
+        callee->registers[i].tag = TYPE_NULL;
     callee->return_ip = return_ip;
     callee->dest_reg = 0;
     callee->dest_raw_kind = 0;
@@ -1174,8 +1174,8 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         reused->raw_real_frame_size = f->max_raw_reals;
         /* Growing the reused frame exposes registers the previous occupant never wrote, which
            mark_vm_roots would still trace -- same clear as the two push paths. */
-        if (f->arity < f->max_registers)
-            memset(&reused->registers[f->arity], 0, (f->max_registers - f->arity) * sizeof(AerVal));
+        for (unsigned int i = f->arity; i < f->max_registers; i++)
+            reused->registers[i].tag = TYPE_NULL;
         reused->tail_calls_collapsed++;
         return;
     }
@@ -1196,8 +1196,8 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     for (int i = arg_count; i < (int)f->arity; i++)
         callee->registers[i] = vm_default_value(vm, f->defaults[i - f->min_arity]);
     /* Same reason as lbl_call's own clear -- everything below frame_size gets traced. */
-    if (f->arity < f->max_registers)
-        memset(&callee->registers[f->arity], 0, (f->max_registers - f->arity) * sizeof(AerVal));
+    for (unsigned int i = f->arity; i < f->max_registers; i++)
+        callee->registers[i].tag = TYPE_NULL;
     callee->return_ip = return_ip;
     callee->dest_reg = dest_reg;
     callee->dest_raw_kind = 0;
@@ -3323,10 +3323,10 @@ lbl_call : {
         callee->registers[i] = registers[arg_reg_base + i];
     /* mark_vm_roots traces every register below frame_size, so the ones this call does not fill are
        whatever a previously popped, deeper frame left there -- pointers to objects that may since
-       have been collected. Clearing them is what makes the frame safe to trace at all; (AerVal){0}
-       is null by construction (value.h), so this is a memset rather than a store loop. */
+       have been collected. Only the tag needs clearing: the GC reaches every register through
+       value_has_cell, which reads the tag and nothing else, so the payload can stay garbage. */
     for (unsigned int i = (unsigned int)arg_count; i < chosen_max_registers; i++)
-        callee->registers[i] = aer_null();
+        callee->registers[i].tag = TYPE_NULL;
     callee->return_ip =
         (unsigned int)(pc - code); /* already past this instruction's operands -- the correct resume point */
     callee->dest_reg = dest_reg;
@@ -3534,7 +3534,7 @@ lbl_raw_math_real : {
         for (int i = 0; i < arg_count; i++)                                                                  \
             callee->bank[i] = bank[arg_slot_base + i];                                                       \
         for (unsigned int i = 0; i < (sizes & 0xFF); i++)                                                    \
-            callee->registers[i] = aer_null();                                                               \
+            callee->registers[i].tag = TYPE_NULL;                                                            \
         callee->return_ip = (unsigned int)(pc - code);                                                       \
         callee->dest_reg = dest_slot;                                                                        \
         callee->dest_raw_kind = (unsigned char)ret_kind;                                                     \
