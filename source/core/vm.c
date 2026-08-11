@@ -3517,25 +3517,23 @@ lbl_raw_math_real : {
         int arg_slot_base = (int)UNPACK_B(op_word);                                                          \
         int arg_count = (int)UNPACK_C(op_word);                                                              \
         unsigned int variant_offset = (unsigned int)READ();                                                  \
-        unsigned int func_byte_offset = (unsigned int)READ();                                                \
+        unsigned int sizes = (unsigned int)READ();                                                           \
         unsigned int ret_kind = (unsigned int)READ();                                                        \
-        ChunkFunction* target_f = (ChunkFunction*)((char*)functions + func_byte_offset);                     \
         if (vm->call_depth + 1 >= VM_CALL_MAX) {                                                             \
             error("v3 call stack overflow");                                                                 \
             DISPATCH();                                                                                      \
         }                                                                                                    \
-        const SpecEntry* e = &target_f->specializations[0];                                                  \
         CallFrame* caller = &vm->call_stack[vm->call_depth];                                                 \
         CallFrame* callee = &vm->call_stack[vm->call_depth + 1];                                             \
         callee->registers = registers + caller->frame_size;                                                  \
-        callee->frame_size = e->raw_variant_max_registers;                                                   \
+        callee->frame_size = sizes & 0xFF;                                                                   \
         callee->raw_ints = raw_ints + caller->raw_int_frame_size;                                            \
         callee->raw_reals = raw_reals + caller->raw_real_frame_size;                                         \
-        callee->raw_int_frame_size = e->raw_variant_max_raw_ints;                                            \
-        callee->raw_real_frame_size = e->raw_variant_max_raw_reals;                                          \
+        callee->raw_int_frame_size = (sizes >> 8) & 0xFF;                                                    \
+        callee->raw_real_frame_size = (sizes >> 16) & 0xFF;                                                  \
         for (int i = 0; i < arg_count; i++)                                                                  \
             callee->bank[i] = bank[arg_slot_base + i];                                                       \
-        for (unsigned int i = 0; i < e->raw_variant_max_registers; i++)                                      \
+        for (unsigned int i = 0; i < (sizes & 0xFF); i++)                                                    \
             callee->registers[i] = aer_null();                                                               \
         callee->return_ip = (unsigned int)(pc - code);                                                       \
         callee->dest_reg = dest_slot;                                                                        \
