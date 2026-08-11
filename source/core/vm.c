@@ -2898,6 +2898,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_LOAD_REAL] = &&lbl_raw_load_real,
         [OP_RAW_ADD_INT] = &&lbl_raw_add_int,
         [OP_RAW_SUB_INT] = &&lbl_raw_sub_int,
+        [OP_RAW_ADD_INT_K] = &&lbl_raw_add_int_k,
+        [OP_RAW_SUB_INT_K] = &&lbl_raw_sub_int_k,
         [OP_RAW_MUL_INT] = &&lbl_raw_mul_int,
         [OP_RAW_DIV_INT] = &&lbl_raw_div_int,
         [OP_RAW_MOD_INT] = &&lbl_raw_mod_int,
@@ -5307,6 +5309,16 @@ lbl_raw_load_real : {
         raw_ints[dest] = raw_ints[a] op raw_ints[b];                                                            \
         DISPATCH();                                                                                          \
     }
+/* The C field is a bare rawk_i index, not an RK -- the opcode itself already says "constant", so
+   all 8 bits are index and no flag needs testing. */
+#define RAW_ARITH_INT_K(name, op)                                                                            \
+    lbl_raw_##name##_int_k : {                                                                               \
+        int dest = (int)UNPACK_A(op_word);                                                                   \
+        int a = (int)UNPACK_B(op_word);                                                                      \
+        unsigned int k = UNPACK_C(op_word);                                                                  \
+        raw_ints[dest] = raw_ints[a] op c->rawk_i[k];                                                        \
+        DISPATCH();                                                                                          \
+    }
 #define RAW_ARITH_REAL(name, op)                                                                             \
     lbl_raw_##name##_real : {                                                                                \
         int dest = (int)UNPACK_A(op_word);                                                                   \
@@ -5334,6 +5346,8 @@ lbl_raw_load_real : {
     RAW_ARITH_INT(add, +)
     RAW_ARITH_INT(sub, -)
     RAW_ARITH_INT(mul, *)
+    RAW_ARITH_INT_K(add, +)
+    RAW_ARITH_INT_K(sub, -)
 
 /* Matches OP_DIV's own semantics: int/int division always promotes to float, so this is the one
    OP_RAW_*_INT opcode whose dest is raw_reals[], not raw_ints[]. */

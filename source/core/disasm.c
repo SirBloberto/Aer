@@ -205,6 +205,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_RAW_ADD_INT] = {"OP_RAW_ADD_INT", "rawi = rawi + rawi"},
     [OP_RAW_SUB_INT] = {"OP_RAW_SUB_INT", "rawi = rawi - rawi"},
     [OP_RAW_MUL_INT] = {"OP_RAW_MUL_INT", "rawi = rawi * rawi"},
+    [OP_RAW_ADD_INT_K] = {"OP_RAW_ADD_INT_K", "rawi = rawi + rawk"},
+    [OP_RAW_SUB_INT_K] = {"OP_RAW_SUB_INT_K", "rawi = rawi - rawk"},
     [OP_RAW_DIV_INT] = {"OP_RAW_DIV_INT", "rawr = rawi / rawi (int/int division always promotes to real)"},
     [OP_RAW_MOD_INT] = {"OP_RAW_MOD_INT", "rawi = rawi % rawi"},
     [OP_RAW_FLOOR_DIV_INT] = {"OP_RAW_FLOOR_DIV_INT", "rawi = floor(rawi / rawi)"},
@@ -880,6 +882,10 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     } else if (op == OP_RAW_LOAD_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
         fprintf(out, "  val=%g", c->rawk_d[c->code[pos++]]);
+    } else if (op == OP_RAW_ADD_INT_K || op == OP_RAW_SUB_INT_K) {
+        print_rawi(out, (int)UNPACK_A(op_word));
+        print_rawi(out, (int)UNPACK_B(op_word));
+        fprintf(out, "  rawk_i=%lld", (long long)c->rawk_i[UNPACK_C(op_word)]);
     } else if (op == OP_RAW_ADD_INT || op == OP_RAW_SUB_INT || op == OP_RAW_MUL_INT || op == OP_RAW_DIV_INT ||
                op == OP_RAW_MOD_INT || op == OP_RAW_FLOOR_DIV_INT) {
         /* OP_RAW_DIV_INT alone writes raw_reals[] (int/int division promotes) -- dest printer differs. */

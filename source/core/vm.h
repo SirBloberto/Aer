@@ -209,6 +209,13 @@ typedef enum {
     OP_RAW_ADD_INT,
     OP_RAW_SUB_INT,
     OP_RAW_MUL_INT,
+    /* Literal right operand read straight from rawk_i, no OP_RAW_LOAD_INT and no slot. Separate
+       opcodes rather than a const flag on the two above, because testing that flag costs every
+       iteration of every numeric loop while the load it saves is one a loop preheader already
+       hoists. These earn their keep only where there is no preheader: a function body, re-entered
+       per call. */
+    OP_RAW_ADD_INT_K,
+    OP_RAW_SUB_INT_K,
     OP_RAW_DIV_INT,
     OP_RAW_MOD_INT,
     OP_RAW_FLOOR_DIV_INT,

@@ -1278,6 +1278,20 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
             if (idx <= RK8_INDEX_MASK) rhs_field = (int)(RK8_CONST_FLAG | idx);
         }
     }
+    /* Same idea for integer +/-, but via a dedicated opcode whose C field is a bare index (see
+       OP_RAW_ADD_INT_K). Worth it only because a recursive body re-runs the load it replaces on
+       every call, where a loop's would have been hoisted once into the preheader. */
+    if (!is_cmp && int_kind && (raw_op == OP_RAW_ADD_INT || raw_op == OP_RAW_SUB_INT) &&
+        (rk_rhs & RK_CONST_FLAG)) {
+        int const_rk;
+        if (rawk_const_rk(c, rk_rhs, RAWK_INT, &const_rk)) {
+            unsigned int idx = (unsigned int)(const_rk & ~RK_CONST_FLAG);
+            if (idx <= 0xFFu) {
+                rhs_field = (int)idx;
+                raw_op = (raw_op == OP_RAW_ADD_INT) ? OP_RAW_ADD_INT_K : OP_RAW_SUB_INT_K;
+            }
+        }
+    }
     int slot_rhs = -1;
     if (rhs_field < 0) {
         slot_rhs = raw_materialize(c, rk_rhs, kind_lhs); /* same kind, confirmed above */
