@@ -28,9 +28,16 @@ endif
 # declaration is NOT enough on its own: -flto ignores it and hands r8 to other translation units,
 # which corrupted the heap (ARCHITECTURE 5.16t). -ffixed-r8 is a codegen-level reservation LTO does
 # honour, so the two are a matched pair -- never set one without the other.
+# AER_NO_PIN=1 hands r8 back to the register allocator, at the cost of rebuilding the dispatch
+# base from pc on every opcode. Worth trying whenever vm_run_slice grows: one fewer register on a
+# 32-bit ARM is felt across every handler, and the balance between those two costs is not fixed.
 HOST_ARCH := $(shell uname -m 2>/dev/null)
 ifneq (,$(filter arm% aarch32,$(HOST_ARCH)))
+ifdef AER_NO_PIN
+PIN_FLAGS := -DAER_NO_PINNED_DISPATCH
+else
 PIN_FLAGS := -ffixed-r8
+endif
 endif
 
 FLAGS := -O2 -g -flto -Wall -Wextra $(PIN_FLAGS) $(ARCH_FLAGS) -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities

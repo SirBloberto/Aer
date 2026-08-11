@@ -70,7 +70,7 @@ char* xstrdup(const char* s);
    must see it. Declaring it only in vm.c let -flto inline parser.c code that still thought r8 was
    free, and a parser pointer took the dispatch base's value, freeing &dt (5.16t). r8 is
    callee-saved under AAPCS, so libc preserves it across calls. */
-#if defined(__arm__) && defined(__GNUC__) && !defined(__clang__)
+#if defined(__arm__) && defined(__GNUC__) && !defined(__clang__) && !defined(AER_NO_PINNED_DISPATCH)
 #define AER_PINNED_DISPATCH 1
 register const void* const* aer_dispatch_base asm("r8");
 #endif
