@@ -23,10 +23,8 @@ function mandelbrot_point(cx, cy, max_iter):
         y2 = y * y
         if x2 + y2 > 4.0:
             return iter
-        y_new = 2.0 * x * y + cy
-        x_new = x2 - y2 + cx
-        y = y_new
-        x = x_new
+        y = 2.0 * x * y + cy
+        x = x2 - y2 + cx
         iter += 1
     return max_iter
 

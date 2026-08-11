@@ -124,6 +124,17 @@ typedef struct Parser {
        instruction lengths vary, so the last word cannot be identified by reading backwards. */
     unsigned int last_cmp_offset;
 
+    /* Offset of the last raw arithmetic instruction emitted, plus the temp slot it wrote and that
+       slot's kind -- lets an assignment retarget it at the variable's own slot instead of following
+       it with a move. patch_epoch counts backpatches: a jump landing between the two would make the
+       arithmetic conditional while the move it replaces was not, so an unchanged epoch is what
+       proves the retarget safe. */
+    unsigned int raw_write_offset;
+    int raw_write_slot;
+    RawKind raw_write_kind;
+    unsigned int raw_write_epoch;
+    unsigned int patch_epoch;
+
     /* How many times the body being compiled had to reach for a raw-vs-BOXED opcode -- a raw local
        composed with a value the compiler could not prove numeric. Nonzero means binding this
        function's numeric parameters as raw locals would turn real work raw, which is the whole
@@ -491,6 +502,7 @@ unsigned int emit_jump_if_false_reg(Chunk* c, int reg) {
    lets one base serve them all. */
 void patch_jump(Chunk* c, unsigned int patch_offset, unsigned int target) {
     c->code[patch_offset] = (uint32_t)(int32_t)((int64_t)target - (int64_t)patch_offset - 1);
+    P.patch_epoch++;
 }
 
 /* A call's callee_offset is an absolute function entry, not intra-function control flow. */
@@ -1103,6 +1115,28 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
     }
 }
 
+static void note_raw_write(Chunk* c, int dest, RawKind kind) {
+    P.raw_write_offset = c->count - 1;
+    P.raw_write_slot = dest;
+    P.raw_write_kind = kind;
+    P.raw_write_epoch = P.patch_epoch;
+}
+
+/* Writes an assignment's value straight into the variable's slot, by re-pointing the arithmetic
+   that produced it, so `x = a * b + c` needs no move afterwards. Declines unless that arithmetic is
+   still the very last word emitted and no jump has been patched since -- either would mean the
+   write is reachable on paths the move was not. The source slot must be a temp: retargeting one
+   that belongs to a variable would drop that variable's own value. */
+static bool retarget_raw_write(Chunk* c, int src_slot, int dest_slot, RawKind kind, int floor_now) {
+    if (P.raw_write_offset == NO_OFFSET || P.raw_write_offset != c->count - 1) return false;
+    if (P.raw_write_slot != src_slot || P.raw_write_kind != kind) return false;
+    if (P.raw_write_epoch != P.patch_epoch || src_slot < floor_now) return false;
+    uint32_t w = c->code[P.raw_write_offset];
+    c->code[P.raw_write_offset] = PACK3((Opcode)(w & 0xFF), dest_slot, UNPACK_B(w), UNPACK_C(w));
+    P.raw_write_offset = NO_OFFSET;
+    return true;
+}
+
 /* Re-points a const-flagged RK at whichever raw constant table `kind` names. An int-kind opcode
    takes only an integer literal: promoting a real one would need the comparison rewritten around
    its fractional part, so it declines and the caller keeps the boxed form. */
@@ -1325,12 +1359,14 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
         int dest = raw_real_alloc();
         if (dest < 0) return false; /* extremely unlikely right after freeing 2 int slots, but stay safe */
         chunk_emit(c, PACK3(raw_op, dest, slot_lhs, rhs_field));
+        note_raw_write(c, dest, RAWK_REAL);
         *out_rk = RK_RAW_REAL_FLAG | dest;
         return true;
     }
     int dest = int_kind ? raw_int_alloc() : raw_real_alloc();
     if (dest < 0) return false;
     chunk_emit(c, PACK3(raw_op, dest, slot_lhs, rhs_field));
+    note_raw_write(c, dest, int_kind ? RAWK_INT : RAWK_REAL);
     *out_rk = (int_kind ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest;
     return true;
 }
@@ -2808,11 +2844,13 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                             raw_real_free(1);
                     } else {
                         if (src_slot != slot) {
-                            /* Direct analog of the boxed path's "reg != rk_val -> MOVE" case. */
-                            Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
-                            chunk_emit(c, PACK3(move_op, slot, src_slot, 0));
                             int floor_now =
                                 (rhs_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+                            /* Direct analog of the boxed path's "reg != rk_val -> MOVE" case. */
+                            if (!retarget_raw_write(c, src_slot, slot, rhs_kind, floor_now)) {
+                                Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
+                                chunk_emit(c, PACK3(move_op, slot, src_slot, 0));
+                            }
                             if (src_slot >= floor_now) {
                                 if (rhs_kind == RAWK_INT)
                                     raw_int_free(1);
@@ -2851,10 +2889,12 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                 int src_slot = raw_materialize(c, rk_val, rhs_kind);
                 if (src_slot >= 0) {
                     if (src_slot != dest_slot) {
-                        Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
-                        chunk_emit(c, PACK3(move_op, dest_slot, src_slot, 0));
                         int floor_now =
                             (rhs_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+                        if (!retarget_raw_write(c, src_slot, dest_slot, rhs_kind, floor_now)) {
+                            Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
+                            chunk_emit(c, PACK3(move_op, dest_slot, src_slot, 0));
+                        }
                         if (src_slot >= floor_now) {
                             if (rhs_kind == RAWK_INT)
                                 raw_int_free(1);
@@ -5333,6 +5373,7 @@ bool parser_read_variable(VM* vm, Chunk* c, const char* name, AerVal* out) {
 void parser_reset(void) {
     reg_reset();
     P.last_cmp_offset = NO_OFFSET;
+    P.raw_write_offset = NO_OFFSET;
     P.last_interp_offset = NO_OFFSET;
     P.current_func_idx = -1; /* 0 is a real function index, so zeroed is not "outside a body" */
     P.var_count = 0;
