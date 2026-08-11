@@ -3505,47 +3505,46 @@ lbl_raw_math_real : {
 }
 
 /* Recursive call inside a numeric variant: arguments move raw slot to raw slot and the result comes
-   back the same way. No resolver -- the target is this same function's variant, already compiled
-   (this opcode only exists inside it), and its frame sizes come straight off the SpecEntry the
-   variant was recorded in. Registers still need clearing: a variant body uses boxed registers too,
-   and mark_vm_roots traces every one below frame_size. */
+   back the same way. The callee is the SAME function running the SAME variant, so its frame is the
+   caller's with three fields changed -- every size, and the entry point, already sit in the caller
+   frame this handler touches anyway. Taking them from there costs no resolver, no walk to the
+   SpecEntry, and no room in the instruction for the callee's identity. Registers are still cleared:
+   a variant body may use boxed ones, and mark_vm_roots traces every one below frame_size. */
 #define CALL_RAW(kindname, bank)                                                                    \
     lbl_call_raw_##kindname : {                                                                              \
         int dest_slot = (int)UNPACK_A(op_word);                                                              \
         int arg_slot_base = (int)UNPACK_B(op_word);                                                          \
         int arg_count = (int)UNPACK_C(op_word);                                                              \
-        unsigned int variant_offset = (unsigned int)READ();                                                  \
-        unsigned int func_byte_offset = (unsigned int)READ();                                                \
         unsigned int ret_kind = (unsigned int)READ();                                                        \
-        ChunkFunction* target_f = (ChunkFunction*)((char*)functions + func_byte_offset);                     \
         if (vm->call_depth + 1 >= VM_CALL_MAX) {                                                             \
             error("v3 call stack overflow");                                                                 \
             DISPATCH();                                                                                      \
         }                                                                                                    \
-        const SpecEntry* e = &target_f->specializations[0];                                                  \
         CallFrame* caller = &vm->call_stack[vm->call_depth];                                                 \
-        CallFrame* callee = &vm->call_stack[vm->call_depth + 1];                                             \
-        callee->registers = registers + caller->frame_size;                                                  \
-        callee->frame_size = e->raw_variant_max_registers;                                                   \
-        callee->raw_ints = raw_ints + caller->raw_int_frame_size;                                            \
-        callee->raw_reals = raw_reals + caller->raw_real_frame_size;                                         \
-        callee->raw_int_frame_size = e->raw_variant_max_raw_ints;                                            \
-        callee->raw_real_frame_size = e->raw_variant_max_raw_reals;                                          \
+        CallFrame* callee = caller + 1;                                                                      \
+        unsigned int fsz = caller->frame_size, isz = caller->raw_int_frame_size;                             \
+        unsigned int rsz = caller->raw_real_frame_size, entry = caller->code_offset;                         \
+        callee->registers = registers + fsz;                                                                 \
+        callee->frame_size = fsz;                                                                            \
+        callee->raw_ints = raw_ints + isz;                                                                   \
+        callee->raw_reals = raw_reals + rsz;                                                                 \
+        callee->raw_int_frame_size = isz;                                                                    \
+        callee->raw_real_frame_size = rsz;                                                                   \
         for (int i = 0; i < arg_count; i++)                                                                  \
             callee->bank[i] = bank[arg_slot_base + i];                                                       \
-        for (unsigned int i = 0; i < e->raw_variant_max_registers; i++)                                      \
+        for (unsigned int i = 0; i < fsz; i++)                                                               \
             callee->registers[i].tag = TYPE_NULL;                                                            \
         callee->return_ip = (unsigned int)(pc - code);                                                       \
         callee->dest_reg = dest_slot;                                                                        \
         callee->dest_raw_kind = (unsigned char)ret_kind;                                                     \
-        callee->code_offset = variant_offset;                                                                \
+        callee->code_offset = entry;                                                                         \
         callee->tail_calls_collapsed = 0;                                                                    \
         callee->synthetic_entry = false;                                                                     \
         vm->call_depth++;                                                                                    \
         registers = callee->registers;                                                                       \
         raw_ints = callee->raw_ints;                                                                         \
         raw_reals = callee->raw_reals;                                                                       \
-        pc = code + variant_offset;                                                                          \
+        pc = code + entry;                                                                                   \
         DISPATCH();                                                                                          \
     }
 

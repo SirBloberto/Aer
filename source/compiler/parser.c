@@ -4426,8 +4426,6 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
             int dest_slot = !ret_raw ? reg_alloc() : ret_int ? raw_int_alloc() : raw_real_alloc();
             if (arg_slot >= 0 && dest_slot >= 0) {
                 chunk_emit(c, PACK3(is_int ? OP_CALL_RAW_INT : OP_CALL_RAW_REAL, dest_slot, arg_slot, 1));
-                chunk_emit(c, P.variant_offset);
-                chunk_emit(c, (uint32_t)(func_index * sizeof(ChunkFunction)));
                 chunk_emit(c, !ret_raw ? 0u : ret_int ? 1u : 2u);
                 if (!ret_raw) return dest_slot;
                 return (ret_int ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest_slot;

@@ -421,9 +421,9 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_TYPED_INDEX_GET_RAW_REAL] = {"OP_TYPED_INDEX_GET_RAW_REAL", "rawr = typed_arr[rk], never boxed"},
     [OP_TYPED_INDEX_SET_RAW_INT] = {"OP_TYPED_INDEX_SET_RAW_INT", "typed_arr[rk] = rawi, never boxed"},
     [OP_TYPED_INDEX_SET_RAW_REAL] = {"OP_TYPED_INDEX_SET_RAW_REAL", "typed_arr[rk] = rawr, never boxed"},
-    [OP_CALL_RAW_INT] = {"OP_CALL_RAW_INT", "recursive numeric call, int args/result stay raw", {0}, false, 2, 0},
+    [OP_CALL_RAW_INT] = {"OP_CALL_RAW_INT", "recursive numeric call, int args/result stay raw", {0}, false, 1, 0},
     [OP_CALL_RAW_REAL] =
-        {"OP_CALL_RAW_REAL", "recursive numeric call, real args/result stay raw", {0}, false, 2, 0},
+        {"OP_CALL_RAW_REAL", "recursive numeric call, real args/result stay raw", {0}, false, 1, 0},
     [OP_RAW_MATH_REAL] = {"OP_RAW_MATH_REAL", "rawr = math fn(rawr), never boxed"},
     [OP_RAW_INT_TO_REAL] = {"OP_RAW_INT_TO_REAL", "rawr = (real)rawi"},
     [OP_RAW_REAL_TO_INT] = {"OP_RAW_REAL_TO_INT", "rawi = (int)rawr, truncating"},
@@ -658,7 +658,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
             print_rawr(out, (int)UNPACK_B(op_word));
         }
         fprintf(out, "  n=%u", UNPACK_C(op_word));
-        fprintf(out, "  -> %u", c->code[pos]), pos += 2;
+        fprintf(out, "  ret_kind=%u", c->code[pos]), pos += 1;
     } else if (op == OP_RAW_INT_TO_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
