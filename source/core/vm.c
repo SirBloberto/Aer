@@ -2980,12 +2980,10 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INTERP] = &&lbl_interp,
         [OP_INDEX_GET_INTERP] = &&lbl_index_get_interp,
     };
-#ifdef AER_PINNED_DISPATCH
-    aer_dispatch_base = dt;
-#define DT_AT(op) (aer_dispatch_base[(op)])
-#else
+/* A plain index. Under PIC the table's address is not a link-time constant and the compiler
+   rebuilds it from `pc` on every opcode, which is what the old r8 pin existed to avoid -- the
+   non-PIE link in the makefile removes the cause instead. */
 #define DT_AT(op) (dt[(op)])
-#endif
 
     /* A designated-initializer table leaves an opcode with no entry as NULL, so emitting one jumps
        through a null pointer instead of failing near the mistake -- OP_BINARY sat in the enum in

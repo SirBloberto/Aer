@@ -24,20 +24,21 @@ endif
 # Instructions drop on every benchmark and mandelbrot loses 27% of its cycles / 97% of its branch
 # mispredictions (ARCHITECTURE 5.16yh). Not the default only because A32 does not exist on
 # Cortex-M, and ARCH_FLAGS is meant to keep a build portable to whatever machine it is copied to.
-# The dispatch base is pinned to r8 on ARM (see error.h). The source-level `register asm("r8")`
-# declaration is NOT enough on its own: -flto ignores it and hands r8 to other translation units,
-# which corrupted the heap (ARCHITECTURE 5.16t). -ffixed-r8 is a codegen-level reservation LTO does
-# honour, so the two are a matched pair -- never set one without the other.
-# AER_NO_PIN=1 hands r8 back to the register allocator, at the cost of rebuilding the dispatch
-# base from pc on every opcode. Worth trying whenever vm_run_slice grows: one fewer register on a
-# 32-bit ARM is felt across every handler, and the balance between those two costs is not fixed.
-HOST_ARCH := $(shell uname -m 2>/dev/null)
-ifneq (,$(filter arm% aarch32,$(HOST_ARCH)))
-ifdef AER_NO_PIN
-PIN_FLAGS := -DAER_NO_PINNED_DISPATCH
-else
-PIN_FLAGS := -ffixed-r8
-endif
+# A non-PIE link makes the dispatch table's address a link-time constant. Under PIC it is not, and
+# the compiler rebuilds it from `pc` on every single opcode -- which used to be worked around by
+# pinning the base to r8 (-ffixed-r8 plus a `register asm` declaration every translation unit had
+# to see). That reserved a register program-wide for one function's benefit, and getting the pair
+# out of step let LTO hand r8 away and corrupt the heap. Removing the cause is measurably better
+# than reserving a register to hide it: against the pinned build, mandelbrot -18.51% cycles,
+# binary_trees -1.94%, fib_bench +0.62%, -10.10% over the three.
+#
+# Skipped where PIE is mandatory or the flag is unknown (Android, some hardened toolchains, the
+# MinGW build), which costs those targets the constant base and nothing else.
+PIE_TEST := $(shell printf 'int main(void){return 0;}' > /tmp/aer_pie_$$.c 2>/dev/null && \
+  $(CC) -fno-pie -no-pie -o /dev/null /tmp/aer_pie_$$.c >/dev/null 2>&1 && echo ok; \
+  rm -f /tmp/aer_pie_$$.c)
+ifeq ($(PIE_TEST),ok)
+PIN_FLAGS := -fno-pie -no-pie
 endif
 
 FLAGS := -O2 -g -flto -Wall -Wextra $(PIN_FLAGS) $(ARCH_FLAGS) -I include -I source -I source/compiler -I source/core -I source/stdlib -I source/utilities
