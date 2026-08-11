@@ -2674,8 +2674,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     Chunk* c = vm->chunk;
     /* Hoisted once -- c->pool is only mutated at parse time, stable for the whole call. */
     AerVal* const_pool = c->pool;
-    int64_t* rawk_i = c->rawk_i;
-    double* rawk_d = c->rawk_d;
     /* Installs this call's error catch point, saving the previous one so nested vm_run calls
        catch their own errors and unwind no further than here; restored on every return. */
     AerJmpBuf catch_point;
@@ -3305,8 +3303,6 @@ lbl_call : {
         pc = code + resume_at;
         functions = c->functions;
         const_pool = c->pool;
-        rawk_i = c->rawk_i;
-        rawk_d = c->rawk_d;
     }
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];
@@ -3770,9 +3766,19 @@ lbl_typed_index_set_raw_int : {
     AerVal obj = registers[arr_reg];
     if (aer_type(obj) == TYPE_TYPED_ARRAY) {
         AerTypedArray* ta = aer_as_typed_array(obj);
-        /* int32 range is enforced, never truncated -- vm_typed_array_check's own contract. */
+        int64_t v = raw_ints[src];
         if (ta->elem_kind == TYPED_ELEM_INT64) {
-            memcpy(ta->data + (size_t)aer_as_int(*idx) * 8, &raw_ints[src], 8);
+            memcpy(ta->data + (size_t)aer_as_int(*idx) * 8, &v, 8);
+            DISPATCH();
+        }
+        if (ta->elem_kind == TYPED_ELEM_INT32) {
+            /* Range-checked, never truncated -- vm_typed_array_check's own contract. */
+            if (v < INT32_MIN || v > INT32_MAX) {
+                error("Value %lld out of range for an int32[] array", (long long)v);
+                DISPATCH();
+            }
+            int32_t narrow = (int32_t)v;
+            memcpy(ta->data + (size_t)aer_as_int(*idx) * 4, &narrow, 4);
             DISPATCH();
         }
     }
@@ -5264,7 +5270,7 @@ lbl_raw_load_int : {
 lbl_raw_load_real : {
     int dest = (int)UNPACK_A(op_word);
     unsigned int idx = (unsigned int)READ();
-    raw_reals[dest] = rawk_d[idx];
+    raw_reals[dest] = c->rawk_d[idx];
     DISPATCH();
 }
 
@@ -5278,8 +5284,8 @@ lbl_raw_load_real : {
    bank, so a literal needs neither an OP_RAW_LOAD nor a slot of its own. Only the right operand,
    and only one predictable branch -- an operand's kind is fixed in the bytecode, so a given site
    always takes the same side. Raw slot indices stop at 31 and can never collide with the flag. */
-#define RAW_I(x) (RK8_IS_CONST(x) ? rawk_i[RK8_INDEX(x)] : raw_ints[x])
-#define RAW_D(x) (RK8_IS_CONST(x) ? rawk_d[RK8_INDEX(x)] : raw_reals[x])
+#define RAW_I(x) (RK8_IS_CONST(x) ? c->rawk_i[RK8_INDEX(x)] : raw_ints[x])
+#define RAW_D(x) (RK8_IS_CONST(x) ? c->rawk_d[RK8_INDEX(x)] : raw_reals[x])
 
 #define RAW_ARITH_INT(name, op)                                                                              \
     lbl_raw_##name##_int : {                                                                                 \
@@ -5463,7 +5469,7 @@ lbl_raw_move_real : {
 lbl_raw_load_int_pool : {
     int dest = (int)UNPACK_A(op_word);
     unsigned int idx = (unsigned int)READ();
-    raw_ints[dest] = rawk_i[idx];
+    raw_ints[dest] = c->rawk_i[idx];
     DISPATCH();
 }
 
