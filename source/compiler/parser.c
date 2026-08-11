@@ -1264,10 +1264,13 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     if (slot_lhs < 0) return false; /* raw-slot budget exhausted: fall back to boxed */
 
     /* A literal right operand rides in the instruction as a raw-constant index instead of being
-       loaded into a slot of its own. Only the right one: the swap form moves it to the left, where
-       the operand field is a bare slot index with no room to say otherwise. */
+       loaded into a slot of its own. Comparisons only: an arithmetic operand is read on the hot
+       path of every numeric loop, and making that read conditional measured +4 instructions on each
+       of mandelbrot's 203M of them -- far more than the OP_RAW_LOAD it saves, which a loop's
+       preheader hoists anyway. A comparison is one per iteration, where the trade goes the other
+       way. Only the right one: the swap form moves it left, where the field is a bare slot index. */
     int rhs_field = -1;
-    if (!swap_cmp && (rk_rhs & RK_CONST_FLAG)) {
+    if (is_cmp && !swap_cmp && (rk_rhs & RK_CONST_FLAG)) {
         int const_rk;
         if (rawk_const_rk(c, rk_rhs, kind_lhs, &const_rk)) {
             unsigned int idx = (unsigned int)(const_rk & ~RK_CONST_FLAG);

@@ -3322,9 +3322,8 @@ lbl_call : {
        whatever a previously popped, deeper frame left there -- pointers to objects that may since
        have been collected. Clearing them is what makes the frame safe to trace at all; (AerVal){0}
        is null by construction (value.h), so this is a memset rather than a store loop. */
-    if ((unsigned int)arg_count < chosen_max_registers)
-        memset(&callee->registers[arg_count], 0,
-               (chosen_max_registers - (unsigned int)arg_count) * sizeof(AerVal));
+    for (unsigned int i = (unsigned int)arg_count; i < chosen_max_registers; i++)
+        callee->registers[i] = aer_null();
     callee->return_ip =
         (unsigned int)(pc - code); /* already past this instruction's operands -- the correct resume point */
     callee->dest_reg = dest_reg;
@@ -3524,7 +3523,8 @@ lbl_raw_math_real : {
         callee->raw_real_frame_size = e->raw_variant_max_raw_reals;                                          \
         for (int i = 0; i < arg_count; i++)                                                                  \
             callee->bank[i] = bank[arg_slot_base + i];                                                       \
-        memset(callee->registers, 0, e->raw_variant_max_registers * sizeof(AerVal));                         \
+        for (unsigned int i = 0; i < e->raw_variant_max_registers; i++)                                      \
+            callee->registers[i] = aer_null();                                                               \
         callee->return_ip = (unsigned int)(pc - code);                                                       \
         callee->dest_reg = dest_slot;                                                                        \
         callee->dest_raw_kind = (unsigned char)ret_kind;                                                     \
@@ -5292,7 +5292,7 @@ lbl_raw_load_real : {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        raw_ints[dest] = raw_ints[a] op RAW_I(b);                                                            \
+        raw_ints[dest] = raw_ints[a] op raw_ints[b];                                                            \
         DISPATCH();                                                                                          \
     }
 #define RAW_ARITH_REAL(name, op)                                                                             \
@@ -5300,7 +5300,7 @@ lbl_raw_load_real : {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        raw_reals[dest] = raw_reals[a] op RAW_D(b);                                                          \
+        raw_reals[dest] = raw_reals[a] op raw_reals[b];                                                          \
         DISPATCH();                                                                                          \
     }
 #define RAW_CMP_INT(name, op)                                                                                \
@@ -5329,7 +5329,7 @@ lbl_raw_div_int : {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    int64_t rv = RAW_I(b);
+    int64_t rv = raw_ints[b];
     if (rv == 0) {
         error("Division by zero");
         raw_reals[dest] = 0.0;
@@ -5342,7 +5342,7 @@ lbl_raw_mod_int : {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    int64_t rv = RAW_I(b);
+    int64_t rv = raw_ints[b];
     if (rv == 0) {
         error("Modulo by zero");
         raw_ints[dest] = 0;
@@ -5355,7 +5355,7 @@ lbl_raw_floor_div_int : {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    int64_t rv = RAW_I(b);
+    int64_t rv = raw_ints[b];
     if (rv == 0) {
         error("Division by zero");
         raw_ints[dest] = 0;
@@ -5378,7 +5378,7 @@ lbl_raw_floor_div_int : {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        raw_reals[dest] = raw_reals[dest] op(raw_reals[a] * RAW_D(b));                                       \
+        raw_reals[dest] = raw_reals[dest] op(raw_reals[a] * raw_reals[b]);                                       \
         DISPATCH();                                                                                          \
     }
     RAW_FUSED_MULACC_REAL(fma, +)
@@ -5389,7 +5389,7 @@ lbl_raw_div_real : {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    double rv = RAW_D(b);
+    double rv = raw_reals[b];
     if (rv == 0.0) {
         error("Division by zero");
         raw_reals[dest] = 0.0;
