@@ -3487,10 +3487,19 @@ lbl_return_raw_real : {
    reached with a real result. */
 lbl_raw_math_real : {
     int dest = (int)UNPACK_A(op_word);
-    int src = (int)UNPACK_B(op_word);
+    double x = raw_reals[UNPACK_B(op_word)];
+    /* sqrt is one machine instruction and the overwhelming majority of the traffic. Calling out for
+       it put a real call in the dispatch loop, which costs far more than the call itself: every
+       hoisted pointer becomes call-clobbered, and the register allocator pessimizes accordingly.
+       nbody was executing 13% fewer instructions than before this opcode existed and still spending
+       10% more cycles. The rest are rare enough to keep paying for the call. */
+    if (UNPACK_C(op_word) == FN_MATH_SQRT && x >= 0) {
+        raw_reals[dest] = sqrt(x);
+        DISPATCH();
+    }
     double out;
     SYNC_IP();
-    if (aer_math_unary_raw((int)UNPACK_C(op_word), raw_reals[src], &out)) raw_reals[dest] = out;
+    if (aer_math_unary_raw((int)UNPACK_C(op_word), x, &out)) raw_reals[dest] = out;
     DISPATCH();
 }
 
