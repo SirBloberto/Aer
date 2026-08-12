@@ -363,6 +363,8 @@ typedef enum {
        loop proof, since an out-of-range index just falls through to the generic path. Emitted
        wherever the parser knows the array's element kind (Parser.reg_elem_kind). */
     OP_INDEX_GET_RAW_INT,  /* raw_int_slot, arr_reg, rk_idx */
+    OP_INDEX_SET_RAW_INT,  /* arr_reg, rk_idx, raw_int_slot */
+    OP_INDEX_SET_RAW_REAL, /* arr_reg, rk_idx, raw_real_slot */
     OP_INDEX_GET_RAW_REAL, /* raw_real_slot, arr_reg, rk_idx */
     OP_TYPED_INDEX_GET_RAW_INT,
     OP_TYPED_INDEX_GET_RAW_REAL,

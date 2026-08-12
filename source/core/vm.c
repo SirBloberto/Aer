@@ -2861,6 +2861,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_TYPED_INDEX_GET_UNCHECKED] = &&lbl_typed_index_get_unchecked,
         [OP_TYPED_INDEX_SET_UNCHECKED] = &&lbl_typed_index_set_unchecked,
         [OP_INDEX_GET_RAW_INT] = &&lbl_index_get_raw_int,
+        [OP_INDEX_SET_RAW_INT] = &&lbl_index_set_raw_int,
+        [OP_INDEX_SET_RAW_REAL] = &&lbl_index_set_raw_real,
         [OP_INDEX_GET_RAW_REAL] = &&lbl_index_get_raw_real,
         [OP_TYPED_INDEX_GET_RAW_INT] = &&lbl_typed_index_get_raw_int,
         [OP_TYPED_INDEX_GET_RAW_REAL] = &&lbl_typed_index_get_raw_real,
@@ -3727,6 +3729,50 @@ lbl_typed_index_get_raw_real : {
     else
         error("Expected a number from this index, got %s", vm_type_name(c, v));
     if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);
+    DISPATCH();
+}
+
+lbl_index_set_raw_int : {
+    AerVal obj = registers[(int)UNPACK_A(op_word)];
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
+    int64_t v = raw_ints[UNPACK_C(op_word)];
+    if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        if ((uint64_t)idx->as.i < (uint64_t)ta->count) {
+            if (ta->elem_kind == TYPED_ELEM_INT64) {
+                memcpy(ta->data + (size_t)idx->as.i * 8, &v, 8);
+                DISPATCH();
+            }
+            if (ta->elem_kind == TYPED_ELEM_INT32 && v >= INT32_MIN && v <= INT32_MAX) {
+                int32_t narrow = (int32_t)v;
+                memcpy(ta->data + (size_t)idx->as.i * 4, &narrow, 4);
+                DISPATCH();
+            }
+        }
+    }
+    vm_index_set_compute(vm, obj, *idx, aer_int(v));
+    DISPATCH();
+}
+
+lbl_index_set_raw_real : {
+    AerVal obj = registers[(int)UNPACK_A(op_word)];
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
+    double v = raw_reals[UNPACK_C(op_word)];
+    if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        if ((uint64_t)idx->as.i < (uint64_t)ta->count) {
+            if (ta->elem_kind == TYPED_ELEM_FLOAT64) {
+                memcpy(ta->data + (size_t)idx->as.i * 8, &v, 8);
+                DISPATCH();
+            }
+            if (ta->elem_kind == TYPED_ELEM_FLOAT32) {
+                float narrow = (float)v;
+                memcpy(ta->data + (size_t)idx->as.i * 4, &narrow, 4);
+                DISPATCH();
+            }
+        }
+    }
+    vm_index_set_compute(vm, obj, *idx, aer_real(v));
     DISPATCH();
 }
 

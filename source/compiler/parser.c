@@ -600,6 +600,24 @@ void emit_index_get(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
 
 void emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val) {
     rk_idx = box_if_raw(c, rk_idx);
+    /* Mirror of the raw read: a raw value stores straight from its slot when the array's element
+       kind matches, instead of boxing only for vm_index_set_compute to unbox again. Bounds-checked,
+       so no loop proof is needed. */
+    RawKind elem = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_elem_kind[arr_reg] : RAWK_NONE;
+    RawKind val_kind = (rk_val & RK_RAW_INT_FLAG) ? RAWK_INT
+                       : (rk_val & RK_RAW_REAL_FLAG) ? RAWK_REAL
+                                                     : RAWK_NONE;
+    if (elem != RAWK_NONE && elem == val_kind && rk8_fits(rk_idx)) {
+        int slot = rk_val & RK_RAW_SLOT_MASK;
+        chunk_emit(c, PACK3(elem == RAWK_INT ? OP_INDEX_SET_RAW_INT : OP_INDEX_SET_RAW_REAL, arr_reg,
+                            pack_rk8(rk_idx), slot));
+        if (elem == RAWK_INT) {
+            if (slot >= P.raw_int_reserved_floor) raw_int_free(1);
+        } else if (slot >= P.raw_real_reserved_floor) {
+            raw_real_free(1);
+        }
+        return;
+    }
     rk_val = box_if_raw(c, rk_val);
     int spilled = 0;
     if (!rk8_fits(rk_idx)) {

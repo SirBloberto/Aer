@@ -420,6 +420,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_RAW_NEQ_REAL_JUMP_IF_FALSE] =
         {"OP_RAW_NEQ_REAL_JUMP_IF_FALSE", "jump if !(rawr != rawr)", {0}, false, 1, 0},
     [OP_INDEX_GET_RAW_INT] = {"OP_INDEX_GET_RAW_INT", "rawi = arr[rk] (checked)"},
+    [OP_INDEX_SET_RAW_INT] = {"OP_INDEX_SET_RAW_INT", "arr[rk] = rawi (checked)"},
+    [OP_INDEX_SET_RAW_REAL] = {"OP_INDEX_SET_RAW_REAL", "arr[rk] = rawr (checked)"},
     [OP_INDEX_GET_RAW_REAL] = {"OP_INDEX_GET_RAW_REAL", "rawr = arr[rk] (checked)"},
     [OP_TYPED_INDEX_GET_RAW_INT] = {"OP_TYPED_INDEX_GET_RAW_INT", "rawi = typed_arr[rk], never boxed"},
     [OP_TYPED_INDEX_GET_RAW_REAL] = {"OP_TYPED_INDEX_GET_RAW_REAL", "rawr = typed_arr[rk], never boxed"},
@@ -677,6 +679,13 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rawi(out, (int)UNPACK_A(op_word));
     } else if (op == OP_RETURN_RAW_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
+    } else if (op == OP_INDEX_SET_RAW_INT || op == OP_INDEX_SET_RAW_REAL) {
+        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
+        print_rk8(out, c, UNPACK_B(op_word));
+        if (op == OP_INDEX_SET_RAW_INT)
+            print_rawi(out, (int)UNPACK_C(op_word));
+        else
+            print_rawr(out, (int)UNPACK_C(op_word));
     } else if (op == OP_INDEX_GET_RAW_INT || op == OP_INDEX_GET_RAW_REAL) {
         if (op == OP_INDEX_GET_RAW_INT)
             print_rawi(out, (int)UNPACK_A(op_word));
