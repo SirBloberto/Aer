@@ -366,10 +366,6 @@ typedef enum {
     OP_INDEX_SET_RAW_INT,  /* arr_reg, rk_idx, raw_int_slot */
     OP_INDEX_SET_RAW_REAL, /* arr_reg, rk_idx, raw_real_slot */
     OP_INDEX_GET_RAW_REAL, /* raw_real_slot, arr_reg, rk_idx */
-    OP_TYPED_INDEX_GET_RAW_INT,
-    OP_TYPED_INDEX_GET_RAW_REAL,
-    OP_TYPED_INDEX_SET_RAW_INT,
-    OP_TYPED_INDEX_SET_RAW_REAL,
 
     /* A recursive call from inside a numeric variant, handing raw slots over and taking one back --
        the last place a numeric body had to build an AerVal just to cross a frame boundary. Only

@@ -1193,7 +1193,7 @@ static bool try_rewrite_index_get_raw(Chunk* c, int* rk, unsigned int start, Raw
     int slot = is_int ? raw_int_alloc() : raw_real_alloc();
     if (slot < 0) return false;
     if (is_temp(*rk)) reg_free(1);
-    c->code[start] = PACK3(is_int ? OP_TYPED_INDEX_GET_RAW_INT : OP_TYPED_INDEX_GET_RAW_REAL, slot,
+    c->code[start] = PACK3(is_int ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL, slot,
                            UNPACK_B(w), UNPACK_C(w));
     *rk = (is_int ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | slot;
     return true;
@@ -3541,8 +3541,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             if (val_kind != RAWK_NONE) {
                 int slot = raw_materialize(c, rk_val, val_kind);
                 if (slot >= 0) {
-                    chunk_emit(c, PACK3(val_kind == RAWK_INT ? OP_TYPED_INDEX_SET_RAW_INT
-                                                             : OP_TYPED_INDEX_SET_RAW_REAL,
+                    chunk_emit(c, PACK3(val_kind == RAWK_INT ? OP_INDEX_SET_RAW_INT
+                                                             : OP_INDEX_SET_RAW_REAL,
                                         obj_reg, pack_rk8(pending_rk_idx), slot));
                     int floor_now =
                         (val_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
