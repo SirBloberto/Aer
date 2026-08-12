@@ -2342,6 +2342,22 @@ static int parse_unary(Chunk* c) {
     return parse_unary_inner(c);
 }
 
+/* Re-points a just-emitted comparison at `dest` so && / || need no move to collect their result.
+   Only a comparison, whose destination is always field A and whose only effect is that write, and
+   only when it is still the last word emitted -- the same test emit_cond_jump_if_false's fusion
+   uses, via the offset it already tracks. */
+static bool retarget_last_cmp(Chunk* c, int reg_rhs, int dest) {
+    if (P.last_cmp_offset == NO_OFFSET || P.last_cmp_offset != c->count - 1) return false;
+    uint32_t w = c->code[P.last_cmp_offset];
+    if ((int)UNPACK_A(w) != reg_rhs || !is_temp(reg_rhs)) return false;
+    c->code[P.last_cmp_offset] = PACK3((Opcode)(w & 0xFF), dest, UNPACK_B(w), UNPACK_C(w));
+    /* This comparison is now the last word emitted, which would let an enclosing if/while fuse its
+       branch with it -- but it sits behind the short circuit and only runs when the left operand was
+       truthy. The move being emitted here is what used to make that impossible. */
+    P.last_cmp_offset = NO_OFFSET;
+    return true;
+}
+
 /* Both the lhs-false and rhs-false paths land on the same "result = false" code. `dest`
    is allocated once, after both operands free. */
 /* `a && b` = a if falsy(a), else b -- the operand itself, not a coerced boolean (matches
@@ -2360,7 +2376,8 @@ static int compile_and(Chunk* c, int lhs, unsigned int prec) {
 
     int rk_rhs = parse_binary(c, prec);
     int reg_rhs = materialize(c, rk_rhs);
-    if (reg_rhs != dest) chunk_emit(c, PACK2(OP_MOVE, dest, reg_rhs));
+    if (reg_rhs != dest && !retarget_last_cmp(c, reg_rhs, dest))
+        chunk_emit(c, PACK2(OP_MOVE, dest, reg_rhs));
     if (is_temp(reg_rhs)) reg_free(1);
 
     patch_jump(c, patch_skip, c->count);
@@ -2387,7 +2404,8 @@ static int compile_or(Chunk* c, int lhs, unsigned int prec) {
     patch_jump(c, patch_use_rhs, c->count);
     int rk_rhs = parse_binary(c, prec);
     int reg_rhs = materialize(c, rk_rhs);
-    if (reg_rhs != dest) chunk_emit(c, PACK2(OP_MOVE, dest, reg_rhs));
+    if (reg_rhs != dest && !retarget_last_cmp(c, reg_rhs, dest))
+        chunk_emit(c, PACK2(OP_MOVE, dest, reg_rhs));
     if (is_temp(reg_rhs)) reg_free(1);
 
     patch_jump(c, patch_end, c->count);
