@@ -108,6 +108,10 @@ typedef struct Parser {
        by OP_ITER_RANGE_PREP's cur >= 0 guard, so this can never be a safety hole. */
     bool reg_nonneg[FRAME_REGISTERS];
     Shape* reg_known_element_shape[FRAME_REGISTERS];
+    /* Element kind of a typed array a register is known to hold, or RAWK_NONE. Only ever set from
+       a `[numeric; count]` literal, whose element kind is a parse-time fact, so a read can go
+       straight to a raw slot instead of boxing. Cleared wherever the register's identity is. */
+    RawKind reg_elem_kind[FRAME_REGISTERS];
     /* Side-channel from the plain index-get site to parse_assignment's plain '=' handler -- see
        last_plain_index_dest_reg's original standalone comment (git blame) for why this is keyed
        on exact register-number equality rather than a syntactic flag. */
@@ -323,6 +327,7 @@ int reg_alloc(void) {
     }
     int reg = P.next_temp_register++;
     P.reg_nonneg[reg] = false; /* a recycled register carries no proof from its last occupant */
+    P.reg_elem_kind[reg] = RAWK_NONE;
     track_peak(P.next_temp_register);
     if (P.next_temp_register > P.loop_cond_peak) P.loop_cond_peak = P.next_temp_register;
     return reg;
@@ -784,6 +789,7 @@ static void invalidate_register(int reg) {
     if (reg < 0) return;
     if (P.length_tracked_valid && reg == P.length_tracked_source_reg) P.length_tracked_valid = false;
     if (reg < FRAME_REGISTERS) P.reg_nonneg[reg] = false;
+    if (reg < FRAME_REGISTERS) P.reg_elem_kind[reg] = RAWK_NONE;
     for (int i = 0; i < P.safe_loop_depth; i++) {
         if (P.safe_loop_item_regs[i] == reg) P.safe_loop_item_regs[i] = -1;
         if (P.safe_loop_array_regs[i] == reg) P.safe_loop_array_regs[i] = -1;
@@ -1531,6 +1537,7 @@ static int arg_materialize(Chunk* c, int rk) {
         chunk_emit(c, PACK_OP_A_W16(OP_LOADK, target, (unsigned int)(rk & ~RK_CONST_FLAG)));
     } else {
         chunk_emit(c, PACK2(OP_MOVE, target, rk));
+        if (rk >= 0 && rk < FRAME_REGISTERS) P.reg_elem_kind[target] = P.reg_elem_kind[rk];
     }
     return target;
 }
@@ -1952,6 +1959,7 @@ static int parse_primary_inner(Chunk* c) {
                 else if (narrow_float_candidate)
                     narrow_flag = 2;
             }
+            RawKind fill_kind = rk_raw_kind(c, rk_first);
             int fill_reg = arg_materialize(c, rk_first);
             int rk_count = parse_binary(c, 0);
             require(TOKEN_CLOSE_BRACKET, "expected ']' after repeat-literal count");
@@ -1967,6 +1975,7 @@ static int parse_primary_inner(Chunk* c) {
             if (is_temp(fill_reg)) reg_free(1);
             int dest = reg_alloc();
             emit_array_repeat(c, dest, fill_reg, narrow_flag, rk_count);
+            P.reg_elem_kind[dest] = fill_kind;
             return dest;
         }
 
@@ -2157,6 +2166,21 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                 /* Free-then-allocate, matching parse_binary_ops's own discipline. */
                 if (is_temp(rk_start)) reg_free(1);
                 if (is_temp(arr_reg)) reg_free(1);
+
+                /* Element kind known, so the read lands in a raw slot and everything downstream
+                   composes raw instead of boxing here and unboxing again later. Needs no loop
+                   proof: the opcode bounds-checks and falls back to the generic path. */
+                RawKind elem = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_elem_kind[arr_reg]
+                                                                          : RAWK_NONE;
+                if (elem != RAWK_NONE && rk8_fits(rk_start)) {
+                    int slot = (elem == RAWK_INT) ? raw_int_alloc() : raw_real_alloc();
+                    if (slot >= 0) {
+                        chunk_emit(c, PACK3(elem == RAWK_INT ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL,
+                                            slot, arr_reg, pack_rk8(rk_start)));
+                        rk = (elem == RAWK_INT ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | slot;
+                        continue;
+                    }
+                }
 
                 int dest = reg_alloc();
                 /* rk_start is guaranteed plain and non-raw here, so it always fits RK8 directly.
@@ -2758,6 +2782,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         for (unsigned int i = 0; i < count; i++) {
             P.reg_known_shape[target_regs[i]] = NULL;
             P.reg_known_element_shape[target_regs[i]] = NULL;
+            P.reg_elem_kind[target_regs[i]] = RAWK_NONE;
             P.alias_source_param[target_regs[i]] = -1;
             invalidate_register(target_regs[i]);
         }
@@ -2944,6 +2969,13 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         rk_val = box_if_raw(c, rk_val);
         int reg = var_slot(c, name_idx);
         if (reg < 0) return; /* error_at already called */
+        /* Read before anything clears it. A `[numeric; count]` literal is built straight into the
+           register var_slot then hands this name, so source and destination are usually the SAME
+           one -- and invalidate_register below would wipe the fact this line is preserving. */
+        RawKind rhs_elem = (!(rk_val & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) &&
+                            rk_val >= 0 && rk_val < FRAME_REGISTERS)
+                               ? P.reg_elem_kind[rk_val]
+                               : RAWK_NONE;
         /* See invalidate_safe_loop_reg's own comment -- without this, `reg` staying on
            safe_loop_item_regs after this reassignment would let a later arr[reg].field inside the
            same loop body keep trusting an index register that may no longer hold what the loop's
@@ -2967,6 +2999,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             P.alias_source_param[reg] = -1;
         }
         P.last_plain_index_dest_reg = -1;
+        P.reg_elem_kind[reg] = rhs_elem;
         if (rk_val & RK_CONST_FLAG) {
             chunk_emit(c, PACK_OP_A_W16(OP_LOADK, reg, (unsigned int)(rk_val & ~RK_CONST_FLAG)));
         } else if (reg != rk_val) {
@@ -3142,6 +3175,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
            invalidate_register's own comment for why safe_loop_item_regs needs the same treatment. */
         P.reg_known_shape[reg] = NULL;
         P.reg_known_element_shape[reg] = NULL;
+        P.reg_elem_kind[reg] = RAWK_NONE;
         P.alias_source_param[reg] = -1;
         invalidate_register(reg);
         emit_binary(c, reg, compound_assign_ops[i].op, reg, rk_rhs);
@@ -3809,6 +3843,7 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
        before this loop's own body (or its own bound_safe/start_safe below) can be compiled. */
     P.reg_known_shape[item_reg] = NULL;
     P.reg_known_element_shape[item_reg] = NULL;
+    P.reg_elem_kind[item_reg] = RAWK_NONE;
     P.alias_source_param[item_reg] = -1;
     invalidate_register(item_reg);
     /* invalidate_register cannot catch loop_var_name reusing the length_tracked_name NAME itself
@@ -3982,10 +4017,12 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
     /* Same name-shadowing reasoning as parse_for_in's own identical block just above. */
     P.reg_known_shape[key_reg] = NULL;
     P.reg_known_element_shape[key_reg] = NULL;
+    P.reg_elem_kind[key_reg] = RAWK_NONE;
     P.alias_source_param[key_reg] = -1;
     invalidate_register(key_reg);
     P.reg_known_shape[val_reg] = NULL;
     P.reg_known_element_shape[val_reg] = NULL;
+    P.reg_elem_kind[val_reg] = RAWK_NONE;
     P.alias_source_param[val_reg] = -1;
     invalidate_register(val_reg);
     /* Same length_tracked_name-by-NAME reasoning as parse_for_in's own identical check. */

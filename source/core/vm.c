@@ -2860,6 +2860,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INDEX_SET] = &&lbl_index_set,
         [OP_TYPED_INDEX_GET_UNCHECKED] = &&lbl_typed_index_get_unchecked,
         [OP_TYPED_INDEX_SET_UNCHECKED] = &&lbl_typed_index_set_unchecked,
+        [OP_INDEX_GET_RAW_INT] = &&lbl_index_get_raw_int,
+        [OP_INDEX_GET_RAW_REAL] = &&lbl_index_get_raw_real,
         [OP_TYPED_INDEX_GET_RAW_INT] = &&lbl_typed_index_get_raw_int,
         [OP_TYPED_INDEX_GET_RAW_REAL] = &&lbl_typed_index_get_raw_real,
         [OP_TYPED_INDEX_SET_RAW_INT] = &&lbl_typed_index_set_raw_int,
@@ -3715,6 +3717,54 @@ lbl_typed_index_get_raw_real : {
         unsigned int width = vm_typed_elem_width(ta->elem_kind);
         raw_reals[dest] = vm_typed_elem_read_real(ta->data + (size_t)aer_as_int(*idx) * width, ta->elem_kind);
         DISPATCH();
+    }
+    AerVal v;
+    vm_index_get_compute(obj, *idx, &v);
+    if (v.tag == TYPE_REAL)
+        raw_reals[dest] = v.as.d;
+    else if (v.tag == TYPE_INTEGER)
+        raw_reals[dest] = (double)v.as.i;
+    else
+        error("Expected a number from this index, got %s", vm_type_name(c, v));
+    if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);
+    DISPATCH();
+}
+
+lbl_index_get_raw_int : {
+    int dest = (int)UNPACK_A(op_word);
+    AerVal obj = registers[(int)UNPACK_B(op_word)];
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
+    if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        if ((uint64_t)idx->as.i < (uint64_t)ta->count &&
+            (ta->elem_kind == TYPED_ELEM_INT32 || ta->elem_kind == TYPED_ELEM_INT64)) {
+            unsigned int width = vm_typed_elem_width(ta->elem_kind);
+            raw_ints[dest] = vm_typed_elem_read_int(ta->data + (size_t)idx->as.i * width, ta->elem_kind);
+            DISPATCH();
+        }
+    }
+    AerVal v;
+    vm_index_get_compute(obj, *idx, &v);
+    if (v.tag == TYPE_INTEGER)
+        raw_ints[dest] = v.as.i;
+    else
+        error("Expected an integer from this index, got %s", vm_type_name(c, v));
+    if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);
+    DISPATCH();
+}
+
+lbl_index_get_raw_real : {
+    int dest = (int)UNPACK_A(op_word);
+    AerVal obj = registers[(int)UNPACK_B(op_word)];
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
+    if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        if ((uint64_t)idx->as.i < (uint64_t)ta->count &&
+            (ta->elem_kind == TYPED_ELEM_FLOAT32 || ta->elem_kind == TYPED_ELEM_FLOAT64)) {
+            unsigned int width = vm_typed_elem_width(ta->elem_kind);
+            raw_reals[dest] = vm_typed_elem_read_real(ta->data + (size_t)idx->as.i * width, ta->elem_kind);
+            DISPATCH();
+        }
     }
     AerVal v;
     vm_index_get_compute(obj, *idx, &v);

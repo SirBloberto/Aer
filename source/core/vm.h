@@ -359,6 +359,11 @@ typedef enum {
        These move the element between the array and a raw slot directly. The receiver is still
        checked: anything but a typed array (or a non-numeric element) falls back to the general
        boxed path, so these are safe on any value, just fast on the one that matters. */
+    /* Bounds-CHECKED siblings of the two below: same raw destination, but usable without any
+       loop proof, since an out-of-range index just falls through to the generic path. Emitted
+       wherever the parser knows the array's element kind (Parser.reg_elem_kind). */
+    OP_INDEX_GET_RAW_INT,  /* raw_int_slot, arr_reg, rk_idx */
+    OP_INDEX_GET_RAW_REAL, /* raw_real_slot, arr_reg, rk_idx */
     OP_TYPED_INDEX_GET_RAW_INT,
     OP_TYPED_INDEX_GET_RAW_REAL,
     OP_TYPED_INDEX_SET_RAW_INT,
