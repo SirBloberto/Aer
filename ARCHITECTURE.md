@@ -1061,6 +1061,21 @@ it removes; a load from an already-hot cache line is cheaper than recomputing an
 
 So the three separate stacks are load-bearing, not an oversight. The four raw-side fields stay.
 
+**Revisited: both objections above are now stale.** The segfault argument rests on `register_stack`
+having only ever held valid AerVals. That is no longer what defends it -- every frame-entry path now
+clears its boxed region to `TYPE_NULL` (five sites in vm.c: the two push paths, the tail-call reuse,
+`lbl_call`, and the raw-call macro), so a reused region's stale words are overwritten before the
+collector can reach them. This section rejected clearing on *pop*, which leaves holes on error
+unwind and yield because those skip `lbl_return`; clearing on *entry* has no such hole, since a frame
+cannot exist without being entered.
+
+The +2.02% / +3.58% is a measurement of a different change: that attempt merged the storage while
+keeping `OP_BOX_*`/`OP_UNBOX_*` and every duplicated opcode family, so it paid the base-derivation
+arithmetic and collected none of the payback. Merging storage *and* deleting the mediation it exists
+to serve is a separate experiment -- worth roughly 11.7% of dispatches and 12-20 opcodes -- and has
+not been run. Merging storage alone is expected to regress; do not treat that as evidence against
+merge-plus-delete, and do not land the merge without the deletion in the same arc.
+
 ### 5.16g Non-PIE is worth 0.3-4.3%, and is deliberately not taken
 
 A PIE build reaches the computed-goto label table PC-relatively, so **every dispatch** pays
