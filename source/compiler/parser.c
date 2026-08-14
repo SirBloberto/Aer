@@ -61,26 +61,21 @@ typedef struct {
 
 typedef enum { RAWK_NONE, RAWK_INT, RAWK_REAL } RawKind;
 
+/* Where a value lives. Today these index three separate banks; the unified-slot migration collapses
+   them into one array of 8-byte slots, at which point the class becomes a range within a frame
+   rather than a choice of array. */
+typedef enum { SLOT_BOXED, SLOT_INT, SLOT_REAL, SLOT_CLASS_COUNT } SlotClass;
+
 /* Every mutable global the compile functions share. P (below) is the live instance;
    parser_save_state/restore_state snapshot it wholesale for a nested compile. */
 typedef struct Parser {
-    /* The register allocator every compile function shares. next_temp_register tracks the next
-       free temp; registers below reserved_floor are permanent and must never be handed out here. */
-    int next_temp_register;
-    int reserved_floor;
-    /* Highest watermark reached since the last reset -- the real peak register need, since both
-       counters shrink back down as temps free. Read back after a function body finishes compiling
-       but before its own restore runs (parse_function/parse_function_expr). */
-    int max_register_used;
-    /* Same idea as max_register_used, for raw_int_next_temp/raw_real_next_temp -- the real peak
-       raw-slot need per function, captured into ChunkFunction/AerFunction's max_raw_ints/reals
-       right alongside max_registers (parse_function/parse_function_expr). */
-    int max_raw_int_used, max_raw_real_used;
-    /* Raw-slot allocators, mirroring reg_alloc/reg_free/reg_reserve's shape -- except overflow:
-       raw_int_alloc/raw_real_alloc return -1 instead of erroring, and every caller falls back to
-       ordinary boxed storage for that one value. */
-    int raw_int_next_temp, raw_int_reserved_floor;
-    int raw_real_next_temp, raw_real_reserved_floor;
+    /* One allocator per slot class. slot_next is the next free temp; anything below slot_floor is a
+       variable's permanent slot and must never be handed out as scratch. slot_max is the watermark,
+       read back after a body compiles but before its restore runs, since both counters shrink again
+       as temps free. */
+    int slot_next[SLOT_CLASS_COUNT];
+    int slot_floor[SLOT_CLASS_COUNT];
+    int slot_max[SLOT_CLASS_COUNT];
 
     /* Every register's current variable binding (0 registers is effectively local -- see
        var_kind below for storage-kind tracking). */
@@ -244,110 +239,99 @@ typedef struct Parser {
 } Parser;
 static Parser P;
 
+/* One allocator for every slot class. Overflow returns -1 and the caller falls back to boxed
+   storage for that one value; reg_alloc is the exception and errors, because there is no fallback
+   below the boxed class. */
+static const int slot_capacity[SLOT_CLASS_COUNT] = {FRAME_REGISTERS, RAW_REGISTERS_INT, RAW_REGISTERS_REAL};
+
+static void track_peak_slot(SlotClass cls, int v) {
+    if (v > P.slot_max[cls])
+        P.slot_max[cls] = v;
+}
 static void track_peak(int v) {
-    if (v > P.max_register_used)
-        P.max_register_used = v;
-}
-static void track_raw_int_peak(int v) {
-    if (v > P.max_raw_int_used)
-        P.max_raw_int_used = v;
-}
-static void track_raw_real_peak(int v) {
-    if (v > P.max_raw_real_used)
-        P.max_raw_real_used = v;
+    track_peak_slot(SLOT_BOXED, v);
 }
 
-/* Raw-slot allocators, mirroring reg_alloc/reg_free/reg_reserve's shape -- except overflow:
-   raw_int_alloc/raw_real_alloc return -1 instead of erroring, and every caller falls back to
-   ordinary boxed storage for that one value. */
-static int raw_int_alloc(void) {
-    if (P.raw_int_next_temp >= RAW_REGISTERS_INT)
+static int slot_alloc(SlotClass cls) {
+    if (P.slot_next[cls] >= slot_capacity[cls])
         return -1;
-    track_raw_int_peak(P.raw_int_next_temp + 1);
-    return P.raw_int_next_temp++;
+    track_peak_slot(cls, P.slot_next[cls] + 1);
+    return P.slot_next[cls]++;
+}
+
+static void slot_free(SlotClass cls, int count) {
+    P.slot_next[cls] -= count;
+    if (P.slot_next[cls] < P.slot_floor[cls])
+        P.slot_next[cls] = P.slot_floor[cls];
+}
+
+/* Claims a permanent slot for a variable's first assignment, the analog of var_slot claiming the
+   boxed floor. */
+static int slot_reserve_one(SlotClass cls) {
+    if (P.slot_floor[cls] >= slot_capacity[cls])
+        return -1;
+    int slot = P.slot_floor[cls]++;
+    P.slot_next[cls] = P.slot_floor[cls];
+    track_peak_slot(cls, P.slot_floor[cls]);
+    return slot;
+}
+
+static int raw_int_alloc(void) {
+    return slot_alloc(SLOT_INT);
 }
 static void raw_int_free(int count) {
-    P.raw_int_next_temp -= count;
-    if (P.raw_int_next_temp < P.raw_int_reserved_floor)
-        P.raw_int_next_temp = P.raw_int_reserved_floor;
+    slot_free(SLOT_INT, count);
 }
 static int raw_real_alloc(void) {
-    if (P.raw_real_next_temp >= RAW_REGISTERS_REAL)
-        return -1;
-    track_raw_real_peak(P.raw_real_next_temp + 1);
-    return P.raw_real_next_temp++;
+    return slot_alloc(SLOT_REAL);
 }
 static void raw_real_free(int count) {
-    P.raw_real_next_temp -= count;
-    if (P.raw_real_next_temp < P.raw_real_reserved_floor)
-        P.raw_real_next_temp = P.raw_real_reserved_floor;
+    slot_free(SLOT_REAL, count);
 }
-
-/* Reserves a new permanent raw slot for a variable's first assignment -- the raw analog of
-   var_slot claiming P.reserved_floor. Returns -1 on overflow (caller falls back to boxed). */
 static int raw_int_reserve_one(void) {
-    if (P.raw_int_reserved_floor >= RAW_REGISTERS_INT)
-        return -1;
-    int slot = P.raw_int_reserved_floor;
-    P.raw_int_reserved_floor++;
-    P.raw_int_next_temp = P.raw_int_reserved_floor;
-    track_raw_int_peak(P.raw_int_reserved_floor);
-    return slot;
+    return slot_reserve_one(SLOT_INT);
 }
 static int raw_real_reserve_one(void) {
-    if (P.raw_real_reserved_floor >= RAW_REGISTERS_REAL)
-        return -1;
-    int slot = P.raw_real_reserved_floor;
-    P.raw_real_reserved_floor++;
-    P.raw_real_next_temp = P.raw_real_reserved_floor;
-    track_raw_real_peak(P.raw_real_reserved_floor);
-    return slot;
+    return slot_reserve_one(SLOT_REAL);
 }
 
 void reg_reset(void) {
     P.hoist_depth = 0;
-    P.next_temp_register = 0;
-    P.reserved_floor = 0;
-    P.max_register_used = 0;
-    P.max_raw_int_used = 0;
-    P.max_raw_real_used = 0;
-    P.raw_int_next_temp = 0;
-    P.raw_int_reserved_floor = 0;
-    P.raw_real_next_temp = 0;
-    P.raw_real_reserved_floor = 0;
+    for (int cls = 0; cls < SLOT_CLASS_COUNT; cls++)
+        P.slot_next[cls] = P.slot_floor[cls] = P.slot_max[cls] = 0;
 }
 
 /* Must refuse a register >= FRAME_REGISTERS -- the register_stack bank is sized assuming no
    frame ever needs more. Returns an in-bounds sentinel after erroring. */
 void reg_reserve(int count) {
-    if (P.reserved_floor + count > FRAME_REGISTERS) {
+    if (P.slot_floor[SLOT_BOXED] + count > FRAME_REGISTERS) {
         return error_at("Too many live variables/temporaries (max %d registers per call)", FRAME_REGISTERS);
     }
-    P.reserved_floor += count;
-    P.next_temp_register += count;
-    track_peak(P.next_temp_register);
+    P.slot_floor[SLOT_BOXED] += count;
+    P.slot_next[SLOT_BOXED] += count;
+    track_peak(P.slot_next[SLOT_BOXED]);
 }
 
 int reg_alloc(void) {
-    if (P.next_temp_register >= FRAME_REGISTERS) {
+    if (P.slot_next[SLOT_BOXED] >= FRAME_REGISTERS) {
         error_at("Too many live variables/temporaries (max %d registers per call)", FRAME_REGISTERS);
         return FRAME_REGISTERS - 1;
     }
-    int reg = P.next_temp_register++;
+    int reg = P.slot_next[SLOT_BOXED]++;
     P.reg_nonneg[reg] = false; /* a recycled register carries no proof from its last occupant */
     P.reg_elem_kind[reg] = RAWK_NONE;
-    track_peak(P.next_temp_register);
-    if (P.next_temp_register > P.loop_cond_peak)
-        P.loop_cond_peak = P.next_temp_register;
+    track_peak(P.slot_next[SLOT_BOXED]);
+    if (P.slot_next[SLOT_BOXED] > P.loop_cond_peak)
+        P.loop_cond_peak = P.slot_next[SLOT_BOXED];
     return reg;
 }
 
 void reg_free(int count) {
-    P.next_temp_register -= count;
+    P.slot_next[SLOT_BOXED] -= count;
     /* Never free below the reserved floor -- a bug elsewhere shouldn't hand out a local's own
        register as a free temp. */
-    if (P.next_temp_register < P.reserved_floor)
-        P.next_temp_register = P.reserved_floor;
+    if (P.slot_next[SLOT_BOXED] < P.slot_floor[SLOT_BOXED])
+        P.slot_next[SLOT_BOXED] = P.slot_floor[SLOT_BOXED];
 }
 
 #ifdef AER_DEBUG_TOOLS
@@ -360,11 +344,11 @@ static void assert_variables_below_floor(const char* where) {
     for (int i = 0; i < P.var_count; i++) {
         if (P.var_kind[i] != VAR_BOXED)
             continue; /* raw kinds index raw_ints/raw_reals, not registers */
-        if (P.var_regs[i] >= P.reserved_floor) {
+        if (P.var_regs[i] >= P.slot_floor[SLOT_BOXED]) {
             fprintf(stderr,
                     "aer: internal error: %s left variable slot %d in register %d, at or above the "
                     "reserved floor %d\n",
-                    where, i, P.var_regs[i], P.reserved_floor);
+                    where, i, P.var_regs[i], P.slot_floor[SLOT_BOXED]);
             abort();
         }
     }
@@ -632,9 +616,9 @@ void emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val) {
         chunk_emit(c, PACK3(elem == RAWK_INT ? OP_INDEX_SET_RAW_INT : OP_INDEX_SET_RAW_REAL, arr_reg,
                             pack_rk8(rk_idx), slot));
         if (elem == RAWK_INT) {
-            if (slot >= P.raw_int_reserved_floor)
+            if (slot >= P.slot_floor[SLOT_INT])
                 raw_int_free(1);
-        } else if (slot >= P.raw_real_reserved_floor) {
+        } else if (slot >= P.slot_floor[SLOT_REAL]) {
             raw_real_free(1);
         }
         return;
@@ -886,8 +870,8 @@ static bool report_if_shadowed_global(Chunk* c, unsigned int name_idx) {
     return false;
 }
 
-/* A new variable's register is P.reserved_floor, not P.var_count -- they diverge when a for-loop
-   promotes P.reserved_floor for its own iteration registers without registering a name (a fresh
+/* A new variable's register is P.slot_floor[SLOT_BOXED], not P.var_count -- they diverge when a for-loop
+   promotes P.slot_floor[SLOT_BOXED] for its own iteration registers without registering a name (a fresh
    variable declared inside that loop's body must land above them, or it silently aliases the
    loop's own state -- a real bug found this way with nested for-loops). P.var_regs[] is what makes
    lookup still resolve correctly once the two diverge. */
@@ -900,13 +884,13 @@ static int var_slot(Chunk* c, unsigned int name_idx) {
        and an already-local name are exempt. */
     if (report_if_shadowed_global(c, name_idx))
         return -1;
-    /* Checks P.reserved_floor, not P.var_count -- P.var_count can lag behind P.reserved_floor once a
+    /* Checks P.slot_floor[SLOT_BOXED], not P.var_count -- P.var_count can lag behind P.slot_floor[SLOT_BOXED] once a
        for-loop promotes it (see this function's own comment above). */
-    if (P.reserved_floor >= FRAME_REGISTERS) {
+    if (P.slot_floor[SLOT_BOXED] >= FRAME_REGISTERS) {
         error_at("Too many variables (max %d)", FRAME_REGISTERS);
         return -1;
     }
-    int reg = P.reserved_floor;
+    int reg = P.slot_floor[SLOT_BOXED];
     P.var_names[P.var_count] = name_idx;
     P.var_regs[P.var_count] = reg;
     /* P.var_kind[] is a persistent static array shared across every function's compilation -- a
@@ -916,10 +900,10 @@ static int var_slot(Chunk* c, unsigned int name_idx) {
        the same index. var_slot resets the kind explicitly here, the one place every name is created. */
     P.var_kind[P.var_count] = VAR_BOXED;
     P.var_count++;
-    P.reserved_floor++; /* permanently protects this register from the temp allocator */
-    P.next_temp_register =
-        P.reserved_floor; /* resync -- see this function's own comment for why that's always safe */
-    track_peak(P.reserved_floor);
+    P.slot_floor[SLOT_BOXED]++; /* permanently protects this register from the temp allocator */
+    P.slot_next[SLOT_BOXED] =
+        P.slot_floor[SLOT_BOXED]; /* resync -- see this function's own comment for why that's always safe */
+    track_peak(P.slot_floor[SLOT_BOXED]);
     if (P.function_depth == 0) {
         P.global_names[P.global_count] = name_idx;
         P.global_regs[P.global_count] = reg;
@@ -950,13 +934,13 @@ static bool var_lookup(unsigned int name_idx, int* out_reg) {
     return false;
 }
 
-/* Works for any RK operand: a temp always lives at/above P.reserved_floor, a permanent variable
+/* Works for any RK operand: a temp always lives at/above P.slot_floor[SLOT_BOXED], a permanent variable
    below it. A raw-flagged rk must return false FIRST -- its numeric value could otherwise
-   coincidentally compare as >= P.reserved_floor. */
+   coincidentally compare as >= P.slot_floor[SLOT_BOXED]. */
 static bool is_temp(int rk) {
     if (rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))
         return false;
-    return !(rk & RK_CONST_FLAG) && rk >= P.reserved_floor;
+    return !(rk & RK_CONST_FLAG) && rk >= P.slot_floor[SLOT_BOXED];
 }
 
 /* The one bridge from raw storage to the rest of the compiler -- every function treating rk as
@@ -966,7 +950,7 @@ static int box_if_raw(Chunk* c, int rk) {
         int slot = rk & RK_RAW_SLOT_MASK;
         int dest = reg_alloc();
         chunk_emit(c, PACK3(OP_BOX_INT, dest, slot, 0));
-        if (slot >= P.raw_int_reserved_floor)
+        if (slot >= P.slot_floor[SLOT_INT])
             raw_int_free(1);
         return dest;
     }
@@ -974,7 +958,7 @@ static int box_if_raw(Chunk* c, int rk) {
         int slot = rk & RK_RAW_SLOT_MASK;
         int dest = reg_alloc();
         chunk_emit(c, PACK3(OP_BOX_REAL, dest, slot, 0));
-        if (slot >= P.raw_real_reserved_floor)
+        if (slot >= P.slot_floor[SLOT_REAL])
             raw_real_free(1);
         return dest;
     }
@@ -996,12 +980,12 @@ static void ensure_boxed(Chunk* c, unsigned int name_idx) {
 
     int old_slot = P.var_regs[existing_idx];
     Opcode box_op = (P.var_kind[existing_idx] == VAR_RAW_INT) ? OP_BOX_INT : OP_BOX_REAL;
-    if (P.reserved_floor >= FRAME_REGISTERS) {
+    if (P.slot_floor[SLOT_BOXED] >= FRAME_REGISTERS) {
         return error_at("Too many variables (max %d)", FRAME_REGISTERS);
     }
-    int new_reg = P.reserved_floor;
-    P.reserved_floor++;
-    P.next_temp_register = P.reserved_floor;
+    int new_reg = P.slot_floor[SLOT_BOXED];
+    P.slot_floor[SLOT_BOXED]++;
+    P.slot_next[SLOT_BOXED] = P.slot_floor[SLOT_BOXED];
     chunk_emit(c, PACK3(box_op, new_reg, old_slot, 0));
     P.var_regs[existing_idx] = new_reg;
     P.var_kind[existing_idx] = VAR_BOXED;
@@ -1103,22 +1087,22 @@ static void hoist_end(Chunk* c, unsigned int after_gap, bool active) {
    slot 3, and `i` advanced by `i * 2` forever. max_raw_*_used is the only counter that outlives a
    statement. Slots skipped this way are never reused -- at most HOIST_MAX per loop. */
 static int hoist_reserve_int(void) {
-    int slot = P.max_raw_int_used > P.raw_int_reserved_floor ? P.max_raw_int_used : P.raw_int_reserved_floor;
+    int slot = P.slot_max[SLOT_INT] > P.slot_floor[SLOT_INT] ? P.slot_max[SLOT_INT] : P.slot_floor[SLOT_INT];
     if (slot >= RAW_REGISTERS_INT)
         return -1;
-    P.raw_int_reserved_floor = slot + 1;
-    P.raw_int_next_temp = P.raw_int_reserved_floor;
-    track_raw_int_peak(P.raw_int_reserved_floor);
+    P.slot_floor[SLOT_INT] = slot + 1;
+    P.slot_next[SLOT_INT] = P.slot_floor[SLOT_INT];
+    track_peak_slot(SLOT_INT, P.slot_floor[SLOT_INT]);
     return slot;
 }
 static int hoist_reserve_real(void) {
     int slot =
-        P.max_raw_real_used > P.raw_real_reserved_floor ? P.max_raw_real_used : P.raw_real_reserved_floor;
+        P.slot_max[SLOT_REAL] > P.slot_floor[SLOT_REAL] ? P.slot_max[SLOT_REAL] : P.slot_floor[SLOT_REAL];
     if (slot >= RAW_REGISTERS_REAL)
         return -1;
-    P.raw_real_reserved_floor = slot + 1;
-    P.raw_real_next_temp = P.raw_real_reserved_floor;
-    track_raw_real_peak(P.raw_real_reserved_floor);
+    P.slot_floor[SLOT_REAL] = slot + 1;
+    P.slot_next[SLOT_REAL] = P.slot_floor[SLOT_REAL];
+    track_peak_slot(SLOT_REAL, P.slot_floor[SLOT_REAL]);
     return slot;
 }
 
@@ -1433,7 +1417,7 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     }
 
     /* Free-then-allocate, RHS then LHS -- only frees a slot that was actually a temp. */
-    int floor_now = int_kind ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+    int floor_now = int_kind ? P.slot_floor[SLOT_INT] : P.slot_floor[SLOT_REAL];
     if (slot_rhs >= floor_now) {
         if (int_kind)
             raw_int_free(1);
@@ -1626,7 +1610,7 @@ static void struct_register(unsigned int name_idx) {
    instead of allocating past it and leaving a gap that breaks contiguity for a later argument. */
 static int arg_materialize(Chunk* c, int rk) {
     rk = box_if_raw(c, rk);
-    if (!(rk & RK_CONST_FLAG) && is_temp(rk) && rk == P.next_temp_register - 1) {
+    if (!(rk & RK_CONST_FLAG) && is_temp(rk) && rk == P.slot_next[SLOT_BOXED] - 1) {
         return rk;
     }
     int target = reg_alloc();
@@ -1977,7 +1961,7 @@ static int emit_primitive_cast(Chunk* c, int cast_type, int lhs) {
         bool to_real = (cast_type == CAST_FLOAT);
         int src = raw_materialize(c, lhs, src_kind);
         if (src >= 0) {
-            int floor_now = to_real ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+            int floor_now = to_real ? P.slot_floor[SLOT_INT] : P.slot_floor[SLOT_REAL];
             if (src >= floor_now) {
                 if (to_real)
                     raw_int_free(1);
@@ -2560,7 +2544,7 @@ static unsigned int compile_pipe_guard_begin(Chunk* c, int dest) {
     emit_index_get(c, dest, dest, (int)val_idx | RK_CONST_FLAG);
 
     patch_jump(c, patch_not_result, c->count);
-    reg_free(1); /* Freed before the next pipe-call argument, restoring P.next_temp_register to where
+    reg_free(1); /* Freed before the next pipe-call argument, restoring P.slot_next[SLOT_BOXED] to where
                        arg_materialize would put it regardless. */
     return patch_skip_call;
 }
@@ -2786,7 +2770,7 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
            unlike `x += a*b` a plain expression's lhs may still be read with its original value.
            Requires the RHS to be exactly one raw MUL; anything else falls through. Real only. */
         if (!lhs_is_field && !lhs_is_chain2 && (op == OP_ADD || op == OP_SUB) &&
-            rk_raw_kind(c, lhs) == RAWK_REAL && (lhs & RK_RAW_SLOT_MASK) >= P.raw_real_reserved_floor &&
+            rk_raw_kind(c, lhs) == RAWK_REAL && (lhs & RK_RAW_SLOT_MASK) >= P.slot_floor[SLOT_REAL] &&
             c->count - rhs_start == 1) {
             uint32_t mw = c->code[rhs_start];
             if ((Opcode)(mw & 0xFF) == OP_RAW_MUL_REAL && rk_raw_kind(c, rhs) == RAWK_REAL &&
@@ -2794,7 +2778,7 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
                 int lhs_slot = lhs & RK_RAW_SLOT_MASK;
                 int mul_a = (int)UNPACK_B(mw), mul_b = (int)UNPACK_C(mw);
                 c->count = rhs_start; /* discard the MUL -- fused below instead */
-                if ((int)UNPACK_A(mw) >= P.raw_real_reserved_floor)
+                if ((int)UNPACK_A(mw) >= P.slot_floor[SLOT_REAL])
                     raw_real_free(1);
                 Opcode fused = (op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
                 chunk_emit(c, PACK3(fused, lhs_slot, mul_a, mul_b));
@@ -3057,7 +3041,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                     } else {
                         if (src_slot != slot) {
                             int floor_now =
-                                (rhs_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+                                (rhs_kind == RAWK_INT) ? P.slot_floor[SLOT_INT] : P.slot_floor[SLOT_REAL];
                             /* Direct analog of the boxed path's "reg != rk_val -> MOVE" case. */
                             if (!retarget_raw_write(c, src_slot, slot, rhs_kind, floor_now)) {
                                 Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
@@ -3102,7 +3086,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                 if (src_slot >= 0) {
                     if (src_slot != dest_slot) {
                         int floor_now =
-                            (rhs_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+                            (rhs_kind == RAWK_INT) ? P.slot_floor[SLOT_INT] : P.slot_floor[SLOT_REAL];
                         if (!retarget_raw_write(c, src_slot, dest_slot, rhs_kind, floor_now)) {
                             Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
                             chunk_emit(c, PACK3(move_op, dest_slot, src_slot, 0));
@@ -3132,12 +3116,12 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                     aer_as_string(c->pool[name_idx])->data, aer_as_string(c->pool[name_idx])->data);
             }
             rk_val = box_if_raw(c, rk_val);
-            if (P.reserved_floor >= FRAME_REGISTERS) {
+            if (P.slot_floor[SLOT_BOXED] >= FRAME_REGISTERS) {
                 return error_at("Too many variables (max %d)", FRAME_REGISTERS);
             }
-            int new_reg = P.reserved_floor;
-            P.reserved_floor++;
-            P.next_temp_register = P.reserved_floor;
+            int new_reg = P.slot_floor[SLOT_BOXED];
+            P.slot_floor[SLOT_BOXED]++;
+            P.slot_next[SLOT_BOXED] = P.slot_floor[SLOT_BOXED];
             P.var_regs[existing_idx] = new_reg;
             P.var_kind[existing_idx] = VAR_BOXED;
             /* No P.global_regs update needed -- see ensure_boxed's identical reasoning: this path
@@ -3247,7 +3231,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                     int dest_slot = P.var_regs[existing_idx];
                     int mul_a = (int)UNPACK_B(mw), mul_b = (int)UNPACK_C(mw);
                     c->count = rhs_start; /* discard the MUL -- fused below instead */
-                    if ((int)UNPACK_A(mw) >= P.raw_real_reserved_floor)
+                    if ((int)UNPACK_A(mw) >= P.slot_floor[SLOT_REAL])
                         raw_real_free(1);
                     Opcode fused = (boxed_op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
                     chunk_emit(c, PACK3(fused, dest_slot, mul_a, mul_b));
@@ -3269,8 +3253,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                                  : (boxed_op == OP_SUB) ? OP_RAW_SUB_REAL
                                                         : OP_RAW_MUL_REAL;
                     chunk_emit(c, PACK3(raw_op, dest_slot, dest_slot, rhs_slot));
-                    int floor_now =
-                        (cur_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+                    int floor_now = (cur_kind == RAWK_INT) ? P.slot_floor[SLOT_INT] : P.slot_floor[SLOT_REAL];
                     if (rhs_slot >= floor_now) {
                         if (cur_kind == RAWK_INT)
                             raw_int_free(1);
@@ -3328,12 +3311,12 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             }
             int old_slot = P.var_regs[existing_idx];
             Opcode box_op = (cur_kind == RAWK_INT) ? OP_BOX_INT : OP_BOX_REAL;
-            if (P.reserved_floor >= FRAME_REGISTERS) {
+            if (P.slot_floor[SLOT_BOXED] >= FRAME_REGISTERS) {
                 return error_at("Too many variables (max %d)", FRAME_REGISTERS);
             }
-            int new_reg = P.reserved_floor;
-            P.reserved_floor++;
-            P.next_temp_register = P.reserved_floor;
+            int new_reg = P.slot_floor[SLOT_BOXED];
+            P.slot_floor[SLOT_BOXED]++;
+            P.slot_next[SLOT_BOXED] = P.slot_floor[SLOT_BOXED];
             chunk_emit(c, PACK3(box_op, new_reg, old_slot, 0));
             P.var_regs[existing_idx] = new_reg;
             P.var_kind[existing_idx] = VAR_BOXED;
@@ -3522,7 +3505,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                         chunk_emit(c, PACK_OP_A_W16(op, obj_reg, pack_rk16(pending_rk_idx)));
                         chunk_emit(c, PACK_2X16((uint16_t)foffset, (uint16_t)slot));
                         int floor_now =
-                            (field_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+                            (field_kind == RAWK_INT) ? P.slot_floor[SLOT_INT] : P.slot_floor[SLOT_REAL];
                         if (slot >= floor_now) {
                             if (field_kind == RAWK_INT)
                                 raw_int_free(1);
@@ -3581,7 +3564,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                         chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(pending_rk_idx)));
                         chunk_emit(c, (uint32_t)slot);
                         int floor_now =
-                            (field_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+                            (field_kind == RAWK_INT) ? P.slot_floor[SLOT_INT] : P.slot_floor[SLOT_REAL];
                         if (slot >= floor_now) {
                             if (field_kind == RAWK_INT)
                                 raw_int_free(1);
@@ -3708,7 +3691,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                         chunk_emit(c, foffset);
                         chunk_emit(c, (uint32_t)slot);
                         int floor_now =
-                            (field_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+                            (field_kind == RAWK_INT) ? P.slot_floor[SLOT_INT] : P.slot_floor[SLOT_REAL];
                         if (slot >= floor_now) {
                             if (field_kind == RAWK_INT)
                                 raw_int_free(1);
@@ -3731,8 +3714,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 if (slot >= 0) {
                     chunk_emit(c, PACK3(val_kind == RAWK_INT ? OP_INDEX_SET_RAW_INT : OP_INDEX_SET_RAW_REAL,
                                         obj_reg, pack_rk8(pending_rk_idx), slot));
-                    int floor_now =
-                        (val_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+                    int floor_now = (val_kind == RAWK_INT) ? P.slot_floor[SLOT_INT] : P.slot_floor[SLOT_REAL];
                     if (slot >= floor_now) {
                         if (val_kind == RAWK_INT)
                             raw_int_free(1);
@@ -3823,7 +3805,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                     chunk_emit(c, foffset);
                     chunk_emit(c, (uint32_t)slot);
                     int floor_now =
-                        (field_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
+                        (field_kind == RAWK_INT) ? P.slot_floor[SLOT_INT] : P.slot_floor[SLOT_REAL];
                     if (slot >= floor_now) {
                         if (field_kind == RAWK_INT)
                             raw_int_free(1);
@@ -3998,7 +3980,7 @@ static void parse_if(Chunk* c) {
 }
 
 /* Shared while/for-while tail: require ':', branch-if-false, body, back-edge to loop_top. */
-/* Shared body-and-back-edge tail for every loop form. Callers that promoted P.reserved_floor can
+/* Shared body-and-back-edge tail for every loop form. Callers that promoted P.slot_floor[SLOT_BOXED] can
    safely restore it unconditionally after this returns either way. */
 static void parse_loop_body(Chunk* c, unsigned int loop_top, unsigned int patch_exit) {
     if (!loop_push(loop_top))
@@ -4032,13 +4014,13 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
        a temp, so raising the floor first would silently disqualify every such loop. */
     unsigned int patch_exit = emit_cond_jump_if_false(c, rk_cond, loop_top);
 
-    int saved_floor = P.reserved_floor;
+    int saved_floor = P.slot_floor[SLOT_BOXED];
     int raised_floor = saved_floor;
-    if (P.loop_cond_peak > P.reserved_floor) {
+    if (P.loop_cond_peak > P.slot_floor[SLOT_BOXED]) {
         raised_floor = P.loop_cond_peak;
-        P.reserved_floor = raised_floor;
-        if (P.next_temp_register < P.reserved_floor)
-            P.next_temp_register = P.reserved_floor;
+        P.slot_floor[SLOT_BOXED] = raised_floor;
+        if (P.slot_next[SLOT_BOXED] < P.slot_floor[SLOT_BOXED])
+            P.slot_next[SLOT_BOXED] = P.slot_floor[SLOT_BOXED];
     }
 
     parse_loop_body(c, loop_top, patch_exit);
@@ -4047,10 +4029,10 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
        variables to the whole function, so a name first assigned inside the body outlives the loop
        and its register must stay reserved -- lowering the floor past it would hand a live variable
        out as a temp to the next statement. */
-    if (P.reserved_floor == raised_floor) {
-        P.reserved_floor = saved_floor;
-        if (P.next_temp_register < P.reserved_floor)
-            P.next_temp_register = P.reserved_floor;
+    if (P.slot_floor[SLOT_BOXED] == raised_floor) {
+        P.slot_floor[SLOT_BOXED] = saved_floor;
+        if (P.slot_next[SLOT_BOXED] < P.slot_floor[SLOT_BOXED])
+            P.slot_next[SLOT_BOXED] = P.slot_floor[SLOT_BOXED];
     }
     assert_variables_below_floor("for-loop body");
 }
@@ -4137,9 +4119,9 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         /* Promotes temps to permanent status for the loop's duration -- without it, a fresh variable
            inside the body could alias cur_reg/step_reg (real bug with nested ranged loops).
            Restored to the pre-loop watermark once the loop's bytecode is emitted. */
-        int saved_reserved_floor = P.reserved_floor;
-        P.reserved_floor = P.next_temp_register;
-        int raised_reserved_floor = P.reserved_floor;
+        int saved_reserved_floor = P.slot_floor[SLOT_BOXED];
+        P.slot_floor[SLOT_BOXED] = P.slot_next[SLOT_BOXED];
+        int raised_reserved_floor = P.slot_floor[SLOT_BOXED];
 
         bool hoisting = hoist_begin(c);
         unsigned int prep_at = c->count;
@@ -4150,8 +4132,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
 
         if (!loop_push_rotated()) {
             hoist_end(c, prep_at, hoisting);
-            P.reserved_floor = saved_reserved_floor;
-            P.next_temp_register = saved_reserved_floor;
+            P.slot_floor[SLOT_BOXED] = saved_reserved_floor;
+            P.slot_next[SLOT_BOXED] = saved_reserved_floor;
             return;
         }
         /* Pushed/popped exactly around this one loop's own body -- see safe_loop_item_regs's own
@@ -4181,8 +4163,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
             if (this_loop_safe)
                 P.safe_loop_depth--;
             P.loop_depth--;
-            P.reserved_floor = saved_reserved_floor;
-            P.next_temp_register = saved_reserved_floor;
+            P.slot_floor[SLOT_BOXED] = saved_reserved_floor;
+            P.slot_next[SLOT_BOXED] = saved_reserved_floor;
             return;
         }
         if (this_loop_safe)
@@ -4206,9 +4188,9 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         /* Conditional for the same reason the while-form's restore is: a name first assigned in the
            body outlives the loop, so lowering past its register would hand a live variable to the
            next statement as a temp. */
-        if (P.reserved_floor == raised_reserved_floor) {
-            P.reserved_floor = saved_reserved_floor;
-            P.next_temp_register = saved_reserved_floor;
+        if (P.slot_floor[SLOT_BOXED] == raised_reserved_floor) {
+            P.slot_floor[SLOT_BOXED] = saved_reserved_floor;
+            P.slot_next[SLOT_BOXED] = saved_reserved_floor;
         }
         assert_variables_below_floor("range-for body");
         return;
@@ -4226,9 +4208,9 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
 
     /* idx_reg/col_reg must stay valid across the whole body, so they're protected before the body
        compiles, same as the range branch. */
-    int saved_reserved_floor = P.reserved_floor;
-    P.reserved_floor = P.next_temp_register;
-    int raised_reserved_floor = P.reserved_floor;
+    int saved_reserved_floor = P.slot_floor[SLOT_BOXED];
+    P.slot_floor[SLOT_BOXED] = P.slot_next[SLOT_BOXED];
+    int raised_reserved_floor = P.slot_floor[SLOT_BOXED];
 
     bool hoisting = hoist_begin(c);
     unsigned int loop_top = c->count; /* the iterate opcode is its own back-edge target */
@@ -4237,9 +4219,9 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
     parse_loop_body(c, loop_top, patch_exit);
     hoist_end(c, loop_top, hoisting);
 
-    if (P.reserved_floor == raised_reserved_floor) {
-        P.reserved_floor = saved_reserved_floor;
-        P.next_temp_register = saved_reserved_floor;
+    if (P.slot_floor[SLOT_BOXED] == raised_reserved_floor) {
+        P.slot_floor[SLOT_BOXED] = saved_reserved_floor;
+        P.slot_next[SLOT_BOXED] = saved_reserved_floor;
     }
     assert_variables_below_floor("for-in body");
 }
@@ -4282,8 +4264,8 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
     unsigned int pool_zero = chunk_add_pool(c, aer_int(0));
     chunk_emit(c, PACK_OP_A_W16(OP_LOADK, idx_reg, pool_zero));
 
-    int saved_reserved_floor = P.reserved_floor;
-    P.reserved_floor = P.next_temp_register;
+    int saved_reserved_floor = P.slot_floor[SLOT_BOXED];
+    P.slot_floor[SLOT_BOXED] = P.slot_next[SLOT_BOXED];
 
     bool hoisting = hoist_begin(c);
     unsigned int loop_top = c->count;
@@ -4292,8 +4274,8 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
     parse_loop_body(c, loop_top, patch_exit);
     hoist_end(c, loop_top, hoisting);
 
-    P.reserved_floor = saved_reserved_floor;
-    P.next_temp_register = saved_reserved_floor;
+    P.slot_floor[SLOT_BOXED] = saved_reserved_floor;
+    P.slot_next[SLOT_BOXED] = saved_reserved_floor;
 }
 
 /* AER has no separate `while` keyword -- `for <condition>:` (no `in`) IS the while form. */
@@ -4332,7 +4314,7 @@ static void parse_for_while(Chunk* c) {
         }
         bool hoisting = hoist_begin(c);
         unsigned int loop_top = c->count;
-        P.loop_cond_peak = P.next_temp_register;
+        P.loop_cond_peak = P.slot_next[SLOT_BOXED];
         /* Resolves the postfix chain first, so `for cur.next:` works -- a bare-variable condition is
            unaffected, since the chain loop immediately returns unchanged. */
         int rk_chain = parse_postfix_chain(c, reg);
@@ -4343,7 +4325,7 @@ static void parse_for_while(Chunk* c) {
     }
     bool hoisting = hoist_begin(c);
     unsigned int loop_top = c->count;
-    P.loop_cond_peak = P.next_temp_register;
+    P.loop_cond_peak = P.slot_next[SLOT_BOXED];
     int rk_cond = parse_binary(c, 0);
     parse_for_body(c, loop_top, rk_cond);
     hoist_end(c, loop_top, hoisting);
@@ -5133,28 +5115,28 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     int saved_var_regs[FRAME_REGISTERS];
     VarKind saved_var_kind[FRAME_REGISTERS];
     int saved_var_count = P.var_count;
-    int saved_next_temp = P.next_temp_register;
-    int saved_reserved_floor = P.reserved_floor;
-    int saved_max_register_used = P.max_register_used;
-    int saved_max_raw_int_used = P.max_raw_int_used;
-    int saved_max_raw_real_used = P.max_raw_real_used;
-    int saved_raw_int_next_temp = P.raw_int_next_temp;
-    int saved_raw_int_reserved_floor = P.raw_int_reserved_floor;
-    int saved_raw_real_next_temp = P.raw_real_next_temp;
-    int saved_raw_real_reserved_floor = P.raw_real_reserved_floor;
+    int saved_next_temp = P.slot_next[SLOT_BOXED];
+    int saved_reserved_floor = P.slot_floor[SLOT_BOXED];
+    int saved_max_register_used = P.slot_max[SLOT_BOXED];
+    int saved_max_raw_int_used = P.slot_max[SLOT_INT];
+    int saved_max_raw_real_used = P.slot_max[SLOT_REAL];
+    int saved_raw_int_next_temp = P.slot_next[SLOT_INT];
+    int saved_raw_int_reserved_floor = P.slot_floor[SLOT_INT];
+    int saved_raw_real_next_temp = P.slot_next[SLOT_REAL];
+    int saved_raw_real_reserved_floor = P.slot_floor[SLOT_REAL];
     memcpy(saved_var_names, P.var_names, sizeof(unsigned int) * (size_t)P.var_count);
     memcpy(saved_var_regs, P.var_regs, sizeof(int) * (size_t)P.var_count);
     memcpy(saved_var_kind, P.var_kind, sizeof(VarKind) * (size_t)P.var_count);
     P.var_count = 0;
-    P.next_temp_register = 0;
-    P.reserved_floor = 0;
-    P.max_register_used = 0;
-    P.max_raw_int_used = 0;
-    P.max_raw_real_used = 0;
-    P.raw_int_next_temp = 0;
-    P.raw_int_reserved_floor = 0;
-    P.raw_real_next_temp = 0;
-    P.raw_real_reserved_floor = 0;
+    P.slot_next[SLOT_BOXED] = 0;
+    P.slot_floor[SLOT_BOXED] = 0;
+    P.slot_max[SLOT_BOXED] = 0;
+    P.slot_max[SLOT_INT] = 0;
+    P.slot_max[SLOT_REAL] = 0;
+    P.slot_next[SLOT_INT] = 0;
+    P.slot_floor[SLOT_INT] = 0;
+    P.slot_next[SLOT_REAL] = 0;
+    P.slot_floor[SLOT_REAL] = 0;
 
     memset(P.shape_sensitive_param, 0, sizeof(P.shape_sensitive_param));
     for (int i = 0; i < FRAME_REGISTERS; i++)
@@ -5227,23 +5209,23 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
         P.body_return_kind = saved_return_kind;
     }
 
-    *out_max_registers = (unsigned int)P.max_register_used;
-    *out_max_raw_ints = (unsigned int)P.max_raw_int_used;
-    *out_max_raw_reals = (unsigned int)P.max_raw_real_used;
+    *out_max_registers = (unsigned int)P.slot_max[SLOT_BOXED];
+    *out_max_raw_ints = (unsigned int)P.slot_max[SLOT_INT];
+    *out_max_raw_reals = (unsigned int)P.slot_max[SLOT_REAL];
 
     P.var_count = saved_var_count;
     memcpy(P.var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
     memcpy(P.var_regs, saved_var_regs, sizeof(int) * (size_t)saved_var_count);
     memcpy(P.var_kind, saved_var_kind, sizeof(VarKind) * (size_t)saved_var_count);
-    P.next_temp_register = saved_next_temp;
-    P.reserved_floor = saved_reserved_floor;
-    P.max_register_used = saved_max_register_used;
-    P.max_raw_int_used = saved_max_raw_int_used;
-    P.max_raw_real_used = saved_max_raw_real_used;
-    P.raw_int_next_temp = saved_raw_int_next_temp;
-    P.raw_int_reserved_floor = saved_raw_int_reserved_floor;
-    P.raw_real_next_temp = saved_raw_real_next_temp;
-    P.raw_real_reserved_floor = saved_raw_real_reserved_floor;
+    P.slot_next[SLOT_BOXED] = saved_next_temp;
+    P.slot_floor[SLOT_BOXED] = saved_reserved_floor;
+    P.slot_max[SLOT_BOXED] = saved_max_register_used;
+    P.slot_max[SLOT_INT] = saved_max_raw_int_used;
+    P.slot_max[SLOT_REAL] = saved_max_raw_real_used;
+    P.slot_next[SLOT_INT] = saved_raw_int_next_temp;
+    P.slot_floor[SLOT_INT] = saved_raw_int_reserved_floor;
+    P.slot_next[SLOT_REAL] = saved_raw_real_next_temp;
+    P.slot_floor[SLOT_REAL] = saved_raw_real_reserved_floor;
 }
 
 /* Named functions can't nest. Once one parameter has a default, every parameter after it must
@@ -5867,6 +5849,6 @@ void parse(Chunk* c) {
         parse_had_error = true;
     /* The top-level chunk is a frame too, and for a script that does its work outside any function
        it is the LARGEST one -- excluding it would measure the wrong ceiling. */
-    aer_debug_note_slot_budget(c, (unsigned int)-1, (unsigned int)P.max_register_used,
-                               (unsigned int)P.max_raw_int_used, (unsigned int)P.max_raw_real_used);
+    aer_debug_note_slot_budget(c, (unsigned int)-1, (unsigned int)P.slot_max[SLOT_BOXED],
+                               (unsigned int)P.slot_max[SLOT_INT], (unsigned int)P.slot_max[SLOT_REAL]);
 }
