@@ -222,11 +222,16 @@ static void mark_vm_roots(VmHeap* heap, VM* vm, bool minor) {
         worklist_push(heap, vm->stack[i], minor);
 
     /* Scanned unconditionally (zero-init decodes as harmless TYPE_NULL), bounded to the live call
-       chain (0..call_depth, by each frame's real frame_size) -- a blanket scan over every frame was
-       a measured cache-miss hotspot, and frames past call_depth are already dead. */
-    for (int f = 0; f <= vm->call_depth; f++)
-        for (unsigned int i = 0; i < vm->call_stack[f].frame_size; i++)
-            worklist_push(heap, vm->call_stack[f].registers[i], minor);
+       chain (0..call_depth) and, within a frame, to the slots that can hold a reference at all --
+       the frame answers that rather than the GC assuming it, so merging the raw banks into the same
+       array later changes the answer and not this loop. */
+    for (int f = 0; f <= vm->call_depth; f++) {
+        CallFrame* frame = &vm->call_stack[f];
+        AerVal* refs;
+        unsigned int ref_count = frame_ref_slots(frame, &refs);
+        for (unsigned int i = 0; i < ref_count; i++)
+            worklist_push(heap, refs[i], minor);
+    }
 }
 
 /* Chunk.pool and every Shape's field_defaults are permanent roots, walked fresh every cycle since mark bits are cleared each sweep. */

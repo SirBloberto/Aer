@@ -1019,6 +1019,15 @@ typedef struct {
         char size_is_a_power_of_two[64];
     };
 } CallFrame;
+
+/* The slots in this frame a heap reference can live in, for the GC to trace. Today that is exactly
+   the boxed registers, since the raw banks are separate arrays holding unboxed numbers. Once all
+   three merge into one slot array this returns a sub-range of it, and every caller is already
+   asking the right question. */
+static inline unsigned int frame_ref_slots(CallFrame* frame, AerVal** out_slots) {
+    *out_slots = frame->registers;
+    return frame->frame_size;
+}
 /* Indexing call_stack[] is `base + depth * sizeof(CallFrame)`, and at 44 bytes that compiled to a
    multiply plus a materialized constant per field on 32-bit ARM. A power of two makes it a shift. */
 _Static_assert((sizeof(CallFrame) & (sizeof(CallFrame) - 1)) == 0,
