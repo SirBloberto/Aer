@@ -306,7 +306,7 @@ field.
 out the opcode, jump — no per-instruction GC check and no per-instruction error-flag check (see
 §5.1 for how both stay off this path entirely).
 
-**`CallFrame`** (`vm.h`) is the unit of call isolation: `registers`/`raw_ints`/`raw_reals` are
+**`CallFrame`** (`vm.h`) is the unit of call isolation: `registers` is
 **bump-pointer bases into a shared, VM-level register stack** (not fixed inline per-frame arrays —
 that was tried and reverted: it cost every single frame `RAW_REGISTERS_INT`+`REAL` slots regardless
 of whether that function used any raw locals at all, `CallFrame` growing past a
@@ -314,7 +314,7 @@ of whether that function used any raw locals at all, `CallFrame` growing past a
 coming back), plus `frame_size`/`raw_int_frame_size`/`raw_real_frame_size` (this callee's own
 compile-time peak), `return_ip`/`dest_reg`, `code_offset` (for stack traces), and
 `tail_calls_collapsed`. `VM.call_stack` is a flat array of these (`VM_CALL_MAX = 64` frames);
-`vm->registers`/`raw_ints`/`raw_reals` are **pointers repointed at the current frame** on every
+`vm->registers` is a **pointer repointed at the current frame** on every
 call/return (not re-derived from `call_depth` on every access) — a tail call reuses the current
 frame in place, so it's the one case that needs *no* repointing.
 
@@ -335,7 +335,7 @@ forward, non-overlapping-hazard copy — see `lbl_call`'s own comment for why in
 iteration is safe even when caller/callee frames alias registers), fill any omitted trailing
 parameters from the function's own compiled-in defaults, save `return_ip`/`dest_reg` in the
 *callee's own* frame (not a single shared global — this is exactly what makes nested/recursive
-calls safe), bump `call_depth`, repoint `registers`/`raw_ints`/`raw_reals`, jump.
+calls safe), bump `call_depth`, repoint `registers`, jump.
 
 **Tail-call reuse**: when `return f(args)` is the *entire* return expression (checked at compile
 time — nothing wraps the call), the already-emitted `OP_CALL`/`OP_CALL_VALUE` opcode word is
@@ -395,7 +395,7 @@ described in §3.2, decided at *compile* time and baked into the emitted instruc
 
 A local variable the compiler can *prove*, from information already visible at each assignment, is
 always the same primitive type (`integer` or `float`, never string/array/hashtable/struct/function) gets
-a raw, unboxed `int64_t`/`double` slot in `CallFrame.raw_ints`/`raw_reals` instead of a tagged
+a slot the compiler knows the type of, reached by unchecked opcodes instead of a tag-checked
 `AerVal` register — and dedicated opcodes (`OP_RAW_ADD_INT`, `OP_RAW_LT_REAL`, ...) that skip both
 the RK register-vs-constant check *and* the value's tag check entirely, since the compiler already
 knows statically which form applies. Tracked per-name via `parser.c`'s `var_kind` table
@@ -661,7 +661,7 @@ frame (`sub sp, sp, #30336` plus a further `#44`), confirmed via `-fstack-usage`
 non-LTO build of the same function alone — the other ~23KB was these three call targets' own
 locals, folded in by the LTO backend at link time.
 
-The dispatch loop's own hot state (`ip`, the `registers`/`raw_ints`/`raw_reals` pointers, `op_word`)
+The dispatch loop's own hot state (`ip`, the `registers` pointer, `op_word`)
 already lives in real registers, not this frame (see §3.3, §5.4's hoisting work) — but the frame
 still exists as real stack memory the CPU touches on entry, and at ~30KB it's comfortably bigger
 than this target's 32KB L1 dcache, all to serve three opcodes (`io`/`actor`/`scheduler` module
@@ -865,7 +865,7 @@ definition the hoisted `registers` local. Removing both round trips regressed **
 confined to `lbl_call` cannot cost it 6% through its own work. A control confirmed it is not generic
 codegen churn either: swapping two independent decodes in a cold label moves every benchmark 0.00%.
 
-The mechanism is live ranges. `registers`/`raw_ints`/`raw_reals` are hoisted for the whole function,
+The mechanism is live ranges. `registers` is hoisted for the whole function,
 and `lbl_call` previously did not touch them -- it went through `caller->...` instead, leaving them
 **dead** across the entire call sequence. Referencing them there extends their live ranges over all
 of it, and in a function under this much register pressure that reshapes allocation for every other
@@ -1036,45 +1036,64 @@ And the performance answer, measured: instructions moved 0.00-0.03% on every ben
 roughly the same amplitude as adding one, in either direction. Trim for size and comprehension, which
 are real goals; do not trim expecting speed, and do not trim anything that carries a capability.
 
-### 5.16f Why the raw slots cannot share register_stack (a GC invariant, then a measurement)
+### 5.16f One register file, and why the earlier attempt to build it failed
 
-`lbl_call` maintains three bump pointers -- `registers`, `raw_ints`, `raw_reals` -- with three
-frame sizes, six of `CallFrame`'s eleven fields. Measuring the compiled handler put **4.53% of
-`fib_bench`'s cycles** in exactly those four raw-side stores and loads, so folding the raw slots into
-`register_stack` and deriving the two bases looked like a clean win: one bump pointer, four fewer
-fields, and better locality for `nbody`-shaped code that touches registers and raw slots in the same
-loop.
+`registers[]`, `raw_ints[]` and `raw_reals[]` were three arrays with three index spaces, and every
+value crossing between them cost an opcode. They are now **one array of tagged `AerVal`s**. An
+unchecked opcode writes the tag along with the payload, so its result is already a valid operand to
+any opcode that checks -- "raw" names the checks the compiler can skip, not a place to live.
 
-It segfaults, and the reason is worth writing down because nothing else records it.
-**`mark_vm_roots` (gc.c) scans `[registers, registers + frame_size)` unconditionally**, including
-slots the callee has not written yet -- its own comment says "zero-init decodes as harmless
-TYPE_NULL". That is only true because `register_stack` has *only ever held valid AerVals*. Interleave
-raw `int64`/`double` words into the same bank and a later frame's register range can overlap a dead
-frame's raw area, so the collector reads a `double` as a tagged pointer. `tests/test_gc_raw_frames.aer`
-was written first, for exactly this, and caught it on the first run.
+Two arguments used to say this could not be done. Both were real when written and both stopped being
+true before the merge landed.
 
-The invariant can be restored by clearing a frame's raw area when it pops -- confirmed, it fixes the
-crash -- but that leaves the same hole on every error unwind and yield, since those skip `lbl_return`
-entirely. And it does not pay regardless: **`fib_bench` +2.02%, `binary_trees` +3.58%**, nothing
-improved. Deriving the two bases costs more arithmetic on every call *and* return than the four loads
-it removes; a load from an already-hot cache line is cheaper than recomputing an address.
+**"It segfaults."** `mark_vm_roots` (gc.c) scans `[registers, registers + frame_size)`
+unconditionally, including slots the callee has not written -- safe only while `register_stack` held
+nothing but valid `AerVal`s. Interleaving raw words let the collector read a `double` as a tagged
+pointer; `tests/test_gc_raw_frames.aer` was written for exactly this and caught it on the first run.
+The fix considered at the time was clearing a frame's raw area on *pop*, which leaves a hole on every
+error unwind and yield, since those skip `lbl_return`. What actually holds now is clearing on
+**entry**: every frame-entry path zeroes its region's tags, and a frame cannot exist without being
+entered. Nothing needs to happen on the way out.
 
-So the three separate stacks are load-bearing, not an oversight. The four raw-side fields stay.
+**"`fib_bench` +2.02%, `binary_trees` +3.58%."** That measured a strictly worse change: it merged the
+storage while keeping `OP_BOX_*`/`OP_UNBOX_*` and every duplicated opcode family, paying the
+base-derivation arithmetic and collecting none of the payback. Merging is only worth doing together
+with deleting the mediation it exists to serve, which is what landed:
 
-**Revisited: both objections above are now stale.** The segfault argument rests on `register_stack`
-having only ever held valid AerVals. That is no longer what defends it -- every frame-entry path now
-clears its boxed region to `TYPE_NULL` (five sites in vm.c: the two push paths, the tail-call reuse,
-`lbl_call`, and the raw-call macro), so a reused region's stale words are overwritten before the
-collector can reach them. This section rejected clearing on *pop*, which leaves holes on error
-unwind and yield because those skip `lbl_return`; clearing on *entry* has no such hole, since a frame
-cannot exist without being entered.
+| gone | why it had nothing left to do |
+|---|---|
+| `OP_BOX_INT` / `OP_BOX_REAL` | boxing is the identity -- the slot already holds a tagged value |
+| `OP_RETURN_RAW_INT` / `_REAL` | a return value is a slot whichever opcode produced it |
+| `OP_CALL_RAW_INT` / `_REAL` | an ordinary call already hands a scalar over unboxed |
 
-The +2.02% / +3.58% is a measurement of a different change: that attempt merged the storage while
-keeping `OP_BOX_*`/`OP_UNBOX_*` and every duplicated opcode family, so it paid the base-derivation
-arithmetic and collected none of the payback. Merging storage *and* deleting the mediation it exists
-to serve is a separate experiment -- worth roughly 11.7% of dispatches and 12-20 opcodes -- and has
-not been run. Merging storage alone is expected to regress; do not treat that as evidence against
-merge-plus-delete, and do not land the merge without the deletion in the same arc.
+Deleting the last pair also deleted the self-call result-kind guess-and-recompile loop, which existed
+only so a raw self-call could return a scalar: a specialized body used to compile up to three times
+to discover its own return kind. `CallFrame` loses four fields (two stores per call, two loads per
+return), `vm_run_slice` hoists one base pointer instead of three, and the VM's fixed register banks
+go from 160KB to 128KB, because the raw banks were *additional* to a full 128-register bank per
+frame.
+
+**Measured (dispatch counts, deterministic).** Mixed code wins outright: `dict_bench` **-21.4%**,
+`log_processing` **-18.0%**, `typed_array_bench` **-14.4%**, `columnar_query` **-11.7%**,
+`struct_array_scan` -2.0%. Numeric loops were already box-free and move as predicted:
+`mandelbrot` -0.5%, `fib_bench`/`nbody`/`sieve` 0.00%.
+
+`binary_trees` **+3.6%** is the one regression, and it is a call-convention artifact rather than
+anything to do with storage. `OP_CALL_RAW_*` took its single argument from *any* slot; `OP_CALL`
+requires arguments in a contiguous run, so `make_tree(d)` now emits an `OP_MOVE` to place `d` where
+the convention wants it. The contiguity requirement is vacuous for **one** argument -- the fix is to
+let a single-argument call name the value's own register as its base and allocate a separate
+destination, which is a change to the call protocol at four parse sites, not to this merge.
+
+**What the single index space costs.** One slot stack means the parser's alloc/free discipline has to
+be honest about *which* slot it is releasing. Four latent hazards surfaced immediately, all caught by
+the existing corpus: loop-constant hoisting raised the floor part-way through an expression and broke
+a call's contiguous argument run (the block is claimed at `hoist_begin` now, at a statement
+boundary); `reg_free(1)` popped the top rather than the value the caller meant (`release_if_top`
+checks first); the specialization resolver bound raw parameters *before* the argument copy, which
+then overwrote them; and `is_temp` reported false for a statically-typed operand, so its slot was
+never released. None of these are new bugs in the sense of new code being wrong -- they are places
+where "different bank" had been doing the work of "different lifetime".
 
 ### 5.16g Non-PIE is worth 0.3-4.3%, and is deliberately not taken
 
