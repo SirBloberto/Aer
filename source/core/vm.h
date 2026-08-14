@@ -1262,6 +1262,15 @@ void aer_debug_memory_report(FILE* out);
    and a per-source-line hot-spot rollup (line -> total hits, sorted descending). Debug-build only --
    see the AER_DEBUG_TOOLS-gated Chunk.debug_hits field above. */
 void aer_disassemble(Chunk* c, FILE* out);
+
+/* Phase 0 of the unified-slot migration: one slot array means one budget, but a function may
+   currently address FRAME_REGISTERS plus RAW_REGISTERS_INT plus RAW_REGISTERS_REAL. Records what
+   each compiled function actually needed so the real ceiling is measured, not assumed. */
+void aer_debug_note_slot_budget(Chunk* c, unsigned int func_idx, unsigned int max_registers,
+                                unsigned int max_raw_ints, unsigned int max_raw_reals);
+void aer_debug_slot_budget_report(FILE* out);
+#else
+#define aer_debug_note_slot_budget(c, i, r, ri, rr) ((void)0)
 #endif
 
 #endif

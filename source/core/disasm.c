@@ -1197,4 +1197,42 @@ void aer_debug_memory_report(FILE* out) {
     fprintf(out, "  %u live cells, %u minor collections, %u major collections\n", live, minor, major);
 }
 
+/* Phase 0 instrumentation for the unified-slot migration -- see aer_debug_note_slot_budget in
+   vm.h. Keeps only what the report needs, so a program with thousands of functions costs a few
+   counters rather than a growing table. */
+static unsigned int slot_budget_funcs = 0;
+static unsigned int slot_budget_peak = 0;
+static unsigned int slot_budget_peak_regs = 0;
+static unsigned int slot_budget_peak_ints = 0;
+static unsigned int slot_budget_peak_reals = 0;
+static unsigned int slot_budget_over_64 = 0;
+static unsigned int slot_budget_over_128 = 0;
+
+void aer_debug_note_slot_budget(Chunk* c, unsigned int func_idx, unsigned int max_registers,
+                                unsigned int max_raw_ints, unsigned int max_raw_reals) {
+    (void)c;
+    (void)func_idx;
+    unsigned int unified = max_registers + max_raw_ints + max_raw_reals;
+    slot_budget_funcs++;
+    if (unified > 64)
+        slot_budget_over_64++;
+    if (unified > 128)
+        slot_budget_over_128++;
+    if (unified > slot_budget_peak) {
+        slot_budget_peak = unified;
+        slot_budget_peak_regs = max_registers;
+        slot_budget_peak_ints = max_raw_ints;
+        slot_budget_peak_reals = max_raw_reals;
+    }
+}
+
+void aer_debug_slot_budget_report(FILE* out) {
+    fprintf(out, "\n--- unified slot budget (Phase 0) ---\n");
+    fprintf(out, "  functions compiled      %u\n", slot_budget_funcs);
+    fprintf(out, "  peak unified slots      %u  (regs %u + rawi %u + rawr %u)\n", slot_budget_peak,
+            slot_budget_peak_regs, slot_budget_peak_ints, slot_budget_peak_reals);
+    fprintf(out, "  functions over 64       %u\n", slot_budget_over_64);
+    fprintf(out, "  functions over 128      %u\n", slot_budget_over_128);
+}
+
 #endif

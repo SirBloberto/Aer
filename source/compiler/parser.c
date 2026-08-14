@@ -5331,6 +5331,8 @@ static void parse_function(Chunk* c) {
     c->functions[this_func_idx].max_registers = captured_max_registers;
     c->functions[this_func_idx].max_raw_ints = captured_max_raw_ints;
     c->functions[this_func_idx].max_raw_reals = captured_max_raw_reals;
+    aer_debug_note_slot_budget(c, this_func_idx, captured_max_registers, captured_max_raw_ints,
+                               captured_max_raw_reals);
 
     patch_jump(c, patch, c->count);
 }
@@ -5863,4 +5865,8 @@ void parse(Chunk* c) {
     }
     if (P.any_compile_error)
         parse_had_error = true;
+    /* The top-level chunk is a frame too, and for a script that does its work outside any function
+       it is the LARGEST one -- excluding it would measure the wrong ceiling. */
+    aer_debug_note_slot_budget(c, (unsigned int)-1, (unsigned int)P.max_register_used,
+                               (unsigned int)P.max_raw_int_used, (unsigned int)P.max_raw_real_used);
 }
