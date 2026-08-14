@@ -321,8 +321,7 @@ void reg_reset(void) {
    frame ever needs more. Returns an in-bounds sentinel after erroring. */
 void reg_reserve(int count) {
     if (P.reserved_floor + count > FRAME_REGISTERS) {
-        error_at("Too many live variables/temporaries (max %d registers per call)", FRAME_REGISTERS);
-        return;
+        return error_at("Too many live variables/temporaries (max %d registers per call)", FRAME_REGISTERS);
     }
     P.reserved_floor += count;
     P.next_temp_register += count;
@@ -662,9 +661,9 @@ void emit_slice_get(Chunk* c, int dest_reg, int arr_reg, int rk_start, int rk_en
     rk_start = box_if_raw(c, rk_start);
     rk_end = box_if_raw(c, rk_end);
     if (!rk16_fits(rk_start) || !rk16_fits(rk_end)) {
-        error_at("Expression too large to compile (register/constant index exceeds the slice-get encoding's "
-                 "range)");
-        return;
+        return error_at(
+            "Expression too large to compile (register/constant index exceeds the slice-get encoding's "
+            "range)");
     }
     chunk_emit(c, PACK3(OP_SLICE_GET, dest_reg, arr_reg, 0));
     chunk_emit(c, PACK_2X16(pack_rk16(rk_start), pack_rk16(rk_end)));
@@ -738,9 +737,9 @@ void emit_field_get(Chunk* c, int dest_reg, int struct_reg, unsigned int field_n
 void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, int rk_val) {
     rk_val = box_if_raw(c, rk_val);
     if (!rk16_fits(rk_val)) {
-        error_at("Expression too large to compile (register/constant index exceeds the field-set encoding's "
-                 "range)");
-        return;
+        return error_at(
+            "Expression too large to compile (register/constant index exceeds the field-set encoding's "
+            "range)");
     }
     chunk_emit(c, PACK_OP_A_W16(OP_FIELD_SET, struct_reg, pack_rk16(rk_val)));
     chunk_emit(c, (uint32_t)field_name_pool_idx);
@@ -998,8 +997,7 @@ static void ensure_boxed(Chunk* c, unsigned int name_idx) {
     int old_slot = P.var_regs[existing_idx];
     Opcode box_op = (P.var_kind[existing_idx] == VAR_RAW_INT) ? OP_BOX_INT : OP_BOX_REAL;
     if (P.reserved_floor >= FRAME_REGISTERS) {
-        error_at("Too many variables (max %d)", FRAME_REGISTERS);
-        return;
+        return error_at("Too many variables (max %d)", FRAME_REGISTERS);
     }
     int new_reg = P.reserved_floor;
     P.reserved_floor++;
@@ -2917,12 +2915,10 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         unsigned int count = 1;
         while (consume(TOKEN_COMMA)) {
             if (!equal(TOKEN_IDENTIFIER)) {
-                error_at("Expected identifier in destructuring");
-                return;
+                return error_at("Expected identifier in destructuring");
             }
             if (count >= MAX_DESTRUCT) {
-                error_at("Too many destructuring targets (max %d)", MAX_DESTRUCT);
-                return;
+                return error_at("Too many destructuring targets (max %d)", MAX_DESTRUCT);
             }
             names[count++] = chunk_add_pool(c, token.value);
             lex();
@@ -3128,17 +3124,16 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                self_ref_watch_seen rather than loop_depth, since a reassignment that doesn't read the
                old value has nothing stale to re-read. */
             if (P.loop_depth > 0 && P.self_ref_watch_seen) {
-                error_at("This assignment would change '%s' from a fixed numeric type to a different type, "
-                         "but it's inside a loop — not supported. If you're accumulating with +, -, or *, "
-                         "use the compound form ('%s += ...' etc.) instead — it doesn't have this "
-                         "restriction. Otherwise, restructure so the type change happens outside any loop.",
-                         aer_as_string(c->pool[name_idx])->data, aer_as_string(c->pool[name_idx])->data);
-                return;
+                return error_at(
+                    "This assignment would change '%s' from a fixed numeric type to a different type, "
+                    "but it's inside a loop — not supported. If you're accumulating with +, -, or *, "
+                    "use the compound form ('%s += ...' etc.) instead — it doesn't have this "
+                    "restriction. Otherwise, restructure so the type change happens outside any loop.",
+                    aer_as_string(c->pool[name_idx])->data, aer_as_string(c->pool[name_idx])->data);
             }
             rk_val = box_if_raw(c, rk_val);
             if (P.reserved_floor >= FRAME_REGISTERS) {
-                error_at("Too many variables (max %d)", FRAME_REGISTERS);
-                return;
+                return error_at("Too many variables (max %d)", FRAME_REGISTERS);
             }
             int new_reg = P.reserved_floor;
             P.reserved_floor++;
@@ -3325,17 +3320,16 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                re-read the stale value every iteration (real bug found this way). No single-pass
                fix exists, so refuse to compile rather than silently corrupt. */
             if (P.loop_depth > 0) {
-                error_at("This compound assignment would change '%s' from a fixed numeric type to a "
-                         "different type, but it's inside a loop — not supported (restructure so the type "
-                         "change happens outside any loop)",
-                         aer_as_string(c->pool[name_idx])->data);
-                return;
+                return error_at(
+                    "This compound assignment would change '%s' from a fixed numeric type to a "
+                    "different type, but it's inside a loop — not supported (restructure so the type "
+                    "change happens outside any loop)",
+                    aer_as_string(c->pool[name_idx])->data);
             }
             int old_slot = P.var_regs[existing_idx];
             Opcode box_op = (cur_kind == RAWK_INT) ? OP_BOX_INT : OP_BOX_REAL;
             if (P.reserved_floor >= FRAME_REGISTERS) {
-                error_at("Too many variables (max %d)", FRAME_REGISTERS);
-                return;
+                return error_at("Too many variables (max %d)", FRAME_REGISTERS);
             }
             int new_reg = P.reserved_floor;
             P.reserved_floor++;
@@ -3362,9 +3356,9 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                          aer_as_string(c->pool[name_idx])->data);
                 return;
             }
-            error_at("Compound assignment target must already have a value (no assigning to an undefined "
-                     "name this way)");
-            return;
+            return error_at(
+                "Compound assignment target must already have a value (no assigning to an undefined "
+                "name this way)");
         }
 
         int rk_rhs = parse_binary(c, 0);
@@ -3398,9 +3392,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                          aer_as_string(c->pool[name_idx])->data);
                 return;
             }
-            error_at("'%s' is not defined (a pipe chain's source must already have a value)",
-                     aer_as_string(c->pool[name_idx])->data);
-            return;
+            return error_at("'%s' is not defined (a pipe chain's source must already have a value)",
+                            aer_as_string(c->pool[name_idx])->data);
         }
         int rk_result = parse_binary_ops(c, 0, reg, lhs_start);
         discard_statement_result(c, rk_result);
@@ -3428,9 +3421,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                  aer_as_string(c->pool[name_idx])->data);
         return;
     } else {
-        error_at("'%s' is not defined (an indexed/field write target must already have a value)",
-                 aer_as_string(c->pool[name_idx])->data);
-        return;
+        return error_at("'%s' is not defined (an indexed/field write target must already have a value)",
+                        aer_as_string(c->pool[name_idx])->data);
     }
 
     bool pending_is_field = !first_is_index;
@@ -3446,8 +3438,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         require(TOKEN_CLOSE_BRACKET, "expected ']' after index");
     } else {
         if (!equal(TOKEN_IDENTIFIER)) {
-            error_at("Expected field name after '.'");
-            return;
+            return error_at("Expected field name after '.'");
         }
         pending_field_idx = chunk_add_pool(c, token.value);
         lex();
@@ -3461,8 +3452,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
     if (first_is_index && equal(TOKEN_DOT)) {
         lex();
         if (!equal(TOKEN_IDENTIFIER)) {
-            error_at("Expected field name after '.'");
-            return;
+            return error_at("Expected field name after '.'");
         }
         unsigned int fused_field_idx = chunk_add_pool(c, token.value);
         lex();
@@ -3481,9 +3471,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
 
         if (no_more_chaining && (is_plain_assign || compound_i >= 0)) {
             if (!rk16_fits(pending_rk_idx)) {
-                error_at("Expression too large to compile (register/constant index exceeds the fused "
-                         "index-field-op encoding's range)");
-                return;
+                return error_at("Expression too large to compile (register/constant index exceeds the fused "
+                                "index-field-op encoding's range)");
             }
             /* obj_reg is still obj's own register here (obj_is_base) -- this is the very first
                postfix step on the name, no chaining happened before it. */
@@ -3549,9 +3538,9 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 }
                 rk_val = box_if_raw(c, rk_val);
                 if (!rk16_fits(rk_val)) {
-                    error_at("Expression too large to compile (value exceeds the fused index-field-set "
-                             "encoding's range)");
-                    return;
+                    return error_at(
+                        "Expression too large to compile (value exceeds the fused index-field-set "
+                        "encoding's range)");
                 }
                 chunk_emit(c, PACK_OP_A_W16(OP_INDEX_FIELD_SET, obj_reg, pack_rk16(pending_rk_idx)));
                 chunk_emit(c, PACK_2X16(fused_field_idx, pack_rk16(rk_val)));
@@ -3608,9 +3597,9 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 }
                 rk_rhs = box_if_raw(c, rk_rhs);
                 if (!rk16_fits(rk_rhs)) {
-                    error_at("Expression too large to compile (value exceeds the fused index-field-compound "
-                             "encoding's range)");
-                    return;
+                    return error_at(
+                        "Expression too large to compile (value exceeds the fused index-field-compound "
+                        "encoding's range)");
                 }
                 chunk_emit(c, PACK3(OP_INDEX_FIELD_COMPOUND, obj_reg, bin_op, 0));
                 chunk_emit(c, PACK_2X16(fused_field_idx, pack_rk16(pending_rk_idx)));
@@ -3679,8 +3668,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         } else {
             consume(TOKEN_DOT);
             if (!equal(TOKEN_IDENTIFIER)) {
-                error_at("Expected field name after '.'");
-                return;
+                return error_at("Expected field name after '.'");
             }
             pending_field_idx = chunk_add_pool(c, token.value);
             pending_is_field = true;
@@ -3852,9 +3840,9 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 rk_rhs = box_if_raw(c, rk_rhs);
 
                 if (!rk16_fits(rk_rhs)) {
-                    error_at("Expression too large to compile (register/constant index exceeds the fused "
-                             "field-op encoding's range)");
-                    return;
+                    return error_at(
+                        "Expression too large to compile (register/constant index exceeds the fused "
+                        "field-op encoding's range)");
                 }
                 chunk_emit(c, PACK3(OP_FIELD_COMPOUND, obj_reg, bin_op, 0));
                 chunk_emit(c, PACK_2X16(pending_field_idx, pack_rk16(rk_rhs)));
@@ -3886,9 +3874,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
 
     /* Finish the pending step as a GET, falling through to a general expression statement. */
     if (!equal(TOKEN_OPEN_PARENTHESE) && !equal(TOKEN_PIPE)) {
-        error_at("Expected an assignment ('='), a compound assignment ('+=' etc.), or a call/pipe "
-                 "continuation after this chain");
-        return;
+        return error_at("Expected an assignment ('='), a compound assignment ('+=' etc.), or a call/pipe "
+                        "continuation after this chain");
     }
 
     {
@@ -4319,8 +4306,7 @@ static void parse_for_while(Chunk* c) {
            variable, never destructuring. */
         if (consume(TOKEN_COMMA)) {
             if (!equal(TOKEN_IDENTIFIER)) {
-                error_at("Expected identifier after ','");
-                return;
+                return error_at("Expected identifier after ','");
             }
             unsigned int name2_idx = chunk_add_pool(c, token.value);
             lex();
@@ -4628,8 +4614,7 @@ static void parse_import_path(Chunk* c, const char* alias, unsigned int alias_le
     unsigned int path_len = path_str->length;
     char path_buf[256];
     if (path_len == 0 || path_len >= sizeof(path_buf)) {
-        error_at("Import path is empty or too long");
-        return;
+        return error_at("Import path is empty or too long");
     }
     memcpy(path_buf, path_str->data, path_len);
     lex();
@@ -4659,16 +4644,14 @@ static void parse_import_path(Chunk* c, const char* alias, unsigned int alias_le
    A failed import is silently not registered. */
 static void parse_import(Chunk* c) {
     if (P.function_depth != 0) {
-        error_at("'import' is only allowed at the top level of a file, not inside a function");
-        return;
+        return error_at("'import' is only allowed at the top level of a file, not inside a function");
     }
     if (token.type == TOKEN_STRING) {
         parse_import_path(c, NULL, 0);
         return;
     }
     if (!equal(TOKEN_IDENTIFIER)) {
-        error_at("Expected a module name or a quoted path after 'import'");
-        return;
+        return error_at("Expected a module name or a quoted path after 'import'");
     }
 
     /* The first identifier is ambiguous until we see what follows it: an alias immediately before a
@@ -4681,8 +4664,7 @@ static void parse_import(Chunk* c) {
         const char* seg = aer_as_string(token.value)->data;
         unsigned int seg_len = aer_as_string(token.value)->length;
         if (seg_len >= sizeof(path_buf)) {
-            error_at("Import name too long");
-            return;
+            return error_at("Import name too long");
         }
         memcpy(path_buf, seg, seg_len);
         bind_len = seg_len;
@@ -4696,15 +4678,13 @@ static void parse_import(Chunk* c) {
 
     while (consume(TOKEN_DOT)) {
         if (!equal(TOKEN_IDENTIFIER)) {
-            error_at("Expected a module name segment after '.'");
-            return;
+            return error_at("Expected a module name segment after '.'");
         }
         const char* seg = aer_as_string(token.value)->data;
         unsigned int seg_len = aer_as_string(token.value)->length;
         path_buf[path_len++] = '/';
         if (path_len + seg_len >= sizeof(path_buf)) {
-            error_at("Import path too long");
-            return;
+            return error_at("Import path too long");
         }
         bind_start = path_len;
         memcpy(path_buf + path_len, seg, seg_len);
@@ -4988,8 +4968,7 @@ static void emit_result_call_and_return(Chunk* c, int reg_base) {
    alone, so there's no shape ambiguity left for this to detect or reject. */
 static void parse_return(Chunk* c) {
     if (P.function_depth == 0) {
-        error_at("'return' outside function");
-        return;
+        return error_at("'return' outside function");
     }
 
     if (!equal(TOKEN_NEW_LINE) && !equal(TOKEN_END_OF_FILE) && !equal(TOKEN_DEDENT)) {
@@ -5048,8 +5027,7 @@ static void parse_return(Chunk* c) {
 /* `raise <expr>` signals a recoverable failure -- builds a Result with the value forced to null. */
 static void parse_raise(Chunk* c) {
     if (P.function_depth == 0) {
-        error_at("'raise' outside function");
-        return;
+        return error_at("'raise' outside function");
     }
     unsigned int null_idx = chunk_add_pool(c, aer_null());
     int reg_base = arg_materialize(c, (int)null_idx | RK_CONST_FLAG);
@@ -5113,25 +5091,21 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
     if (!equal(TOKEN_CLOSE_PARENTHESE)) {
         do {
             if (!equal(TOKEN_IDENTIFIER)) {
-                error_at("Expected parameter name");
-                return;
+                return error_at("Expected parameter name");
             }
             if (param_count >= FRAME_REGISTERS) {
-                error_at("Too many parameters (max %d)", FRAME_REGISTERS);
-                return;
+                return error_at("Too many parameters (max %d)", FRAME_REGISTERS);
             }
             param_names[param_count] = chunk_add_pool(c, token.value);
             lex();
             if (consume(TOKEN_ASSIGN)) {
                 bool unused_narrow;
                 if (!parse_literal_default(c, &param_defaults[param_count], &unused_narrow)) {
-                    error_at("Parameter defaults must be a literal value");
-                    return;
+                    return error_at("Parameter defaults must be a literal value");
                 }
                 seen_default = true;
             } else if (seen_default) {
-                error_at("A parameter without a default cannot follow one that has a default");
-                return;
+                return error_at("A parameter without a default cannot follow one that has a default");
             } else {
                 min_param_count++;
             }
@@ -5276,14 +5250,12 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
    too. */
 static void parse_function(Chunk* c) {
     if (!equal(TOKEN_IDENTIFIER)) {
-        error_at("Expected function name");
-        return;
+        return error_at("Expected function name");
     }
     unsigned int name_idx = chunk_add_pool(c, token.value);
     if (is_builtin_name(c, name_idx)) {
-        error_at("'%s' is a reserved builtin name and can't be redefined as a function",
-                 aer_as_string(token.value)->data);
-        return;
+        return error_at("'%s' is a reserved builtin name and can't be redefined as a function",
+                        aer_as_string(token.value)->data);
     }
     /* Captured unconditionally so the span from '(' onward is available if this function turns out
        shape-sensitive. Must happen before the lex() below: the cursor reflects the position past
@@ -5546,8 +5518,7 @@ static bool parse_literal_default(Chunk* c, AerVal* out, bool* out_narrow) {
    construction. Field defaults share parse_literal_default with function parameters. */
 static void parse_struct(Chunk* c) {
     if (!equal(TOKEN_IDENTIFIER)) {
-        error_at("Expected struct name");
-        return;
+        return error_at("Expected struct name");
     }
     unsigned int name_idx = chunk_add_pool(c, token.value);
     lex();
@@ -5567,12 +5538,10 @@ static void parse_struct(Chunk* c) {
         if (consume(TOKEN_NEW_LINE))
             continue;
         if (!equal(TOKEN_IDENTIFIER)) {
-            error_at("Expected field name");
-            return;
+            return error_at("Expected field name");
         }
         if (field_count >= MAX_STRUCT_FIELDS) {
-            error_at("Too many struct fields (max %d)", MAX_STRUCT_FIELDS);
-            return;
+            return error_at("Too many struct fields (max %d)", MAX_STRUCT_FIELDS);
         }
 
         unsigned int fname = chunk_add_pool(c, token.value);
@@ -5584,15 +5553,13 @@ static void parse_struct(Chunk* c) {
            default didn't already have. 'null' is the one default with no matching ValueType, and
            is what TYPE_ANY (unconstrained) means here -- never a spelled-out keyword. */
         if (!consume(TOKEN_ASSIGN)) {
-            error_at("Struct field '%.*s' must have an explicit default value",
-                     (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
-            return;
+            return error_at("Struct field '%.*s' must have an explicit default value",
+                            (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
         }
         AerVal dflt;
         bool narrow;
         if (!parse_literal_default(c, &dflt, &narrow)) {
-            error_at("Struct field defaults must be a literal value");
-            return;
+            return error_at("Struct field defaults must be a literal value");
         }
         field_names[field_count] = fname;
         field_defaults[field_count] = dflt;
@@ -5609,9 +5576,8 @@ static void parse_struct(Chunk* c) {
            rejected before that trust is established. */
         if (field_narrow[field_count] && field_types[field_count] == TYPE_INTEGER &&
             (aer_as_int(dflt) < INT32_MIN || aer_as_int(dflt) > INT32_MAX)) {
-            error_at("Struct field '%.*s' default is out of range for a narrow (int32) field",
-                     (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
-            return;
+            return error_at("Struct field '%.*s' default is out of range for a narrow (int32) field",
+                            (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
         }
         field_count++;
 
@@ -5623,8 +5589,7 @@ static void parse_struct(Chunk* c) {
     consume(TOKEN_DEDENT);
 
     if (field_count == 0) {
-        error_at("Struct must have at least one field");
-        return;
+        return error_at("Struct must have at least one field");
     }
 
     chunk_emit(c, PACK_STRUCT_HEADER(name_idx, field_count));
@@ -5642,13 +5607,11 @@ static void parse_struct(Chunk* c) {
 /* break/continue -- no iter_slots POPs needed (see LoopContext's own comment). */
 static void parse_break(Chunk* c) {
     if (P.loop_depth == 0) {
-        error_at("'break' outside loop");
-        return;
+        return error_at("'break' outside loop");
     }
     LoopContext* ctx = &P.loop_stack[P.loop_depth - 1];
     if (ctx->patch_count >= BREAK_MAX) {
-        error_at("Too many breaks in one loop (max %d)", BREAK_MAX);
-        return;
+        return error_at("Too many breaks in one loop (max %d)", BREAK_MAX);
     }
     chunk_emit(c, OP_JUMP);
     ctx->patches[ctx->patch_count++] = c->count;
@@ -5657,15 +5620,13 @@ static void parse_break(Chunk* c) {
 
 static void parse_continue(Chunk* c) {
     if (P.loop_depth == 0) {
-        error_at("'continue' outside loop");
-        return;
+        return error_at("'continue' outside loop");
     }
     LoopContext* ctx = &P.loop_stack[P.loop_depth - 1];
     chunk_emit(c, OP_JUMP);
     if (ctx->rotated) {
         if (ctx->continue_patch_count >= BREAK_MAX) {
-            error_at("Too many continues in one loop (max %d)", BREAK_MAX);
-            return;
+            return error_at("Too many continues in one loop (max %d)", BREAK_MAX);
         }
         ctx->continue_patches[ctx->continue_patch_count++] = c->count;
         chunk_emit(
@@ -5733,8 +5694,7 @@ static void parse_statement(Chunk* c) {
         else if (equal(TOKEN_TYPE_BOOLEAN))
             reserved_word = "boolean";
         if (reserved_word) {
-            error_at("'%s' is a reserved type name and can't be used as a variable", reserved_word);
-            return;
+            return error_at("'%s' is a reserved type name and can't be used as a variable", reserved_word);
         }
     }
     /* Checked right after the call, alongside the bare-name and field-chain pipe-statement cases

@@ -5,8 +5,7 @@
 #include "value.h"
 
 typedef enum TokenType {
-    /* Binary ops -- precedence is looked up by binary_op_info()'s switch in parser.c, not by enum
-       order, so nothing here needs to stay contiguous. */
+    /* Binary operators */
     TOKEN_OR, /* or */
     TOKEN_PIPE, /* |> -- x |> f(a) desugars to f(x, a) */
     TOKEN_AND, /* and */

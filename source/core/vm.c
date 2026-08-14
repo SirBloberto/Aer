@@ -1198,17 +1198,15 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
 static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int arg_count, bool is_tail_call,
                           unsigned int return_ip) {
     if (aer_type(fv) != TYPE_FUNCTION) {
-        error("Value of type '%s' is not callable", vm_type_name(vm->chunk, fv));
-        return;
+        return error("Value of type '%s' is not callable", vm_type_name(vm->chunk, fv));
     }
     AerFunction* f = aer_as_function(fv);
     if (arg_count < (int)f->min_arity || arg_count > (int)f->arity) {
         if (f->min_arity == f->arity)
             error("Function expects %u arguments, got %d", (unsigned int)f->arity, arg_count);
         else
-            error("Function expects between %u and %u arguments, got %d", (unsigned int)f->min_arity,
-                  (unsigned int)f->arity, arg_count);
-        return;
+            return error("Function expects between %u and %u arguments, got %d", (unsigned int)f->min_arity,
+                         (unsigned int)f->arity, arg_count);
     }
     /* Tail-call reuse -- `f` is already a plain pointer, so overwriting its source register during
        the copy can't invalidate it. Args copied before defaults, so no source register is
@@ -1239,8 +1237,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         return;
     }
     if (vm->call_depth + 1 >= VM_CALL_MAX) {
-        error("v3 call stack overflow");
-        return;
+        return error("v3 call stack overflow");
     }
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
@@ -2137,19 +2134,16 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
     if (aer_type(obj) == TYPE_ARRAY) {
         AerArray* a = aer_as_array(obj);
         if (a->shape) {
-            error("Struct fields are assigned with '.', not '[]'");
-            return;
+            return error("Struct fields are assigned with '.', not '[]'");
         }
         if (aer_type(idx) != TYPE_INTEGER) {
-            error("Array index must be an integer");
-            return;
+            return error("Array index must be an integer");
         }
         int64_t i = aer_as_int(idx);
         if (i < 0)
             i += (int64_t)a->count;
         if (i < 0 || (uint64_t)i >= a->count) {
-            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count);
-            return;
+            return error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count);
         }
         gc_barrier_array(vm, a, (unsigned int)i, val);
         a->items[i] = val;
@@ -2159,8 +2153,7 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         a->generation++;
     } else if (aer_type(obj) == TYPE_DICT) {
         if (aer_type(idx) != TYPE_STRING) {
-            error("Hashtable key must be a string");
-            return;
+            return error("Hashtable key must be a string");
         }
         AerString* is = aer_as_string(idx);
         unsigned int klen = hashtable_key_true_len(is->data, is->length);
@@ -2182,15 +2175,13 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
     } else if (aer_type(obj) == TYPE_TYPED_ARRAY) {
         AerTypedArray* ta = aer_as_typed_array(obj);
         if (aer_type(idx) != TYPE_INTEGER) {
-            error("Array index must be an integer");
-            return;
+            return error("Array index must be an integer");
         }
         int64_t i = aer_as_int(idx);
         if (i < 0)
             i += (int64_t)ta->count;
         if (i < 0 || (uint64_t)i >= ta->count) {
-            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), ta->count);
-            return;
+            return error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), ta->count);
         }
         if (!vm_typed_array_check(vm->chunk, ta->elem_kind, val))
             return;

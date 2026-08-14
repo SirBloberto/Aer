@@ -101,17 +101,14 @@ void lexer_restore_state(LexerState* s) {
 
 void read_file(char* filename) {
     FILE* fp = fopen(filename, "rb");
-    if (!fp) {
-        error("Cannot open file: %s", filename);
-        return;
-    }
+    if (!fp)
+        return error("Cannot open file: %s", filename);
 
     fseek(fp, 0, SEEK_END);
     long size = ftell(fp);
     if (size < 0) {
         fclose(fp);
-        error("Cannot determine size of file: %s", filename);
-        return;
+        return error("Cannot determine size of file: %s", filename);
     }
     fseek(fp, 0, SEEK_SET);
     unsigned long length = (unsigned long)size;
@@ -119,8 +116,7 @@ void read_file(char* filename) {
     char* buf = malloc(length + 1);
     if (!buf) {
         fclose(fp);
-        error("Out of memory reading file: %s", filename);
-        return;
+        return error("Out of memory reading file: %s", filename);
     }
     unsigned long nread = (unsigned long)fread(buf, 1, length, fp);
     fclose(fp);
@@ -133,9 +129,9 @@ void read_file(char* filename) {
     if (strlen(buf) != nread) {
         unsigned long at = (unsigned long)strlen(buf);
         free(buf);
-        error("Source file '%s' contains an embedded NUL byte at offset %lu -- not a valid AER source file",
-              filename, at);
-        return;
+        return error(
+            "Source file '%s' contains an embedded NUL byte at offset %lu -- not a valid AER source file",
+            filename, at);
     }
 
     /* Normalize Windows line endings: strip \r in-place */
@@ -283,8 +279,7 @@ static void lex_number() {
         if (!isxdigit((unsigned char)buf[2])) {
             error_at("Expected hex digits after '0x'");
             /* Consume "0x" ourselves -- whether strtoll backs off to just "0" here is libc-defined, not something to rely on for forward progress. */
-            emit(TOKEN_ERROR, 2);
-            return;
+            return emit(TOKEN_ERROR, 2);
         }
         char* end;
         errno = 0;
@@ -293,8 +288,7 @@ static void lex_number() {
             error_at("Integer literal overflow");
         if (isalpha((unsigned char)*end) || *end == '_')
             error_at("Invalid character after integer literal");
-        emit_integer(val, (unsigned int)(end - buf));
-        return;
+        return emit_integer(val, (unsigned int)(end - buf));
     }
 
     /* lex() only calls lex_number() on a digit, so int_len is always >= 1 -- safe to fall through from error_at() below without an explicit return. */
@@ -318,8 +312,7 @@ static void lex_number() {
         }
         if (isalpha((unsigned char)*end) || *end == '_')
             error_at("Invalid character after integer literal");
-        emit_integer(int_val, int_len);
-        return;
+        return emit_integer(int_val, int_len);
     }
 
     /* Float: use strtod from original start for correct precision */
@@ -406,10 +399,8 @@ static void lex_string() {
             brace_depth--;
         current->buffer++;
     }
-    if (*current->buffer != '"') {
-        error_at("Unterminated string");
-        return;
-    }
+    if (*current->buffer != '"')
+        return error_at("Unterminated string");
     unsigned int length = (unsigned int)(current->buffer - start);
     token.value = aer_make_string_copy(start, length);
     token.type = TOKEN_STRING;
@@ -423,10 +414,8 @@ static void lex_multiline_string() {
     while (*current->buffer != '\0' &&
            !(current->buffer[0] == '"' && current->buffer[1] == '"' && current->buffer[2] == '"'))
         current->buffer++;
-    if (*current->buffer != '"') {
-        error_at("Unterminated multi-line string");
-        return;
-    }
+    if (*current->buffer != '"')
+        return error_at("Unterminated multi-line string");
     unsigned int length = (unsigned int)(current->buffer - start);
     token.value = aer_make_string_copy(start, length);
     token.type = TOKEN_STRING;
@@ -480,18 +469,14 @@ void lex() {
             spaces++;
             p++;
         }
-        if (*p == '\t') {
-            error_at("Tabs not allowed for indentation");
-            return;
-        }
+        if (*p == '\t')
+            return error_at("Tabs not allowed for indentation");
 
         unsigned int top = indent_stack[indent_depth - 1];
 
         if (*p != '\0' && spaces > top) {
-            if (indent_depth >= 64) {
-                error("Indentation too deep");
-                return;
-            }
+            if (indent_depth >= 64)
+                return error("Indentation too deep");
             indent_stack[indent_depth++] = spaces;
             current->buffer = p;
             token.type = TOKEN_INDENT;
@@ -503,13 +488,10 @@ void lex() {
                 indent_depth--;
                 pops++;
             }
-            if (*p != '\0' && indent_depth > 1 && indent_stack[indent_depth - 1] != spaces) {
-                error_at("Indentation does not match any outer level");
-                return;
-            }
-            if (*p == '\0') {
+            if (*p != '\0' && indent_depth > 1 && indent_stack[indent_depth - 1] != spaces)
+                return error_at("Indentation does not match any outer level");
+            if (*p == '\0')
                 indent_depth = 1;
-            }
             pending_dedents = pops - 1;
             token.type = TOKEN_DEDENT;
             return;
@@ -522,30 +504,20 @@ void lex() {
 
     char* b = current->buffer;
 
-    if (isdigit((unsigned char)*b)) {
-        lex_number();
-        return;
-    }
-    if (isalpha((unsigned char)*b) || *b == '_') {
-        lex_identifier();
-        return;
-    }
+    if (isdigit((unsigned char)*b))
+        return lex_number();
+    if (isalpha((unsigned char)*b) || *b == '_')
+        return lex_identifier();
     if (*b == '"') {
-        if (b[1] == '"' && b[2] == '"') {
-            lex_multiline_string();
-            return;
-        }
-        lex_string();
-        return;
+        if (b[1] == '"' && b[2] == '"')
+            return lex_multiline_string();
+        return lex_string();
     }
 
     switch (*b) {
-        case ',': emit(TOKEN_COMMA, 1); return;
-        case ';': emit(TOKEN_SEMICOLON, 1); return;
-        case '\n':
-            at_line_start = true;
-            emit(TOKEN_NEW_LINE, 1);
-            return;
+        case ',': return emit(TOKEN_COMMA, 1);
+        case ';': return emit(TOKEN_SEMICOLON, 1);
+        case '\n': at_line_start = true; return emit(TOKEN_NEW_LINE, 1);
         case '\0':
             /* No trailing newline -- flush remaining indent levels */
             if (indent_depth > 1) {
@@ -555,145 +527,89 @@ void lex() {
                 token.type = TOKEN_DEDENT;
                 return;
             }
-            emit(TOKEN_END_OF_FILE, 0);
-            return;
-        case '(':
-            bracket_depth++;
-            emit(TOKEN_OPEN_PARENTHESE, 1);
-            return;
+            return emit(TOKEN_END_OF_FILE, 0);
+        case '(': bracket_depth++; return emit(TOKEN_OPEN_PARENTHESE, 1);
         case ')':
             if (bracket_depth > 0)
                 bracket_depth--;
-            emit(TOKEN_CLOSE_PARENTHESE, 1);
-            return;
-        case '[':
-            bracket_depth++;
-            emit(TOKEN_OPEN_BRACKET, 1);
-            return;
+            return emit(TOKEN_CLOSE_PARENTHESE, 1);
+        case '[': bracket_depth++; return emit(TOKEN_OPEN_BRACKET, 1);
         case ']':
             if (bracket_depth > 0)
                 bracket_depth--;
-            emit(TOKEN_CLOSE_BRACKET, 1);
-            return;
-        case '{':
-            bracket_depth++;
-            emit(TOKEN_OPEN_BRACE, 1);
-            return;
+            return emit(TOKEN_CLOSE_BRACKET, 1);
+        case '{': bracket_depth++; return emit(TOKEN_OPEN_BRACE, 1);
         case '}':
             if (bracket_depth > 0)
                 bracket_depth--;
-            emit(TOKEN_CLOSE_BRACE, 1);
-            return;
-        case ':': emit(TOKEN_COLON, 1); return;
+            return emit(TOKEN_CLOSE_BRACE, 1);
+        case ':': return emit(TOKEN_COLON, 1);
         case '.':
-            if (b[1] == '.') {
-                emit(TOKEN_DOT_DOT, 2);
-                return;
-            }
-            emit(TOKEN_DOT, 1);
-            return;
-        case '~': emit(TOKEN_BITWISE_NOT, 1); return;
+            if (b[1] == '.')
+                return emit(TOKEN_DOT_DOT, 2);
+            return emit(TOKEN_DOT, 1);
+        case '~': return emit(TOKEN_BITWISE_NOT, 1);
         case '*':
-            if (b[1] == '=') {
-                emit(TOKEN_MULTIPLY_ASSIGN, 2);
-                return;
-            }
-            emit(TOKEN_MULTIPLY, 1);
-            return;
+            if (b[1] == '=')
+                return emit(TOKEN_MULTIPLY_ASSIGN, 2);
+            return emit(TOKEN_MULTIPLY, 1);
         case '/':
             if (b[1] == '/') {
-                if (b[2] == '=') {
-                    emit(TOKEN_FLOOR_DIVIDE_ASSIGN, 3);
-                    return;
-                }
-                emit(TOKEN_FLOOR_DIVIDE, 2);
-                return;
+                if (b[2] == '=')
+                    return emit(TOKEN_FLOOR_DIVIDE_ASSIGN, 3);
+                return emit(TOKEN_FLOOR_DIVIDE, 2);
             }
-            if (b[1] == '=') {
-                emit(TOKEN_DIVIDE_ASSIGN, 2);
-                return;
-            }
-            emit(TOKEN_DIVIDE, 1);
-            return;
+            if (b[1] == '=')
+                return emit(TOKEN_DIVIDE_ASSIGN, 2);
+            return emit(TOKEN_DIVIDE, 1);
         case '%':
-            if (b[1] == '=') {
-                emit(TOKEN_MODULO_ASSIGN, 2);
-                return;
-            }
-            emit(TOKEN_MODULO, 1);
-            return;
+            if (b[1] == '=')
+                return emit(TOKEN_MODULO_ASSIGN, 2);
+            return emit(TOKEN_MODULO, 1);
         case '+':
-            if (b[1] == '=') {
-                emit(TOKEN_ADD_ASSIGN, 2);
-                return;
-            }
-            emit(TOKEN_ADD, 1);
-            return;
+            if (b[1] == '=')
+                return emit(TOKEN_ADD_ASSIGN, 2);
+            return emit(TOKEN_ADD, 1);
         case '-':
-            if (b[1] == '=') {
-                emit(TOKEN_SUBTRACT_ASSIGN, 2);
-                return;
-            }
-            emit(TOKEN_SUBTRACT, 1);
-            return;
+            if (b[1] == '=')
+                return emit(TOKEN_SUBTRACT_ASSIGN, 2);
+            return emit(TOKEN_SUBTRACT, 1);
         case '!':
-            if (b[1] == '=') {
-                emit(TOKEN_NOT_EQUAL, 2);
-                return;
-            }
+            if (b[1] == '=')
+                return emit(TOKEN_NOT_EQUAL, 2);
             error_at("'!' is not an operator -- use 'not'");
-            emit(TOKEN_ERROR, 1);
-            return;
+            return emit(TOKEN_ERROR, 1);
         case '=':
-            if (b[1] == '=') {
-                emit(TOKEN_EQUAL, 2);
-                return;
-            }
-            emit(TOKEN_ASSIGN, 1);
-            return;
+            if (b[1] == '=')
+                return emit(TOKEN_EQUAL, 2);
+            return emit(TOKEN_ASSIGN, 1);
         case '<':
-            if (b[1] == '<') {
-                emit(TOKEN_LEFT_SHIFT, 2);
-                return;
-            }
-            if (b[1] == '=') {
-                emit(TOKEN_LESS_EQUAL, 2);
-                return;
-            }
-            emit(TOKEN_LESS, 1);
-            return;
+            if (b[1] == '<')
+                return emit(TOKEN_LEFT_SHIFT, 2);
+            if (b[1] == '=')
+                return emit(TOKEN_LESS_EQUAL, 2);
+            return emit(TOKEN_LESS, 1);
         case '>':
-            if (b[1] == '>') {
-                emit(TOKEN_RIGHT_SHIFT, 2);
-                return;
-            }
-            if (b[1] == '=') {
-                emit(TOKEN_GREATER_EQUAL, 2);
-                return;
-            }
-            emit(TOKEN_GREATER, 1);
-            return;
+            if (b[1] == '>')
+                return emit(TOKEN_RIGHT_SHIFT, 2);
+            if (b[1] == '=')
+                return emit(TOKEN_GREATER_EQUAL, 2);
+            return emit(TOKEN_GREATER, 1);
         case '&':
             if (b[1] == '&') {
                 error_at("'&&' is not an operator -- use 'and'");
-                emit(TOKEN_ERROR, 2);
-                return;
+                return emit(TOKEN_ERROR, 2);
             }
-            emit(TOKEN_BITWISE_AND, 1);
-            return;
+            return emit(TOKEN_BITWISE_AND, 1);
         case '|':
             if (b[1] == '|') {
                 error_at("'||' is not an operator -- use 'or'");
-                emit(TOKEN_ERROR, 2);
-                return;
+                return emit(TOKEN_ERROR, 2);
             }
-            if (b[1] == '>') {
-                emit(TOKEN_PIPE, 2);
-                return;
-            }
-            emit(TOKEN_BITWISE_OR, 1);
-            return;
-        case '^': emit(TOKEN_BITWISE_XOR, 1); return;
+            if (b[1] == '>')
+                return emit(TOKEN_PIPE, 2);
+            return emit(TOKEN_BITWISE_OR, 1);
+        case '^': return emit(TOKEN_BITWISE_XOR, 1);
     }
 
     /* Unrecognized byte: error_at() doesn't exit in MODE_SHELL, so it must still be consumed here or parser.c's error-recovery loop spins forever re-lexing it. */
@@ -701,6 +617,7 @@ void lex() {
     emit(TOKEN_ERROR, 1);
 }
 
+/* ------------------------------------------------------------------ */
 /* Token matching utilities */
 /* ------------------------------------------------------------------ */
 
