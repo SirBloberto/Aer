@@ -2872,6 +2872,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INDEX_SET_RAW_INT] = &&lbl_index_set_raw_int,
         [OP_INDEX_SET_RAW_REAL] = &&lbl_index_set_raw_real,
         [OP_INDEX_GET_RAW_REAL] = &&lbl_index_get_raw_real,
+        [OP_CALL_SELF] = &&lbl_call_self,
         [OP_RAW_MATH_REAL] = &&lbl_raw_math_real,
         [OP_RAW_INT_TO_REAL] = &&lbl_raw_int_to_real,
         [OP_RAW_REAL_TO_INT] = &&lbl_raw_real_to_int,
@@ -3410,6 +3411,39 @@ lbl_return: {
     else
         registers[dest_reg] = aer_real((result.tag == TYPE_INTEGER) ? (double)result.as.i : result.as.d);
     pc = code + return_ip;
+    DISPATCH();
+}
+
+/* See OP_CALL_SELF (vm.h). The frame is the caller's own size and entry point, both read from the
+   caller frame rather than resolved, so this is a push and nothing else. */
+lbl_call_self: {
+    int dest_reg = (int)UNPACK_A(op_word);
+    int arg_reg_base = (int)UNPACK_B(op_word);
+    int arg_count = (int)UNPACK_C(op_word);
+    if (vm->call_depth + 1 >= VM_CALL_MAX) {
+        error("v3 call stack overflow");
+        DISPATCH();
+    }
+    CallFrame* caller = &vm->call_stack[vm->call_depth];
+    CallFrame* callee = caller + 1;
+    unsigned int fsz = caller->frame_size, entry = caller->code_offset;
+    callee->registers = registers + fsz;
+    callee->frame_size = fsz;
+    for (int i = 0; i < arg_count; i++)
+        callee->registers[i] = registers[arg_reg_base + i];
+    /* mark_vm_roots traces every slot below frame_size, so the ones this call does not fill must not
+       keep a popped frame's stale references. */
+    for (unsigned int i = (unsigned int)arg_count; i < fsz; i++)
+        callee->registers[i].tag = TYPE_NULL;
+    callee->return_ip = (unsigned int)(pc - code);
+    callee->dest_reg = dest_reg;
+    callee->dest_raw_kind = 0;
+    callee->code_offset = entry;
+    callee->tail_calls_collapsed = 0;
+    callee->synthetic_entry = false;
+    vm->call_depth++;
+    registers = callee->registers;
+    pc = code + entry;
     DISPATCH();
 }
 

@@ -146,6 +146,10 @@ typedef struct Parser {
        vm.h). -1 outside any function body. */
     int current_func_idx;
     bool self_call_seen;
+    /* Set only while a SPECIALIZED body is compiling, so a self-call inside it can skip resolution
+       (OP_CALL_SELF, vm.h). A generic body must not: resolution is what triggers specialization in
+       the first place, so bypassing it there means the variant is never compiled at all. */
+    bool in_variant;
 
     /* Same trick for the last OP_INTERP: emit_index_get folds one into OP_INDEX_GET_INTERP when the
        interpolation it is indexing with is the instruction immediately before it. */
@@ -4675,7 +4679,11 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         last_bare_call_start = c->count;
         if (needs_call_value)
             emit_call_value(c, dest, base, arg_count, callee_reg);
-        else
+        else if (P.in_variant && (int)func_index == P.current_func_idx &&
+                 arg_count == (int)func_arity && func_arity == func_min_arity) {
+            P.self_call_seen = true;
+            chunk_emit(c, PACK3(OP_CALL_SELF, dest, base, arg_count));
+        } else
             emit_call(
                 c, dest, func_offset, base, arg_count,
                 func_index); /* exact arity -- no forward-ref patching needed, is_func means already resolved */
@@ -5057,11 +5065,15 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     unsigned int new_offset = c->count;
     unsigned int max_registers = 0;
     P.current_func_idx = (int)(target_f - c->functions);
+    /* Only a numeric variant may self-call without resolving: a shape-specialized body is chosen by
+       the argument's SHAPE, which a recursive call has no guarantee of preserving. */
+    P.in_variant = (raw_param_count > 0);
     if (!parse_had_error) {
         parse_function_body(c, param_names, param_count, param_index, shape,
                             kind == SPEC_KIND_ARRAY_OF_STRUCTS, raw_param_regs, raw_param_types,
                             raw_param_count, &max_registers);
     }
+    P.in_variant = false;
     bool ok = !parse_had_error;
 
     lexer_restore_state(saved_lexer);
