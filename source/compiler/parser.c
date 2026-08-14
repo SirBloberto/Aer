@@ -4679,8 +4679,8 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         last_bare_call_start = c->count;
         if (needs_call_value)
             emit_call_value(c, dest, base, arg_count, callee_reg);
-        else if (P.in_variant && (int)func_index == P.current_func_idx &&
-                 arg_count == (int)func_arity && func_arity == func_min_arity) {
+        else if (P.in_variant && (int)func_index == P.current_func_idx && arg_count == (int)func_arity &&
+                 func_arity == func_min_arity) {
             P.self_call_seen = true;
             chunk_emit(c, PACK3(OP_CALL_SELF, dest, base, arg_count));
         } else
@@ -4802,8 +4802,7 @@ static int parse_function_expr(Chunk* c) {
     unsigned int func_start = c->count;
 
     unsigned int captured_max_registers;
-    parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0,
-                        &captured_max_registers);
+    parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0, &captured_max_registers);
 
     patch_jump(c, patch, c->count);
 
@@ -5003,8 +5002,7 @@ static void parse_function(Chunk* c) {
     bool saved_self_call = P.self_call_seen;
     P.current_func_idx = (int)this_func_idx;
     P.self_call_seen = false;
-    parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0,
-                        &captured_max_registers);
+    parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0, &captured_max_registers);
     unsigned int raw_boxed_in_body = P.raw_boxed_emits - raw_boxed_before;
     P.current_func_idx = saved_func_idx;
     P.self_call_seen = saved_self_call;

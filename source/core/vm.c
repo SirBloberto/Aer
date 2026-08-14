@@ -2458,7 +2458,7 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                 if (matches_existing) {
                     *chosen_offset = entry->raw_variant_code_offset;
                     *chosen_max_registers = entry->raw_variant_max_registers;
-                                } else if (entry->raw_param_count == 0) {
+                } else if (entry->raw_param_count == 0) {
                     /* Never attempted for THIS entry -- try to compile it now. A failure here
                        (raw_ints/raw_reals budget exhausted -- realistic, since this shape's own
                        raw field usage already competes for the same 32-slot budget) sets
@@ -2482,7 +2482,7 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                         entry->raw_param_count = cand_count;
                         *chosen_offset = entry->raw_variant_code_offset;
                         *chosen_max_registers = entry->raw_variant_max_registers;
-                                        } else {
+                    } else {
                         entry->raw_param_count = -1;
                     }
                 }
@@ -2532,7 +2532,7 @@ static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFun
                 return; /* a different numeric signature than the one compiled -- stay boxed */
         *chosen_offset = entry->raw_variant_code_offset;
         *chosen_max_registers = entry->raw_variant_max_registers;
-            return;
+        return;
     }
     if (entry->raw_param_count != 0)
         return;
@@ -2568,10 +2568,11 @@ static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFun
    both on every call regardless of which path runs. Split here rather than at the call site because
    growing lbl_call reshuffles register allocation across all 153 label bodies -- measured at +6.93%
    cycles on nbody, whose lbl_call is cold, for a call-site version of exactly this test. */
-static void __attribute__((noinline))
-vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
-                               unsigned int ip, unsigned int* chosen_offset,
-                               unsigned int* chosen_max_registers) {
+static void __attribute__((noinline)) vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f,
+                                                                     AerVal* registers, int arg_reg_base,
+                                                                     unsigned int ip,
+                                                                     unsigned int* chosen_offset,
+                                                                     unsigned int* chosen_max_registers) {
     if (target_f->shape_sensitive_mask == SHAPE_MASK_NUMERIC_ONLY) {
         vm_call_resolve_numeric(c, target_f, registers, arg_reg_base, chosen_offset, chosen_max_registers);
         return;
