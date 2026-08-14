@@ -459,10 +459,6 @@ void vm_init(VM* vm, Chunk* chunk) {
        else a fresh run needs is exactly what aer_vm_reset_for_reuse() already does. */
     vm->call_stack[0].registers = &vm->register_stack[0];
     vm->call_stack[0].frame_size = FRAME_REGISTERS;
-    vm->call_stack[0].raw_ints = &vm->raw_int_stack[0];
-    vm->call_stack[0].raw_reals = &vm->raw_real_stack[0];
-    vm->call_stack[0].raw_int_frame_size = RAW_REGISTERS_INT;
-    vm->call_stack[0].raw_real_frame_size = RAW_REGISTERS_REAL;
     aer_vm_reset_for_reuse(vm);
 }
 
@@ -1168,10 +1164,6 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
     CallFrame* callee = &target->call_stack[target->call_depth + 1];
     callee->registers = caller->registers + caller->frame_size;
     callee->frame_size = fn->max_registers;
-    callee->raw_ints = caller->raw_ints + caller->raw_int_frame_size;
-    callee->raw_reals = caller->raw_reals + caller->raw_real_frame_size;
-    callee->raw_int_frame_size = fn->max_raw_ints;
-    callee->raw_real_frame_size = fn->max_raw_reals;
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = args[i];
     for (int i = arg_count; i < (int)fn->arity; i++)
@@ -1223,12 +1215,9 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         CallFrame* reused = &vm->call_stack[vm->call_depth];
         reused->code_offset = f->code_offset; /* reused frame now runs a different function */
         /* Same stale-sizing hazard as lbl_call's OP_TAIL_CALL branch (see its own comment) -- `f`
-           may need a different max_registers/max_raw_ints/max_raw_reals than whatever function
-           last occupied this frame. Must be refreshed here too, not just on the non-tail push path
-           above (which already sizes from f->max_registers/max_raw_ints/max_raw_reals). */
+           may need a different max_registers than whatever function last occupied this frame.
+           Must be refreshed here too, not just on the non-tail push path above. */
         reused->frame_size = f->max_registers;
-        reused->raw_int_frame_size = f->max_raw_ints;
-        reused->raw_real_frame_size = f->max_raw_reals;
         /* Growing the reused frame exposes registers the previous occupant never wrote, which
            mark_vm_roots would still trace -- same clear as the two push paths. */
         for (unsigned int i = f->arity; i < f->max_registers; i++)
@@ -1243,10 +1232,6 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
     callee->registers = caller->registers + caller->frame_size;
     callee->frame_size = f->max_registers;
-    callee->raw_ints = caller->raw_ints + caller->raw_int_frame_size;
-    callee->raw_reals = caller->raw_reals + caller->raw_real_frame_size;
-    callee->raw_int_frame_size = f->max_raw_ints;
-    callee->raw_real_frame_size = f->max_raw_reals;
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = caller->registers[arg_reg_base + i];
     for (int i = arg_count; i < (int)f->arity; i++)
@@ -1774,7 +1759,7 @@ static bool vm_check_narrow_field_write(ValueType ftype, bool narrow, AerVal val
 
 /* Narrow (4-byte) counterparts of the raw-slot memcpy's the wide RAW opcode family (vm_run_slice's
    own OP_FIELD_GET_RAW_INT/REAL etc. handlers) uses -- widen into an ordinary int64_t/double
-   raw_ints[]/raw_reals[] slot on read, narrow back on write. No range check on the int32 write side
+   registers[].as.i/registers[].as.d slot on read, narrow back on write. No range check on the int32 write side
    -- see the narrow RAW opcode family's own comment (vm.h) for why that's the intentional,
    consistent-with-every-other-raw-opcode tradeoff here. */
 static inline int64_t vm_raw_read_int32(unsigned char* p) {
@@ -2316,20 +2301,23 @@ static void chunk_ensure_call_spec_cache(Chunk* c) {
     memset(c->call_spec_cache + old_cap, 0, sizeof(CallSpecCacheEntry) * (c->call_spec_cache_cap - old_cap));
 }
 
-/* Writes the arguments a variant binds raw straight into the callee's raw bank. The arguments have
+/* Places the arguments a variant binds unchecked into the callee's own slots. The arguments have
    already been read to choose the variant, and their types already checked against what it was
-   compiled for, so this is the whole of what the per-parameter prologue opcodes used to do. */
+   compiled for, so this is the whole of what the per-parameter prologue opcodes used to do. An int
+   argument a real parameter binds is widened here, since the body will only ever read it as one.
+   Runs AFTER the ordinary argument copy and the frame clear, never before: a bound slot is an
+   ordinary register now, and either of those would otherwise overwrite it. */
 static inline void vm_bind_raw_params(const SpecEntry* e, AerVal* registers, int arg_reg_base,
-                                      int64_t* callee_raw_ints, double* callee_raw_reals) {
+                                      AerVal* callee_regs) {
     for (int k = 0; k < e->raw_param_count; k++) {
         int slot = e->raw_param_slots[k];
         if (slot < 0)
-            continue; /* budget ran out for this one -- it stayed boxed */
+            continue; /* budget ran out for this one -- it stayed dynamically typed */
         AerVal v = registers[arg_reg_base + e->raw_param_regs[k]];
         if (e->raw_param_types[k] == TYPE_INTEGER)
-            callee_raw_ints[slot] = v.as.i;
+            callee_regs[slot] = v;
         else
-            callee_raw_reals[slot] = (v.tag == TYPE_INTEGER) ? (double)v.as.i : v.as.d;
+            callee_regs[slot] = aer_real((v.tag == TYPE_INTEGER) ? (double)v.as.i : v.as.d);
     }
 }
 
@@ -2337,10 +2325,10 @@ static inline void vm_bind_raw_params(const SpecEntry* e, AerVal* registers, int
    by far the largest handler in vm_run_slice, next-largest under 40 -- so every ordinary call paid
    its icache cost without executing it. noinline is required: a static function with one call site
    is a prime candidate for LTO to inline right back in. */
-static void __attribute__((noinline)) vm_call_resolve_specialization_full(
-    Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base, unsigned int ip,
-    unsigned int* chosen_offset, unsigned int* chosen_max_registers, unsigned int* chosen_max_raw_ints,
-    unsigned int* chosen_max_raw_reals, int64_t* callee_raw_ints, double* callee_raw_reals) {
+static void __attribute__((noinline))
+vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
+                                    unsigned int ip, unsigned int* chosen_offset,
+                                    unsigned int* chosen_max_registers, const SpecEntry** out_bind) {
     unsigned int site =
         ip - 3; /* this instruction's own word0 offset -- ip already advanced past all 3 words by now */
     /* Lowest set bit -- which argument register carries the shape-sensitive parameter. Only
@@ -2405,8 +2393,6 @@ static void __attribute__((noinline)) vm_call_resolve_specialization_full(
         if (site_entry->last_shape == observed) {
             *chosen_offset = site_entry->last_code_offset;
             *chosen_max_registers = site_entry->last_max_registers;
-            *chosen_max_raw_ints = site_entry->last_max_raw_ints;
-            *chosen_max_raw_reals = site_entry->last_max_raw_reals;
             entry = site_entry->last_entry;
         } else {
             SpecEntry* found = NULL;
@@ -2447,13 +2433,9 @@ static void __attribute__((noinline)) vm_call_resolve_specialization_full(
                 site_entry->last_shape = found->shape;
                 site_entry->last_code_offset = found->code_offset;
                 site_entry->last_max_registers = found->max_registers;
-                site_entry->last_max_raw_ints = found->max_raw_ints;
-                site_entry->last_max_raw_reals = found->max_raw_reals;
                 site_entry->last_entry = found;
                 *chosen_offset = found->code_offset;
                 *chosen_max_registers = found->max_registers;
-                *chosen_max_raw_ints = found->max_raw_ints;
-                *chosen_max_raw_reals = found->max_raw_reals;
                 entry = found;
             }
         }
@@ -2496,9 +2478,7 @@ static void __attribute__((noinline)) vm_call_resolve_specialization_full(
                 if (matches_existing) {
                     *chosen_offset = entry->raw_variant_code_offset;
                     *chosen_max_registers = entry->raw_variant_max_registers;
-                    *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
-                    *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
-                    vm_bind_raw_params(entry, registers, arg_reg_base, callee_raw_ints, callee_raw_reals);
+                    *out_bind = entry;
                 } else if (entry->raw_param_count == 0) {
                     /* Never attempted for THIS entry -- try to compile it now. A failure here
                        (raw_ints/raw_reals budget exhausted -- realistic, since this shape's own
@@ -2516,8 +2496,6 @@ static void __attribute__((noinline)) vm_call_resolve_specialization_full(
                         chunk_ensure_call_spec_cache(c);
                         entry->raw_variant_code_offset = variant.code_offset;
                         entry->raw_variant_max_registers = variant.max_registers;
-                        entry->raw_variant_max_raw_ints = variant.max_raw_ints;
-                        entry->raw_variant_max_raw_reals = variant.max_raw_reals;
                         for (int k = 0; k < cand_count; k++) {
                             entry->raw_param_regs[k] = cand_regs[k];
                             entry->raw_param_types[k] = cand_types[k];
@@ -2527,9 +2505,7 @@ static void __attribute__((noinline)) vm_call_resolve_specialization_full(
                             entry->raw_param_slots[k] = variant.raw_param_slots[k];
                         *chosen_offset = entry->raw_variant_code_offset;
                         *chosen_max_registers = entry->raw_variant_max_registers;
-                        *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
-                        *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
-                        vm_bind_raw_params(entry, registers, arg_reg_base, callee_raw_ints, callee_raw_reals);
+                        *out_bind = entry;
                     } else {
                         entry->raw_param_count = -1;
                     }
@@ -2547,11 +2523,11 @@ static void __attribute__((noinline)) vm_call_resolve_specialization_full(
    arrived with the types the variant was compiled for -- read straight from the argument registers,
    needing neither the site cache nor the shape table. specializations[0] holds it; shape stays NULL
    because nothing ever looks this entry up by shape. */
-static void __attribute__((noinline))
-vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
-                        unsigned int* chosen_offset, unsigned int* chosen_max_registers,
-                        unsigned int* chosen_max_raw_ints, unsigned int* chosen_max_raw_reals,
-                        int64_t* callee_raw_ints, double* callee_raw_reals) {
+static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f,
+                                                              AerVal* registers, int arg_reg_base,
+                                                              unsigned int* chosen_offset,
+                                                              unsigned int* chosen_max_registers,
+                                                              const SpecEntry** out_bind) {
     int cand_regs[SPEC_MAX_RAW_PARAMS];
     ValueType cand_types[SPEC_MAX_RAW_PARAMS];
     int cand_count = 0;
@@ -2581,9 +2557,7 @@ vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, in
                 return; /* a different numeric signature than the one compiled -- stay boxed */
         *chosen_offset = entry->raw_variant_code_offset;
         *chosen_max_registers = entry->raw_variant_max_registers;
-        *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
-        *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
-        vm_bind_raw_params(entry, registers, arg_reg_base, callee_raw_ints, callee_raw_reals);
+        *out_bind = entry;
         return;
     }
     if (entry->raw_param_count != 0)
@@ -2606,8 +2580,6 @@ vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, in
     chunk_ensure_call_spec_cache(c);
     entry->raw_variant_code_offset = variant.code_offset;
     entry->raw_variant_max_registers = variant.max_registers;
-    entry->raw_variant_max_raw_ints = variant.max_raw_ints;
-    entry->raw_variant_max_raw_reals = variant.max_raw_reals;
     for (int k = 0; k < cand_count; k++) {
         entry->raw_param_regs[k] = cand_regs[k];
         entry->raw_param_types[k] = cand_types[k];
@@ -2617,9 +2589,7 @@ vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, in
         entry->raw_param_slots[k] = variant.raw_param_slots[k];
     *chosen_offset = entry->raw_variant_code_offset;
     *chosen_max_registers = entry->raw_variant_max_registers;
-    *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
-    *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
-    vm_bind_raw_params(entry, registers, arg_reg_base, callee_raw_ints, callee_raw_reals);
+    *out_bind = entry;
 }
 
 /* The monomorphic case, split off so it does not pay for the full resolver's frame: that one is
@@ -2627,13 +2597,13 @@ vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, in
    both on every call regardless of which path runs. Split here rather than at the call site because
    growing lbl_call reshuffles register allocation across all 153 label bodies -- measured at +6.93%
    cycles on nbody, whose lbl_call is cold, for a call-site version of exactly this test. */
-static void __attribute__((noinline)) vm_call_resolve_specialization(
-    Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base, unsigned int ip,
-    unsigned int* chosen_offset, unsigned int* chosen_max_registers, unsigned int* chosen_max_raw_ints,
-    unsigned int* chosen_max_raw_reals, int64_t* callee_raw_ints, double* callee_raw_reals) {
+static void __attribute__((noinline))
+vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
+                               unsigned int ip, unsigned int* chosen_offset,
+                               unsigned int* chosen_max_registers, const SpecEntry** out_bind) {
     if (target_f->shape_sensitive_mask == SHAPE_MASK_NUMERIC_ONLY) {
         vm_call_resolve_numeric(c, target_f, registers, arg_reg_base, chosen_offset, chosen_max_registers,
-                                chosen_max_raw_ints, chosen_max_raw_reals, callee_raw_ints, callee_raw_reals);
+                                out_bind);
         return;
     }
     unsigned int site = ip - 3;
@@ -2646,13 +2616,10 @@ static void __attribute__((noinline)) vm_call_resolve_specialization(
         const CallSpecCacheEntry* hit = &c->call_spec_cache[site];
         *chosen_offset = hit->last_code_offset;
         *chosen_max_registers = hit->last_max_registers;
-        *chosen_max_raw_ints = hit->last_max_raw_ints;
-        *chosen_max_raw_reals = hit->last_max_raw_reals;
         return;
     }
     vm_call_resolve_specialization_full(c, target_f, registers, arg_reg_base, ip, chosen_offset,
-                                        chosen_max_registers, chosen_max_raw_ints, chosen_max_raw_reals,
-                                        callee_raw_ints, callee_raw_reals);
+                                        chosen_max_registers, out_bind);
 }
 
 /* lbl_call_module's cold path, split for the same reason as vm_call_resolve_specialization: inlined
@@ -2806,8 +2773,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
        the dispatch loop (perf annotate, nbody). The backing stacks are fixed-size inline VM
        arrays, never reallocated, so caching them across dispatches is safe. */
     AerVal* registers = vm->call_stack[vm->call_depth].registers;
-    int64_t* raw_ints = vm->call_stack[vm->call_depth].raw_ints;
-    double* raw_reals = vm->call_stack[vm->call_depth].raw_reals;
     /* Only ever read/decremented at the handful of yield-checkpoints below; never touched when
        max_instructions is 0. */
     unsigned int slice_budget = max_instructions;
@@ -2940,10 +2905,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_MATH_REAL] = &&lbl_raw_math_real,
         [OP_RAW_INT_TO_REAL] = &&lbl_raw_int_to_real,
         [OP_RAW_REAL_TO_INT] = &&lbl_raw_real_to_int,
-        [OP_CALL_RAW_INT] = &&lbl_call_raw_int,
-        [OP_CALL_RAW_REAL] = &&lbl_call_raw_real,
-        [OP_RETURN_RAW_INT] = &&lbl_return_raw_int,
-        [OP_RETURN_RAW_REAL] = &&lbl_return_raw_real,
         [OP_DESTRUCTURE] = &&lbl_destructure,
         [OP_SLICE_GET] = &&lbl_slice_get,
         [OP_DICT_NEW] = &&lbl_dict_new,
@@ -2991,8 +2952,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_RAW_NEQ_INT] = &&lbl_raw_neq_int,
         [OP_RAW_EQ_REAL] = &&lbl_raw_eq_real,
         [OP_RAW_NEQ_REAL] = &&lbl_raw_neq_real,
-        [OP_BOX_INT] = &&lbl_box_int,
-        [OP_BOX_REAL] = &&lbl_box_real,
         [OP_UNBOX_INT] = &&lbl_unbox_int,
         [OP_UNBOX_REAL] = &&lbl_unbox_real,
         [OP_RAW_MOVE_INT] = &&lbl_raw_move_int,
@@ -3332,7 +3291,7 @@ lbl_call: {
     int callee_offset = READ();
     /* The target's BYTE offset into c->functions[] -- always present (emit_call always emits it,
        patched in later by func_register for a forward reference), letting this size the callee's
-       frame from its real max_registers/max_raw_ints/max_raw_reals peaks instead of a flat,
+       frame from its real max_registers peak instead of a flat,
        function-agnostic ceiling. A byte offset rather than an index because ChunkFunction is not a
        power of two, so indexing cost a multiply on every call. */
     unsigned int func_byte_offset = (unsigned int)READ();
@@ -3347,25 +3306,19 @@ lbl_call: {
        but forward-referenced and self-recursive calls need their opcode chosen before that. */
     unsigned int chosen_offset = (unsigned int)callee_offset;
     unsigned int chosen_max_registers = target_f->max_registers;
-    unsigned int chosen_max_raw_ints = target_f->max_raw_ints;
-    unsigned int chosen_max_raw_reals = target_f->max_raw_reals;
+    const SpecEntry* bind_entry = NULL;
 
     if (!target_f->megamorphic && target_f->shape_sensitive_mask != 0) {
         /* The out-params are scoped to this branch on purpose. Taking the address of the chosen_*
-           locals themselves forces all four into memory for the WHOLE handler -- an address that
-           escapes cannot live in a register -- so every ordinary call paid four stores and four
-           address computations for a path it never takes. */
+           locals themselves forces both into memory for the WHOLE handler -- an address that escapes
+           cannot live in a register -- so every ordinary call paid stores and address computations
+           for a path it never takes. */
         unsigned int spec_offset = chosen_offset, spec_registers = chosen_max_registers;
-        unsigned int spec_raw_ints = chosen_max_raw_ints, spec_raw_reals = chosen_max_raw_reals;
         unsigned int resume_at = (unsigned int)(pc - code);
         vm_call_resolve_specialization(c, target_f, registers, arg_reg_base, resume_at, &spec_offset,
-                                       &spec_registers, &spec_raw_ints, &spec_raw_reals,
-                                       raw_ints + vm->call_stack[vm->call_depth].raw_int_frame_size,
-                                       raw_reals + vm->call_stack[vm->call_depth].raw_real_frame_size);
+                                       &spec_registers, &bind_entry);
         chosen_offset = spec_offset;
         chosen_max_registers = spec_registers;
-        chosen_max_raw_ints = spec_raw_ints;
-        chosen_max_raw_reals = spec_raw_reals;
         /* Compiling a specialized body can realloc any of the chunk's growable arrays, so every
            hoisted pointer into them is refreshed here. const_pool looks safe -- a recompile of the
            same source finds every constant already interned -- but chunk_add_pool dedups
@@ -3378,15 +3331,11 @@ lbl_call: {
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
-    /* registers/raw_ints/raw_reals are the hoisted copies of this same frame's three bases -- every
-       site that changes frames reassigns them together -- so reading them back out of `caller` is
-       four redundant dependent loads on the hottest path in the interpreter. */
+    /* `registers` is the hoisted copy of this same frame's base -- every site that changes frames
+       reassigns it -- so reading it back out of `caller` is a redundant dependent load on the
+       hottest path in the interpreter. */
     callee->registers = registers + caller->frame_size;
     callee->frame_size = chosen_max_registers;
-    callee->raw_ints = raw_ints + caller->raw_int_frame_size;
-    callee->raw_reals = raw_reals + caller->raw_real_frame_size;
-    callee->raw_int_frame_size = chosen_max_raw_ints;
-    callee->raw_real_frame_size = chosen_max_raw_reals;
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = registers[arg_reg_base + i];
     /* mark_vm_roots traces every register below frame_size, so the ones this call does not fill are
@@ -3395,6 +3344,8 @@ lbl_call: {
        value_has_cell, which reads the tag and nothing else, so the payload can stay garbage. */
     for (unsigned int i = (unsigned int)arg_count; i < chosen_max_registers; i++)
         callee->registers[i].tag = TYPE_NULL;
+    if (bind_entry)
+        vm_bind_raw_params(bind_entry, registers, arg_reg_base, callee->registers);
     callee->return_ip =
         (unsigned int)(pc - code); /* already past this instruction's operands -- the correct resume point */
     callee->dest_reg = dest_reg;
@@ -3403,12 +3354,7 @@ lbl_call: {
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
     vm->call_depth++;
-    /* Straight off the frame this handler already built -- the VM-level copies were a cache with no
-       hot reader (mark_vm_roots scans call_stack[f].registers, not these), so maintaining them cost
-       three stores here and three more on every return. */
     registers = callee->registers;
-    raw_ints = callee->raw_ints;
-    raw_reals = callee->raw_reals;
     pc = code + chosen_offset;
     if (max_instructions && --slice_budget == 0) {
         vm->ip = (unsigned int)(pc - code);
@@ -3439,8 +3385,6 @@ lbl_tail_call: {
        computes its child's base from the wrong frame_size and overlaps still-live slots. The base
        pointers are untouched -- same frame, same memory, only the claim changes. */
     reused->frame_size = target_f->max_registers;
-    reused->raw_int_frame_size = target_f->max_raw_ints;
-    reused->raw_real_frame_size = target_f->max_raw_reals;
     reused->tail_calls_collapsed++;
     /* Every call (tail or not) is the other place a script can spend unbounded time (recursion
        instead of a loop) -- checked once pc already points at the callee's real entry point, so a
@@ -3468,8 +3412,6 @@ lbl_call_value: {
     /* vm_call_value may have pushed a frame (non-tail) or reused this one (tail) -- refresh from
        whichever is now current, either way. */
     registers = vm->call_stack[vm->call_depth].registers;
-    raw_ints = vm->call_stack[vm->call_depth].raw_ints;
-    raw_reals = vm->call_stack[vm->call_depth].raw_reals;
     DISPATCH();
 }
 
@@ -3489,10 +3431,6 @@ lbl_return: {
        dest_reg's index instead of writing the return value where the caller expects it. */
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     registers = caller->registers;
-    raw_ints = caller->raw_ints;
-    raw_reals = caller->raw_reals;
-    /* A raw-expecting caller (OP_CALL_RAW_*) can still reach an ordinary return -- the same body
-       serves both entry points, and only some of its returns may be raw. */
     if (dest_raw_kind == 0)
         registers[dest_reg] = result;
     else if (result.tag != TYPE_INTEGER && result.tag != TYPE_REAL)
@@ -3501,55 +3439,9 @@ lbl_return: {
            be a clear error into a wrong answer. */
         error("Expected a number back from this call, got %s", vm_type_name(c, result));
     else if (dest_raw_kind == 1)
-        raw_ints[dest_reg] = (result.tag == TYPE_REAL) ? (int64_t)result.as.d : result.as.i;
+        registers[dest_reg] = aer_int((result.tag == TYPE_REAL) ? (int64_t)result.as.d : result.as.i);
     else
-        raw_reals[dest_reg] = (result.tag == TYPE_INTEGER) ? (double)result.as.i : result.as.d;
-    pc = code + return_ip;
-    DISPATCH();
-}
-
-/* The raw counterparts. Boxing here (dest_raw_kind == 0) is the ordinary case for a variant body
-   entered from a plain call site, not a fallback. */
-lbl_return_raw_int: {
-    int src = (int)UNPACK_A(op_word);
-    CallFrame* callee = &vm->call_stack[vm->call_depth];
-    int64_t result = callee->raw_ints[src];
-    unsigned int return_ip = callee->return_ip;
-    int dest_reg = callee->dest_reg;
-    unsigned char dest_raw_kind = callee->dest_raw_kind;
-    vm->call_depth--;
-    CallFrame* caller = &vm->call_stack[vm->call_depth];
-    registers = caller->registers;
-    raw_ints = caller->raw_ints;
-    raw_reals = caller->raw_reals;
-    if (dest_raw_kind == 1)
-        raw_ints[dest_reg] = result;
-    else if (dest_raw_kind == 0)
-        registers[dest_reg] = aer_int(result);
-    else
-        raw_reals[dest_reg] = (double)result;
-    pc = code + return_ip;
-    DISPATCH();
-}
-
-lbl_return_raw_real: {
-    int src = (int)UNPACK_A(op_word);
-    CallFrame* callee = &vm->call_stack[vm->call_depth];
-    double result = callee->raw_reals[src];
-    unsigned int return_ip = callee->return_ip;
-    int dest_reg = callee->dest_reg;
-    unsigned char dest_raw_kind = callee->dest_raw_kind;
-    vm->call_depth--;
-    CallFrame* caller = &vm->call_stack[vm->call_depth];
-    registers = caller->registers;
-    raw_ints = caller->raw_ints;
-    raw_reals = caller->raw_reals;
-    if (dest_raw_kind == 2)
-        raw_reals[dest_reg] = result;
-    else if (dest_raw_kind == 0)
-        registers[dest_reg] = aer_real(result);
-    else
-        raw_ints[dest_reg] = (int64_t)result;
+        registers[dest_reg] = aer_real((result.tag == TYPE_INTEGER) ? (double)result.as.i : result.as.d);
     pc = code + return_ip;
     DISPATCH();
 }
@@ -3558,69 +3450,22 @@ lbl_return_raw_real: {
    reached with a real result. */
 lbl_raw_math_real: {
     int dest = (int)UNPACK_A(op_word);
-    double x = raw_reals[UNPACK_B(op_word)];
+    double x = registers[UNPACK_B(op_word)].as.d;
     /* sqrt is one machine instruction and the overwhelming majority of the traffic. Calling out for
        it put a real call in the dispatch loop, which costs far more than the call itself: every
        hoisted pointer becomes call-clobbered, and the register allocator pessimizes accordingly.
        nbody was executing 13% fewer instructions than before this opcode existed and still spending
        10% more cycles. The rest are rare enough to keep paying for the call. */
     if (UNPACK_C(op_word) == FN_MATH_SQRT && x >= 0) {
-        raw_reals[dest] = sqrt(x);
+        registers[dest] = aer_real(sqrt(x));
         DISPATCH();
     }
     double out;
     SYNC_IP();
     if (aer_math_unary_raw((int)UNPACK_C(op_word), x, &out))
-        raw_reals[dest] = out;
+        registers[dest] = aer_real(out);
     DISPATCH();
 }
-
-/* Recursive call inside a numeric variant: arguments move raw slot to raw slot and the result comes
-   back the same way. The callee is the SAME function running the SAME variant, so its frame is the
-   caller's with three fields changed -- every size, and the entry point, already sit in the caller
-   frame this handler touches anyway. Taking them from there costs no resolver, no walk to the
-   SpecEntry, and no room in the instruction for the callee's identity. Registers are still cleared:
-   a variant body may use boxed ones, and mark_vm_roots traces every one below frame_size. */
-#define CALL_RAW(kindname, bank)                                                                             \
-    lbl_call_raw_##kindname : {                                                                              \
-        int dest_slot = (int)UNPACK_A(op_word);                                                              \
-        int arg_slot_base = (int)UNPACK_B(op_word);                                                          \
-        int arg_count = (int)UNPACK_C(op_word);                                                              \
-        unsigned int ret_kind = (unsigned int)READ();                                                        \
-        if (vm->call_depth + 1 >= VM_CALL_MAX) {                                                             \
-            error("v3 call stack overflow");                                                                 \
-            DISPATCH();                                                                                      \
-        }                                                                                                    \
-        CallFrame* caller = &vm->call_stack[vm->call_depth];                                                 \
-        CallFrame* callee = caller + 1;                                                                      \
-        unsigned int fsz = caller->frame_size, isz = caller->raw_int_frame_size;                             \
-        unsigned int rsz = caller->raw_real_frame_size, entry = caller->code_offset;                         \
-        callee->registers = registers + fsz;                                                                 \
-        callee->frame_size = fsz;                                                                            \
-        callee->raw_ints = raw_ints + isz;                                                                   \
-        callee->raw_reals = raw_reals + rsz;                                                                 \
-        callee->raw_int_frame_size = isz;                                                                    \
-        callee->raw_real_frame_size = rsz;                                                                   \
-        for (int i = 0; i < arg_count; i++)                                                                  \
-            callee->bank[i] = bank[arg_slot_base + i];                                                       \
-        for (unsigned int i = 0; i < fsz; i++)                                                               \
-            callee->registers[i].tag = TYPE_NULL;                                                            \
-        callee->return_ip = (unsigned int)(pc - code);                                                       \
-        callee->dest_reg = dest_slot;                                                                        \
-        callee->dest_raw_kind = (unsigned char)ret_kind;                                                     \
-        callee->code_offset = entry;                                                                         \
-        callee->tail_calls_collapsed = 0;                                                                    \
-        callee->synthetic_entry = false;                                                                     \
-        vm->call_depth++;                                                                                    \
-        registers = callee->registers;                                                                       \
-        raw_ints = callee->raw_ints;                                                                         \
-        raw_reals = callee->raw_reals;                                                                       \
-        pc = code + entry;                                                                                   \
-        DISPATCH();                                                                                          \
-    }
-
-    CALL_RAW(int, raw_ints)
-    CALL_RAW(real, raw_reals)
 
 #undef CALL_RAW
 
@@ -3776,7 +3621,7 @@ lbl_typed_index_set_unchecked: {
 lbl_index_set_raw_int: {
     AerVal obj = registers[(int)UNPACK_A(op_word)];
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
-    int64_t v = raw_ints[UNPACK_C(op_word)];
+    int64_t v = registers[UNPACK_C(op_word)].as.i;
     if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
         AerTypedArray* ta = aer_as_typed_array(obj);
         if ((uint64_t)idx->as.i < (uint64_t)ta->count) {
@@ -3798,7 +3643,7 @@ lbl_index_set_raw_int: {
 lbl_index_set_raw_real: {
     AerVal obj = registers[(int)UNPACK_A(op_word)];
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
-    double v = raw_reals[UNPACK_C(op_word)];
+    double v = registers[UNPACK_C(op_word)].as.d;
     if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
         AerTypedArray* ta = aer_as_typed_array(obj);
         if ((uint64_t)idx->as.i < (uint64_t)ta->count) {
@@ -3826,14 +3671,15 @@ lbl_index_get_raw_int: {
         if ((uint64_t)idx->as.i < (uint64_t)ta->count &&
             (ta->elem_kind == TYPED_ELEM_INT32 || ta->elem_kind == TYPED_ELEM_INT64)) {
             unsigned int width = vm_typed_elem_width(ta->elem_kind);
-            raw_ints[dest] = vm_typed_elem_read_int(ta->data + (size_t)idx->as.i * width, ta->elem_kind);
+            registers[dest] =
+                aer_int(vm_typed_elem_read_int(ta->data + (size_t)idx->as.i * width, ta->elem_kind));
             DISPATCH();
         }
     }
     AerVal v;
     vm_index_get_compute(obj, *idx, &v);
     if (v.tag == TYPE_INTEGER)
-        raw_ints[dest] = v.as.i;
+        registers[dest] = aer_int(v.as.i);
     else
         error("Expected an integer from this index, got %s", vm_type_name(c, v));
     if (aer_type(obj) == TYPE_STRING)
@@ -3850,16 +3696,17 @@ lbl_index_get_raw_real: {
         if ((uint64_t)idx->as.i < (uint64_t)ta->count &&
             (ta->elem_kind == TYPED_ELEM_FLOAT32 || ta->elem_kind == TYPED_ELEM_FLOAT64)) {
             unsigned int width = vm_typed_elem_width(ta->elem_kind);
-            raw_reals[dest] = vm_typed_elem_read_real(ta->data + (size_t)idx->as.i * width, ta->elem_kind);
+            registers[dest] =
+                aer_real(vm_typed_elem_read_real(ta->data + (size_t)idx->as.i * width, ta->elem_kind));
             DISPATCH();
         }
     }
     AerVal v;
     vm_index_get_compute(obj, *idx, &v);
     if (v.tag == TYPE_REAL)
-        raw_reals[dest] = v.as.d;
+        registers[dest] = aer_real(v.as.d);
     else if (v.tag == TYPE_INTEGER)
-        raw_reals[dest] = (double)v.as.i;
+        registers[dest] = aer_real((double)v.as.i);
     else
         error("Expected a number from this index, got %s", vm_type_name(c, v));
     if (aer_type(obj) == TYPE_STRING)
@@ -4376,7 +4223,8 @@ lbl_index_field_get_raw_int: {
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    memcpy(&raw_ints[dest_slot], elem, 8);
+    registers[dest_slot].tag = TYPE_INTEGER;
+    memcpy(&registers[dest_slot].as.i, elem, 8);
     DISPATCH();
 }
 
@@ -4389,7 +4237,8 @@ lbl_index_field_get_raw_real: {
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    memcpy(&raw_reals[dest_slot], elem, 8);
+    registers[dest_slot].tag = TYPE_REAL;
+    memcpy(&registers[dest_slot].as.d, elem, 8);
     DISPATCH();
 }
 
@@ -4403,7 +4252,8 @@ lbl_field_get_raw_int: {
         DISPATCH();
     }
     AerStruct* oa = aer_as_struct(obj);
-    memcpy(&raw_ints[dest_slot], oa->fields + foffset, 8);
+    registers[dest_slot].tag = TYPE_INTEGER;
+    memcpy(&registers[dest_slot].as.i, oa->fields + foffset, 8);
     DISPATCH();
 }
 
@@ -4417,12 +4267,13 @@ lbl_field_get_raw_real: {
         DISPATCH();
     }
     AerStruct* oa = aer_as_struct(obj);
-    memcpy(&raw_reals[dest_slot], oa->fields + foffset, 8);
+    registers[dest_slot].tag = TYPE_REAL;
+    memcpy(&registers[dest_slot].as.d, oa->fields + foffset, 8);
     DISPATCH();
 }
 
 /* Narrow (int32/float32) counterparts of the 4 GET opcodes above -- same contract, but the field's
-   storage is 4 bytes, widened into the same int64_t/double raw_ints[]/raw_reals[] slots the wide
+   storage is 4 bytes, widened into the same int64_t/double registers[].as.i/registers[].as.d slots the wide
    opcodes and every raw arithmetic opcode already use. */
 lbl_index_field_get_raw_int32: {
     int dest_slot = (int)UNPACK_A(op_word);
@@ -4433,7 +4284,7 @@ lbl_index_field_get_raw_int32: {
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    raw_ints[dest_slot] = vm_raw_read_int32(elem);
+    registers[dest_slot] = aer_int(vm_raw_read_int32(elem));
     DISPATCH();
 }
 
@@ -4446,7 +4297,7 @@ lbl_index_field_get_raw_float32: {
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    raw_reals[dest_slot] = vm_raw_read_float32(elem);
+    registers[dest_slot] = aer_real(vm_raw_read_float32(elem));
     DISPATCH();
 }
 
@@ -4460,7 +4311,7 @@ lbl_field_get_raw_int32: {
         DISPATCH();
     }
     AerStruct* oa = aer_as_struct(obj);
-    raw_ints[dest_slot] = vm_raw_read_int32(oa->fields + foffset);
+    registers[dest_slot] = aer_int(vm_raw_read_int32(oa->fields + foffset));
     DISPATCH();
 }
 
@@ -4474,7 +4325,7 @@ lbl_field_get_raw_float32: {
         DISPATCH();
     }
     AerStruct* oa = aer_as_struct(obj);
-    raw_reals[dest_slot] = vm_raw_read_float32(oa->fields + foffset);
+    registers[dest_slot] = aer_real(vm_raw_read_float32(oa->fields + foffset));
     DISPATCH();
 }
 
@@ -4487,7 +4338,7 @@ lbl_index_field_set_raw_int: {
     unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    memcpy(elem, &raw_ints[src_slot], 8);
+    memcpy(elem, &registers[src_slot].as.i, 8);
     DISPATCH();
 }
 
@@ -4500,7 +4351,7 @@ lbl_index_field_set_raw_real: {
     unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    memcpy(elem, &raw_reals[src_slot], 8);
+    memcpy(elem, &registers[src_slot].as.d, 8);
     DISPATCH();
 }
 
@@ -4514,7 +4365,7 @@ lbl_field_set_raw_int: {
         DISPATCH();
     }
     AerStruct* oa = aer_as_struct(obj);
-    memcpy(oa->fields + foffset, &raw_ints[src_slot], 8);
+    memcpy(oa->fields + foffset, &registers[src_slot].as.i, 8);
     DISPATCH();
 }
 
@@ -4528,12 +4379,12 @@ lbl_field_set_raw_real: {
         DISPATCH();
     }
     AerStruct* oa = aer_as_struct(obj);
-    memcpy(oa->fields + foffset, &raw_reals[src_slot], 8);
+    memcpy(oa->fields + foffset, &registers[src_slot].as.d, 8);
     DISPATCH();
 }
 
-/* Narrow (int32/float32) counterparts of the 4 SET opcodes above -- narrows the raw_ints[]/
-   raw_reals[] slot's int64_t/double value back down to 4 bytes on write. No range check on the
+/* Narrow (int32/float32) counterparts of the 4 SET opcodes above -- narrows the registers[].as.i/
+   registers[].as.d slot's int64_t/double value back down to 4 bytes on write. No range check on the
    int32 side -- see the narrow RAW opcode family's own comment (vm.h) for why. */
 lbl_index_field_set_raw_int32: {
     int obj_reg = (int)UNPACK_A(op_word);
@@ -4544,7 +4395,7 @@ lbl_index_field_set_raw_int32: {
     unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    vm_raw_write_int32(elem, raw_ints[src_slot]);
+    vm_raw_write_int32(elem, registers[src_slot].as.i);
     DISPATCH();
 }
 
@@ -4557,7 +4408,7 @@ lbl_index_field_set_raw_float32: {
     unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    vm_raw_write_float32(elem, raw_reals[src_slot]);
+    vm_raw_write_float32(elem, registers[src_slot].as.d);
     DISPATCH();
 }
 
@@ -4571,7 +4422,7 @@ lbl_field_set_raw_int32: {
         DISPATCH();
     }
     AerStruct* oa = aer_as_struct(obj);
-    vm_raw_write_int32(oa->fields + foffset, raw_ints[src_slot]);
+    vm_raw_write_int32(oa->fields + foffset, registers[src_slot].as.i);
     DISPATCH();
 }
 
@@ -4585,7 +4436,7 @@ lbl_field_set_raw_float32: {
         DISPATCH();
     }
     AerStruct* oa = aer_as_struct(obj);
-    vm_raw_write_float32(oa->fields + foffset, raw_reals[src_slot]);
+    vm_raw_write_float32(oa->fields + foffset, registers[src_slot].as.d);
     DISPATCH();
 }
 
@@ -4606,7 +4457,7 @@ lbl_field_compound_raw_int: {
     AerStruct* oa = aer_as_struct(obj);
     int64_t lhs;
     memcpy(&lhs, oa->fields + foffset, 8);
-    int64_t rhs = raw_ints[rhs_slot];
+    int64_t rhs = registers[rhs_slot].as.i;
     int64_t result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -4631,7 +4482,7 @@ lbl_field_compound_raw_real: {
     AerStruct* oa = aer_as_struct(obj);
     double lhs;
     memcpy(&lhs, oa->fields + foffset, 8);
-    double rhs = raw_reals[rhs_slot];
+    double rhs = registers[rhs_slot].as.d;
     double result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -4655,7 +4506,7 @@ lbl_index_field_compound_raw_int: {
         DISPATCH();
     int64_t lhs;
     memcpy(&lhs, elem, 8);
-    int64_t rhs = raw_ints[rhs_slot];
+    int64_t rhs = registers[rhs_slot].as.i;
     int64_t result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -4679,7 +4530,7 @@ lbl_index_field_compound_raw_real: {
         DISPATCH();
     double lhs;
     memcpy(&lhs, elem, 8);
-    double rhs = raw_reals[rhs_slot];
+    double rhs = registers[rhs_slot].as.d;
     double result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -4704,7 +4555,8 @@ lbl_index_field_get_raw_int_unchecked: {
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    memcpy(&raw_ints[dest_slot], elem, 8);
+    registers[dest_slot].tag = TYPE_INTEGER;
+    memcpy(&registers[dest_slot].as.i, elem, 8);
     DISPATCH();
 }
 
@@ -4717,7 +4569,8 @@ lbl_index_field_get_raw_real_unchecked: {
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    memcpy(&raw_reals[dest_slot], elem, 8);
+    registers[dest_slot].tag = TYPE_REAL;
+    memcpy(&registers[dest_slot].as.d, elem, 8);
     DISPATCH();
 }
 
@@ -4730,7 +4583,7 @@ lbl_index_field_set_raw_int_unchecked: {
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    memcpy(elem, &raw_ints[src_slot], 8);
+    memcpy(elem, &registers[src_slot].as.i, 8);
     DISPATCH();
 }
 
@@ -4743,7 +4596,7 @@ lbl_index_field_set_raw_real_unchecked: {
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    memcpy(elem, &raw_reals[src_slot], 8);
+    memcpy(elem, &registers[src_slot].as.d, 8);
     DISPATCH();
 }
 
@@ -4759,7 +4612,7 @@ lbl_index_field_compound_raw_int_unchecked: {
         DISPATCH();
     int64_t lhs;
     memcpy(&lhs, elem, 8);
-    int64_t rhs = raw_ints[rhs_slot];
+    int64_t rhs = registers[rhs_slot].as.i;
     int64_t result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -4783,7 +4636,7 @@ lbl_index_field_compound_raw_real_unchecked: {
         DISPATCH();
     double lhs;
     memcpy(&lhs, elem, 8);
-    double rhs = raw_reals[rhs_slot];
+    double rhs = registers[rhs_slot].as.d;
     double result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -4811,7 +4664,7 @@ lbl_field_compound_raw_int32: {
     }
     AerStruct* oa = aer_as_struct(obj);
     int64_t lhs = vm_raw_read_int32(oa->fields + foffset);
-    int64_t rhs = raw_ints[rhs_slot];
+    int64_t rhs = registers[rhs_slot].as.i;
     int64_t result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -4835,7 +4688,7 @@ lbl_field_compound_raw_float32: {
     }
     AerStruct* oa = aer_as_struct(obj);
     double lhs = vm_raw_read_float32(oa->fields + foffset);
-    double rhs = raw_reals[rhs_slot];
+    double rhs = registers[rhs_slot].as.d;
     double result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -4858,7 +4711,7 @@ lbl_index_field_compound_raw_int32: {
     if (!elem)
         DISPATCH();
     int64_t lhs = vm_raw_read_int32(elem);
-    int64_t rhs = raw_ints[rhs_slot];
+    int64_t rhs = registers[rhs_slot].as.i;
     int64_t result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -4881,7 +4734,7 @@ lbl_index_field_compound_raw_float32: {
     if (!elem)
         DISPATCH();
     double lhs = vm_raw_read_float32(elem);
-    double rhs = raw_reals[rhs_slot];
+    double rhs = registers[rhs_slot].as.d;
     double result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -4907,7 +4760,7 @@ lbl_index_field_get_raw_int32_unchecked: {
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    raw_ints[dest_slot] = vm_raw_read_int32(elem);
+    registers[dest_slot] = aer_int(vm_raw_read_int32(elem));
     DISPATCH();
 }
 
@@ -4920,7 +4773,7 @@ lbl_index_field_get_raw_float32_unchecked: {
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    raw_reals[dest_slot] = vm_raw_read_float32(elem);
+    registers[dest_slot] = aer_real(vm_raw_read_float32(elem));
     DISPATCH();
 }
 
@@ -4933,7 +4786,7 @@ lbl_index_field_set_raw_int32_unchecked: {
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    vm_raw_write_int32(elem, raw_ints[src_slot]);
+    vm_raw_write_int32(elem, registers[src_slot].as.i);
     DISPATCH();
 }
 
@@ -4946,7 +4799,7 @@ lbl_index_field_set_raw_float32_unchecked: {
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
     if (!elem)
         DISPATCH();
-    vm_raw_write_float32(elem, raw_reals[src_slot]);
+    vm_raw_write_float32(elem, registers[src_slot].as.d);
     DISPATCH();
 }
 
@@ -4961,7 +4814,7 @@ lbl_index_field_compound_raw_int32_unchecked: {
     if (!elem)
         DISPATCH();
     int64_t lhs = vm_raw_read_int32(elem);
-    int64_t rhs = raw_ints[rhs_slot];
+    int64_t rhs = registers[rhs_slot].as.i;
     int64_t result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -4984,7 +4837,7 @@ lbl_index_field_compound_raw_float32_unchecked: {
     if (!elem)
         DISPATCH();
     double lhs = vm_raw_read_float32(elem);
-    double rhs = raw_reals[rhs_slot];
+    double rhs = registers[rhs_slot].as.d;
     double result;
     switch (bin_op) {
         case OP_ADD: result = lhs + rhs; break;
@@ -5366,12 +5219,12 @@ lbl_cast: {
 }
 
 lbl_raw_int_to_real: {
-    raw_reals[UNPACK_A(op_word)] = (double)raw_ints[UNPACK_B(op_word)];
+    registers[UNPACK_A(op_word)] = aer_real((double)registers[UNPACK_B(op_word)].as.i);
     DISPATCH();
 }
 
 lbl_raw_real_to_int: {
-    raw_ints[UNPACK_A(op_word)] = (int64_t)raw_reals[UNPACK_B(op_word)];
+    registers[UNPACK_A(op_word)] = aer_int((int64_t)registers[UNPACK_B(op_word)].as.d);
     DISPATCH();
 }
 
@@ -5382,14 +5235,14 @@ lbl_raw_load_int: {
     /* Full 32-bit signed immediate, its own dedicated word -- closes the old 20-bit-immediate
        truncation bug outright (a 20M-iteration bound once silently became 77056) rather than
        just widening it again. */
-    raw_ints[dest] = (int32_t)READ();
+    registers[dest] = aer_int((int32_t)READ());
     DISPATCH();
 }
 
 lbl_raw_load_real: {
     int dest = (int)UNPACK_A(op_word);
     unsigned int idx = (unsigned int)READ();
-    raw_reals[dest] = c->rawk_d[idx];
+    registers[dest] = aer_real(c->rawk_d[idx]);
     DISPATCH();
 }
 
@@ -5403,15 +5256,15 @@ lbl_raw_load_real: {
    bank, so a literal needs neither an OP_RAW_LOAD nor a slot of its own. Only the right operand,
    and only one predictable branch -- an operand's kind is fixed in the bytecode, so a given site
    always takes the same side. Raw slot indices stop at 31 and can never collide with the flag. */
-#define RAW_I(x) (RK8_IS_CONST(x) ? c->rawk_i[RK8_INDEX(x)] : raw_ints[x])
-#define RAW_D(x) (RK8_IS_CONST(x) ? c->rawk_d[RK8_INDEX(x)] : raw_reals[x])
+#define RAW_I(x) (RK8_IS_CONST(x) ? c->rawk_i[RK8_INDEX(x)] : registers[x].as.i)
+#define RAW_D(x) (RK8_IS_CONST(x) ? c->rawk_d[RK8_INDEX(x)] : registers[x].as.d)
 
 #define RAW_ARITH_INT(name, op)                                                                              \
     lbl_raw_##name##_int : {                                                                                 \
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        raw_ints[dest] = raw_ints[a] op raw_ints[b];                                                         \
+        registers[dest] = aer_int(registers[a].as.i op registers[b].as.i);                                   \
         DISPATCH();                                                                                          \
     }
 /* The C field is a bare rawk_i index, not an RK -- the opcode itself already says "constant", so
@@ -5421,7 +5274,7 @@ lbl_raw_load_real: {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int k = UNPACK_C(op_word);                                                                  \
-        raw_ints[dest] = raw_ints[a] op c->rawk_i[k];                                                        \
+        registers[dest] = aer_int(registers[a].as.i op c->rawk_i[k]);                                        \
         DISPATCH();                                                                                          \
     }
 #define RAW_ARITH_REAL(name, op)                                                                             \
@@ -5429,7 +5282,7 @@ lbl_raw_load_real: {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        raw_reals[dest] = raw_reals[a] op raw_reals[b];                                                      \
+        registers[dest] = aer_real(registers[a].as.d op registers[b].as.d);                                  \
         DISPATCH();                                                                                          \
     }
 #define RAW_CMP_INT(name, op)                                                                                \
@@ -5437,7 +5290,7 @@ lbl_raw_load_real: {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        registers[dest] = aer_bool(raw_ints[a] op RAW_I(b));                                                 \
+        registers[dest] = aer_bool(registers[a].as.i op RAW_I(b));                                           \
         DISPATCH();                                                                                          \
     }
 #define RAW_CMP_REAL(name, op)                                                                               \
@@ -5445,7 +5298,7 @@ lbl_raw_load_real: {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        registers[dest] = aer_bool(raw_reals[a] op RAW_D(b));                                                \
+        registers[dest] = aer_bool(registers[a].as.d op RAW_D(b));                                           \
         DISPATCH();                                                                                          \
     }
     RAW_ARITH_INT(add, +)
@@ -5455,17 +5308,17 @@ lbl_raw_load_real: {
     RAW_ARITH_INT_K(sub, -)
 
 /* Matches OP_DIV's own semantics: int/int division always promotes to float, so this is the one
-   OP_RAW_*_INT opcode whose dest is raw_reals[], not raw_ints[]. */
+   OP_RAW_*_INT opcode whose dest is registers[].as.d, not registers[].as.i. */
 lbl_raw_div_int: {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    int64_t rv = raw_ints[b];
+    int64_t rv = registers[b].as.i;
     if (rv == 0) {
         error("Division by zero");
-        raw_reals[dest] = 0.0;
+        registers[dest] = aer_real(0.0);
     } else
-        raw_reals[dest] = (double)raw_ints[a] / (double)rv;
+        registers[dest] = aer_real((double)registers[a].as.i / (double)rv);
     DISPATCH();
 }
 
@@ -5473,12 +5326,12 @@ lbl_raw_mod_int: {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    int64_t rv = raw_ints[b];
+    int64_t rv = registers[b].as.i;
     if (rv == 0) {
         error("Modulo by zero");
-        raw_ints[dest] = 0;
+        registers[dest] = aer_int(0);
     } else
-        raw_ints[dest] = aer_mod_int64(raw_ints[a], rv);
+        registers[dest] = aer_int(aer_mod_int64(registers[a].as.i, rv));
     DISPATCH();
 }
 
@@ -5486,12 +5339,12 @@ lbl_raw_floor_div_int: {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    int64_t rv = raw_ints[b];
+    int64_t rv = registers[b].as.i;
     if (rv == 0) {
         error("Division by zero");
-        raw_ints[dest] = 0;
+        registers[dest] = aer_int(0);
     } else
-        raw_ints[dest] = (int64_t)floor((double)raw_ints[a] / (double)rv);
+        registers[dest] = aer_int((int64_t)floor((double)registers[a].as.i / (double)rv));
     DISPATCH();
 }
 
@@ -5509,7 +5362,7 @@ lbl_raw_floor_div_int: {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        raw_reals[dest] = raw_reals[dest] op(raw_reals[a] * raw_reals[b]);                                   \
+        registers[dest] = aer_real(registers[dest].as.d op(registers[a].as.d * registers[b].as.d));          \
         DISPATCH();                                                                                          \
     }
     RAW_FUSED_MULACC_REAL(fma, +)
@@ -5520,12 +5373,12 @@ lbl_raw_div_real: {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    double rv = raw_reals[b];
+    double rv = registers[b].as.d;
     if (rv == 0.0) {
         error("Division by zero");
-        raw_reals[dest] = 0.0;
+        registers[dest] = aer_real(0.0);
     } else
-        raw_reals[dest] = raw_reals[a] / rv;
+        registers[dest] = aer_real(registers[a].as.d / rv);
     DISPATCH();
 }
 
@@ -5540,27 +5393,13 @@ lbl_raw_div_real: {
     RAW_CMP_REAL(neq, !=)
 
 /* The only bridge from raw storage back to a tagged AerVal register. */
-lbl_box_int: {
-    int dest = (int)UNPACK_A(op_word);
-    int src = (int)UNPACK_B(op_word);
-    registers[dest] = aer_int(raw_ints[src]);
-    DISPATCH();
-}
-
-lbl_box_real: {
-    int dest = (int)UNPACK_A(op_word);
-    int src = (int)UNPACK_B(op_word);
-    registers[dest] = aer_real(raw_reals[src]);
-    DISPATCH();
-}
-
 /* The error wording says the operator, not "unbox", because that is what the source line reads as
    and what the boxed arithmetic this replaces reported. */
 lbl_unbox_int: {
     int dest = (int)UNPACK_A(op_word);
     AerVal* v = &registers[UNPACK_B(op_word)];
     if (v->tag == TYPE_INTEGER)
-        raw_ints[dest] = v->as.i;
+        registers[dest] = aer_int(v->as.i);
     else
         error("Cannot apply this operator to integer and %s", vm_type_name(c, *v));
     DISPATCH();
@@ -5570,9 +5409,9 @@ lbl_unbox_real: {
     int dest = (int)UNPACK_A(op_word);
     AerVal* v = &registers[UNPACK_B(op_word)];
     if (v->tag == TYPE_REAL)
-        raw_reals[dest] = v->as.d;
+        registers[dest] = aer_real(v->as.d);
     else if (v->tag == TYPE_INTEGER)
-        raw_reals[dest] = (double)v->as.i;
+        registers[dest] = aer_real((double)v->as.i);
     else
         error("Cannot apply this operator to float and %s", vm_type_name(c, *v));
     DISPATCH();
@@ -5581,14 +5420,14 @@ lbl_unbox_real: {
 lbl_raw_move_int: {
     int dest = (int)UNPACK_A(op_word);
     int src = (int)UNPACK_B(op_word);
-    raw_ints[dest] = raw_ints[src];
+    registers[dest] = aer_int(registers[src].as.i);
     DISPATCH();
 }
 
 lbl_raw_move_real: {
     int dest = (int)UNPACK_A(op_word);
     int src = (int)UNPACK_B(op_word);
-    raw_reals[dest] = raw_reals[src];
+    registers[dest] = aer_real(registers[src].as.d);
     DISPATCH();
 }
 
@@ -5600,30 +5439,30 @@ lbl_raw_move_real: {
 lbl_raw_load_int_pool: {
     int dest = (int)UNPACK_A(op_word);
     unsigned int idx = (unsigned int)READ();
-    raw_ints[dest] = c->rawk_i[idx];
+    registers[dest] = aer_int(c->rawk_i[idx]);
     DISPATCH();
 }
 
 /* Both operands raw: no tag, no table, no error path -- the comparison is the two loads the
    hardware would do anyway. */
-#define RAW_CMP_JUMP_IF_FALSE(name, bank, rhs, op)                                                           \
+#define RAW_CMP_JUMP_IF_FALSE(name, member, rhs, op)                                                         \
     lbl_raw_##name##_jump_if_false : {                                                                       \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
         int target = READ();                                                                                 \
-        if (!(bank[a] op rhs(b)))                                                                            \
+        if (!(registers[a].as.member op rhs(b)))                                                             \
             pc += (int32_t)target;                                                                           \
         DISPATCH();                                                                                          \
     }
 
-    RAW_CMP_JUMP_IF_FALSE(lt_int, raw_ints, RAW_I, <)
-    RAW_CMP_JUMP_IF_FALSE(lte_int, raw_ints, RAW_I, <=)
-    RAW_CMP_JUMP_IF_FALSE(eq_int, raw_ints, RAW_I, ==)
-    RAW_CMP_JUMP_IF_FALSE(neq_int, raw_ints, RAW_I, !=)
-    RAW_CMP_JUMP_IF_FALSE(lt_real, raw_reals, RAW_D, <)
-    RAW_CMP_JUMP_IF_FALSE(lte_real, raw_reals, RAW_D, <=)
-    RAW_CMP_JUMP_IF_FALSE(eq_real, raw_reals, RAW_D, ==)
-    RAW_CMP_JUMP_IF_FALSE(neq_real, raw_reals, RAW_D, !=)
+    RAW_CMP_JUMP_IF_FALSE(lt_int, i, RAW_I, <)
+    RAW_CMP_JUMP_IF_FALSE(lte_int, i, RAW_I, <=)
+    RAW_CMP_JUMP_IF_FALSE(eq_int, i, RAW_I, ==)
+    RAW_CMP_JUMP_IF_FALSE(neq_int, i, RAW_I, !=)
+    RAW_CMP_JUMP_IF_FALSE(lt_real, d, RAW_D, <)
+    RAW_CMP_JUMP_IF_FALSE(lte_real, d, RAW_D, <=)
+    RAW_CMP_JUMP_IF_FALSE(eq_real, d, RAW_D, ==)
+    RAW_CMP_JUMP_IF_FALSE(neq_real, d, RAW_D, !=)
 
 #undef RAW_CMP_JUMP_IF_FALSE
 

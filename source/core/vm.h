@@ -201,9 +201,9 @@ typedef enum {
     /* Shell mode: a bare statement's non-null result is printed. */
     OP_PRINT_REPL, /* operand: src_reg -- prints registers[src_reg] unless it's TYPE_NULL */
 
-    /* Raw (unboxed) arithmetic on provably-monotype locals; operands are raw_ints/raw_reals slot
-       indices, no RK encoding. Comparisons produce a boxed boolean; OP_BOX_* is the only bridge
-       back to registers[]. */
+    /* Unchecked arithmetic on provably-monotype locals; operands are plain register indices, no RK
+       encoding. Each writes a fully tagged AerVal, so the result needs no conversion to be read by
+       any other opcode -- "raw" names the checks skipped, not a separate place to live. */
     OP_RAW_LOAD_INT,
     OP_RAW_LOAD_REAL,
     OP_RAW_ADD_INT,
@@ -239,12 +239,10 @@ typedef enum {
     OP_RAW_NEQ_INT,
     OP_RAW_EQ_REAL,
     OP_RAW_NEQ_REAL,
-    OP_BOX_INT,
-    OP_BOX_REAL,
-    /* The bridge the other way: a register whose type nothing has proven, checked once and dropped
-       into a raw slot so everything after it is ordinary raw arithmetic. Two opcodes covering every
-       boxed-to-raw crossing, in place of a per-operator family that only ever served one of them.
-       UNBOX_REAL takes an integer too, matching what the boxed arithmetic would have done. */
+    /* The one remaining bridge: a slot whose type nothing has proven, checked once so everything
+       after it is unchecked arithmetic. UNBOX_REAL takes an integer too, matching what the checked
+       arithmetic would have done. There is no opcode for the other direction -- an unchecked opcode
+       already leaves a fully tagged value behind. */
     OP_UNBOX_INT,
     OP_UNBOX_REAL,
     /* Raw-to-raw copy -- OP_MOVE's analog for raw slots. */
@@ -384,13 +382,6 @@ typedef enum {
     OP_RAW_INT_TO_REAL,
     OP_RAW_REAL_TO_INT,
 
-    OP_CALL_RAW_INT,
-    OP_CALL_RAW_REAL,
-    /* Returns a raw slot. Boxes into the caller's register when the frame was entered by an
-       ordinary call instead (dest_raw_kind == 0), so the same body serves both entry points. */
-    OP_RETURN_RAW_INT,
-    OP_RETURN_RAW_REAL,
-
     /* Builds one string from N parts in a single allocation. `"key_{n}"` used to compile to
        OP_LOADK + OP_TO_STR + OP_ADD -- three dispatches and two AerStrings, the second immediately
        garbage. Each part is a whole trailing word holding an RK16, so a constant segment needs no
@@ -415,19 +406,16 @@ _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — 
    instruction stream -- every emission site converts it to one of the WIRE encodings below. */
 #define RK_CONST_FLAG (1 << 30)
 
-/* Compiler-internal raw-slot tags (bits 28/29) -- never emitted into an instruction word. */
+/* Compiler-internal raw-slot tags (bits 28/29) -- never emitted into an instruction word. They say
+   what a slot's STATIC type is, so the parser can pick an unchecked opcode; they no longer name a
+   separate bank, since every slot is an AerVal in the one register file. */
 #define RK_RAW_INT_FLAG (1 << 29)
 #define RK_RAW_REAL_FLAG (1 << 28)
-#define RK_RAW_SLOT_MASK 0x1F
+#define RK_RAW_SLOT_MASK 0x7F
 
 /* Per-frame register bank size; a register index must stay within RK8's 7 index bits with zero
    headroom to spare -- see RK8 below. */
 #define FRAME_REGISTERS 128
-
-/* Raw slot counts -- stored as a full byte on the wire now (no bit-packing pressure), but the
-   allocator ceiling itself is unchanged from the original design. */
-#define RAW_REGISTERS_INT 32
-#define RAW_REGISTERS_REAL 32
 
 /* Fixed-width, word-granular instruction encoding: every instruction is one or more 32-bit words,
    the shape (1-word, 2-word, ...) fixed per opcode at compile time -- never a variable byte count.
@@ -684,9 +672,8 @@ typedef enum {
 
 /* One already-compiled specialized body for a shape-sensitive function (ChunkFunction.
    specializations below) -- keyed by the Shape observed for its shape-sensitive parameter(s) at
-   the point specialization was triggered. Each specialized body has its OWN max_registers/
-   max_raw_ints/max_raw_reals peaks, independent of the generic body's (typically fewer boxed
-   registers, more raw slots, since that's the whole point). */
+   the point specialization was triggered. Each specialized body has its OWN max_registers peak,
+   independent of the generic body's. */
 #define SPEC_MAX_RAW_PARAMS 3
 
 typedef struct {
@@ -694,8 +681,6 @@ typedef struct {
     SpecKind kind;
     unsigned int code_offset;
     unsigned int max_registers;
-    unsigned int max_raw_ints;
-    unsigned int max_raw_reals;
 
     /* Optional second specialized body for this shape that also binds up to SPEC_MAX_RAW_PARAMS
        numeric parameters as raw locals. Declines silently to this entry's baseline body when it
@@ -705,14 +690,12 @@ typedef struct {
     int raw_param_count;
     int raw_param_regs[SPEC_MAX_RAW_PARAMS];
     ValueType raw_param_types[SPEC_MAX_RAW_PARAMS];
-    /* Which raw slot each bound parameter landed in, so the resolver can unbox the arguments
-       straight into the callee's bank -- it already reads them all to choose this variant. -1 means
-       the slot budget ran out for that one parameter and it stayed boxed. */
+    /* Which slot each bound parameter landed in, so the resolver can place the arguments straight
+       into the callee's frame -- it already reads them all to choose this variant. -1 means the
+       slot budget ran out for that one parameter and it stayed dynamically typed. */
     int raw_param_slots[SPEC_MAX_RAW_PARAMS];
     unsigned int raw_variant_code_offset;
     unsigned int raw_variant_max_registers;
-    unsigned int raw_variant_max_raw_ints;
-    unsigned int raw_variant_max_raw_reals;
 } SpecEntry;
 #define SPEC_MAX 4
 
@@ -727,16 +710,12 @@ typedef struct {
     /* Real peak register need, patched in after the body compiles; the FRAME_REGISTERS
        placeholder (read only by in-body self-reference) is never an under-allocation. */
     unsigned int max_registers;
-    /* Same idea, for raw_ints[]/raw_reals[] -- placeholders are RAW_REGISTERS_INT/REAL (see
-       chunk_add_function), never an under-allocation for the same in-body-self-reference reason. */
-    unsigned int max_raw_ints;
-    unsigned int max_raw_reals;
 
     /* Shape-specializing compilation (lazy, per-call-observed-shape recompiles) -- see
        vm_call_resolve_specialization (vm.c). Bit i set = parameter i was seen used as the base of a
        struct-field access (directly, or through a one-hop plain-local alias) during the ordinary
-       compile; folded in at function-exit, same moment max_registers/max_raw_ints/max_raw_reals are
-       captured. Zero means this function is never specialized, and lbl_call skips the lookup. */
+       compile; folded in at function-exit, same moment max_registers is captured. Zero means this
+       function is never specialized, and lbl_call skips the lookup. */
     unsigned int shape_sensitive_mask;
 /* Set instead of a parameter bit when no parameter is shape-sensitive but the body composed a raw
    local with a boxed value -- work that goes raw once the numeric parameters do. It rides in this
@@ -805,8 +784,6 @@ typedef struct {
     Shape* last_shape;
     unsigned int last_code_offset;
     unsigned int last_max_registers;
-    unsigned int last_max_raw_ints;
-    unsigned int last_max_raw_reals;
     /* ARRAY_OF_STRUCTS only: the array (by pointer) and AerArray.generation at the last successful
        homogeneity scan. A later call with both unchanged can skip re-scanning. NULL/0 means never
        verified; only ever set on a scan that fully succeeded, so a failed one never poisons a
@@ -995,35 +972,25 @@ typedef struct {
                0) -- read by the next push. */
             unsigned int frame_size;
 
-            /* Raw unboxed scratch for the primitive pass -- never GC-scanned, never crosses a call
-               boundary (only its boxed form does). Bump-pointer bases into
-               vm->raw_int_stack/raw_real_stack rather than fixed inline arrays, which would cost
-               every frame RAW_REGISTERS_INT+REAL slots whether or not it uses any raw locals. */
-            int64_t* raw_ints;
-            double* raw_reals;
-            unsigned int raw_int_frame_size;
-            unsigned int raw_real_frame_size;
-
             unsigned int return_ip; /* where to resume in the CALLER */
             int dest_reg; /* which of the CALLER's registers gets the return value */
-            /* 0 = dest_reg names a boxed register, the ordinary case. 1/2 = it names a raw int/real
-               slot instead, because this frame was entered by OP_CALL_RAW_* -- the return then
-               moves a scalar rather than building an AerVal. Both return opcodes handle both, so a
-               body entered either way is correct. */
-            unsigned char dest_raw_kind;
 
             unsigned int code_offset; /* this frame's entry point, for stack traces; unset on frame 0 */
             unsigned int tail_calls_collapsed; /* tail calls collapsed since this frame's last real push */
+            /* What the return value must be coerced to before it lands in dest_reg: 0 = whatever the
+               callee produced, 1/2 = integer/real. A call site that goes on to read the result with
+               an unchecked numeric opcode needs the payload to be the width that opcode assumes, and
+               only the site knows which. Every return path honours it, so a body is correct however
+               it was entered. */
+            unsigned char dest_raw_kind;
             bool synthetic_entry; /* set by setup_call() -- return_ip isn't a real caller line */
         };
-        char size_is_a_power_of_two[64];
+        char size_is_a_power_of_two[32];
     };
 } CallFrame;
 
-/* The slots in this frame a heap reference can live in, for the GC to trace. Today that is exactly
-   the boxed registers, since the raw banks are separate arrays holding unboxed numbers. Once all
-   three merge into one slot array this returns a sub-range of it, and every caller is already
-   asking the right question. */
+/* The slots in this frame a heap reference can live in, for the GC to trace -- the whole frame,
+   since every slot is a tagged AerVal whatever its static type. */
 static inline unsigned int frame_ref_slots(CallFrame* frame, AerVal** out_slots) {
     *out_slots = frame->registers;
     return frame->frame_size;
@@ -1032,19 +999,6 @@ static inline unsigned int frame_ref_slots(CallFrame* frame, AerVal** out_slots)
    multiply plus a materialized constant per field on 32-bit ARM. A power of two makes it a shift. */
 _Static_assert((sizeof(CallFrame) & (sizeof(CallFrame) - 1)) == 0,
                "CallFrame must stay a power of two -- see CALL_FRAME_PAD");
-/* Keep these OUT of register_stack. mark_vm_roots scans a frame's whole register range including
-   slots the callee has not written, which is safe only because register_stack has only ever held
-   AerVals; interleaved raw words let the GC read a double as a pointer. Tried, segfaulted, and
-   measured worse anyway -- see ARCHITECTURE 5.16f and tests/test_gc_raw_frames.aer. */
-
-/* Regression guard: raw_ints/raw_reals used to be fixed inline arrays here (RAW_REGISTERS_INT +
-   RAW_REGISTERS_REAL int64_t/double slots each), costing every single frame ~550+ bytes whether or
-   not that function used any raw locals at all. They're pointers into a shared VM-level bump-pointer
-   stack now (see raw_int_stack/raw_real_stack below) -- if this ever creeps back up near the old
-   size, someone likely reintroduced fixed per-frame arrays instead of the shared-stack pattern. */
-_Static_assert(sizeof(CallFrame) <= 96,
-               "CallFrame grew unexpectedly large -- raw_ints/raw_reals should stay pointers into the shared "
-               "VM-level raw_int_stack/raw_real_stack, not fixed inline per-frame arrays");
 
 typedef struct {
     /* First. A Thumb-2 `ldr` reaches a 12-bit displacement, so a field past 4095 bytes needs its
@@ -1084,10 +1038,6 @@ typedef struct {
     /* One shared register bank for the whole chain (calls bump a base pointer). Same worst-case
        size as a flat design, but the actually-touched working set is far smaller. */
     AerVal register_stack[VM_CALL_MAX * FRAME_REGISTERS];
-    /* Same bump-pointer-bank idea as register_stack, for raw_ints[]/raw_reals[] -- see CallFrame's
-       own comment for why this replaced per-frame fixed arrays. */
-    int64_t raw_int_stack[VM_CALL_MAX * RAW_REGISTERS_INT];
-    double raw_real_stack[VM_CALL_MAX * RAW_REGISTERS_REAL];
 } VM;
 
 /* Bounds-checked push/pop for native-module files, outside vm_run's PUSH()/POP() macros. */
@@ -1272,14 +1222,6 @@ void aer_debug_memory_report(FILE* out);
    see the AER_DEBUG_TOOLS-gated Chunk.debug_hits field above. */
 void aer_disassemble(Chunk* c, FILE* out);
 
-/* Phase 0 of the unified-slot migration: one slot array means one budget, but a function may
-   currently address FRAME_REGISTERS plus RAW_REGISTERS_INT plus RAW_REGISTERS_REAL. Records what
-   each compiled function actually needed so the real ceiling is measured, not assumed. */
-void aer_debug_note_slot_budget(Chunk* c, unsigned int func_idx, unsigned int max_registers,
-                                unsigned int max_raw_ints, unsigned int max_raw_reals);
-void aer_debug_slot_budget_report(FILE* out);
-#else
-#define aer_debug_note_slot_budget(c, i, r, ri, rr) ((void)0)
 #endif
 
 #endif

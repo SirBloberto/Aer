@@ -258,7 +258,6 @@ static bool run_file(char* path) {
         }
         aer_disassemble(&chunk, dump_out);
         aer_debug_memory_report(dump_out);
-        aer_debug_slot_budget_report(dump_out);
         if (dump_out != stderr)
             fclose(dump_out);
     }

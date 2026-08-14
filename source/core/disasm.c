@@ -226,8 +226,6 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_RAW_NEQ_INT] = {"OP_RAW_NEQ_INT", "reg = rawi != rawi"},
     [OP_RAW_EQ_REAL] = {"OP_RAW_EQ_REAL", "reg = rawr == rawr"},
     [OP_RAW_NEQ_REAL] = {"OP_RAW_NEQ_REAL", "reg = rawr != rawr"},
-    [OP_BOX_INT] = {"OP_BOX_INT", "reg = box(rawi)"},
-    [OP_BOX_REAL] = {"OP_BOX_REAL", "reg = box(rawr)"},
     [OP_UNBOX_INT] = {"OP_UNBOX_INT", "rawi = unbox(reg) (tag-checked)"},
     [OP_UNBOX_REAL] = {"OP_UNBOX_REAL", "rawr = unbox(reg) (tag-checked)"},
     [OP_RAW_MOVE_INT] = {"OP_RAW_MOVE_INT", "rawi = rawi"},
@@ -424,15 +422,9 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_INDEX_SET_RAW_INT] = {"OP_INDEX_SET_RAW_INT", "arr[rk] = rawi (checked)"},
     [OP_INDEX_SET_RAW_REAL] = {"OP_INDEX_SET_RAW_REAL", "arr[rk] = rawr (checked)"},
     [OP_INDEX_GET_RAW_REAL] = {"OP_INDEX_GET_RAW_REAL", "rawr = arr[rk] (checked)"},
-    [OP_CALL_RAW_INT] =
-        {"OP_CALL_RAW_INT", "recursive numeric call, int args/result stay raw", {0}, false, 1, 0},
-    [OP_CALL_RAW_REAL] =
-        {"OP_CALL_RAW_REAL", "recursive numeric call, real args/result stay raw", {0}, false, 1, 0},
     [OP_RAW_MATH_REAL] = {"OP_RAW_MATH_REAL", "rawr = math fn(rawr), never boxed"},
     [OP_RAW_INT_TO_REAL] = {"OP_RAW_INT_TO_REAL", "rawr = (real)rawi"},
     [OP_RAW_REAL_TO_INT] = {"OP_RAW_REAL_TO_INT", "rawi = (int)rawr, truncating"},
-    [OP_RETURN_RAW_INT] = {"OP_RETURN_RAW_INT", "return rawi (boxes if the caller wants boxed)"},
-    [OP_RETURN_RAW_REAL] = {"OP_RETURN_RAW_REAL", "return rawr (boxes if the caller wants boxed)"},
 };
 
 static const char* cast_name(int k) {
@@ -655,16 +647,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
-    } else if (op == OP_CALL_RAW_INT || op == OP_CALL_RAW_REAL) {
-        if (op == OP_CALL_RAW_INT) {
-            print_rawi(out, (int)UNPACK_A(op_word));
-            print_rawi(out, (int)UNPACK_B(op_word));
-        } else {
-            print_rawr(out, (int)UNPACK_A(op_word));
-            print_rawr(out, (int)UNPACK_B(op_word));
-        }
-        fprintf(out, "  n=%u", UNPACK_C(op_word));
-        fprintf(out, "  ret_kind=%u", c->code[pos]), pos += 1;
     } else if (op == OP_RAW_INT_TO_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
@@ -675,10 +657,6 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
         fprintf(out, "  fn_id=%u", UNPACK_C(op_word));
-    } else if (op == OP_RETURN_RAW_INT) {
-        print_rawi(out, (int)UNPACK_A(op_word));
-    } else if (op == OP_RETURN_RAW_REAL) {
-        print_rawr(out, (int)UNPACK_A(op_word));
     } else if (op == OP_INDEX_SET_RAW_INT || op == OP_INDEX_SET_RAW_REAL) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rk8(out, c, UNPACK_B(op_word));
@@ -913,12 +891,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
         print_rawk_d(out, c, UNPACK_C(op_word));
-    } else if (op == OP_BOX_INT) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rawi(out, (int)UNPACK_B(op_word));
-    } else if (op == OP_BOX_REAL) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rawr(out, (int)UNPACK_B(op_word));
+
     } else if (op == OP_UNBOX_INT) {
         print_rawi(out, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
@@ -1195,44 +1168,6 @@ void aer_debug_memory_report(FILE* out) {
     unsigned int live, minor, major;
     aer_gc_stats(&live, &minor, &major);
     fprintf(out, "  %u live cells, %u minor collections, %u major collections\n", live, minor, major);
-}
-
-/* Phase 0 instrumentation for the unified-slot migration -- see aer_debug_note_slot_budget in
-   vm.h. Keeps only what the report needs, so a program with thousands of functions costs a few
-   counters rather than a growing table. */
-static unsigned int slot_budget_funcs = 0;
-static unsigned int slot_budget_peak = 0;
-static unsigned int slot_budget_peak_regs = 0;
-static unsigned int slot_budget_peak_ints = 0;
-static unsigned int slot_budget_peak_reals = 0;
-static unsigned int slot_budget_over_64 = 0;
-static unsigned int slot_budget_over_128 = 0;
-
-void aer_debug_note_slot_budget(Chunk* c, unsigned int func_idx, unsigned int max_registers,
-                                unsigned int max_raw_ints, unsigned int max_raw_reals) {
-    (void)c;
-    (void)func_idx;
-    unsigned int unified = max_registers + max_raw_ints + max_raw_reals;
-    slot_budget_funcs++;
-    if (unified > 64)
-        slot_budget_over_64++;
-    if (unified > 128)
-        slot_budget_over_128++;
-    if (unified > slot_budget_peak) {
-        slot_budget_peak = unified;
-        slot_budget_peak_regs = max_registers;
-        slot_budget_peak_ints = max_raw_ints;
-        slot_budget_peak_reals = max_raw_reals;
-    }
-}
-
-void aer_debug_slot_budget_report(FILE* out) {
-    fprintf(out, "\n--- unified slot budget (Phase 0) ---\n");
-    fprintf(out, "  functions compiled      %u\n", slot_budget_funcs);
-    fprintf(out, "  peak unified slots      %u  (regs %u + rawi %u + rawr %u)\n", slot_budget_peak,
-            slot_budget_peak_regs, slot_budget_peak_ints, slot_budget_peak_reals);
-    fprintf(out, "  functions over 64       %u\n", slot_budget_over_64);
-    fprintf(out, "  functions over 128      %u\n", slot_budget_over_128);
 }
 
 #endif
