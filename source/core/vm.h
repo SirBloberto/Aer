@@ -690,10 +690,6 @@ typedef struct {
     int raw_param_count;
     int raw_param_regs[SPEC_MAX_RAW_PARAMS];
     ValueType raw_param_types[SPEC_MAX_RAW_PARAMS];
-    /* Which slot each bound parameter landed in, so the resolver can place the arguments straight
-       into the callee's frame -- it already reads them all to choose this variant. -1 means the
-       slot budget ran out for that one parameter and it stayed dynamically typed. */
-    int raw_param_slots[SPEC_MAX_RAW_PARAMS];
     unsigned int raw_variant_code_offset;
     unsigned int raw_variant_max_registers;
 } SpecEntry;

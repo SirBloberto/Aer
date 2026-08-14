@@ -2301,26 +2301,6 @@ static void chunk_ensure_call_spec_cache(Chunk* c) {
     memset(c->call_spec_cache + old_cap, 0, sizeof(CallSpecCacheEntry) * (c->call_spec_cache_cap - old_cap));
 }
 
-/* Places the arguments a variant binds unchecked into the callee's own slots. The arguments have
-   already been read to choose the variant, and their types already checked against what it was
-   compiled for, so this is the whole of what the per-parameter prologue opcodes used to do. An int
-   argument a real parameter binds is widened here, since the body will only ever read it as one.
-   Runs AFTER the ordinary argument copy and the frame clear, never before: a bound slot is an
-   ordinary register now, and either of those would otherwise overwrite it. */
-static inline void vm_bind_raw_params(const SpecEntry* e, AerVal* registers, int arg_reg_base,
-                                      AerVal* callee_regs) {
-    for (int k = 0; k < e->raw_param_count; k++) {
-        int slot = e->raw_param_slots[k];
-        if (slot < 0)
-            continue; /* budget ran out for this one -- it stayed dynamically typed */
-        AerVal v = registers[arg_reg_base + e->raw_param_regs[k]];
-        if (e->raw_param_types[k] == TYPE_INTEGER)
-            callee_regs[slot] = v;
-        else
-            callee_regs[slot] = aer_real((v.tag == TYPE_INTEGER) ? (double)v.as.i : v.as.d);
-    }
-}
-
 /* lbl_call's cold path, split out because inlining it made lbl_call ~572 machine instructions --
    by far the largest handler in vm_run_slice, next-largest under 40 -- so every ordinary call paid
    its icache cost without executing it. noinline is required: a static function with one call site
@@ -2328,7 +2308,7 @@ static inline void vm_bind_raw_params(const SpecEntry* e, AerVal* registers, int
 static void __attribute__((noinline))
 vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
                                     unsigned int ip, unsigned int* chosen_offset,
-                                    unsigned int* chosen_max_registers, const SpecEntry** out_bind) {
+                                    unsigned int* chosen_max_registers) {
     unsigned int site =
         ip - 3; /* this instruction's own word0 offset -- ip already advanced past all 3 words by now */
     /* Lowest set bit -- which argument register carries the shape-sensitive parameter. Only
@@ -2478,8 +2458,7 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                 if (matches_existing) {
                     *chosen_offset = entry->raw_variant_code_offset;
                     *chosen_max_registers = entry->raw_variant_max_registers;
-                    *out_bind = entry;
-                } else if (entry->raw_param_count == 0) {
+                                } else if (entry->raw_param_count == 0) {
                     /* Never attempted for THIS entry -- try to compile it now. A failure here
                        (raw_ints/raw_reals budget exhausted -- realistic, since this shape's own
                        raw field usage already competes for the same 32-slot budget) sets
@@ -2501,12 +2480,9 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                             entry->raw_param_types[k] = cand_types[k];
                         }
                         entry->raw_param_count = cand_count;
-                        for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++)
-                            entry->raw_param_slots[k] = variant.raw_param_slots[k];
                         *chosen_offset = entry->raw_variant_code_offset;
                         *chosen_max_registers = entry->raw_variant_max_registers;
-                        *out_bind = entry;
-                    } else {
+                                        } else {
                         entry->raw_param_count = -1;
                     }
                 }
@@ -2526,8 +2502,7 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
 static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f,
                                                               AerVal* registers, int arg_reg_base,
                                                               unsigned int* chosen_offset,
-                                                              unsigned int* chosen_max_registers,
-                                                              const SpecEntry** out_bind) {
+                                                              unsigned int* chosen_max_registers) {
     int cand_regs[SPEC_MAX_RAW_PARAMS];
     ValueType cand_types[SPEC_MAX_RAW_PARAMS];
     int cand_count = 0;
@@ -2557,8 +2532,7 @@ static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFun
                 return; /* a different numeric signature than the one compiled -- stay boxed */
         *chosen_offset = entry->raw_variant_code_offset;
         *chosen_max_registers = entry->raw_variant_max_registers;
-        *out_bind = entry;
-        return;
+            return;
     }
     if (entry->raw_param_count != 0)
         return;
@@ -2585,11 +2559,8 @@ static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFun
         entry->raw_param_types[k] = cand_types[k];
     }
     entry->raw_param_count = cand_count;
-    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++)
-        entry->raw_param_slots[k] = variant.raw_param_slots[k];
     *chosen_offset = entry->raw_variant_code_offset;
     *chosen_max_registers = entry->raw_variant_max_registers;
-    *out_bind = entry;
 }
 
 /* The monomorphic case, split off so it does not pay for the full resolver's frame: that one is
@@ -2600,10 +2571,9 @@ static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFun
 static void __attribute__((noinline))
 vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
                                unsigned int ip, unsigned int* chosen_offset,
-                               unsigned int* chosen_max_registers, const SpecEntry** out_bind) {
+                               unsigned int* chosen_max_registers) {
     if (target_f->shape_sensitive_mask == SHAPE_MASK_NUMERIC_ONLY) {
-        vm_call_resolve_numeric(c, target_f, registers, arg_reg_base, chosen_offset, chosen_max_registers,
-                                out_bind);
+        vm_call_resolve_numeric(c, target_f, registers, arg_reg_base, chosen_offset, chosen_max_registers);
         return;
     }
     unsigned int site = ip - 3;
@@ -2619,7 +2589,7 @@ vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* regist
         return;
     }
     vm_call_resolve_specialization_full(c, target_f, registers, arg_reg_base, ip, chosen_offset,
-                                        chosen_max_registers, out_bind);
+                                        chosen_max_registers);
 }
 
 /* lbl_call_module's cold path, split for the same reason as vm_call_resolve_specialization: inlined
@@ -3306,7 +3276,6 @@ lbl_call: {
        but forward-referenced and self-recursive calls need their opcode chosen before that. */
     unsigned int chosen_offset = (unsigned int)callee_offset;
     unsigned int chosen_max_registers = target_f->max_registers;
-    const SpecEntry* bind_entry = NULL;
 
     if (!target_f->megamorphic && target_f->shape_sensitive_mask != 0) {
         /* The out-params are scoped to this branch on purpose. Taking the address of the chosen_*
@@ -3316,7 +3285,7 @@ lbl_call: {
         unsigned int spec_offset = chosen_offset, spec_registers = chosen_max_registers;
         unsigned int resume_at = (unsigned int)(pc - code);
         vm_call_resolve_specialization(c, target_f, registers, arg_reg_base, resume_at, &spec_offset,
-                                       &spec_registers, &bind_entry);
+                                       &spec_registers);
         chosen_offset = spec_offset;
         chosen_max_registers = spec_registers;
         /* Compiling a specialized body can realloc any of the chunk's growable arrays, so every
@@ -3344,8 +3313,6 @@ lbl_call: {
        value_has_cell, which reads the tag and nothing else, so the payload can stay garbage. */
     for (unsigned int i = (unsigned int)arg_count; i < chosen_max_registers; i++)
         callee->registers[i].tag = TYPE_NULL;
-    if (bind_entry)
-        vm_bind_raw_params(bind_entry, registers, arg_reg_base, callee->registers);
     callee->return_ip =
         (unsigned int)(pc - code); /* already past this instruction's operands -- the correct resume point */
     callee->dest_reg = dest_reg;

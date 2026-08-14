@@ -720,7 +720,7 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
 static void parse_function_body(Chunk* c, unsigned int* param_names, int param_count, int hint_param_reg,
                                 Shape* hint_shape, bool hint_is_element_shape, const int* raw_param_regs,
                                 const ValueType* raw_param_types, int raw_param_count,
-                                unsigned int* out_max_registers, int* out_raw_param_slots);
+                                unsigned int* out_max_registers);
 
 /* reg is the parameter's own register (0..P.current_param_count-1) OR a register whose value is
    known (via P.alias_source_param) to have come from indexing that parameter -- either way, marks
@@ -2895,7 +2895,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                never touches them. global_regs[] only compares register numbers, never dereferences. */
             RawKind rhs_kind = rk_raw_kind(c, rk_val);
             if (P.branch_depth == 0 && rhs_kind != RAWK_NONE) {
-                int slot = (rhs_kind == RAWK_INT) ? slot_reserve_one() : slot_reserve_one();
+                int slot = slot_reserve_one();
                 if (slot >= 0) {
                     int src_slot = raw_materialize(c, rk_val, rhs_kind);
                     if (src_slot < 0) {
@@ -4794,8 +4794,8 @@ static int parse_function_expr(Chunk* c) {
     unsigned int func_start = c->count;
 
     unsigned int captured_max_registers;
-    parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0, &captured_max_registers,
-                        NULL);
+    parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0,
+                        &captured_max_registers);
 
     patch_jump(c, patch, c->count);
 
@@ -4859,11 +4859,11 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
    everything it touches. hint_param_reg/hint_shape seed one parameter's shape for this compile
    only; hint_is_element_shape picks the table: false means the parameter IS the struct/packed
    array, true means it is a plain array and hint_shape describes `param[idx]`. raw_param_regs/
-   types/count bind those parameters as raw locals, reported back in out_raw_param_slots. */
+   types/count bind those parameters as statically typed locals, in their own argument registers. */
 static void parse_function_body(Chunk* c, unsigned int* param_names, int param_count, int hint_param_reg,
                                 Shape* hint_shape, bool hint_is_element_shape, const int* raw_param_regs,
                                 const ValueType* raw_param_types, int raw_param_count,
-                                unsigned int* out_max_registers, int* out_raw_param_slots) {
+                                unsigned int* out_max_registers) {
     unsigned int saved_var_names[FRAME_REGISTERS];
     int saved_var_regs[FRAME_REGISTERS];
     VarKind saved_var_kind[FRAME_REGISTERS];
@@ -4912,22 +4912,11 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
         for (int k = 0; k < raw_param_count; k++) {
             if (raw_param_regs[k] != i)
                 continue;
-            bool is_int = raw_param_types[k] == TYPE_INTEGER;
-            int slot = slot_reserve_one();
-            if (out_raw_param_slots)
-                out_raw_param_slots[k] = slot;
-            if (slot >= 0) {
-                /* var_slot just appended P.var_count-1 as this parameter's own (boxed) entry --
-                   rebind THAT SAME entry to the raw slot instead, as an ordinary local's first
-                   raw-eligible assignment would; binding time IS a parameter's first assignment.
-                   No prologue opcode writes the slot: the resolver does, having already read every
-                   argument to choose this variant (vm_bind_raw_params, vm.c). */
-                P.var_regs[P.var_count - 1] = slot;
-                P.var_kind[P.var_count - 1] = is_int ? VAR_RAW_INT : VAR_RAW_REAL;
-            }
-            /* slot < 0: the frame's slot budget is exhausted. Leave THIS ONE parameter dynamically
-               typed (var_slot's binding above already stands, untouched) and fall through to the
-               other candidates in raw_param_regs -- one exhausted budget doesn't block the rest. */
+            /* The argument already sits in register i, correctly tagged, and the resolver verified
+               its type before choosing this variant -- so recording the type is the whole of the
+               binding. No second slot, and no prologue opcode to fill one: the parameter simply
+               stops needing its tag checked. */
+            P.var_kind[P.var_count - 1] = (raw_param_types[k] == TYPE_INTEGER) ? VAR_RAW_INT : VAR_RAW_REAL;
             break;
         }
     }
@@ -5006,8 +4995,8 @@ static void parse_function(Chunk* c) {
     bool saved_self_call = P.self_call_seen;
     P.current_func_idx = (int)this_func_idx;
     P.self_call_seen = false;
-    parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0, &captured_max_registers,
-                        NULL);
+    parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0,
+                        &captured_max_registers);
     unsigned int raw_boxed_in_body = P.raw_boxed_emits - raw_boxed_before;
     P.current_func_idx = saved_func_idx;
     P.self_call_seen = saved_self_call;
@@ -5067,14 +5056,11 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
 
     unsigned int new_offset = c->count;
     unsigned int max_registers = 0;
-    int slots[SPEC_MAX_RAW_PARAMS];
-    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++)
-        slots[k] = -1;
     P.current_func_idx = (int)(target_f - c->functions);
     if (!parse_had_error) {
         parse_function_body(c, param_names, param_count, param_index, shape,
                             kind == SPEC_KIND_ARRAY_OF_STRUCTS, raw_param_regs, raw_param_types,
-                            raw_param_count, &max_registers, slots);
+                            raw_param_count, &max_registers);
     }
     bool ok = !parse_had_error;
 
@@ -5087,8 +5073,6 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
 
     out_entry->code_offset = new_offset;
     out_entry->max_registers = max_registers;
-    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++)
-        out_entry->raw_param_slots[k] = slots[k];
     if (raw_param_count == 0) {
         /* Ordinary shape-only compile -- a freshly-created SpecEntry (see lbl_call, vm.c) needs its
            OWN raw-variant bookkeeping starting from a well-defined "never attempted" state (0),
