@@ -718,7 +718,7 @@ static int parse_module_call(Chunk* c);
 static void parse_import(Chunk* c);
 static bool is_builtin_name(Chunk* c, unsigned int name_idx);
 static int parse_builtin_call(Chunk* c, unsigned int name_idx);
-static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base);
+static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base, bool* out_base_is_temp);
 static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal* param_defaults,
                                      int* out_param_count, int* out_min_param_count);
 static void parse_function_body(Chunk* c, unsigned int* param_names, int param_count, int hint_param_reg,
@@ -1526,19 +1526,29 @@ static int arg_materialize(Chunk* c, int rk) {
     return target;
 }
 
-/* Shared bulk-copy prep for calls/arrays/dicts -- all three opcodes need contiguous operand
-   registers. Returns the count; *out_base unspecified when count==0. */
-static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base) {
+/* Shared bulk-copy prep for calls/arrays/dicts -- all three need contiguous operand registers.
+   Returns the count; *out_base unspecified when count==0. ONE operand has no run to be contiguous
+   with, so it stays where it is and no move is emitted -- that move was 10.3% of binary_trees'
+   dispatches. *out_base_is_temp then tells the caller whether the result may overwrite it, since a
+   variable's own register is not the caller's to clobber. */
+static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base, bool* out_base_is_temp) {
     int base = -1;
     int count = 0;
+    *out_base_is_temp = true;
     if (!equal(close_tok)) {
-        do {
-            int rk = parse_binary(c, 0);
-            int reg = arg_materialize(c, rk);
-            if (count == 0)
-                base = reg;
+        int rk = parse_binary(c, 0);
+        if (!equal(TOKEN_COMMA)) {
+            base = materialize(c, rk);
+            *out_base_is_temp = is_temp(base);
+            *out_base = base;
+            return 1;
+        }
+        base = arg_materialize(c, rk);
+        count = 1;
+        while (consume(TOKEN_COMMA)) {
+            arg_materialize(c, parse_binary(c, 0));
             count++;
-        } while (consume(TOKEN_COMMA));
+        }
     }
     *out_base = base;
     return count;
@@ -2080,14 +2090,16 @@ static int parse_postfix_chain(Chunk* c, int rk) {
         if (consume(TOKEN_OPEN_PARENTHESE)) {
             int callee_reg = materialize(c, rk);
             int arg_reg_base;
-            int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
+            bool arg_base_is_temp;
+            int arg_count =
+                parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base, &arg_base_is_temp);
             require(TOKEN_CLOSE_PARENTHESE, "expected ')' after call arguments");
             if (parse_had_error)
                 return rk;
             int dest = callee_reg;
             int base = arg_reg_base < 0 ? dest : arg_reg_base;
             emit_call_value(c, dest, base, arg_count, callee_reg);
-            if (arg_count > 0)
+            if (arg_count > 0 && arg_base_is_temp)
                 reg_free(arg_count);
             rk = dest;
             continue;
@@ -4385,12 +4397,15 @@ static int parse_module_call(Chunk* c) {
     }
 
     int arg_reg_base;
-    int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
+    bool arg_base_is_temp;
+    int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base, &arg_base_is_temp);
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after module call arguments");
     if (parse_had_error)
         return 0;
 
-    int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
+    /* Reusing the argument base as the destination is only safe when it is a temp -- a lone
+       argument now stays in its own register, which may be a variable's. */
+    int dest = (arg_count > 0 && arg_base_is_temp) ? arg_reg_base : reg_alloc();
     if (arg_count > 1)
         reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
@@ -4526,13 +4541,16 @@ static int builtin_call_id(AerString* name) {
 static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
     unsigned int arg_code_begin = c->count;
     int arg_reg_base;
-    int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
+    bool arg_base_is_temp;
+    int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base, &arg_base_is_temp);
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after call arguments");
     if (parse_had_error)
         return 0;
     unsigned int arg_code_end = c->count;
 
-    int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
+    /* Reusing the argument base as the destination is only safe when it is a temp -- a lone
+       argument now stays in its own register, which may be a variable's. */
+    int dest = (arg_count > 0 && arg_base_is_temp) ? arg_reg_base : reg_alloc();
     if (arg_count > 1)
         reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
@@ -4632,7 +4650,8 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
 
     /* Usually a no-op check, not a copy -- see arg_materialize's own comment. */
     int arg_reg_base;
-    int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
+    bool arg_base_is_temp;
+    int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base, &arg_base_is_temp);
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after call arguments");
     if (parse_had_error)
         return 0;
@@ -4657,7 +4676,9 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
        any callee_reg is allocated, so an extra register (a freshly built function value) always
        lands above dest/the args -- allocating after compaction (the original order) could
        silently hand out a register an omitted-defaults call's argument was still sitting in. */
-    int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
+    /* Reusing the argument base as the destination is only safe when it is a temp -- a lone argument
+       now stays in its own register, which may be a variable's. */
+    int dest = (arg_count > 0 && arg_base_is_temp) ? arg_reg_base : reg_alloc();
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
 
     bool needs_callee_reg = needs_call_value;
