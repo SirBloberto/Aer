@@ -1073,17 +1073,38 @@ return), `vm_run_slice` hoists one base pointer instead of three, and the VM's f
 go from 160KB to 128KB, because the raw banks were *additional* to a full 128-register bank per
 frame.
 
-**Measured (dispatch counts, deterministic).** Mixed code wins outright: `dict_bench` **-21.4%**,
-`log_processing` **-18.0%**, `typed_array_bench` **-14.4%**, `columnar_query` **-11.7%**,
-`struct_array_scan` -2.0%. Numeric loops were already box-free and move as predicted:
-`mandelbrot` -0.5%, `fib_bench`/`nbody`/`sieve` 0.00%.
+**Measured on ARM (`perf`, Pi, spread 0.02-0.08%), against the pre-merge commit.** Mixed and
+call-heavy code wins outright: `binary_trees` **-7.62%**, `sieve` **-6.18%**, `log_processing`
+-3.27%, `dict_bench` -2.67%, `small_dict_bench` -2.52%, `fib_bench` -1.13%, `struct_array_scan`
+-1.05%, `lookup_table_bench` -0.86%, `compile_bound` -0.03%. Two regressions remain: `nbody` +0.97%
+and `mandelbrot` **+3.64%**.
 
-`binary_trees` **+3.6%** is the one regression, and it is a call-convention artifact rather than
-anything to do with storage. `OP_CALL_RAW_*` took its single argument from *any* slot; `OP_CALL`
-requires arguments in a contiguous run, so `make_tree(d)` now emits an `OP_MOVE` to place `d` where
-the convention wants it. The contiguity requirement is vacuous for **one** argument -- the fix is to
-let a single-argument call name the value's own register as its base and allocate a separate
-destination, which is a change to the call protocol at four parse sites, not to this merge.
+**Measure this with `perf`, not with dispatch counts.** Dispatch counts called the merge clean --
+`fib_bench` came out at exactly 0.00%, the same 134,373,167 dispatches on both sides. On ARM it was
+**+88.57%**, deterministic to 0.01%. A dispatch count cannot see work *inside* a dispatch, and what
+had moved inside one was a whole specialization resolver.
+
+That regression is worth recording in full, because the cause was nothing to do with storage.
+Deleting `OP_CALL_RAW_INT` removed the only path that skipped `vm_call_resolve_numeric`, so a
+self-recursive numeric function re-resolved its own specialization on every one of its recursive
+calls -- a noinline call, a loop reading each argument's tag, and a walk of the `SpecEntry`, to
+reach a conclusion that could not have changed. Specialization went from **-51%** on `fib_bench` to
+**+8%**: worse than never specializing at all. `OP_CALL_RAW_*`'s real job had been skipping
+*resolution*, not skipping boxing, which is why its replacement (`OP_CALL_SELF`) is one opcode where
+the deleted pair was two.
+
+The diagnosis came from disabling numeric specialization on **both** sides and re-measuring, which
+separated "the merge is bad" from "specialization stopped paying" in a single run: with it off,
+the merge alone was `fib_bench` -14.47%, `binary_trees` -8.10%, `mandelbrot` -2.91%. Guessing had
+already produced one wrong answer before that.
+
+`mandelbrot` **+3.64%** is the honest structural price, and it is the tag store: roughly one extra
+store per unchecked arithmetic op, and its inner loop has seven, which is +250M instructions against
+a measured +250M. Two probes fix the mechanism. Writing the payload without the tag kills the program
+in 1.95M instructions, so the tag is load-bearing; splitting the write into `.tag =` and `.as.d =`
+instead of storing the struct whole costs +0.36%, so it is not a codegen artifact. Removing it means
+establishing a slot's tag **once** rather than on every write -- not encoding it more narrowly. See
+5.16yp for why a narrower value representation is not available.
 
 **What the single index space costs.** One slot stack means the parser's alloc/free discipline has to
 be honest about *which* slot it is releasing. Four latent hazards surfaced immediately, all caught by
@@ -2849,6 +2870,34 @@ platforms; the x86 laboratory is better than ARM's, not perfect.
 Both wins in this section came from the same place: a hot loop calling a general helper that
 re-derives what the caller already knows. Neither is exotic, and neither is in the dispatch path
 that most of section 5.16 is about.
+
+### 5.16yp NaN boxing, including the narrow "just the pointers" version
+
+Raised again once the register file became one array of tagged 16-byte `AerVal`s: the tag is 4 bytes
+plus 4 of padding, pointer values never need to be read as integers, and pointers are pool-allocated
+so their addresses have spare bits. Why not NaN-box at least those, and shrink the slot?
+
+**Integers block the general form.** AER integers are a full `int64_t`, and moving *to* the tagged
+union is what let that be true -- it deleted a heap-boxed-overflow path outright (see the value
+representation section above). The corpus exercises the range for real (`9223372036854775`,
+`18446744073709550`, `140737488355328`), and `<<`/`&` push values into the high bits deliberately.
+NaN boxing offers roughly 48-52 payload bits, so going back means either heap-allocating large
+integers -- an allocation inside the arithmetic path -- or keeping a second untagged integer world,
+which is exactly the split 5.16f removed. It was also measured as a loss on the way out: -11.2%
+instructions on `nbody` and -3.3x cache misses, moving away from it.
+
+**Narrowing only the pointers saves nothing, and this is the more interesting half.** A slot's width
+is set by its *largest* case. Every slot stays 16 bytes for the int64/double case whether or not a
+pointer could fit in 8, so encoding pointers more cleverly frees no memory at all. It would pay only
+if pointer-typed values lived in a different array from numeric ones -- which is, again, the split
+5.16f removed. The same reasoning applies to `AerArray`'s payload: a general array's elements must be
+16 bytes because the array can hold anything, and the case where they need not be already has its own
+mechanism (typed and packed arrays).
+
+The instinct behind the question is still right, though: the tag genuinely is dead weight on values
+whose type the compiler already knows. It just cashes out in *time* rather than *space* -- write the
+tag once per slot instead of on every unchecked write, which is what `mandelbrot`'s +3.64% in 5.16f
+is waiting on.
 
 ### 5.17 String interning would not fix the dict benchmarks (measured, not built)
 
