@@ -375,13 +375,10 @@ typedef enum {
        the argument used to be boxed for the module calling convention and the result immediately
        tag-checked back out by whatever consumed it. word0 = PACK3(op, dest_slot, src_slot, fn_id).
        Only the functions aer_math_fn_is_raw_real accepts; floor/ceil/round return integers. */
-    /* A call from inside a specialized body to the function that body IS. The callee is the same
-       function running the same variant, so its frame is the caller's with two fields changed --
-       both already sit in the caller frame this handler touches anyway. That costs no resolver walk
-       and needs no room in the instruction for the callee's identity, which is the whole point: a
-       self-recursive numeric function otherwise re-resolves its own specialization on every call,
-       and that cost is larger than everything specializing it saved. Only ever emitted INTO a
-       variant body -- a generic body must keep resolving, or it never specializes at all. */
+    /* A call from inside a numeric variant to the function that body IS: same variant, so the frame
+       is the caller's size and entry point and no resolver runs. Without it a self-recursive
+       function re-resolves its own specialization every call, costing more than specializing saved.
+       Emitted only INTO a variant -- a generic body must keep resolving or it never specializes. */
     OP_CALL_SELF, /* dest_reg, arg_reg_base, arg_count */
 
     OP_RAW_MATH_REAL,
