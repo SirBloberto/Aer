@@ -58,7 +58,8 @@ void chunk_free(Chunk* c) {
 }
 
 void chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line) {
-    if (c->line_mark_count > 0 && c->line_mark_offsets[c->line_mark_count - 1] >= offset) return;
+    if (c->line_mark_count > 0 && c->line_mark_offsets[c->line_mark_count - 1] >= offset)
+        return;
     if (c->line_mark_count >= c->line_mark_cap) {
         c->line_mark_cap = c->line_mark_cap ? c->line_mark_cap * 2 : 64;
         c->line_mark_offsets = xrealloc(c->line_mark_offsets, sizeof(unsigned int) * c->line_mark_cap);
@@ -70,7 +71,8 @@ void chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line) {
 }
 
 unsigned int chunk_line_for_offset(Chunk* c, unsigned int offset) {
-    if (c->line_mark_count == 0) return 0;
+    if (c->line_mark_count == 0)
+        return 0;
     unsigned int lo = 0, hi = c->line_mark_count; /* find first mark with offset > target */
     while (lo < hi) {
         unsigned int mid = lo + (hi - lo) / 2;
@@ -108,7 +110,8 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
         AerString* vs = aer_as_string(v);
         unsigned int key_len = hashtable_key_true_len(vs->data, vs->length);
         AerVal* existing = hashtable_get(&c->name_index, vs->data, key_len);
-        if (existing) return (unsigned int)aer_as_int(*existing);
+        if (existing)
+            return (unsigned int)aer_as_int(*existing);
 
         unsigned int idx = chunk_pool_append(c, v);
         /* name_index keeps its own copy so it and the pool entry free independently. */
@@ -119,11 +122,16 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
 
     for (unsigned int i = 0; i < c->pool_count; i++) {
         AerVal* e = &c->pool[i];
-        if (aer_type(*e) != aer_type(v)) continue;
-        if (aer_type(v) == TYPE_NULL) return i;
-        if (aer_type(v) == TYPE_INTEGER && aer_as_int(*e) == aer_as_int(v)) return i;
-        if (aer_type(v) == TYPE_REAL && aer_as_real(*e) == aer_as_real(v)) return i;
-        if (aer_type(v) == TYPE_BOOLEAN && aer_as_bool(*e) == aer_as_bool(v)) return i;
+        if (aer_type(*e) != aer_type(v))
+            continue;
+        if (aer_type(v) == TYPE_NULL)
+            return i;
+        if (aer_type(v) == TYPE_INTEGER && aer_as_int(*e) == aer_as_int(v))
+            return i;
+        if (aer_type(v) == TYPE_REAL && aer_as_real(*e) == aer_as_real(v))
+            return i;
+        if (aer_type(v) == TYPE_BOOLEAN && aer_as_bool(*e) == aer_as_bool(v))
+            return i;
         if (aer_type(v) == TYPE_FUNCTION &&
             aer_as_function(*e)->code_offset == aer_as_function(v)->code_offset &&
             aer_as_function(*e)->arity == aer_as_function(v)->arity)
@@ -141,7 +149,8 @@ unsigned int chunk_add_pool(Chunk* c, AerVal v) {
 unsigned int chunk_add_rawk_int(Chunk* c, int64_t v) {
     unsigned int scan = c->rawk_i_count < RAWK_DEDUP_SCAN ? c->rawk_i_count : RAWK_DEDUP_SCAN;
     for (unsigned int i = 0; i < scan; i++)
-        if (c->rawk_i[i] == v) return i;
+        if (c->rawk_i[i] == v)
+            return i;
     if (c->rawk_i_count >= c->rawk_i_cap) {
         c->rawk_i_cap = c->rawk_i_cap ? c->rawk_i_cap * 2 : 8;
         c->rawk_i = xrealloc(c->rawk_i, sizeof(int64_t) * c->rawk_i_cap);
@@ -155,7 +164,8 @@ unsigned int chunk_add_rawk_int(Chunk* c, int64_t v) {
 unsigned int chunk_add_rawk_real(Chunk* c, double v) {
     unsigned int scan = c->rawk_d_count < RAWK_DEDUP_SCAN ? c->rawk_d_count : RAWK_DEDUP_SCAN;
     for (unsigned int i = 0; i < scan; i++)
-        if (memcmp(&c->rawk_d[i], &v, sizeof(double)) == 0) return i;
+        if (memcmp(&c->rawk_d[i], &v, sizeof(double)) == 0)
+            return i;
     if (c->rawk_d_count >= c->rawk_d_cap) {
         c->rawk_d_cap = c->rawk_d_cap ? c->rawk_d_cap * 2 : 8;
         c->rawk_d = xrealloc(c->rawk_d, sizeof(double) * c->rawk_d_cap);
@@ -168,7 +178,8 @@ unsigned int chunk_add_rawk_real(Chunk* c, double v) {
 Shape* chunk_find_shape(Chunk* c, const char* name) {
     for (unsigned int i = c->shape_count; i > 0; i--) {
         Shape* s = c->shapes[i - 1];
-        if (strcmp(aer_as_string(c->pool[s->name])->data, name) == 0) return s;
+        if (strcmp(aer_as_string(c->pool[s->name])->data, name) == 0)
+            return s;
     }
     return NULL;
 }
@@ -205,7 +216,8 @@ void chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offse
 ChunkFunction* chunk_find_function(Chunk* c, const char* name) {
     for (unsigned int i = c->function_count; i > 0; i--) {
         ChunkFunction* f = &c->functions[i - 1];
-        if (strcmp(aer_as_string(c->pool[f->name])->data, name) == 0) return f;
+        if (strcmp(aer_as_string(c->pool[f->name])->data, name) == 0)
+            return f;
     }
     return NULL;
 }
@@ -214,7 +226,8 @@ ChunkFunction* chunk_find_function(Chunk* c, const char* name) {
 ChunkFunction* chunk_find_function_by_name_idx(Chunk* c, unsigned int name_idx) {
     for (unsigned int i = c->function_count; i > 0; i--) {
         ChunkFunction* f = &c->functions[i - 1];
-        if (f->name == name_idx) return f;
+        if (f->name == name_idx)
+            return f;
     }
     return NULL;
 }
@@ -222,7 +235,8 @@ ChunkFunction* chunk_find_function_by_name_idx(Chunk* c, unsigned int name_idx) 
 ChunkFunction* chunk_find_function_by_offset(Chunk* c, unsigned int code_offset) {
     for (unsigned int i = c->function_count; i > 0; i--) {
         ChunkFunction* f = &c->functions[i - 1];
-        if (f->code_offset == code_offset) return f;
+        if (f->code_offset == code_offset)
+            return f;
     }
     return NULL;
 }
@@ -249,7 +263,8 @@ bool chunk_add_import(Chunk* c, const char* name, unsigned int len, const char* 
     if (!is_native_or_host && !aer_module_load(name, len, path_name, path_len)) {
         return false;
     }
-    if (chunk_is_imported(c, name, len)) return true; /* re-importing is harmless, not an error */
+    if (chunk_is_imported(c, name, len))
+        return true; /* re-importing is harmless, not an error */
     if (c->import_count >= c->import_cap) {
         c->import_cap = c->import_cap ? c->import_cap * 2 : 8;
         c->imported_modules = xrealloc(c->imported_modules, sizeof(char*) * c->import_cap);

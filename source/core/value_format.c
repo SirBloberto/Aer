@@ -84,16 +84,19 @@ void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
         case TYPE_FUNCTION: strbuf_append(sb, "<function>"); break;
         case TYPE_STRING: {
             AerString* s = aer_as_string(v);
-            if (in_collection) strbuf_append(sb, "\"");
+            if (in_collection)
+                strbuf_append(sb, "\"");
             strbuf_append_n(sb, s->data, s->length);
-            if (in_collection) strbuf_append(sb, "\"");
+            if (in_collection)
+                strbuf_append(sb, "\"");
             break;
         }
         case TYPE_ARRAY: {
             AerArray* a = aer_as_array(v);
             strbuf_append(sb, "[");
             for (unsigned int i = 0; i < a->count; i++) {
-                if (i > 0) strbuf_append(sb, ", ");
+                if (i > 0)
+                    strbuf_append(sb, ", ");
                 vm_format_value(c, a->items[i], true, sb);
             }
             strbuf_append(sb, "]");
@@ -105,7 +108,8 @@ void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
             strbuf_append(sb, aer_as_string(c->pool[shape->name])->data);
             strbuf_append(sb, "{");
             for (unsigned int i = 0; i < shape->field_count; i++) {
-                if (i > 0) strbuf_append(sb, ", ");
+                if (i > 0)
+                    strbuf_append(sb, ", ");
                 strbuf_append(sb, aer_as_string(c->pool[shape->field_names[i]])->data);
                 strbuf_append(sb, ": ");
                 vm_format_value(c, vm_struct_field_read(s, i), true, sb);
@@ -140,7 +144,8 @@ void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
             bool first = true;
             for (unsigned int i = 0; i < d->map.count; i++) {
                 HashTableEntry* e = &d->map.dense[i];
-                if (!first) strbuf_append(sb, ", ");
+                if (!first)
+                    strbuf_append(sb, ", ");
                 first = false;
                 strbuf_append(sb, "\"");
                 strbuf_append(sb, e->key);
@@ -173,7 +178,8 @@ void vm_print_value(Chunk* c, AerVal v, bool in_collection) {
 
 /* Structural/reference equality with no error path -- unlike OP_EQ, a type mismatch here just means "not this one, keep looking." Used by OP_IN's array scan and collection.index_of (aer_collection.c). */
 bool values_equal(AerVal a, AerVal b) {
-    if (aer_type(a) != aer_type(b)) return false;
+    if (aer_type(a) != aer_type(b))
+        return false;
     switch (aer_type(a)) {
         case TYPE_NULL: return true;
         case TYPE_BOOLEAN: return aer_as_bool(a) == aer_as_bool(b);

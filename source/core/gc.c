@@ -23,7 +23,8 @@ static bool value_is_young(AerVal v) {
    REMEMBERED bit is always available -- no separate scan of remembered_set needed to dedup. */
 static void gc_remember(VmHeap* heap, void* ptr, RememberedKind kind) {
     (void)kind;
-    if (pool_is_remembered(ptr)) return; /* already remembered */
+    if (pool_is_remembered(ptr))
+        return; /* already remembered */
     pool_mark_remembered(ptr);
     if (heap->remembered_count >= heap->remembered_cap) {
         heap->remembered_cap = heap->remembered_cap ? heap->remembered_cap * 2 : 64;
@@ -49,8 +50,10 @@ static void mark_card_dirty(unsigned char** dirty_cards, unsigned int* dirty_car
     }
     (*dirty_cards)[index / 8] |= (unsigned char)(1u << (index % 8));
     unsigned int byte_i = index / 8;
-    if (byte_i < *dirty_min_byte) *dirty_min_byte = byte_i;
-    if (byte_i + 1 > *dirty_max_byte) *dirty_max_byte = byte_i + 1;
+    if (byte_i < *dirty_min_byte)
+        *dirty_min_byte = byte_i;
+    if (byte_i + 1 > *dirty_max_byte)
+        *dirty_max_byte = byte_i + 1;
 }
 
 /* Array write barrier (index-assign, append, insert) -- `index` is the exact slot new_value lands
@@ -60,9 +63,12 @@ static void mark_card_dirty(unsigned char** dirty_cards, unsigned int* dirty_car
    elements' indices. */
 void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value) {
     VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected) return; /* nothing can be old yet -- see gc_ever_collected's own comment */
-    if (pool_is_young(a)) return; /* young containers are re-traced normally next cycle */
-    if (!value_is_young(new_value)) return;
+    if (!heap->gc_ever_collected)
+        return; /* nothing can be old yet -- see gc_ever_collected's own comment */
+    if (pool_is_young(a))
+        return; /* young containers are re-traced normally next cycle */
+    if (!value_is_young(new_value))
+        return;
     mark_card_dirty(&a->dirty_cards, &a->dirty_cards_bytes, &a->dirty_min_byte, &a->dirty_max_byte, index);
     gc_remember(heap, a, REMEMBERED_ARRAY);
 }
@@ -72,9 +78,12 @@ void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value)
    The O(n^2) problem cards solve is specific to unbounded containers. */
 void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value) {
     VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected) return;
-    if (pool_is_young(s)) return;
-    if (!value_is_young(new_value)) return;
+    if (!heap->gc_ever_collected)
+        return;
+    if (pool_is_young(s))
+        return;
+    if (!value_is_young(new_value))
+        return;
     gc_remember(heap, s, REMEMBERED_STRUCT);
 }
 
@@ -86,9 +95,12 @@ void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value) {
    collection.delete sets dirty_all instead (see AerDict.dirty_cards's own comment, vm.h). */
 void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value) {
     VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected) return; /* nothing can be old yet -- see gc_ever_collected's own comment */
-    if (pool_is_young(d)) return;
-    if (!value_is_young(new_value)) return;
+    if (!heap->gc_ever_collected)
+        return; /* nothing can be old yet -- see gc_ever_collected's own comment */
+    if (pool_is_young(d))
+        return;
+    if (!value_is_young(new_value))
+        return;
     mark_card_dirty(&d->dirty_cards, &d->dirty_cards_bytes, &d->dirty_min_byte, &d->dirty_max_byte, index);
     gc_remember(heap, d, REMEMBERED_DICT);
 }
@@ -117,14 +129,16 @@ static bool value_has_cell(AerVal v) {
 }
 
 static void worklist_push(VmHeap* heap, AerVal v, bool minor) {
-    if (!value_has_cell(v)) return;
+    if (!value_has_cell(v))
+        return;
     /* An old cell is frozen during a minor cycle: pool_sweep's young_only skip already presumes it
        alive regardless of mark state, and the only legitimate old -> young edge (a write reaching it
        through gc_barrier_array/struct/dict) is captured by the remembered set and replayed
        separately in gc_collect's own `if (minor)` block below -- so there is nothing left for the
        ordinary mark phase to find by recursing into an old object's own children here. This is also
        why no old cell ever carries a mark bit going into a minor sweep (pool.c's pool_sweep). */
-    if (minor && !value_is_young(v)) return;
+    if (minor && !value_is_young(v))
+        return;
     MarkWorklist* wl = &heap->gc_worklist;
     if (wl->count >= wl->cap) {
         wl->cap = wl->cap ? wl->cap * 2 : 256;
@@ -235,7 +249,8 @@ static void mark_chunk_roots(VmHeap* heap, Chunk* chunk, bool minor) {
    cell's own heap for the same reason free_typed_array below can rely on it. */
 static void free_string(void* cell) {
     AerString* s = (AerString*)cell;
-    if (s->data != s->inline_buf) vm_string_payload_free(vm_current_heap(), s->data, s->length);
+    if (s->data != s->inline_buf)
+        vm_string_payload_free(vm_current_heap(), s->data, s->length);
 }
 static void free_array(void* cell) {
     AerArray* a = (AerArray*)cell;
@@ -262,7 +277,8 @@ static void free_packed_array(void* cell) {
    cell's own heap: vm_run_slice sets it for normal GC, and vm_free brackets teardown with it. */
 static void free_typed_array(void* cell) {
     AerTypedArray* ta = (AerTypedArray*)cell;
-    if (!ta->data) return;
+    if (!ta->data)
+        return;
     size_t size = (size_t)ta->count * vm_typed_elem_width(ta->elem_kind);
     VmHeap* heap = vm_current_heap();
     if (heap && size > 0 && size <= TYPED_ARRAY_FREE_CACHE_MAX_BYTES) {
@@ -357,11 +373,14 @@ static void gc_collect(VM* vm, bool minor, unsigned int* live_out) {
                     } else {
                         for (unsigned int byte_i = a->dirty_min_byte; byte_i < a->dirty_max_byte; byte_i++) {
                             unsigned char byte = a->dirty_cards[byte_i];
-                            if (!byte) continue;
+                            if (!byte)
+                                continue;
                             for (unsigned int bit = 0; bit < 8; bit++) {
-                                if (!(byte & (1u << bit))) continue;
+                                if (!(byte & (1u << bit)))
+                                    continue;
                                 unsigned int idx = byte_i * 8 + bit;
-                                if (idx < a->count) worklist_push(heap, a->items[idx], minor);
+                                if (idx < a->count)
+                                    worklist_push(heap, a->items[idx], minor);
                             }
                         }
                     }
@@ -396,11 +415,14 @@ static void gc_collect(VM* vm, bool minor, unsigned int* live_out) {
                     } else {
                         for (unsigned int byte_i = d->dirty_min_byte; byte_i < d->dirty_max_byte; byte_i++) {
                             unsigned char byte = d->dirty_cards[byte_i];
-                            if (!byte) continue;
+                            if (!byte)
+                                continue;
                             for (unsigned int bit = 0; bit < 8; bit++) {
-                                if (!(byte & (1u << bit))) continue;
+                                if (!(byte & (1u << bit)))
+                                    continue;
                                 unsigned int idx = byte_i * 8 + bit;
-                                if (idx < map->count) worklist_push(heap, map->dense[idx].payload, minor);
+                                if (idx < map->count)
+                                    worklist_push(heap, map->dense[idx].payload, minor);
                             }
                         }
                     }
@@ -445,7 +467,8 @@ unsigned int gc_count_live_cells(VmHeap* heap) {
             unsigned int count = (i == pool->slab_count - 1) ? pool->next_index : pool->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
                 char* cell = pool->slabs[i] + (size_t)j * pool->stride;
-                if (!(*(unsigned char*)cell & POOL_FREE)) total++;
+                if (!(*(unsigned char*)cell & POOL_FREE))
+                    total++;
             }
         }
     }
@@ -487,17 +510,20 @@ void gc_run_collection_cycle(VM* vm) {
     }
 
     /* Checked once per opcode, not per allocation -- a ceiling'd host can slip slightly past it. */
-    if (heap->gc_live_cell_ceiling == 0) return;
-    if (!live_known) live = gc_count_live_cells(heap); /* a minor did not visit the old cells, so it owes a full walk */
-    if (live <= heap->gc_live_cell_ceiling) return;
+    if (heap->gc_live_cell_ceiling == 0)
+        return;
+    if (!live_known)
+        live = gc_count_live_cells(heap); /* a minor did not visit the old cells, so it owes a full walk */
+    if (live <= heap->gc_live_cell_ceiling)
+        return;
     if (!major_ran) {
         live = 0;
         gc_collect(vm, false, &live);
         heap->major_collections_run++;
         heap->minor_since_major = 0;
         gc_rescale_minor_threshold(heap, live);
-        if (live <= heap->gc_live_cell_ceiling) return;
+        if (live <= heap->gc_live_cell_ceiling)
+            return;
     }
     error("Memory ceiling exceeded: %u live cells (limit %u)", live, heap->gc_live_cell_ceiling);
 }
-

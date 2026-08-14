@@ -26,7 +26,8 @@ static AerVal io_read_until_eof(FILE* fp) {
         }
         size_t n = fread(buf + len, 1, cap - len, fp);
         len += n;
-        if (n == 0) break; /* EOF or a read error either way */
+        if (n == 0)
+            break; /* EOF or a read error either way */
     }
     buf = xrealloc(buf, len + 1);
     buf[len] = '\0';
@@ -35,9 +36,11 @@ static AerVal io_read_until_eof(FILE* fp) {
 
 /* Seek-and-presize when possible; io_read_until_eof for non-seekable streams (pipes). */
 static AerVal io_read_fp(FILE* fp) {
-    if (fseek(fp, 0, SEEK_END) != 0) return io_read_until_eof(fp);
+    if (fseek(fp, 0, SEEK_END) != 0)
+        return io_read_until_eof(fp);
     long size = ftell(fp);
-    if (size < 0) return aer_make_result(aer_null(), aer_make_error(strerror(errno)));
+    if (size < 0)
+        return aer_make_result(aer_null(), aer_make_error(strerror(errno)));
     fseek(fp, 0, SEEK_SET);
 
     char* buf = xmalloc((size_t)size + 1);
@@ -84,7 +87,8 @@ static AerVal io_write_mode(AerVal path_v, AerVal data_v, const char* mode) {
     AerString* s = aer_as_string(data_v);
     size_t written = fwrite(s->data, 1, s->length, fp);
     fclose(fp);
-    if (written != s->length) return aer_make_result(aer_null(), aer_make_error(strerror(errno)));
+    if (written != s->length)
+        return aer_make_result(aer_null(), aer_make_error(strerror(errno)));
     return aer_make_result(aer_null(), aer_null());
 }
 
@@ -173,7 +177,8 @@ static AerVal io_stdin(VM* vm, int arg_count, AerVal* args, void* userdata) {
 /* Handles both '/' and '\\' -- a path from io.args() may be OS-native on Windows. */
 static const char* io_last_sep(const char* s, unsigned int len) {
     for (unsigned int i = len; i-- > 0;) {
-        if (s[i] == '/' || s[i] == '\\') return s + i;
+        if (s[i] == '/' || s[i] == '\\')
+            return s + i;
     }
     return NULL;
 }
@@ -212,7 +217,8 @@ static AerVal io_dirname(VM* vm, int arg_count, AerVal* args, void* userdata) {
     }
     /* A separator at position 0 ("/etc") means the directory is "/" itself, not "". */
     unsigned int n = (unsigned int)(sep - s->data);
-    if (n == 0) n = 1;
+    if (n == 0)
+        n = 1;
     char* buf = xmalloc((size_t)n + 1);
     memcpy(buf, s->data, n);
     buf[n] = '\0';
@@ -233,7 +239,8 @@ static AerVal io_join(VM* vm, int arg_count, AerVal* args, void* userdata) {
     char* buf = xmalloc((size_t)n + 1);
     memcpy(buf, a->data, a->length);
     unsigned int pos = a->length;
-    if (need_sep) buf[pos++] = '/';
+    if (need_sep)
+        buf[pos++] = '/';
     memcpy(buf + pos, b->data, b->length);
     buf[n] = '\0';
     return aer_make_string(buf, n);

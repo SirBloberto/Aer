@@ -32,7 +32,8 @@ static Task* tasks_tail = NULL;
 /* Registers fn(args...) as a task to run on actor under the scheduler. False if fn isn't defined
    on actor's script. Must be called before aer_scheduler_run() -- a task can't be added mid-run. */
 static bool aer_scheduler_add(Actor* actor, const char* fn, int arg_count, AerVal* args) {
-    if (!aer_actor_prepare_call(actor, fn, arg_count, args)) return false;
+    if (!aer_actor_prepare_call(actor, fn, arg_count, args))
+        return false;
 
     Task* t = xmalloc(sizeof(Task));
     t->actor = actor;
@@ -56,7 +57,8 @@ static void aer_scheduler_run(void) {
     while (any_unfinished) {
         any_unfinished = false;
         for (Task* t = tasks; t; t = t->next) {
-            if (t->finished) continue;
+            if (t->finished)
+                continue;
             any_unfinished = true;
 
             vm_gc_suppress();

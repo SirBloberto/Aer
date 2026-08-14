@@ -25,7 +25,8 @@ static inline uint64_t rotl(uint64_t x, int k) {
 }
 
 static uint64_t rng_next(void) {
-    if (!rng_seeded) rng_seed((uint64_t)time(NULL) ^ ((uint64_t)clock() << 32));
+    if (!rng_seeded)
+        rng_seed((uint64_t)time(NULL) ^ ((uint64_t)clock() << 32));
     uint64_t result = rotl(rng_state[1] * 5, 7) * 9;
     uint64_t t = rng_state[1] << 17;
     rng_state[2] ^= rng_state[0];

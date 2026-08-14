@@ -29,14 +29,17 @@ void aer_set_diagnostic_callback(AerDiagnosticCallback callback, void* userdata)
 }
 
 static void append_fmt(char* buf, size_t bufsize, size_t* pos, const char* fmt, ...) {
-    if (*pos >= bufsize) return;
+    if (*pos >= bufsize)
+        return;
     va_list args;
     va_start(args, fmt);
     int n = vsnprintf(buf + *pos, bufsize - *pos, fmt, args);
     va_end(args);
-    if (n < 0) return;
+    if (n < 0)
+        return;
     *pos += (size_t)n;
-    if (*pos >= bufsize) *pos = bufsize - 1;
+    if (*pos >= bufsize)
+        *pos = bufsize - 1;
 }
 
 /* Routes to the host-registered callback if any, else stderr; updates aer_last_error() either way. */
@@ -83,25 +86,29 @@ void aer_report_fatal(const char* msg) {
 
 void* xmalloc(size_t size) {
     void* p = malloc(size);
-    if (!p) aer_report_fatal("Out of memory");
+    if (!p)
+        aer_report_fatal("Out of memory");
     return p;
 }
 
 void* xcalloc(size_t count, size_t size) {
     void* p = calloc(count, size);
-    if (!p) aer_report_fatal("Out of memory");
+    if (!p)
+        aer_report_fatal("Out of memory");
     return p;
 }
 
 void* xrealloc(void* ptr, size_t size) {
     void* p = realloc(ptr, size);
-    if (!p) aer_report_fatal("Out of memory");
+    if (!p)
+        aer_report_fatal("Out of memory");
     return p;
 }
 
 char* xstrdup(const char* s) {
     char* p = strdup(s);
-    if (!p) aer_report_fatal("Out of memory");
+    if (!p)
+        aer_report_fatal("Out of memory");
     return p;
 }
 
@@ -132,17 +139,20 @@ void error(const char* format, ...) {
     if (runtime_stack_trace_lookup) {
         char trace[1024];
         unsigned int n = runtime_stack_trace_lookup(trace, sizeof(trace));
-        if (n > 0) append_fmt(buf, sizeof(buf), &pos, "%s", trace);
+        if (n > 0)
+            append_fmt(buf, sizeof(buf), &pos, "%s", trace);
     }
 
     append_fmt(buf, sizeof(buf), &pos, "\n");
     emit_error(buf);
-    if (diagnostic_callback) diagnostic_callback(line, 0, msg_only, diagnostic_callback_userdata);
+    if (diagnostic_callback)
+        diagnostic_callback(line, 0, msg_only, diagnostic_callback_userdata);
 
     parse_had_error = true;
     runtime_had_error = true;
 
-    if (runtime_error_unwind_target) AER_LONGJMP(*runtime_error_unwind_target, 1);
+    if (runtime_error_unwind_target)
+        AER_LONGJMP(*runtime_error_unwind_target, 1);
 }
 
 /* Print a message pinpointing the current token in the source. */
@@ -170,7 +180,8 @@ void error_at(const char* format, ...) {
     char buf[ERROR_MSG_MAX];
     size_t pos = 0;
     const char* filename = runtime_filename_lookup ? runtime_filename_lookup() : NULL;
-    if (filename) append_fmt(buf, sizeof(buf), &pos, "%s:", filename);
+    if (filename)
+        append_fmt(buf, sizeof(buf), &pos, "%s:", filename);
     append_fmt(buf, sizeof(buf), &pos, "%u | %.*s\n    ", line_number, (int)line_len, line_start);
     for (unsigned int i = 0; i < col && pos < sizeof(buf) - 1; i++)
         buf[pos++] = ' ';
@@ -193,5 +204,6 @@ void error_at(const char* format, ...) {
     parse_had_error = true;
     runtime_had_error = true;
 
-    if (runtime_error_unwind_target) AER_LONGJMP(*runtime_error_unwind_target, 1);
+    if (runtime_error_unwind_target)
+        AER_LONGJMP(*runtime_error_unwind_target, 1);
 }

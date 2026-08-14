@@ -245,41 +245,49 @@ typedef struct Parser {
 static Parser P;
 
 static void track_peak(int v) {
-    if (v > P.max_register_used) P.max_register_used = v;
+    if (v > P.max_register_used)
+        P.max_register_used = v;
 }
 static void track_raw_int_peak(int v) {
-    if (v > P.max_raw_int_used) P.max_raw_int_used = v;
+    if (v > P.max_raw_int_used)
+        P.max_raw_int_used = v;
 }
 static void track_raw_real_peak(int v) {
-    if (v > P.max_raw_real_used) P.max_raw_real_used = v;
+    if (v > P.max_raw_real_used)
+        P.max_raw_real_used = v;
 }
 
 /* Raw-slot allocators, mirroring reg_alloc/reg_free/reg_reserve's shape -- except overflow:
    raw_int_alloc/raw_real_alloc return -1 instead of erroring, and every caller falls back to
    ordinary boxed storage for that one value. */
 static int raw_int_alloc(void) {
-    if (P.raw_int_next_temp >= RAW_REGISTERS_INT) return -1;
+    if (P.raw_int_next_temp >= RAW_REGISTERS_INT)
+        return -1;
     track_raw_int_peak(P.raw_int_next_temp + 1);
     return P.raw_int_next_temp++;
 }
 static void raw_int_free(int count) {
     P.raw_int_next_temp -= count;
-    if (P.raw_int_next_temp < P.raw_int_reserved_floor) P.raw_int_next_temp = P.raw_int_reserved_floor;
+    if (P.raw_int_next_temp < P.raw_int_reserved_floor)
+        P.raw_int_next_temp = P.raw_int_reserved_floor;
 }
 static int raw_real_alloc(void) {
-    if (P.raw_real_next_temp >= RAW_REGISTERS_REAL) return -1;
+    if (P.raw_real_next_temp >= RAW_REGISTERS_REAL)
+        return -1;
     track_raw_real_peak(P.raw_real_next_temp + 1);
     return P.raw_real_next_temp++;
 }
 static void raw_real_free(int count) {
     P.raw_real_next_temp -= count;
-    if (P.raw_real_next_temp < P.raw_real_reserved_floor) P.raw_real_next_temp = P.raw_real_reserved_floor;
+    if (P.raw_real_next_temp < P.raw_real_reserved_floor)
+        P.raw_real_next_temp = P.raw_real_reserved_floor;
 }
 
 /* Reserves a new permanent raw slot for a variable's first assignment -- the raw analog of
    var_slot claiming P.reserved_floor. Returns -1 on overflow (caller falls back to boxed). */
 static int raw_int_reserve_one(void) {
-    if (P.raw_int_reserved_floor >= RAW_REGISTERS_INT) return -1;
+    if (P.raw_int_reserved_floor >= RAW_REGISTERS_INT)
+        return -1;
     int slot = P.raw_int_reserved_floor;
     P.raw_int_reserved_floor++;
     P.raw_int_next_temp = P.raw_int_reserved_floor;
@@ -287,7 +295,8 @@ static int raw_int_reserve_one(void) {
     return slot;
 }
 static int raw_real_reserve_one(void) {
-    if (P.raw_real_reserved_floor >= RAW_REGISTERS_REAL) return -1;
+    if (P.raw_real_reserved_floor >= RAW_REGISTERS_REAL)
+        return -1;
     int slot = P.raw_real_reserved_floor;
     P.raw_real_reserved_floor++;
     P.raw_real_next_temp = P.raw_real_reserved_floor;
@@ -329,7 +338,8 @@ int reg_alloc(void) {
     P.reg_nonneg[reg] = false; /* a recycled register carries no proof from its last occupant */
     P.reg_elem_kind[reg] = RAWK_NONE;
     track_peak(P.next_temp_register);
-    if (P.next_temp_register > P.loop_cond_peak) P.loop_cond_peak = P.next_temp_register;
+    if (P.next_temp_register > P.loop_cond_peak)
+        P.loop_cond_peak = P.next_temp_register;
     return reg;
 }
 
@@ -337,7 +347,8 @@ void reg_free(int count) {
     P.next_temp_register -= count;
     /* Never free below the reserved floor -- a bug elsewhere shouldn't hand out a local's own
        register as a free temp. */
-    if (P.next_temp_register < P.reserved_floor) P.next_temp_register = P.reserved_floor;
+    if (P.next_temp_register < P.reserved_floor)
+        P.next_temp_register = P.reserved_floor;
 }
 
 #ifdef AER_DEBUG_TOOLS
@@ -348,7 +359,8 @@ void reg_free(int count) {
    bench/ and tests/ corpus through that build for check-opcode-coverage, so it is exercised. */
 static void assert_variables_below_floor(const char* where) {
     for (int i = 0; i < P.var_count; i++) {
-        if (P.var_kind[i] != VAR_BOXED) continue; /* raw kinds index raw_ints/raw_reals, not registers */
+        if (P.var_kind[i] != VAR_BOXED)
+            continue; /* raw kinds index raw_ints/raw_reals, not registers */
         if (P.var_regs[i] >= P.reserved_floor) {
             fprintf(stderr,
                     "aer: internal error: %s left variable slot %d in register %d, at or above the "
@@ -391,7 +403,8 @@ static bool rk_nonneg(Chunk* c, int rk) {
         AerVal v = c->pool[rk & ~RK_CONST_FLAG];
         return aer_type(v) == TYPE_INTEGER && aer_as_int(v) >= 0;
     }
-    if (rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
+    if (rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))
+        return false;
     return rk >= 0 && rk < FRAME_REGISTERS && P.reg_nonneg[rk];
 }
 
@@ -402,8 +415,8 @@ static bool rk_nonneg(Chunk* c, int rk) {
    not a sampling of it. The three exclusions are exclusions on their merits: SUB goes negative,
    LSHIFT can shift a positive value into the sign bit, and DIV yields a real rather than an index. */
 static bool binop_preserves_nonneg(Opcode op) {
-    return op == OP_ADD || op == OP_MUL || op == OP_FLOOR_DIV || op == OP_MOD ||
-           op == OP_BITWISE_AND || op == OP_BITWISE_OR || op == OP_BITWISE_XOR || op == OP_RSHIFT;
+    return op == OP_ADD || op == OP_MUL || op == OP_FLOOR_DIV || op == OP_MOD || op == OP_BITWISE_AND ||
+           op == OP_BITWISE_OR || op == OP_BITWISE_XOR || op == OP_RSHIFT;
 }
 
 /* A plain register below the parameter count -- parameters occupy the frame's first registers. */
@@ -436,7 +449,8 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
        about whether the operand is a number. */
     if ((op <= OP_FLOOR_DIV || (op >= OP_LT && op <= OP_GTE)) && (rk_param(rk_lhs) || rk_param(rk_rhs)))
         P.raw_boxed_emits++;
-    if (spilled) reg_free(spilled);
+    if (spilled)
+        reg_free(spilled);
 }
 
 /* Emits the branch-on-false half of an if/while condition, fusing a bare comparison directly with
@@ -490,7 +504,8 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
     }
     int reg_cond = materialize(c, rk_cond);
     unsigned int patch = emit_jump_if_false_reg(c, reg_cond);
-    if (is_temp(reg_cond)) reg_free(1);
+    if (is_temp(reg_cond))
+        reg_free(1);
     return patch;
 }
 
@@ -527,7 +542,8 @@ void emit_jump_target(Chunk* c, unsigned int target) {
    ceiling. */
 unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count,
                        unsigned int func_index) {
-    if ((int)func_index == P.current_func_idx) P.self_call_seen = true;
+    if ((int)func_index == P.current_func_idx)
+        P.self_call_seen = true;
     chunk_emit(c, PACK3(OP_CALL, dest_reg, arg_reg_base, arg_count));
     unsigned int patch_offset = c->count;
     chunk_emit(c, (uint32_t)callee_offset);
@@ -567,12 +583,16 @@ void emit_array_new(Chunk* c, int dest_reg, int item_reg_base, int item_count) {
    this emitter just produced, fold the two into one opcode that hashes the bytes directly. Detected
    by rollback like emit_cond_jump_if_false, so anything else falls through untouched. */
 static bool try_fuse_index_get_interp(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
-    if (P.last_interp_offset == NO_OFFSET || rk_idx != P.last_interp_dest) return false;
-    if (arr_reg == rk_idx) return false; /* the receiver is what we are about to stop writing */
+    if (P.last_interp_offset == NO_OFFSET || rk_idx != P.last_interp_dest)
+        return false;
+    if (arr_reg == rk_idx)
+        return false; /* the receiver is what we are about to stop writing */
     uint32_t w = c->code[P.last_interp_offset];
-    if ((Opcode)(w & 0xFF) != OP_INTERP || (int)UNPACK_A(w) != rk_idx) return false;
+    if ((Opcode)(w & 0xFF) != OP_INTERP || (int)UNPACK_A(w) != rk_idx)
+        return false;
     unsigned int parts = UNPACK_B(w);
-    if (P.last_interp_offset + 1 + parts != c->count) return false; /* not the immediately preceding instruction */
+    if (P.last_interp_offset + 1 + parts != c->count)
+        return false; /* not the immediately preceding instruction */
 
     uint32_t operands[INTERP_MAX_PARTS];
     for (unsigned int i = 0; i < parts; i++)
@@ -586,7 +606,8 @@ static bool try_fuse_index_get_interp(Chunk* c, int dest_reg, int arr_reg, int r
 }
 
 void emit_index_get(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
-    if (try_fuse_index_get_interp(c, dest_reg, arr_reg, rk_idx)) return;
+    if (try_fuse_index_get_interp(c, dest_reg, arr_reg, rk_idx))
+        return;
     rk_idx = box_if_raw(c, rk_idx);
     /* Same spill-to-register fallback as emit_binary. */
     if (!rk8_fits(rk_idx)) {
@@ -604,7 +625,7 @@ void emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val) {
        kind matches, instead of boxing only for vm_index_set_compute to unbox again. Bounds-checked,
        so no loop proof is needed. */
     RawKind elem = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_elem_kind[arr_reg] : RAWK_NONE;
-    RawKind val_kind = (rk_val & RK_RAW_INT_FLAG) ? RAWK_INT
+    RawKind val_kind = (rk_val & RK_RAW_INT_FLAG)    ? RAWK_INT
                        : (rk_val & RK_RAW_REAL_FLAG) ? RAWK_REAL
                                                      : RAWK_NONE;
     if (elem != RAWK_NONE && elem == val_kind && rk8_fits(rk_idx)) {
@@ -612,7 +633,8 @@ void emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val) {
         chunk_emit(c, PACK3(elem == RAWK_INT ? OP_INDEX_SET_RAW_INT : OP_INDEX_SET_RAW_REAL, arr_reg,
                             pack_rk8(rk_idx), slot));
         if (elem == RAWK_INT) {
-            if (slot >= P.raw_int_reserved_floor) raw_int_free(1);
+            if (slot >= P.raw_int_reserved_floor)
+                raw_int_free(1);
         } else if (slot >= P.raw_real_reserved_floor) {
             raw_real_free(1);
         }
@@ -629,7 +651,8 @@ void emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val) {
         spilled++;
     }
     chunk_emit(c, PACK3(OP_INDEX_SET, arr_reg, pack_rk8(rk_idx), pack_rk8(rk_val)));
-    if (spilled) reg_free(spilled);
+    if (spilled)
+        reg_free(spilled);
 }
 
 /* rk_start/rk_end are RK-encoded like any value operand; a missing bound is an RK-encoded
@@ -775,13 +798,15 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
    silent no-op), matching var_lookup_rk's own "harmless on a miss" convention. See the Parser
    struct's own field comments (top of file) for what each of these tables tracks. */
 static void mark_shape_sensitive(int reg) {
-    if (reg < 0 || reg >= FRAME_REGISTERS) return;
+    if (reg < 0 || reg >= FRAME_REGISTERS)
+        return;
     if (reg < P.current_param_count) {
         P.shape_sensitive_param[reg] = true;
         return;
     }
     int src = P.alias_source_param[reg];
-    if (src >= 0) P.shape_sensitive_param[src] = true;
+    if (src >= 0)
+        P.shape_sensitive_param[src] = true;
 }
 
 /* True iff (arr_reg, idx_rk) matches a pair on the safe_loop_item/array_regs stack. Both halves
@@ -790,9 +815,11 @@ static void mark_shape_sensitive(int reg) {
    Packed-array field callers additionally require arr_reg == P.hint_param_reg (the field offset
    is only valid for that one specialized parameter); typed-array callers do not. */
 static bool index_safe_unchecked(int arr_reg, int idx_rk) {
-    if (idx_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
+    if (idx_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))
+        return false;
     for (int i = 0; i < P.safe_loop_depth; i++) {
-        if (P.safe_loop_item_regs[i] == idx_rk && P.safe_loop_array_regs[i] == arr_reg) return true;
+        if (P.safe_loop_item_regs[i] == idx_rk && P.safe_loop_array_regs[i] == arr_reg)
+            return true;
     }
     return false;
 }
@@ -804,16 +831,23 @@ static bool index_safe_unchecked(int arr_reg, int idx_rk) {
    so parse_for_in's push/pop depth counting is untouched and a dead slot can never be resurrected.
    The length_tracked_valid and range_item_written updates ride along for the same reason. */
 static void invalidate_register(int reg) {
-    if (reg < 0) return;
-    if (P.length_tracked_valid && reg == P.length_tracked_source_reg) P.length_tracked_valid = false;
-    if (reg < FRAME_REGISTERS) P.reg_nonneg[reg] = false;
-    if (reg < FRAME_REGISTERS) P.reg_elem_kind[reg] = RAWK_NONE;
+    if (reg < 0)
+        return;
+    if (P.length_tracked_valid && reg == P.length_tracked_source_reg)
+        P.length_tracked_valid = false;
+    if (reg < FRAME_REGISTERS)
+        P.reg_nonneg[reg] = false;
+    if (reg < FRAME_REGISTERS)
+        P.reg_elem_kind[reg] = RAWK_NONE;
     for (int i = 0; i < P.safe_loop_depth; i++) {
-        if (P.safe_loop_item_regs[i] == reg) P.safe_loop_item_regs[i] = -1;
-        if (P.safe_loop_array_regs[i] == reg) P.safe_loop_array_regs[i] = -1;
+        if (P.safe_loop_item_regs[i] == reg)
+            P.safe_loop_item_regs[i] = -1;
+        if (P.safe_loop_array_regs[i] == reg)
+            P.safe_loop_array_regs[i] = -1;
     }
     for (int i = 0; i < P.range_loop_depth; i++)
-        if (P.range_item_regs[i] == reg) P.range_item_written[i] = true;
+        if (P.range_item_regs[i] == reg)
+            P.range_item_written[i] = true;
 }
 
 /* Compile-time field lookup against a known Shape, resolving offset and type from the Shape's own
@@ -840,7 +874,8 @@ static bool shape_find_field(Shape* shape, unsigned int field_name_idx, unsigned
    inside a function body -- see the Parser struct's own field comments (top of file) for how
    global_names/function_depth track this. */
 static bool report_if_shadowed_global(Chunk* c, unsigned int name_idx) {
-    if (P.function_depth == 0) return false;
+    if (P.function_depth == 0)
+        return false;
     for (int i = 0; i < P.global_count; i++) {
         if (P.global_names[i] == name_idx) {
             error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a "
@@ -859,11 +894,13 @@ static bool report_if_shadowed_global(Chunk* c, unsigned int name_idx) {
    lookup still resolve correctly once the two diverge. */
 static int var_slot(Chunk* c, unsigned int name_idx) {
     for (int i = 0; i < P.var_count; i++)
-        if (P.var_names[i] == name_idx) return P.var_regs[i];
+        if (P.var_names[i] == name_idx)
+            return P.var_regs[i];
     /* Shadowing a top-level name is a compile error, not a silent fresh local -- catches both a
        fresh local and a parameter with that name. P.function_depth == 0 (the definition itself)
        and an already-local name are exempt. */
-    if (report_if_shadowed_global(c, name_idx)) return -1;
+    if (report_if_shadowed_global(c, name_idx))
+        return -1;
     /* Checks P.reserved_floor, not P.var_count -- P.var_count can lag behind P.reserved_floor once a
        for-loop promotes it (see this function's own comment above). */
     if (P.reserved_floor >= FRAME_REGISTERS) {
@@ -918,7 +955,8 @@ static bool var_lookup(unsigned int name_idx, int* out_reg) {
    below it. A raw-flagged rk must return false FIRST -- its numeric value could otherwise
    coincidentally compare as >= P.reserved_floor. */
 static bool is_temp(int rk) {
-    if (rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
+    if (rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))
+        return false;
     return !(rk & RK_CONST_FLAG) && rk >= P.reserved_floor;
 }
 
@@ -929,14 +967,16 @@ static int box_if_raw(Chunk* c, int rk) {
         int slot = rk & RK_RAW_SLOT_MASK;
         int dest = reg_alloc();
         chunk_emit(c, PACK3(OP_BOX_INT, dest, slot, 0));
-        if (slot >= P.raw_int_reserved_floor) raw_int_free(1);
+        if (slot >= P.raw_int_reserved_floor)
+            raw_int_free(1);
         return dest;
     }
     if (rk & RK_RAW_REAL_FLAG) {
         int slot = rk & RK_RAW_SLOT_MASK;
         int dest = reg_alloc();
         chunk_emit(c, PACK3(OP_BOX_REAL, dest, slot, 0));
-        if (slot >= P.raw_real_reserved_floor) raw_real_free(1);
+        if (slot >= P.raw_real_reserved_floor)
+            raw_real_free(1);
         return dest;
     }
     return rk;
@@ -952,7 +992,8 @@ static void ensure_boxed(Chunk* c, unsigned int name_idx) {
             existing_idx = i;
             break;
         }
-    if (existing_idx < 0 || P.var_kind[existing_idx] == VAR_BOXED) return;
+    if (existing_idx < 0 || P.var_kind[existing_idx] == VAR_BOXED)
+        return;
 
     int old_slot = P.var_regs[existing_idx];
     Opcode box_op = (P.var_kind[existing_idx] == VAR_RAW_INT) ? OP_BOX_INT : OP_BOX_REAL;
@@ -973,7 +1014,8 @@ static void ensure_boxed(Chunk* c, unsigned int name_idx) {
    actual register, no RK/raw form. */
 static int materialize(Chunk* c, int rk) {
     rk = box_if_raw(c, rk);
-    if (!(rk & RK_CONST_FLAG)) return rk;
+    if (!(rk & RK_CONST_FLAG))
+        return rk;
     int reg = reg_alloc();
     /* dest+pool_idx both fit word0 now (op(8)+dest(8)+pool_idx(16)) -- no trailing word. */
     chunk_emit(c, PACK_OP_A_W16(OP_LOADK, reg, (unsigned int)(rk & ~RK_CONST_FLAG)));
@@ -983,9 +1025,11 @@ static int materialize(Chunk* c, int rk) {
 /* Every reader of a variable's value must go through this, not raw P.var_regs[i], or a raw slot
    index gets misread as a plain register (real bug found in string interpolation). */
 static bool var_lookup_rk(unsigned int name_idx, int* out_rk) {
-    if (name_idx == P.self_ref_watch_name) P.self_ref_watch_seen = true;
+    if (name_idx == P.self_ref_watch_name)
+        P.self_ref_watch_seen = true;
     for (int i = 0; i < P.var_count; i++) {
-        if (P.var_names[i] != name_idx) continue;
+        if (P.var_names[i] != name_idx)
+            continue;
         switch (P.var_kind[i]) {
             case VAR_RAW_INT: *out_rk = RK_RAW_INT_FLAG | P.var_regs[i]; break;
             case VAR_RAW_REAL: *out_rk = RK_RAW_REAL_FLAG | P.var_regs[i]; break;
@@ -996,17 +1040,20 @@ static bool var_lookup_rk(unsigned int name_idx, int* out_rk) {
     return false;
 }
 
-
 /* The ONE gate deciding whether an expression can compose as raw: an already-raw operand, or a
    compile-time int/real literal. A call result, container read, string, or struct/array/dict is
    never raw-composable. */
 static RawKind rk_raw_kind(Chunk* c, int rk) {
-    if (rk & RK_RAW_INT_FLAG) return RAWK_INT;
-    if (rk & RK_RAW_REAL_FLAG) return RAWK_REAL;
+    if (rk & RK_RAW_INT_FLAG)
+        return RAWK_INT;
+    if (rk & RK_RAW_REAL_FLAG)
+        return RAWK_REAL;
     if (rk & RK_CONST_FLAG) {
         AerVal v = c->pool[rk & ~RK_CONST_FLAG];
-        if (aer_type(v) == TYPE_INTEGER) return RAWK_INT;
-        if (aer_type(v) == TYPE_REAL) return RAWK_REAL;
+        if (aer_type(v) == TYPE_INTEGER)
+            return RAWK_INT;
+        if (aer_type(v) == TYPE_REAL)
+            return RAWK_REAL;
     }
     return RAWK_NONE;
 }
@@ -1016,18 +1063,21 @@ static RawKind rk_raw_kind(Chunk* c, int rk) {
    dominates every use it can serve. Returns false when the nesting bound is reached, in which case
    nothing hoists and hoist_end must be told so. */
 static bool hoist_begin(Chunk* c) {
-    if (P.hoist_depth >= LOOP_MAX) return false;
+    if (P.hoist_depth >= LOOP_MAX)
+        return false;
     LoopHoist* h = &P.hoist_stack[P.hoist_depth++];
     h->count = 0;
     h->gap_offset = c->count;
-    for (int i = 0; i < HOIST_GAP_WORDS; i++) chunk_emit(c, 0);
+    for (int i = 0; i < HOIST_GAP_WORDS; i++)
+        chunk_emit(c, 0);
     return true;
 }
 
 /* Backfills the gap now the body has been parsed. after_gap is the loop's own first instruction --
    the address the skip-jump targets when fewer than HOIST_MAX constants were hoisted. */
 static void hoist_end(Chunk* c, unsigned int after_gap, bool active) {
-    if (!active) return;
+    if (!active)
+        return;
     LoopHoist* h = &P.hoist_stack[--P.hoist_depth];
     unsigned int w = h->gap_offset;
     for (int i = 0; i < h->count; i++) {
@@ -1055,18 +1105,19 @@ static void hoist_end(Chunk* c, unsigned int after_gap, bool active) {
    slot 3, and `i` advanced by `i * 2` forever. max_raw_*_used is the only counter that outlives a
    statement. Slots skipped this way are never reused -- at most HOIST_MAX per loop. */
 static int hoist_reserve_int(void) {
-    int slot = P.max_raw_int_used > P.raw_int_reserved_floor ? P.max_raw_int_used
-                                                             : P.raw_int_reserved_floor;
-    if (slot >= RAW_REGISTERS_INT) return -1;
+    int slot = P.max_raw_int_used > P.raw_int_reserved_floor ? P.max_raw_int_used : P.raw_int_reserved_floor;
+    if (slot >= RAW_REGISTERS_INT)
+        return -1;
     P.raw_int_reserved_floor = slot + 1;
     P.raw_int_next_temp = P.raw_int_reserved_floor;
     track_raw_int_peak(P.raw_int_reserved_floor);
     return slot;
 }
 static int hoist_reserve_real(void) {
-    int slot = P.max_raw_real_used > P.raw_real_reserved_floor ? P.max_raw_real_used
-                                                               : P.raw_real_reserved_floor;
-    if (slot >= RAW_REGISTERS_REAL) return -1;
+    int slot =
+        P.max_raw_real_used > P.raw_real_reserved_floor ? P.max_raw_real_used : P.raw_real_reserved_floor;
+    if (slot >= RAW_REGISTERS_REAL)
+        return -1;
     P.raw_real_reserved_floor = slot + 1;
     P.raw_real_next_temp = P.raw_real_reserved_floor;
     track_raw_real_peak(P.raw_real_reserved_floor);
@@ -1077,15 +1128,20 @@ static int hoist_reserve_real(void) {
    "not hoisted" -- no enclosing loop, this loop's gap is full, or the raw-slot budget is spent --
    and the caller then emits the load inline exactly as before. */
 static int hoist_constant(bool is_int, int64_t value, unsigned int rawk_idx, bool from_pool) {
-    if (P.hoist_depth <= 0) return -1;
+    if (P.hoist_depth <= 0)
+        return -1;
     LoopHoist* h = &P.hoist_stack[P.hoist_depth - 1];
     for (int i = 0; i < h->count; i++) {
-        if (h->is_int[i] != is_int) continue;
-        if (is_int ? (h->value[i] == value) : (h->rawk_idx[i] == rawk_idx)) return h->slot[i];
+        if (h->is_int[i] != is_int)
+            continue;
+        if (is_int ? (h->value[i] == value) : (h->rawk_idx[i] == rawk_idx))
+            return h->slot[i];
     }
-    if (h->count >= HOIST_MAX) return -1;
+    if (h->count >= HOIST_MAX)
+        return -1;
     int slot = is_int ? hoist_reserve_int() : hoist_reserve_real();
-    if (slot < 0) return -1;
+    if (slot < 0)
+        return -1;
     int i = h->count++;
     h->is_int[i] = is_int;
     h->from_pool[i] = from_pool;
@@ -1106,14 +1162,17 @@ static unsigned int rawk_real_of_pool(Chunk* c, unsigned int pool_idx) {
    Returns -1 on budget overflow (caller falls back to boxed). */
 static int raw_materialize(Chunk* c, int rk, RawKind kind) {
     if (kind == RAWK_INT) {
-        if (rk & RK_RAW_INT_FLAG) return rk & RK_RAW_SLOT_MASK;
+        if (rk & RK_RAW_INT_FLAG)
+            return rk & RK_RAW_SLOT_MASK;
         int64_t v = aer_as_int(c->pool[rk & ~RK_CONST_FLAG]);
         bool wide = !(v >= INT32_MIN && v <= INT32_MAX);
         unsigned int rawk_idx = wide ? chunk_add_rawk_int(c, v) : 0;
         int hoisted = hoist_constant(true, v, rawk_idx, wide);
-        if (hoisted >= 0) return hoisted;
+        if (hoisted >= 0)
+            return hoisted;
         int slot = raw_int_alloc();
-        if (slot < 0) return -1;
+        if (slot < 0)
+            return -1;
         /* A literal outside the signed 32-bit range needs the side table -- OP_RAW_LOAD_INT's
            immediate is a full int32 now (the old 20-bit immediate's truncation bug -- `i < 20000000`
            silently becoming 77056 -- is closed outright, not just widened again), but AER integers
@@ -1127,12 +1186,15 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
         }
         return slot;
     } else {
-        if (rk & RK_RAW_REAL_FLAG) return rk & RK_RAW_SLOT_MASK;
+        if (rk & RK_RAW_REAL_FLAG)
+            return rk & RK_RAW_SLOT_MASK;
         unsigned int rawk_idx = rawk_real_of_pool(c, rk & ~RK_CONST_FLAG);
         int hoisted = hoist_constant(false, 0, rawk_idx, false);
-        if (hoisted >= 0) return hoisted;
+        if (hoisted >= 0)
+            return hoisted;
         int slot = raw_real_alloc();
-        if (slot < 0) return -1;
+        if (slot < 0)
+            return -1;
         chunk_emit(c, PACK1(OP_RAW_LOAD_REAL, slot));
         chunk_emit(c, rawk_idx);
         return slot;
@@ -1152,9 +1214,12 @@ static void note_raw_write(Chunk* c, int dest, RawKind kind) {
    write is reachable on paths the move was not. The source slot must be a temp: retargeting one
    that belongs to a variable would drop that variable's own value. */
 static bool retarget_raw_write(Chunk* c, int src_slot, int dest_slot, RawKind kind, int floor_now) {
-    if (P.raw_write_offset == NO_OFFSET || P.raw_write_offset != c->count - 1) return false;
-    if (P.raw_write_slot != src_slot || P.raw_write_kind != kind) return false;
-    if (P.raw_write_epoch != P.patch_epoch || src_slot < floor_now) return false;
+    if (P.raw_write_offset == NO_OFFSET || P.raw_write_offset != c->count - 1)
+        return false;
+    if (P.raw_write_slot != src_slot || P.raw_write_kind != kind)
+        return false;
+    if (P.raw_write_epoch != P.patch_epoch || src_slot < floor_now)
+        return false;
     uint32_t w = c->code[P.raw_write_offset];
     c->code[P.raw_write_offset] = PACK3((Opcode)(w & 0xFF), dest_slot, UNPACK_B(w), UNPACK_C(w));
     P.raw_write_offset = NO_OFFSET;
@@ -1169,10 +1234,12 @@ static bool rawk_const_rk(Chunk* c, int rk, RawKind kind, int* out_rk) {
     AerVal v = c->pool[pool_idx];
     unsigned int idx;
     if (kind == RAWK_INT) {
-        if (aer_type(v) != TYPE_INTEGER) return false;
+        if (aer_type(v) != TYPE_INTEGER)
+            return false;
         idx = chunk_add_rawk_int(c, aer_as_int(v));
     } else {
-        if (aer_type(v) != TYPE_REAL && aer_type(v) != TYPE_INTEGER) return false;
+        if (aer_type(v) != TYPE_REAL && aer_type(v) != TYPE_INTEGER)
+            return false;
         idx = rawk_real_of_pool(c, pool_idx);
     }
     *out_rk = (int)(RK_CONST_FLAG | idx);
@@ -1184,17 +1251,22 @@ static bool rawk_const_rk(Chunk* c, int rk, RawKind kind, int* out_rk) {
    the same "inspect what was just compiled" test compare fusion and FMA fusion already use. Safe to
    fail after rewriting: emit_binary's own box_if_raw handles a raw operand on the boxed path. */
 static bool try_rewrite_index_get_raw(Chunk* c, int* rk, unsigned int start, RawKind want) {
-    if (want == RAWK_NONE || c->count - start != 1) return false;
-    if (*rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) return false;
+    if (want == RAWK_NONE || c->count - start != 1)
+        return false;
+    if (*rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))
+        return false;
     uint32_t w = c->code[start];
-    if ((Opcode)(w & 0xFF) != OP_TYPED_INDEX_GET_UNCHECKED || (int)UNPACK_A(w) != *rk) return false;
+    if ((Opcode)(w & 0xFF) != OP_TYPED_INDEX_GET_UNCHECKED || (int)UNPACK_A(w) != *rk)
+        return false;
 
     bool is_int = (want == RAWK_INT);
     int slot = is_int ? raw_int_alloc() : raw_real_alloc();
-    if (slot < 0) return false;
-    if (is_temp(*rk)) reg_free(1);
-    c->code[start] = PACK3(is_int ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL, slot,
-                           UNPACK_B(w), UNPACK_C(w));
+    if (slot < 0)
+        return false;
+    if (is_temp(*rk))
+        reg_free(1);
+    c->code[start] =
+        PACK3(is_int ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL, slot, UNPACK_B(w), UNPACK_C(w));
     *rk = (is_int ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | slot;
     return true;
 }
@@ -1223,7 +1295,8 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
             int tmp = raw_real_alloc();
             if (tmp >= 0) {
                 chunk_emit(c, PACK3(OP_UNBOX_REAL, tmp, boxed_rk, 0));
-                if (is_temp(boxed_rk)) reg_free(1);
+                if (is_temp(boxed_rk))
+                    reg_free(1);
                 if (lhs_raw) {
                     rk_rhs = RK_RAW_REAL_FLAG | tmp;
                     kind_rhs = RAWK_REAL;
@@ -1234,7 +1307,8 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
             }
         }
     }
-    if (kind_lhs == RAWK_NONE || kind_rhs == RAWK_NONE || kind_lhs != kind_rhs) return false;
+    if (kind_lhs == RAWK_NONE || kind_rhs == RAWK_NONE || kind_lhs != kind_rhs)
+        return false;
     bool int_kind = (kind_lhs == RAWK_INT);
 
     Opcode raw_op;
@@ -1320,7 +1394,8 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     }
 
     int slot_lhs = raw_materialize(c, rk_lhs, kind_lhs);
-    if (slot_lhs < 0) return false; /* raw-slot budget exhausted: fall back to boxed */
+    if (slot_lhs < 0)
+        return false; /* raw-slot budget exhausted: fall back to boxed */
 
     /* A literal right operand rides in the instruction as a raw-constant index instead of being
        loaded into a slot of its own. Comparisons only: an arithmetic operand is read on the hot
@@ -1333,7 +1408,8 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
         int const_rk;
         if (rawk_const_rk(c, rk_rhs, kind_lhs, &const_rk)) {
             unsigned int idx = (unsigned int)(const_rk & ~RK_CONST_FLAG);
-            if (idx <= RK8_INDEX_MASK) rhs_field = (int)(RK8_CONST_FLAG | idx);
+            if (idx <= RK8_INDEX_MASK)
+                rhs_field = (int)(RK8_CONST_FLAG | idx);
         }
     }
     /* Same idea for integer +/-, but via a dedicated opcode whose C field is a bare index (see
@@ -1353,7 +1429,8 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     int slot_rhs = -1;
     if (rhs_field < 0) {
         slot_rhs = raw_materialize(c, rk_rhs, kind_lhs); /* same kind, confirmed above */
-        if (slot_rhs < 0) return false;
+        if (slot_rhs < 0)
+            return false;
         rhs_field = slot_rhs;
     }
 
@@ -1381,14 +1458,16 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     }
     if (div_int_promotes_to_real) {
         int dest = raw_real_alloc();
-        if (dest < 0) return false; /* extremely unlikely right after freeing 2 int slots, but stay safe */
+        if (dest < 0)
+            return false; /* extremely unlikely right after freeing 2 int slots, but stay safe */
         chunk_emit(c, PACK3(raw_op, dest, slot_lhs, rhs_field));
         note_raw_write(c, dest, RAWK_REAL);
         *out_rk = RK_RAW_REAL_FLAG | dest;
         return true;
     }
     int dest = int_kind ? raw_int_alloc() : raw_real_alloc();
-    if (dest < 0) return false;
+    if (dest < 0)
+        return false;
     chunk_emit(c, PACK3(raw_op, dest, slot_lhs, rhs_field));
     note_raw_write(c, dest, int_kind ? RAWK_INT : RAWK_REAL);
     *out_rk = (int_kind ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest;
@@ -1400,7 +1479,8 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
 static bool func_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offset,
                         unsigned int* out_func_index) {
     ChunkFunction* f = chunk_find_function_by_name_idx(c, name_idx);
-    if (!f) return false;
+    if (!f)
+        return false;
     *out_offset = f->code_offset;
     *out_func_index = (unsigned int)(f - c->functions);
     return true;
@@ -1413,7 +1493,8 @@ static bool func_full_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_
                              unsigned int* out_max_registers, unsigned int* out_max_raw_ints,
                              unsigned int* out_max_raw_reals, unsigned int* out_func_index) {
     ChunkFunction* f = chunk_find_function_by_name_idx(c, name_idx);
-    if (!f) return false;
+    if (!f)
+        return false;
     *out_offset = f->code_offset;
     *out_arity = f->arity;
     *out_min_arity = f->min_arity;
@@ -1468,8 +1549,7 @@ static void func_register(Chunk* c, unsigned int name_idx, unsigned int offset, 
     for (int i = 0; i < P.pending_count;) {
         if (P.pending_calls[i].name_idx == name_idx) {
             patch_call_target(c, P.pending_calls[i].patch_offset, offset);
-            c->code[P.pending_calls[i].patch_offset + 1] =
-                (uint32_t)(new_func_index * sizeof(ChunkFunction));
+            c->code[P.pending_calls[i].patch_offset + 1] = (uint32_t)(new_func_index * sizeof(ChunkFunction));
             P.pending_calls[i] = P.pending_calls[--P.pending_count];
         } else {
             i++;
@@ -1530,7 +1610,8 @@ static void loop_pop_and_patch_rotated(Chunk* c, unsigned int exit_target, unsig
 
 static bool is_struct_name(unsigned int name_idx) {
     for (int i = 0; i < P.struct_count; i++)
-        if (P.struct_names[i] == name_idx) return true;
+        if (P.struct_names[i] == name_idx)
+            return true;
     return false;
 }
 
@@ -1555,7 +1636,8 @@ static int arg_materialize(Chunk* c, int rk) {
         chunk_emit(c, PACK_OP_A_W16(OP_LOADK, target, (unsigned int)(rk & ~RK_CONST_FLAG)));
     } else {
         chunk_emit(c, PACK2(OP_MOVE, target, rk));
-        if (rk >= 0 && rk < FRAME_REGISTERS) P.reg_elem_kind[target] = P.reg_elem_kind[rk];
+        if (rk >= 0 && rk < FRAME_REGISTERS)
+            P.reg_elem_kind[target] = P.reg_elem_kind[rk];
     }
     return target;
 }
@@ -1569,7 +1651,8 @@ static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base) 
         do {
             int rk = parse_binary(c, 0);
             int reg = arg_materialize(c, rk);
-            if (count == 0) base = reg;
+            if (count == 0)
+                base = reg;
             count++;
         } while (consume(TOKEN_COMMA));
     }
@@ -1733,7 +1816,8 @@ static int parse_interpolated_expr(Chunk* c, const char* text, unsigned int len)
     free(decoded); /* lexer_begin_span copies it into its own owned buffer */
     lex();
     int rk = parse_binary(c, 0);
-    if (!parse_had_error && !equal(TOKEN_END_OF_FILE)) error_at("Unexpected token in string interpolation");
+    if (!parse_had_error && !equal(TOKEN_END_OF_FILE))
+        error_at("Unexpected token in string interpolation");
     lexer_restore_state(saved);
     return rk;
 }
@@ -1746,8 +1830,10 @@ static int parse_interpolated_expr(Chunk* c, const char* text, unsigned int len)
 static int emit_interp(Chunk* c, const int* parts, int part_count) {
     int temps = 0;
     for (int i = 0; i < part_count; i++)
-        if (is_temp(parts[i])) temps++;
-    if (temps) reg_free(temps);
+        if (is_temp(parts[i]))
+            temps++;
+    if (temps)
+        reg_free(temps);
     int dest = reg_alloc();
     P.last_interp_offset = c->count;
     P.last_interp_dest = dest;
@@ -1797,7 +1883,8 @@ static int parse_string_literal(Chunk* c) {
                 i += 2;
                 continue;
             }
-            if (s[i] == '{') break;
+            if (s[i] == '{')
+                break;
             i++;
         }
         if (i > seg_start) {
@@ -1811,7 +1898,8 @@ static int parse_string_literal(Chunk* c) {
             }
             parts[part_count++] = rk_seg;
         }
-        if (i >= len) break;
+        if (i >= len)
+            break;
 
         /* Depth-aware so a nested '{'/'}'  (a dict literal) doesn't end the scan early. */
         i++; /* skip '{' */
@@ -1829,7 +1917,8 @@ static int parse_string_literal(Chunk* c) {
             }
             if (s[i] == '}') {
                 depth--;
-                if (depth == 0) break;
+                if (depth == 0)
+                    break;
                 i++;
                 continue;
             }
@@ -1905,7 +1994,8 @@ static int emit_primitive_cast(Chunk* c, int cast_type, int lhs) {
         }
     }
     lhs = box_if_raw(c, lhs);
-    if (is_temp(lhs)) reg_free(1);
+    if (is_temp(lhs))
+        reg_free(1);
     int dest = reg_alloc();
     bool spilled = false;
     if (!rk8_fits(lhs)) {
@@ -1916,7 +2006,8 @@ static int emit_primitive_cast(Chunk* c, int cast_type, int lhs) {
         chunk_emit(c, PACK3(OP_UNARY, dest, OP_TO_STR, pack_rk8(lhs)));
     else
         chunk_emit(c, PACK3(OP_CAST, dest, cast_type, pack_rk8(lhs)));
-    if (spilled) reg_free(1);
+    if (spilled)
+        reg_free(1);
     return dest;
 }
 
@@ -1931,18 +2022,23 @@ static int parse_primitive_cast_call(Chunk* c, int cast_type) {
     require(TOKEN_OPEN_PARENTHESE, "expected '(' after type name");
     int lhs = parse_binary(c, 0);
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after cast argument");
-    if (parse_had_error) return 0;
+    if (parse_had_error)
+        return 0;
     return emit_primitive_cast(c, cast_type, lhs);
 }
 
 static int parse_primary_inner(Chunk* c) {
-    if (consume(TOKEN_FUNCTION)) return parse_function_expr(c);
+    if (consume(TOKEN_FUNCTION))
+        return parse_function_expr(c);
     /* These 3 reserved tokens have no other valid meaning in primary-expression position now that
        'as' is gone -- parse_primitive_cast_call's own require(TOKEN_OPEN_PARENTHESE, ...) produces a
        clear error if '(' doesn't follow, so no 2-token lookahead is needed here. */
-    if (equal(TOKEN_TYPE_INTEGER)) return parse_primitive_cast_call(c, CAST_INTEGER);
-    if (equal(TOKEN_TYPE_FLOAT)) return parse_primitive_cast_call(c, CAST_FLOAT);
-    if (equal(TOKEN_TYPE_BOOLEAN)) return parse_primitive_cast_call(c, CAST_BOOLEAN);
+    if (equal(TOKEN_TYPE_INTEGER))
+        return parse_primitive_cast_call(c, CAST_INTEGER);
+    if (equal(TOKEN_TYPE_FLOAT))
+        return parse_primitive_cast_call(c, CAST_FLOAT);
+    if (equal(TOKEN_TYPE_BOOLEAN))
+        return parse_primitive_cast_call(c, CAST_BOOLEAN);
     if (consume(TOKEN_OPEN_PARENTHESE)) {
         int rk = parse_binary(c, 0);
         require(TOKEN_CLOSE_PARENTHESE, "expected ')' after expression");
@@ -1967,7 +2063,8 @@ static int parse_primary_inner(Chunk* c) {
         bool narrow_float_candidate = (token.type == TOKEN_REAL && token.narrow);
         unsigned int emit_count_before = c->count;
         int rk_first = parse_binary(c, 0);
-        if (parse_had_error) return 0;
+        if (parse_had_error)
+            return 0;
 
         if (consume(TOKEN_SEMICOLON)) {
             int narrow_flag = 0;
@@ -1981,7 +2078,8 @@ static int parse_primary_inner(Chunk* c) {
             int fill_reg = arg_materialize(c, rk_first);
             int rk_count = parse_binary(c, 0);
             require(TOKEN_CLOSE_BRACKET, "expected ']' after repeat-literal count");
-            if (parse_had_error) return 0;
+            if (parse_had_error)
+                return 0;
             rk_count = box_if_raw(c, rk_count);
             if (!rk16_fits(rk_count)) {
                 error_at("Expression too large to compile (register/constant exceeds the repeat-literal "
@@ -1989,8 +2087,10 @@ static int parse_primary_inner(Chunk* c) {
                 return 0;
             }
             /* Strict LIFO free order -- rk_count was allocated (if a temp at all) after fill_reg. */
-            if (is_temp(rk_count)) reg_free(1);
-            if (is_temp(fill_reg)) reg_free(1);
+            if (is_temp(rk_count))
+                reg_free(1);
+            if (is_temp(fill_reg))
+                reg_free(1);
             int dest = reg_alloc();
             emit_array_repeat(c, dest, fill_reg, narrow_flag, rk_count);
             P.reg_elem_kind[dest] = fill_kind;
@@ -2005,8 +2105,10 @@ static int parse_primary_inner(Chunk* c) {
             item_count++;
         }
         require(TOKEN_CLOSE_BRACKET, "expected ']' after array literal");
-        if (parse_had_error) return 0;
-        if (item_count > 1) reg_free(item_count - 1);
+        if (parse_had_error)
+            return 0;
+        if (item_count > 1)
+            reg_free(item_count - 1);
         emit_array_new(c, item_reg_base, item_reg_base, item_count);
         return item_reg_base;
     }
@@ -2019,18 +2121,22 @@ static int parse_primary_inner(Chunk* c) {
             do {
                 int rk_key = parse_binary(c, 0);
                 int reg_key = arg_materialize(c, rk_key);
-                if (pair_count == 0) pair_reg_base = reg_key;
+                if (pair_count == 0)
+                    pair_reg_base = reg_key;
                 require(TOKEN_COLON, "expected ':' after dict key");
-                if (parse_had_error) return 0;
+                if (parse_had_error)
+                    return 0;
                 int rk_val = parse_binary(c, 0);
                 arg_materialize(c, rk_val);
                 pair_count++;
             } while (consume(TOKEN_COMMA));
         }
         require(TOKEN_CLOSE_BRACE, "expected '}' after dict literal");
-        if (parse_had_error) return 0;
+        if (parse_had_error)
+            return 0;
         int dest = (pair_count > 0) ? pair_reg_base : reg_alloc();
-        if (pair_count > 1) reg_free(2 * pair_count - 1);
+        if (pair_count > 1)
+            reg_free(2 * pair_count - 1);
         emit_dict_new(c, dest, pair_reg_base < 0 ? dest : pair_reg_base, pair_count);
         return dest;
     }
@@ -2048,17 +2154,21 @@ static int parse_primary_inner(Chunk* c) {
         lex();
         return (int)chunk_add_pool(c, v) | RK_CONST_FLAG;
     }
-    if (token.type == TOKEN_STRING) return parse_string_literal(c);
-    if (at_module_name(c)) return parse_module_call(c);
+    if (token.type == TOKEN_STRING)
+        return parse_string_literal(c);
+    if (at_module_name(c))
+        return parse_module_call(c);
     if (token.type == TOKEN_IDENTIFIER) {
         unsigned int name_idx = chunk_add_pool(c, token.value);
         lex();
-        if (consume(TOKEN_OPEN_PARENTHESE)) return parse_call(c, name_idx);
+        if (consume(TOKEN_OPEN_PARENTHESE))
+            return parse_call(c, name_idx);
 
         /* A raw-tracked name returns an RK_RAW_*_FLAG-tagged operand, letting a bare reference compose
            through further arithmetic without boxing. */
         int reg;
-        if (var_lookup_rk(name_idx, &reg)) return reg;
+        if (var_lookup_rk(name_idx, &reg))
+            return reg;
 
         /* A known function referenced without a following '(' is a reference to the function itself
            as a value -- built once per reference as a deduped pool constant. */
@@ -2076,7 +2186,8 @@ static int parse_primary_inner(Chunk* c) {
         }
 
         /* Must not fall through to var_slot -- that would read an uninitialized register. */
-        if (report_if_shadowed_global(c, name_idx)) return 0;
+        if (report_if_shadowed_global(c, name_idx))
+            return 0;
         error_at("'%s' is not defined", aer_as_string(c->pool[name_idx])->data);
         return 0;
     }
@@ -2095,11 +2206,13 @@ static int parse_postfix_chain(Chunk* c, int rk) {
             int arg_reg_base;
             int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
             require(TOKEN_CLOSE_PARENTHESE, "expected ')' after call arguments");
-            if (parse_had_error) return rk;
+            if (parse_had_error)
+                return rk;
             int dest = callee_reg;
             int base = arg_reg_base < 0 ? dest : arg_reg_base;
             emit_call_value(c, dest, base, arg_count, callee_reg);
-            if (arg_count > 0) reg_free(arg_count);
+            if (arg_count > 0)
+                reg_free(arg_count);
             rk = dest;
             continue;
         }
@@ -2114,7 +2227,8 @@ static int parse_postfix_chain(Chunk* c, int rk) {
 
             if (!consume(TOKEN_COLON)) {
                 require(TOKEN_CLOSE_BRACKET, "expected ']' after index");
-                if (parse_had_error) return rk;
+                if (parse_had_error)
+                    return rk;
 
                 int arr_reg = materialize(c, rk);
 
@@ -2129,8 +2243,10 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                     unsigned int field_idx = chunk_add_pool(c, token.value);
                     lex();
 
-                    if (is_temp(rk_start)) reg_free(1);
-                    if (is_temp(arr_reg)) reg_free(1);
+                    if (is_temp(rk_start))
+                        reg_free(1);
+                    if (is_temp(arr_reg))
+                        reg_free(1);
 
                     if (!rk16_fits(rk_start)) {
                         error_at("Expression too large to compile (register/constant index exceeds the fused "
@@ -2182,14 +2298,16 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                 }
 
                 /* Free-then-allocate, matching parse_binary_ops's own discipline. */
-                if (is_temp(rk_start)) reg_free(1);
-                if (is_temp(arr_reg)) reg_free(1);
+                if (is_temp(rk_start))
+                    reg_free(1);
+                if (is_temp(arr_reg))
+                    reg_free(1);
 
                 /* Element kind known, so the read lands in a raw slot and everything downstream
                    composes raw instead of boxing here and unboxing again later. Needs no loop
                    proof: the opcode bounds-checks and falls back to the generic path. */
-                RawKind elem = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_elem_kind[arr_reg]
-                                                                          : RAWK_NONE;
+                RawKind elem =
+                    (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_elem_kind[arr_reg] : RAWK_NONE;
                 if (elem != RAWK_NONE && rk8_fits(rk_start)) {
                     int slot = (elem == RAWK_INT) ? raw_int_alloc() : raw_real_alloc();
                     if (slot >= 0) {
@@ -2229,13 +2347,17 @@ static int parse_postfix_chain(Chunk* c, int rk) {
             else
                 rk_end = parse_binary(c, 0);
             require(TOKEN_CLOSE_BRACKET, "expected ']' after slice");
-            if (parse_had_error) return rk;
+            if (parse_had_error)
+                return rk;
 
             int arr_reg = materialize(c, rk);
 
-            if (is_temp(rk_end)) reg_free(1);
-            if (is_temp(rk_slice_start)) reg_free(1);
-            if (is_temp(arr_reg)) reg_free(1);
+            if (is_temp(rk_end))
+                reg_free(1);
+            if (is_temp(rk_slice_start))
+                reg_free(1);
+            if (is_temp(arr_reg))
+                reg_free(1);
 
             int dest = reg_alloc();
             emit_slice_get(c, dest, arr_reg, rk_slice_start, rk_end);
@@ -2252,7 +2374,8 @@ static int parse_postfix_chain(Chunk* c, int rk) {
             lex();
 
             int struct_reg = materialize(c, rk);
-            if (is_temp(struct_reg)) reg_free(1);
+            if (is_temp(struct_reg))
+                reg_free(1);
 
             mark_shape_sensitive(struct_reg);
             {
@@ -2299,7 +2422,8 @@ static int parse_primary(Chunk* c) {
 static int parse_not(Chunk* c) {
     int rk = parse_binary(c, 2);
     rk = box_if_raw(c, rk);
-    if (is_temp(rk)) reg_free(1);
+    if (is_temp(rk))
+        reg_free(1);
     int dest = reg_alloc();
     bool spilled = false;
     if (!rk8_fits(rk)) {
@@ -2307,13 +2431,15 @@ static int parse_not(Chunk* c) {
         spilled = true;
     }
     chunk_emit(c, PACK3(OP_UNARY, dest, OP_NOT, pack_rk8(rk)));
-    if (spilled) reg_free(1);
+    if (spilled)
+        reg_free(1);
     return dest;
 }
 
 /* Recurses into parse_unary so chained unary (`~~x`) works. rk is RK-encoded like any binary operand. */
 static int parse_unary_inner(Chunk* c) {
-    if (consume(TOKEN_NOT)) return parse_not(c);
+    if (consume(TOKEN_NOT))
+        return parse_not(c);
 
     Opcode unary_op;
     if (consume(TOKEN_BITWISE_NOT))
@@ -2326,7 +2452,8 @@ static int parse_unary_inner(Chunk* c) {
     int rk = parse_unary(c);
     rk = box_if_raw(
         c, rk); /* No raw-native unary form -- box first, or a raw slot index gets misread as a register. */
-    if (is_temp(rk)) reg_free(1); /* free-then-allocate, matching every other site */
+    if (is_temp(rk))
+        reg_free(1); /* free-then-allocate, matching every other site */
     int dest = reg_alloc();
     bool spilled = false;
     if (!rk8_fits(rk)) {
@@ -2334,7 +2461,8 @@ static int parse_unary_inner(Chunk* c) {
         spilled = true;
     }
     chunk_emit(c, PACK3(OP_UNARY, dest, unary_op, pack_rk8(rk)));
-    if (spilled) reg_free(1);
+    if (spilled)
+        reg_free(1);
     return dest;
 }
 
@@ -2347,9 +2475,11 @@ static int parse_unary(Chunk* c) {
    only when it is still the last word emitted -- the same test emit_cond_jump_if_false's fusion
    uses, via the offset it already tracks. */
 static bool retarget_last_cmp(Chunk* c, int reg_rhs, int dest) {
-    if (P.last_cmp_offset == NO_OFFSET || P.last_cmp_offset != c->count - 1) return false;
+    if (P.last_cmp_offset == NO_OFFSET || P.last_cmp_offset != c->count - 1)
+        return false;
     uint32_t w = c->code[P.last_cmp_offset];
-    if ((int)UNPACK_A(w) != reg_rhs || !is_temp(reg_rhs)) return false;
+    if ((int)UNPACK_A(w) != reg_rhs || !is_temp(reg_rhs))
+        return false;
     c->code[P.last_cmp_offset] = PACK3((Opcode)(w & 0xFF), dest, UNPACK_B(w), UNPACK_C(w));
     /* This comparison is now the last word emitted, which would let an enclosing if/while fuse its
        branch with it -- but it sits behind the short circuit and only runs when the left operand was
@@ -2378,7 +2508,8 @@ static int compile_and(Chunk* c, int lhs, unsigned int prec) {
     int reg_rhs = materialize(c, rk_rhs);
     if (reg_rhs != dest && !retarget_last_cmp(c, reg_rhs, dest))
         chunk_emit(c, PACK2(OP_MOVE, dest, reg_rhs));
-    if (is_temp(reg_rhs)) reg_free(1);
+    if (is_temp(reg_rhs))
+        reg_free(1);
 
     patch_jump(c, patch_skip, c->count);
     return dest;
@@ -2406,7 +2537,8 @@ static int compile_or(Chunk* c, int lhs, unsigned int prec) {
     int reg_rhs = materialize(c, rk_rhs);
     if (reg_rhs != dest && !retarget_last_cmp(c, reg_rhs, dest))
         chunk_emit(c, PACK2(OP_MOVE, dest, reg_rhs));
-    if (is_temp(reg_rhs)) reg_free(1);
+    if (is_temp(reg_rhs))
+        reg_free(1);
 
     patch_jump(c, patch_end, c->count);
     return dest;
@@ -2460,7 +2592,8 @@ static int compile_pipe(Chunk* c, int lhs) {
         unsigned int module_idx = chunk_add_pool(c, token.value);
         lex();
         require(TOKEN_DOT, "expected '.' after module name");
-        if (parse_had_error) return lhs;
+        if (parse_had_error)
+            return lhs;
         if (!equal(TOKEN_IDENTIFIER)) {
             error_at("Expected a function name after '.'");
             return lhs;
@@ -2469,9 +2602,11 @@ static int compile_pipe(Chunk* c, int lhs) {
         unsigned int fn_idx = chunk_add_pool(c, token.value);
         lex();
         require(TOKEN_OPEN_PARENTHESE, "expected '(' after piped module function name");
-        if (parse_had_error) return lhs;
+        if (parse_had_error)
+            return lhs;
 
-        if (is_temp(lhs)) reg_free(1);
+        if (is_temp(lhs))
+            reg_free(1);
         int arg_reg_base = arg_materialize(c, lhs);
         int dest = arg_reg_base;
         unsigned int patch_skip_call = compile_pipe_guard_begin(c, dest);
@@ -2485,9 +2620,11 @@ static int compile_pipe(Chunk* c, int lhs) {
             } while (consume(TOKEN_COMMA));
         }
         require(TOKEN_CLOSE_PARENTHESE, "expected ')' after pipe call arguments");
-        if (parse_had_error) return lhs;
+        if (parse_had_error)
+            return lhs;
 
-        if (arg_count > 1) reg_free(arg_count - 1);
+        if (arg_count > 1)
+            reg_free(arg_count - 1);
         chunk_emit(c, PACK3(OP_CALL_MODULE, dest, arg_reg_base, arg_count));
         chunk_emit(c, (uint32_t)module_idx);
         chunk_emit(c, (uint32_t)fn_idx);
@@ -2512,9 +2649,11 @@ static int compile_pipe(Chunk* c, int lhs) {
     }
 
     require(TOKEN_OPEN_PARENTHESE, "expected '(' after piped function name");
-    if (parse_had_error) return lhs;
+    if (parse_had_error)
+        return lhs;
 
-    if (is_temp(lhs)) reg_free(1);
+    if (is_temp(lhs))
+        reg_free(1);
     int arg_reg_base = arg_materialize(c, lhs);
     int dest = arg_reg_base;
     /* No reasonable meaning for short-circuiting a struct construction, so the guard is skipped. */
@@ -2529,9 +2668,11 @@ static int compile_pipe(Chunk* c, int lhs) {
         } while (consume(TOKEN_COMMA));
     }
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after pipe call arguments");
-    if (parse_had_error) return lhs;
+    if (parse_had_error)
+        return lhs;
 
-    if (arg_count > 1) reg_free(arg_count - 1);
+    if (arg_count > 1)
+        reg_free(arg_count - 1);
     if (is_struct) {
         emit_struct_new(c, dest, name_idx, arg_reg_base, arg_count);
     } else {
@@ -2547,7 +2688,8 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
     for (;;) {
         unsigned int prec;
         Opcode op;
-        if (!binary_op_info(token.type, &prec, &op) || prec <= min_prec) break;
+        if (!binary_op_info(token.type, &prec, &op) || prec <= min_prec)
+            break;
         lex();
 
         if (op == OP_AND) {
@@ -2607,8 +2749,10 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
         if (lhs_is_field) {
             /* lhs is always the OP_FIELD_GET result (never raw); rhs could be raw -- box it. */
             rhs = box_if_raw(c, rhs);
-            if (is_temp(rhs)) reg_free(1);
-            if (is_temp(lhs)) reg_free(1);
+            if (is_temp(rhs))
+                reg_free(1);
+            if (is_temp(lhs))
+                reg_free(1);
 
             int dest = reg_alloc();
             if (!rk16_fits(rhs)) {
@@ -2627,7 +2771,8 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             /* C must be a plain register too -- the opcode reads registers[c_reg] directly, no RK
                decode. materialize handles both "was raw" and "was a bare constant" in one call. */
             int c_reg = materialize(c, rhs);
-            if (is_temp(c_reg)) reg_free(1);
+            if (is_temp(c_reg))
+                reg_free(1);
             int dest = reg_alloc();
             chunk_emit(c, PACK3(OP_TYPED_ARRAY_CHAIN2, dest, lhs_chain2_a, lhs_chain2_b));
             chunk_emit(c, PACK_2X16((uint16_t)lhs_chain2_op1, (uint16_t)c_reg));
@@ -2651,7 +2796,8 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
                 int lhs_slot = lhs & RK_RAW_SLOT_MASK;
                 int mul_a = (int)UNPACK_B(mw), mul_b = (int)UNPACK_C(mw);
                 c->count = rhs_start; /* discard the MUL -- fused below instead */
-                if ((int)UNPACK_A(mw) >= P.raw_real_reserved_floor) raw_real_free(1);
+                if ((int)UNPACK_A(mw) >= P.raw_real_reserved_floor)
+                    raw_real_free(1);
                 Opcode fused = (op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
                 chunk_emit(c, PACK3(fused, lhs_slot, mul_a, mul_b));
                 lhs = RK_RAW_REAL_FLAG | lhs_slot;
@@ -2691,8 +2837,10 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
 
                 /* rhs is always the OP_FIELD_GET result (never raw); lhs could be raw -- box it. */
                 lhs = box_if_raw(c, lhs);
-                if (is_temp(rhs)) reg_free(1);
-                if (is_temp(lhs)) reg_free(1);
+                if (is_temp(rhs))
+                    reg_free(1);
+                if (is_temp(lhs))
+                    reg_free(1);
 
                 int dest = reg_alloc();
                 if (!rk16_fits(lhs)) {
@@ -2726,8 +2874,10 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
         }
 
         /* Free-then-allocate, RHS then LHS, matching compile_node's own discipline exactly. */
-        if (is_temp(rhs)) reg_free(1);
-        if (is_temp(lhs)) reg_free(1);
+        if (is_temp(rhs))
+            reg_free(1);
+        if (is_temp(lhs))
+            reg_free(1);
 
         int dest = reg_alloc();
         emit_binary(c, dest, op, lhs, rhs);
@@ -2788,7 +2938,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             }
         }
         require(TOKEN_ASSIGN, "expected '=' after destructuring targets");
-        if (parse_had_error) return;
+        if (parse_had_error)
+            return;
 
         int target_regs[MAX_DESTRUCT];
         for (unsigned int i = 0; i < count; i++) {
@@ -2798,16 +2949,19 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                     [i]); /* A destructuring target is always a plain boxed write -- an existing raw name must shadow to
                                              boxed before var_slot looks it up. */
             target_regs[i] = var_slot(c, names[i]);
-            if (target_regs[i] < 0) return; /* error_at already called */
+            if (target_regs[i] < 0)
+                return; /* error_at already called */
         }
 
         int rk_first = parse_binary(c, 0);
-        if (parse_had_error) return;
+        if (parse_had_error)
+            return;
         int rhs_reg_base = arg_materialize(c, rk_first);
         unsigned int rhs_count = 1;
         while (consume(TOKEN_COMMA)) {
             int rk_next = parse_binary(c, 0);
-            if (parse_had_error) return;
+            if (parse_had_error)
+                return;
             arg_materialize(c, rk_next);
             rhs_count++;
         }
@@ -2848,7 +3002,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         P.self_ref_watch_name = name_idx;
         P.self_ref_watch_seen = false;
         int rk_val = parse_binary(c, 0);
-        if (parse_had_error) return;
+        if (parse_had_error)
+            return;
 
         /* Tracks/invalidates length_tracked_name -- see P.last_length_call_result_reg's own
            comment. Equality against rk_val (the FINAL, fully-parsed RHS) rather than clearing this
@@ -2996,7 +3151,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                 chunk_emit(c, PACK_OP_A_W16(OP_LOADK, new_reg, (unsigned int)(rk_val & ~RK_CONST_FLAG)));
             } else if (new_reg != rk_val) {
                 chunk_emit(c, PACK2(OP_MOVE, new_reg, rk_val));
-                if (is_temp(rk_val)) reg_free(1);
+                if (is_temp(rk_val))
+                    reg_free(1);
             }
             return;
         }
@@ -3004,12 +3160,13 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         /* Unchanged existing behavior. rk_val is boxed first in case it's raw-flagged. */
         rk_val = box_if_raw(c, rk_val);
         int reg = var_slot(c, name_idx);
-        if (reg < 0) return; /* error_at already called */
+        if (reg < 0)
+            return; /* error_at already called */
         /* Read before anything clears it. A `[numeric; count]` literal is built straight into the
            register var_slot then hands this name, so source and destination are usually the SAME
            one -- and invalidate_register below would wipe the fact this line is preserving. */
-        RawKind rhs_elem = (!(rk_val & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) &&
-                            rk_val >= 0 && rk_val < FRAME_REGISTERS)
+        RawKind rhs_elem = (!(rk_val & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) && rk_val >= 0 &&
+                            rk_val < FRAME_REGISTERS)
                                ? P.reg_elem_kind[rk_val]
                                : RAWK_NONE;
         /* See invalidate_safe_loop_reg's own comment -- without this, `reg` staying on
@@ -3042,18 +3199,21 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             chunk_emit(c, PACK2(OP_MOVE, reg, rk_val));
             /* Checked after var_slot (which may have just raised the floor), so this correctly recognizes
                rk_val as no-longer-a-temp in the common case. */
-            if (is_temp(rk_val)) reg_free(1);
+            if (is_temp(rk_val))
+                reg_free(1);
         }
         /* reg == rk_val: the RHS already landed where var_slot reserved -- skip the no-op MOVE. */
         return;
     }
 
     for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
-        if (!consume(compound_assign_ops[i].tok)) continue;
+        if (!consume(compound_assign_ops[i].tok))
+            continue;
 
         /* A compound assignment can never re-derive length_tracked_name's invariant (the RHS is
            combined with the OLD value, never a fresh length() call alone) -- invalidate eagerly. */
-        if (P.length_tracked_valid && name_idx == P.length_tracked_name) P.length_tracked_valid = false;
+        if (P.length_tracked_valid && name_idx == P.length_tracked_name)
+            P.length_tracked_valid = false;
 
         /* A raw-tracked compound-assignment target needs its own path -- var_lookup would return a
            bare register-shaped int with no distinguishing flag (real bug: silently misread as a
@@ -3073,7 +3233,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
 
             unsigned int rhs_start = c->count;
             int rk_rhs = parse_binary(c, 0);
-            if (parse_had_error) return;
+            if (parse_had_error)
+                return;
             RawKind rhs_kind = rk_raw_kind(c, rk_rhs);
             /* The target's kind is the wanted kind, so `total += nums[i]` reads the element raw
                rather than boxing it for a tag check one opcode later. */
@@ -3091,7 +3252,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                     int dest_slot = P.var_regs[existing_idx];
                     int mul_a = (int)UNPACK_B(mw), mul_b = (int)UNPACK_C(mw);
                     c->count = rhs_start; /* discard the MUL -- fused below instead */
-                    if ((int)UNPACK_A(mw) >= P.raw_real_reserved_floor) raw_real_free(1);
+                    if ((int)UNPACK_A(mw) >= P.raw_real_reserved_floor)
+                        raw_real_free(1);
                     Opcode fused = (boxed_op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
                     chunk_emit(c, PACK3(fused, dest_slot, mul_a, mul_b));
                     return;
@@ -3150,10 +3312,12 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                         raw_int_free(1);
                     else
                         raw_real_free(1);
-                    if (is_temp(boxed_reg)) reg_free(1);
+                    if (is_temp(boxed_reg))
+                        reg_free(1);
                     return;
                 }
-                if (is_temp(boxed_reg)) reg_free(1);
+                if (is_temp(boxed_reg))
+                    reg_free(1);
             }
 
             /* Boxes the current raw value, then performs the compound op -- unlike plain assignment's
@@ -3182,7 +3346,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             /* No P.global_regs update needed -- see ensure_boxed's identical reasoning. */
             rk_rhs = box_if_raw(c, rk_rhs);
             emit_binary(c, new_reg, boxed_op, new_reg, rk_rhs);
-            if (is_temp(rk_rhs)) reg_free(1);
+            if (is_temp(rk_rhs))
+                reg_free(1);
             return;
         }
 
@@ -3203,7 +3368,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         }
 
         int rk_rhs = parse_binary(c, 0);
-        if (parse_had_error) return;
+        if (parse_had_error)
+            return;
         /* Same P.reg_known_shape invalidation as the plain-assignment tail above -- `reg`'s value
            is about to change (e.g. `bodies += extra_bodies`), so any shape hint on it is no longer
            trustworthy. alias_source_param and reg_known_element_shape cleared alongside it now too
@@ -3215,7 +3381,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         P.alias_source_param[reg] = -1;
         invalidate_register(reg);
         emit_binary(c, reg, compound_assign_ops[i].op, reg, rk_rhs);
-        if (is_temp(rk_rhs)) reg_free(1);
+        if (is_temp(rk_rhs))
+            reg_free(1);
         return;
     }
 
@@ -3285,7 +3452,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         pending_field_idx = chunk_add_pool(c, token.value);
         lex();
     }
-    if (parse_had_error) return;
+    if (parse_had_error)
+        return;
 
     /* Fuses into OP_INDEX_FIELD_GET/SET for the same reason the read side does -- a packed array
        has no standalone `name[index]` value. Falls through to the general path for any further
@@ -3334,7 +3502,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             if (is_plain_assign) {
                 lex();
                 int rk_val = parse_binary(c, 0);
-                if (parse_had_error) return;
+                if (parse_had_error)
+                    return;
                 /* Specialized path: the field's byte offset/type is a compile-time-known fact
                    here (see P.reg_known_shape's own comment) -- write straight into it from a raw
                    slot, no boxing, when rk_val is already the matching raw kind (an already-raw
@@ -3371,8 +3540,10 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                             else
                                 raw_real_free(1);
                         }
-                        if (is_temp(pending_rk_idx)) reg_free(1);
-                        if (!obj_is_base) reg_free(1);
+                        if (is_temp(pending_rk_idx))
+                            reg_free(1);
+                        if (!obj_is_base)
+                            reg_free(1);
                         return;
                     }
                 }
@@ -3384,11 +3555,13 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 }
                 chunk_emit(c, PACK_OP_A_W16(OP_INDEX_FIELD_SET, obj_reg, pack_rk16(pending_rk_idx)));
                 chunk_emit(c, PACK_2X16(fused_field_idx, pack_rk16(rk_val)));
-                if (is_temp(rk_val)) reg_free(1);
+                if (is_temp(rk_val))
+                    reg_free(1);
             } else {
                 lex();
                 int rk_rhs = parse_binary(c, 0);
-                if (parse_had_error) return;
+                if (parse_had_error)
+                    return;
                 Opcode bin_op = compound_assign_ops[compound_i].op;
                 /* Decomposing into raw GET + arithmetic + SET measured worse whenever the rhs needed
                    boxing -- the generic opcode already does it all in one dispatch. When the rhs is
@@ -3426,8 +3599,10 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                             else
                                 raw_real_free(1);
                         }
-                        if (is_temp(pending_rk_idx)) reg_free(1);
-                        if (!obj_is_base) reg_free(1);
+                        if (is_temp(pending_rk_idx))
+                            reg_free(1);
+                        if (!obj_is_base)
+                            reg_free(1);
                         return;
                     }
                 }
@@ -3440,10 +3615,13 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 chunk_emit(c, PACK3(OP_INDEX_FIELD_COMPOUND, obj_reg, bin_op, 0));
                 chunk_emit(c, PACK_2X16(fused_field_idx, pack_rk16(pending_rk_idx)));
                 chunk_emit(c, PACK_2X16(0, pack_rk16(rk_rhs)));
-                if (is_temp(rk_rhs)) reg_free(1);
+                if (is_temp(rk_rhs))
+                    reg_free(1);
             }
-            if (is_temp(pending_rk_idx)) reg_free(1);
-            if (!obj_is_base) reg_free(1);
+            if (is_temp(pending_rk_idx))
+                reg_free(1);
+            if (!obj_is_base)
+                reg_free(1);
             return;
         }
 
@@ -3460,7 +3638,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
 
         emit_index_get(c, dest_reg, obj_reg, pending_rk_idx);
 
-        if (reuse_pending_idx_reg && dest_reg != pending_rk_idx) reg_free(1);
+        if (reuse_pending_idx_reg && dest_reg != pending_rk_idx)
+            reg_free(1);
 
         obj_reg = dest_reg;
         obj_is_base = false;
@@ -3485,7 +3664,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
 
         /* Only free the index temp when it's a different register than dest_reg -- otherwise it was
            already folded in. */
-        if (reuse_pending_idx_reg && dest_reg != pending_rk_idx) reg_free(1);
+        if (reuse_pending_idx_reg && dest_reg != pending_rk_idx)
+            reg_free(1);
 
         obj_reg = dest_reg;
         obj_is_base = false;
@@ -3506,12 +3686,14 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             pending_is_field = true;
             lex();
         }
-        if (parse_had_error) return;
+        if (parse_had_error)
+            return;
     }
 
     if (consume(TOKEN_ASSIGN)) {
         int rk_val = parse_binary(c, 0);
-        if (parse_had_error) return;
+        if (parse_had_error)
+            return;
 
         /* Only a direct `param.field = ...` (obj_is_base, no preceding chain step) marks the
            parameter shape-sensitive -- an intermediate chain register (`a.b.c = ...`) isn't a
@@ -3559,8 +3741,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             if (val_kind != RAWK_NONE) {
                 int slot = raw_materialize(c, rk_val, val_kind);
                 if (slot >= 0) {
-                    chunk_emit(c, PACK3(val_kind == RAWK_INT ? OP_INDEX_SET_RAW_INT
-                                                             : OP_INDEX_SET_RAW_REAL,
+                    chunk_emit(c, PACK3(val_kind == RAWK_INT ? OP_INDEX_SET_RAW_INT : OP_INDEX_SET_RAW_REAL,
                                         obj_reg, pack_rk8(pending_rk_idx), slot));
                     int floor_now =
                         (val_kind == RAWK_INT) ? P.raw_int_reserved_floor : P.raw_real_reserved_floor;
@@ -3570,8 +3751,10 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                         else
                             raw_real_free(1);
                     }
-                    if (!pending_is_field && is_temp(pending_rk_idx)) reg_free(1);
-                    if (!obj_is_base) reg_free(1);
+                    if (!pending_is_field && is_temp(pending_rk_idx))
+                        reg_free(1);
+                    if (!obj_is_base)
+                        reg_free(1);
                     return;
                 }
             }
@@ -3586,24 +3769,30 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             }
             chunk_emit(c, PACK3(OP_TYPED_INDEX_SET_UNCHECKED, obj_reg, pack_rk8(pending_rk_idx),
                                 pack_rk8(rk_val_boxed)));
-            if (spilled) reg_free(spilled);
+            if (spilled)
+                reg_free(spilled);
         } else {
             emit_index_set(c, obj_reg, pending_rk_idx, rk_val);
         }
 
-        if (is_temp(rk_val)) reg_free(1);
-        if (!pending_is_field && is_temp(pending_rk_idx)) reg_free(1);
-        if (!obj_is_base) reg_free(1);
+        if (is_temp(rk_val))
+            reg_free(1);
+        if (!pending_is_field && is_temp(pending_rk_idx))
+            reg_free(1);
+        if (!obj_is_base)
+            reg_free(1);
         return;
     }
 
     /* Read-modify-write via the same fusion opcodes the single-level cases use -- no dedicated
        OP_INDEX_BINARY fusion exists. */
     for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
-        if (!consume(compound_assign_ops[i].tok)) continue;
+        if (!consume(compound_assign_ops[i].tok))
+            continue;
 
         if (pending_is_field) {
-            if (obj_is_base) mark_shape_sensitive(obj_reg);
+            if (obj_is_base)
+                mark_shape_sensitive(obj_reg);
 
             /* Same compile-time field lookup the plain '=' branch above uses -- only meaningful
                when obj_is_base (this register really is the shape-sensitive parameter/alias, not
@@ -3623,7 +3812,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             }
 
             int rk_rhs = parse_binary(c, 0);
-            if (parse_had_error) return;
+            if (parse_had_error)
+                return;
 
             Opcode bin_op = compound_assign_ops[i].op;
             /* Decomposing into raw GET + arithmetic + SET was tried and measured WORSE on
@@ -3668,24 +3858,29 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 }
                 chunk_emit(c, PACK3(OP_FIELD_COMPOUND, obj_reg, bin_op, 0));
                 chunk_emit(c, PACK_2X16(pending_field_idx, pack_rk16(rk_rhs)));
-                if (is_temp(rk_rhs)) reg_free(1);
+                if (is_temp(rk_rhs))
+                    reg_free(1);
             }
         } else {
             int item_reg = reg_alloc();
             emit_index_get(c, item_reg, obj_reg, pending_rk_idx);
 
             int rk_rhs = parse_binary(c, 0);
-            if (parse_had_error) return;
+            if (parse_had_error)
+                return;
 
             emit_binary(c, item_reg, compound_assign_ops[i].op, item_reg, rk_rhs);
-            if (is_temp(rk_rhs)) reg_free(1);
+            if (is_temp(rk_rhs))
+                reg_free(1);
 
             emit_index_set(c, obj_reg, pending_rk_idx, item_reg);
             reg_free(1); /* item_reg */
         }
 
-        if (!pending_is_field && is_temp(pending_rk_idx)) reg_free(1);
-        if (!obj_is_base) reg_free(1);
+        if (!pending_is_field && is_temp(pending_rk_idx))
+            reg_free(1);
+        if (!obj_is_base)
+            reg_free(1);
         return;
     }
 
@@ -3711,7 +3906,8 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         else
             emit_index_get(c, dest_reg, obj_reg, pending_rk_idx);
 
-        if (reuse_pending_idx_reg && dest_reg != pending_rk_idx) reg_free(1);
+        if (reuse_pending_idx_reg && dest_reg != pending_rk_idx)
+            reg_free(1);
 
         int rk = parse_postfix_chain(c, dest_reg);
         unsigned int lhs_start = c->count;
@@ -3723,9 +3919,11 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
 /* Called when the skip-to-boundary loop stops at a plain NEWLINE, not already a boundary -- a
    statement that failed to introduce a block leaves an orphaned indented block otherwise. */
 static void skip_orphaned_block(void) {
-    if (!equal(TOKEN_NEW_LINE)) return;
+    if (!equal(TOKEN_NEW_LINE))
+        return;
     lex();
-    if (!equal(TOKEN_INDENT)) return;
+    if (!equal(TOKEN_INDENT))
+        return;
     int depth = 0;
     do {
         if (equal(TOKEN_INDENT))
@@ -3741,9 +3939,11 @@ static void skip_orphaned_block(void) {
 static void parse_block(Chunk* c) {
     require(TOKEN_NEW_LINE, "expected newline before indented block");
     require(TOKEN_INDENT, "expected indented block");
-    if (parse_had_error) return;
+    if (parse_had_error)
+        return;
     while (!equal(TOKEN_END_OF_FILE) && !equal(TOKEN_ELSE) && !equal(TOKEN_DEDENT)) {
-        if (consume(TOKEN_NEW_LINE)) continue;
+        if (consume(TOKEN_NEW_LINE))
+            continue;
         parse_had_error = false;
         P.recovered_at_boundary = false;
         unsigned int saved = c->count;
@@ -3779,7 +3979,8 @@ static void parse_if(Chunk* c) {
     require(TOKEN_COLON, "expected ':' after if condition");
     /* require() can't abort on failure -- without this, a malformed condition still compiles a
        real branch. */
-    if (parse_had_error) return;
+    if (parse_had_error)
+        return;
 
     unsigned int patch_jif = emit_cond_jump_if_false(c, rk_cond, cond_start);
 
@@ -3789,11 +3990,13 @@ static void parse_if(Chunk* c) {
     P.branch_depth++;
     parse_block(c);
     P.branch_depth--;
-    if (parse_had_error) return;
+    if (parse_had_error)
+        return;
 
     if (consume(TOKEN_ELSE)) {
         require(TOKEN_COLON, "expected ':' after else");
-        if (parse_had_error) return;
+        if (parse_had_error)
+            return;
         chunk_emit(c, OP_JUMP);
         unsigned int patch_jmp = c->count;
         chunk_emit(c, 0);
@@ -3811,7 +4014,8 @@ static void parse_if(Chunk* c) {
 /* Shared body-and-back-edge tail for every loop form. Callers that promoted P.reserved_floor can
    safely restore it unconditionally after this returns either way. */
 static void parse_loop_body(Chunk* c, unsigned int loop_top, unsigned int patch_exit) {
-    if (!loop_push(loop_top)) return;
+    if (!loop_push(loop_top))
+        return;
     parse_block(c);
     if (parse_had_error) {
         P.loop_depth--;
@@ -3826,7 +4030,8 @@ static void parse_loop_body(Chunk* c, unsigned int loop_top, unsigned int patch_
 
 static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
     require(TOKEN_COLON, "expected ':' after for/while condition");
-    if (parse_had_error) return;
+    if (parse_had_error)
+        return;
 
     /* The back-edge re-runs the condition, so every temp the condition writes is rewritten on each
        iteration. Those registers are ordinarily freed the moment the condition is compiled, which
@@ -3845,7 +4050,8 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
     if (P.loop_cond_peak > P.reserved_floor) {
         raised_floor = P.loop_cond_peak;
         P.reserved_floor = raised_floor;
-        if (P.next_temp_register < P.reserved_floor) P.next_temp_register = P.reserved_floor;
+        if (P.next_temp_register < P.reserved_floor)
+            P.next_temp_register = P.reserved_floor;
     }
 
     parse_loop_body(c, loop_top, patch_exit);
@@ -3856,7 +4062,8 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
        out as a temp to the next statement. */
     if (P.reserved_floor == raised_floor) {
         P.reserved_floor = saved_floor;
-        if (P.next_temp_register < P.reserved_floor) P.next_temp_register = P.reserved_floor;
+        if (P.next_temp_register < P.reserved_floor)
+            P.next_temp_register = P.reserved_floor;
     }
     assert_variables_below_floor("for-loop body");
 }
@@ -3870,7 +4077,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         loop_var_name); /* A for-in loop variable always holds a plain item, never raw -- an existing raw name of the
                                           same spelling must shadow to boxed first. */
     int item_reg = var_slot(c, loop_var_name);
-    if (item_reg < 0) return;
+    if (item_reg < 0)
+        return;
     /* var_slot has no block scoping -- an already-declared name (a sibling or enclosing loop
        reusing the same spelling, e.g. `for i in 0..n: ... for i in 0..m: ...`) returns THAT
        register back, which may still carry a shape hint or a live safe_loop_item_regs entry from
@@ -3886,7 +4094,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
        (`for n in 0..1000:` after `n = length(bodies)`) -- var_slot returns a bare register number,
        indistinguishable from a new one. This loop overwrites that register every iteration, so a
        later `for i in 0..n:` would otherwise trust the stale leftover. */
-    if (P.length_tracked_valid && loop_var_name == P.length_tracked_name) P.length_tracked_valid = false;
+    if (P.length_tracked_valid && loop_var_name == P.length_tracked_name)
+        P.length_tracked_valid = false;
 
     int rk_start = parse_binary(c, 0); /* the range's start, or the whole collection if no '..' follows */
 
@@ -3901,7 +4110,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
             rk_step = (int)chunk_add_pool(c, aer_int(1)) | RK_CONST_FLAG;
 
         require(TOKEN_COLON, "expected ':' after for-in clause");
-        if (parse_had_error) return;
+        if (parse_had_error)
+            return;
 
         /* Checked before arg_materialize, which may copy rk_start/rk_end into fresh registers that
            no longer identify their source. bound_safe: rk_end reads exactly the local proven ==
@@ -3965,7 +4175,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
             P.safe_loop_depth++;
             /* Accepting the loop required a non-negative start, and the step is positive, so
                every value this register takes is >= 0. */
-            if (item_reg >= 0 && item_reg < FRAME_REGISTERS) P.reg_nonneg[item_reg] = true;
+            if (item_reg >= 0 && item_reg < FRAME_REGISTERS)
+                P.reg_nonneg[item_reg] = true;
         }
         /* Same push/pop discipline as safe_loop_* above; invalidate_register does the recording. */
         bool range_tracked = P.range_loop_depth < LOOP_MAX;
@@ -3978,16 +4189,20 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         parse_block(c);
         if (parse_had_error) {
             hoist_end(c, prep_at, hoisting);
-            if (range_tracked) P.range_loop_depth--;
-            if (this_loop_safe) P.safe_loop_depth--;
+            if (range_tracked)
+                P.range_loop_depth--;
+            if (this_loop_safe)
+                P.safe_loop_depth--;
             P.loop_depth--;
             P.reserved_floor = saved_reserved_floor;
             P.next_temp_register = saved_reserved_floor;
             return;
         }
-        if (this_loop_safe) P.safe_loop_depth--;
+        if (this_loop_safe)
+            P.safe_loop_depth--;
         bool body_wrote_item = !range_tracked || P.range_item_written[P.range_loop_depth - 1];
-        if (range_tracked) P.range_loop_depth--;
+        if (range_tracked)
+            P.range_loop_depth--;
 
         unsigned int loop_bottom = c->count;
         /* PREP already left the start value in item_reg, so when the body never writes that register
@@ -4013,7 +4228,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
     }
 
     require(TOKEN_COLON, "expected ':' after for-in clause");
-    if (parse_had_error) return;
+    if (parse_had_error)
+        return;
 
     int col_reg = materialize(c, rk_start);
 
@@ -4047,9 +4263,11 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
     ensure_boxed(c, key_name); /* same reasoning as parse_for_in's own ensure_boxed call */
     ensure_boxed(c, val_name);
     int key_reg = var_slot(c, key_name);
-    if (key_reg < 0) return;
+    if (key_reg < 0)
+        return;
     int val_reg = var_slot(c, val_name);
-    if (val_reg < 0) return;
+    if (val_reg < 0)
+        return;
     /* Same name-shadowing reasoning as parse_for_in's own identical block just above. */
     P.reg_known_shape[key_reg] = NULL;
     P.reg_known_element_shape[key_reg] = NULL;
@@ -4068,7 +4286,8 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
 
     int rk_col = parse_binary(c, 0);
     require(TOKEN_COLON, "expected ':' after for-in clause");
-    if (parse_had_error) return;
+    if (parse_had_error)
+        return;
 
     int col_reg = materialize(c, rk_col);
 
@@ -4106,7 +4325,8 @@ static void parse_for_while(Chunk* c) {
             unsigned int name2_idx = chunk_add_pool(c, token.value);
             lex();
             require(TOKEN_IN, "expected 'in' after 'for k, v'");
-            if (parse_had_error) return;
+            if (parse_had_error)
+                return;
             parse_for_in_pair(c, name_idx, name2_idx);
             return;
         }
@@ -4121,7 +4341,8 @@ static void parse_for_while(Chunk* c) {
         int reg;
         if (!var_lookup_rk(name_idx, &reg)) {
             reg = var_slot(c, name_idx);
-            if (reg < 0) return;
+            if (reg < 0)
+                return;
         }
         bool hoisting = hoist_begin(c);
         unsigned int loop_top = c->count;
@@ -4154,16 +4375,26 @@ static bool at_module_name(Chunk* c) {
 /* A module name is always a literal identifier, never a runtime value, so it's fully knowable
    here. Returns CALL_MODULE_DYNAMIC for anything not a fixed core built-in. */
 static int module_call_id(AerString* name) {
-    if (name->length == 4 && strncmp(name->data, "math", 4) == 0) return CALL_MODULE_MATH;
-    if (name->length == 6 && strncmp(name->data, "random", 6) == 0) return CALL_MODULE_RANDOM;
-    if (name->length == 6 && strncmp(name->data, "string", 6) == 0) return CALL_MODULE_STRING;
-    if (name->length == 4 && strncmp(name->data, "time", 4) == 0) return CALL_MODULE_TIME;
-    if (name->length == 4 && strncmp(name->data, "json", 4) == 0) return CALL_MODULE_JSON;
-    if (name->length == 10 && strncmp(name->data, "collection", 10) == 0) return CALL_MODULE_COLLECTION;
-    if (name->length == 3 && strncmp(name->data, "net", 3) == 0) return CALL_MODULE_NET;
-    if (name->length == 5 && strncmp(name->data, "regex", 5) == 0) return CALL_MODULE_REGEX;
-    if (name->length == 5 && strncmp(name->data, "actor", 5) == 0) return CALL_MODULE_ACTOR;
-    if (name->length == 9 && strncmp(name->data, "scheduler", 9) == 0) return CALL_MODULE_SCHEDULER;
+    if (name->length == 4 && strncmp(name->data, "math", 4) == 0)
+        return CALL_MODULE_MATH;
+    if (name->length == 6 && strncmp(name->data, "random", 6) == 0)
+        return CALL_MODULE_RANDOM;
+    if (name->length == 6 && strncmp(name->data, "string", 6) == 0)
+        return CALL_MODULE_STRING;
+    if (name->length == 4 && strncmp(name->data, "time", 4) == 0)
+        return CALL_MODULE_TIME;
+    if (name->length == 4 && strncmp(name->data, "json", 4) == 0)
+        return CALL_MODULE_JSON;
+    if (name->length == 10 && strncmp(name->data, "collection", 10) == 0)
+        return CALL_MODULE_COLLECTION;
+    if (name->length == 3 && strncmp(name->data, "net", 3) == 0)
+        return CALL_MODULE_NET;
+    if (name->length == 5 && strncmp(name->data, "regex", 5) == 0)
+        return CALL_MODULE_REGEX;
+    if (name->length == 5 && strncmp(name->data, "actor", 5) == 0)
+        return CALL_MODULE_ACTOR;
+    if (name->length == 9 && strncmp(name->data, "scheduler", 9) == 0)
+        return CALL_MODULE_SCHEDULER;
     return CALL_MODULE_DYNAMIC;
 }
 
@@ -4174,88 +4405,152 @@ static int module_call_id(AerString* name) {
 static int module_fn_id(int module_id, AerString* name) {
     switch (module_id) {
         case CALL_MODULE_MATH:
-            if (NAME_IS("sqrt")) return FN_MATH_SQRT;
-            if (NAME_IS("pow")) return FN_MATH_POW;
-            if (NAME_IS("floor")) return FN_MATH_FLOOR;
-            if (NAME_IS("ceil")) return FN_MATH_CEIL;
-            if (NAME_IS("abs")) return FN_MATH_ABS;
-            if (NAME_IS("min")) return FN_MATH_MIN;
-            if (NAME_IS("max")) return FN_MATH_MAX;
-            if (NAME_IS("sin")) return FN_MATH_SIN;
-            if (NAME_IS("cos")) return FN_MATH_COS;
-            if (NAME_IS("log")) return FN_MATH_LOG;
-            if (NAME_IS("log2")) return FN_MATH_LOG2;
-            if (NAME_IS("log10")) return FN_MATH_LOG10;
-            if (NAME_IS("pi")) return FN_MATH_PI;
-            if (NAME_IS("round")) return FN_MATH_ROUND;
-            if (NAME_IS("tan")) return FN_MATH_TAN;
-            if (NAME_IS("exp")) return FN_MATH_EXP;
+            if (NAME_IS("sqrt"))
+                return FN_MATH_SQRT;
+            if (NAME_IS("pow"))
+                return FN_MATH_POW;
+            if (NAME_IS("floor"))
+                return FN_MATH_FLOOR;
+            if (NAME_IS("ceil"))
+                return FN_MATH_CEIL;
+            if (NAME_IS("abs"))
+                return FN_MATH_ABS;
+            if (NAME_IS("min"))
+                return FN_MATH_MIN;
+            if (NAME_IS("max"))
+                return FN_MATH_MAX;
+            if (NAME_IS("sin"))
+                return FN_MATH_SIN;
+            if (NAME_IS("cos"))
+                return FN_MATH_COS;
+            if (NAME_IS("log"))
+                return FN_MATH_LOG;
+            if (NAME_IS("log2"))
+                return FN_MATH_LOG2;
+            if (NAME_IS("log10"))
+                return FN_MATH_LOG10;
+            if (NAME_IS("pi"))
+                return FN_MATH_PI;
+            if (NAME_IS("round"))
+                return FN_MATH_ROUND;
+            if (NAME_IS("tan"))
+                return FN_MATH_TAN;
+            if (NAME_IS("exp"))
+                return FN_MATH_EXP;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_RANDOM:
-            if (NAME_IS("random")) return FN_RANDOM_RANDOM;
-            if (NAME_IS("randint")) return FN_RANDOM_RANDINT;
-            if (NAME_IS("seed")) return FN_RANDOM_SEED;
-            if (NAME_IS("choice")) return FN_RANDOM_CHOICE;
-            if (NAME_IS("shuffle")) return FN_RANDOM_SHUFFLE;
+            if (NAME_IS("random"))
+                return FN_RANDOM_RANDOM;
+            if (NAME_IS("randint"))
+                return FN_RANDOM_RANDINT;
+            if (NAME_IS("seed"))
+                return FN_RANDOM_SEED;
+            if (NAME_IS("choice"))
+                return FN_RANDOM_CHOICE;
+            if (NAME_IS("shuffle"))
+                return FN_RANDOM_SHUFFLE;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_STRING:
-            if (NAME_IS("upper")) return FN_STRING_UPPER;
-            if (NAME_IS("lower")) return FN_STRING_LOWER;
-            if (NAME_IS("trim")) return FN_STRING_TRIM;
-            if (NAME_IS("contains")) return FN_STRING_CONTAINS;
-            if (NAME_IS("split")) return FN_STRING_SPLIT;
-            if (NAME_IS("starts_with")) return FN_STRING_STARTS_WITH;
-            if (NAME_IS("ends_with")) return FN_STRING_ENDS_WITH;
-            if (NAME_IS("repeat")) return FN_STRING_REPEAT;
-            if (NAME_IS("replace")) return FN_STRING_REPLACE;
-            if (NAME_IS("join")) return FN_STRING_JOIN;
-            if (NAME_IS("index_of")) return FN_STRING_INDEX_OF;
+            if (NAME_IS("upper"))
+                return FN_STRING_UPPER;
+            if (NAME_IS("lower"))
+                return FN_STRING_LOWER;
+            if (NAME_IS("trim"))
+                return FN_STRING_TRIM;
+            if (NAME_IS("contains"))
+                return FN_STRING_CONTAINS;
+            if (NAME_IS("split"))
+                return FN_STRING_SPLIT;
+            if (NAME_IS("starts_with"))
+                return FN_STRING_STARTS_WITH;
+            if (NAME_IS("ends_with"))
+                return FN_STRING_ENDS_WITH;
+            if (NAME_IS("repeat"))
+                return FN_STRING_REPEAT;
+            if (NAME_IS("replace"))
+                return FN_STRING_REPLACE;
+            if (NAME_IS("join"))
+                return FN_STRING_JOIN;
+            if (NAME_IS("index_of"))
+                return FN_STRING_INDEX_OF;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_TIME:
-            if (NAME_IS("now")) return FN_TIME_NOW;
-            if (NAME_IS("strftime")) return FN_TIME_STRFTIME;
-            if (NAME_IS("sleep")) return FN_TIME_SLEEP;
-            if (NAME_IS("parse")) return FN_TIME_PARSE;
-            if (NAME_IS("to_parts")) return FN_TIME_TO_PARTS;
-            if (NAME_IS("from_parts")) return FN_TIME_FROM_PARTS;
+            if (NAME_IS("now"))
+                return FN_TIME_NOW;
+            if (NAME_IS("strftime"))
+                return FN_TIME_STRFTIME;
+            if (NAME_IS("sleep"))
+                return FN_TIME_SLEEP;
+            if (NAME_IS("parse"))
+                return FN_TIME_PARSE;
+            if (NAME_IS("to_parts"))
+                return FN_TIME_TO_PARTS;
+            if (NAME_IS("from_parts"))
+                return FN_TIME_FROM_PARTS;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_JSON:
-            if (NAME_IS("encode")) return FN_JSON_ENCODE;
-            if (NAME_IS("decode")) return FN_JSON_DECODE;
+            if (NAME_IS("encode"))
+                return FN_JSON_ENCODE;
+            if (NAME_IS("decode"))
+                return FN_JSON_DECODE;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_COLLECTION:
-            if (NAME_IS("append")) return FN_COLLECTION_APPEND;
-            if (NAME_IS("delete")) return FN_COLLECTION_DELETE;
-            if (NAME_IS("copy")) return FN_COLLECTION_COPY;
-            if (NAME_IS("insert")) return FN_COLLECTION_INSERT;
-            if (NAME_IS("index_of")) return FN_COLLECTION_INDEX_OF;
-            if (NAME_IS("keys")) return FN_COLLECTION_KEYS;
-            if (NAME_IS("sort")) return FN_COLLECTION_SORT;
-            if (NAME_IS("reserve")) return FN_COLLECTION_RESERVE;
+            if (NAME_IS("append"))
+                return FN_COLLECTION_APPEND;
+            if (NAME_IS("delete"))
+                return FN_COLLECTION_DELETE;
+            if (NAME_IS("copy"))
+                return FN_COLLECTION_COPY;
+            if (NAME_IS("insert"))
+                return FN_COLLECTION_INSERT;
+            if (NAME_IS("index_of"))
+                return FN_COLLECTION_INDEX_OF;
+            if (NAME_IS("keys"))
+                return FN_COLLECTION_KEYS;
+            if (NAME_IS("sort"))
+                return FN_COLLECTION_SORT;
+            if (NAME_IS("reserve"))
+                return FN_COLLECTION_RESERVE;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_NET:
-            if (NAME_IS("connect")) return FN_NET_CONNECT;
-            if (NAME_IS("send")) return FN_NET_SEND;
-            if (NAME_IS("recv")) return FN_NET_RECV;
-            if (NAME_IS("close")) return FN_NET_CLOSE;
-            if (NAME_IS("listen")) return FN_NET_LISTEN;
-            if (NAME_IS("accept")) return FN_NET_ACCEPT;
+            if (NAME_IS("connect"))
+                return FN_NET_CONNECT;
+            if (NAME_IS("send"))
+                return FN_NET_SEND;
+            if (NAME_IS("recv"))
+                return FN_NET_RECV;
+            if (NAME_IS("close"))
+                return FN_NET_CLOSE;
+            if (NAME_IS("listen"))
+                return FN_NET_LISTEN;
+            if (NAME_IS("accept"))
+                return FN_NET_ACCEPT;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_REGEX:
-            if (NAME_IS("match")) return FN_REGEX_MATCH;
-            if (NAME_IS("find")) return FN_REGEX_FIND;
-            if (NAME_IS("replace")) return FN_REGEX_REPLACE;
-            if (NAME_IS("find_all")) return FN_REGEX_FIND_ALL;
+            if (NAME_IS("match"))
+                return FN_REGEX_MATCH;
+            if (NAME_IS("find"))
+                return FN_REGEX_FIND;
+            if (NAME_IS("replace"))
+                return FN_REGEX_REPLACE;
+            if (NAME_IS("find_all"))
+                return FN_REGEX_FIND_ALL;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_ACTOR:
-            if (NAME_IS("spawn")) return FN_ACTOR_SPAWN;
-            if (NAME_IS("send")) return FN_ACTOR_SEND;
-            if (NAME_IS("receive")) return FN_ACTOR_RECEIVE;
-            if (NAME_IS("call")) return FN_ACTOR_CALL;
+            if (NAME_IS("spawn"))
+                return FN_ACTOR_SPAWN;
+            if (NAME_IS("send"))
+                return FN_ACTOR_SEND;
+            if (NAME_IS("receive"))
+                return FN_ACTOR_RECEIVE;
+            if (NAME_IS("call"))
+                return FN_ACTOR_CALL;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_SCHEDULER:
-            if (NAME_IS("add")) return FN_SCHEDULER_ADD;
-            if (NAME_IS("run")) return FN_SCHEDULER_RUN;
+            if (NAME_IS("add"))
+                return FN_SCHEDULER_ADD;
+            if (NAME_IS("run"))
+                return FN_SCHEDULER_RUN;
             return FN_ID_UNKNOWN;
         default: return FN_ID_UNKNOWN;
     }
@@ -4280,13 +4575,15 @@ static int parse_module_call(Chunk* c) {
     unsigned int fn_idx = chunk_add_pool(c, token.value);
     lex();
     require(TOKEN_OPEN_PARENTHESE, "expected '(' after module function name");
-    if (parse_had_error) return 0;
+    if (parse_had_error)
+        return 0;
 
     unsigned int args_start = c->count;
     int arg_reg_base;
     int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after module call arguments");
-    if (parse_had_error) return 0;
+    if (parse_had_error)
+        return 0;
 
     /* `math.sqrt(<raw real>)` boxed its argument only because the module calling convention wanted
        an AerVal, and the box is the whole of what the argument compiled to. Undo it and go raw at
@@ -4310,7 +4607,8 @@ static int parse_module_call(Chunk* c) {
     }
 
     int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
-    if (arg_count > 1) reg_free(arg_count - 1);
+    if (arg_count > 1)
+        reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
     chunk_emit(c, PACK3(OP_CALL_MODULE, dest, base, arg_count));
     chunk_emit(c, (uint32_t)module_idx);
@@ -4340,10 +4638,12 @@ static void parse_import_path(Chunk* c, const char* alias, unsigned int alias_le
     if (alias_len == 0) {
         /* Derive the bound name from the last path segment, stripping a trailing ".aer". */
         unsigned int end = path_len;
-        if (end > 4 && strncmp(path_buf + end - 4, ".aer", 4) == 0) end -= 4;
+        if (end > 4 && strncmp(path_buf + end - 4, ".aer", 4) == 0)
+            end -= 4;
         unsigned int start = 0;
         for (unsigned int i = 0; i < end; i++)
-            if (path_buf[i] == '/' || path_buf[i] == '\\') start = i + 1;
+            if (path_buf[i] == '/' || path_buf[i] == '\\')
+                start = i + 1;
         alias_len = end - start;
         if (alias_len == 0 || alias_len >= sizeof(derived_buf)) {
             error_at("Cannot derive a module name from this path; give it an alias: import name \"path\"");
@@ -4422,18 +4722,24 @@ static bool is_builtin_name(Chunk* c, unsigned int name_idx) {
     static const char* const names[] = {"length", "print", "type", "assert", "panic", "Result"};
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         size_t len = strlen(names[i]);
-        if (s->length == len && strncmp(s->data, names[i], len) == 0) return true;
+        if (s->length == len && strncmp(s->data, names[i], len) == 0)
+            return true;
     }
     return false;
 }
 
 /* Mirrors module_call_id below -- only called after is_builtin_name confirms a match. */
 static int builtin_call_id(AerString* name) {
-    if (name->length == 6 && strncmp(name->data, "length", 6) == 0) return CALL_BUILTIN_LENGTH;
-    if (name->length == 5 && strncmp(name->data, "print", 5) == 0) return CALL_BUILTIN_PRINT;
-    if (name->length == 4 && strncmp(name->data, "type", 4) == 0) return CALL_BUILTIN_TYPE;
-    if (name->length == 6 && strncmp(name->data, "assert", 6) == 0) return CALL_BUILTIN_ASSERT;
-    if (name->length == 6 && strncmp(name->data, "Result", 6) == 0) return CALL_BUILTIN_RESULT;
+    if (name->length == 6 && strncmp(name->data, "length", 6) == 0)
+        return CALL_BUILTIN_LENGTH;
+    if (name->length == 5 && strncmp(name->data, "print", 5) == 0)
+        return CALL_BUILTIN_PRINT;
+    if (name->length == 4 && strncmp(name->data, "type", 4) == 0)
+        return CALL_BUILTIN_TYPE;
+    if (name->length == 6 && strncmp(name->data, "assert", 6) == 0)
+        return CALL_BUILTIN_ASSERT;
+    if (name->length == 6 && strncmp(name->data, "Result", 6) == 0)
+        return CALL_BUILTIN_RESULT;
     return CALL_BUILTIN_PANIC;
 }
 
@@ -4444,11 +4750,13 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
     int arg_reg_base;
     int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after call arguments");
-    if (parse_had_error) return 0;
+    if (parse_had_error)
+        return 0;
     unsigned int arg_code_end = c->count;
 
     int dest = (arg_count > 0) ? arg_reg_base : reg_alloc();
-    if (arg_count > 1) reg_free(arg_count - 1);
+    if (arg_count > 1)
+        reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
     int call_id = builtin_call_id(aer_as_string(c->pool[name_idx]));
     chunk_emit(c, PACK3(OP_CALL_BUILTIN, dest, base, arg_count));
@@ -4463,11 +4771,13 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
     P.last_length_call_result_reg = -1;
     P.last_length_call_arg_reg = -1;
     if (call_id == CALL_BUILTIN_LENGTH && arg_count == 1) {
-        if (dest >= 0 && dest < FRAME_REGISTERS) P.reg_nonneg[dest] = true; /* a count */
+        if (dest >= 0 && dest < FRAME_REGISTERS)
+            P.reg_nonneg[dest] = true; /* a count */
         int arg_orig_reg = base;
         if (arg_code_end - arg_code_begin == 1) {
             uint32_t w = c->code[arg_code_begin];
-            if ((w & 0xFF) == OP_MOVE && (int)UNPACK_A(w) == base) arg_orig_reg = (int)UNPACK_B(w);
+            if ((w & 0xFF) == OP_MOVE && (int)UNPACK_A(w) == base)
+                arg_orig_reg = (int)UNPACK_B(w);
         }
         if (arg_orig_reg >= 0) {
             P.last_length_call_result_reg = dest;
@@ -4498,12 +4808,14 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     if (callee_name->length == 6 && strncmp(callee_name->data, "string", 6) == 0) {
         int lhs = parse_binary(c, 0);
         require(TOKEN_CLOSE_PARENTHESE, "expected ')' after cast argument");
-        if (parse_had_error) return 0;
+        if (parse_had_error)
+            return 0;
         return emit_primitive_cast(c, -1, lhs);
     }
 
     /* Builtins win unconditionally -- length/print/type/assert/panic/Result can never be shadowed. */
-    if (is_builtin_name(c, name_idx)) return parse_builtin_call(c, name_idx);
+    if (is_builtin_name(c, name_idx))
+        return parse_builtin_call(c, name_idx);
 
     /* A call through an existing local variable resolves via OP_CALL_VALUE instead of compile-time
        name resolution. A top-level variable of this name is never callable from inside a
@@ -4550,7 +4862,8 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         (int)func_index == P.current_func_idx) {
         int rk_arg = parse_binary(c, 0);
         require(TOKEN_CLOSE_PARENTHESE, "expected ')' after call arguments");
-        if (parse_had_error) return 0;
+        if (parse_had_error)
+            return 0;
         bool is_int = (P.variant_kind == RAWK_INT);
         bool ret_int = (P.variant_return_kind == RAWK_INT);
         bool ret_raw = (P.variant_return_kind != RAWK_NONE);
@@ -4565,7 +4878,8 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
             if (arg_slot >= 0 && dest_slot >= 0) {
                 chunk_emit(c, PACK3(is_int ? OP_CALL_RAW_INT : OP_CALL_RAW_REAL, dest_slot, arg_slot, 1));
                 chunk_emit(c, !ret_raw ? 0u : ret_int ? 1u : 2u);
-                if (!ret_raw) return dest_slot;
+                if (!ret_raw)
+                    return dest_slot;
                 return (ret_int ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest_slot;
             }
             if (dest_slot >= 0) {
@@ -4587,7 +4901,8 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     int arg_reg_base;
     int arg_count = parse_contiguous_exprs(c, TOKEN_CLOSE_PARENTHESE, &arg_reg_base);
     require(TOKEN_CLOSE_PARENTHESE, "expected ')' after call arguments");
-    if (parse_had_error) return 0;
+    if (parse_had_error)
+        return 0;
 
     /* A direct call must check arity -- fewer args than declared means some fall back to
        defaults, not garbage from a prior occupant of that frame slot. */
@@ -4639,14 +4954,16 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     } else {
         last_bare_call_start = c->count;
         unsigned int patch_offset = emit_call(c, dest, func_offset, base, arg_count, func_index);
-        if (is_forward_ref) pending_call_add(name_idx, patch_offset, call_site_cursor);
+        if (is_forward_ref)
+            pending_call_add(name_idx, patch_offset, call_site_cursor);
         last_bare_call_end = c->count;
     }
 
     /* One combined compaction for both the extra argument registers and callee_reg, not two
        separately-timed frees -- nothing allocates between them. */
     int extra = (arg_count > 1 ? arg_count - 1 : 0) + (needs_callee_reg ? 1 : 0);
-    if (extra > 0) reg_free(extra);
+    if (extra > 0)
+        reg_free(extra);
 
     return dest;
 }
@@ -4677,14 +4994,16 @@ static void parse_return(Chunk* c) {
 
     if (!equal(TOKEN_NEW_LINE) && !equal(TOKEN_END_OF_FILE) && !equal(TOKEN_DEDENT)) {
         int rk_first = parse_binary(c, 0);
-        if (parse_had_error) return;
+        if (parse_had_error)
+            return;
 
         if (equal(TOKEN_COMMA)) {
             int reg_base = arg_materialize(c, rk_first);
             unsigned int count = 1;
             while (consume(TOKEN_COMMA)) {
                 int rk_next = parse_binary(c, 0);
-                if (parse_had_error) return;
+                if (parse_had_error)
+                    return;
                 arg_materialize(c, rk_next);
                 count++;
             }
@@ -4735,7 +5054,8 @@ static void parse_raise(Chunk* c) {
     unsigned int null_idx = chunk_add_pool(c, aer_null());
     int reg_base = arg_materialize(c, (int)null_idx | RK_CONST_FLAG);
     int rk_err = parse_binary(c, 0);
-    if (parse_had_error) return;
+    if (parse_had_error)
+        return;
     arg_materialize(c, rk_err);
     emit_result_call_and_return(c, reg_base);
 }
@@ -4750,7 +5070,8 @@ static int parse_function_expr(Chunk* c) {
     AerVal param_defaults[FRAME_REGISTERS];
     int param_count, min_param_count;
     parse_function_signature(c, param_names, param_defaults, &param_count, &min_param_count);
-    if (parse_had_error) return 0;
+    if (parse_had_error)
+        return 0;
 
     chunk_emit(c, OP_JUMP);
     unsigned int patch = c->count;
@@ -4783,7 +5104,8 @@ static int parse_function_expr(Chunk* c) {
 static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal* param_defaults,
                                      int* out_param_count, int* out_min_param_count) {
     require(TOKEN_OPEN_PARENTHESE, "expected '(' after function name");
-    if (parse_had_error) return;
+    if (parse_had_error)
+        return;
 
     int param_count = 0;
     int min_param_count = 0;
@@ -4893,10 +5215,12 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
                 P.reg_known_shape[i] = hint_shape;
         }
         for (int k = 0; k < raw_param_count; k++) {
-            if (raw_param_regs[k] != i) continue;
+            if (raw_param_regs[k] != i)
+                continue;
             bool is_int = raw_param_types[k] == TYPE_INTEGER;
             int slot = is_int ? raw_int_reserve_one() : raw_real_reserve_one();
-            if (out_raw_param_slots) out_raw_param_slots[k] = slot;
+            if (out_raw_param_slots)
+                out_raw_param_slots[k] = slot;
             if (slot >= 0) {
                 /* var_slot just appended P.var_count-1 as this parameter's own (boxed) entry --
                    rebind THAT SAME entry to the raw slot instead, as an ordinary local's first
@@ -4932,7 +5256,6 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     *out_max_registers = (unsigned int)P.max_register_used;
     *out_max_raw_ints = (unsigned int)P.max_raw_int_used;
     *out_max_raw_reals = (unsigned int)P.max_raw_real_used;
-
 
     P.var_count = saved_var_count;
     memcpy(P.var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
@@ -4973,7 +5296,8 @@ static void parse_function(Chunk* c) {
     AerVal param_defaults[FRAME_REGISTERS]; /* only [min_param_count, param_count) are meaningful */
     int param_count, min_param_count;
     parse_function_signature(c, param_names, param_defaults, &param_count, &min_param_count);
-    if (parse_had_error) return;
+    if (parse_had_error)
+        return;
 
     chunk_emit(c, OP_JUMP);
     unsigned int patch = c->count;
@@ -5016,8 +5340,10 @@ static void parse_function(Chunk* c) {
        -- reads them here, right after the call, before anything else can touch them. */
     unsigned int shape_mask = 0;
     for (int i = 0; i < param_count && i < 31; i++)
-        if (P.shape_sensitive_param[i]) shape_mask |= (1u << i);
-    if (shape_mask == 0 && param_count > 0 && raw_boxed_in_body > 0) shape_mask = SHAPE_MASK_NUMERIC_ONLY;
+        if (P.shape_sensitive_param[i])
+            shape_mask |= (1u << i);
+    if (shape_mask == 0 && param_count > 0 && raw_boxed_in_body > 0)
+        shape_mask = SHAPE_MASK_NUMERIC_ONLY;
     c->functions[this_func_idx].shape_sensitive_mask = shape_mask;
     if (shape_mask != 0) {
         const char* span_end = current_source_cursor();
@@ -5065,7 +5391,8 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     unsigned int new_offset = c->count;
     unsigned int max_registers = 0, max_raw_ints = 0, max_raw_reals = 0;
     int slots[SPEC_MAX_RAW_PARAMS];
-    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++) slots[k] = -1;
+    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++)
+        slots[k] = -1;
     /* OP_CALL_RAW_* can only address one bank and a contiguous run, so a mixed-kind or partially
        bound signature stays on the boxed call. Parameters reserve their slots before anything else
        compiles, so `raw_param_regs[k] == k` is exactly "all of them, in order". */
@@ -5074,7 +5401,8 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     if (raw_param_count > 0 && raw_param_count == (int)target_f->arity) {
         bool uniform = true;
         for (int k = 0; k < raw_param_count; k++)
-            if (raw_param_types[k] != raw_param_types[0] || raw_param_regs[k] != k) uniform = false;
+            if (raw_param_types[k] != raw_param_types[0] || raw_param_regs[k] != k)
+                uniform = false;
         if (uniform) {
             P.variant_kind = (raw_param_types[0] == TYPE_INTEGER) ? RAWK_INT : RAWK_REAL;
             P.variant_param_count = raw_param_count;
@@ -5095,7 +5423,8 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
        leaving the boxed compile. Both guesses are tried, and only at specialization time. */
     if (!parse_had_error && P.variant_kind != RAWK_NONE && P.self_call_seen) {
         RawKind guesses[2] = {RAWK_INT, RAWK_REAL};
-        if (P.body_return_kind == 2) guesses[0] = RAWK_REAL, guesses[1] = RAWK_INT;
+        if (P.body_return_kind == 2)
+            guesses[0] = RAWK_REAL, guesses[1] = RAWK_INT;
         for (int g = 0; g < 2; g++) {
             c->count = new_offset;
             lexer_restore_state(saved_lexer);
@@ -5105,15 +5434,17 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
             parse_function_signature(c, param_names, param_defaults, &param_count, &min_param_count);
             P.variant_return_kind = guesses[g];
             P.body_return_kind = -1;
-            for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++) slots[k] = -1;
+            for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++)
+                slots[k] = -1;
             max_registers = max_raw_ints = max_raw_reals = 0;
             parse_function_body(c, param_names, param_count, param_index, shape,
                                 kind == SPEC_KIND_ARRAY_OF_STRUCTS, raw_param_regs, raw_param_types,
                                 raw_param_count, &max_registers, &max_raw_ints, &max_raw_reals, slots);
-            RawKind got = (P.body_return_kind == 1) ? RAWK_INT
+            RawKind got = (P.body_return_kind == 1)   ? RAWK_INT
                           : (P.body_return_kind == 2) ? RAWK_REAL
                                                       : RAWK_NONE;
-            if (!parse_had_error && got == guesses[g]) break;
+            if (!parse_had_error && got == guesses[g])
+                break;
             if (g == 1) { /* neither held -- rebuild the boxed body, which always compiles */
                 parse_had_error = false;
                 c->count = new_offset;
@@ -5124,7 +5455,8 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
                 lex();
                 parse_function_signature(c, param_names, param_defaults, &param_count, &min_param_count);
                 P.variant_return_kind = RAWK_NONE;
-                for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++) slots[k] = -1;
+                for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++)
+                    slots[k] = -1;
                 max_registers = max_raw_ints = max_raw_reals = 0;
                 parse_function_body(c, param_names, param_count, param_index, shape,
                                     kind == SPEC_KIND_ARRAY_OF_STRUCTS, raw_param_regs, raw_param_types,
@@ -5139,13 +5471,15 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     parser_restore_state(saved_parser);
     parse_had_error = saved_had_error;
 
-    if (!ok) return false;
+    if (!ok)
+        return false;
 
     out_entry->code_offset = new_offset;
     out_entry->max_registers = max_registers;
     out_entry->max_raw_ints = max_raw_ints;
     out_entry->max_raw_reals = max_raw_reals;
-    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++) out_entry->raw_param_slots[k] = slots[k];
+    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++)
+        out_entry->raw_param_slots[k] = slots[k];
     if (raw_param_count == 0) {
         /* Ordinary shape-only compile -- a freshly-created SpecEntry (see lbl_call, vm.c) needs its
            OWN raw-variant bookkeeping starting from a well-defined "never attempted" state (0),
@@ -5187,7 +5521,8 @@ static bool parse_literal_default(Chunk* c, AerVal* out, bool* out_narrow) {
         *out = c->pool[pool_escaped_string(c, ts->data, ts->length)];
     } else if (token.type == TOKEN_OPEN_BRACKET) {
         lex();
-        if (token.type != TOKEN_CLOSE_BRACKET) return false;
+        if (token.type != TOKEN_CLOSE_BRACKET)
+            return false;
         AerArray* a = vm_new_array();
         a->count = a->capacity = 0;
         a->items = NULL;
@@ -5196,7 +5531,8 @@ static bool parse_literal_default(Chunk* c, AerVal* out, bool* out_narrow) {
         *out = aer_array_val(a);
     } else if (token.type == TOKEN_OPEN_BRACE) {
         lex();
-        if (token.type != TOKEN_CLOSE_BRACE) return false;
+        if (token.type != TOKEN_CLOSE_BRACE)
+            return false;
         AerDict* d = vm_new_dict();
         *out = aer_dict_val(d);
     } else {
@@ -5218,7 +5554,8 @@ static void parse_struct(Chunk* c) {
     require(TOKEN_COLON, "expected ':' after struct name");
     require(TOKEN_NEW_LINE, "expected newline before indented struct body");
     require(TOKEN_INDENT, "expected indented struct body");
-    if (parse_had_error) return;
+    if (parse_had_error)
+        return;
 
     unsigned int field_names[MAX_STRUCT_FIELDS];
     AerVal field_defaults[MAX_STRUCT_FIELDS];
@@ -5227,7 +5564,8 @@ static void parse_struct(Chunk* c) {
     unsigned int field_count = 0;
 
     while (!equal(TOKEN_END_OF_FILE) && !equal(TOKEN_DEDENT)) {
-        if (consume(TOKEN_NEW_LINE)) continue;
+        if (consume(TOKEN_NEW_LINE))
+            continue;
         if (!equal(TOKEN_IDENTIFIER)) {
             error_at("Expected field name");
             return;
@@ -5279,7 +5617,8 @@ static void parse_struct(Chunk* c) {
 
         if (!equal(TOKEN_DEDENT) && !equal(TOKEN_END_OF_FILE))
             require(TOKEN_NEW_LINE, "expected newline after struct field");
-        if (parse_had_error) return;
+        if (parse_had_error)
+            return;
     }
     consume(TOKEN_DEDENT);
 
@@ -5341,8 +5680,10 @@ static void parse_continue(Chunk* c) {
    free, every bare call statement would permanently waste a register slot (fatal for a REPL
    session accumulating statements). */
 static void discard_statement_result(Chunk* c, int dest) {
-    if (parse_had_error) return;
-    if (mode == MODE_SHELL) emit_print_repl(c, dest);
+    if (parse_had_error)
+        return;
+    if (mode == MODE_SHELL)
+        emit_print_repl(c, dest);
     reg_free(1);
 }
 
@@ -5441,9 +5782,11 @@ static void parse_statement(Chunk* c) {
 bool parser_read_variable(VM* vm, Chunk* c, const char* name, AerVal* out) {
     for (int i = P.var_count - 1; i >= 0; i--) {
         AerVal entry = c->pool[P.var_names[i]];
-        if (aer_type(entry) != TYPE_STRING) continue;
+        if (aer_type(entry) != TYPE_STRING)
+            continue;
         AerString* s = aer_as_string(entry);
-        if (strlen(name) != s->length || memcmp(s->data, name, s->length) != 0) continue;
+        if (strlen(name) != s->length || memcmp(s->data, name, s->length) != 0)
+            continue;
         int slot = P.var_regs[i];
         switch (P.var_kind[i]) {
             case VAR_RAW_INT: *out = aer_int(vm->call_stack[vm->call_depth].raw_ints[slot]); return true;
@@ -5520,8 +5863,10 @@ void parser_restore_state(ParserState* s) {
 void parse(Chunk* c) {
     P.any_compile_error = false;
     while (!equal(TOKEN_END_OF_FILE)) {
-        if (consume(TOKEN_NEW_LINE)) continue;
-        if (consume(TOKEN_DEDENT)) continue;
+        if (consume(TOKEN_NEW_LINE))
+            continue;
+        if (consume(TOKEN_DEDENT))
+            continue;
         parse_had_error = false;
         P.recovered_at_boundary = false;
         unsigned int saved = c->count;
@@ -5553,7 +5898,9 @@ void parse(Chunk* c) {
         }
         lexer_set_cursor(real_cursor);
         P.pending_count = 0;
-        if (any_pending_error) P.any_compile_error = true;
+        if (any_pending_error)
+            P.any_compile_error = true;
     }
-    if (P.any_compile_error) parse_had_error = true;
+    if (P.any_compile_error)
+        parse_had_error = true;
 }

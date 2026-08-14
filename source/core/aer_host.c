@@ -13,7 +13,8 @@ static HostFunction host_functions[MAX_HOST_FUNCTIONS];
 static int host_function_count = 0;
 
 bool aer_register_function(const char* module, const char* name, AerNativeFn fn, void* userdata) {
-    if (host_function_count >= MAX_HOST_FUNCTIONS) return false;
+    if (host_function_count >= MAX_HOST_FUNCTIONS)
+        return false;
     HostFunction* h = &host_functions[host_function_count++];
     h->module = xstrdup(module);
     h->name = xstrdup(name);
@@ -37,12 +38,15 @@ bool aer_host_is_module(const char* name, unsigned int len) {
 __attribute__((noinline)) bool aer_host_call(VM* vm, const char* module, const char* fn_name, int arg_count) {
     HostFunction* h = NULL;
     for (int i = 0; i < host_function_count; i++) {
-        if (strcmp(host_functions[i].module, module) != 0) continue;
-        if (strcmp(host_functions[i].name, fn_name) != 0) continue;
+        if (strcmp(host_functions[i].module, module) != 0)
+            continue;
+        if (strcmp(host_functions[i].name, fn_name) != 0)
+            continue;
         h = &host_functions[i];
         break;
     }
-    if (!h) return false;
+    if (!h)
+        return false;
 
     if (vm->stack_top < arg_count) {
         error("Stack underflow");

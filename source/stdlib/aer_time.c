@@ -16,7 +16,8 @@ static bool parse_digits(const char** s, int max_digits, int* out) {
         (*s)++;
         count++;
     }
-    if (count == 0) return false;
+    if (count == 0)
+        return false;
     *out = n;
     return true;
 }
@@ -34,38 +35,46 @@ static bool time_parse_impl(const char* input, const char* fmt, struct tm* tm) {
             int val;
             switch (*f) {
                 case 'Y':
-                    if (!parse_digits(&s, 4, &val)) return false;
+                    if (!parse_digits(&s, 4, &val))
+                        return false;
                     tm->tm_year = val - 1900;
                     break;
                 case 'm':
-                    if (!parse_digits(&s, 2, &val)) return false;
+                    if (!parse_digits(&s, 2, &val))
+                        return false;
                     tm->tm_mon = val - 1;
                     break;
                 case 'd':
-                    if (!parse_digits(&s, 2, &val)) return false;
+                    if (!parse_digits(&s, 2, &val))
+                        return false;
                     tm->tm_mday = val;
                     break;
                 case 'H':
-                    if (!parse_digits(&s, 2, &val)) return false;
+                    if (!parse_digits(&s, 2, &val))
+                        return false;
                     tm->tm_hour = val;
                     break;
                 case 'M':
-                    if (!parse_digits(&s, 2, &val)) return false;
+                    if (!parse_digits(&s, 2, &val))
+                        return false;
                     tm->tm_min = val;
                     break;
                 case 'S':
-                    if (!parse_digits(&s, 2, &val)) return false;
+                    if (!parse_digits(&s, 2, &val))
+                        return false;
                     tm->tm_sec = val;
                     break;
                 case '%':
-                    if (*s != '%') return false;
+                    if (*s != '%')
+                        return false;
                     s++;
                     break;
                 default: return false; /* unsupported format code */
             }
             f++;
         } else {
-            if (*s != *f) return false;
+            if (*s != *f)
+                return false;
             s++;
             f++;
         }

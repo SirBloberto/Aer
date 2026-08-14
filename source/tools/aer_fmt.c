@@ -57,7 +57,8 @@ static TokList tokenize(const char* src) {
 
     while (*p) {
         if (*p == '\n') {
-            if (!seen_token_on_line) blank_run++;
+            if (!seen_token_on_line)
+                blank_run++;
             line++;
             p++;
             line_begin = p;
@@ -83,14 +84,17 @@ static TokList tokenize(const char* src) {
                 p += 3;
                 while (*p && !(p[0] == '"' && p[1] == '"' && p[2] == '"'))
                     p++;
-                if (*p) p += 3;
+                if (*p)
+                    p += 3;
             } else {
                 p++;
                 while (*p && *p != '"' && *p != '\n') {
-                    if (*p == '\\' && p[1]) p++;
+                    if (*p == '\\' && p[1])
+                        p++;
                     p++;
                 }
-                if (*p == '"') p++;
+                if (*p == '"')
+                    p++;
             }
             type = T_STRING;
         } else if (isalpha((unsigned char)*p) || *p == '_') {
@@ -115,7 +119,8 @@ static TokList tokenize(const char* src) {
         } else {
             unsigned int mlen = 1;
             for (int i = 0; OPS3[i] && mlen == 1; i++)
-                if (!strncmp(p, OPS3[i], 3)) mlen = 3;
+                if (!strncmp(p, OPS3[i], 3))
+                    mlen = 3;
             if (mlen == 1)
                 for (int i = 0; OPS2[i]; i++)
                     if (!strncmp(p, OPS2[i], 2)) {
@@ -182,7 +187,8 @@ static LLineList group_logical_lines(TokList* tl) {
         unsigned int blank_before = tl->items[i].blank_before;
         while (i < tl->count && tl->items[i].type != T_EOF) {
             Tok* t = &tl->items[i];
-            if (i > start && t->line != tl->items[i - 1].line && bracket_depth == 0) break;
+            if (i > start && t->line != tl->items[i - 1].line && bracket_depth == 0)
+                break;
             if (is_open_bracket(t))
                 bracket_depth++;
             else if (is_close_bracket(t) && bracket_depth > 0)
@@ -213,7 +219,8 @@ static void compute_depths(LLineList* lines, TokList* tl) {
                 break;
             }
         }
-        if (comment_only) continue;
+        if (comment_only)
+            continue;
         unsigned int col = l->orig_col;
         while (sp > 0 && col < stack[sp])
             sp--;
@@ -260,10 +267,12 @@ static bool is_flow_keyword(const Tok* t) {
                                       "raise",   "break", "continue", "import", "in",        "as",
                                       "integer", "float", "boolean",  "array",  "hashtable", "and",
                                       "or",      "not",   NULL};
-    if (t->type != T_WORD) return false;
+    if (t->type != T_WORD)
+        return false;
     for (int i = 0; kws[i]; i++) {
         size_t n = strlen(kws[i]);
-        if (t->len == n && !strncmp(t->text, kws[i], n)) return true;
+        if (t->len == n && !strncmp(t->text, kws[i], n))
+            return true;
     }
     return false;
 }
@@ -271,10 +280,14 @@ static bool is_flow_keyword(const Tok* t) {
 /* '~' has no binary form in AER at all -- always unary. '-' is the only one that's genuinely
    context-sensitive (binary subtract vs. unary negate). */
 static bool is_unary_here(Tok* op, Tok* prev) {
-    if (op_is(op, "~")) return true;
-    if (!prev) return true;
-    if (prev->type == T_OP) return !is_close_bracket(prev);
-    if (prev->type == T_WORD) return is_flow_keyword(prev);
+    if (op_is(op, "~"))
+        return true;
+    if (!prev)
+        return true;
+    if (prev->type == T_OP)
+        return !is_close_bracket(prev);
+    if (prev->type == T_WORD)
+        return is_flow_keyword(prev);
     return false;
 }
 
@@ -282,25 +295,35 @@ static bool is_unary_here(Tok* op, Tok* prev) {
    before them -- true for a preceding identifier/number/string or a closing bracket (chained
    calls/indexing, f()(), arr[0][1]), never for a keyword-like standalone '(' grouping. */
 static bool is_call_or_index_open(Tok* prev, Tok* cur) {
-    if (!is_open_bracket(cur) || (cur->len == 1 && cur->text[0] == '{')) return false;
-    if (!prev) return false;
+    if (!is_open_bracket(cur) || (cur->len == 1 && cur->text[0] == '{'))
+        return false;
+    if (!prev)
+        return false;
     return prev->type == T_WORD || prev->type == T_NUMBER || prev->type == T_STRING || is_close_bracket(prev);
 }
 
 /* Whitespace between two adjacent non-comment tokens on the same emitted line. */
 static bool needs_space(Tok* prev, Tok* cur, bool prev_is_unary) {
-    if (!prev) return false;
-    if (op_is(cur, ",") || op_is(cur, ":") || op_is(cur, ".") || op_is(cur, "..")) return false;
-    if (is_close_bracket(cur)) return false;
-    if (is_open_bracket(prev)) return false;
-    if (op_is(prev, ".") || op_is(prev, "..")) return false;
-    if (prev_is_unary) return false;
-    if (is_call_or_index_open(prev, cur)) return false;
+    if (!prev)
+        return false;
+    if (op_is(cur, ",") || op_is(cur, ":") || op_is(cur, ".") || op_is(cur, ".."))
+        return false;
+    if (is_close_bracket(cur))
+        return false;
+    if (is_open_bracket(prev))
+        return false;
+    if (op_is(prev, ".") || op_is(prev, ".."))
+        return false;
+    if (prev_is_unary)
+        return false;
+    if (is_call_or_index_open(prev, cur))
+        return false;
     return true;
 }
 
 static void emit_comment(FILE* out, Tok* c, bool trailing) {
-    if (trailing) fputs("  ", out);
+    if (trailing)
+        fputs("  ", out);
     fwrite(c->text, 1, c->len, out);
 }
 
@@ -312,7 +335,8 @@ static void format_file(const char* src, FILE* out) {
     bool at_file_start = true; /* suppress a leading blank line at file start */
     for (unsigned int li = 0; li < lines.count; li++) {
         LLine* l = &lines.items[li];
-        if (l->blank_before > 0 && !at_file_start) fputc('\n', out);
+        if (l->blank_before > 0 && !at_file_start)
+            fputc('\n', out);
         at_file_start =
             false; /* every line emits real content below -- the line just emitted is never blank */
 
@@ -327,7 +351,8 @@ static void format_file(const char* src, FILE* out) {
                 emit_comment(out, t, prev != NULL);
                 continue;
             }
-            if (prev && needs_space(prev, t, prev_is_unary)) fputc(' ', out);
+            if (prev && needs_space(prev, t, prev_is_unary))
+                fputc(' ', out);
             fwrite(t->text, 1, t->len, out);
             prev_is_unary = (t->type == T_OP && (op_is(t, "-") || op_is(t, "~")) && is_unary_here(t, prev));
             prev = t;
@@ -361,7 +386,8 @@ static char* read_whole_file(const char* path) {
        stream (stdout's Windows default) would double it into '\r\r\n'. */
     char* w = buf;
     for (char* r = buf; *r; r++)
-        if (*r != '\r') *w++ = *r;
+        if (*r != '\r')
+            *w++ = *r;
     *w = '\0';
     return buf;
 }

@@ -8,7 +8,8 @@
 static int sort_cmp(const void* pa, const void* pb) {
     const AerVal* a = (const AerVal*)pa;
     const AerVal* b = (const AerVal*)pb;
-    if (aer_type(*a) == TYPE_STRING) return aer_string_compare(aer_as_string(*a), aer_as_string(*b));
+    if (aer_type(*a) == TYPE_STRING)
+        return aer_string_compare(aer_as_string(*a), aer_as_string(*b));
     double da = aer_type(*a) == TYPE_INTEGER ? (double)aer_as_int(*a) : aer_as_real(*a);
     double db = aer_type(*b) == TYPE_INTEGER ? (double)aer_as_int(*b) : aer_as_real(*b);
     return da < db ? -1 : (da > db ? 1 : 0);
@@ -110,7 +111,8 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
                 return true;
             }
             int64_t i = aer_as_int(key);
-            if (i < 0) i += (int64_t)a->count;
+            if (i < 0)
+                i += (int64_t)a->count;
             if (i < 0 || (uint64_t)i >= a->count) {
                 error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(key), a->count);
                 vm_stack_push(vm, aer_null());
@@ -146,7 +148,8 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         if (aer_type(src) == TYPE_DICT) {
             AerDict* d = aer_as_dict(src);
             AerDict* r = vm_new_dict();
-            if (d->map.count > 0) hashtable_reserve(&r->map, d->map.count);
+            if (d->map.count > 0)
+                hashtable_reserve(&r->map, d->map.count);
             for (unsigned int i = 0; i < d->map.count; i++) {
                 /* Duped into r's own pools, not d's -- the copy owns r->map, not the original.
                    Each source entry's own .hash was already computed once at its original
@@ -181,7 +184,8 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         }
         AerArray* a = aer_as_array(arr);
         int64_t i = aer_as_int(idx);
-        if (i < 0) i += (int64_t)a->count;
+        if (i < 0)
+            i += (int64_t)a->count;
         /* i == count is valid: insert at the end, same as append(). */
         if (i < 0 || (uint64_t)i > a->count) {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count);
@@ -259,8 +263,10 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         /* Ordering across mixed types has no sensible answer, so it's rejected up front rather than falling back to an arbitrary tie-break. */
         bool numeric = true, stringy = true;
         for (unsigned int i = 0; i < a->count; i++) {
-            if (aer_type(a->items[i]) != TYPE_INTEGER && aer_type(a->items[i]) != TYPE_REAL) numeric = false;
-            if (aer_type(a->items[i]) != TYPE_STRING) stringy = false;
+            if (aer_type(a->items[i]) != TYPE_INTEGER && aer_type(a->items[i]) != TYPE_REAL)
+                numeric = false;
+            if (aer_type(a->items[i]) != TYPE_STRING)
+                stringy = false;
         }
         if (a->count > 0 && !numeric && !stringy) {
             error("sort() requires all elements to be numbers, or all to be strings");

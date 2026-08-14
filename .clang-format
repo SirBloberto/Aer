@@ -11,7 +11,7 @@ ColumnLimit: 110
 
 # Single-statement guards (`if (!p) return;`) stay on one line -- that was already the plurality
 # style. Anything carrying an else gets braces, where the one-line form actually misleads.
-AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortIfStatementsOnASingleLine: false
 AllowShortLoopsOnASingleLine: false
 AllowShortFunctionsOnASingleLine: Inline
 AllowShortCaseLabelsOnASingleLine: true

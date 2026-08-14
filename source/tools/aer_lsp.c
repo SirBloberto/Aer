@@ -32,11 +32,13 @@ static const char* json_find_key(const char* json, const char* key) {
     char pattern[128];
     snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     const char* p = strstr(json, pattern);
-    if (!p) return NULL;
+    if (!p)
+        return NULL;
     p += strlen(pattern);
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
         p++;
-    if (*p != ':') return NULL;
+    if (*p != ':')
+        return NULL;
     p++;
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
         p++;
@@ -47,7 +49,8 @@ static const char* json_find_key(const char* json, const char* key) {
    returns a freshly xmalloc'd NUL-terminated buffer, or NULL. */
 static char* json_get_string(const char* json, const char* key) {
     const char* p = json_find_key(json, key);
-    if (!p || *p != '"') return NULL;
+    if (!p || *p != '"')
+        return NULL;
     p++;
     size_t cap = 256, len = 0;
     char* out = xmalloc(cap);
@@ -65,7 +68,8 @@ static char* json_get_string(const char* json, const char* key) {
                 case 'u': {
                     /* Best-effort: only handle the common ASCII-range \u00XX case, else emit '?'. */
                     unsigned int code = 0;
-                    if (strlen(p) >= 5) sscanf(p + 1, "%4x", &code);
+                    if (strlen(p) >= 5)
+                        sscanf(p + 1, "%4x", &code);
                     c = (code < 128) ? (char)code : '?';
                     p += 4;
                     break;
@@ -86,7 +90,8 @@ static char* json_get_string(const char* json, const char* key) {
 
 static long json_get_int(const char* json, const char* key, long fallback) {
     const char* p = json_find_key(json, key);
-    if (!p) return fallback;
+    if (!p)
+        return fallback;
     return strtol(p, NULL, 10);
 }
 
@@ -98,12 +103,16 @@ static char* read_message(void) {
     long content_length = -1;
     char header[512];
     for (;;) {
-        if (!fgets(header, sizeof(header), stdin)) return NULL;
-        if (!strcmp(header, "\r\n") || !strcmp(header, "\n")) break;
+        if (!fgets(header, sizeof(header), stdin))
+            return NULL;
+        if (!strcmp(header, "\r\n") || !strcmp(header, "\n"))
+            break;
         long v;
-        if (sscanf(header, "Content-Length: %ld", &v) == 1) content_length = v;
+        if (sscanf(header, "Content-Length: %ld", &v) == 1)
+            content_length = v;
     }
-    if (content_length < 0) return NULL;
+    if (content_length < 0)
+        return NULL;
     char* body = xmalloc((size_t)content_length + 1);
     size_t got = fread(body, 1, (size_t)content_length, stdin);
     body[got] = '\0';
@@ -136,7 +145,8 @@ static void set_document(const char* uri, const char* text) {
             return;
         }
     }
-    if (open_doc_count >= MAX_OPEN_DOCS) return;
+    if (open_doc_count >= MAX_OPEN_DOCS)
+        return;
     open_docs[open_doc_count].uri = xstrdup(uri);
     open_docs[open_doc_count].text = xstrdup(text);
     open_doc_count++;
@@ -144,7 +154,8 @@ static void set_document(const char* uri, const char* text) {
 
 static const char* get_document(const char* uri) {
     for (int i = 0; i < open_doc_count; i++)
-        if (!strcmp(open_docs[i].uri, uri)) return open_docs[i].text;
+        if (!strcmp(open_docs[i].uri, uri))
+            return open_docs[i].text;
     return NULL;
 }
 
@@ -161,7 +172,8 @@ static int diag_count;
 
 static void collect_diag(unsigned int line, unsigned int col, const char* message, void* userdata) {
     (void)userdata;
-    if (diag_count >= 128) return;
+    if (diag_count >= 128)
+        return;
     Diag* d = &diag_buf[diag_count++];
     d->line = line;
     d->col = col;
@@ -230,7 +242,8 @@ static void publish_diagnostics(const char* uri) {
             buf = xrealloc(buf, cap);                                                                        \
             n = snprintf(buf + len, cap - len, __VA_ARGS__);                                                 \
         }                                                                                                    \
-        if (n > 0) len += (size_t)n;                                                                         \
+        if (n > 0)                                                                                           \
+            len += (size_t)n;                                                                                \
     } while (0)
 
     APPEND("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/"
@@ -240,7 +253,8 @@ static void publish_diagnostics(const char* uri) {
         Diag* d = &diag_buf[i];
         unsigned int line0 = d->line > 0 ? d->line - 1 : 0;
         unsigned int col0 = d->col > 0 ? d->col - 1 : 0;
-        if (i > 0) APPEND(",");
+        if (i > 0)
+            APPEND(",");
         APPEND("{\"range\":{\"start\":{\"line\":%u,\"character\":%u},\"end\":{\"line\":%u,\"character\":%u}},"
                "\"severity\":1,\"source\":\"aer\",\"message\":\"",
                line0, col0, line0, col0 + 1);
@@ -370,7 +384,8 @@ static bool find_word_at(const char* text, long line, long character, char* out,
     for (long l = 0; l < line && *p; l++) {
         while (*p && *p != '\n')
             p++;
-        if (*p == '\n') p++;
+        if (*p == '\n')
+            p++;
     }
     const char* line_start = p;
     const char* line_end = p;
@@ -379,10 +394,13 @@ static bool find_word_at(const char* text, long line, long character, char* out,
 
     long len = (long)(line_end - line_start);
     long col = character < len ? character : len - 1;
-    if (col < 0) return false;
+    if (col < 0)
+        return false;
     const char* at = line_start + col;
-    if (!is_word_char(*at) && at > line_start) at--;
-    if (!is_word_char(*at)) return false;
+    if (!is_word_char(*at) && at > line_start)
+        at--;
+    if (!is_word_char(*at))
+        return false;
 
     const char* start = at;
     while (start > line_start && is_word_char(start[-1]))
@@ -392,7 +410,8 @@ static bool find_word_at(const char* text, long line, long character, char* out,
         end++;
 
     size_t n = (size_t)(end - start);
-    if (n == 0 || n >= out_size) return false;
+    if (n == 0 || n >= out_size)
+        return false;
     memcpy(out, start, n);
     out[n] = '\0';
     return true;
@@ -435,7 +454,8 @@ static void handle_completion(const char* msg) {
     long id = json_get_int(msg, "id", 0);
     char* uri = json_get_string(msg, "uri");
     const char* text = uri ? get_document(uri) : NULL;
-    if (text) scan_symbols(text);
+    if (text)
+        scan_symbols(text);
 
     char* buf = xmalloc(16384);
     size_t cap = 16384, len = 0;
@@ -447,21 +467,24 @@ static void handle_completion(const char* msg) {
             buf = xrealloc(buf, cap);                                                                        \
             n = snprintf(buf + len, cap - len, __VA_ARGS__);                                                 \
         }                                                                                                    \
-        if (n > 0) len += (size_t)n;                                                                         \
+        if (n > 0)                                                                                           \
+            len += (size_t)n;                                                                                \
     } while (0)
 
     APPEND("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":[", id);
     bool first = true;
     for (int m = 0; MODULE_FNS[m].module; m++) {
         for (int f = 0; MODULE_FNS[m].fns[f]; f++) {
-            if (!first) APPEND(",");
+            if (!first)
+                APPEND(",");
             first = false;
             APPEND("{\"label\":\"%s\",\"kind\":3}", MODULE_FNS[m].fns[f]);
         }
     }
     if (text) {
         for (int i = 0; i < symbol_count; i++) {
-            if (!first) APPEND(",");
+            if (!first)
+                APPEND(",");
             first = false;
             if (symbols[i].may_fail)
                 APPEND("{\"label\":\"%s\",\"kind\":%d,\"detail\":\"may fail\"}", symbols[i].name,
@@ -497,7 +520,8 @@ int main(void) {
 
     for (;;) {
         char* msg = read_message();
-        if (!msg) break;
+        if (!msg)
+            break;
 
         char* method = json_get_string(msg, "method");
         if (!method) {

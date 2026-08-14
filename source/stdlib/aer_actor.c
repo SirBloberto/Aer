@@ -33,7 +33,8 @@ static Actor* aer_actor_spawn(const char* path) {
     VM* vm = NULL;
     Chunk* chunk = NULL;
     unsigned int halt_addr = 0;
-    if (aer_vm_instantiate_from_file((char*)path, &vm, &chunk, &halt_addr) != INSTANTIATE_OK) return NULL;
+    if (aer_vm_instantiate_from_file((char*)path, &vm, &chunk, &halt_addr) != INSTANTIATE_OK)
+        return NULL;
 
     Actor* a = xmalloc(sizeof(Actor));
     a->vm = vm;
@@ -57,12 +58,14 @@ static unsigned int aer_actor_id(Actor* actor) {
 
 static Actor* aer_actor_find(unsigned int id) {
     for (Actor* a = actors; a; a = a->next)
-        if (a->id == id) return a;
+        if (a->id == id)
+            return a;
     return NULL;
 }
 
 Actor* aer_actor_resolve(AerVal handle) {
-    if (aer_type(handle) != TYPE_INTEGER) return NULL;
+    if (aer_type(handle) != TYPE_INTEGER)
+        return NULL;
     return aer_actor_find((unsigned int)aer_as_int(handle));
 }
 
@@ -72,7 +75,8 @@ VM* aer_actor_vm(Actor* actor) {
 
 bool aer_actor_prepare_call(Actor* actor, const char* fn, int arg_count, AerVal* args) {
     ChunkFunction* fnreg = chunk_find_function(actor->chunk, fn);
-    if (!fnreg) return false;
+    if (!fnreg)
+        return false;
 
     VM* mv = actor->vm;
     /* A prior call's error can leave call_depth/stack_top stuck above 0 (same reset
@@ -83,7 +87,8 @@ bool aer_actor_prepare_call(Actor* actor, const char* fn, int arg_count, AerVal*
 }
 
 bool aer_actor_call(Actor* actor, const char* fn, int arg_count, AerVal* args, AerVal* out_result) {
-    if (!aer_actor_prepare_call(actor, fn, arg_count, args)) return false;
+    if (!aer_actor_prepare_call(actor, fn, arg_count, args))
+        return false;
     VM* mv = actor->vm;
 
     /* Called directly by host (C) code, never from inside another VM's bytecode dispatch, so
@@ -99,7 +104,8 @@ bool aer_actor_call(Actor* actor, const char* fn, int arg_count, AerVal* args, A
        mid-parse. This actor's own failure must not leak into the caller's other work at all. */
     runtime_had_error = false;
     parse_had_error = false;
-    if (!ok) return false;
+    if (!ok)
+        return false;
 
     *out_result = mv->call_stack[0].registers[0];
     return true;
@@ -126,9 +132,11 @@ static bool aer_actor_send(Actor* actor, const char* message, unsigned int len) 
 
 static bool aer_actor_try_receive(Actor* actor, char** out_message, unsigned int* out_len) {
     Mailbox* m = actor->mailbox_head;
-    if (!m) return false;
+    if (!m)
+        return false;
     actor->mailbox_head = m->next;
-    if (!actor->mailbox_head) actor->mailbox_tail = NULL;
+    if (!actor->mailbox_head)
+        actor->mailbox_tail = NULL;
     *out_message = m->data;
     *out_len = m->len;
     free(m);
@@ -149,7 +157,8 @@ static void aer_actor_free(Actor* actor) {
     Actor** link = &actors;
     while (*link && *link != actor)
         link = &(*link)->next;
-    if (*link) *link = actor->next;
+    if (*link)
+        *link = actor->next;
 
     vm_free(actor->vm);
     chunk_free(actor->chunk);

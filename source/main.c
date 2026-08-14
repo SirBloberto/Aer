@@ -147,7 +147,8 @@ static void run() {
        for a file: a corrupted loop body (e.g. an increment that failed to compile) silently becomes
        an infinite loop instead of the syntax error it actually is. File mode refuses to run at all
        once parse() has flagged any statement as invalid; the REPL still runs the rest of the line. */
-    if (mode == MODE_RUN && parse_had_error) return;
+    if (mode == MODE_RUN && parse_had_error)
+        return;
     if (max_instructions == 0) {
         vm_run(&vm);
         return;
@@ -158,7 +159,8 @@ static void run() {
     for (;;) {
         unsigned int step = remaining < INSTRUCTION_SLICE ? remaining : INSTRUCTION_SLICE;
         VmSliceResult r = vm_run_slice(&vm, step);
-        if (r != VM_SLICE_YIELDED) return;
+        if (r != VM_SLICE_YIELDED)
+            return;
         remaining -= step;
         if (remaining == 0) {
             budget_exhausted = true;
@@ -194,7 +196,8 @@ static void run_shell() {
         bool ends_with_colon = false;
         for (size_t i = len; i > 0; i--) {
             char ch = line[i - 1];
-            if (ch == '\n' || ch == ' ' || ch == '\t') continue;
+            if (ch == '\n' || ch == ' ' || ch == '\t')
+                continue;
             ends_with_colon = (ch == ':');
             break;
         }
@@ -218,7 +221,8 @@ static void run_shell() {
                     break;
                 }
             }
-            if (!blank) continue;
+            if (!blank)
+                continue;
 
             set_terminal_prompt(">>> ");
             aer_run_source(&vm, &chunk, block_buf);
@@ -241,7 +245,8 @@ static bool run_file(char* path) {
     read_file(path);
     /* read_file() can fail (missing file, unreadable, embedded NUL) without ever setting up the
        lexer's current file -- calling run() anyway would lex/parse a null or stale File*. */
-    if (!aer_had_error()) run();
+    if (!aer_had_error())
+        run();
 #ifdef AER_DEBUG_TOOLS
     /* After run() so the dump has both the bytecode and the run's hit counts; "-" means stderr */
     const char* dump_path = debug_dump_path;
@@ -253,7 +258,8 @@ static bool run_file(char* path) {
         }
         aer_disassemble(&chunk, dump_out);
         aer_debug_memory_report(dump_out);
-        if (dump_out != stderr) fclose(dump_out);
+        if (dump_out != stderr)
+            fclose(dump_out);
     }
 #endif
     /* A runtime error doesn't terminate the process (see error.c) -- the CLI decides to exit nonzero here; a failed assert() doesn't set aer_had_error() on purpose (see error.h), so it's checked separately. */

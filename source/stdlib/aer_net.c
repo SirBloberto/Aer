@@ -27,7 +27,8 @@ typedef SOCKET sock_t;
    module's lack of explicit process-exit teardown; the OS reclaims it. */
 static bool wsa_ready = false;
 static void ensure_socket_layer(void) {
-    if (wsa_ready) return;
+    if (wsa_ready)
+        return;
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     wsa_ready = true;
@@ -60,7 +61,8 @@ static bool set_nonblocking(sock_t s, bool nonblocking) {
 #else
 static bool set_nonblocking(sock_t s, bool nonblocking) {
     int flags = fcntl(s, F_GETFL, 0);
-    if (flags < 0) return false;
+    if (flags < 0)
+        return false;
     flags = nonblocking ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
     return fcntl(s, F_SETFL, flags) == 0;
 }
@@ -84,9 +86,11 @@ static bool connect_with_timeout(sock_t s, const struct sockaddr* addr, socklen_
         return true;
     }
 #ifdef _WIN32
-    if (WSAGetLastError() != WSAEWOULDBLOCK) return false;
+    if (WSAGetLastError() != WSAEWOULDBLOCK)
+        return false;
 #else
-    if (errno != EINPROGRESS) return false;
+    if (errno != EINPROGRESS)
+        return false;
 #endif
     fd_set write_set;
     FD_ZERO(&write_set);
@@ -148,7 +152,8 @@ static unsigned int register_socket(sock_t s) {
 
 /* *out_sock untouched on failure. */
 static bool resolve_socket(AerVal handle_v, sock_t* out_sock) {
-    if (aer_type(handle_v) != TYPE_INTEGER) return false;
+    if (aer_type(handle_v) != TYPE_INTEGER)
+        return false;
     unsigned int id = (unsigned int)aer_as_int(handle_v);
     for (SocketEntry* e = sockets; e; e = e->next) {
         if (e->id == id) {
@@ -205,8 +210,10 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
         sock_t s = SOCK_INVALID;
         for (struct addrinfo* p = res; p; p = p->ai_next) {
             s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-            if (s == SOCK_INVALID) continue;
-            if (connect_with_timeout(s, p->ai_addr, (socklen_t)p->ai_addrlen)) break;
+            if (s == SOCK_INVALID)
+                continue;
+            if (connect_with_timeout(s, p->ai_addr, (socklen_t)p->ai_addrlen))
+                break;
             sock_close(s);
             s = SOCK_INVALID;
         }
@@ -330,10 +337,12 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
         sock_t s = SOCK_INVALID;
         for (struct addrinfo* p = res; p; p = p->ai_next) {
             s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-            if (s == SOCK_INVALID) continue;
+            if (s == SOCK_INVALID)
+                continue;
             int yes = 1;
             setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
-            if (bind(s, p->ai_addr, (socklen_t)p->ai_addrlen) == 0 && listen(s, 16) == 0) break;
+            if (bind(s, p->ai_addr, (socklen_t)p->ai_addrlen) == 0 && listen(s, 16) == 0)
+                break;
             sock_close(s);
             s = SOCK_INVALID;
         }

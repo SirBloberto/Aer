@@ -33,7 +33,8 @@ static int loading_capacity = 0;
 
 static FileModule* find_module(const char* name, unsigned int len) {
     for (int i = 0; i < module_count; i++)
-        if (strlen(modules[i].name) == len && strncmp(modules[i].name, name, len) == 0) return &modules[i];
+        if (strlen(modules[i].name) == len && strncmp(modules[i].name, name, len) == 0)
+            return &modules[i];
     return NULL;
 }
 
@@ -47,22 +48,26 @@ static char* join_path(const char* dir, size_t dir_len, const char* name, unsign
     char* path = xmalloc(dir_len + len + (ext ? 0 : 4) + 1 /* NUL */);
     memcpy(path, dir, dir_len);
     memcpy(path + dir_len, name, len);
-    if (!ext) memcpy(path + dir_len + len, ".aer", 4);
+    if (!ext)
+        memcpy(path + dir_len + len, ".aer", 4);
     path[dir_len + len + (ext ? 0 : 4)] = '\0';
     return path;
 }
 
 static bool file_exists(const char* path) {
     FILE* f = fopen(path, "rb");
-    if (!f) return false;
+    if (!f)
+        return false;
     fclose(f);
     return true;
 }
 
 /* Fully qualified (leading '/', '', or drive letter) -- never dir-joined or AER_PATH-searched. */
 static bool is_absolute_path(const char* p, unsigned int len) {
-    if (len == 0) return false;
-    if (p[0] == '/' || p[0] == '\\') return true;
+    if (len == 0)
+        return false;
+    if (p[0] == '/' || p[0] == '\\')
+        return true;
     if (len >= 2 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':')
         return true;
     return false;
@@ -72,16 +77,19 @@ static bool is_absolute_path(const char* p, unsigned int len) {
    importing file's directory, then each AER_PATH entry. Dots in dotted imports were already
    turned into '/' by the parser; quoted paths arrive untouched. */
 static char* resolve_path(const char* path_name, unsigned int len) {
-    if (is_absolute_path(path_name, len)) return join_path("", 0, path_name, len);
+    if (is_absolute_path(path_name, len))
+        return join_path("", 0, path_name, len);
 
     const char* base = current_source_name();
     const char* slash = NULL;
     for (const char* p = base; *p; p++)
-        if (*p == '/' || *p == '\\') slash = p;
+        if (*p == '/' || *p == '\\')
+            slash = p;
     size_t dir_len = slash ? (size_t)(slash - base + 1) : 0;
 
     char* same_dir_path = join_path(base, dir_len, path_name, len);
-    if (file_exists(same_dir_path)) return same_dir_path;
+    if (file_exists(same_dir_path))
+        return same_dir_path;
 
     const char* aer_path = getenv("AER_PATH");
     if (aer_path) {
@@ -96,7 +104,8 @@ static char* resolve_path(const char* path_name, unsigned int len) {
                 size_t joined_dir_len = entry_len + (needs_sep ? 1 : 0);
                 char* dirbuf = xmalloc(joined_dir_len);
                 memcpy(dirbuf, start, entry_len);
-                if (needs_sep) dirbuf[entry_len] = '/';
+                if (needs_sep)
+                    dirbuf[entry_len] = '/';
                 char* candidate = join_path(dirbuf, joined_dir_len, path_name, len);
                 free(dirbuf);
                 if (file_exists(candidate)) {
@@ -129,7 +138,8 @@ void aer_module_free_all(void) {
 
 /* Pushes a null placeholder onto the CALLING vm's stack -- every failure path in aer_module_call reports its error and still needs to leave exactly one result behind, matching the core builtins' convention. */
 static void push_null_result(VM* vm) {
-    if (vm->stack_top < VM_STACK_MAX) vm->stack[vm->stack_top++] = aer_null();
+    if (vm->stack_top < VM_STACK_MAX)
+        vm->stack[vm->stack_top++] = aer_null();
 }
 
 /* Shared by aer_module_load below and aer_actor_spawn (aer_actor.c) -- both need "make a
@@ -222,7 +232,8 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
 }
 
 bool aer_module_load(const char* name, unsigned int len, const char* path_name, unsigned int path_len) {
-    if (find_module(name, len)) return true; /* already loaded, not an error */
+    if (find_module(name, len))
+        return true; /* already loaded, not an error */
 
     char* path = resolve_path(path_name, path_len);
 
@@ -246,7 +257,8 @@ bool aer_module_load(const char* name, unsigned int len, const char* path_name, 
     loading_depth--;
 
     if (r != INSTANTIATE_OK) {
-        if (r == INSTANTIATE_RUNTIME_FAILED) error_at("Error while loading module '%.*s'", (int)len, name);
+        if (r == INSTANTIATE_RUNTIME_FAILED)
+            error_at("Error while loading module '%.*s'", (int)len, name);
         free(path);
         return false;
     }
@@ -273,10 +285,12 @@ static ChunkFunction* find_module_function(FileModule* m, const char* fn) {
 
 bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) {
     FileModule* m = find_module(module, (unsigned int)strlen(module));
-    if (!m) return false;
+    if (!m)
+        return false;
 
     ChunkFunction* fnreg = find_module_function(m, fn);
-    if (!fnreg) return false;
+    if (!fnreg)
+        return false;
 
     VM* mv = m->vm;
 
@@ -308,11 +322,13 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
     /* runtime_had_error deliberately stays true on failure here (unlike aer_module_load's parse-time path) -- the called module's vm_run(mv) already caught its own error locally (its own catch point, installed and restored inside vm_run itself) and returned cleanly, so nothing automatically aborts the CALLING vm too anymore now that DISPATCH() no longer polls this flag every instruction. Propagate explicitly: longjmp to whatever vm_run() call is now the current unwind target (the calling vm's own, since vm_run(mv)'s return already restored it) -- exactly like a same-VM call error, just raised here instead of noticed passively. */
     if (runtime_had_error) {
         push_null_result(vm);
-        if (runtime_error_unwind_target) AER_LONGJMP(*runtime_error_unwind_target, 1);
+        if (runtime_error_unwind_target)
+            AER_LONGJMP(*runtime_error_unwind_target, 1);
         return true;
     }
 
     AerVal ret = mv->call_stack[0].registers[0];
-    if (vm->stack_top < VM_STACK_MAX) vm->stack[vm->stack_top++] = ret;
+    if (vm->stack_top < VM_STACK_MAX)
+        vm->stack[vm->stack_top++] = ret;
     return true;
 }

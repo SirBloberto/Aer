@@ -60,7 +60,8 @@ void lexer_set_cursor(const char* pos) {
 unsigned int current_source_line() {
     unsigned int line = 1;
     for (const char* p = current->start; p < current->buffer; p++)
-        if (*p == '\n') line++;
+        if (*p == '\n')
+            line++;
     return current->line_base + line;
 }
 
@@ -141,7 +142,8 @@ void read_file(char* filename) {
     char* dst = buf;
     char* src = buf;
     while (*src) {
-        if (*src != '\r') *dst++ = *src;
+        if (*src != '\r')
+            *dst++ = *src;
         src++;
     }
     *dst = '\0';
@@ -167,12 +169,14 @@ void shell(char* line) {
     free(previous);
 
     previous = strdup(line);
-    if (!previous) error("Out of memory in shell");
+    if (!previous)
+        error("Out of memory in shell");
     /* Strip \r from pasted Windows-style input */
     char* r = previous;
     char* w = previous;
     while (*r) {
-        if (*r != '\r') *w++ = *r;
+        if (*r != '\r')
+            *w++ = *r;
         r++;
     }
     *w = '\0';
@@ -265,7 +269,8 @@ static void skip_whitespace_and_comments() {
             current->buffer++;
             continue;
         }
-        if (*current->buffer != '#') return;
+        if (*current->buffer != '#')
+            return;
         skip_comment();
     }
 }
@@ -284,8 +289,10 @@ static void lex_number() {
         char* end;
         errno = 0;
         int64_t val = strtoll(buf, &end, 16);
-        if (errno == ERANGE) error_at("Integer literal overflow");
-        if (isalpha((unsigned char)*end) || *end == '_') error_at("Invalid character after integer literal");
+        if (errno == ERANGE)
+            error_at("Integer literal overflow");
+        if (isalpha((unsigned char)*end) || *end == '_')
+            error_at("Invalid character after integer literal");
         emit_integer(val, (unsigned int)(end - buf));
         return;
     }
@@ -294,7 +301,8 @@ static void lex_number() {
     char* end;
     errno = 0;
     int64_t int_val = strtoll(buf, &end, 10);
-    if (errno == ERANGE) error_at("Integer literal overflow");
+    if (errno == ERANGE)
+        error_at("Integer literal overflow");
     unsigned int int_len = (unsigned int)(end - buf);
 
     /* Not a float, or range operator (..) follows */
@@ -308,7 +316,8 @@ static void lex_number() {
             token.narrow = true;
             return;
         }
-        if (isalpha((unsigned char)*end) || *end == '_') error_at("Invalid character after integer literal");
+        if (isalpha((unsigned char)*end) || *end == '_')
+            error_at("Invalid character after integer literal");
         emit_integer(int_val, int_len);
         return;
     }
@@ -316,7 +325,8 @@ static void lex_number() {
     /* Float: use strtod from original start for correct precision */
     double real_val = strtod(buf, &end);
     unsigned int len = (unsigned int)(end - buf);
-    if (len <= int_len + 1) error_at("Expected digit after '.'");
+    if (len <= int_len + 1)
+        error_at("Expected digit after '.'");
     /* `f` immediately after a float literal (`0.0f`) -- same narrow-marker convention as `i` above,
        selecting float32 storage instead of int32. */
     if (*end == 'f' && !(isalnum((unsigned char)end[1]) || end[1] == '_')) {
@@ -324,7 +334,8 @@ static void lex_number() {
         token.narrow = true;
         return;
     }
-    if (isalpha((unsigned char)*end) || *end == '_') error_at("Invalid character after float literal");
+    if (isalpha((unsigned char)*end) || *end == '_')
+        error_at("Invalid character after float literal");
     emit_real(real_val, len);
 }
 
@@ -429,7 +440,8 @@ static void lex_identifier() {
         buf++;
         length++;
     }
-    if (!lex_keyword(length)) emit_string_token(TOKEN_IDENTIFIER, length);
+    if (!lex_keyword(length))
+        emit_string_token(TOKEN_IDENTIFIER, length);
 }
 
 /* ------------------------------------------------------------------ */
@@ -456,7 +468,8 @@ void lex() {
             if (*p == '#')
                 while (*p != '\n' && *p != '\0')
                     p++;
-            if (*p != '\n') break;
+            if (*p != '\n')
+                break;
             current->buffer = p + 1;
         }
 
@@ -549,7 +562,8 @@ void lex() {
             emit(TOKEN_OPEN_PARENTHESE, 1);
             return;
         case ')':
-            if (bracket_depth > 0) bracket_depth--;
+            if (bracket_depth > 0)
+                bracket_depth--;
             emit(TOKEN_CLOSE_PARENTHESE, 1);
             return;
         case '[':
@@ -557,7 +571,8 @@ void lex() {
             emit(TOKEN_OPEN_BRACKET, 1);
             return;
         case ']':
-            if (bracket_depth > 0) bracket_depth--;
+            if (bracket_depth > 0)
+                bracket_depth--;
             emit(TOKEN_CLOSE_BRACKET, 1);
             return;
         case '{':
@@ -565,7 +580,8 @@ void lex() {
             emit(TOKEN_OPEN_BRACE, 1);
             return;
         case '}':
-            if (bracket_depth > 0) bracket_depth--;
+            if (bracket_depth > 0)
+                bracket_depth--;
             emit(TOKEN_CLOSE_BRACE, 1);
             return;
         case ':': emit(TOKEN_COLON, 1); return;
@@ -693,12 +709,14 @@ bool equal(TokenType match) {
 }
 
 void require(TokenType match, const char* msg) {
-    if (!equal(match)) error_at("%s", msg);
+    if (!equal(match))
+        error_at("%s", msg);
     lex();
 }
 
 bool consume(TokenType match) {
-    if (!equal(match)) return false;
+    if (!equal(match))
+        return false;
     lex();
     return true;
 }

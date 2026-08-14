@@ -109,8 +109,10 @@ unsigned int hashtable_key_true_len(const char* data, unsigned int len);
    aer_string_alloc, so the memo can never go stale; see AerString.hash for why the truncated case
    opts out rather than caching a hash the key's own length disagrees with. */
 static inline HashValue hashtable_string_hash(AerString* s, unsigned int true_len) {
-    if (true_len != s->length) return hashtable_hash_bytes(s->data, true_len);
-    if (s->hash == 0) s->hash = hashtable_hash_bytes(s->data, true_len);
+    if (true_len != s->length)
+        return hashtable_hash_bytes(s->data, true_len);
+    if (s->hash == 0)
+        s->hash = hashtable_hash_bytes(s->data, true_len);
     return s->hash;
 }
 

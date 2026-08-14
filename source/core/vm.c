@@ -27,7 +27,8 @@ static VmHeap* current_heap = NULL;
 static VmHeap bootstrap_heap = {0};
 
 static VmHeap* require_current_heap(void) {
-    if (!current_heap) current_heap = &bootstrap_heap;
+    if (!current_heap)
+        current_heap = &bootstrap_heap;
     return current_heap;
 }
 
@@ -65,7 +66,8 @@ static const unsigned int STRUCT_TIER_ELEMS_PER_SLAB[STRUCT_PAYLOAD_TIER_COUNT] 
    same cell) run past the cell's actual allocation. */
 static Pool* struct_pool_for_size(VmHeap* heap, unsigned int instance_bytes) {
     for (unsigned int i = 0; i < STRUCT_PAYLOAD_TIER_COUNT; i++)
-        if (instance_bytes <= STRUCT_PAYLOAD_TIER_SIZE[i]) return &heap->struct_pools[i];
+        if (instance_bytes <= STRUCT_PAYLOAD_TIER_SIZE[i])
+            return &heap->struct_pools[i];
     return &heap->struct_pools
                 [STRUCT_PAYLOAD_TIER_COUNT -
                  1]; /* unreachable given the 256 ceiling above, but fail safe rather than out-of-bounds */
@@ -83,13 +85,15 @@ static void vm_heap_init(VmHeap* heap); /* defined below; the payload allocator 
 static int string_payload_tier(unsigned int length) {
     size_t need = (size_t)length + 1; /* + NUL, exactly what the allocation must hold */
     for (int i = 0; i < STRING_PAYLOAD_TIER_COUNT; i++)
-        if (need <= STRING_PAYLOAD_TIER_SIZE[i]) return i;
+        if (need <= STRING_PAYLOAD_TIER_SIZE[i])
+            return i;
     return -1;
 }
 
 char* vm_string_payload_alloc(VmHeap* heap, unsigned int length) {
     int tier = string_payload_tier(length);
-    if (tier < 0 || !heap) return xmalloc((size_t)length + 1);
+    if (tier < 0 || !heap)
+        return xmalloc((size_t)length + 1);
     vm_heap_init(heap);
     return pool_alloc(&heap->string_payload_pools[tier]);
 }
@@ -102,14 +106,16 @@ void vm_string_payload_free(VmHeap* heap, char* payload, unsigned int length) {
     }
     /* No heap means the payload outlived its own pools, which vm_free prevents by bracketing
        gc_finalize_all_pools with current_heap. Leave it to the slab teardown rather than guess. */
-    if (!heap) return;
+    if (!heap)
+        return;
     pool_free(&heap->string_payload_pools[tier], payload);
 }
 
 /* Initializes one heap's pools -- called once per VM (vm_init), not once per process, since every
    VM now owns its own. */
 static void vm_heap_init(VmHeap* heap) {
-    if (heap->pools_initialized) return;
+    if (heap->pools_initialized)
+        return;
     pool_init(&heap->string_pool, sizeof(AerString), 256);
     pool_init(&heap->array_pool, sizeof(AerArray), 256);
     pool_init(&heap->dict_pool, sizeof(AerDict), 64);
@@ -158,7 +164,8 @@ AerVal register_get(VM* vm, int slot) {
    a VM*: that re-fetch, through a pointer the compiler cannot prove is unaliased inside this
    computed-goto function, measured ~4.5% more instructions on fib_bench. */
 static inline AerVal* vm_rk_ptr16(AerVal* registers, AerVal* pool, uint32_t rk16) {
-    if (rk16 & RK16_CONST_FLAG) return &pool[rk16 & RK16_INDEX_MASK];
+    if (rk16 & RK16_CONST_FLAG)
+        return &pool[rk16 & RK16_INDEX_MASK];
     return &registers[rk16 & RK16_INDEX_MASK];
 }
 
@@ -168,7 +175,8 @@ static inline AerVal* vm_rk_ptr16(AerVal* registers, AerVal* pool, uint32_t rk16
    made calls slower; Lua/V8 accept this branch too and make calls free instead (register_stack).
    Takes registers directly -- see vm_rk_ptr16's own comment just above for why. */
 static inline AerVal* vm_rk_ptr8(AerVal* registers, AerVal* pool, uint32_t rk8) {
-    if (rk8 & RK8_CONST_FLAG) return &pool[rk8 & RK8_INDEX_MASK];
+    if (rk8 & RK8_CONST_FLAG)
+        return &pool[rk8 & RK8_INDEX_MASK];
     return &registers[rk8 & RK8_INDEX_MASK];
 }
 
@@ -185,12 +193,15 @@ void vm_gc_suppress(void) {
 }
 void vm_gc_unsuppress(void) {
     VmHeap* h = require_current_heap();
-    if (h->gc_suppress_depth > 0) h->gc_suppress_depth--;
+    if (h->gc_suppress_depth > 0)
+        h->gc_suppress_depth--;
 }
 
 void aer_gc_configure(unsigned int minor_threshold, unsigned int major_every_n_minor) {
-    if (minor_threshold) default_minor_gc_threshold = minor_threshold;
-    if (major_every_n_minor) default_major_gc_every_n_minor = major_every_n_minor;
+    if (minor_threshold)
+        default_minor_gc_threshold = minor_threshold;
+    if (major_every_n_minor)
+        default_major_gc_every_n_minor = major_every_n_minor;
     /* Also apply immediately to whichever heap is already current, if one exists -- so
        reconfiguring an already-running VM takes effect right away, not just for the next one. */
     VmHeap* heap = require_current_heap();
@@ -198,7 +209,8 @@ void aer_gc_configure(unsigned int minor_threshold, unsigned int major_every_n_m
         heap->minor_gc_threshold = minor_threshold;
         heap->minor_gc_threshold_floor = minor_threshold;
     }
-    if (major_every_n_minor) heap->major_gc_every_n_minor = major_every_n_minor;
+    if (major_every_n_minor)
+        heap->major_gc_every_n_minor = major_every_n_minor;
 }
 
 void aer_gc_set_ceiling(unsigned int max_live_cells) {
@@ -211,22 +223,27 @@ void aer_gc_set_ceiling(unsigned int max_live_cells) {
    threshold" one -- see vm_run_slice's gc_maybe_collect shadow. */
 static inline __attribute__((always_inline)) bool gc_should_collect(VM* vm) {
     VmHeap* heap = &vm->heap;
-    if (heap->gc_suppress_depth > 0) return false;
+    if (heap->gc_suppress_depth > 0)
+        return false;
     return heap->pool_alloc_count >= heap->minor_gc_threshold;
 }
 
 /* Called from every allocating opcode; kept tiny and always_inline so the common case costs nothing beyond what's already inlined into the dispatch loop. gc_run_collection_cycle (the rare, actual-collection path) lives in gc.c. */
 static inline __attribute__((always_inline)) void gc_maybe_collect(VM* vm) {
-    if (gc_should_collect(vm)) gc_run_collection_cycle(vm);
+    if (gc_should_collect(vm))
+        gc_run_collection_cycle(vm);
 }
 
 /* Embedding-facing introspection (include/aer.h); live_cells is a bookkeeping snapshot, not a fresh trace, so it undercounts unswept-but-garbage cells since the last cycle. Reads whichever heap is current -- see vm_gc_suppress's comment. */
 void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
                   unsigned int* major_collections) {
     VmHeap* heap = require_current_heap();
-    if (live_cells) *live_cells = gc_count_live_cells(heap);
-    if (minor_collections) *minor_collections = heap->minor_collections_run;
-    if (major_collections) *major_collections = heap->major_collections_run;
+    if (live_cells)
+        *live_cells = gc_count_live_cells(heap);
+    if (minor_collections)
+        *minor_collections = heap->minor_collections_run;
+    if (major_collections)
+        *major_collections = heap->major_collections_run;
 }
 
 /* ------------------------------------------------------------------ */
@@ -251,37 +268,45 @@ void vm_set_active_error_vm(VM* vm) {
 
 static unsigned int lookup_runtime_line(void) {
     VM* vm = active_vm_for_errors;
-    if (!vm) return 0;
+    if (!vm)
+        return 0;
     /* error_pc is only ever set while that same chunk is executing, so resolving it here is safe --
        and this path is cold, so reloading chunk->code costs nothing. Falls back to ip for a VM that
        has not entered vm_run_slice yet. */
-    if (!vm->error_pc || !vm->chunk) return chunk_line_for_offset(vm->chunk, vm->ip);
+    if (!vm->error_pc || !vm->chunk)
+        return chunk_line_for_offset(vm->chunk, vm->ip);
     return chunk_line_for_offset(vm->chunk, (unsigned int)(vm->error_pc - vm->chunk->code));
 }
 
 static const char* lookup_runtime_filename(void) {
-    if (!active_vm_for_errors) return NULL;
+    if (!active_vm_for_errors)
+        return NULL;
     return active_vm_for_errors->chunk->source_filename;
 }
 
 static const char* lookup_runtime_function(void) {
-    if (!active_vm_for_errors) return NULL;
+    if (!active_vm_for_errors)
+        return NULL;
     VM* vm = active_vm_for_errors;
-    if (vm->call_depth == 0) return NULL;
+    if (vm->call_depth == 0)
+        return NULL;
     ChunkFunction* fn = chunk_find_function_by_offset(vm->chunk, vm->call_stack[vm->call_depth].code_offset);
     return fn ? aer_as_string(vm->chunk->pool[fn->name])->data : NULL;
 }
 
 static const char* tail_call_note(unsigned int collapsed, char* buf, size_t bufsize) {
-    if (collapsed == 0) return "";
+    if (collapsed == 0)
+        return "";
     snprintf(buf, bufsize, " (+%u tail call%s not shown)", collapsed, collapsed == 1 ? "" : "s");
     return buf;
 }
 
 static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size) {
-    if (!active_vm_for_errors) return 0;
+    if (!active_vm_for_errors)
+        return 0;
     VM* vm = active_vm_for_errors;
-    if (vm->call_depth == 0) return 0;
+    if (vm->call_depth == 0)
+        return 0;
     Chunk* c = vm->chunk;
     const unsigned int max_frames = 20;
     unsigned int pos = 0, shown = 0;
@@ -292,7 +317,8 @@ static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size)
     if (innermost_collapsed > 0) {
         int n = snprintf(out + pos, out_size - pos, "\n %s",
                          tail_call_note(innermost_collapsed, note_buf, sizeof(note_buf)));
-        if (n > 0 && (unsigned int)n < out_size - pos) pos += (unsigned int)n;
+        if (n > 0 && (unsigned int)n < out_size - pos)
+            pos += (unsigned int)n;
     }
 
     for (int depth = (int)vm->call_depth; depth >= 1 && shown < max_frames; depth--) {
@@ -311,14 +337,16 @@ static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size)
             const char* fname = fn ? aer_as_string(c->pool[fn->name])->data : "?";
             n = snprintf(out + pos, out_size - pos, "\n  called from line %u, in %s()%s", line, fname, note);
         }
-        if (n < 0 || (unsigned int)n >= out_size - pos) break;
+        if (n < 0 || (unsigned int)n >= out_size - pos)
+            break;
         pos += (unsigned int)n;
         shown++;
     }
     if (!hit_synthetic_boundary && shown < (unsigned int)vm->call_depth) {
         int n =
             snprintf(out + pos, out_size - pos, "\n  ... and %u more", (unsigned int)vm->call_depth - shown);
-        if (n > 0 && (unsigned int)n < out_size - pos) pos += (unsigned int)n;
+        if (n > 0 && (unsigned int)n < out_size - pos)
+            pos += (unsigned int)n;
     }
     return pos;
 }
@@ -384,7 +412,8 @@ AerVal aer_make_string_copy(const char* src, unsigned int length) {
    aer_io_register() more than once would silently grow host_functions[] on every import. */
 static bool io_registered = false;
 static void ensure_io_registered(void) {
-    if (io_registered) return;
+    if (io_registered)
+        return;
     aer_io_register();
     io_registered = true;
 }
@@ -479,7 +508,8 @@ void vm_free(VM* vm) {
     free(heap->gc_worklist.items);
     /* If this VM's heap was the active allocation target, it no longer exists -- leaving
        current_heap dangling would be a use-after-free the moment anything allocates next. */
-    if (current_heap == heap) current_heap = NULL;
+    if (current_heap == heap)
+        current_heap = NULL;
     *heap = (VmHeap){0};
 }
 
@@ -526,7 +556,8 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
 static const char* vm_type_name(Chunk* c, AerVal v) {
     static const char* type_names[] = {"null",   "boolean",  "integer", "float",
                                        "string", "function", "array",   "hashtable"};
-    if (aer_type(v) == TYPE_STRUCT) return aer_as_string(c->pool[aer_as_struct(v)->shape->name])->data;
+    if (aer_type(v) == TYPE_STRUCT)
+        return aer_as_string(c->pool[aer_as_struct(v)->shape->name])->data;
     if (aer_type(v) == TYPE_PACKED_ARRAY) {
         /* static buf is safe only because every caller consumes the result immediately. */
         AerPackedArray* pa = aer_as_packed_array(v);
@@ -540,7 +571,8 @@ static const char* vm_type_name(Chunk* c, AerVal v) {
         snprintf(buf, sizeof(buf), "%s[]", elem_names[aer_as_typed_array(v)->elem_kind]);
         return buf;
     }
-    if (aer_type(v) == TYPE_RESULT) return "Result";
+    if (aer_type(v) == TYPE_RESULT)
+        return "Result";
     return type_names[aer_type(v)];
 }
 
@@ -567,7 +599,8 @@ static inline __attribute__((always_inline)) bool vm_truthy(AerVal v) {
 }
 
 static inline __attribute__((always_inline)) AerVal vm_promote_real(AerVal v) {
-    if (aer_type(v) == TYPE_INTEGER) v = aer_real((double)aer_as_int(v));
+    if (aer_type(v) == TYPE_INTEGER)
+        v = aer_real((double)aer_as_int(v));
     return v;
 }
 
@@ -586,14 +619,16 @@ static inline int64_t aer_mod_int64(int64_t l, int64_t rv) {
         r = (int32_t)l % (int32_t)rv;
     else
         r = l % rv;
-    if (r != 0 && ((r < 0) != (rv < 0))) r += rv;
+    if (r != 0 && ((r < 0) != (rv < 0)))
+        r += rv;
     return r;
 }
 
 /* Same flooring for reals, so `%` means one thing regardless of operand type. */
 static inline double aer_mod_double(double l, double rv) {
     double r = fmod(l, rv);
-    if (r != 0.0 && ((r < 0.0) != (rv < 0.0))) r += rv;
+    if (r != 0.0 && ((r < 0.0) != (rv < 0.0)))
+        r += rv;
     return r;
 }
 
@@ -699,7 +734,8 @@ static AerVal vm_in(AerVal a, AerVal b) {
     if (aer_type(b) == TYPE_ARRAY) {
         AerArray* arr = aer_as_array(b);
         for (unsigned int i = 0; i < arr->count; i++) {
-            if (values_equal(a, arr->items[i])) return aer_bool(true);
+            if (values_equal(a, arr->items[i]))
+                return aer_bool(true);
         }
         return aer_bool(false);
     }
@@ -741,12 +777,15 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* ta, AerTypedArray* tb, Opc
 
 static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
     /* Checked before null-handling below so `null in arr` isn't intercepted by the "null op anything-else errors" rule, which is about direct comparison, not container search. */
-    if (op == OP_IN) return vm_in(a, b);
+    if (op == OP_IN)
+        return vm_in(a, b);
 
     /* null equality: null == null is true; null op anything-else errors */
     if (ta == TYPE_NULL || tb == TYPE_NULL) {
-        if (op == OP_EQ) return aer_bool(ta == TYPE_NULL && tb == TYPE_NULL);
-        if (op == OP_NEQ) return aer_bool(!(ta == TYPE_NULL && tb == TYPE_NULL));
+        if (op == OP_EQ)
+            return aer_bool(ta == TYPE_NULL && tb == TYPE_NULL);
+        if (op == OP_NEQ)
+            return aer_bool(!(ta == TYPE_NULL && tb == TYPE_NULL));
         error("Operator not valid for null");
         return aer_bool(false);
     }
@@ -786,8 +825,10 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
     }
 
     if (aer_type(a) == TYPE_BOOLEAN && aer_type(b) == TYPE_BOOLEAN) {
-        if (op == OP_EQ) return aer_bool(aer_as_bool(a) == aer_as_bool(b));
-        if (op == OP_NEQ) return aer_bool(aer_as_bool(a) != aer_as_bool(b));
+        if (op == OP_EQ)
+            return aer_bool(aer_as_bool(a) == aer_as_bool(b));
+        if (op == OP_NEQ)
+            return aer_bool(aer_as_bool(a) != aer_as_bool(b));
         error("Operator not valid for booleans");
         return aer_bool(false);
     }
@@ -796,8 +837,10 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
         AerString* as = aer_as_string(a);
         AerString* bs = aer_as_string(b);
         bool eq = as->length == bs->length && strncmp(as->data, bs->data, as->length) == 0;
-        if (op == OP_EQ) return aer_bool(eq);
-        if (op == OP_NEQ) return aer_bool(!eq);
+        if (op == OP_EQ)
+            return aer_bool(eq);
+        if (op == OP_NEQ)
+            return aer_bool(!eq);
         if (op == OP_ADD) {
             unsigned int len = as->length + bs->length;
             if (len <= AER_STRING_INLINE_MAX) {
@@ -830,8 +873,10 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
     }
 
     if (aer_type(a) == TYPE_ARRAY && aer_type(b) == TYPE_ARRAY) {
-        if (op == OP_EQ) return aer_bool(aer_as_array(a) == aer_as_array(b));
-        if (op == OP_NEQ) return aer_bool(aer_as_array(a) != aer_as_array(b));
+        if (op == OP_EQ)
+            return aer_bool(aer_as_array(a) == aer_as_array(b));
+        if (op == OP_NEQ)
+            return aer_bool(aer_as_array(a) != aer_as_array(b));
         error("Operator not valid for arrays");
         return aer_bool(false);
     }
@@ -839,23 +884,30 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
     if (aer_type(a) == TYPE_TYPED_ARRAY && aer_type(b) == TYPE_TYPED_ARRAY) {
         AerTypedArray* tta = aer_as_typed_array(a);
         AerTypedArray* ttb = aer_as_typed_array(b);
-        if (op == OP_EQ) return aer_bool(tta == ttb);
-        if (op == OP_NEQ) return aer_bool(tta != ttb);
-        if (op == OP_ADD || op == OP_SUB || op == OP_MUL) return vm_typed_array_binary_op(tta, ttb, op);
+        if (op == OP_EQ)
+            return aer_bool(tta == ttb);
+        if (op == OP_NEQ)
+            return aer_bool(tta != ttb);
+        if (op == OP_ADD || op == OP_SUB || op == OP_MUL)
+            return vm_typed_array_binary_op(tta, ttb, op);
         error("Operator not valid for typed arrays");
         return aer_bool(false);
     }
 
     if (aer_type(a) == TYPE_DICT && aer_type(b) == TYPE_DICT) {
-        if (op == OP_EQ) return aer_bool(aer_as_dict(a) == aer_as_dict(b));
-        if (op == OP_NEQ) return aer_bool(aer_as_dict(a) != aer_as_dict(b));
+        if (op == OP_EQ)
+            return aer_bool(aer_as_dict(a) == aer_as_dict(b));
+        if (op == OP_NEQ)
+            return aer_bool(aer_as_dict(a) != aer_as_dict(b));
         error("Operator not valid for dicts");
         return aer_bool(false);
     }
 
     if (aer_type(a) == TYPE_RESULT && aer_type(b) == TYPE_RESULT) {
-        if (op == OP_EQ) return aer_bool(aer_as_result(a) == aer_as_result(b));
-        if (op == OP_NEQ) return aer_bool(aer_as_result(a) != aer_as_result(b));
+        if (op == OP_EQ)
+            return aer_bool(aer_as_result(a) == aer_as_result(b));
+        if (op == OP_NEQ)
+            return aer_bool(aer_as_result(a) != aer_as_result(b));
         error("Operator not valid for Results");
         return aer_bool(false);
     }
@@ -869,7 +921,8 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
 /* ------------------------------------------------------------------ */
 
 static AerVal vm_to_str(VM* vm, AerVal v) {
-    if (aer_type(v) == TYPE_STRING) return v;
+    if (aer_type(v) == TYPE_STRING)
+        return v;
 
     char* owned;
     unsigned int len;
@@ -950,7 +1003,8 @@ static __attribute__((noinline)) bool vm_dict_get_interp(AerDict* d, const uint3
                 break;
             default: return false; /* a collection part needs vm_to_str, which allocates */
         }
-        if (at + piece_len > INTERP_KEY_MAX) return false;
+        if (at + piece_len > INTERP_KEY_MAX)
+            return false;
         memcpy(key + at, piece, piece_len);
         at += piece_len;
     }
@@ -1042,11 +1096,16 @@ static bool vm_slice_bounds(AerVal start_v, AerVal end_v, int64_t len, int64_t* 
     }
     int64_t start = (aer_type(start_v) == TYPE_NULL) ? 0 : aer_as_int(start_v);
     int64_t end = (aer_type(end_v) == TYPE_NULL) ? len : aer_as_int(end_v);
-    if (start < 0) start += len;
-    if (end < 0) end += len;
-    if (start < 0) start = 0;
-    if (end > len) end = len;
-    if (end < start) end = start;
+    if (start < 0)
+        start += len;
+    if (end < 0)
+        end += len;
+    if (start < 0)
+        start = 0;
+    if (end > len)
+        end = len;
+    if (end < start)
+        end = start;
     *out_start = start;
     *out_end = end;
     return true;
@@ -1401,7 +1460,8 @@ static inline __attribute__((always_inline)) unsigned char* vm_packed_raw_elem(A
         return NULL;
     }
     int64_t i = aer_as_int(*idx);
-    if (i < 0) i += (int64_t)pa->count;
+    if (i < 0)
+        i += (int64_t)pa->count;
     if (i < 0 || (uint64_t)i >= pa->count) {
         error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
         return NULL;
@@ -1664,7 +1724,6 @@ AerVal vm_struct_field_read(AerStruct* s, unsigned int slot) {
     return vm_packed_slot_read(p, ftype);
 }
 
-
 /* Natural literal shape, not exact-tag matching (unlike a typed struct field's OP_FIELD_SET) --
    `arr[i] = 5` into a float32 array shouldn't require writing `5.0`. int32/int64 variants still
    require TYPE_INTEGER; int32 additionally range-checks (erroring rather than silently wrapping,
@@ -1707,7 +1766,8 @@ static bool vm_typed_array_check(Chunk* c, TypedArrayElemKind kind, AerVal val) 
    already confirms val really is an integer whenever ftype/declared is TYPE_INTEGER, so this only
    needs to add the extra range check on top of that, not re-verify the type itself. */
 static bool vm_check_narrow_field_write(ValueType ftype, bool narrow, AerVal val) {
-    if (!narrow || ftype != TYPE_INTEGER) return true;
+    if (!narrow || ftype != TYPE_INTEGER)
+        return true;
     if (aer_as_int(val) < INT32_MIN || aer_as_int(val) > INT32_MAX) {
         error("Value %lld out of range for a narrow (int32) field", (long long)aer_as_int(val));
         return false;
@@ -1750,7 +1810,8 @@ static inline AerVal vm_struct_field_read_at(AerStruct* s, unsigned int offset, 
         memcpy(&v, p, sizeof(AerVal));
         return v;
     }
-    if (narrow) return vm_typed_elem_read(p, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32);
+    if (narrow)
+        return vm_typed_elem_read(p, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32);
     return vm_packed_slot_read(p, ftype);
 }
 
@@ -1776,7 +1837,8 @@ static inline void vm_struct_field_write_at(AerStruct* s, unsigned int offset, V
 /* ------------------------------------------------------------------ */
 
 static bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
-    if ((uint64_t)*idx >= d->map.count) return false;
+    if ((uint64_t)*idx >= d->map.count)
+        return false;
     unsigned int key_len = d->map.dense[*idx].length;
     *out_key = aer_make_string_copy(d->map.dense[*idx].key,
                                     key_len); /* no chunk_add_pool interning -- see vm_to_str's comment */
@@ -1848,7 +1910,8 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
 
     switch (builtin_id) {
         case CALL_BUILTIN_LENGTH: {
-            if (arg_count != 1) return false;
+            if (arg_count != 1)
+                return false;
             AerVal a = args[0];
             if (aer_type(a) == TYPE_ARRAY)
                 *out = aer_int((int64_t)aer_as_array(a)->count);
@@ -1865,13 +1928,15 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
             return true;
         }
         case CALL_BUILTIN_PRINT: {
-            if (arg_count != 1) return false;
+            if (arg_count != 1)
+                return false;
             vm_print_value(c, args[0], false);
             printf("\n");
             return true;
         }
         case CALL_BUILTIN_TYPE: {
-            if (arg_count != 1) return false;
+            if (arg_count != 1)
+                return false;
             const char* tn = vm_type_name(c, args[0]);
             /* Copies rather than pointing at a static literal or the chunk's pool data -- AerString always owns its data, no exceptions. */
             *out = aer_make_string_copy(
@@ -1879,7 +1944,8 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
             return true;
         }
         case CALL_BUILTIN_ASSERT: {
-            if (arg_count != 2) return false;
+            if (arg_count != 2)
+                return false;
             AerVal cond = args[0], msg = args[1];
             if (aer_type(msg) != TYPE_STRING) {
                 error("assert() requires a string message as its second argument");
@@ -1893,7 +1959,8 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
             return true;
         }
         case CALL_BUILTIN_PANIC: {
-            if (arg_count != 1) return false;
+            if (arg_count != 1)
+                return false;
             AerVal msg = args[0];
             if (aer_type(msg) != TYPE_STRING) {
                 error("panic() requires a string message");
@@ -1904,7 +1971,8 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
             return true;
         }
         case CALL_BUILTIN_RESULT: {
-            if (arg_count != 2) return false;
+            if (arg_count != 2)
+                return false;
             bool value_is_null = aer_type(args[0]) == TYPE_NULL;
             bool err_is_null = aer_type(args[1]) == TYPE_NULL;
             if (value_is_null == err_is_null) {
@@ -1937,7 +2005,8 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
             return;
         }
         int64_t i = aer_as_int(idx);
-        if (i < 0) i += (int64_t)a->count;
+        if (i < 0)
+            i += (int64_t)a->count;
         if (i < 0 || (uint64_t)i >= a->count) {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count);
             *out = aer_null();
@@ -1970,7 +2039,8 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         }
         int64_t i = aer_as_int(idx);
         int64_t len = (int64_t)os->length;
-        if (i < 0) i += len;
+        if (i < 0)
+            i += len;
         if (i < 0 || i >= len) {
             error("String index %lld out of bounds (len %lld)", (long long)aer_as_int(idx), (long long)len);
             *out = aer_null();
@@ -2008,7 +2078,8 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
             return;
         }
         int64_t i = aer_as_int(idx);
-        if (i < 0) i += (int64_t)ta->count;
+        if (i < 0)
+            i += (int64_t)ta->count;
         if (i < 0 || (uint64_t)i >= ta->count) {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), ta->count);
             *out = aer_null();
@@ -2074,7 +2145,8 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
             return;
         }
         int64_t i = aer_as_int(idx);
-        if (i < 0) i += (int64_t)a->count;
+        if (i < 0)
+            i += (int64_t)a->count;
         if (i < 0 || (uint64_t)i >= a->count) {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count);
             return;
@@ -2114,12 +2186,14 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
             return;
         }
         int64_t i = aer_as_int(idx);
-        if (i < 0) i += (int64_t)ta->count;
+        if (i < 0)
+            i += (int64_t)ta->count;
         if (i < 0 || (uint64_t)i >= ta->count) {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), ta->count);
             return;
         }
-        if (!vm_typed_array_check(vm->chunk, ta->elem_kind, val)) return;
+        if (!vm_typed_array_check(vm->chunk, ta->elem_kind, val))
+            return;
         unsigned int width = vm_typed_elem_width(ta->elem_kind);
         vm_typed_elem_write(ta->data + (size_t)i * width, ta->elem_kind, val);
     } else {
@@ -2204,7 +2278,8 @@ static AerVal vm_cast(AerVal v, int cast_type) {
 /* Grows debug_hits to cover c->code, zero-filling the new region; a no-op once already covered
    (REPL appends code across calls). */
 static void chunk_ensure_debug_hits(Chunk* c) {
-    if (c->count <= c->debug_hits_cap) return;
+    if (c->count <= c->debug_hits_cap)
+        return;
     unsigned int old_cap = c->debug_hits_cap;
     c->debug_hits_cap = c->count;
     c->debug_hits = xrealloc(c->debug_hits, sizeof(uint64_t) * c->debug_hits_cap);
@@ -2214,7 +2289,8 @@ static void chunk_ensure_debug_hits(Chunk* c) {
 
 /* Same growth idiom as chunk_ensure_debug_hits, but always-on (a real perf feature, not debug). */
 static void chunk_ensure_field_cache(Chunk* c) {
-    if (c->count <= c->field_cache_cap) return;
+    if (c->count <= c->field_cache_cap)
+        return;
     unsigned int old_cap = c->field_cache_cap;
     c->field_cache_cap = c->count;
     c->field_cache = xrealloc(c->field_cache, sizeof(FieldCacheEntry) * c->field_cache_cap);
@@ -2224,9 +2300,11 @@ static void chunk_ensure_field_cache(Chunk* c) {
 /* Resolves a struct name to its Shape, memoised on the name's pool index -- see Chunk.shape_by_name.
    A miss falls through to the same newest-first scan as before, so a redeclared struct still wins. */
 static Shape* chunk_shape_for_pool_idx(Chunk* c, unsigned int pool_idx) {
-    if (pool_idx < c->shape_by_name_cap && c->shape_by_name[pool_idx]) return c->shape_by_name[pool_idx];
+    if (pool_idx < c->shape_by_name_cap && c->shape_by_name[pool_idx])
+        return c->shape_by_name[pool_idx];
     Shape* s = chunk_find_shape(c, aer_as_string(c->pool[pool_idx])->data);
-    if (!s) return NULL;
+    if (!s)
+        return NULL;
     if (pool_idx >= c->shape_by_name_cap) {
         unsigned int old = c->shape_by_name_cap;
         c->shape_by_name_cap = c->pool_count > pool_idx + 1 ? c->pool_count : pool_idx + 1;
@@ -2239,7 +2317,8 @@ static Shape* chunk_shape_for_pool_idx(Chunk* c, unsigned int pool_idx) {
 
 /* Same idiom, for lbl_call's shape-specialization per-site dispatch cache (see its own comment). */
 static void chunk_ensure_call_spec_cache(Chunk* c) {
-    if (c->count <= c->call_spec_cache_cap) return;
+    if (c->count <= c->call_spec_cache_cap)
+        return;
     unsigned int old_cap = c->call_spec_cache_cap;
     c->call_spec_cache_cap = c->count;
     c->call_spec_cache = xrealloc(c->call_spec_cache, sizeof(CallSpecCacheEntry) * c->call_spec_cache_cap);
@@ -2253,7 +2332,8 @@ static inline void vm_bind_raw_params(const SpecEntry* e, AerVal* registers, int
                                       int64_t* callee_raw_ints, double* callee_raw_reals) {
     for (int k = 0; k < e->raw_param_count; k++) {
         int slot = e->raw_param_slots[k];
-        if (slot < 0) continue; /* budget ran out for this one -- it stayed boxed */
+        if (slot < 0)
+            continue; /* budget ran out for this one -- it stayed boxed */
         AerVal v = registers[arg_reg_base + e->raw_param_regs[k]];
         if (e->raw_param_types[k] == TYPE_INTEGER)
             callee_raw_ints[slot] = v.as.i;
@@ -2266,13 +2346,10 @@ static inline void vm_bind_raw_params(const SpecEntry* e, AerVal* registers, int
    by far the largest handler in vm_run_slice, next-largest under 40 -- so every ordinary call paid
    its icache cost without executing it. noinline is required: a static function with one call site
    is a prime candidate for LTO to inline right back in. */
-static void __attribute__((noinline))
-vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* registers,
-                                    int arg_reg_base, unsigned int ip, unsigned int* chosen_offset,
-                                    unsigned int* chosen_max_registers,
-                                    unsigned int* chosen_max_raw_ints,
-                                    unsigned int* chosen_max_raw_reals, int64_t* callee_raw_ints,
-                                    double* callee_raw_reals) {
+static void __attribute__((noinline)) vm_call_resolve_specialization_full(
+    Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base, unsigned int ip,
+    unsigned int* chosen_offset, unsigned int* chosen_max_registers, unsigned int* chosen_max_raw_ints,
+    unsigned int* chosen_max_raw_reals, int64_t* callee_raw_ints, double* callee_raw_reals) {
     unsigned int site =
         ip - 3; /* this instruction's own word0 offset -- ip already advanced past all 3 words by now */
     /* Lowest set bit -- which argument register carries the shape-sensitive parameter. Only
@@ -2402,7 +2479,8 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
             ValueType cand_types[SPEC_MAX_RAW_PARAMS];
             int cand_count = 0;
             for (unsigned int pi = 0; pi < target_f->arity && cand_count < SPEC_MAX_RAW_PARAMS; pi++) {
-                if ((int)pi == param_index) continue;
+                if ((int)pi == param_index)
+                    continue;
                 AerVal pv = registers[arg_reg_base + pi];
                 ValueType pt = aer_type(pv);
                 if (pt != TYPE_INTEGER && pt != TYPE_REAL) {
@@ -2460,8 +2538,7 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                         *chosen_max_registers = entry->raw_variant_max_registers;
                         *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
                         *chosen_max_raw_reals = entry->raw_variant_max_raw_reals;
-                        vm_bind_raw_params(entry, registers, arg_reg_base, callee_raw_ints,
-                                           callee_raw_reals);
+                        vm_bind_raw_params(entry, registers, arg_reg_base, callee_raw_ints, callee_raw_reals);
                     } else {
                         entry->raw_param_count = -1;
                     }
@@ -2492,16 +2569,20 @@ vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, in
        and bailing on it left the scalar boxed through the whole body. */
     for (unsigned int pi = 0; pi < target_f->arity && cand_count < SPEC_MAX_RAW_PARAMS; pi++) {
         ValueType pt = aer_type(registers[arg_reg_base + pi]);
-        if (pt != TYPE_INTEGER && pt != TYPE_REAL) continue;
+        if (pt != TYPE_INTEGER && pt != TYPE_REAL)
+            continue;
         cand_regs[cand_count] = (int)pi;
         cand_types[cand_count] = pt;
         cand_count++;
     }
-    if (cand_count == 0) return;
+    if (cand_count == 0)
+        return;
 
-    if (!target_f->specializations) target_f->specializations = xcalloc(SPEC_MAX, sizeof(SpecEntry));
+    if (!target_f->specializations)
+        target_f->specializations = xcalloc(SPEC_MAX, sizeof(SpecEntry));
     SpecEntry* entry = &target_f->specializations[0];
-    if (entry->raw_param_count < 0) return; /* permanently declined for this function */
+    if (entry->raw_param_count < 0)
+        return; /* permanently declined for this function */
 
     if (entry->raw_param_count == cand_count) {
         for (int k = 0; k < cand_count; k++)
@@ -2514,14 +2595,16 @@ vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, in
         vm_bind_raw_params(entry, registers, arg_reg_base, callee_raw_ints, callee_raw_reals);
         return;
     }
-    if (entry->raw_param_count != 0) return;
+    if (entry->raw_param_count != 0)
+        return;
     /* Warm up first -- see numeric_call_count (vm.h). Counted here rather than in lbl_call so an
        ordinary call pays nothing for it. */
-    if (++target_f->numeric_call_count < NUMERIC_SPECIALIZE_AFTER) return;
+    if (++target_f->numeric_call_count < NUMERIC_SPECIALIZE_AFTER)
+        return;
 
     SpecEntry variant;
-    if (!parser_specialize_function(c, target_f, NULL, SPEC_KIND_STRUCT, -1, &variant, cand_regs,
-                                    cand_types, cand_count)) {
+    if (!parser_specialize_function(c, target_f, NULL, SPEC_KIND_STRUCT, -1, &variant, cand_regs, cand_types,
+                                    cand_count)) {
         entry->raw_param_count = -1;
         return;
     }
@@ -2539,7 +2622,8 @@ vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, in
         entry->raw_param_types[k] = cand_types[k];
     }
     entry->raw_param_count = cand_count;
-    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++) entry->raw_param_slots[k] = variant.raw_param_slots[k];
+    for (int k = 0; k < SPEC_MAX_RAW_PARAMS; k++)
+        entry->raw_param_slots[k] = variant.raw_param_slots[k];
     *chosen_offset = entry->raw_variant_code_offset;
     *chosen_max_registers = entry->raw_variant_max_registers;
     *chosen_max_raw_ints = entry->raw_variant_max_raw_ints;
@@ -2552,16 +2636,13 @@ vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f, AerVal* registers, in
    both on every call regardless of which path runs. Split here rather than at the call site because
    growing lbl_call reshuffles register allocation across all 153 label bodies -- measured at +6.93%
    cycles on nbody, whose lbl_call is cold, for a call-site version of exactly this test. */
-static void __attribute__((noinline))
-vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
-                               unsigned int ip, unsigned int* chosen_offset,
-                               unsigned int* chosen_max_registers, unsigned int* chosen_max_raw_ints,
-                               unsigned int* chosen_max_raw_reals, int64_t* callee_raw_ints,
-                               double* callee_raw_reals) {
+static void __attribute__((noinline)) vm_call_resolve_specialization(
+    Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base, unsigned int ip,
+    unsigned int* chosen_offset, unsigned int* chosen_max_registers, unsigned int* chosen_max_raw_ints,
+    unsigned int* chosen_max_raw_reals, int64_t* callee_raw_ints, double* callee_raw_reals) {
     if (target_f->shape_sensitive_mask == SHAPE_MASK_NUMERIC_ONLY) {
         vm_call_resolve_numeric(c, target_f, registers, arg_reg_base, chosen_offset, chosen_max_registers,
-                                chosen_max_raw_ints, chosen_max_raw_reals, callee_raw_ints,
-                                callee_raw_reals);
+                                chosen_max_raw_ints, chosen_max_raw_reals, callee_raw_ints, callee_raw_reals);
         return;
     }
     unsigned int site = ip - 3;
@@ -2706,7 +2787,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         current_heap = saved_current_heap;                                                                   \
         return (result);                                                                                     \
     } while (0)
-    if (AER_SETJMP(catch_point) != 0) SLICE_RETURN(VM_SLICE_ERROR);
+    if (AER_SETJMP(catch_point) != 0)
+        SLICE_RETURN(VM_SLICE_ERROR);
     Opcode cur_op;
     /* word0 -- opcode(8) plus up to 3 narrow packed fields (PACK3) or one 16-bit field
        (PACK_OP_A_W16), depending on cur_op's own fixed shape. Must survive past DISPATCH()'s own
@@ -2966,14 +3048,12 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED] = &&lbl_index_field_compound_raw_int32_unchecked,
         [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED] = &&lbl_index_field_compound_raw_float32_unchecked,
 
-
         [OP_EQ_JUMP_IF_FALSE] = &&lbl_eq_jump_if_false,
         [OP_NEQ_JUMP_IF_FALSE] = &&lbl_neq_jump_if_false,
         [OP_LT_JUMP_IF_FALSE] = &&lbl_lt_jump_if_false,
         [OP_GT_JUMP_IF_FALSE] = &&lbl_gt_jump_if_false,
         [OP_LTE_JUMP_IF_FALSE] = &&lbl_lte_jump_if_false,
         [OP_GTE_JUMP_IF_FALSE] = &&lbl_gte_jump_if_false,
-
 
         [OP_RAW_LT_INT_JUMP_IF_FALSE] = &&lbl_raw_lt_int_jump_if_false,
         [OP_RAW_LTE_INT_JUMP_IF_FALSE] = &&lbl_raw_lte_int_jump_if_false,
@@ -3015,7 +3095,7 @@ shared_dispatch:
     goto* DT_AT(cur_op);
 #endif
 
-lbl_jump : {
+lbl_jump: {
     int target = READ();
     pc += (int32_t)target;
     /* Every loop's back-edge (while/for/plain jump alike) goes through here -- the one checkpoint
@@ -3028,7 +3108,7 @@ lbl_jump : {
     DISPATCH();
 }
 
-lbl_define_struct : {
+lbl_define_struct: {
     int name_idx = (int)UNPACK_STRUCT_HEADER_NAME(op_word);
     int field_count = (int)UNPACK_STRUCT_HEADER_COUNT(op_word);
     Shape* shape = xmalloc(sizeof(Shape));
@@ -3061,27 +3141,28 @@ lbl_define_struct : {
     }
     c->shapes[c->shape_count++] = shape;
     /* A redeclare must not keep resolving to the Shape it shadows -- see Chunk.shape_by_name. */
-    if (c->shape_by_name) memset(c->shape_by_name, 0, sizeof(Shape*) * c->shape_by_name_cap);
+    if (c->shape_by_name)
+        memset(c->shape_by_name, 0, sizeof(Shape*) * c->shape_by_name_cap);
     DISPATCH();
 }
 
 /* dest+pool_idx both fit in word0 now (op(8)+dest(8)+pool_idx(16)) -- no trailing word needed,
    down from the original design's 2-word form. */
-lbl_loadk : {
+lbl_loadk: {
     int dest = (int)UNPACK_A(op_word);
     unsigned int pool_idx = UNPACK_W16(op_word);
     registers[dest] = c->pool[pool_idx];
     DISPATCH();
 }
 
-lbl_move : {
+lbl_move: {
     int dest = (int)UNPACK_A(op_word);
     int src = (int)UNPACK_B(op_word);
     registers[dest] = registers[src];
     DISPATCH();
 }
 
-lbl_is_result : {
+lbl_is_result: {
     int dest = (int)UNPACK_A(op_word);
     int src = (int)UNPACK_B(op_word);
     registers[dest] = aer_bool(aer_type(registers[src]) == TYPE_RESULT);
@@ -3133,12 +3214,9 @@ lbl_is_result : {
         DISPATCH();                                                                                          \
     }
 
-    BINARY_OP_INT_REAL(
-        add, OP_ADD, { *result = aer_int(l + rv); }, { *result = aer_real(l + rv); })
-    BINARY_OP_INT_REAL(
-        sub, OP_SUB, { *result = aer_int(l - rv); }, { *result = aer_real(l - rv); })
-    BINARY_OP_INT_REAL(
-        mul, OP_MUL, { *result = aer_int(l * rv); }, { *result = aer_real(l * rv); })
+    BINARY_OP_INT_REAL(add, OP_ADD, { *result = aer_int(l + rv); }, { *result = aer_real(l + rv); })
+    BINARY_OP_INT_REAL(sub, OP_SUB, { *result = aer_int(l - rv); }, { *result = aer_real(l - rv); })
+    BINARY_OP_INT_REAL(mul, OP_MUL, { *result = aer_int(l * rv); }, { *result = aer_real(l * rv); })
     BINARY_OP_INT_REAL(
         div, OP_DIV,
         {
@@ -3186,18 +3264,12 @@ lbl_is_result : {
             }
         },
         { *result = aer_real(aer_mod_double(l, rv)); })
-    BINARY_OP_INT_REAL(
-        eq, OP_EQ, { *result = aer_bool(l == rv); }, { *result = aer_bool(l == rv); })
-    BINARY_OP_INT_REAL(
-        neq, OP_NEQ, { *result = aer_bool(l != rv); }, { *result = aer_bool(l != rv); })
-    BINARY_OP_INT_REAL(
-        lt, OP_LT, { *result = aer_bool(l < rv); }, { *result = aer_bool(l < rv); })
-    BINARY_OP_INT_REAL(
-        gt, OP_GT, { *result = aer_bool(l > rv); }, { *result = aer_bool(l > rv); })
-    BINARY_OP_INT_REAL(
-        lte, OP_LTE, { *result = aer_bool(l <= rv); }, { *result = aer_bool(l <= rv); })
-    BINARY_OP_INT_REAL(
-        gte, OP_GTE, { *result = aer_bool(l >= rv); }, { *result = aer_bool(l >= rv); })
+    BINARY_OP_INT_REAL(eq, OP_EQ, { *result = aer_bool(l == rv); }, { *result = aer_bool(l == rv); })
+    BINARY_OP_INT_REAL(neq, OP_NEQ, { *result = aer_bool(l != rv); }, { *result = aer_bool(l != rv); })
+    BINARY_OP_INT_REAL(lt, OP_LT, { *result = aer_bool(l < rv); }, { *result = aer_bool(l < rv); })
+    BINARY_OP_INT_REAL(gt, OP_GT, { *result = aer_bool(l > rv); }, { *result = aer_bool(l > rv); })
+    BINARY_OP_INT_REAL(lte, OP_LTE, { *result = aer_bool(l <= rv); }, { *result = aer_bool(l <= rv); })
+    BINARY_OP_INT_REAL(gte, OP_GTE, { *result = aer_bool(l >= rv); }, { *result = aer_bool(l >= rv); })
     BINARY_OP_INT_ONLY(bitwise_and, OP_BITWISE_AND, { *result = aer_int(l & rv); })
     BINARY_OP_INT_ONLY(bitwise_or, OP_BITWISE_OR, { *result = aer_int(l | rv); })
     BINARY_OP_INT_ONLY(bitwise_xor, OP_BITWISE_XOR, { *result = aer_int(l ^ rv); })
@@ -3229,7 +3301,8 @@ lbl_is_result : {
         } else {                                                                                             \
             cond = vm_truthy(vm_binary_cold(c, *ra, *rb, OPENUM, ta, tb));                                   \
         }                                                                                                    \
-        if (!cond) pc += (int32_t)target;                                                                    \
+        if (!cond)                                                                                           \
+            pc += (int32_t)target;                                                                           \
         DISPATCH();                                                                                          \
     }
 
@@ -3242,7 +3315,7 @@ lbl_is_result : {
 #undef CMP_JUMP_IF_FALSE
 
 /* No int/int or real/real fast path -- dispatches straight to the shared vm_in(). */
-lbl_in : {
+lbl_in: {
     int dest = (int)UNPACK_A(op_word);
     AerVal a = *vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
     AerVal b = *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
@@ -3251,16 +3324,17 @@ lbl_in : {
 }
 
 /* Control flow -- stack-neutral, reads only registers[]/the pool. */
-lbl_jump_if_false_reg : {
+lbl_jump_if_false_reg: {
     int reg = (int)UNPACK_A(op_word);
     int target = READ();
-    if (!vm_truthy(registers[reg])) pc += (int32_t)target;
+    if (!vm_truthy(registers[reg]))
+        pc += (int32_t)target;
     DISPATCH();
 }
 
 /* Bulk-copies args from the caller's bank into the new frame's bank at register 0; overflow
    check mirrors vm_setup_call's own ceiling. */
-lbl_call : {
+lbl_call: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
@@ -3356,7 +3430,7 @@ lbl_call : {
    so every ordinary call tested `cur_op == OP_TAIL_CALL` and carried this body in its live range --
    35.5M ordinary calls across the benchmark suite against zero tail calls. Reuses the current frame
    instead of pushing, so it needs none of lbl_call's sizing or base-pointer work. */
-lbl_tail_call : {
+lbl_tail_call: {
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
     int callee_offset = READ();
@@ -3390,7 +3464,7 @@ lbl_tail_call : {
 /* Same frame-push shape as lbl_call, but the target is a runtime AerFunction read from a register.
    3 registers fit word0 (PACK3); callee_reg is the 4th and gets its own trailing word (no room
    left in a 32-bit word0 for a 4th 8-bit field alongside the opcode). */
-lbl_call_value : {
+lbl_call_value: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
@@ -3410,7 +3484,7 @@ lbl_call_value : {
 
 /* return_ip/dest_reg live in the callee's own frame, not a shared global -- what makes
    nested/recursive calls safe. */
-lbl_return : {
+lbl_return: {
     int src_reg = (int)UNPACK_A(op_word);
     CallFrame* callee = &vm->call_stack[vm->call_depth];
 
@@ -3445,7 +3519,7 @@ lbl_return : {
 
 /* The raw counterparts. Boxing here (dest_raw_kind == 0) is the ordinary case for a variant body
    entered from a plain call site, not a fallback. */
-lbl_return_raw_int : {
+lbl_return_raw_int: {
     int src = (int)UNPACK_A(op_word);
     CallFrame* callee = &vm->call_stack[vm->call_depth];
     int64_t result = callee->raw_ints[src];
@@ -3467,7 +3541,7 @@ lbl_return_raw_int : {
     DISPATCH();
 }
 
-lbl_return_raw_real : {
+lbl_return_raw_real: {
     int src = (int)UNPACK_A(op_word);
     CallFrame* callee = &vm->call_stack[vm->call_depth];
     double result = callee->raw_reals[src];
@@ -3491,7 +3565,7 @@ lbl_return_raw_real : {
 
 /* On a domain error aer_math_unary_raw has already raised it and longjmped, so the store is only
    reached with a real result. */
-lbl_raw_math_real : {
+lbl_raw_math_real: {
     int dest = (int)UNPACK_A(op_word);
     double x = raw_reals[UNPACK_B(op_word)];
     /* sqrt is one machine instruction and the overwhelming majority of the traffic. Calling out for
@@ -3505,7 +3579,8 @@ lbl_raw_math_real : {
     }
     double out;
     SYNC_IP();
-    if (aer_math_unary_raw((int)UNPACK_C(op_word), x, &out)) raw_reals[dest] = out;
+    if (aer_math_unary_raw((int)UNPACK_C(op_word), x, &out))
+        raw_reals[dest] = out;
     DISPATCH();
 }
 
@@ -3515,7 +3590,7 @@ lbl_raw_math_real : {
    frame this handler touches anyway. Taking them from there costs no resolver, no walk to the
    SpecEntry, and no room in the instruction for the callee's identity. Registers are still cleared:
    a variant body may use boxed ones, and mark_vm_roots traces every one below frame_size. */
-#define CALL_RAW(kindname, bank)                                                                    \
+#define CALL_RAW(kindname, bank)                                                                             \
     lbl_call_raw_##kindname : {                                                                              \
         int dest_slot = (int)UNPACK_A(op_word);                                                              \
         int arg_slot_base = (int)UNPACK_B(op_word);                                                          \
@@ -3559,7 +3634,7 @@ lbl_raw_math_real : {
 #undef CALL_RAW
 
 /* Bridges to the same stack-based stdlib dispatch lbl_call_module uses. */
-lbl_call_module : {
+lbl_call_module: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
@@ -3580,7 +3655,7 @@ lbl_call_module : {
 }
 
 /* vm_call_builtin takes a plain AerVal* array -- no push/pop bridge needed. */
-lbl_call_builtin : {
+lbl_call_builtin: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
@@ -3605,7 +3680,7 @@ lbl_call_builtin : {
 
 /* Builds an array from an in-order register range -- mark_vm_roots's registers scan keeps the
    result alive across GC. */
-lbl_array_new : {
+lbl_array_new: {
     int dest_reg = (int)UNPACK_A(op_word);
     int item_reg_base = (int)UNPACK_B(op_word);
     int item_count = (int)UNPACK_C(op_word);
@@ -3628,7 +3703,7 @@ lbl_array_new : {
 }
 
 /* Already type-generic (array/dict/string) with all bounds/negative-index logic. */
-lbl_index_get : {
+lbl_index_get: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
@@ -3636,13 +3711,14 @@ lbl_index_get : {
     vm_index_get_compute(obj, *idx, &registers[dest_reg]);
     /* Only single-char string indexing allocates -- array/dict indexing never touches the heap, so
        skip the check for the dominant common case. */
-    if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);
+    if (aer_type(obj) == TYPE_STRING)
+        gc_maybe_collect(vm);
     DISPATCH();
 }
 
 /* a, b = expr -- see vm_destructure_compute. Never allocates, unlike lbl_index_get, so no
    gc_maybe_collect needed. */
-lbl_destructure : {
+lbl_destructure: {
     int t0 = (int)UNPACK_A(op_word);
     int t1 = (int)UNPACK_B(op_word);
     int src_reg = (int)UNPACK_C(op_word);
@@ -3651,7 +3727,7 @@ lbl_destructure : {
 }
 
 /* Includes the internal write barrier, now exercised against a register-held reference. */
-lbl_index_set : {
+lbl_index_set: {
     int arr_reg = (int)UNPACK_A(op_word);
     AerVal idx = *vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
     AerVal val = *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
@@ -3664,7 +3740,7 @@ lbl_index_set : {
    TYPE_TYPED_ARRAY check below is not a defensive net -- it is the only thing deciding whether the
    fast path applies. A miss must fall through to the fully generic behavior for any other
    container, not error: the parser's loop-safety proof knows nothing about container type. */
-lbl_typed_index_get_unchecked : {
+lbl_typed_index_get_unchecked: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
@@ -3682,7 +3758,7 @@ lbl_typed_index_get_unchecked : {
     DISPATCH();
 }
 
-lbl_typed_index_set_unchecked : {
+lbl_typed_index_set_unchecked: {
     int arr_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
     AerVal* val = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
@@ -3694,7 +3770,8 @@ lbl_typed_index_set_unchecked : {
     AerTypedArray* ta = aer_as_typed_array(obj);
     /* Value-type/range validation is a separate concern from index safety and is NOT skipped --
        see vm_typed_array_check's own contract (vm_typed_elem_write's comment above). */
-    if (!vm_typed_array_check(c, ta->elem_kind, *val)) DISPATCH();
+    if (!vm_typed_array_check(c, ta->elem_kind, *val))
+        DISPATCH();
     int64_t i = aer_as_int(*idx);
     unsigned int width = vm_typed_elem_width(ta->elem_kind);
     vm_typed_elem_write(ta->data + (size_t)i * width, ta->elem_kind, *val);
@@ -3705,7 +3782,7 @@ lbl_typed_index_set_unchecked : {
    stay correct on any value -- a plain array of reals, a string index, a dict -- and only the
    typed-array case skips the AerVal entirely. A non-numeric result is the same error the raw
    arithmetic that consumes this slot would have raised one opcode later. */
-lbl_index_set_raw_int : {
+lbl_index_set_raw_int: {
     AerVal obj = registers[(int)UNPACK_A(op_word)];
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
     int64_t v = raw_ints[UNPACK_C(op_word)];
@@ -3727,7 +3804,7 @@ lbl_index_set_raw_int : {
     DISPATCH();
 }
 
-lbl_index_set_raw_real : {
+lbl_index_set_raw_real: {
     AerVal obj = registers[(int)UNPACK_A(op_word)];
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
     double v = raw_reals[UNPACK_C(op_word)];
@@ -3749,7 +3826,7 @@ lbl_index_set_raw_real : {
     DISPATCH();
 }
 
-lbl_index_get_raw_int : {
+lbl_index_get_raw_int: {
     int dest = (int)UNPACK_A(op_word);
     AerVal obj = registers[(int)UNPACK_B(op_word)];
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
@@ -3768,11 +3845,12 @@ lbl_index_get_raw_int : {
         raw_ints[dest] = v.as.i;
     else
         error("Expected an integer from this index, got %s", vm_type_name(c, v));
-    if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);
+    if (aer_type(obj) == TYPE_STRING)
+        gc_maybe_collect(vm);
     DISPATCH();
 }
 
-lbl_index_get_raw_real : {
+lbl_index_get_raw_real: {
     int dest = (int)UNPACK_A(op_word);
     AerVal obj = registers[(int)UNPACK_B(op_word)];
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
@@ -3793,12 +3871,13 @@ lbl_index_get_raw_real : {
         raw_reals[dest] = (double)v.as.i;
     else
         error("Expected a number from this index, got %s", vm_type_name(c, v));
-    if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm);
+    if (aer_type(obj) == TYPE_STRING)
+        gc_maybe_collect(vm);
     DISPATCH();
 }
 
 /* `arr[a:b]` -- vm_slice_bounds() resolves/clamps the bounds; a slice is always a fresh copy. */
-lbl_slice_get : {
+lbl_slice_get: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
     uint32_t bounds_word = READ();
@@ -3853,7 +3932,7 @@ lbl_slice_get : {
 
 /* Errors unless src_reg holds exactly that struct type; never converts. */
 /* Dict literal -- each key stored as an owned copy, never an alias into the source string. */
-lbl_dict_new : {
+lbl_dict_new: {
     int dest_reg = (int)UNPACK_A(op_word);
     int pair_reg_base = (int)UNPACK_B(op_word);
     int pair_count = (int)UNPACK_C(op_word);
@@ -3865,7 +3944,8 @@ lbl_dict_new : {
     d->dirty_min_byte = (unsigned int)-1;
     d->dirty_max_byte = 0;
     d->dirty_all = false;
-    if (pair_count > 0) hashtable_reserve(&d->map, (unsigned int)pair_count);
+    if (pair_count > 0)
+        hashtable_reserve(&d->map, (unsigned int)pair_count);
     for (int i = 0; i < pair_count; i++) {
         AerVal key = registers[pair_reg_base + 2 * i];
         AerVal val = registers[pair_reg_base + 2 * i + 1];
@@ -3885,7 +3965,7 @@ lbl_dict_new : {
 }
 
 /* Arrays yield items, dicts yield keys, strings yield 1-char strings. */
-lbl_iter_next_array : {
+lbl_iter_next_array: {
     int col_reg = (int)UNPACK_A(op_word);
     int idx_reg = (int)UNPACK_B(op_word);
     int item_dest_reg = (int)UNPACK_C(op_word);
@@ -3946,7 +4026,7 @@ lbl_iter_next_array : {
 }
 
 /* `for k, v in dict:` -- see vm_dict_next_key (above) for the shared bucket-scan/copy-key logic. */
-lbl_iter_next_pair : {
+lbl_iter_next_pair: {
     int col_reg = (int)UNPACK_A(op_word);
     int idx_reg = (int)UNPACK_B(op_word);
     int key_dest_reg = (int)UNPACK_C(op_word);
@@ -3974,7 +4054,7 @@ lbl_iter_next_pair : {
 
 /* Runs once before the loop -- same checks as OP_ITER_RANGE_LOOP below, but never advances
    cur_reg (nothing to prepare yet). */
-lbl_iter_range_prep : {
+lbl_iter_range_prep: {
     int cur_reg = (int)UNPACK_A(op_word);
     int end_reg = (int)UNPACK_B(op_word);
     int step_reg = (int)UNPACK_C(op_word);
@@ -4041,7 +4121,7 @@ lbl_iter_range_prep : {
    cur/remaining/step are written value-only -- PREP validated all three as integers and they are
    loop-owned snapshots, so nothing can have retagged them. body_target is always a resolved
    address, never a patch placeholder. No gc_maybe_collect -- nothing here allocates. */
-lbl_iter_range_loop : {
+lbl_iter_range_loop: {
     int cur_reg = (int)UNPACK_A(op_word);
     int remaining_reg = (int)UNPACK_B(op_word);
     int signed_step_reg = (int)UNPACK_C(op_word);
@@ -4056,7 +4136,8 @@ lbl_iter_range_loop : {
     registers[remaining_reg].as.i = remaining - 1;
     /* Equal when the parser proved this loop's body never writes the loop variable, so cur_reg IS
        item_dest_reg and the store above already published this iteration's value. */
-    if (cur_reg != item_dest_reg) registers[item_dest_reg] = aer_int(new_cur);
+    if (cur_reg != item_dest_reg)
+        registers[item_dest_reg] = aer_int(new_cur);
     pc += (int32_t)body_target;
     /* range-for's own dedicated back-edge -- lbl_jump's check doesn't cover this loop shape since
        it never goes through a plain OP_JUMP. */
@@ -4069,7 +4150,7 @@ lbl_iter_range_loop : {
 
 /* chunk_find_shape() by name, arity check, one struct_pools[] allocation (sized to the tier this
    shape's instance_bytes fits), trailing fields default-filled. */
-lbl_struct_new : {
+lbl_struct_new: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
@@ -4105,11 +4186,11 @@ lbl_struct_new : {
        per field through a non-inlinable external call, and this loop runs for every field of every
        construction -- 8.19% of bench/binary_trees.aer sat in it. */
     for (unsigned int i = 0; i < (unsigned int)arg_count; i++)
-        vm_struct_field_write_at(s, shape->field_offsets[i], shape->field_types[i],
-                                 shape->field_narrow[i], registers[arg_reg_base + i]);
+        vm_struct_field_write_at(s, shape->field_offsets[i], shape->field_types[i], shape->field_narrow[i],
+                                 registers[arg_reg_base + i]);
     for (unsigned int i = (unsigned int)arg_count; i < shape->field_count; i++)
-        vm_struct_field_write_at(s, shape->field_offsets[i], shape->field_types[i],
-                                 shape->field_narrow[i], vm_default_value(vm, shape->field_defaults[i]));
+        vm_struct_field_write_at(s, shape->field_offsets[i], shape->field_types[i], shape->field_narrow[i],
+                                 vm_default_value(vm, shape->field_defaults[i]));
     registers[dest_reg] = aer_struct_val(s);
     gc_maybe_collect(
         vm); /* pool_alloc(&struct_pools[tier]) above, plus any vm_default_value array/dict defaults -- all rooted now that the struct itself is stored */
@@ -4117,7 +4198,7 @@ lbl_struct_new : {
 }
 
 /* Reads struct_reg from a register instead of popping the stack. */
-lbl_field_get : {
+lbl_field_get: {
     unsigned int site = (unsigned int)(pc - code) - 1;
     int dest_reg = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
@@ -4137,7 +4218,7 @@ lbl_field_get : {
    opcode's own `field OP' x` form at compile time instead (see that function's own comment, and
    OP_FIELD_BINARY's, vm.h, for why that's exact, not an approximation, for every operator that
    reaches here). */
-lbl_field_binary : {
+lbl_field_binary: {
     unsigned int site = (unsigned int)(pc - code) - 1;
     int dest_reg = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
@@ -4166,7 +4247,7 @@ lbl_field_binary : {
 /* `struct.field OP= rhs` -- resolves the field exactly ONCE (one vm_resolve_field/cache lookup),
    reads it, computes, type-checks, and writes back, instead of the two full field resolutions
    (OP_FIELD_BINARY's read + a separate OP_FIELD_SET's write) this used to compile to. */
-lbl_field_compound : {
+lbl_field_compound: {
     unsigned int site = (unsigned int)(pc - code) - 1;
     int struct_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
@@ -4194,7 +4275,8 @@ lbl_field_compound : {
               aer_as_string(c->pool[field_idx])->data);
         DISPATCH();
     }
-    if (!vm_check_narrow_field_write(ftype, narrow, result)) DISPATCH();
+    if (!vm_check_narrow_field_write(ftype, narrow, result))
+        DISPATCH();
     gc_barrier_struct(vm, oa, result);
     vm_struct_field_write_at(oa, foffset, ftype, narrow, result);
     DISPATCH();
@@ -4206,7 +4288,7 @@ lbl_field_compound : {
    computing the EXACT unfused result: op1 first, then op2 on that intermediate -- the same value
    this would have produced as two separate statements, just without the fusion win for this one
    call. Correctness never depends on which path runs. */
-lbl_typed_array_chain2 : {
+lbl_typed_array_chain2: {
     int dest_reg = (int)UNPACK_A(op_word);
     int a_reg = (int)UNPACK_B(op_word);
     int b_reg = (int)UNPACK_C(op_word);
@@ -4250,7 +4332,7 @@ lbl_typed_array_chain2 : {
 }
 
 /* Shell mode auto-print: a bare statement's result is printed unless null. */
-lbl_print_repl : {
+lbl_print_repl: {
     int src_reg = (int)UNPACK_A(op_word);
     AerVal v = registers[src_reg];
     if (aer_type(v) != TYPE_NULL) {
@@ -4261,7 +4343,7 @@ lbl_print_repl : {
 }
 
 /* gc_barrier_struct is the write barrier every mutating struct field-set needs. */
-lbl_field_set : {
+lbl_field_set: {
     unsigned int site = (unsigned int)(pc - code) - 1;
     int struct_reg = (int)UNPACK_A(op_word);
     AerVal* val = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
@@ -4281,7 +4363,8 @@ lbl_field_set : {
               aer_as_string(c->pool[field_idx])->data);
         DISPATCH();
     }
-    if (!vm_check_narrow_field_write(declared, narrow, *val)) DISPATCH();
+    if (!vm_check_narrow_field_write(declared, narrow, *val))
+        DISPATCH();
     gc_barrier_struct(vm, oa, *val);
     vm_struct_field_write_at(oa, foffset, declared, narrow, *val);
     DISPATCH();
@@ -4293,31 +4376,33 @@ lbl_field_set : {
    The aer_type() check below is a safety net: the parser clears reg_known_shape[] on the
    reassignment paths it knows about, but that audit is not proven exhaustive, and a gap should
    surface as a loud error rather than silent corruption. */
-lbl_index_field_get_raw_int : {
+lbl_index_field_get_raw_int: {
     int dest_slot = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     memcpy(&raw_ints[dest_slot], elem, 8);
     DISPATCH();
 }
 
-lbl_index_field_get_raw_real : {
+lbl_index_field_get_raw_real: {
     int dest_slot = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     memcpy(&raw_reals[dest_slot], elem, 8);
     DISPATCH();
 }
 
-lbl_field_get_raw_int : {
+lbl_field_get_raw_int: {
     int dest_slot = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
     unsigned int foffset = READ();
@@ -4331,7 +4416,7 @@ lbl_field_get_raw_int : {
     DISPATCH();
 }
 
-lbl_field_get_raw_real : {
+lbl_field_get_raw_real: {
     int dest_slot = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
     unsigned int foffset = READ();
@@ -4348,31 +4433,33 @@ lbl_field_get_raw_real : {
 /* Narrow (int32/float32) counterparts of the 4 GET opcodes above -- same contract, but the field's
    storage is 4 bytes, widened into the same int64_t/double raw_ints[]/raw_reals[] slots the wide
    opcodes and every raw arithmetic opcode already use. */
-lbl_index_field_get_raw_int32 : {
+lbl_index_field_get_raw_int32: {
     int dest_slot = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     raw_ints[dest_slot] = vm_raw_read_int32(elem);
     DISPATCH();
 }
 
-lbl_index_field_get_raw_float32 : {
+lbl_index_field_get_raw_float32: {
     int dest_slot = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     raw_reals[dest_slot] = vm_raw_read_float32(elem);
     DISPATCH();
 }
 
-lbl_field_get_raw_int32 : {
+lbl_field_get_raw_int32: {
     int dest_slot = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
     unsigned int foffset = READ();
@@ -4386,7 +4473,7 @@ lbl_field_get_raw_int32 : {
     DISPATCH();
 }
 
-lbl_field_get_raw_float32 : {
+lbl_field_get_raw_float32: {
     int dest_slot = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
     unsigned int foffset = READ();
@@ -4400,31 +4487,33 @@ lbl_field_get_raw_float32 : {
     DISPATCH();
 }
 
-lbl_index_field_set_raw_int : {
+lbl_index_field_set_raw_int: {
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot = (int)UNPACK_2X16_LO(off_slot_word);
     unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     memcpy(elem, &raw_ints[src_slot], 8);
     DISPATCH();
 }
 
-lbl_index_field_set_raw_real : {
+lbl_index_field_set_raw_real: {
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot = (int)UNPACK_2X16_LO(off_slot_word);
     unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     memcpy(elem, &raw_reals[src_slot], 8);
     DISPATCH();
 }
 
-lbl_field_set_raw_int : {
+lbl_field_set_raw_int: {
     int struct_reg = (int)UNPACK_A(op_word);
     unsigned int foffset = READ();
     int src_slot = (int)READ();
@@ -4438,7 +4527,7 @@ lbl_field_set_raw_int : {
     DISPATCH();
 }
 
-lbl_field_set_raw_real : {
+lbl_field_set_raw_real: {
     int struct_reg = (int)UNPACK_A(op_word);
     unsigned int foffset = READ();
     int src_slot = (int)READ();
@@ -4455,31 +4544,33 @@ lbl_field_set_raw_real : {
 /* Narrow (int32/float32) counterparts of the 4 SET opcodes above -- narrows the raw_ints[]/
    raw_reals[] slot's int64_t/double value back down to 4 bytes on write. No range check on the
    int32 side -- see the narrow RAW opcode family's own comment (vm.h) for why. */
-lbl_index_field_set_raw_int32 : {
+lbl_index_field_set_raw_int32: {
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot = (int)UNPACK_2X16_LO(off_slot_word);
     unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     vm_raw_write_int32(elem, raw_ints[src_slot]);
     DISPATCH();
 }
 
-lbl_index_field_set_raw_float32 : {
+lbl_index_field_set_raw_float32: {
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot = (int)UNPACK_2X16_LO(off_slot_word);
     unsigned char* elem = vm_packed_raw_elem(registers[obj_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     vm_raw_write_float32(elem, raw_reals[src_slot]);
     DISPATCH();
 }
 
-lbl_field_set_raw_int32 : {
+lbl_field_set_raw_int32: {
     int struct_reg = (int)UNPACK_A(op_word);
     unsigned int foffset = READ();
     int src_slot = (int)READ();
@@ -4493,7 +4584,7 @@ lbl_field_set_raw_int32 : {
     DISPATCH();
 }
 
-lbl_field_set_raw_float32 : {
+lbl_field_set_raw_float32: {
     int struct_reg = (int)UNPACK_A(op_word);
     unsigned int foffset = READ();
     int src_slot = (int)READ();
@@ -4511,7 +4602,7 @@ lbl_field_set_raw_float32 : {
    specialized-body contract and safety net as the GET/SET family, folding read, compute and write
    into one dispatch with neither side boxed. ADD/SUB/MUL only, matching the _BOXED family. Emitted
    only where the parser proved the RHS was already raw. */
-lbl_field_compound_raw_int : {
+lbl_field_compound_raw_int: {
     int struct_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     unsigned int foffset = READ();
@@ -4536,7 +4627,7 @@ lbl_field_compound_raw_int : {
     DISPATCH();
 }
 
-lbl_field_compound_raw_real : {
+lbl_field_compound_raw_real: {
     int struct_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     unsigned int foffset = READ();
@@ -4561,7 +4652,7 @@ lbl_field_compound_raw_real : {
     DISPATCH();
 }
 
-lbl_index_field_compound_raw_int : {
+lbl_index_field_compound_raw_int: {
     int arr_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
@@ -4569,7 +4660,8 @@ lbl_index_field_compound_raw_int : {
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     int64_t lhs;
     memcpy(&lhs, elem, 8);
     int64_t rhs = raw_ints[rhs_slot];
@@ -4584,7 +4676,7 @@ lbl_index_field_compound_raw_int : {
     DISPATCH();
 }
 
-lbl_index_field_compound_raw_real : {
+lbl_index_field_compound_raw_real: {
     int arr_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
@@ -4592,7 +4684,8 @@ lbl_index_field_compound_raw_real : {
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     double lhs;
     memcpy(&lhs, elem, 8);
     double rhs = raw_reals[rhs_slot];
@@ -4611,55 +4704,59 @@ lbl_index_field_compound_raw_real : {
    they resolve the element through vm_packed_raw_elem_unchecked. See parser.c's
    index_safe_unchecked for the proof that the index is in range every iteration. No narrow-field
    counterparts -- not measured hot enough to double the family again. */
-lbl_index_field_get_raw_int_unchecked : {
+lbl_index_field_get_raw_int_unchecked: {
     int dest_slot = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     memcpy(&raw_ints[dest_slot], elem, 8);
     DISPATCH();
 }
 
-lbl_index_field_get_raw_real_unchecked : {
+lbl_index_field_get_raw_real_unchecked: {
     int dest_slot = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     memcpy(&raw_reals[dest_slot], elem, 8);
     DISPATCH();
 }
 
-lbl_index_field_set_raw_int_unchecked : {
+lbl_index_field_set_raw_int_unchecked: {
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot = (int)UNPACK_2X16_LO(off_slot_word);
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     memcpy(elem, &raw_ints[src_slot], 8);
     DISPATCH();
 }
 
-lbl_index_field_set_raw_real_unchecked : {
+lbl_index_field_set_raw_real_unchecked: {
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot = (int)UNPACK_2X16_LO(off_slot_word);
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     memcpy(elem, &raw_reals[src_slot], 8);
     DISPATCH();
 }
 
-lbl_index_field_compound_raw_int_unchecked : {
+lbl_index_field_compound_raw_int_unchecked: {
     int arr_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
@@ -4667,7 +4764,8 @@ lbl_index_field_compound_raw_int_unchecked : {
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     int64_t lhs;
     memcpy(&lhs, elem, 8);
     int64_t rhs = raw_ints[rhs_slot];
@@ -4682,7 +4780,7 @@ lbl_index_field_compound_raw_int_unchecked : {
     DISPATCH();
 }
 
-lbl_index_field_compound_raw_real_unchecked : {
+lbl_index_field_compound_raw_real_unchecked: {
     int arr_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
@@ -4690,7 +4788,8 @@ lbl_index_field_compound_raw_real_unchecked : {
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     double lhs;
     memcpy(&lhs, elem, 8);
     double rhs = raw_reals[rhs_slot];
@@ -4709,7 +4808,7 @@ lbl_index_field_compound_raw_real_unchecked : {
    4-byte storage into the compute-side int64_t/double, apply the op, narrow the RESULT back down
    on write. No range check on the int32 side -- see the narrow RAW opcode family's own comment
    (vm.h) for why. */
-lbl_field_compound_raw_int32 : {
+lbl_field_compound_raw_int32: {
     int struct_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     unsigned int foffset = READ();
@@ -4733,7 +4832,7 @@ lbl_field_compound_raw_int32 : {
     DISPATCH();
 }
 
-lbl_field_compound_raw_float32 : {
+lbl_field_compound_raw_float32: {
     int struct_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     unsigned int foffset = READ();
@@ -4757,7 +4856,7 @@ lbl_field_compound_raw_float32 : {
     DISPATCH();
 }
 
-lbl_index_field_compound_raw_int32 : {
+lbl_index_field_compound_raw_int32: {
     int arr_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
@@ -4765,7 +4864,8 @@ lbl_index_field_compound_raw_int32 : {
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     int64_t lhs = vm_raw_read_int32(elem);
     int64_t rhs = raw_ints[rhs_slot];
     int64_t result;
@@ -4779,7 +4879,7 @@ lbl_index_field_compound_raw_int32 : {
     DISPATCH();
 }
 
-lbl_index_field_compound_raw_float32 : {
+lbl_index_field_compound_raw_float32: {
     int arr_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
@@ -4787,7 +4887,8 @@ lbl_index_field_compound_raw_float32 : {
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     double lhs = vm_raw_read_float32(elem);
     double rhs = raw_reals[rhs_slot];
     double result;
@@ -4806,55 +4907,59 @@ lbl_index_field_compound_raw_float32 : {
    to its own checked counterparts; see that family's own comment and parser.c's
    index_safe_unchecked for the compile-time proof. Narrow storage width (4 bytes) unaffected --
    only vm_packed_raw_elem's index-side checks are skipped, via vm_packed_raw_elem_unchecked. */
-lbl_index_field_get_raw_int32_unchecked : {
+lbl_index_field_get_raw_int32_unchecked: {
     int dest_slot = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     raw_ints[dest_slot] = vm_raw_read_int32(elem);
     DISPATCH();
 }
 
-lbl_index_field_get_raw_float32_unchecked : {
+lbl_index_field_get_raw_float32_unchecked: {
     int dest_slot = (int)UNPACK_A(op_word);
     int arr_reg = (int)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     raw_reals[dest_slot] = vm_raw_read_float32(elem);
     DISPATCH();
 }
 
-lbl_index_field_set_raw_int32_unchecked : {
+lbl_index_field_set_raw_int32_unchecked: {
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot = (int)UNPACK_2X16_LO(off_slot_word);
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     vm_raw_write_int32(elem, raw_ints[src_slot]);
     DISPATCH();
 }
 
-lbl_index_field_set_raw_float32_unchecked : {
+lbl_index_field_set_raw_float32_unchecked: {
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     uint32_t off_slot_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     int src_slot = (int)UNPACK_2X16_LO(off_slot_word);
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[obj_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     vm_raw_write_float32(elem, raw_reals[src_slot]);
     DISPATCH();
 }
 
-lbl_index_field_compound_raw_int32_unchecked : {
+lbl_index_field_compound_raw_int32_unchecked: {
     int arr_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
@@ -4862,7 +4967,8 @@ lbl_index_field_compound_raw_int32_unchecked : {
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     int64_t lhs = vm_raw_read_int32(elem);
     int64_t rhs = raw_ints[rhs_slot];
     int64_t result;
@@ -4876,7 +4982,7 @@ lbl_index_field_compound_raw_int32_unchecked : {
     DISPATCH();
 }
 
-lbl_index_field_compound_raw_float32_unchecked : {
+lbl_index_field_compound_raw_float32_unchecked: {
     int arr_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
     uint32_t field_rk_word = READ();
@@ -4884,7 +4990,8 @@ lbl_index_field_compound_raw_float32_unchecked : {
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
     int rhs_slot = (int)READ();
     unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
-    if (!elem) DISPATCH();
+    if (!elem)
+        DISPATCH();
     double lhs = vm_raw_read_float32(elem);
     double rhs = raw_reals[rhs_slot];
     double result;
@@ -4906,7 +5013,7 @@ lbl_index_field_compound_raw_float32_unchecked : {
    already been evaluated exactly once by the parser's own codegen; this handler just branches on
    its RUNTIME type. Eligibility (every field a fixed primitive) is checked here for the same reason
    the old opcode checked it here -- a Shape is only fully known once its OP_DEFINE_STRUCT has run. */
-lbl_array_repeat : {
+lbl_array_repeat: {
     int dest_reg = (int)UNPACK_A(op_word);
     int fill_reg = (int)UNPACK_B(op_word);
     int narrow_flag = (int)UNPACK_C(op_word);
@@ -4992,7 +5099,7 @@ lbl_array_repeat : {
 /* Handles both a packed array and an ordinary struct array (the parser can't know which --
    functions are untyped). The non-packed branch reproduces the plain index+field path exactly,
    just without needing a scratch register for the intermediate. */
-lbl_index_field_get : {
+lbl_index_field_get: {
     unsigned int site = (unsigned int)(pc - code) - 1;
     int dest_reg = (int)UNPACK_A(op_word);
     int obj_reg = (int)UNPACK_B(op_word);
@@ -5007,7 +5114,8 @@ lbl_index_field_get : {
             DISPATCH();
         }
         int64_t i = aer_as_int(*idx);
-        if (i < 0) i += (int64_t)pa->count;
+        if (i < 0)
+            i += (int64_t)pa->count;
         if (i < 0 || (uint64_t)i >= pa->count) {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
             DISPATCH();
@@ -5027,7 +5135,8 @@ lbl_index_field_get : {
     }
     AerVal tmp;
     vm_index_get_compute(obj, *idx, &tmp);
-    if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm); /* single-char string indexing allocates */
+    if (aer_type(obj) == TYPE_STRING)
+        gc_maybe_collect(vm); /* single-char string indexing allocates */
     if (aer_type(tmp) != TYPE_STRUCT) {
         error("'.' field access requires a struct instance");
         DISPATCH();
@@ -5044,7 +5153,7 @@ lbl_index_field_get : {
 }
 
 /* Mirror of lbl_index_field_get -- same dual dispatch, same reason no scratch register is needed. */
-lbl_index_field_set : {
+lbl_index_field_set: {
     unsigned int site = (unsigned int)(pc - code) - 1;
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
@@ -5059,7 +5168,8 @@ lbl_index_field_set : {
             DISPATCH();
         }
         int64_t i = aer_as_int(*idx);
-        if (i < 0) i += (int64_t)pa->count;
+        if (i < 0)
+            i += (int64_t)pa->count;
         if (i < 0 || (uint64_t)i >= pa->count) {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
             DISPATCH();
@@ -5075,7 +5185,8 @@ lbl_index_field_set : {
                   aer_as_string(c->pool[field_idx])->data);
             DISPATCH();
         }
-        if (!vm_check_narrow_field_write(declared, narrow, *val)) DISPATCH();
+        if (!vm_check_narrow_field_write(declared, narrow, *val))
+            DISPATCH();
         unsigned int element_size = pa->shape->instance_bytes;
         unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
         if (narrow)
@@ -5086,7 +5197,8 @@ lbl_index_field_set : {
     }
     AerVal tmp;
     vm_index_get_compute(obj, *idx, &tmp);
-    if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm); /* single-char string indexing allocates */
+    if (aer_type(obj) == TYPE_STRING)
+        gc_maybe_collect(vm); /* single-char string indexing allocates */
     if (aer_type(tmp) != TYPE_STRUCT) {
         error("'.' field access requires a struct instance");
         DISPATCH();
@@ -5103,7 +5215,8 @@ lbl_index_field_set : {
               aer_as_string(c->pool[field_idx])->data);
         DISPATCH();
     }
-    if (!vm_check_narrow_field_write(declared, narrow, *val)) DISPATCH();
+    if (!vm_check_narrow_field_write(declared, narrow, *val))
+        DISPATCH();
     gc_barrier_struct(vm, oa, *val);
     vm_struct_field_write_at(oa, foffset, declared, narrow, *val);
     DISPATCH();
@@ -5115,7 +5228,7 @@ lbl_index_field_set : {
    by a separate OP_INDEX_FIELD_SET (a second index+field resolution just to write the same slot
    back) -- exactly the nbody-style `bodies[j].vx += dx * mi` pattern, twice resolved for one
    logical operation. */
-lbl_index_field_compound : {
+lbl_index_field_compound: {
     unsigned int site = (unsigned int)(pc - code) - 1;
     int obj_reg = (int)UNPACK_A(op_word);
     Opcode bin_op = (Opcode)UNPACK_B(op_word);
@@ -5132,7 +5245,8 @@ lbl_index_field_compound : {
             DISPATCH();
         }
         int64_t i = aer_as_int(*idx);
-        if (i < 0) i += (int64_t)pa->count;
+        if (i < 0)
+            i += (int64_t)pa->count;
         if (i < 0 || (uint64_t)i >= pa->count) {
             error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
             DISPATCH();
@@ -5159,7 +5273,8 @@ lbl_index_field_compound : {
                   aer_as_string(c->pool[field_idx])->data);
             DISPATCH();
         }
-        if (!vm_check_narrow_field_write(ftype, narrow, result)) DISPATCH();
+        if (!vm_check_narrow_field_write(ftype, narrow, result))
+            DISPATCH();
         if (narrow)
             vm_typed_elem_write(elem, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32, result);
         else
@@ -5168,7 +5283,8 @@ lbl_index_field_compound : {
     }
     AerVal tmp;
     vm_index_get_compute(obj, *idx, &tmp);
-    if (aer_type(obj) == TYPE_STRING) gc_maybe_collect(vm); /* single-char string indexing allocates */
+    if (aer_type(obj) == TYPE_STRING)
+        gc_maybe_collect(vm); /* single-char string indexing allocates */
     if (aer_type(tmp) != TYPE_STRUCT) {
         error("'.' field access requires a struct instance");
         DISPATCH();
@@ -5193,7 +5309,8 @@ lbl_index_field_compound : {
               aer_as_string(c->pool[field_idx])->data);
         DISPATCH();
     }
-    if (!vm_check_narrow_field_write(ftype, narrow, result)) DISPATCH();
+    if (!vm_check_narrow_field_write(ftype, narrow, result))
+        DISPATCH();
     gc_barrier_struct(vm, oa, result);
     vm_struct_field_write_at(oa, foffset, ftype, narrow, result);
     DISPATCH();
@@ -5201,7 +5318,7 @@ lbl_index_field_compound : {
 
 /* Keyed by unary_op, same tag convention as lbl_binary. Also folds in OP_TO_STR
    (interpolation's string conversion) via the shared vm_to_str(). */
-lbl_interp : {
+lbl_interp: {
     int dest = (int)UNPACK_A(op_word);
     unsigned int count = UNPACK_B(op_word);
     AerVal parts[INTERP_MAX_PARTS];
@@ -5212,7 +5329,7 @@ lbl_interp : {
     DISPATCH();
 }
 
-lbl_unary : {
+lbl_unary: {
     int dest = (int)UNPACK_A(op_word);
     Opcode unary_op = (Opcode)UNPACK_B(op_word);
     AerVal v = *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
@@ -5249,7 +5366,7 @@ lbl_unary : {
 
 /* No gc_maybe_collect -- every cast_type only ever produces a plain tagged-union value
    (confirmed by inspection, including vm_cast's string-parsing sub-cases). */
-lbl_cast : {
+lbl_cast: {
     int dest = (int)UNPACK_A(op_word);
     int cast_type = (int)UNPACK_B(op_word);
     AerVal v = *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
@@ -5257,19 +5374,19 @@ lbl_cast : {
     DISPATCH();
 }
 
-lbl_raw_int_to_real : {
+lbl_raw_int_to_real: {
     raw_reals[UNPACK_A(op_word)] = (double)raw_ints[UNPACK_B(op_word)];
     DISPATCH();
 }
 
-lbl_raw_real_to_int : {
+lbl_raw_real_to_int: {
     raw_ints[UNPACK_A(op_word)] = (int64_t)raw_reals[UNPACK_B(op_word)];
     DISPATCH();
 }
 
 /* Skip both the RK-flag check and the tag check -- the parser already proved every operand's
    type at compile time. None allocate: integers/reals/booleans never have heap cells. */
-lbl_raw_load_int : {
+lbl_raw_load_int: {
     int dest = (int)UNPACK_A(op_word);
     /* Full 32-bit signed immediate, its own dedicated word -- closes the old 20-bit-immediate
        truncation bug outright (a 20M-iteration bound once silently became 77056) rather than
@@ -5278,7 +5395,7 @@ lbl_raw_load_int : {
     DISPATCH();
 }
 
-lbl_raw_load_real : {
+lbl_raw_load_real: {
     int dest = (int)UNPACK_A(op_word);
     unsigned int idx = (unsigned int)READ();
     raw_reals[dest] = c->rawk_d[idx];
@@ -5303,7 +5420,7 @@ lbl_raw_load_real : {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        raw_ints[dest] = raw_ints[a] op raw_ints[b];                                                            \
+        raw_ints[dest] = raw_ints[a] op raw_ints[b];                                                         \
         DISPATCH();                                                                                          \
     }
 /* The C field is a bare rawk_i index, not an RK -- the opcode itself already says "constant", so
@@ -5321,7 +5438,7 @@ lbl_raw_load_real : {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        raw_reals[dest] = raw_reals[a] op raw_reals[b];                                                          \
+        raw_reals[dest] = raw_reals[a] op raw_reals[b];                                                      \
         DISPATCH();                                                                                          \
     }
 #define RAW_CMP_INT(name, op)                                                                                \
@@ -5348,7 +5465,7 @@ lbl_raw_load_real : {
 
 /* Matches OP_DIV's own semantics: int/int division always promotes to float, so this is the one
    OP_RAW_*_INT opcode whose dest is raw_reals[], not raw_ints[]. */
-lbl_raw_div_int : {
+lbl_raw_div_int: {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
@@ -5361,7 +5478,7 @@ lbl_raw_div_int : {
     DISPATCH();
 }
 
-lbl_raw_mod_int : {
+lbl_raw_mod_int: {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
@@ -5374,7 +5491,7 @@ lbl_raw_mod_int : {
     DISPATCH();
 }
 
-lbl_raw_floor_div_int : {
+lbl_raw_floor_div_int: {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
@@ -5401,14 +5518,14 @@ lbl_raw_floor_div_int : {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        raw_reals[dest] = raw_reals[dest] op(raw_reals[a] * raw_reals[b]);                                       \
+        raw_reals[dest] = raw_reals[dest] op(raw_reals[a] * raw_reals[b]);                                   \
         DISPATCH();                                                                                          \
     }
     RAW_FUSED_MULACC_REAL(fma, +)
     RAW_FUSED_MULACC_REAL(fms, -)
 #undef RAW_FUSED_MULACC_REAL
 
-lbl_raw_div_real : {
+lbl_raw_div_real: {
     int dest = (int)UNPACK_A(op_word);
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
@@ -5432,14 +5549,14 @@ lbl_raw_div_real : {
     RAW_CMP_REAL(neq, !=)
 
 /* The only bridge from raw storage back to a tagged AerVal register. */
-lbl_box_int : {
+lbl_box_int: {
     int dest = (int)UNPACK_A(op_word);
     int src = (int)UNPACK_B(op_word);
     registers[dest] = aer_int(raw_ints[src]);
     DISPATCH();
 }
 
-lbl_box_real : {
+lbl_box_real: {
     int dest = (int)UNPACK_A(op_word);
     int src = (int)UNPACK_B(op_word);
     registers[dest] = aer_real(raw_reals[src]);
@@ -5448,7 +5565,7 @@ lbl_box_real : {
 
 /* The error wording says the operator, not "unbox", because that is what the source line reads as
    and what the boxed arithmetic this replaces reported. */
-lbl_unbox_int : {
+lbl_unbox_int: {
     int dest = (int)UNPACK_A(op_word);
     AerVal* v = &registers[UNPACK_B(op_word)];
     if (v->tag == TYPE_INTEGER)
@@ -5458,7 +5575,7 @@ lbl_unbox_int : {
     DISPATCH();
 }
 
-lbl_unbox_real : {
+lbl_unbox_real: {
     int dest = (int)UNPACK_A(op_word);
     AerVal* v = &registers[UNPACK_B(op_word)];
     if (v->tag == TYPE_REAL)
@@ -5470,14 +5587,14 @@ lbl_unbox_real : {
     DISPATCH();
 }
 
-lbl_raw_move_int : {
+lbl_raw_move_int: {
     int dest = (int)UNPACK_A(op_word);
     int src = (int)UNPACK_B(op_word);
     raw_ints[dest] = raw_ints[src];
     DISPATCH();
 }
 
-lbl_raw_move_real : {
+lbl_raw_move_real: {
     int dest = (int)UNPACK_A(op_word);
     int src = (int)UNPACK_B(op_word);
     raw_reals[dest] = raw_reals[src];
@@ -5489,7 +5606,7 @@ lbl_raw_move_real : {
 #undef RAW_CMP_INT
 #undef RAW_CMP_REAL
 
-lbl_raw_load_int_pool : {
+lbl_raw_load_int_pool: {
     int dest = (int)UNPACK_A(op_word);
     unsigned int idx = (unsigned int)READ();
     raw_ints[dest] = c->rawk_i[idx];
@@ -5503,7 +5620,8 @@ lbl_raw_load_int_pool : {
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
         int target = READ();                                                                                 \
-        if (!(bank[a] op rhs(b))) pc += (int32_t)target;                                                     \
+        if (!(bank[a] op rhs(b)))                                                                            \
+            pc += (int32_t)target;                                                                           \
         DISPATCH();                                                                                          \
     }
 
@@ -5522,7 +5640,7 @@ lbl_raw_load_int_pool : {
    a local array -- 16 AerVals of scratch here would grow vm_run_slice's frame for every opcode
    (5.16b). Both helpers read every part before dest is written, so dest may alias a part's register,
    which emit_interp deliberately arranges. */
-lbl_index_get_interp : {
+lbl_index_get_interp: {
     int dest_reg = (int)UNPACK_A(op_word);
     int obj_reg = (int)UNPACK_B(op_word);
     unsigned int count = UNPACK_C(op_word);

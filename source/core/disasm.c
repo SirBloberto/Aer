@@ -412,7 +412,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
         {"OP_RAW_LT_REAL_JUMP_IF_FALSE", "jump if !(rawr < rawr)", {0}, false, 1, 0},
     [OP_RAW_LTE_REAL_JUMP_IF_FALSE] =
         {"OP_RAW_LTE_REAL_JUMP_IF_FALSE", "jump if !(rawr <= rawr)", {0}, false, 1, 0},
-    [OP_RAW_EQ_INT_JUMP_IF_FALSE] = {"OP_RAW_EQ_INT_JUMP_IF_FALSE", "jump if !(rawi == rawi)", {0}, false, 1, 0},
+    [OP_RAW_EQ_INT_JUMP_IF_FALSE] =
+        {"OP_RAW_EQ_INT_JUMP_IF_FALSE", "jump if !(rawi == rawi)", {0}, false, 1, 0},
     [OP_RAW_NEQ_INT_JUMP_IF_FALSE] =
         {"OP_RAW_NEQ_INT_JUMP_IF_FALSE", "jump if !(rawi != rawi)", {0}, false, 1, 0},
     [OP_RAW_EQ_REAL_JUMP_IF_FALSE] =
@@ -423,7 +424,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_INDEX_SET_RAW_INT] = {"OP_INDEX_SET_RAW_INT", "arr[rk] = rawi (checked)"},
     [OP_INDEX_SET_RAW_REAL] = {"OP_INDEX_SET_RAW_REAL", "arr[rk] = rawr (checked)"},
     [OP_INDEX_GET_RAW_REAL] = {"OP_INDEX_GET_RAW_REAL", "rawr = arr[rk] (checked)"},
-    [OP_CALL_RAW_INT] = {"OP_CALL_RAW_INT", "recursive numeric call, int args/result stay raw", {0}, false, 1, 0},
+    [OP_CALL_RAW_INT] =
+        {"OP_CALL_RAW_INT", "recursive numeric call, int args/result stay raw", {0}, false, 1, 0},
     [OP_CALL_RAW_REAL] =
         {"OP_CALL_RAW_REAL", "recursive numeric call, real args/result stay raw", {0}, false, 1, 0},
     [OP_RAW_MATH_REAL] = {"OP_RAW_MATH_REAL", "rawr = math fn(rawr), never boxed"},
@@ -621,9 +623,11 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
             uint32_t ftype_word = (uint32_t)c->code[pos++];
             int ftype = (int)(ftype_word & 0xFF);
             bool narrow = (ftype_word & 0x100) != 0;
-            if (i > 0) fprintf(out, ", ");
+            if (i > 0)
+                fprintf(out, ", ");
             fprintf(out, "%s", aer_as_string(c->pool[fname_idx])->data);
-            if (ftype != TYPE_ANY) fprintf(out, ": %s%s", field_type_names[ftype], narrow ? " (narrow)" : "");
+            if (ftype != TYPE_ANY)
+                fprintf(out, ": %s%s", field_type_names[ftype], narrow ? " (narrow)" : "");
             fprintf(out, "=");
             print_pool_value(out, c->pool[fdefault_idx]);
         }
@@ -900,8 +904,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
         print_rawk_d(out, c, UNPACK_C(op_word));
-    } else if (op == OP_RAW_LT_INT || op == OP_RAW_LTE_INT || op == OP_RAW_EQ_INT ||
-               op == OP_RAW_NEQ_INT) {
+    } else if (op == OP_RAW_LT_INT || op == OP_RAW_LTE_INT || op == OP_RAW_EQ_INT || op == OP_RAW_NEQ_INT) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
         print_rawk_i(out, c, UNPACK_C(op_word));
@@ -1021,7 +1024,8 @@ void aer_disassemble(Chunk* c, FILE* out) {
     while (offset < c->count)
         offset = disassemble_one(c, offset, out);
 
-    if (!c->debug_hits) return; /* static-only dump if no run happened yet */
+    if (!c->debug_hits)
+        return; /* static-only dump if no run happened yet */
 
     NamedCount by_op[OP_INFO_MAX + 1];
     int by_op_count = 0;
@@ -1029,7 +1033,8 @@ void aer_disassemble(Chunk* c, FILE* out) {
     offset = 0;
     while (offset < c->count) {
         Opcode op = (Opcode)(c->code[offset] & 0xFF);
-        if (offset < c->debug_hits_cap) op_totals[op] += c->debug_hits[offset];
+        if (offset < c->debug_hits_cap)
+            op_totals[op] += c->debug_hits[offset];
         const OpInfo* info = &op_info[op];
         unsigned int next;
         if (op == OP_INTERP) {
@@ -1046,7 +1051,8 @@ void aer_disassemble(Chunk* c, FILE* out) {
         offset = next;
     }
     for (int i = 0; i <= OP_INFO_MAX; i++)
-        if (op_totals[i] > 0) by_op[by_op_count++] = (NamedCount){opcode_name(i), op_totals[i]};
+        if (op_totals[i] > 0)
+            by_op[by_op_count++] = (NamedCount){opcode_name(i), op_totals[i]};
     qsort(by_op, (size_t)by_op_count, sizeof(NamedCount), cmp_named_count_desc);
 
     fprintf(out, "\n--- per-opcode summary ---\n");
@@ -1058,7 +1064,8 @@ void aer_disassemble(Chunk* c, FILE* out) {
     LineCount* by_line = xmalloc(sizeof(LineCount) * c->debug_hits_cap);
     int by_line_count = 0;
     for (unsigned int i = 0; i < c->debug_hits_cap; i++) {
-        if (c->debug_hits[i] == 0) continue;
+        if (c->debug_hits[i] == 0)
+            continue;
         unsigned int line = chunk_line_for_offset(c, i);
         int found = -1;
         for (int j = 0; j < by_line_count; j++)
@@ -1103,7 +1110,8 @@ void aer_debug_memory_report(FILE* out) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
                 AerString* s = (AerString*)(p->slabs[i] + (size_t)j * p->stride);
-                if (s->gc_state & POOL_FREE) continue;
+                if (s->gc_state & POOL_FREE)
+                    continue;
                 str_hdr += sizeof(AerString);
                 str_payload += s->length;
             }
@@ -1118,7 +1126,8 @@ void aer_debug_memory_report(FILE* out) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
                 AerArray* a = (AerArray*)(p->slabs[i] + (size_t)j * p->stride);
-                if (a->gc_state & POOL_FREE) continue;
+                if (a->gc_state & POOL_FREE)
+                    continue;
                 arr_hdr += sizeof(AerArray);
                 arr_payload += (uint64_t)a->capacity * sizeof(AerVal);
             }
@@ -1133,7 +1142,8 @@ void aer_debug_memory_report(FILE* out) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
                 AerDict* d = (AerDict*)(p->slabs[i] + (size_t)j * p->stride);
-                if (d->gc_state & POOL_FREE) continue;
+                if (d->gc_state & POOL_FREE)
+                    continue;
                 dict_hdr += sizeof(AerDict);
                 dict_payload += (uint64_t)d->map.capacity * sizeof(unsigned int) +
                                 (uint64_t)d->map.dense_capacity * sizeof(HashTableEntry);
@@ -1151,9 +1161,11 @@ void aer_debug_memory_report(FILE* out) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
                 AerFunction* f = (AerFunction*)(p->slabs[i] + (size_t)j * p->stride);
-                if (f->gc_state & POOL_FREE) continue;
+                if (f->gc_state & POOL_FREE)
+                    continue;
                 fn_hdr += sizeof(AerFunction);
-                if (f->defaults) fn_payload += (uint64_t)(f->arity - f->min_arity) * sizeof(AerVal);
+                if (f->defaults)
+                    fn_payload += (uint64_t)(f->arity - f->min_arity) * sizeof(AerVal);
             }
         }
     }
@@ -1171,7 +1183,8 @@ void aer_debug_memory_report(FILE* out) {
             unsigned int count = (i == p->slab_count - 1) ? p->next_index : p->elems_per_slab;
             for (unsigned int j = 0; j < count; j++) {
                 AerStruct* s = (AerStruct*)(p->slabs[i] + (size_t)j * p->stride);
-                if (s->gc_state & POOL_FREE) continue;
+                if (s->gc_state & POOL_FREE)
+                    continue;
                 struct_hdr += p->stride;
                 struct_payload += s->shape->instance_bytes;
             }

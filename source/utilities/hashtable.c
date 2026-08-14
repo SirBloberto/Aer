@@ -33,7 +33,8 @@ static const unsigned int DENSE_TIER_CAPACITY[HASH_DENSE_TIER_COUNT] = {4, 8, 16
 static const unsigned int DENSE_TIER_ELEMS_PER_SLAB[HASH_DENSE_TIER_COUNT] = {64, 32, 16, 8, 4, 2};
 
 void hashtable_pools_init(HashPools* pools) {
-    if (pools->initialized) return;
+    if (pools->initialized)
+        return;
     for (unsigned int i = 0; i < HASH_KEY_TIER_COUNT; i++)
         pool_init(&pools->key_pools[i], KEY_TIER_SIZE[i], KEY_TIER_ELEMS_PER_SLAB[i]);
     for (unsigned int i = 0; i < HASH_SPARSE_TIER_COUNT; i++)
@@ -47,7 +48,8 @@ void hashtable_pools_init(HashPools* pools) {
 
 static char* key_alloc(HashPools* pools, size_t size) {
     for (unsigned int i = 0; i < HASH_KEY_TIER_COUNT; i++)
-        if (size <= KEY_TIER_SIZE[i]) return pool_alloc(&pools->key_pools[i]);
+        if (size <= KEY_TIER_SIZE[i])
+            return pool_alloc(&pools->key_pools[i]);
     return xmalloc(size);
 }
 
@@ -88,12 +90,14 @@ static void sparse_array_free(HashPools* pools, unsigned int* sparse, unsigned i
    reads it, and nothing ever reads past t->count, so an uninitialized cell is harmless. */
 static HashTableEntry* dense_array_alloc(HashPools* pools, unsigned int capacity) {
     for (unsigned int i = 0; i < HASH_DENSE_TIER_COUNT; i++)
-        if (capacity == DENSE_TIER_CAPACITY[i]) return pool_alloc(&pools->dense_pools[i]);
+        if (capacity == DENSE_TIER_CAPACITY[i])
+            return pool_alloc(&pools->dense_pools[i]);
     return xmalloc((size_t)capacity * sizeof(HashTableEntry));
 }
 
 static void dense_array_free(HashPools* pools, HashTableEntry* dense, unsigned int capacity) {
-    if (!dense) return;
+    if (!dense)
+        return;
     for (unsigned int i = 0; i < HASH_DENSE_TIER_COUNT; i++)
         if (capacity == DENSE_TIER_CAPACITY[i]) {
             pool_free(&pools->dense_pools[i], dense);
@@ -118,7 +122,8 @@ char* hashtable_key_dup_known(HashPools* pools, const char* data, unsigned int t
 
 char* hashtable_key_dup(HashPools* pools, const char* data, unsigned int len, unsigned int* out_len) {
     unsigned int true_len = hashtable_key_true_len(data, len);
-    if (out_len) *out_len = true_len;
+    if (out_len)
+        *out_len = true_len;
     return hashtable_key_dup_known(pools, data, true_len);
 }
 
@@ -141,11 +146,13 @@ HashValue hashtable_hash_bytes(const char* key, unsigned int length) {
 #define HASH_KEY_INLINE_CMP_MAX 16u
 
 static bool hash_match(const HashTableEntry* entry, const char* key, unsigned int length) {
-    if (!entry->key || entry->length != length) return false;
+    if (!entry->key || entry->length != length)
+        return false;
     if (length <= HASH_KEY_INLINE_CMP_MAX) {
         const char* a = entry->key;
         for (unsigned int i = 0; i < length; i++)
-            if (a[i] != key[i]) return false;
+            if (a[i] != key[i])
+                return false;
         return true;
     }
     return memcmp(entry->key, key, length) == 0;
@@ -158,7 +165,8 @@ static bool hash_match(const HashTableEntry* entry, const char* key, unsigned in
    capacities are past the last tier there is no pool involved, so plain xrealloc is strictly
    better -- only the climb through the tiers needs the copy. */
 static void dense_grow_if_needed(HashTable* t) {
-    if (t->count < t->dense_capacity) return;
+    if (t->count < t->dense_capacity)
+        return;
     unsigned int new_capacity = t->dense_capacity ? t->dense_capacity * 2 : 4;
     unsigned int largest_tier = DENSE_TIER_CAPACITY[HASH_DENSE_TIER_COUNT - 1];
     if (t->dense_capacity > largest_tier) {
@@ -213,11 +221,14 @@ AerVal* hashtable_get(HashTable* t, const char* key, unsigned int length) {
 }
 
 AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length, HashValue hash) {
-    if (!t->sparse) return NULL;
+    if (!t->sparse)
+        return NULL;
     for (unsigned int i = 0; i < t->capacity; i++) {
         unsigned int slot = t->sparse[(hash + i) & (t->capacity - 1)];
-        if (slot == SPARSE_EMPTY) return NULL;
-        if (hash_match(&t->dense[slot], key, length)) return &t->dense[slot].payload;
+        if (slot == SPARSE_EMPTY)
+            return NULL;
+        if (hash_match(&t->dense[slot], key, length))
+            return &t->dense[slot].payload;
     }
     return NULL;
 }
@@ -227,11 +238,14 @@ AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length,
    slot a write will land in BEFORE the write happens (an update reuses an existing slot; a fresh
    key always lands at the current t->count, appended). -1 if not found. */
 int hashtable_get_index_hashed(HashTable* t, const char* key, unsigned int length, HashValue hash) {
-    if (!t->sparse) return -1;
+    if (!t->sparse)
+        return -1;
     for (unsigned int i = 0; i < t->capacity; i++) {
         unsigned int slot = t->sparse[(hash + i) & (t->capacity - 1)];
-        if (slot == SPARSE_EMPTY) return -1;
-        if (hash_match(&t->dense[slot], key, length)) return (int)slot;
+        if (slot == SPARSE_EMPTY)
+            return -1;
+        if (hash_match(&t->dense[slot], key, length))
+            return (int)slot;
     }
     return -1;
 }
@@ -317,7 +331,8 @@ void hashtable_reserve(HashTable* t, unsigned int expected_count) {
    repaired (classic open-addressing deletion), and the dense array must stay hole-free by moving
    the last entry into the vacated slot. */
 void hashtable_remove(HashTable* t, const char* key, unsigned int length) {
-    if (!t->sparse) return;
+    if (!t->sparse)
+        return;
     HashValue hash = hashtable_hash_bytes(key, length);
 
     unsigned int found_slot = t->capacity;
@@ -325,14 +340,16 @@ void hashtable_remove(HashTable* t, const char* key, unsigned int length) {
     for (unsigned int i = 0; i < t->capacity; i++) {
         unsigned int probe = (unsigned int)((hash + i) & (t->capacity - 1));
         unsigned int slot_val = t->sparse[probe];
-        if (slot_val == SPARSE_EMPTY) return; /* not found */
+        if (slot_val == SPARSE_EMPTY)
+            return; /* not found */
         if (hash_match(&t->dense[slot_val], key, length)) {
             found_slot = probe;
             removed_idx = slot_val;
             break;
         }
     }
-    if (found_slot == t->capacity) return;
+    if (found_slot == t->capacity)
+        return;
 
     hashtable_key_free(t->pools, t->dense[removed_idx].key, t->dense[removed_idx].length);
 
@@ -373,7 +390,8 @@ void hashtable_clear(HashTable* t) {
 void hashtable_free(HashTable* t) {
     HashPools* pools = t->pools;
     hashtable_clear(t);
-    if (t->sparse) sparse_array_free(pools, t->sparse, t->capacity);
+    if (t->sparse)
+        sparse_array_free(pools, t->sparse, t->capacity);
     dense_array_free(pools, t->dense, t->dense_capacity);
     *t = (HashTable){0};
 }

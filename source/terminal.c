@@ -126,7 +126,8 @@ void start_terminal(char* name) {
     }
 
 #ifdef _WIN32
-    if (!GetConsoleMode(hStdout, &original_out_mode)) die("GetConsoleMode (stdout)");
+    if (!GetConsoleMode(hStdout, &original_out_mode))
+        die("GetConsoleMode (stdout)");
     atexit(end_terminal);
 
     /* Equivalent of clearing ICANON|ECHO|ISIG in termios. */
@@ -136,22 +137,26 @@ void start_terminal(char* name) {
     SetConsoleMode(hStdout, original_out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 
     CONSOLE_SCREEN_BUFFER_INFO info;
-    if (!GetConsoleScreenBufferInfo(hStdout, &info)) die("Could not retrieve window size");
+    if (!GetConsoleScreenBufferInfo(hStdout, &info))
+        die("Could not retrieve window size");
     screen_columns = (unsigned short)(info.srWindow.Right - info.srWindow.Left + 1);
 #else
-    if (tcgetattr(STDIN_FILENO, &original) == -1) die("tcgetattr");
+    if (tcgetattr(STDIN_FILENO, &original) == -1)
+        die("tcgetattr");
     atexit(end_terminal);
 
     struct termios raw = original;
     /* No echo | character-at-a-time | don't auto-handle Ctrl-C/Z */
     raw.c_lflag &= ~(ECHO | ICANON | ISIG);
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
+        die("tcsetattr");
 
     /* Safe signal handler -- just sets a flag */
     signal(SIGWINCH, handle_resize);
 
     struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) die("Could not retrieve window size");
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0)
+        die("Could not retrieve window size");
     screen_columns = ws.ws_col;
 #endif
 
@@ -200,14 +205,16 @@ static char* handle_terminal_piped(void) {
             buffer = xrealloc(buffer, buffer_length);
         }
         buffer[length++] = (char)ch;
-        if (ch == '\n') break;
+        if (ch == '\n')
+            break;
     }
     buffer[length] = '\0';
     return buffer;
 }
 
 char* handle_terminal() {
-    if (piped_stdin) return handle_terminal_piped();
+    if (piped_stdin)
+        return handle_terminal_piped();
 
     clear();
     refresh();
@@ -220,7 +227,8 @@ char* handle_terminal() {
         if (resize_pending) {
             resize_pending = 0;
             struct winsize ws;
-            if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != -1 && ws.ws_col != 0) screen_columns = ws.ws_col;
+            if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != -1 && ws.ws_col != 0)
+                screen_columns = ws.ws_col;
             refresh();
         }
 #endif
@@ -228,7 +236,8 @@ char* handle_terminal() {
         int key = read_key(); /* int: preserves high-bit chars, EOF, and KEY_* sentinels */
 
         if (key == KEY_ARROW_UP) {
-            if (history_position < 2) continue; /* underflow guard */
+            if (history_position < 2)
+                continue; /* underflow guard */
             reset();
             clear();
             /* Bytes before this floor were overwritten by ring wraparound -- scanning past it aliases. */
@@ -250,7 +259,8 @@ char* handle_terminal() {
             history_position = entry_start;
 
         } else if (key == KEY_ARROW_DOWN) {
-            if (history_position >= history_length) continue;
+            if (history_position >= history_length)
+                continue;
             reset();
             clear();
             /* Skip to after the current newline */
@@ -284,7 +294,8 @@ char* handle_terminal() {
             }
 
         } else if (key == BACKSPACE) {
-            if (position == 0) continue;
+            if (position == 0)
+                continue;
             memmove(&buffer[position - 1], &buffer[position], length - position);
             position--;
             length--;
@@ -308,7 +319,8 @@ char* handle_terminal() {
                 history_length += (unsigned long)(length + 1);
             }
             /* Move cursor to last row of input then advance to next line */
-            if (screen_rows > screen_row) printf("\x1b[%dB", screen_rows - screen_row);
+            if (screen_rows > screen_row)
+                printf("\x1b[%dB", screen_rows - screen_row);
             printf("\r\n");
             fflush(stdout);
             screen_row = 0;
@@ -317,7 +329,8 @@ char* handle_terminal() {
         } else if (key == END_OF_TEXT) { /* Ctrl-C */
             /* Ctrl-C cancels the whole in-progress input (including a multi-line block), not the shell;
                Ctrl-D exits -- say so, there's no other way to discover it. */
-            if (screen_rows > screen_row) printf("\x1b[%dB", screen_rows - screen_row);
+            if (screen_rows > screen_row)
+                printf("\x1b[%dB", screen_rows - screen_row);
             printf("\nKeyboardInterrupt (press Ctrl-D to exit)\n");
             clear();
             screen_row = 0;
@@ -353,7 +366,8 @@ void end_terminal() {
         fclose(history);
         history = NULL;
     }
-    if (piped_stdin) return; /* raw mode was never entered -- nothing to restore */
+    if (piped_stdin)
+        return; /* raw mode was never entered -- nothing to restore */
 #ifdef _WIN32
     SetConsoleMode(hStdin, original_in_mode);
     SetConsoleMode(hStdout, original_out_mode);
@@ -392,7 +406,8 @@ static void refresh() {
     /* Redraw: go to column 0, clear to end of screen, print prompt + buffer */
     printf("\x1b[0G\x1b[0J%s%.*s", prompt, length, buffer);
 
-    if (((int)prompt_len + length) % (int)screen_columns == 0 && position == length) printf("\x1b[1E");
+    if (((int)prompt_len + length) % (int)screen_columns == 0 && position == length)
+        printf("\x1b[1E");
 
     /* Move up from the last row to the cursor row */
     for (int r = screen_rows; r > screen_row; r--)
@@ -409,7 +424,8 @@ static void refresh() {
 /* Polled resize check for Windows (no SIGWINCH); refresh() only on an actual change. */
 static void check_resize() {
     CONSOLE_SCREEN_BUFFER_INFO info;
-    if (!GetConsoleScreenBufferInfo(hStdout, &info)) return;
+    if (!GetConsoleScreenBufferInfo(hStdout, &info))
+        return;
     unsigned short cols = (unsigned short)(info.srWindow.Right - info.srWindow.Left + 1);
     if (cols != 0 && cols != screen_columns) {
         screen_columns = cols;
@@ -428,9 +444,12 @@ static void handle_resize(int sig) {
 #ifdef _WIN32
 static int read_key(void) {
     int c = _getch();
-    if (c == '\r') return NEW_LINE; /* Windows Enter is CR, not LF */
-    if (c == '\b') return BACKSPACE; /* Windows Backspace is BS (0x08), not DEL (127) */
-    if (c != 0 && c != 0xE0) return c;
+    if (c == '\r')
+        return NEW_LINE; /* Windows Enter is CR, not LF */
+    if (c == '\b')
+        return BACKSPACE; /* Windows Backspace is BS (0x08), not DEL (127) */
+    if (c != 0 && c != 0xE0)
+        return c;
     switch (_getch()) { /* extended-key scan code */
         case 72: return KEY_ARROW_UP;
         case 80: return KEY_ARROW_DOWN;
@@ -445,8 +464,10 @@ static int read_key(void) {
 #else
 static int read_key(void) {
     int c = getchar();
-    if (c != ESCAPE_SEQUENCE) return c;
-    if (getchar() != '[') return ESCAPE_SEQUENCE;
+    if (c != ESCAPE_SEQUENCE)
+        return c;
+    if (getchar() != '[')
+        return ESCAPE_SEQUENCE;
     switch (getchar()) {
         case ARROW_UP: return KEY_ARROW_UP;
         case ARROW_DOWN: return KEY_ARROW_DOWN;
@@ -482,7 +503,8 @@ static void die(const char* message) {
                        FORMAT_MESSAGE_IGNORE_INSERTS,
                    NULL, err, 0, (LPSTR)&msg, 0, NULL);
     fprintf(stderr, "%s: %s\n", message, msg ? msg : "(unknown error)");
-    if (msg) LocalFree(msg);
+    if (msg)
+        LocalFree(msg);
 #else
     perror(message);
 #endif

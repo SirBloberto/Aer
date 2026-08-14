@@ -7,7 +7,8 @@
 /* Pop-and-coerce for single-arg functions; on false the error is already reported and null pushed. */
 static bool math_pop_double(VM* vm, const char* name, double* out) {
     AerVal a = vm_stack_pop(vm);
-    if (aer_as_double(a, out)) return true;
+    if (aer_as_double(a, out))
+        return true;
     error("%s() requires a number", name);
     vm_stack_push(vm, aer_null());
     return false;
@@ -59,9 +60,8 @@ bool aer_math_unary_raw(int fn_id, double x, double* out) {
 
 /* Which fn_ids aer_math_unary_raw handles -- the parser's test before it may emit OP_RAW_MATH_REAL. */
 bool aer_math_fn_is_raw_real(int fn_id) {
-    return fn_id == FN_MATH_SQRT || fn_id == FN_MATH_SIN || fn_id == FN_MATH_COS ||
-           fn_id == FN_MATH_TAN || fn_id == FN_MATH_EXP || fn_id == FN_MATH_LOG ||
-           fn_id == FN_MATH_LOG2 || fn_id == FN_MATH_LOG10;
+    return fn_id == FN_MATH_SQRT || fn_id == FN_MATH_SIN || fn_id == FN_MATH_COS || fn_id == FN_MATH_TAN ||
+           fn_id == FN_MATH_EXP || fn_id == FN_MATH_LOG || fn_id == FN_MATH_LOG2 || fn_id == FN_MATH_LOG10;
 }
 
 static bool math_unary(int fn_id, double x, AerVal* out) {
@@ -112,7 +112,8 @@ static bool math_unary(int fn_id, double x, AerVal* out) {
     if (fn_id == (FN_ID) && arg_count == 1) {                                                                \
         double x;                                                                                            \
         AerVal result;                                                                                       \
-        if (!math_pop_double(vm, (NAME), &x)) return true;                                                   \
+        if (!math_pop_double(vm, (NAME), &x))                                                                \
+            return true;                                                                                     \
         if (!math_unary(fn_id, x, &result)) {                                                                \
             vm_stack_push(vm, aer_null());                                                                   \
             return true;                                                                                     \

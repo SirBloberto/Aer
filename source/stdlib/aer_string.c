@@ -126,7 +126,8 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
                 r->items = xrealloc(r->items, sizeof(AerVal) * r->capacity);
             }
             r->items[r->count++] = aer_make_string_copy(s + seg_start, at - seg_start);
-            if (at == slen) break;
+            if (at == slen)
+                break;
             seg_start = at + seplen;
         }
         vm_stack_push(vm, aer_array_val(r));
@@ -220,7 +221,8 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
         unsigned int matches = 0;
         for (unsigned int i = 0; i < ss->length;) {
             unsigned int at = aer_bytes_find(ss->data, ss->length, os->data, os->length, i);
-            if (at == ss->length) break;
+            if (at == ss->length)
+                break;
             matches++;
             i = at + os->length;
         }
@@ -233,7 +235,8 @@ bool aer_string_call(VM* vm, int fn_id, int arg_count) {
             unsigned int keep = at - i; /* the run before the match, or the whole tail when absent */
             memcpy(buf + pos, ss->data + i, keep);
             pos += keep;
-            if (at == ss->length) break;
+            if (at == ss->length)
+                break;
             memcpy(buf + pos, nsv->data, nsv->length);
             pos += nsv->length;
             i = at + os->length;

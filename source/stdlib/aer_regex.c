@@ -51,7 +51,8 @@ static void class_shorthand(unsigned char* bits, char letter) {
         case 'd': class_set_range(bits, '0', '9'); break;
         case 'D':
             for (int c = 0; c < 256; c++)
-                if (!(c >= '0' && c <= '9')) class_set_range(bits, (unsigned char)c, (unsigned char)c);
+                if (!(c >= '0' && c <= '9'))
+                    class_set_range(bits, (unsigned char)c, (unsigned char)c);
             break;
         case 'w':
             class_set_range(bits, 'a', 'z');
@@ -63,7 +64,8 @@ static void class_shorthand(unsigned char* bits, char letter) {
             for (int c = 0; c < 256; c++) {
                 bool word =
                     (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
-                if (!word) class_set_range(bits, (unsigned char)c, (unsigned char)c);
+                if (!word)
+                    class_set_range(bits, (unsigned char)c, (unsigned char)c);
             }
             break;
         case 's': {
@@ -78,7 +80,8 @@ static void class_shorthand(unsigned char* bits, char letter) {
             for (const char* w = ws; *w; w++)
                 is_ws[(unsigned char)*w] = true;
             for (int c = 0; c < 256; c++)
-                if (!is_ws[c]) class_set_range(bits, (unsigned char)c, (unsigned char)c);
+                if (!is_ws[c])
+                    class_set_range(bits, (unsigned char)c, (unsigned char)c);
             break;
         }
         default: break;
@@ -131,7 +134,8 @@ static void parse_class(unsigned char* bits) {
         return;
     }
     p++;
-    if (!any) parse_failed = true;
+    if (!any)
+        parse_failed = true;
     if (negate)
         for (int i = 0; i < 32; i++)
             bits[i] = (unsigned char)~bits[i];
@@ -215,7 +219,8 @@ static Seq parse_seq(void) {
     Seq seq = {0};
     while (*p && *p != '|' && *p != ')' && !parse_failed) {
         Node node;
-        if (!parse_atom(&node)) break;
+        if (!parse_atom(&node))
+            break;
         if (*p == '*' || *p == '+' || *p == '?') {
             node.quant = *p;
             p++;
@@ -241,13 +246,15 @@ static Group* regex_compile(const char* pattern) {
     p = pattern;
     parse_failed = false;
     Group* g = parse_alt();
-    if (parse_failed || *p != '\0') return NULL;
+    if (parse_failed || *p != '\0')
+        return NULL;
     return g;
 }
 
 static void free_seq(Seq* seq);
 static void free_group(Group* g) {
-    if (!g) return;
+    if (!g)
+        return;
     for (int i = 0; i < g->alt_count; i++)
         free_seq(&g->alts[i]);
     free(g->alts);
@@ -255,7 +262,8 @@ static void free_group(Group* g) {
 }
 static void free_seq(Seq* seq) {
     for (int i = 0; i < seq->count; i++)
-        if (seq->nodes[i].type == NODE_GROUP) free_group(seq->nodes[i].group);
+        if (seq->nodes[i].type == NODE_GROUP)
+            free_group(seq->nodes[i].group);
     free(seq->nodes);
 }
 
@@ -290,7 +298,8 @@ static long steps_left;
 static bool match_frame(Frame* frame, const char* text, const char** end);
 
 static bool node_matches_char(Node* node, char c) {
-    if (c == '\0') return false;
+    if (c == '\0')
+        return false;
     switch (node->type) {
         case NODE_CHAR: return c == node->ch;
         case NODE_ANY: return c != '\n';
@@ -302,52 +311,63 @@ static bool node_matches_char(Node* node, char c) {
 /* Greedy repetition of a single-char atom: consume as many as possible, then backtrack fewer
    until `after` succeeds. */
 static bool match_atom_star(Node* node, Frame* after, const char* text, const char** end) {
-    if (node_matches_char(node, *text) && match_atom_star(node, after, text + 1, end)) return true;
+    if (node_matches_char(node, *text) && match_atom_star(node, after, text + 1, end))
+        return true;
     return match_frame(after, text, end);
 }
 
 static bool match_group_once(Group* g, Frame* after, const char* text, const char** end) {
     for (int i = 0; i < g->alt_count; i++) {
         Frame alt_frame = {FRAME_SEQ, &g->alts[i], 0, NULL, NULL, after};
-        if (match_frame(&alt_frame, text, end)) return true;
+        if (match_frame(&alt_frame, text, end))
+            return true;
     }
     return false;
 }
 
 static bool match_frame(Frame* frame, const char* text, const char** end) {
-    if (--steps_left <= 0) return false;
+    if (--steps_left <= 0)
+        return false;
     if (!frame) {
         *end = text;
         return true;
     }
 
     if (frame->kind == FRAME_GROUP_REPEAT) {
-        if (text == frame->prev_text) return match_frame(frame->parent, text, end); /* zero-width guard */
+        if (text == frame->prev_text)
+            return match_frame(frame->parent, text, end); /* zero-width guard */
         Frame repeat_again = {FRAME_GROUP_REPEAT, NULL, 0, frame->group, text, frame->parent};
-        if (match_group_once(frame->group, &repeat_again, text, end)) return true;
+        if (match_group_once(frame->group, &repeat_again, text, end))
+            return true;
         return match_frame(frame->parent, text, end);
     }
 
-    if (frame->idx >= frame->seq->count) return match_frame(frame->parent, text, end);
+    if (frame->idx >= frame->seq->count)
+        return match_frame(frame->parent, text, end);
     Node* node = &frame->seq->nodes[frame->idx];
     Frame next = {FRAME_SEQ, frame->seq, frame->idx + 1, NULL, NULL, frame->parent};
 
-    if (node->type == NODE_START) return (text == subject_start) && match_frame(&next, text, end);
-    if (node->type == NODE_END) return (*text == '\0') && match_frame(&next, text, end);
+    if (node->type == NODE_START)
+        return (text == subject_start) && match_frame(&next, text, end);
+    if (node->type == NODE_END)
+        return (*text == '\0') && match_frame(&next, text, end);
 
     if (node->type == NODE_GROUP) {
-        if (node->quant == '\0') return match_group_once(node->group, &next, text, end);
+        if (node->quant == '\0')
+            return match_group_once(node->group, &next, text, end);
         if (node->quant == '?')
             return match_group_once(node->group, &next, text, end) || match_frame(&next, text, end);
         /* '*' or '+' */
         Frame repeat = {FRAME_GROUP_REPEAT, NULL, 0, node->group, text, &next};
         bool matched_once = match_group_once(node->group, &repeat, text, end);
-        if (node->quant == '+') return matched_once;
+        if (node->quant == '+')
+            return matched_once;
         return matched_once || match_frame(&next, text, end);
     }
 
     /* single-char atom: CHAR/ANY/CLASS */
-    if (node->quant == '\0') return node_matches_char(node, *text) && match_frame(&next, text + 1, end);
+    if (node->quant == '\0')
+        return node_matches_char(node, *text) && match_frame(&next, text + 1, end);
     if (node->quant == '?')
         return (node_matches_char(node, *text) && match_frame(&next, text + 1, end)) ||
                match_frame(&next, text, end);
@@ -361,7 +381,8 @@ static bool regex_match_at(Group* g, const char* text, const char** end) {
     steps_left = REGEX_STEP_BUDGET;
     for (int i = 0; i < g->alt_count; i++) {
         Frame top = {FRAME_SEQ, &g->alts[i], 0, NULL, NULL, NULL};
-        if (match_frame(&top, text, end)) return true;
+        if (match_frame(&top, text, end))
+            return true;
     }
     return false;
 }
@@ -379,7 +400,8 @@ static const char* regex_search(Group* g, const char* subject_true_start, const 
             *match_len = (int)(end - s);
             return s;
         }
-        if (*s == '\0') return NULL;
+        if (*s == '\0')
+            return NULL;
     }
 }
 
@@ -472,13 +494,15 @@ bool aer_regex_call(VM* vm, int fn_id, int arg_count) {
             }
             memcpy(out + len, cursor, chunk);
             len += chunk;
-            if (!at) break;
+            if (!at)
+                break;
             memcpy(out + len, repl->data, repl->length);
             len += repl->length;
             /* A zero-width match (e.g. pattern "a*" against "bbb") must still advance past one
                real character, or replacement never terminates. */
             if (mlen == 0) {
-                if (at[0] == '\0') break;
+                if (at[0] == '\0')
+                    break;
                 if (len + 1 >= cap) {
                     cap *= 2;
                     out = xrealloc(out, cap);
@@ -523,7 +547,8 @@ bool aer_regex_call(VM* vm, int fn_id, int arg_count) {
         for (;;) {
             int mlen;
             const char* at = regex_search(g, subject->data, cursor, &mlen);
-            if (!at) break;
+            if (!at)
+                break;
             char* buf = xmalloc((size_t)mlen + 1);
             memcpy(buf, at, (size_t)mlen);
             buf[mlen] = '\0';
@@ -535,7 +560,8 @@ bool aer_regex_call(VM* vm, int fn_id, int arg_count) {
             /* A zero-width match (e.g. pattern "a*" against "bbb") must still advance past one
                real character, or this loop never terminates -- same guard replace() uses. */
             if (mlen == 0) {
-                if (at[0] == '\0') break;
+                if (at[0] == '\0')
+                    break;
                 cursor = at + 1;
             } else {
                 cursor = at + mlen;

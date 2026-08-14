@@ -362,8 +362,8 @@ typedef enum {
     /* Bounds-CHECKED siblings of the two below: same raw destination, but usable without any
        loop proof, since an out-of-range index just falls through to the generic path. Emitted
        wherever the parser knows the array's element kind (Parser.reg_elem_kind). */
-    OP_INDEX_GET_RAW_INT,  /* raw_int_slot, arr_reg, rk_idx */
-    OP_INDEX_SET_RAW_INT,  /* arr_reg, rk_idx, raw_int_slot */
+    OP_INDEX_GET_RAW_INT, /* raw_int_slot, arr_reg, rk_idx */
+    OP_INDEX_SET_RAW_INT, /* arr_reg, rk_idx, raw_int_slot */
     OP_INDEX_SET_RAW_REAL, /* arr_reg, rk_idx, raw_real_slot */
     OP_INDEX_GET_RAW_REAL, /* raw_real_slot, arr_reg, rk_idx */
 
@@ -437,8 +437,8 @@ _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — 
 /* op(8) | A(8) | B(8) | C(8), low byte first -- generic 1-4 byte-field packer, unchanged in spirit
    from the old scheme's own PACK3 (which already only used the low 32 bits of its wider word). */
 #define PACK3(op, a, b, cc)                                                                                  \
-    (((uint32_t)(op)&0xFF) | (((uint32_t)(a)&0xFF) << 8) | (((uint32_t)(b)&0xFF) << 16) |                    \
-     (((uint32_t)(cc)&0xFF) << 24))
+    (((uint32_t)(op) & 0xFF) | (((uint32_t)(a) & 0xFF) << 8) | (((uint32_t)(b) & 0xFF) << 16) |              \
+     (((uint32_t)(cc) & 0xFF) << 24))
 #define PACK2(op, a, b) PACK3(op, a, b, 0)
 #define PACK1(op, a) PACK3(op, a, 0, 0)
 #define UNPACK_A(word) (((word) >> 8) & 0xFF)
@@ -447,9 +447,9 @@ _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — 
 
 /* Packs two independent 16-bit fields into one word -- used for word1-style "two wide fields,
    no room for anything else" shapes (e.g. field_idx + an RK16 operand). */
-#define PACK_2X16(hi, lo) ((((uint32_t)(hi)&0xFFFF) << 16) | ((uint32_t)(lo)&0xFFFF))
+#define PACK_2X16(hi, lo) ((((uint32_t)(hi) & 0xFFFF) << 16) | ((uint32_t)(lo) & 0xFFFF))
 #define UNPACK_2X16_HI(word) (((word) >> 16) & 0xFFFF)
-#define UNPACK_2X16_LO(word) ((word)&0xFFFF)
+#define UNPACK_2X16_LO(word) ((word) & 0xFFFF)
 
 /* RK8: 1 flag bit + 7 index bits. A register index is always < FRAME_REGISTERS(128) by the time it
    reaches emission, so it fits with zero headroom; a constant-pool index past 127 must be hoisted
@@ -462,8 +462,8 @@ static inline uint8_t pack_rk8(int rk) {
         return (uint8_t)(RK8_CONST_FLAG | ((unsigned)(rk & ~RK_CONST_FLAG) & RK8_INDEX_MASK));
     return (uint8_t)((unsigned)rk & RK8_INDEX_MASK);
 }
-#define RK8_IS_CONST(b) ((b)&RK8_CONST_FLAG)
-#define RK8_INDEX(b) ((b)&RK8_INDEX_MASK)
+#define RK8_IS_CONST(b) ((b) & RK8_CONST_FLAG)
+#define RK8_INDEX(b) ((b) & RK8_INDEX_MASK)
 
 /* RK16: 1 flag bit + 15 index bits (32767 registers/constants direct) -- generous enough that no
    overflow path is needed anywhere it's used. */
@@ -475,8 +475,8 @@ static inline uint16_t pack_rk16(int rk) {
         return (uint16_t)(RK16_CONST_FLAG | ((unsigned)(rk & ~RK_CONST_FLAG) & RK16_INDEX_MASK));
     return (uint16_t)((unsigned)rk & RK16_INDEX_MASK);
 }
-#define RK16_IS_CONST(w) ((w)&RK16_CONST_FLAG)
-#define RK16_INDEX(w) ((w)&RK16_INDEX_MASK)
+#define RK16_IS_CONST(w) ((w) & RK16_CONST_FLAG)
+#define RK16_INDEX(w) ((w) & RK16_INDEX_MASK)
 
 /* type_name_idx / field_name_idx / module_idx / fn_idx / callee_offset / jump targets all get a
    full dedicated 32-bit word wherever this comment appears in the shapes below -- no packing, no
@@ -486,14 +486,14 @@ static inline uint16_t pack_rk16(int rk) {
    whose only two real fields are a register/small-count and one RK16/count16 value (OP_FIELD_SET,
    OP_INDEX_FIELD_SET's obj_reg+rk_idx half). */
 #define PACK_OP_A_W16(op, a, w16)                                                                            \
-    (((uint32_t)(op)&0xFF) | (((uint32_t)(a)&0xFF) << 8) | (((uint32_t)(w16)&0xFFFF) << 16))
+    (((uint32_t)(op) & 0xFF) | (((uint32_t)(a) & 0xFF) << 8) | (((uint32_t)(w16) & 0xFFFF) << 16))
 #define UNPACK_W16(word) (((word) >> 16) & 0xFFFFU)
 
 /* OP_DEFINE_STRUCT's header word: op(8) | name_idx(16) | field_count(8) -- name_idx sits in the
    middle (unlike PACK_OP_A_W16), so it gets its own macro rather than misusing that one. */
 #define PACK_STRUCT_HEADER(name_idx, field_count)                                                            \
-    (((uint32_t)(OP_DEFINE_STRUCT)&0xFF) | (((uint32_t)(name_idx)&0xFFFF) << 8) |                            \
-     (((uint32_t)(field_count)&0xFF) << 24))
+    (((uint32_t)(OP_DEFINE_STRUCT) & 0xFF) | (((uint32_t)(name_idx) & 0xFFFF) << 8) |                        \
+     (((uint32_t)(field_count) & 0xFF) << 24))
 #define UNPACK_STRUCT_HEADER_NAME(word) (((word) >> 8) & 0xFFFFU)
 #define UNPACK_STRUCT_HEADER_COUNT(word) (((word) >> 24) & 0xFFU)
 
@@ -611,7 +611,7 @@ static inline uint16_t pack_rk16(int rk) {
    (Parser.reg_nonneg), so PREP verifies that once here instead of the body checking every index.
    Only reachable when integer overflow defeated the proof -- see 5.16k. */
 #define RANGE_PREP_GUARD_NONNEG 0x80000000u
-#define RANGE_PREP_ITEM_REG(w) ((int)((w)&0xFFu))
+#define RANGE_PREP_ITEM_REG(w) ((int)((w) & 0xFFu))
 
 #define INTERP_MAX_PARTS 16
 
@@ -1071,7 +1071,6 @@ typedef struct {
        the dispatch loop's call path touches this array. */
     AerVal stack[VM_STACK_MAX];
     int stack_top;
-
 
     /* One shared register bank for the whole chain (calls bump a base pointer). Same worst-case
        size as a flat design, but the actually-touched working set is far smaller. */
