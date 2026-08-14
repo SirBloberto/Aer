@@ -2871,6 +2871,34 @@ Both wins in this section came from the same place: a hot loop calling a general
 re-derives what the caller already knows. Neither is exotic, and neither is in the dispatch path
 that most of section 5.16 is about.
 
+### 5.16yq The idiomatic loop form is 15.9% slower, and the obvious fix regressed sieve by 61%
+
+`for i in 0..n` compiles its body to the generic opcodes while the hand-written `i = 0; for i < n`
+gets the unchecked ones, because the parser does not know the range variable's type. Measured on
+identical work (fill then sum a 4M-element `[0i; N]`): **1.257G instructions for the while form,
+1.457G for the range form**. The benchmark suite hides this completely -- it was hand-converted to
+the while form in an earlier sweep, so nothing in `bench/` pays the penalty that ordinary code does.
+
+The type is provable. `OP_ITER_RANGE_PREP` rejects a non-integer bound or step outright and
+publishes a tagged integer; `OP_ITER_RANGE_LOOP` only ever advances it through `.as.i`. So marking
+the loop variable `VAR_RAW_INT` is sound, and it does produce the unchecked body -- verified.
+
+**It still regressed `sieve` by 61.15% and `nbody` by 6.09%, and the reason is worth keeping.**
+Marking the variable typed routes writes to it through the statically-typed assignment paths, and
+those paths never called `invalidate_register` -- only the boxed ones did, because nothing carrying
+a loop-safety proof had ever been statically typed. Two tests caught that immediately
+(`test_range_loop_counter.aer`, `test_loop_bound_hoisting.aer`). Adding the call fixed them and
+caused the regression, because `invalidate_register` also clears `reg_nonneg`, and `sieve`'s inner
+loop advances its index with a compound assignment on every iteration -- so every `j += step` threw
+away the proof that `j >= 0` and forced the checked index path back.
+
+The fix therefore needs a *narrower* signal than `invalidate_register`: a "this slot was written"
+notification that poisons the range-item and safe-loop tracking without touching `reg_nonneg` or
+`reg_elem_kind`. Whether dropping `reg_nonneg` is even required on a compound write is a separate
+question -- `binop_preserves_nonneg` already models which operators keep the property, and the boxed
+path may simply be over-conservative. Answer that before re-attempting; the whole 15.9% depends on
+it, and reverted commit `11afae9` has the working parser change to build on.
+
 ### 5.16yp NaN boxing, including the narrow "just the pointers" version
 
 Raised again once the register file became one array of tagged 16-byte `AerVal`s: the tag is 4 bytes
