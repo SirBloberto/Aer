@@ -2925,6 +2925,59 @@ range-for variable. The two reverted attempts (`11afae9`, `f057a43`) hold the pa
 Both attempts are in the history (`11afae9`, `f057a43`) with their reverts; the parser change itself
 is correct and reusable, and only the index-family decision is missing.
 
+### 5.16yr The tag store costs 8% of mandelbrot on x86, and what removing it actually requires
+
+The merged register file (5.16f) made every unchecked arithmetic opcode write a tag alongside its
+payload. Measured on **Windows x86-64, min-of-7 wall clock**, across the whole migration:
+
+| regressed | | improved | |
+|---|---|---|---|
+| mandelbrot | **+8.39%** | binary_trees | **-6.18%** |
+| nbody_large_packed | +5.77% | small_dict_bench | -4.84% |
+| struct_array_scan | +3.66% | lookup_table_bench | -4.14% |
+| nbody | +3.08% | typed_array_bench | -1.52% |
+| fib_bench | +2.18% | columnar_query | -1.43% |
+| sieve | +0.66% | dict_bench, log_processing | -0.6% |
+
+Every regression is float/numeric-arithmetic dense; every improvement is dict/call/string heavy.
+
+**Measure this on x86 wall clock, not ARM instruction counts.** The migration was tuned on a 32-bit
+armv7l Pi, which called the same window roughly neutral -- instruction counts cannot see an extra
+store, and the Pi is not the target anyway. Use min-of-N wall clock (min, not mean:
+`tools/compare_languages.py` reports means and showed 15.6% spread on mandelbrot, enough to invent
+regressions that are not there).
+
+The cost is exactly one store, confirmed by reading the generated x86:
+
+```
+tagged:        movl  $2, (%rax,%rcx)        payload-only:  movsd %xmm1, 8(%rax,%rcx)
+               movsd %xmm1, 8(%rax,%rcx)
+```
+
+gcc cannot merge them -- a 4-byte tag, 4 bytes of padding, then an 8-byte payload. So there is no
+cheaper encoding of the tagged write; the store has to stop happening. `OP_SET_TAG` (stamp a slot's
+tag, leave its payload alone) plus payload-only arithmetic is on branch `wip-tag-once`, along with
+the debug-build assertion that every payload-only write verifies its destination tag. **What is NOT
+written is the parser side, and that is the whole problem:**
+
+- **Variables are easy and nearly worthless.** A `VAR_RAW_INT`/`VAR_RAW_REAL` slot is committed at
+  `branch_depth == 0` and its defining assignment already writes a full tagged value, so every later
+  write to it can be payload-only with no new mechanism at all. That covers 3 of the 11 unchecked
+  writes in mandelbrot's inner loop -- roughly 1%.
+- **Temps are where the other 8 are, and they need one of two real designs.** Either (a) hoist the
+  stamps into the loop preheader, reusing `hoist_begin`/`hoist_end`'s existing backfill, which needs
+  the parser to know that no *boxed* write to that slot occurs inside the loop -- enumerating every
+  boxed write site is the fragile part; or (b) partition the allocator so a slot used for one raw
+  kind within a function is never reused for another kind or for a boxed value, put the resulting
+  per-slot kind table on `ChunkFunction`, and have frame entry stamp tags from it instead of writing
+  `TYPE_NULL`. (b) is provably safe and costs nothing at runtime -- frame entry already writes every
+  slot's tag -- but it reduces slot reuse, so frames grow. Peak measured need is 70 of 128, so there
+  is headroom.
+
+(b) is the better design. It is also the one that touches the allocator every other proof in the
+parser now depends on, so it wants a session of its own with the assertion build running the whole
+corpus from the first commit.
+
 ### 5.16yp NaN boxing, including the narrow "just the pointers" version
 
 Raised again once the register file became one array of tagged 16-byte `AerVal`s: the tag is 4 bytes
