@@ -4973,7 +4973,13 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     P.function_depth--;
 
     if (!parse_had_error) {
-        /* Implicit 'return null' if control falls off the end. */
+        /* Implicit 'return null' if control falls off the end. Given a slot above everything the
+           body used rather than one recycled from the temp allocator: this instruction usually
+           never executes, and recycling ties a tagged write to a register the hot loop writes
+           unchecked, which forfeits that register's tag elision for the whole function. Costs one
+           register in a frame whose peak was set elsewhere. */
+        if (P.slot_next < P.slot_max)
+            P.slot_next = P.slot_max;
         int rk_null = (int)chunk_add_pool(c, aer_null()) | RK_CONST_FLAG;
         int reg_null = materialize(c, rk_null);
         emit_return(c, reg_null);
