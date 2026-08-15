@@ -63,6 +63,40 @@ def scan(max_block):
     return sorted(found)
 
 
+def dangling_enum_comments():
+    """A comment block inside the Opcode enum that is followed by ANOTHER comment rather than by an
+    opcode. That is what a deleted opcode leaves behind: the enum entry goes, the paragraph
+    explaining it stays, and it then reads as documentation for whichever opcode follows. Three of
+    these had accumulated in vm.h, one describing an opcode removed the same day."""
+    path = os.path.join(ROOT, "source", "core", "vm.h")
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    if "} Opcode;" not in text or "typedef enum {" not in text:
+        return []
+    head = text[: text.index("} Opcode;")]
+    offset = text[: head.index("typedef enum {")].count("\n")
+    lines = head[head.index("typedef enum {"):].splitlines()
+
+    out = []
+    i = 0
+    while i < len(lines):
+        if not lines[i].strip().startswith("/*"):
+            i += 1
+            continue
+        start = i
+        while i < len(lines) and "*/" not in lines[i]:
+            i += 1
+        i += 1
+        j = i
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        if j < len(lines) and lines[j].strip().startswith("/*"):
+            out.append((offset + start + 1, lines[start].strip()[:70]))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max", type=int, default=MAX_BLOCK)
@@ -104,6 +138,15 @@ def main():
             print("  %s:%d  %d lines" % (rel, line, length))
         print("\nSay it in one line, delete it, or make it a _Static_assert. If it genuinely needs")
         print("the space, run: python3 tools/check_comments.py --update-baseline")
+        return 1
+
+    stale = dangling_enum_comments()
+    if stale:
+        print("Comment blocks in the Opcode enum that document no opcode:\n")
+        for line, text in stale:
+            print("  source/core/vm.h:%d  %s" % (line, text))
+        print("\nAn opcode was deleted and its paragraph stayed. Delete it, or attach it to the")
+        print("opcode it actually describes.")
         return 1
 
     print("comment check: clean (%d grandfathered block(s) remaining)" % len(found))
