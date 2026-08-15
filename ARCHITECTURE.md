@@ -2932,7 +2932,7 @@ range-for variable. The two reverted attempts (`11afae9`, `f057a43`) hold the pa
 Both attempts are in the history (`11afae9`, `f057a43`) with their reverts; the parser change itself
 is correct and reusable, and only the index-family decision is missing.
 
-### 5.16yr The tag store costs 8% of mandelbrot on x86, and what removing it actually requires
+### 5.16yr The tag store cost 8% of mandelbrot on x86, and what it took to stop paying it
 
 The merged register file (5.16f) made every unchecked arithmetic opcode write a tag alongside its
 payload. Measured on **Windows x86-64, min-of-7 wall clock**, across the whole migration:
@@ -2964,7 +2964,8 @@ tagged:        movl  $2, (%rax,%rcx)        payload-only:  movsd %xmm1, 8(%rax,%
 gcc cannot merge them -- a 4-byte tag, 4 bytes of padding, then an 8-byte payload. So there is no
 cheaper encoding of the tagged write; the store has to stop happening.
 
-**It was built, measured, and it does not pay.** Branch `tag-once-wip`: unchecked arithmetic writes
+**Three designs are dead ends; the fourth landed.** The three below are recorded so none is
+re-attempted -- each was correct and each was measured. Branch `tag-once-wip`: unchecked arithmetic writes
 payload only, `OP_SET_TAG` stamps a slot's tag, and a debug assertion checks every payload-only write
 against its destination's real tag. Correctness reached **0 assertion trips across all 64 bench and
 test programs, 64/64 byte-identical, `make test` green**. Then measured against `feature` (Windows,
@@ -2990,9 +2991,33 @@ The programs are still wrong, and the assertion cannot see it, because every wri
 typed -- just to the wrong register. `OP_CALL` requires its arguments in CONSECUTIVE registers, and
 `arg_materialize` builds that run one `reg_alloc` at a time; one skip mid-run leaves a hole and the
 callee reads an unrelated slot. **Kind-immutable slots and contiguous argument runs cannot both come
-out of a single ascending watermark.** Satisfying both puts raw temps in a region of their own, whose
-base must sit above the dynamic peak -- which is not known until the body has been compiled. That is
-a two-pass compile of every function body, for a ceiling of the ~8% above on two benchmarks.
+out of a single ascending watermark.**
+
+**Two observations close it, and neither needs a second pass.** First, only the REAL opcodes are
+worth converting: integers keep writing their tag, which halves the slots involved and leaves the
+ordinary allocator untouched. Second, a region whose base must be known before the body compiles can
+be anchored to the TOP of the frame instead of above the dynamic peak -- reals grow down,
+everything else grows up, and the two meet in the middle exactly as one watermark met
+`FRAME_REGISTERS` before. Nothing is capped and nothing is renumbered.
+
+A body claiming any real slot then needs a full-size frame, since those slots sit at its top. Paid
+naively that costs more than the tag store saves -- nbody went **+8.64%** from tagging all 128 slots
+on every call. `ChunkFunction.frame_bounds` names the two edges of the gap a full-size frame leaves;
+the gap is never written, tagged or traced, so frame entry and the collector cost what they did
+before, and nbody's +8.64% becomes -1.35%.
+
+Final, median over an 8-build layout ensemble (a single build swings +-6% here, which is larger than
+the effect -- see 5.16yd): mandelbrot **-6.15%**, typed_array_bench -2.05%, nbody_large_packed
+-1.64%, nbody -1.35%, fib_bench -3.16%. The isolated effect of the tag store alone, holding the
+allocator constant, is -5.3% on mandelbrot and -5.1% on nbody_large_packed, against a control group
+of benchmarks that never execute those opcodes at **+0.07%** -- which is what makes the rest of the
+column believable.
+
+fib_bench is the reason to keep a control group. It has no real slots and cannot benefit, yet it
+first measured **+2.58%** on all 8 layouts: `frame_init_tags` was taking the frame size purely to
+bound a loop over real slots, which only a full-size frame has. Running that loop to
+`FRAME_REGISTERS` unconditionally is identical work and one fewer argument per call, and fib went to
+-3.16% -- the call path ended up cheaper than before the change.
 
 Five domination bugs surfaced on the way, every one caught by the assertion rather than by a wrong
 answer, and all five worth expecting if this is ever revisited: `retarget_raw_write` rewriting an
