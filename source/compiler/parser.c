@@ -5,21 +5,14 @@
 #include "error.h"
 #include "lexer.h"
 
-/* Per-variable storage kind. VAR_BOXED means nothing is known about the value's type;
-   VAR_RAW_INT/REAL means it is statically known, earned only when a name's first assignment is provably
-   int/real (rk_raw_kind), only inside a function body, and only outside any if/else branch
-   (P.branch_depth == 0 -- a name assigned different types down mutually-exclusive branches can't
-   be resolved without real dataflow analysis). Transitions are one-way: RAW_* can shadow to
-   VAR_BOXED on a mismatch; VAR_BOXED never promotes to RAW_*. */
+/* VAR_RAW_* is earned by a name whose first assignment is provably int/real outside any branch,
+   and is lost on a mismatch; VAR_BOXED never promotes back. */
 typedef enum { VAR_BOXED, VAR_RAW_INT, VAR_RAW_REAL } VarKind;
 
 /* Nothing emitted yet at a tracked offset -- see Parser.last_cmp_offset / last_interp_offset. */
 #define NO_OFFSET ((unsigned int)-1)
 
-/* A call to a not-yet-registered name is optimistically assumed to be defined later in this
-   same parse() call -- recorded here with a placeholder already emitted; func_register patches
-   every pending entry once that name registers. Still-pending entries at parse()'s end were
-   never defined anywhere in this call. */
+/* A call to a name not yet registered, patched once parse() has seen the whole file. */
 typedef struct {
     unsigned int name_idx;
     unsigned int patch_offset;
@@ -42,11 +35,9 @@ typedef struct {
     int continue_patch_count;
 } LoopContext;
 
-/* A literal inside a loop is re-materialised every iteration, because the raw slot it lands in is
-   clobbered by whatever consumes it. Each loop reserves a preheader gap up front and fills it once
-   the body is parsed; uses need no rewriting, since the parser already knows the hoisted slot when
-   it emits the instruction that reads it. HOIST_MAX loads exactly fill the gap, so a loop using
-   fewer skips the rest with one OP_JUMP -- paid per loop ENTRY, against a load per ITERATION. */
+/* A literal in a loop would reload every iteration, since whatever consumes its slot clobbers it.
+   Each loop reserves a preheader gap up front and fills it once the body is known; HOIST_MAX loads
+   fill the gap exactly, so a loop using fewer skips the rest with one OP_JUMP. */
 #define HOIST_MAX 4
 #define HOIST_GAP_WORDS (HOIST_MAX * 2)
 typedef struct {
@@ -74,9 +65,8 @@ typedef enum { RAWK_NONE, RAWK_INT, RAWK_REAL } RawKind;
 /* Every mutable global the compile functions share. P (below) is the live instance;
    parser_save_state/restore_state snapshot it wholesale for a nested compile. */
 typedef struct Parser {
-    /* slot_next is the next free temp; anything below slot_floor is a variable's permanent slot and
-       must never be handed out as scratch. slot_max is the watermark, read back after a body
-       compiles but before its restore runs, since both counters shrink again as temps free. */
+    /* slot_next is the next free temp, slot_floor the line below which slots belong to variables.
+   slot_max is read back after a body compiles, before its restore, since both shrink again. */
     int slot_next;
     int slot_floor;
     int slot_max;
@@ -96,31 +86,24 @@ typedef struct Parser {
     /* Per-variable storage kind -- see VarKind's own comment above. */
     VarKind var_kind[FRAME_REGISTERS];
 
-    /* Shape-specializing compilation (see vm_call_resolve_specialization, vm.c) -- tracks which of the CURRENT
-       function's parameters have been used as the base of a struct-field access, directly or
-       through a one-hop plain-local alias. See mark_shape_sensitive's own comment for how these
-       three fields work together. */
+    /* Which of this function's parameters were used as the base of a struct-field access, directly or
+   through a one-hop alias. See mark_shape_sensitive for how the three work together. */
     bool shape_sensitive_param[FRAME_REGISTERS];
     int current_param_count;
     int alias_source_param[FRAME_REGISTERS]; /* -1 = no known alias */
-    /* Populated ONLY during a specialization recompile -- see reg_known_shape's original
-       standalone comment (git blame) for the full mechanism; consulted at '.field'/'[idx].field'
-       emission sites to skip the generic runtime field-resolution path entirely. */
+    /* Set only during a specialization recompile, and read at field-access sites to skip the generic
+   runtime resolution. */
     Shape* reg_known_shape[FRAME_REGISTERS];
-    /* True when this register is PROVEN to hold a value >= 0 -- a non-negative literal, a loop
-       index already bounded by its array, a length(), or those combined with + * // %. Read by
-       the range-for bounds proof to accept a computed start. Conservative in one direction only:
-       a false negative just declines an optimisation, and a false POSITIVE is caught at runtime
-       by OP_ITER_RANGE_PREP's cur >= 0 guard, so this can never be a safety hole. */
+    /* Proven >= 0: a non-negative literal, a bounded loop index, a length(), or those combined with
+   + * // %. Wrong in one direction only -- a false positive is caught at runtime by
+   OP_ITER_RANGE_PREP's own guard, so it can never be a safety hole. */
     bool reg_nonneg[FRAME_REGISTERS];
     Shape* reg_known_element_shape[FRAME_REGISTERS];
-    /* Element kind of a typed array a register is known to hold, or RAWK_NONE. Only ever set from
-       a `[numeric; count]` literal, whose element kind is a parse-time fact, so a read can go
-       straight to a raw slot instead of boxing. Cleared wherever the register's identity is. */
+    /* Element kind of a typed array a register holds, from a `[numeric; count]` literal -- a
+   parse-time fact, so the read can go straight to a raw slot. */
     RawKind reg_elem_kind[FRAME_REGISTERS];
-    /* Side-channel from the plain index-get site to parse_assignment's plain '=' handler -- see
-       last_plain_index_dest_reg's original standalone comment (git blame) for why this is keyed
-       on exact register-number equality rather than a syntactic flag. */
+    /* Side channel from the index-get site to parse_assignment, keyed on exact register equality
+   rather than a flag. */
     int last_plain_index_dest_reg;
     int last_plain_index_src_param;
     Shape* last_plain_index_known_elem_shape;
@@ -129,26 +112,21 @@ typedef struct Parser {
        see parse_for_body for why the body must not be allowed to claim one of these. */
     int loop_cond_peak;
 
-    /* Offset of the last single-word comparison emitted, or NO_OFFSET. Lets emit_cond_jump_if_false
-       tell "the condition ends in a comparison" from "a word that happens to look like one" --
-       instruction lengths vary, so the last word cannot be identified by reading backwards. */
+    /* The last comparison emitted, so emit_cond_jump_if_false can tell one from a word that merely
+   looks like one -- instruction lengths vary, so it cannot be found by reading backwards. */
     unsigned int last_cmp_offset;
 
-    /* Offset of the last raw arithmetic instruction emitted, plus the temp slot it wrote and that
-       slot's kind -- lets an assignment retarget it at the variable's own slot instead of following
-       it with a move. patch_epoch counts backpatches: a jump landing between the two would make the
-       arithmetic conditional while the move it replaces was not, so an unchanged epoch is what
-       proves the retarget safe. */
+    /* The last raw arithmetic emitted, so an assignment can retarget it at the variable's own slot
+   instead of following it with a move. patch_epoch counts backpatches: a jump landing between the
+   two would make the arithmetic conditional when the move was not. */
     unsigned int raw_write_offset;
     int raw_write_slot;
     RawKind raw_write_kind;
     unsigned int raw_write_epoch;
     unsigned int patch_epoch;
 
-    /* How many times the body being compiled had to reach for a raw-vs-BOXED opcode -- a raw local
-       composed with a value the compiler could not prove numeric. Nonzero means binding this
-       function's numeric parameters as raw locals would turn real work raw, which is the whole
-       trigger for a numeric specialization (see SHAPE_MASK_NUMERIC_ONLY, vm.h). */
+    /* Raw-vs-boxed opcodes reached for in this body. Nonzero means binding its numeric parameters raw
+   would turn real work raw, which is the trigger for a numeric specialization. */
     unsigned int raw_boxed_emits;
 
     /* Index of the function whose body is compiling, and whether that body calls itself. A

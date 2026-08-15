@@ -53,6 +53,15 @@ ifdef THREADS
     THREAD_FLAGS := -DAER_HEAP_REF_TLS -pthread
 endif
 
+# Toggling THREADS changes a type's storage class without changing any file, so make would happily
+# link objects built both ways -- which fails at LTO if you are lucky and misbehaves if you are not.
+# This stamp changes whenever the setting does, and every object depends on it.
+THREAD_STAMP := object/.threads-$(if $(THREADS),on,off)
+$(THREAD_STAMP):
+	@mkdir -p object
+	@rm -f object/.threads-on object/.threads-off
+	@touch $@
+
 FLAGS := -O2 -g -flto -Wall -Wextra -DAER_BUILD_REV=\"$(BUILD_REV)\" $(PIN_FLAGS) $(ARCH_FLAGS) $(THREAD_FLAGS) -I include -I source -I source/compiler -I source/core -I source/debug -I source/repl -I source/runtime -I source/stdlib -I source/utilities
 
 SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/debug/*.c source/repl/*.c source/runtime/*.c source/stdlib/*.c source/utilities/*.c)
@@ -70,7 +79,7 @@ all: $(OBJECT)
 	@mkdir -p binary object
 	gcc $(FLAGS) -o binary/aer$(EXE) $^ -lm $(WINLIBS)
 
-object/%.o: source/%.c $(HEADERS)
+object/%.o: source/%.c $(HEADERS) $(THREAD_STAMP)
 	@mkdir -p $(dir $@)
 	gcc $(FLAGS) -c $< -o $@
 
