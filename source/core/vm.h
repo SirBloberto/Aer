@@ -340,10 +340,9 @@ typedef enum {
     OP_INDEX_SET_RAW_REAL, /* arr_reg, rk_idx, raw_real_slot */
     OP_INDEX_GET_RAW_REAL, /* raw_real_slot, arr_reg, rk_idx */
 
-    /* Same variant, so the frame is the caller's own size and entry point and no resolver runs.
-       Without it a self-recursive function re-resolves its specialization on every call, costing
-       more than specializing saved. Emitted only INTO a variant: a generic body must keep resolving
-       or it never specializes at all. */
+    /* Same variant, so the frame is the caller's own and no resolver runs -- without it a recursive
+       function re-resolves every call, costing more than specializing saved. Emitted only INTO a
+       variant: a generic body must keep resolving or it never specializes at all. */
     OP_CALL_SELF, /* dest_reg, arg_reg_base, arg_count */
 
     /* Only the functions aer_math_fn_is_raw_real accepts -- floor/ceil/round return integers. */
@@ -353,33 +352,26 @@ typedef enum {
     OP_RAW_INT_TO_REAL,
     OP_RAW_REAL_TO_INT,
 
-    /* Builds one string from N parts in a single allocation. `"key_{n}"` used to compile to
-       OP_LOADK + OP_TO_STR + OP_ADD -- three dispatches and two AerStrings, the second immediately
-       garbage. Each part is a whole trailing word holding an RK16, so a constant segment needs no
-       OP_LOADK and a non-string part is formatted straight into the result rather than through a
-       throwaway string. Variable-length like OP_DEFINE_STRUCT: header word, then part_count words.
-       Parts beyond INTERP_MAX_PARTS fall back to the old chain (parse_string_literal). */
+    /* One string from N parts in one allocation: each part is a trailing RK16 word, so a constant
+       segment needs no OP_LOADK and a non-string part formats straight into the result. Variable
+       length like OP_DEFINE_STRUCT. Past INTERP_MAX_PARTS, parse_string_literal chains instead. */
     OP_INTERP, /* word0: dest_reg, part_count -- then part_count words, each one RK16 */
 
-    /* `dict["key_{n}"]` read: formats the key into a stack buffer, hashes and probes with it, and
-       never builds the AerString at all -- the string existed only to be hashed and discarded, and
-       hashtable_get_hashed already takes raw bytes. Falls back to OP_INTERP's builder plus the
-       general index path whenever the fast route cannot apply (non-dict receiver, a part that is
-       itself a collection, or a key past INTERP_KEY_MAX). Same operand shape as OP_INTERP. */
+    /* `dict["key_{n}"]` read: formats the key into a stack buffer and probes with the raw bytes,
+       never building the AerString that existed only to be hashed. Falls back to OP_INTERP plus the
+       general index path for a non-dict receiver, a collection part, or a key past INTERP_KEY_MAX. */
     OP_INDEX_GET_INTERP, /* word0: dest_reg, obj_reg, part_count -- then part_count RK16 words */
 
     OP_OPCODE_COUNT_MARKER /* not a real opcode -- sizes the static assert below */
 } Opcode;
 _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — widen the opcode field");
 
-/* RK bit: set = constant-pool index, clear = register (Lua's BITRK convention). This is the
-   COMPILE-TIME-internal representation the parser passes around; never emitted directly into the
-   instruction stream -- every emission site converts it to one of the WIRE encodings below. */
+/* Set = constant-pool index, clear = register (Lua's BITRK convention). Parser-internal: every
+   emission site converts it to one of the wire encodings below. */
 #define RK_CONST_FLAG (1 << 30)
 
-/* Compiler-internal raw-slot tags (bits 28/29) -- never emitted into an instruction word. They say
-   what a slot's STATIC type is, so the parser can pick an unchecked opcode; they no longer name a
-   separate bank, since every slot is an AerVal in the one register file. */
+/* Parser-internal too: a slot's static type, so the parser can pick an unchecked opcode. Not a
+   separate bank -- every slot is an AerVal in the one register file. */
 #define RK_RAW_INT_FLAG (1 << 29)
 #define RK_RAW_REAL_FLAG (1 << 28)
 #define RK_RAW_SLOT_MASK 0x7F
@@ -388,12 +380,11 @@ _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — 
    headroom to spare -- see RK8 below. */
 #define FRAME_REGISTERS 128
 
-/* Real-typed slots grow DOWN from the top of the frame while everything else grows up, so their
-   position is fixed before a body compiles -- which a 7-bit register operand needs, and a
-   per-function size could never give. Frame entry can then tag them once and the unchecked real
-   opcodes store only the payload. A body using any gets a full-size frame; FRAME_BOUNDS names the
-   two edges of the gap that leaves, which is never written, tagged or traced, so the full size
-   costs nothing. Integers need none of this -- their unchecked opcodes still write the tag. */
+/* Real-typed slots grow DOWN from the top of the frame, everything else up, so their position is
+   fixed before a body compiles -- which a 7-bit operand needs and a per-function size cannot give.
+   Frame entry tags them once and the unchecked real opcodes then store only the payload. Such a body
+   gets a full-size frame; FRAME_BOUNDS names the gap that leaves, never written, tagged or traced.
+   Integers need none of this -- their unchecked opcodes still write the tag. */
 #define FRAME_BOUNDS(dyn_end, real_base) ((unsigned short)(((dyn_end) << 8) | (real_base)))
 #define FRAME_DYN_END(bounds) ((unsigned int)((bounds) >> 8))
 #define FRAME_REAL_BASE(bounds) ((unsigned int)((bounds) & 0xFF))
@@ -503,26 +494,19 @@ struct Shape {
     /* TYPE_ANY = no declared type. A declared type is enforced once at FIELD_SET/construction,
        then trusted -- the fused opcodes skip the runtime check on that side. */
     ValueType field_types[MAX_STRUCT_FIELDS];
-    /* True for an int/real field whose default carried an `i`/`f` suffix, selecting 4-byte storage
-       instead of 8. Works the same for a plain instance or a packed-array element, since every
-       access uses shape->instance_bytes as the stride. Meaningless for any other field kind. */
+    /* An int/real field whose default carried an `i`/`f` suffix: 4-byte storage instead of 8.
+       Meaningless for any other field kind. */
     bool field_narrow[MAX_STRUCT_FIELDS];
-    /* Byte offset of each field within an instance's fields buffer (AerStruct.fields) -- a typed
-       field (TYPE_ANY excluded) is stored RAW in 8 bytes (no tag; the type is this Shape's own
-       static knowledge, never read from the instance) unless field_narrow marks it 4 instead, an
-       untyped (TYPE_ANY) field stays a full boxed AerVal (16 bytes), since it can hold any value
-       including a reference type the GC must trace. Computed once in OP_DEFINE_STRUCT's handler,
-       right after field_types/field_narrow are known. See vm_struct_field_read. */
+    /* Offset into AerStruct.fields. A typed field is stored raw -- 8 bytes, or 4 if field_narrow,
+       with the type known from this Shape rather than the instance. A TYPE_ANY field stays a boxed
+       16-byte AerVal, since it can hold a reference the GC must trace. */
     unsigned int field_offsets[MAX_STRUCT_FIELDS];
     unsigned int instance_bytes; /* total size of the fields buffer -- sum of every field's width above */
 };
 
-/* A single struct instance -- its own type (TYPE_STRUCT), split out from AerArray specifically
-   because sharing one C type/tag for "ordinary array" and "struct instance" meant every site
-   handling TYPE_ARRAY had to remember to ask "but what if this is actually a struct" (one real
-   site didn't -- for-x-in iteration silently walked a struct's fields with no shape check at all).
-   No count/capacity: a struct's field count is always shape->field_count, fixed, never grows --
-   carrying them the way the old shared AerArray design did was already dead weight. */
+/* Its own type rather than an AerArray with a shape: sharing one tag meant every TYPE_ARRAY site
+   had to ask "but what if this is a struct", and one didn't -- for-in iteration walked a struct's
+   fields unchecked. No count/capacity either; a struct's field count is always shape->field_count. */
 struct AerStruct {
     unsigned char gc_state; /* byte 0, same pool.c convention as every other pool-managed type */
     Shape* shape;
@@ -531,16 +515,12 @@ struct AerStruct {
 };
 _Static_assert(offsetof(struct AerStruct, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* Reads/writes one struct field at its own byte offset -- raw (untagged, vm_packed_slot_read's
-   scheme) for a typed field, a full boxed AerVal for a TYPE_ANY one. Shared by every struct-field
-   opcode in vm.c plus json.encode's struct-serialization branch (aer_json.c), which is why these
-   aren't file-static. */
+/* One field at its own offset: raw for a typed field, a boxed AerVal for TYPE_ANY. Not file-static
+   -- json.encode serializes structs through it too. */
 AerVal vm_struct_field_read(AerStruct* s, unsigned int slot);
 
-/* Byte width of one element: 4 for int32/float32, 8 for int64/float64. Not file-static -- gc.c's
-   free_typed_array needs it too, to recompute a dying typed array's data-buffer size (count is
-   already on the struct; the byte width isn't) before deciding whether it qualifies for the
-   free-cache above. */
+/* 4 for int32/float32, 8 for int64/float64. Not file-static: gc.c's free_typed_array recomputes a
+   dying array's buffer size from it. */
 unsigned int vm_typed_elem_width(TypedArrayElemKind kind);
 
 /* Which runtime shape a shape-sensitive parameter arrived as. STRUCT and PACKED_ARRAY carry a
@@ -607,24 +587,18 @@ typedef struct {
    mask rather than a field of its own so lbl_call's gate stays the one already-fetched test it is;
    parameter bits are capped at 31 to keep the top one free. */
 #define SHAPE_MASK_NUMERIC_ONLY (1u << 31)
-    /* Calls seen so far, counted only for a numeric-only function and only until it specializes.
-       Compiling a variant re-parses the body, so doing it on the first call is a straight loss for
-       a function called once -- and a file of many small functions each called once is a realistic
-       shape, not a contrived one (bench/compile_bound.aer). */
+    /* Counted only for a numeric-only function, only until it specializes. A variant re-parses the
+       body, so specializing on the first call loses outright for a function called once -- which
+       bench/compile_bound.aer is a whole file of. */
     unsigned int numeric_call_count;
 #define NUMERIC_SPECIALIZE_AFTER 16
-    /* Owned copy of the source text spanning from '(' through the end of the body -- NULL unless
-       shape_sensitive_mask != 0. Needed to re-invoke the parser later (long after the original
-       parse() call returned) with a specific parameter's Shape substituted in as compile-time-known.
-       An owned copy, not a retained lexer pointer: the REPL/aer_run_source path frees and replaces
-       its one static source buffer on the NEXT call, which would dangle a raw pointer the instant
-       a second such call happens -- exactly when a lazy specialization might fire. */
+    /* '(' through the end of the body, for re-invoking the parser long after parse() returned.
+       NULL unless shape_sensitive_mask != 0. Owned, not a lexer pointer: aer_run_source replaces its
+       one source buffer on the next call, which is exactly when a lazy specialization might fire. */
     char* source_span;
     unsigned int source_span_len;
-    /* Absolute source line the span's first character ('(') sits on -- passed to lexer_begin_span
-       so a specialization recompile's bytecode gets tagged with true source line numbers instead
-       of ones relative to the span's own start (a real bug: an error inside a specialized body used
-       to report a line number offset by however many lines precede the function in its file). */
+    /* Absolute line of the span's first character, so a recompile's bytecode carries true line
+       numbers rather than ones relative to the span (an error inside a variant used to misreport). */
     unsigned int source_span_line;
     /* Small, bounded table of already-compiled specialized bodies, keyed by the shape observed for
        this function's shape-sensitive parameter(s). Checked (via the call site's own
@@ -647,41 +621,29 @@ typedef struct {
    above chunk_emit_word/read_word (vm.c). */
 /* ------------------------------------------------------------------ */
 
-/* One per-callsite field-cache entry -- see Chunk.field_cache's own comment below. Caches offset
-   and ftype alongside slot, not just slot: both are pure functions of (shape, slot), so once the
-   shape comparison confirms a cache hit, re-deriving them from shape->field_offsets[slot]/
-   field_types[slot] on every single access was a second, avoidable indirection through Shape --
-   this makes a cache hit read them from the entry itself (already touched for the shape check)
-   instead. */
+/* offset/ftype/narrow are pure functions of (shape, slot), cached here so a hit reads them from the
+   entry it already touched for the shape check rather than indirecting through Shape again. */
 typedef struct {
     Shape* shape;
     int slot;
     unsigned int offset;
     ValueType ftype;
-    bool narrow; /* same reasoning as offset/ftype above -- cached, not re-derived from shape */
+    bool narrow;
 } FieldCacheEntry;
 
-/* One per-callsite specialization-dispatch cache entry (lbl_call) -- same monomorphic-inline-
-   cache idea as FieldCacheEntry above: the last shape seen AT THIS CALL SITE, checked before
-   falling into the callee's own (function-wide) SpecEntry table on a miss. last_shape == NULL
-   means never populated. */
+/* The last shape seen at ONE call site, checked before falling into the callee's function-wide
+   SpecEntry table. NULL last_shape = never populated. */
 typedef struct {
     Shape* last_shape;
     unsigned int last_code_offset;
     unsigned int last_max_registers;
     unsigned short last_frame_bounds;
-    /* ARRAY_OF_STRUCTS only: the array (by pointer) and AerArray.generation at the last successful
-       homogeneity scan. A later call with both unchanged can skip re-scanning. NULL/0 means never
-       verified; only ever set on a scan that fully succeeded, so a failed one never poisons a
-       later genuinely-uniform call. */
+    /* ARRAY_OF_STRUCTS only: the array and its generation at the last homogeneity scan that fully
+       succeeded, so a failed scan never poisons a later genuinely-uniform call. */
     AerArray* last_verified_array;
     unsigned int last_verified_generation;
-    /* Direct pointer into target_f->specializations[] for whichever SpecEntry last_shape matched --
-       lets a site-cache HIT still reach that entry's raw-numeric-variant fields (raw_param_regs/
-       types, raw_variant_code_offset, ...) without needing its own full duplicate of them here.
-       Stable for the chunk's life once set: SpecEntry lives inside a FIXED-SIZE array
-       (ChunkFunction.specializations[SPEC_MAX], never reallocated/grown), the same stability
-       assumption lbl_call already relies on for target_f itself across a specialization recompile. */
+    /* Which SpecEntry last_shape matched, so a hit here can still reach that entry's raw-variant
+       fields. Stable for the chunk's life: specializations[] is fixed-size and never reallocated. */
     SpecEntry* last_entry;
 } CallSpecCacheEntry;
 
@@ -737,12 +699,10 @@ typedef struct {
     CallSpecCacheEntry* call_spec_cache;
     unsigned int call_spec_cache_cap;
 
-    /* Struct-name -> Shape*, keyed by the name's POOL index rather than the call site, since
-       chunk_add_pool dedups strings and every site building the same struct shares that index.
-       Without it every single struct construction re-ran chunk_find_shape's newest-first scan with
-       a strcmp per shape -- 1.63% of bench/binary_trees.aer was strcmp alone. Cleared wholesale
-       when a shape is registered (a redeclare must not keep resolving to the older Shape); struct
-       definitions are rare and constructions are not, which is the whole trade. */
+    /* Struct-name -> Shape*, keyed by POOL index: chunk_add_pool dedups strings, so every site
+       building the same struct shares one. Replaces a newest-first scan with a strcmp per shape,
+       which was 1.63% of binary_trees. Cleared wholesale when a shape is registered, so a redeclare
+       cannot keep resolving to the old one -- definitions are rare, constructions are not. */
     Shape** shape_by_name;
     unsigned int shape_by_name_cap;
 
@@ -920,20 +880,16 @@ typedef struct {
 
     Chunk* chunk;
     unsigned int ip;
-    /* Where the currently-executing instruction is, for runtime error line lookup ONLY. A pointer
-       rather than an offset because vm_run_slice writes it at every site that can raise, and an
-       offset would force `code` to stay live across all of them just to do the subtraction. `ip`
-       stays the offset: it is what SURVIVES, across a yield/resume and across the reparse a REPL
-       line performs in between, which would leave any stored pointer dangling. */
+    /* For runtime error line lookup only. A pointer, not an offset: vm_run_slice writes it at
+       every site that can raise, and an offset would keep `code` live across all of them. `ip`
+       stays an offset because it must survive a yield/resume and a REPL reparse in between. */
     const uint32_t* error_pc;
 
     /* This VM's own heap -- every pool it allocates from, independent of every other VM's. */
     VmHeap heap;
 
-    /* Per-VM capability toggles, seeded from the process-wide aer_io_enabled/aer_net_enabled
-       defaults at vm_init AND every aer_run_source call (the REPL/embedding "run more code into an
-       existing VM" entry point) -- see those externs' own comment below for why io/net moved here
-       but import_enabled didn't. */
+    /* Seeded from the process-wide defaults at vm_init and at every aer_run_source call, so the
+       documented "toggle off, run one thing, toggle back" pattern works on an existing VM. */
     bool io_enabled;
     bool net_enabled;
 
@@ -1055,11 +1011,9 @@ typedef enum {
     VM_SLICE_ERROR, /* runtime error, same as vm_run's false */
 } VmSliceResult;
 
-/* vm_run(vm) is exactly vm_run_slice(vm, 0) -- 0 means unlimited, the only budget every caller but
-   the scheduler (aer_scheduler.c) ever passes. A nonzero budget bounds how many loop-back-edges and
-   calls this call executes before returning VM_SLICE_YIELDED with vm->ip left at a valid resume
-   point; calling vm_run_slice again on the same VM continues exactly where it left off, the same
-   way vm_run already resumes from wherever vm->ip points (main.c's REPL already relies on this). */
+/* 0 = unlimited, which is what every caller but the scheduler passes. A nonzero budget counts loop
+   back-edges and calls, then returns VM_SLICE_YIELDED with vm->ip at a valid resume point; calling
+   again continues from there. */
 VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions);
 
 /* A counter, not a flag -- imports/module-calls nest. Operates on whichever heap is current (see
@@ -1074,43 +1028,34 @@ void vm_gc_unsuppress(void);
    0 -- after the trampoline drains, the result is in call_stack[0].registers[0]. */
 bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsigned int return_ip);
 
-/* Returns an uninitialized AerArray header from vm.c's internal slab pool, as if xmalloc'd directly (every in-file vm.c site still uses pool_alloc); exposed only because aer_stdlib.c's string.split() needs one and the pool isn't a raw global outside vm.c. */
+/* Uninitialized AerArray header from vm.c's slab pool -- exposed for string.split(). */
 AerArray* vm_new_array(void);
 
-/* Same idea, for AerDict -- exposed for aer_json.c's json.decode(); caller must zero-init map itself (see lbl_dict_new's call site in vm.c). */
+/* Same, for AerDict -- exposed for json.decode(). The caller must zero-init `map` itself. */
 AerDict* vm_new_dict(void);
 
-/* Generational-GC write barrier -- any store of `new_value` into an already-existing array must go
-   through this (see gc_barrier_array's own comment, gc.c). `index` is the exact slot being written
-   -- it feeds card marking, so a later minor GC only has to rescan indices actually dirtied since
-   the last cycle rather than the whole array. Exposed for aer_collection.c's append/insert; a
-   freshly built, not-yet-returned array needs no barrier. */
+/* Every store into an already-existing array goes through this. `index` feeds card marking, so a
+   minor GC rescans only the slots dirtied since the last cycle. A freshly built, not-yet-returned
+   array needs no barrier. */
 void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value);
 
-/* Same contract as gc_barrier_array, for a struct field-set -- AerStruct is its own type/pool now,
-   not a shaped AerArray, so it needs its own barrier rather than gc_barrier_array's old
-   shape-ternary dispatch. No index/card-marking parameter -- see gc_barrier_struct's own comment
-   (gc.c) for why a struct's small, fixed field count doesn't need it. */
+/* Same, for a struct field-set. No index: a struct's field count is small and fixed, so there is
+   nothing for card marking to save. */
 void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value);
 
-/* Same contract, for a dict entry (update-in-place and new-entry paths) -- vm.c's vm_call_builtin
-   is the only caller outside gc.c itself. `index` is the entry's DENSE index (map.dense[index]) --
-   see gc_barrier_dict's own comment (gc.c) for how the caller resolves this before the actual
-   hashtable write. */
+/* Same, for a dict entry. `index` is the DENSE index, which the caller resolves before the write. */
 void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value);
 
-/* Both defined in gc.c; called from vm.c's gc_maybe_collect (the tiny, always_inline gatekeeper
-   checked once per DISPATCH()) once the rare threshold-crossing case actually happens, and from
-   aer_gc_stats (embedding-facing introspection) respectively. */
+/* Called from vm.c's gc_maybe_collect once the threshold is actually crossed, and from
+   aer_gc_stats, respectively. gc_maybe_collect runs at hand-placed points in the allocating
+   opcodes, not on every dispatch. */
 unsigned int gc_count_live_cells(VmHeap* heap);
 void gc_run_collection_cycle(VM* vm);
 
-/* Frees every live cell's own separately-owned payload across all 7 pools, regardless of mark/
-   generation state -- vm_free's one call site, whole-heap teardown (not a normal sweep). */
+/* Whole-heap teardown, not a sweep: frees every live cell's payload regardless of mark state. */
 void gc_finalize_all_pools(VmHeap* heap);
 
-/* Structural/reference equality with no error path (see its comment in vm.c) -- exposed for
-   aer_collection.c's index_of, the same scan OP_IN's array case uses. */
+/* Structural/reference equality, no error path -- the same scan OP_IN's array case uses. */
 bool values_equal(AerVal a, AerVal b);
 
 /* Must come from function_pool (pool_mark's slab lookup fails on xmalloc'd cells); returns
