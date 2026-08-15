@@ -762,18 +762,10 @@ static bool index_safe_unchecked(int arr_reg, int idx_rk) {
     return false;
 }
 
-/* Call at every site that changes what `reg` holds. Poisons any safe_loop_item/array_regs entry
-   keyed on reg as EITHER the index or the array -- missing the array half means trusting a
-   register number regardless of what it now holds, an out-of-bounds read through the _UNCHECKED
-   opcodes, which have no runtime check to fall back on. Overwrites with -1 rather than removing,
-   so parse_for_in's push/pop depth counting is untouched and a dead slot can never be resurrected.
-   The length_tracked_valid and range_item_written updates ride along for the same reason. */
-/* Everything invalidate_register does EXCEPT clearing reg_nonneg, for the statically-typed write
-   paths. Those never invalidated anything at all before loop variables could be typed, so their
-   slots have always carried a surviving non-negativity proof -- and clearing it outright costs
-   sieve 61%, whose inner loop re-derives its index with a compound assignment every iteration.
-   emit_binary recomputes the proof rather than dropping it (see its own reg_nonneg line); these
-   paths simply keep it, which is exactly what they did before. */
+/* Poisons what a write invalidates about a slot's CONTENTS, keyed on reg as either the index or
+   the array half -- the _UNCHECKED opcodes have no runtime check to fall back on. Entries are
+   overwritten with -1, not removed, so parse_for_in's push/pop depth counting is untouched.
+   Deliberately leaves reg_nonneg alone; see ARCHITECTURE 5.16yq for what clearing it cost. */
 static void note_slot_written(int reg) {
     if (reg < 0)
         return;
@@ -792,6 +784,7 @@ static void note_slot_written(int reg) {
             P.range_item_written[i] = true;
 }
 
+/* note_slot_written plus the non-negativity proof, for writes that could produce any value. */
 static void invalidate_register(int reg) {
     if (reg < 0)
         return;
@@ -3861,18 +3854,12 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
     if (parse_had_error)
         return;
 
-    /* The back-edge re-runs the condition, so every temp the condition writes is rewritten on each
-       iteration. Those registers are ordinarily freed the moment the condition is compiled, which
-       would let a shadowing assignment in the body ('total = f()' rebinding a raw local to a fresh
-       boxed register) claim one as a permanent variable and have the next condition evaluation
-       silently overwrite it. Holding the floor above them for the body's duration prevents that. */
-    /* loop_top doubles as cond_start here -- it's already exactly "the bytecode offset the
-       condition's own first instruction starts at" (the same reason the loop's own back-edge
-       jumps there to re-evaluate the condition each iteration). Emitted BEFORE the floor is
-       raised below: its compare/branch fusion only fires when the preceding LOADK's destination is
-       a temp, so raising the floor first would silently disqualify every such loop. */
+    /* Emitted BEFORE the floor is raised below: the compare/branch fusion only fires when the
+       preceding LOADK wrote a temp, and raising the floor first disqualifies every such loop. */
     unsigned int patch_exit = emit_cond_jump_if_false(c, rk_cond, loop_top);
 
+    /* The back-edge re-runs the condition, so holding the floor above the temps it writes stops a
+       shadowing assignment in the body from claiming one as a permanent variable. */
     int saved_floor = P.slot_floor;
     int raised_floor = saved_floor;
     if (P.loop_cond_peak > P.slot_floor) {

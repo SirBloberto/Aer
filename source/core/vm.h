@@ -95,11 +95,8 @@ typedef enum {
     OP_TAIL_CALL, /* same operands as OP_CALL; dest_reg is unused (ignored) here */
     OP_TAIL_CALL_VALUE, /* same operands as OP_CALL_VALUE; dest_reg is unused (ignored) here */
 
-    /* Bridges to the stack-based stdlib dispatch: push args from registers, call aer_*_call(),
-       pop the one result into dest_reg. Stack-neutral. */
-    /* One packed word (dest, module_idx, fn_idx, arg base/count) + two trailing words:
-       parse-time-resolved module_id and fn_id (CALL_MODULE_DYNAMIC = host/file module,
-       resolved by name at runtime). */
+    /* Bridges to the stack-based stdlib dispatch, stack-neutral. Trailing words carry the
+       parse-time-resolved module_id and fn_id; CALL_MODULE_DYNAMIC resolves by name at runtime. */
     OP_CALL_MODULE,
 
     /* Bare global builtins (length/print/type/assert/panic/Result): bridges to vm_call_builtin()
@@ -245,16 +242,9 @@ typedef enum {
        already leaves a fully tagged value behind. */
     OP_UNBOX_INT,
     OP_UNBOX_REAL,
-    /* Raw-to-raw copy -- OP_MOVE's analog for raw slots. */
     OP_RAW_MOVE_INT,
     OP_RAW_MOVE_REAL,
-    /* In-place accumulation of a BOXED value into a raw slot (`e += <boxed expr>`); runtime tag
-       check, ADD/SUB/MUL only. */
-    /* Pool fallback for literals outside the old 20-bit immediate; kept as a distinct opcode
-       (rather than widening OP_RAW_LOAD_INT's own immediate) since the fixed-width redesign below
-       gives OP_RAW_LOAD_INT a full 32-bit immediate anyway -- this opcode now only exists for
-       pool-sourced values that don't fit an int32 (rare, kept for parser-side symmetry with
-       OP_RAW_LOAD_REAL). */
+    /* For the rare literal that does not fit OP_RAW_LOAD_INT's int32 immediate. */
     OP_RAW_LOAD_INT_POOL,
 
     /* Shape-specialized field access -- only ever emitted into a ChunkFunction's SPECIALIZED body
@@ -331,18 +321,8 @@ typedef enum {
     OP_LTE_JUMP_IF_FALSE,
     OP_GTE_JUMP_IF_FALSE,
 
-    /* OP_LT_JUMP_IF_FALSE's fusion, for the raw-boxed int family only -- the other 12 raw
-       comparison opcodes were measured earning nothing against the branch-predictor cost every
-       added opcode imposes. Operand layout is the raw-boxed int opcode's own word0 B/C verbatim,
-       plus a trailing jump-target word. */
-    /* Same fusion for a raw REAL local against a boxed value -- the shape `x*x + y*y > 4.0` in any
-       float loop, which was three dispatches (load the constant, compare, branch) against the int
-       path's two. */
-
-    /* The same fusion where BOTH operands are raw slots -- `iter < max_iter` once max_iter is a raw
-       parameter rather than a boxed one. No GT/GTE members: the raw-vs-raw family emits `a > b` as
-       `b < a` with the slots already swapped (try_emit_binary_raw, parser.c), so four cover eight
-       operators. Word0 B/C are the two slots; the jump target trails. */
+    /* The same fusion with both operands unchecked. No GT/GTE members: `a > b` is emitted as
+       `b < a` with the slots swapped (try_emit_binary_raw), so four cover eight operators. */
     OP_RAW_LT_INT_JUMP_IF_FALSE,
     OP_RAW_LTE_INT_JUMP_IF_FALSE,
     OP_RAW_EQ_INT_JUMP_IF_FALSE,
@@ -352,39 +332,24 @@ typedef enum {
     OP_RAW_EQ_REAL_JUMP_IF_FALSE,
     OP_RAW_NEQ_REAL_JUMP_IF_FALSE,
 
-    /* A typed array's elements are already unboxed bytes -- reading one into a register built an
-       AerVal for the sole purpose of being tag-checked and torn apart again by the next opcode.
-       These move the element between the array and a raw slot directly. The receiver is still
-       checked: anything but a typed array (or a non-numeric element) falls back to the general
-       boxed path, so these are safe on any value, just fast on the one that matters. */
-    /* Bounds-CHECKED siblings of the two below: same raw destination, but usable without any
-       loop proof, since an out-of-range index just falls through to the generic path. Emitted
-       wherever the parser knows the array's element kind (Parser.reg_elem_kind). */
+    /* A typed array's element moves straight between the array and a slot, never becoming an
+       AerVal just to be torn apart again. Bounds-checked, so no loop proof is needed -- an
+       out-of-range index or a non-typed-array receiver falls through to the generic path. */
     OP_INDEX_GET_RAW_INT, /* raw_int_slot, arr_reg, rk_idx */
     OP_INDEX_SET_RAW_INT, /* arr_reg, rk_idx, raw_int_slot */
     OP_INDEX_SET_RAW_REAL, /* arr_reg, rk_idx, raw_real_slot */
     OP_INDEX_GET_RAW_REAL, /* raw_real_slot, arr_reg, rk_idx */
 
-    /* A recursive call from inside a numeric variant, handing raw slots over and taking one back --
-       the last place a numeric body had to build an AerVal just to cross a frame boundary. Only
-       emitted INTO a variant body and only for a call to that same function, so the variant is
-       always already compiled when this runs; no lazy-compile fallback exists or is needed.
-       word0 = PACK3(op, dest_raw_slot, arg_slot_base, arg_count); then the variant's code offset,
-       the function's byte offset, and the result kind (independent of the argument kind). */
-    /* `math.sqrt(x)` and its real-returning siblings on a raw real, with no AerVal at either end --
-       the argument used to be boxed for the module calling convention and the result immediately
-       tag-checked back out by whatever consumed it. word0 = PACK3(op, dest_slot, src_slot, fn_id).
-       Only the functions aer_math_fn_is_raw_real accepts; floor/ceil/round return integers. */
-    /* A call from inside a numeric variant to the function that body IS: same variant, so the frame
-       is the caller's size and entry point and no resolver runs. Without it a self-recursive
-       function re-resolves its own specialization every call, costing more than specializing saved.
-       Emitted only INTO a variant -- a generic body must keep resolving or it never specializes. */
+    /* Same variant, so the frame is the caller's own size and entry point and no resolver runs.
+       Without it a self-recursive function re-resolves its specialization on every call, costing
+       more than specializing saved. Emitted only INTO a variant: a generic body must keep resolving
+       or it never specializes at all. */
     OP_CALL_SELF, /* dest_reg, arg_reg_base, arg_count */
 
-    OP_RAW_MATH_REAL,
-    /* `float(i)` / `int(x)` between the two raw banks -- a hardware conversion that used to box its
-       operand just to reach OP_CAST's type dispatch. int() truncates toward zero, matching OP_CAST's
-       own rule. */
+    /* Only the functions aer_math_fn_is_raw_real accepts -- floor/ceil/round return integers. */
+    OP_RAW_MATH_REAL, /* dest_slot, src_slot, fn_id */
+
+    /* int() truncates toward zero, matching OP_CAST's rule. */
     OP_RAW_INT_TO_REAL,
     OP_RAW_REAL_TO_INT,
 

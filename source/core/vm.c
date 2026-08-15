@@ -3309,10 +3309,8 @@ lbl_call: {
     callee->frame_size = chosen_max_registers;
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = registers[arg_reg_base + i];
-    /* mark_vm_roots traces every register below frame_size, so the ones this call does not fill are
-       whatever a previously popped, deeper frame left there -- pointers to objects that may since
-       have been collected. Only the tag needs clearing: the GC reaches every register through
-       value_has_cell, which reads the tag and nothing else, so the payload can stay garbage. */
+    /* mark_vm_roots traces every register below frame_size, so an unfilled one would still hold a
+       popped frame's pointer. Only the tag matters -- value_has_cell reads nothing else. */
     for (unsigned int i = (unsigned int)arg_count; i < chosen_max_registers; i++)
         callee->registers[i].tag = TYPE_NULL;
     callee->return_ip =
@@ -5248,16 +5246,12 @@ lbl_raw_load_real: {
     DISPATCH();
 }
 
-/* Source-level dedup only, zero behavior/codegen change (each invocation below still expands to
-   its own full label + body, byte-for-byte what was hand-written here before) -- NOT a NOINLINE
-   shared-function refactor, which would trade a real per-dispatch call+branch cost on these
-   extremely hot opcodes for a code-size win already confirmed not to matter (icache misses are
-   16-140x rarer than dcache misses on every workload measured this session). #undef'd right after
-   the last family that needs them. */
-/* A raw right-hand operand: the RK8 const flag picks the raw constant table instead of the slot
-   bank, so a literal needs neither an OP_RAW_LOAD nor a slot of its own. Only the right operand,
-   and only one predictable branch -- an operand's kind is fixed in the bytecode, so a given site
-   always takes the same side. Raw slot indices stop at 31 and can never collide with the flag. */
+/* Source-level dedup only: each invocation still expands to its own full label and body. NOT a
+   shared noinline function, which would put a call in the dispatch loop for a code-size win these
+   workloads do not need. #undef'd after the last family that uses them.
+
+   RAW_I/RAW_D: the RK8 const flag picks the raw constant table, so a literal needs no slot. A slot
+   index is at most FRAME_REGISTERS-1 (127) and the flag is 0x80, so the two never collide. */
 #define RAW_I(x) (RK8_IS_CONST(x) ? c->rawk_i[RK8_INDEX(x)] : registers[x].as.i)
 #define RAW_D(x) (RK8_IS_CONST(x) ? c->rawk_d[RK8_INDEX(x)] : registers[x].as.d)
 
