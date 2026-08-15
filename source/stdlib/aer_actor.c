@@ -7,9 +7,15 @@
 #include "aer_stdlib.h"
 #include "error.h"
 
+/* A message is bytes either way. A typed array carries its element kind and count alongside them,
+   so the receiving side can rebuild one instead of parsing a string -- its buffer holds numbers and
+   no pointers, which is what makes handing it between two heaps a memcpy. */
 typedef struct Mailbox {
     char* data;
     unsigned int len;
+    bool is_typed_array;
+    TypedArrayElemKind elem_kind;
+    unsigned int count;
     struct Mailbox* next;
 } Mailbox;
 
@@ -121,11 +127,15 @@ bool aer_actor_call(Actor* actor, const char* fn, int arg_count, AerVal* args, A
    json.encode()/json.decode() calls) is entirely up to the AER code on each end; the mailbox
    itself only ever moves bytes. send() copies message; try_receive() hands back an owned buffer
    the caller must free(). */
-static bool aer_actor_send(Actor* actor, const char* message, unsigned int len) {
+static bool aer_actor_send_bytes(Actor* actor, const char* message, unsigned int len, bool is_typed_array,
+                                 TypedArrayElemKind kind, unsigned int count) {
     Mailbox* m = xmalloc(sizeof(Mailbox));
-    m->data = xmalloc(len);
+    m->data = xmalloc(len ? len : 1);
     memcpy(m->data, message, len);
     m->len = len;
+    m->is_typed_array = is_typed_array;
+    m->elem_kind = kind;
+    m->count = count;
     m->next = NULL;
     aer_mutex_lock(&actor->mailbox_lock);
     if (actor->mailbox_tail)
@@ -137,7 +147,13 @@ static bool aer_actor_send(Actor* actor, const char* message, unsigned int len) 
     return true;
 }
 
-static bool aer_actor_try_receive(Actor* actor, char** out_message, unsigned int* out_len) {
+static bool aer_actor_send(Actor* actor, const char* message, unsigned int len) {
+    return aer_actor_send_bytes(actor, message, len, false, TYPED_ELEM_INT32, 0);
+}
+
+static bool aer_actor_try_receive(Actor* actor, char** out_message, unsigned int* out_len,
+                                  bool* out_is_typed_array, TypedArrayElemKind* out_kind,
+                                  unsigned int* out_count) {
     aer_mutex_lock(&actor->mailbox_lock);
     Mailbox* m = actor->mailbox_head;
     if (!m) {
@@ -149,6 +165,9 @@ static bool aer_actor_try_receive(Actor* actor, char** out_message, unsigned int
         actor->mailbox_tail = NULL;
     *out_message = m->data;
     *out_len = m->len;
+    *out_is_typed_array = m->is_typed_array;
+    *out_kind = m->elem_kind;
+    *out_count = m->count;
     aer_mutex_unlock(&actor->mailbox_lock);
     free(m);
     return true;
@@ -221,8 +240,9 @@ __attribute__((noinline)) bool aer_actor_module_call(VM* vm, int fn_id, int arg_
     if (fn_id == FN_ACTOR_SEND && arg_count == 2) {
         AerVal message_v = vm_stack_pop(vm);
         AerVal handle_v = vm_stack_pop(vm);
-        if (aer_type(message_v) != TYPE_STRING) {
-            error("actor.send() requires an actor handle and a string message");
+        bool typed = aer_type(message_v) == TYPE_TYPED_ARRAY;
+        if (aer_type(message_v) != TYPE_STRING && !typed) {
+            error("actor.send() requires an actor handle and a string or typed array");
             vm_stack_push(vm, aer_null());
             return true;
         }
@@ -232,8 +252,17 @@ __attribute__((noinline)) bool aer_actor_module_call(VM* vm, int fn_id, int arg_
             vm_stack_push(vm, aer_null());
             return true;
         }
-        AerString* str = aer_as_string(message_v);
-        aer_actor_send(a, str->data, str->length);
+        /* A typed array crosses as its raw bytes, not as text. Its elements are numbers with no
+           pointers among them, so the receiver rebuilds it with a memcpy rather than a parse -- the
+           whole reason chunking work across actors is affordable. */
+        if (typed) {
+            AerTypedArray* ta = aer_as_typed_array(message_v);
+            unsigned int width = vm_typed_elem_width(ta->elem_kind);
+            aer_actor_send_bytes(a, (const char*)ta->data, ta->count * width, true, ta->elem_kind, ta->count);
+        } else {
+            AerString* str = aer_as_string(message_v);
+            aer_actor_send(a, str->data, str->length);
+        }
         vm_stack_push(vm, aer_null());
         return true;
     }
@@ -248,10 +277,21 @@ __attribute__((noinline)) bool aer_actor_module_call(VM* vm, int fn_id, int arg_
         }
         char* message;
         unsigned int len;
+        bool typed;
+        TypedArrayElemKind kind;
+        unsigned int count;
         /* No message ready is a normal, non-error outcome -- plain null, matching this language's
            existing "missing dict key returns null" idiom, not a Result. */
-        if (!aer_actor_try_receive(a, &message, &len)) {
+        if (!aer_actor_try_receive(a, &message, &len, &typed, &kind, &count)) {
             vm_stack_push(vm, aer_null());
+            return true;
+        }
+        if (typed) {
+            AerVal arr = vm_new_typed_array_val(kind, count);
+            if (count)
+                memcpy(aer_as_typed_array(arr)->data, message, len);
+            free(message);
+            vm_stack_push(vm, arr);
             return true;
         }
         vm_stack_push(vm, aer_make_string(message, len));

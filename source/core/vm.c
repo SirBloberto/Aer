@@ -1488,6 +1488,12 @@ static AerTypedArray* vm_new_typed_array(TypedArrayElemKind kind, unsigned int c
     return ta;
 }
 
+/* A zeroed typed array as a value -- exposed for actor.receive(), which rebuilds one from the raw
+   bytes a message carried. */
+AerVal vm_new_typed_array_val(TypedArrayElemKind kind, unsigned int count) {
+    return aer_typed_array_val(vm_new_typed_array(kind, count));
+}
+
 /* Fuses (A op1 B) op2 C over three typed arrays into one pass, materializing no intermediate.
    Emitted only when the parser sees the whole expression at once. The ~1.65x win is from memory
    traffic -- two passes over 3 arrays become one over 4 -- not from vectorization. ADD/SUB/MUL

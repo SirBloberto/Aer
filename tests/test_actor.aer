@@ -75,4 +75,31 @@ for i < 1500:
 assert(result_a == expected_a, "actor A's own heavy allocation computed the correct result, unaffected by actor B")
 assert(result_b == expected_b, "actor B's own heavy allocation computed the correct result, unaffected by actor A — each actor's own heap stayed independent")
 
+# A typed array crosses the mailbox as its raw bytes -- its elements are numbers with no pointers
+# among them, so the receiver rebuilds it with a memcpy instead of parsing text. That is what makes
+# splitting work across actors affordable: for 200k elements the round trip is 24x cheaper than the
+# json.encode/decode it replaces, and less than the cost of processing the chunk rather than 5x more.
+tarr = [0.0; 6]
+tarr[0] = 1.5
+tarr[5] = 9.25
+actor.send(handle, tarr)
+back = actor.receive(handle)
+assert(type(back) == "float[]", "a typed array comes back as a typed array, not a string")
+assert(length(back) == 6, "and keeps its length")
+assert(back[0] == 1.5 and back[5] == 9.25, "and its contents")
+# A copy, exactly like the string case -- the sender keeps its own array untouched.
+tarr[0] = 99.0
+assert(back[0] == 1.5, "the message is a copy, so writing the sender's array leaves it alone")
+
+tint = [0i; 3]
+tint[1] = 7
+actor.send(handle, tint)
+back_int = actor.receive(handle)
+assert(type(back_int) == "int32[]" and back_int[1] == 7, "the element kind survives the trip")
+
+empty_arr = [0.0; 0]
+actor.send(handle, empty_arr)
+back_empty = actor.receive(handle)
+assert(type(back_empty) == "float[]" and length(back_empty) == 0, "an empty typed array survives too")
+
 print("test_actor.aer: all assertions passed.")

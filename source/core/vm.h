@@ -1039,6 +1039,9 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
 /* Uninitialized AerArray header from vm.c's slab pool -- exposed for string.split(). */
 AerArray* vm_new_array(void);
 
+/* A zeroed typed array as a value -- exposed for actor.receive(). */
+AerVal vm_new_typed_array_val(TypedArrayElemKind kind, unsigned int count);
+
 /* Same, for AerDict -- exposed for json.decode(). The caller must zero-init `map` itself. */
 AerDict* vm_new_dict(void);
 
