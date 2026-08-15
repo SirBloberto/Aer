@@ -84,10 +84,51 @@ VM* aer_actor_vm(Actor* actor) {
     return actor->vm;
 }
 
+/* An argument crosses into another heap, so anything with a cell behind it has to be rebuilt on the
+   far side -- handing over the pointer would put one heap's cell in another's frame, where that
+   VM's collector would mark a cell it does not own. Numbers and booleans carry no cell and pass as
+   they are; strings and typed arrays are copied; anything else is refused, because a deep copy of
+   an array or dict is a different feature and silently sharing one is not an option. */
+static bool actor_copy_args_into(Actor* actor, int arg_count, AerVal* args) {
+    VmHeap* saved = vm_current_heap();
+    vm_set_current_heap(&actor->vm->heap);
+    bool ok = true;
+    for (int i = 0; i < arg_count && ok; i++) {
+        switch (aer_type(args[i])) {
+            case TYPE_NULL:
+            case TYPE_BOOLEAN:
+            case TYPE_INTEGER:
+            case TYPE_REAL: break;
+            case TYPE_STRING: {
+                AerString* src = aer_as_string(args[i]);
+                args[i] = aer_make_string_copy(src->data, src->length);
+                break;
+            }
+            case TYPE_TYPED_ARRAY: {
+                AerTypedArray* src = aer_as_typed_array(args[i]);
+                AerVal copy = vm_new_typed_array_val(src->elem_kind, src->count);
+                if (src->count)
+                    memcpy(aer_as_typed_array(copy)->data, src->data,
+                           (size_t)src->count * vm_typed_elem_width(src->elem_kind));
+                args[i] = copy;
+                break;
+            }
+            default: ok = false; break;
+        }
+    }
+    vm_set_current_heap(saved);
+    return ok;
+}
+
 bool aer_actor_prepare_call(Actor* actor, const char* fn, int arg_count, AerVal* args) {
     ChunkFunction* fnreg = chunk_find_function(actor->chunk, fn);
     if (!fnreg)
         return false;
+    if (!actor_copy_args_into(actor, arg_count, args)) {
+        error("An actor argument must be a number, boolean, string or typed array -- an array, "
+              "hashtable or struct would have to be shared across two heaps");
+        return false;
+    }
 
     VM* mv = actor->vm;
     /* A prior call's error can leave call_depth/stack_top stuck above 0 (same reset

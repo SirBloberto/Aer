@@ -1,0 +1,12 @@
+# Worker for parallel_chunks.aer. Takes a chunk of a column and reduces it alone -- no shared
+# state, so the only thing that crosses is the chunk in and a number out.
+
+function weighted_sum(chunk):
+    total = 0.0
+    i = 0
+    n = length(chunk)
+    for i < n:
+        x = chunk[i]
+        total = total + x * x * 0.5
+        i += 1
+    return total

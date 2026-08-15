@@ -1,0 +1,55 @@
+# Splitting one column across actors, which is what `make THREADS=1` is for.
+#
+#   make THREADS=1 && ./binary/aer examples/parallel_chunks.aer
+#
+# Without THREADS the scheduler interleaves the same tasks on one thread and the answer is
+# identical -- only the wall clock changes.
+
+import actor
+import scheduler
+import collection
+import time
+
+N = 1200000
+WORKERS = 6
+
+column = [0.0; N]
+i = 0
+for i < N:
+    column[i] = float(i % 1000) * 0.25
+    i += 1
+
+# Serial, for comparison.
+start = time.now()
+serial = 0.0
+i = 0
+for i < N:
+    x = column[i]
+    serial = serial + x * x * 0.5
+    i += 1
+serial_time = time.now() - start
+
+# One actor per chunk. Each gets its own slice of the column as a call argument -- a typed array
+# is copied into that actor's own heap, so nothing is shared and nothing needs a lock.
+workers = []
+w = 0
+for w < WORKERS:
+    a, err = actor.spawn("examples/parallel_chunk_worker.aer")
+    if err != null:
+        panic("spawn failed: {err}")
+    collection.append(workers, a)
+    w += 1
+
+per = N // WORKERS
+start = time.now()
+w = 0
+for w < WORKERS:
+    lo = w * per
+    hi = lo + per
+    scheduler.add(workers[w], "weighted_sum", column[lo:hi])
+    w += 1
+scheduler.run()
+parallel_time = time.now() - start
+
+print("serial   {serial_time}s -> {serial}")
+print("parallel {parallel_time}s across {WORKERS} actors")

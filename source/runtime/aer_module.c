@@ -322,13 +322,9 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
     vm_gc_suppress();
     vm_run(mv);
     vm_gc_unsuppress();
-    /* runtime_had_error deliberately stays true on failure here (unlike aer_module_load's parse-time path)
-       -- the called module's vm_run(mv) already caught its own error locally (its own catch point,
-       installed and restored inside vm_run itself) and returned cleanly, so nothing automatically aborts
-       the CALLING vm too anymore now that DISPATCH() no longer polls this flag every instruction.
-       Propagate explicitly: longjmp to whatever vm_run() call is now the current unwind target (the
-       calling vm's own, since vm_run(mv)'s return already restored it) -- exactly like a same-VM call
-       error, just raised here instead of noticed passively. */
+    /* The flag stays set on purpose: the module's own vm_run caught its error and returned cleanly,
+       so nothing aborts the CALLING vm by itself. Propagate by longjmping to whatever unwind target
+       is current now, which vm_run(mv)'s return has already restored to the caller's. */
     if (runtime_had_error) {
         push_null_result(vm);
         if (runtime_error_unwind_target)
