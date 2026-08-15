@@ -4350,6 +4350,14 @@ static int module_fn_id(int module_id, AerString* name) {
                 return FN_MATH_TAN;
             if (NAME_IS("exp"))
                 return FN_MATH_EXP;
+            if (NAME_IS("asin"))
+                return FN_MATH_ASIN;
+            if (NAME_IS("acos"))
+                return FN_MATH_ACOS;
+            if (NAME_IS("atan"))
+                return FN_MATH_ATAN;
+            if (NAME_IS("atan2"))
+                return FN_MATH_ATAN2;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_RANDOM:
             if (NAME_IS("random"))

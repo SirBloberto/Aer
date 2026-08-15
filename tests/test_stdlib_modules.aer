@@ -39,6 +39,22 @@ assert(math.exp(0) == 1, "math.exp(0)")
 assert(math.exp(1) > 2.718 and math.exp(1) < 2.719, "math.exp(1) is e")
 assert(math.pi() > 3.14 and math.pi() < 3.15, "math.pi() is a function, not a bare module value")
 
+assert(math.asin(0) == 0 and math.acos(1) == 0, "math.asin/acos at zero")
+assert(math.asin(1) > 1.5707 and math.asin(1) < 1.5709, "math.asin(1) is pi/2")
+assert(math.atan(0) == 0, "math.atan(0)")
+assert(math.atan(1) > 0.7853 and math.atan(1) < 0.7854, "math.atan(1) is pi/4")
+# The whole reason atan2 exists as its own function: atan(y / x) cannot tell quadrant II from IV,
+# because the division discards which of the two operands carried the sign.
+assert(math.atan2(1.0, -1.0) > 2.356 and math.atan2(1.0, -1.0) < 2.357, "math.atan2 in quadrant II")
+assert(math.atan2(-1.0, -1.0) < -2.356 and math.atan2(-1.0, -1.0) > -2.357, "math.atan2 in quadrant III")
+# Raw-slot path (OP_RAW_MATH_REAL), which the boxed calls above never reach.
+raw_trig = 0.0
+ti = 0
+for ti < 3:
+    raw_trig = raw_trig + math.atan(float(ti))
+    ti += 1
+assert(raw_trig > 1.892 and raw_trig < 1.893, "math.atan composes into a raw real slot")
+
 r = random.random()
 assert(r >= 0.0 and r < 1.0, "random.random() is in [0, 1)")
 

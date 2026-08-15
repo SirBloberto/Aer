@@ -32,6 +32,21 @@ bool aer_math_unary_raw(int fn_id, double x, double* out) {
         case FN_MATH_SIN: *out = sin(x); return true;
         case FN_MATH_COS: *out = cos(x); return true;
         case FN_MATH_TAN: *out = tan(x); return true;
+        case FN_MATH_ATAN: *out = atan(x); return true;
+        case FN_MATH_ASIN:
+            if (x < -1 || x > 1) {
+                error("asin() requires a number between -1 and 1");
+                return false;
+            }
+            *out = asin(x);
+            return true;
+        case FN_MATH_ACOS:
+            if (x < -1 || x > 1) {
+                error("acos() requires a number between -1 and 1");
+                return false;
+            }
+            *out = acos(x);
+            return true;
         case FN_MATH_EXP: *out = exp(x); return true;
         case FN_MATH_LOG:
             if (x <= 0) {
@@ -61,7 +76,8 @@ bool aer_math_unary_raw(int fn_id, double x, double* out) {
 /* Which fn_ids aer_math_unary_raw handles -- the parser's test before it may emit OP_RAW_MATH_REAL. */
 bool aer_math_fn_is_raw_real(int fn_id) {
     return fn_id == FN_MATH_SQRT || fn_id == FN_MATH_SIN || fn_id == FN_MATH_COS || fn_id == FN_MATH_TAN ||
-           fn_id == FN_MATH_EXP || fn_id == FN_MATH_LOG || fn_id == FN_MATH_LOG2 || fn_id == FN_MATH_LOG10;
+           fn_id == FN_MATH_EXP || fn_id == FN_MATH_LOG || fn_id == FN_MATH_LOG2 || fn_id == FN_MATH_LOG10 ||
+           fn_id == FN_MATH_ASIN || fn_id == FN_MATH_ACOS || fn_id == FN_MATH_ATAN;
 }
 
 static bool math_unary(int fn_id, double x, AerVal* out) {
@@ -80,6 +96,15 @@ static bool math_unary(int fn_id, double x, AerVal* out) {
         case FN_MATH_SIN: *out = aer_real(sin(x)); return true;
         case FN_MATH_COS: *out = aer_real(cos(x)); return true;
         case FN_MATH_TAN: *out = aer_real(tan(x)); return true;
+        case FN_MATH_ATAN: *out = aer_real(atan(x)); return true;
+        case FN_MATH_ASIN:
+        case FN_MATH_ACOS: {
+            double raw;
+            if (!aer_math_unary_raw(fn_id, x, &raw))
+                return false;
+            *out = aer_real(raw);
+            return true;
+        }
         case FN_MATH_EXP: *out = aer_real(exp(x)); return true;
         case FN_MATH_LOG:
             if (x <= 0) {
@@ -131,9 +156,26 @@ bool aer_math_call(VM* vm, int fn_id, int arg_count) {
     MATH_UNARY_CASE(FN_MATH_COS, "cos")
     MATH_UNARY_CASE(FN_MATH_TAN, "tan")
     MATH_UNARY_CASE(FN_MATH_EXP, "exp")
+    MATH_UNARY_CASE(FN_MATH_ASIN, "asin")
+    MATH_UNARY_CASE(FN_MATH_ACOS, "acos")
+    MATH_UNARY_CASE(FN_MATH_ATAN, "atan")
     MATH_UNARY_CASE(FN_MATH_LOG, "log")
     MATH_UNARY_CASE(FN_MATH_LOG2, "log2")
     MATH_UNARY_CASE(FN_MATH_LOG10, "log10")
+    /* Two arguments, so it gets the quadrant right where atan(y / x) cannot -- and unlike the
+       unary functions it has no raw-slot form, since OP_RAW_MATH_REAL carries one operand. */
+    if (fn_id == FN_MATH_ATAN2 && arg_count == 2) {
+        AerVal ax = vm_stack_pop(vm);
+        AerVal ay = vm_stack_pop(vm);
+        double y, x;
+        if (!aer_as_double(ay, &y) || !aer_as_double(ax, &x)) {
+            error("atan2() requires two numbers");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        vm_stack_push(vm, aer_real(atan2(y, x)));
+        return true;
+    }
     if (fn_id == FN_MATH_POW && arg_count == 2) {
         AerVal ey = vm_stack_pop(vm);
         AerVal ex = vm_stack_pop(vm);
