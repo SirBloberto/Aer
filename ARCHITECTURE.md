@@ -2962,28 +2962,31 @@ tagged:        movl  $2, (%rax,%rcx)        payload-only:  movsd %xmm1, 8(%rax,%
 ```
 
 gcc cannot merge them -- a 4-byte tag, 4 bytes of padding, then an 8-byte payload. So there is no
-cheaper encoding of the tagged write; the store has to stop happening. `OP_SET_TAG` (stamp a slot's
-tag, leave its payload alone) plus payload-only arithmetic is on branch `wip-tag-once`, along with
-the debug-build assertion that every payload-only write verifies its destination tag. **What is NOT
-written is the parser side, and that is the whole problem:**
+cheaper encoding of the tagged write; the store has to stop happening.
 
-- **Variables are easy and nearly worthless.** A `VAR_RAW_INT`/`VAR_RAW_REAL` slot is committed at
-  `branch_depth == 0` and its defining assignment already writes a full tagged value, so every later
-  write to it can be payload-only with no new mechanism at all. That covers 3 of the 11 unchecked
-  writes in mandelbrot's inner loop -- roughly 1%.
-- **Temps are where the other 8 are, and they need one of two real designs.** Either (a) hoist the
-  stamps into the loop preheader, reusing `hoist_begin`/`hoist_end`'s existing backfill, which needs
-  the parser to know that no *boxed* write to that slot occurs inside the loop -- enumerating every
-  boxed write site is the fragile part; or (b) partition the allocator so a slot used for one raw
-  kind within a function is never reused for another kind or for a boxed value, put the resulting
-  per-slot kind table on `ChunkFunction`, and have frame entry stamp tags from it instead of writing
-  `TYPE_NULL`. (b) is provably safe and costs nothing at runtime -- frame entry already writes every
-  slot's tag -- but it reduces slot reuse, so frames grow. Peak measured need is 70 of 128, so there
-  is headroom.
+**It was built, measured, and it does not pay.** Branch `tag-once-wip`: unchecked arithmetic writes
+payload only, `OP_SET_TAG` stamps a slot's tag, and a debug assertion checks every payload-only write
+against its destination's real tag. Correctness reached **0 assertion trips across all 64 bench and
+test programs, 64/64 byte-identical, `make test` green**. Then measured against `feature` (Windows,
+min-of-7): mandelbrot **+31.21%**, nbody_large_packed +23.07%, lookup_table_bench +11.53%,
+nbody +7.85%, struct_array_scan +6.76%, and **nothing improved**. One `OP_SET_TAG` dispatch per
+unchecked write costs more than the 4-byte store it removes -- a dispatch is not cheaper than a
+store, which inverts the premise.
 
-(b) is the better design. It is also the one that touches the allocator every other proof in the
-parser now depends on, so it wants a session of its own with the assertion build running the whole
-corpus from the first commit.
+**The saving only exists if the stamps leave the loop, and they cannot.** Hoisting them into the
+preheader was tried and broke 9 programs, for a structural reason rather than a bug: a preheader
+stamp dominates only the FIRST iteration. If anything in the body retags that slot, the next
+iteration's unchecked write reads the new tag. Making it safe needs loop-invariance analysis of slot
+tags -- knowing, before the body is emitted, that nothing in it will retag a given slot. That is a
+far larger change than the ~8% it recovers, and it is the real reason this is parked rather than
+finished.
+
+Five domination bugs surfaced on the way, every one caught by the assertion rather than by a wrong
+answer, and all five worth expecting if this is ever revisited: `retarget_raw_write` rewriting an
+already-emitted instruction's destination, so a stamp would land after it; a stamp inside an
+if-branch not running on the other path; a specialization recompile inheriting the generic compile's
+table; a call's destination replacing the tag without passing through `reg_alloc` again; and
+`OP_RAW_INT_TO_REAL` silently changing a slot's kind.
 
 ### 5.16yp NaN boxing, including the narrow "just the pointers" version
 
