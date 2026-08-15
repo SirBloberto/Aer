@@ -2194,32 +2194,17 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
 /* integer(x)/float(x)/boolean(x)/string(x) conversion rules, shared by OP_CAST's handler below. */
 static AerVal vm_cast(AerVal v, int cast_type) {
     AerVal r = aer_null();
-    /* atoll()/atof() only consume a leading sign/digits(/./exponent), so truncating to a fixed buffer (instead of a length-sized VLA) can't change the parsed value for a real number. */
-    char buf[64];
     switch (cast_type) {
         case CAST_INTEGER:
             switch (aer_type(v)) {
                 case TYPE_INTEGER: r = v; break;
                 case TYPE_REAL: r = aer_int((int64_t)aer_as_real(v)); break;
                 case TYPE_BOOLEAN: r = aer_int(aer_as_bool(v) ? 1 : 0); break;
-                case TYPE_STRING: {
-                    AerString* vs = aer_as_string(v);
-                    unsigned int n = vs->length < sizeof(buf) - 1 ? vs->length : sizeof(buf) - 1;
-                    memcpy(buf, vs->data, n);
-                    buf[n] = '\0';
-                    /* strtoll, not atoll -- atoll can't distinguish "parsed as zero" from "not a number". */
-                    char* end;
-                    long long parsed = strtoll(buf, &end, 10);
-                    while (*end == ' ' || *end == '\t')
-                        end++; /* tolerate trailing whitespace, same as leading */
-                    if (end == buf || *end != '\0') {
-                        error("integer('%.*s'): not a valid integer", (int)n, buf);
-                        r = aer_int(0);
-                        break;
-                    }
-                    r = aer_int(parsed);
+                case TYPE_STRING:
+                    error("integer() converts between number types, which cannot fail; parse a "
+                          "string with string.to_integer(), which returns (value, err)");
+                    r = aer_int(0);
                     break;
-                }
                 default: error("Cannot convert this type to integer"); r = aer_int(0);
             }
             break;
@@ -2228,24 +2213,11 @@ static AerVal vm_cast(AerVal v, int cast_type) {
                 case TYPE_REAL: r = v; break;
                 case TYPE_INTEGER: r = aer_real((double)aer_as_int(v)); break;
                 case TYPE_BOOLEAN: r = aer_real(aer_as_bool(v) ? 1.0 : 0.0); break;
-                case TYPE_STRING: {
-                    AerString* vs = aer_as_string(v);
-                    unsigned int n = vs->length < sizeof(buf) - 1 ? vs->length : sizeof(buf) - 1;
-                    memcpy(buf, vs->data, n);
-                    buf[n] = '\0';
-                    /* strtod, not atof -- same reasoning as CAST_INTEGER above. */
-                    char* end;
-                    double parsed = strtod(buf, &end);
-                    while (*end == ' ' || *end == '\t')
-                        end++;
-                    if (end == buf || *end != '\0') {
-                        error("float('%.*s'): not a valid number", (int)n, buf);
-                        r = aer_real(0.0);
-                        break;
-                    }
-                    r = aer_real(parsed);
+                case TYPE_STRING:
+                    error("float() converts between number types, which cannot fail; parse a "
+                          "string with string.to_float(), which returns (value, err)");
+                    r = aer_real(0.0);
                     break;
-                }
                 default: error("Cannot convert this type to float"); r = aer_real(0.0);
             }
             break;

@@ -4292,10 +4292,19 @@ static void parse_for_while(Chunk* c) {
 }
 
 /* Checked before the normal identifier/call/assignment path -- a module name isn't a
-   variable, so var_slot/func_lookup must never see it. */
+   variable, so var_slot/func_lookup must never see it.
+
+   The following '.' is part of the test, not just an expectation: `string` and `time` are module
+   names AND builtin casts/functions, so `import string` used to make `string(42)` unreachable. A
+   module use is always `name.function(...)`, so the dot is what tells the two apart. */
 static bool at_module_name(Chunk* c) {
-    return token.type == TOKEN_IDENTIFIER &&
-           chunk_is_imported(c, aer_as_string(token.value)->data, aer_as_string(token.value)->length);
+    if (token.type != TOKEN_IDENTIFIER ||
+        !chunk_is_imported(c, aer_as_string(token.value)->data, aer_as_string(token.value)->length))
+        return false;
+    const char* p = current_source_cursor();
+    while (*p == ' ' || *p == '\t')
+        p++;
+    return *p == '.';
 }
 
 /* Arguments reach the call via contiguous registers, same as every other call site;
@@ -4392,6 +4401,10 @@ static int module_fn_id(int module_id, AerString* name) {
                 return FN_STRING_REPLACE;
             if (NAME_IS("join"))
                 return FN_STRING_JOIN;
+            if (NAME_IS("to_integer"))
+                return FN_STRING_TO_INTEGER;
+            if (NAME_IS("to_float"))
+                return FN_STRING_TO_FLOAT;
             if (NAME_IS("index_of"))
                 return FN_STRING_INDEX_OF;
             return FN_ID_UNKNOWN;

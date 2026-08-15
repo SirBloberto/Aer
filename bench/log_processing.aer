@@ -33,7 +33,9 @@ function process_lines(lines):
         parts = string.split(lines[i], " ")
         path = parts[2]
         status = parts[3]
-        nbytes = integer(parts[4])
+        nbytes, nerr = string.to_integer(parts[4])
+        if nerr != null:
+            nbytes = 0
 
         if status in status_counts:
             status_counts[status] += 1

@@ -1,5 +1,6 @@
 #!/usr/bin/env aer
 import collection
+import string
 # AER test suite — core language mechanics: types, arithmetic, strings,
 # comparisons/logic, bitwise, casting, control flow, all `for` forms,
 # break/continue, and truthiness rules.
@@ -263,16 +264,36 @@ assert(bw == 60, "bitwise update chain spelled out")
 # 6. Primitive casts — integer()/float()/boolean()/string()             #
 # ------------------------------------------------------------------ #
 
-assert(integer("42") == 42, "string to integer cast")
 assert(float(42) == 42, "integer to float cast (compares equal via promotion)")
+# integer()/float() convert between number types, which cannot fail. Parsing a string can, so it
+# lives in string.to_integer/to_float and reports through (value, err) like every other fallible
+# call, instead of aborting the program on input nobody controls.
+parsed_ok, parse_err = string.to_integer("42")
+assert(parsed_ok == 42 and parse_err == null, "string.to_integer on a valid integer")
+parsed_bad, parse_bad_err = string.to_integer("abc")
+assert(parsed_bad == null and parse_bad_err != null, "string.to_integer reports a malformed string instead of aborting")
+parsed_pad, parse_pad_err = string.to_integer("  17  ")
+assert(parsed_pad == 17 and parse_pad_err == null, "string.to_integer tolerates surrounding whitespace")
+# The old integer("...") cast returned LLONG_MAX here, which is a wrong answer rather than a
+# reported one.
+parsed_big, parse_big_err = string.to_integer("99999999999999999999999")
+assert(parsed_big == null and parse_big_err != null, "string.to_integer reports out-of-range rather than clamping")
+parsed_f, parse_f_err = string.to_float("3.5")
+assert(parsed_f == 3.5 and parse_f_err == null, "string.to_float on a valid number")
+parsed_fb, parse_fb_err = string.to_float("x")
+assert(parsed_fb == null and parse_fb_err != null, "string.to_float reports a malformed string")
 assert(string(42) == "42", "integer to string cast")
+# `string` is both a module name and a builtin cast, and this file imports the module. A module use
+# is always `name.function(...)`, so the following '.' is what separates them -- without that test,
+# importing the module made the cast unreachable.
+assert(string.upper("ab") == "AB" and string(7) == "7", "the string module and the string() cast coexist")
 assert(integer(3.7) == 3, "float to integer cast truncates, does not round")
 assert(boolean(0) == false, "0 casts to false")
 assert(boolean(1) == true, "nonzero casts to true")
 assert(boolean("") == false, "empty string casts to false")
 
 # Ordinary call-then-operator precedence, no special-cased "cast operator" tier to remember
-assert(integer("10") + 1 == 11, "cast result composes with arithmetic like any other call's return value")
+assert(integer(10.0) + 1 == 11, "cast result composes with arithmetic like any other call's return value")
 
 # ------------------------------------------------------------------ #
 # 7. If / else — block form, plus the inline if-EXPRESSION              #

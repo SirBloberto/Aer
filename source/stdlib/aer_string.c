@@ -1,9 +1,60 @@
 #include <ctype.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "aer_stdlib.h"
 #include "error.h"
 
+/* Parsing a string can fail on input nobody controls, so these return (value, err) like every other
+   fallible call rather than aborting the way the integer()/float() casts do -- those convert a
+   number whose type is already known, which cannot fail. Shared by both since only the strtoll/
+   strtod step and the error wording differ. */
+static bool string_to_number(VM* vm, int arg_count, bool want_int) {
+    const char* what = want_int ? "string.to_integer()" : "string.to_float()";
+    AerVal a = vm_stack_pop(vm);
+    if (aer_type(a) != TYPE_STRING) {
+        error("%s requires a string", what);
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    (void)arg_count;
+    AerString* as = aer_as_string(a);
+    /* strtoll/strtod consume only a leading sign and digits, so truncating to a fixed buffer cannot
+       change what a real number parses to. */
+    char buf[64];
+    unsigned int n = as->length < sizeof(buf) - 1 ? as->length : (unsigned int)sizeof(buf) - 1;
+    memcpy(buf, as->data, n);
+    buf[n] = '\0';
+
+    char* end;
+    errno = 0;
+    AerVal value = want_int ? aer_int(strtoll(buf, &end, 10)) : aer_real(strtod(buf, &end));
+    while (*end == ' ' || *end == '\t')
+        end++;
+    if (end == buf || *end != '\0') {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "'%.*s' is not %s", (int)n, buf, want_int ? "an integer" : "a number");
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
+        return true;
+    }
+    /* Out of range is a different failure from malformed, and silently clamping to the extreme
+       would be a wrong answer rather than a reported one. */
+    if (errno == ERANGE) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "'%.*s' is out of range", (int)n, buf);
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
+        return true;
+    }
+    vm_stack_push(vm, aer_make_result(value, aer_null()));
+    return true;
+}
+
 bool aer_string_call(VM* vm, int fn_id, int arg_count) {
+    if (fn_id == FN_STRING_TO_INTEGER && arg_count == 1)
+        return string_to_number(vm, arg_count, true);
+    if (fn_id == FN_STRING_TO_FLOAT && arg_count == 1)
+        return string_to_number(vm, arg_count, false);
     if (fn_id == FN_STRING_UPPER && arg_count == 1) {
         AerVal a = vm_stack_pop(vm);
         if (aer_type(a) != TYPE_STRING) {
