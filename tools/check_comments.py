@@ -18,8 +18,12 @@ import re
 import sys
 
 MAX_BLOCK = 6
+# How far a file may drift above its recorded density before failing, so one genuinely needed
+# sentence doesn't break the build while a paragraph habit still does.
+DENSITY_SLACK = 2
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "tools", "comment_baseline.txt")
+DENSITY_BASELINE = os.path.join(ROOT, "tools", "comment_density_baseline.txt")
 SCAN = ("source", "include")
 
 
@@ -46,6 +50,45 @@ def blocks(path):
     if inside:
         out.append((start, count))
     return out
+
+
+def all_sources():
+    for top in SCAN:
+        for dirpath, _, names in os.walk(os.path.join(ROOT, top)):
+            for name in sorted(names):
+                if name.endswith((".c", ".h")):
+                    path = os.path.join(dirpath, name)
+                    yield os.path.relpath(path, ROOT).replace(os.sep, "/"), path
+
+
+def density(path):
+    """Comment lines as a percentage of the file's non-blank lines."""
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        nonblank = sum(1 for line in fh if line.strip())
+    comment = sum(length for _, length in blocks(path))
+    return (comment * 100 // nonblank) if nonblank else 0
+
+
+def scan_density():
+    """Files whose comment density has grown past what the baseline recorded.
+
+    A ratchet rather than a limit. MAX_BLOCK only kills essays, and the density that actually
+    happened was death by a thousand three-line paragraphs, every one of which passes that check.
+    An absolute threshold cannot work either: vm.h sits near half comment legitimately, because 149
+    opcodes carry their operand shapes one line each."""
+    recorded = {}
+    if os.path.exists(DENSITY_BASELINE):
+        with open(DENSITY_BASELINE, encoding="utf-8") as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if raw and not raw.startswith("#"):
+                    rel, pct = raw.rsplit(" ", 1)
+                    recorded[rel] = int(pct)
+    grown = []
+    for rel, path in all_sources():
+        if rel in recorded and density(path) > recorded[rel] + DENSITY_SLACK:
+            grown.append((rel, recorded[rel], density(path)))
+    return grown
 
 
 def scan(max_block):
@@ -109,7 +152,12 @@ def main():
         with open(BASELINE, "w", encoding="utf-8") as fh:
             for rel, line, length in found:
                 fh.write("%s:%d\n" % (rel, length))
-        print("baseline: %d block(s) over %d lines" % (len(found), args.max))
+        with open(DENSITY_BASELINE, "w", encoding="utf-8") as fh:
+            fh.write("# Comment lines as a percent of non-blank, per file. A ratchet: free to fall,\n")
+            fh.write("# may not rise by more than %d without being re-recorded here.\n" % DENSITY_SLACK)
+            for rel, path in all_sources():
+                fh.write("%s %d\n" % (rel, density(path)))
+        print("baseline: %d block(s) over %d lines, plus per-file density" % (len(found), args.max))
         return 0
 
     # Grandfathers the blocks that already existed, keyed by file+length rather than line number so
@@ -138,6 +186,15 @@ def main():
             print("  %s:%d  %d lines" % (rel, line, length))
         print("\nSay it in one line, delete it, or make it a _Static_assert. If it genuinely needs")
         print("the space, run: python3 tools/check_comments.py --update-baseline")
+        return 1
+
+    grown = scan_density()
+    if grown:
+        print("Comment density grew (see ARCHITECTURE.md, Contributing conventions):\n")
+        for rel, was, now in grown:
+            print("  %-42s %d%% -> %d%% of non-blank lines" % (rel, was, now))
+        print("\nSay it in fewer lines, or if the file has genuinely earned it, run:")
+        print("  python3 tools/check_comments.py --update-baseline")
         return 1
 
     stale = dangling_enum_comments()
