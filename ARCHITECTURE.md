@@ -2900,14 +2900,27 @@ untyped, `is_composite[p]` compiled to `OP_TYPED_INDEX_GET_UNCHECKED`; with `p` 
 *downgrade* from the proof-based unchecked opcode to the checked one.
 
 That is the gap: the index family has an unchecked-but-untyped member and a typed-but-checked
-member, and no unchecked-and-typed one. Closing it costs either **four new opcodes** (a `_RAW_*_UNCHECKED` GET/SET pair) or making `Parser.reg_elem_kind` **correctness-critical** -- today
-`OP_INDEX_GET_RAW_INT` re-checks the element kind at runtime, so `reg_elem_kind` is only a hint;
-emitting the unchecked opcode and marking its destination typed would promote that hint to a
-load-bearing proof. `reg_elem_kind` is only ever set from a literal `[0i; n]`-style construction and
-cleared on any write to the register, so it looks sound -- but "looks sound" is exactly the standard
-that needs evidence before a runtime check is deleted. A cheap first step: instrument whether
-`OP_INDEX_GET_RAW_INT`'s fallback ever fires across `bench/` + `tests/`. If it never does, the check
-is already dead weight and the question is settled.
+member, and no unchecked-and-typed one.
+
+**Instrumenting the fallback answered whether the runtime check can just be dropped, and the answer
+is a useful "no, but".** Counting both arms of `OP_INDEX_GET_RAW_INT` across all of `bench/` +
+`tests/`: **22,104,118 fast-path hits against 15 fallbacks**, and every one of the 15 is in
+`tests/test_loop_bound_hoisting.aer`. Reading what produces them shows the two emit sites are not
+equally trustworthy, which is the part that matters:
+
+- The **`reg_elem_kind` site** (`parse_postfix_chain`) knows the element kind because it watched the
+  array get built from a literal `[0i; n]`, and any write to that register clears the fact. This
+  site never produced a fallback.
+- **`try_rewrite_index_get_raw`** infers the kind from the *consumer* instead -- `total += nums[i]`
+  where `total` is a raw int makes it rewrite the read as an integer read. That is a guess about a
+  value the parser has never seen the construction of (`nums` is a parameter), and the runtime check
+  is what catches it being wrong. All 15 fallbacks come from here.
+
+So the check is load-bearing, but only for the inference site. The `reg_elem_kind` site can safely
+emit `OP_TYPED_INDEX_GET_UNCHECKED` when `index_safe_unchecked` also holds, and mark its destination
+typed from `reg_elem_kind` -- no new opcode, no promotion of a guess, because at that site the kind
+is not a guess. Doing that removes the downgrade this section is about, and unblocks typing the
+range-for variable. The two reverted attempts (`11afae9`, `f057a43`) hold the parser half.
 
 Both attempts are in the history (`11afae9`, `f057a43`) with their reverts; the parser change itself
 is correct and reusable, and only the index-family decision is missing.
