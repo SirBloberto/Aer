@@ -76,7 +76,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
                           "register a struct type (variable-length: header word, then that many field words)",
                           {0},
                           true},
-    [OP_HALT] = {"OP_HALT", "stop execution", {0}, false, 0, 0},
+    [OP_HALT] = {"OP_HALT", "stop execution"},
 
     /* dest+pool_idx both fit word0 now (op(8)+dest(8)+pool_idx(16)) -- no trailing word. */
     [OP_LOADK] = {"OP_LOADK", "reg = pool constant", {FLD_REG, FLD_POOL}, false, 0, 2},
@@ -93,25 +93,23 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
                  2,
                  3},
     /* word0: dest+arg_base+arg_count. word1: callee_reg (never patched). */
-    [OP_CALL_VALUE] = {"OP_CALL_VALUE", "call a runtime function value held in a register", {0}, false, 1, 0},
+    [OP_CALL_VALUE] = {"OP_CALL_VALUE", "call a runtime function value held in a register",
+                       .trailing_words = 1},
     [OP_TAIL_CALL] = {"OP_TAIL_CALL",
                       "tail call by compile-time-resolved offset, reuses this frame",
                       {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP, FLD_COUNT},
                       false,
                       2,
                       3},
-    [OP_TAIL_CALL_VALUE] =
-        {"OP_TAIL_CALL_VALUE", "tail call through a register value, reuses this frame", {0}, false, 1, 0},
+    [OP_TAIL_CALL_VALUE] = {"OP_TAIL_CALL_VALUE", "tail call through a register value, reuses this frame",
+                            .trailing_words = 1},
     [OP_RETURN] = {"OP_RETURN", "return reg to caller", {FLD_REG}, false, 0, 1},
     /* word0: dest+arg_base+arg_count. word1: module_idx. word2: fn_idx. word3: module_id+fn_id. */
-    [OP_CALL_MODULE] = {"OP_CALL_MODULE",
-                        "call a native or file-module function by (module, function) name",
-                        {0},
-                        false,
-                        3,
-                        0},
+    [OP_CALL_MODULE] = {"OP_CALL_MODULE", "call a native or file-module function by (module, function) name",
+                        .trailing_words = 3},
     /* word0: dest+arg_base+arg_count. word1: name_idx. word2: builtin_id. */
-    [OP_CALL_BUILTIN] = {"OP_CALL_BUILTIN", "global builtin (length/print/etc.) by name", {0}, false, 2, 0},
+    [OP_CALL_BUILTIN] = {"OP_CALL_BUILTIN", "global builtin (length/print/etc.) by name",
+                         .trailing_words = 2},
     [OP_ARRAY_NEW] = {"OP_ARRAY_NEW",
                       "reg = new array from a contiguous reg range",
                       {FLD_REG, FLD_REG, FLD_COUNT},
@@ -126,7 +124,7 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_TYPED_INDEX_SET_UNCHECKED] = {"OP_TYPED_INDEX_SET_UNCHECKED", "loop-proven-safe: typed_arr[rk] = rk"},
     [OP_DESTRUCTURE] = {"OP_DESTRUCTURE", "reg, reg = destructure(reg)"},
     /* word0: dest+arr_reg. word1: rk_start16+rk_end16. */
-    [OP_SLICE_GET] = {"OP_SLICE_GET", "reg = reg[rk:rk]", {0}, false, 1, 0},
+    [OP_SLICE_GET] = {"OP_SLICE_GET", "reg = reg[rk:rk]", .trailing_words = 1},
     [OP_DICT_NEW] = {"OP_DICT_NEW",
                      "reg = new dict from contiguous key/value reg pairs",
                      {FLD_REG, FLD_REG, FLD_COUNT},
@@ -141,9 +139,9 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
                             1,
                             3},
     /* word0: col+idx+key_dest. word1: val_dest. word2: end_target. */
-    [OP_ITER_NEXT_PAIR] = {"OP_ITER_NEXT_PAIR", "for-each step, dict key+value pairs", {0}, false, 2, 0},
-    [OP_ITER_RANGE_PREP] =
-        {"OP_ITER_RANGE_PREP", "rotated range-for: once-before-loop check", {0}, false, 2, 0},
+    [OP_ITER_NEXT_PAIR] = {"OP_ITER_NEXT_PAIR", "for-each step, dict key+value pairs", .trailing_words = 2},
+    [OP_ITER_RANGE_PREP] = {"OP_ITER_RANGE_PREP", "rotated range-for: once-before-loop check",
+                            .trailing_words = 2},
     [OP_ITER_RANGE_LOOP] = {"OP_ITER_RANGE_LOOP",
                             "rotated range-for: bottom-of-loop advance+check+branch-back (bounds snapshotted "
                             "once, never re-validated)",
@@ -152,56 +150,47 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
                             2,
                             0},
     /* word0: dest+arg_base+arg_count. word1: type_name_idx. */
-    [OP_STRUCT_NEW] =
-        {"OP_STRUCT_NEW", "reg = new struct instance from a contiguous reg range", {0}, false, 1, 0},
+    [OP_STRUCT_NEW] = {"OP_STRUCT_NEW", "reg = new struct instance from a contiguous reg range",
+                       .trailing_words = 1},
     /* word0: dest+struct_reg. word1: field_name_idx. */
-    [OP_FIELD_GET] = {"OP_FIELD_GET", "reg = struct.field", {0}, false, 1, 0},
+    [OP_FIELD_GET] = {"OP_FIELD_GET", "reg = struct.field", .trailing_words = 1},
     /* word0: struct_reg+rk_val16. word1: field_name_idx. */
-    [OP_FIELD_SET] = {"OP_FIELD_SET", "struct.field = rk", {0}, false, 1, 0},
+    [OP_FIELD_SET] = {"OP_FIELD_SET", "struct.field = rk", .trailing_words = 1},
     /* word0: dest+fill_reg+narrow_flag. word1: rk_count16. */
     [OP_ARRAY_REPEAT] = {"OP_ARRAY_REPEAT",
                          "reg = [fill_reg; rk_count] (struct -> packed array, number -> typed array)",
-                         {0},
-                         false,
-                         1,
-                         0},
+                         .trailing_words = 1},
     /* word0: dest+obj_reg. word1: field_idx16+rk_idx16. */
-    [OP_INDEX_FIELD_GET] =
-        {"OP_INDEX_FIELD_GET", "fused: reg = reg[rk].field (packed or struct array)", {0}, false, 1, 0},
+    [OP_INDEX_FIELD_GET] = {"OP_INDEX_FIELD_GET", "fused: reg = reg[rk].field (packed or struct array)",
+                            .trailing_words = 1},
     /* word0: obj_reg+rk_idx16. word1: field_idx16+rk_val16. */
-    [OP_INDEX_FIELD_SET] =
-        {"OP_INDEX_FIELD_SET", "fused: reg[rk].field = rk (packed or struct array)", {0}, false, 1, 0},
+    [OP_INDEX_FIELD_SET] = {"OP_INDEX_FIELD_SET", "fused: reg[rk].field = rk (packed or struct array)",
+                            .trailing_words = 1},
     /* word0: obj_reg+bin_op. word1: field_idx16+rk_idx16. word2: rk_rhs16. */
     [OP_INDEX_FIELD_COMPOUND] = {"OP_INDEX_FIELD_COMPOUND",
                                  "fused: reg[rk].field OP= rk (resolved once, packed or struct array)",
-                                 {0},
-                                 false,
-                                 2,
-                                 0},
+                                 .trailing_words = 2},
     /* Single-word RK8-packed -- special-cased. */
     [OP_UNARY] = {"OP_UNARY", "reg = unary_op(rk)"},
     [OP_CAST] = {"OP_CAST", "reg = cast(rk)"},
     /* word0: dest+struct_reg+bin_op. word1: field_idx16+rk16. Covers both `struct.field OP rk`
        AND `rk OP struct.field` -- the parser canonicalizes the latter into this same opcode
        wherever that's exact (see OP_FIELD_BINARY's own comment, vm.h). */
-    [OP_FIELD_BINARY] =
-        {"OP_FIELD_BINARY", "fused: reg = struct.field OP rk (field on the left)", {0}, false, 1, 0},
+    [OP_FIELD_BINARY] = {"OP_FIELD_BINARY", "fused: reg = struct.field OP rk (field on the left)",
+                         .trailing_words = 1},
     /* word0: struct_reg+bin_op. word1: field_idx16+rk16. */
-    [OP_FIELD_COMPOUND] =
-        {"OP_FIELD_COMPOUND", "fused: struct.field OP= rk (resolved once, no dest reg)", {0}, false, 1, 0},
+    [OP_FIELD_COMPOUND] = {"OP_FIELD_COMPOUND", "fused: struct.field OP= rk (resolved once, no dest reg)",
+                           .trailing_words = 1},
     /* word0: dest+a_reg+b_reg. word1: op1(hi16)+c_reg(lo16). word2: op2. */
     [OP_TYPED_ARRAY_CHAIN2] = {"OP_TYPED_ARRAY_CHAIN2",
                                "fused: reg = (reg op1 reg) op2 reg (typed-array chain, runtime-checked)",
-                               {0},
-                               false,
-                               2,
-                               0},
+                               .trailing_words = 2},
     [OP_PRINT_REPL] = {"OP_PRINT_REPL", "shell mode: print reg unless null", {FLD_REG}, false, 0, 1},
 
     /* Raw-arithmetic family -- special-cased below; fields[]/packed/trailing_words kept for
        documentation only except where noted (LOAD_INT/LOAD_REAL/LOAD_INT_POOL are 2 words). */
-    [OP_RAW_LOAD_INT] = {"OP_RAW_LOAD_INT", "rawi = imm (full int32)", {0}, false, 1, 0},
-    [OP_RAW_LOAD_REAL] = {"OP_RAW_LOAD_REAL", "rawr = pool constant", {0}, false, 1, 0},
+    [OP_RAW_LOAD_INT] = {"OP_RAW_LOAD_INT", "rawi = imm (full int32)", .trailing_words = 1},
+    [OP_RAW_LOAD_REAL] = {"OP_RAW_LOAD_REAL", "rawr = pool constant", .trailing_words = 1},
     [OP_RAW_ADD_INT] = {"OP_RAW_ADD_INT", "rawi = rawi + rawi"},
     [OP_RAW_SUB_INT] = {"OP_RAW_SUB_INT", "rawi = rawi - rawi"},
     [OP_RAW_MUL_INT] = {"OP_RAW_MUL_INT", "rawi = rawi * rawi"},
@@ -230,194 +219,136 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_UNBOX_REAL] = {"OP_UNBOX_REAL", "rawr = unbox(reg) (tag-checked)"},
     [OP_RAW_MOVE_INT] = {"OP_RAW_MOVE_INT", "rawi = rawi"},
     [OP_RAW_MOVE_REAL] = {"OP_RAW_MOVE_REAL", "rawr = rawr"},
-    [OP_RAW_LOAD_INT_POOL] = {"OP_RAW_LOAD_INT_POOL", "rawi = pool constant", {0}, false, 1, 0},
+    [OP_RAW_LOAD_INT_POOL] = {"OP_RAW_LOAD_INT_POOL", "rawi = pool constant", .trailing_words = 1},
 
     /* Shape-specialized field access -- see vm.h's own comment on this opcode family. All fully
        special-cased below (custom word layouts), fields[]/packed unused. */
-    [OP_INDEX_FIELD_GET_RAW_INT] =
-        {"OP_INDEX_FIELD_GET_RAW_INT", "specialized: rawi = packed_arr[rk].field", {0}, false, 1, 0},
-    [OP_INDEX_FIELD_GET_RAW_REAL] =
-        {"OP_INDEX_FIELD_GET_RAW_REAL", "specialized: rawr = packed_arr[rk].field", {0}, false, 1, 0},
-    [OP_FIELD_GET_RAW_INT] = {"OP_FIELD_GET_RAW_INT", "specialized: rawi = struct.field", {0}, false, 1, 0},
-    [OP_FIELD_GET_RAW_REAL] = {"OP_FIELD_GET_RAW_REAL", "specialized: rawr = struct.field", {0}, false, 1, 0},
-    [OP_INDEX_FIELD_SET_RAW_INT] =
-        {"OP_INDEX_FIELD_SET_RAW_INT", "specialized: packed_arr[rk].field = rawi", {0}, false, 1, 0},
-    [OP_INDEX_FIELD_SET_RAW_REAL] =
-        {"OP_INDEX_FIELD_SET_RAW_REAL", "specialized: packed_arr[rk].field = rawr", {0}, false, 1, 0},
-    [OP_FIELD_SET_RAW_INT] = {"OP_FIELD_SET_RAW_INT", "specialized: struct.field = rawi", {0}, false, 2, 0},
-    [OP_FIELD_SET_RAW_REAL] = {"OP_FIELD_SET_RAW_REAL", "specialized: struct.field = rawr", {0}, false, 2, 0},
-    [OP_FIELD_COMPOUND_RAW_INT] =
-        {"OP_FIELD_COMPOUND_RAW_INT", "specialized: struct.field OP= rawi", {0}, false, 2, 0},
-    [OP_FIELD_COMPOUND_RAW_REAL] =
-        {"OP_FIELD_COMPOUND_RAW_REAL", "specialized: struct.field OP= rawr", {0}, false, 2, 0},
-    [OP_INDEX_FIELD_COMPOUND_RAW_INT] =
-        {"OP_INDEX_FIELD_COMPOUND_RAW_INT", "specialized: packed_arr[rk].field OP= rawi", {0}, false, 2, 0},
-    [OP_INDEX_FIELD_COMPOUND_RAW_REAL] =
-        {"OP_INDEX_FIELD_COMPOUND_RAW_REAL", "specialized: packed_arr[rk].field OP= rawr", {0}, false, 2, 0},
+    [OP_INDEX_FIELD_GET_RAW_INT] = {"OP_INDEX_FIELD_GET_RAW_INT", "specialized: rawi = packed_arr[rk].field",
+                                    .trailing_words = 1},
+    [OP_INDEX_FIELD_GET_RAW_REAL] = {"OP_INDEX_FIELD_GET_RAW_REAL",
+                                     "specialized: rawr = packed_arr[rk].field", .trailing_words = 1},
+    [OP_FIELD_GET_RAW_INT] = {"OP_FIELD_GET_RAW_INT", "specialized: rawi = struct.field",
+                              .trailing_words = 1},
+    [OP_FIELD_GET_RAW_REAL] = {"OP_FIELD_GET_RAW_REAL", "specialized: rawr = struct.field",
+                               .trailing_words = 1},
+    [OP_INDEX_FIELD_SET_RAW_INT] = {"OP_INDEX_FIELD_SET_RAW_INT", "specialized: packed_arr[rk].field = rawi",
+                                    .trailing_words = 1},
+    [OP_INDEX_FIELD_SET_RAW_REAL] = {"OP_INDEX_FIELD_SET_RAW_REAL",
+                                     "specialized: packed_arr[rk].field = rawr", .trailing_words = 1},
+    [OP_FIELD_SET_RAW_INT] = {"OP_FIELD_SET_RAW_INT", "specialized: struct.field = rawi",
+                              .trailing_words = 2},
+    [OP_FIELD_SET_RAW_REAL] = {"OP_FIELD_SET_RAW_REAL", "specialized: struct.field = rawr",
+                               .trailing_words = 2},
+    [OP_FIELD_COMPOUND_RAW_INT] = {"OP_FIELD_COMPOUND_RAW_INT", "specialized: struct.field OP= rawi",
+                                   .trailing_words = 2},
+    [OP_FIELD_COMPOUND_RAW_REAL] = {"OP_FIELD_COMPOUND_RAW_REAL", "specialized: struct.field OP= rawr",
+                                    .trailing_words = 2},
+    [OP_INDEX_FIELD_COMPOUND_RAW_INT] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT",
+                                         "specialized: packed_arr[rk].field OP= rawi", .trailing_words = 2},
+    [OP_INDEX_FIELD_COMPOUND_RAW_REAL] = {"OP_INDEX_FIELD_COMPOUND_RAW_REAL",
+                                          "specialized: packed_arr[rk].field OP= rawr", .trailing_words = 2},
 
     /* _UNCHECKED counterparts -- same word layouts as the 3 wide INDEX_FIELD_*_RAW_INT/REAL
        families above, decoded by the same branches below; see vm.h's own comment on this family
        for the compile-time proof that makes skipping vm_packed_raw_elem's index checks safe. */
     [OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED] = {"OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED",
                                               "specialized+loop-proven-safe: rawi = packed_arr[rk].field",
-                                              {0},
-                                              false,
-                                              1,
-                                              0},
+                                              .trailing_words = 1},
     [OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED] = {"OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED",
                                                "specialized+loop-proven-safe: rawr = packed_arr[rk].field",
-                                               {0},
-                                               false,
-                                               1,
-                                               0},
+                                               .trailing_words = 1},
     [OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED] = {"OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED",
                                               "specialized+loop-proven-safe: packed_arr[rk].field = rawi",
-                                              {0},
-                                              false,
-                                              1,
-                                              0},
+                                              .trailing_words = 1},
     [OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED] = {"OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED",
                                                "specialized+loop-proven-safe: packed_arr[rk].field = rawr",
-                                               {0},
-                                               false,
-                                               1,
-                                               0},
+                                               .trailing_words = 1},
     [OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED] =
         {"OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawi",
-         {0},
-         false,
-         2,
-         0},
+         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawi", .trailing_words = 2},
     [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED] =
         {"OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr",
-         {0},
-         false,
-         2,
-         0},
+         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr", .trailing_words = 2},
 
     /* Narrow (int32/float32) counterparts of the whole family above -- same word layouts, just a
        4-byte field instead of 8. See vm.h's own comment on this opcode family. */
     [OP_INDEX_FIELD_GET_RAW_INT32] = {"OP_INDEX_FIELD_GET_RAW_INT32",
                                       "specialized: rawi = packed_arr[rk].field (narrow)",
-                                      {0},
-                                      false,
-                                      1,
-                                      0},
+                                      .trailing_words = 1},
     [OP_INDEX_FIELD_GET_RAW_FLOAT32] = {"OP_INDEX_FIELD_GET_RAW_FLOAT32",
                                         "specialized: rawr = packed_arr[rk].field (narrow)",
-                                        {0},
-                                        false,
-                                        1,
-                                        0},
-    [OP_FIELD_GET_RAW_INT32] =
-        {"OP_FIELD_GET_RAW_INT32", "specialized: rawi = struct.field (narrow)", {0}, false, 1, 0},
-    [OP_FIELD_GET_RAW_FLOAT32] =
-        {"OP_FIELD_GET_RAW_FLOAT32", "specialized: rawr = struct.field (narrow)", {0}, false, 1, 0},
+                                        .trailing_words = 1},
+    [OP_FIELD_GET_RAW_INT32] = {"OP_FIELD_GET_RAW_INT32", "specialized: rawi = struct.field (narrow)",
+                                .trailing_words = 1},
+    [OP_FIELD_GET_RAW_FLOAT32] = {"OP_FIELD_GET_RAW_FLOAT32", "specialized: rawr = struct.field (narrow)",
+                                  .trailing_words = 1},
     [OP_INDEX_FIELD_SET_RAW_INT32] = {"OP_INDEX_FIELD_SET_RAW_INT32",
                                       "specialized: packed_arr[rk].field = rawi (narrow)",
-                                      {0},
-                                      false,
-                                      1,
-                                      0},
+                                      .trailing_words = 1},
     [OP_INDEX_FIELD_SET_RAW_FLOAT32] = {"OP_INDEX_FIELD_SET_RAW_FLOAT32",
                                         "specialized: packed_arr[rk].field = rawr (narrow)",
-                                        {0},
-                                        false,
-                                        1,
-                                        0},
-    [OP_FIELD_SET_RAW_INT32] =
-        {"OP_FIELD_SET_RAW_INT32", "specialized: struct.field = rawi (narrow)", {0}, false, 2, 0},
-    [OP_FIELD_SET_RAW_FLOAT32] =
-        {"OP_FIELD_SET_RAW_FLOAT32", "specialized: struct.field = rawr (narrow)", {0}, false, 2, 0},
-    [OP_FIELD_COMPOUND_RAW_INT32] =
-        {"OP_FIELD_COMPOUND_RAW_INT32", "specialized: struct.field OP= rawi (narrow)", {0}, false, 2, 0},
-    [OP_FIELD_COMPOUND_RAW_FLOAT32] =
-        {"OP_FIELD_COMPOUND_RAW_FLOAT32", "specialized: struct.field OP= rawr (narrow)", {0}, false, 2, 0},
+                                        .trailing_words = 1},
+    [OP_FIELD_SET_RAW_INT32] = {"OP_FIELD_SET_RAW_INT32", "specialized: struct.field = rawi (narrow)",
+                                .trailing_words = 2},
+    [OP_FIELD_SET_RAW_FLOAT32] = {"OP_FIELD_SET_RAW_FLOAT32", "specialized: struct.field = rawr (narrow)",
+                                  .trailing_words = 2},
+    [OP_FIELD_COMPOUND_RAW_INT32] = {"OP_FIELD_COMPOUND_RAW_INT32",
+                                     "specialized: struct.field OP= rawi (narrow)", .trailing_words = 2},
+    [OP_FIELD_COMPOUND_RAW_FLOAT32] = {"OP_FIELD_COMPOUND_RAW_FLOAT32",
+                                       "specialized: struct.field OP= rawr (narrow)", .trailing_words = 2},
     [OP_INDEX_FIELD_COMPOUND_RAW_INT32] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT32",
                                            "specialized: packed_arr[rk].field OP= rawi (narrow)",
-                                           {0},
-                                           false,
-                                           2,
-                                           0},
+                                           .trailing_words = 2},
     [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32] = {"OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32",
                                              "specialized: packed_arr[rk].field OP= rawr (narrow)",
-                                             {0},
-                                             false,
-                                             2,
-                                             0},
+                                             .trailing_words = 2},
 
     [OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED] =
         {"OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED",
-         "specialized+loop-proven-safe: rawi = packed_arr[rk].field (narrow)",
-         {0},
-         false,
-         1,
-         0},
+         "specialized+loop-proven-safe: rawi = packed_arr[rk].field (narrow)", .trailing_words = 1},
     [OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED] =
         {"OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED",
-         "specialized+loop-proven-safe: rawr = packed_arr[rk].field (narrow)",
-         {0},
-         false,
-         1,
-         0},
+         "specialized+loop-proven-safe: rawr = packed_arr[rk].field (narrow)", .trailing_words = 1},
     [OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED] =
         {"OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field = rawi (narrow)",
-         {0},
-         false,
-         1,
-         0},
+         "specialized+loop-proven-safe: packed_arr[rk].field = rawi (narrow)", .trailing_words = 1},
     [OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED] =
         {"OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field = rawr (narrow)",
-         {0},
-         false,
-         1,
-         0},
+         "specialized+loop-proven-safe: packed_arr[rk].field = rawr (narrow)", .trailing_words = 1},
     [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED] =
         {"OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawi (narrow)",
-         {0},
-         false,
-         2,
-         0},
+         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawi (narrow)", .trailing_words = 2},
     [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED] =
         {"OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr (narrow)",
-         {0},
-         false,
-         2,
-         0},
+         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr (narrow)", .trailing_words = 2},
 
-    [OP_EQ_JUMP_IF_FALSE] = {"OP_EQ_JUMP_IF_FALSE", "jump if !(rk == rk)", {0}, false, 1, 0},
-    [OP_NEQ_JUMP_IF_FALSE] = {"OP_NEQ_JUMP_IF_FALSE", "jump if !(rk != rk)", {0}, false, 1, 0},
-    [OP_LT_JUMP_IF_FALSE] = {"OP_LT_JUMP_IF_FALSE", "jump if !(rk < rk)", {0}, false, 1, 0},
-    [OP_GT_JUMP_IF_FALSE] = {"OP_GT_JUMP_IF_FALSE", "jump if !(rk > rk)", {0}, false, 1, 0},
-    [OP_LTE_JUMP_IF_FALSE] = {"OP_LTE_JUMP_IF_FALSE", "jump if !(rk <= rk)", {0}, false, 1, 0},
-    [OP_GTE_JUMP_IF_FALSE] = {"OP_GTE_JUMP_IF_FALSE", "jump if !(rk >= rk)", {0}, false, 1, 0},
+    [OP_EQ_JUMP_IF_FALSE] = {"OP_EQ_JUMP_IF_FALSE", "jump if !(rk == rk)", .trailing_words = 1},
+    [OP_NEQ_JUMP_IF_FALSE] = {"OP_NEQ_JUMP_IF_FALSE", "jump if !(rk != rk)", .trailing_words = 1},
+    [OP_LT_JUMP_IF_FALSE] = {"OP_LT_JUMP_IF_FALSE", "jump if !(rk < rk)", .trailing_words = 1},
+    [OP_GT_JUMP_IF_FALSE] = {"OP_GT_JUMP_IF_FALSE", "jump if !(rk > rk)", .trailing_words = 1},
+    [OP_LTE_JUMP_IF_FALSE] = {"OP_LTE_JUMP_IF_FALSE", "jump if !(rk <= rk)", .trailing_words = 1},
+    [OP_GTE_JUMP_IF_FALSE] = {"OP_GTE_JUMP_IF_FALSE", "jump if !(rk >= rk)", .trailing_words = 1},
     /* Variable-length, but not OP_DEFINE_STRUCT's shape -- header word then part_count RK16
        words, one per part. Both walkers below special-case it. */
-    [OP_INTERP] = {"OP_INTERP", "reg = one string built from N parts", {0}, false, 0, 2},
-    [OP_INDEX_GET_INTERP] =
-        {"OP_INDEX_GET_INTERP", "reg = dict[N-part key], key never allocated", {0}, false, 0, 3},
-    [OP_RAW_LT_INT_JUMP_IF_FALSE] =
-        {"OP_RAW_LT_INT_JUMP_IF_FALSE", "jump if !(rawi < rawi)", {0}, false, 1, 0},
-    [OP_RAW_LTE_INT_JUMP_IF_FALSE] =
-        {"OP_RAW_LTE_INT_JUMP_IF_FALSE", "jump if !(rawi <= rawi)", {0}, false, 1, 0},
-    [OP_RAW_LT_REAL_JUMP_IF_FALSE] =
-        {"OP_RAW_LT_REAL_JUMP_IF_FALSE", "jump if !(rawr < rawr)", {0}, false, 1, 0},
-    [OP_RAW_LTE_REAL_JUMP_IF_FALSE] =
-        {"OP_RAW_LTE_REAL_JUMP_IF_FALSE", "jump if !(rawr <= rawr)", {0}, false, 1, 0},
-    [OP_RAW_EQ_INT_JUMP_IF_FALSE] =
-        {"OP_RAW_EQ_INT_JUMP_IF_FALSE", "jump if !(rawi == rawi)", {0}, false, 1, 0},
-    [OP_RAW_NEQ_INT_JUMP_IF_FALSE] =
-        {"OP_RAW_NEQ_INT_JUMP_IF_FALSE", "jump if !(rawi != rawi)", {0}, false, 1, 0},
-    [OP_RAW_EQ_REAL_JUMP_IF_FALSE] =
-        {"OP_RAW_EQ_REAL_JUMP_IF_FALSE", "jump if !(rawr == rawr)", {0}, false, 1, 0},
-    [OP_RAW_NEQ_REAL_JUMP_IF_FALSE] =
-        {"OP_RAW_NEQ_REAL_JUMP_IF_FALSE", "jump if !(rawr != rawr)", {0}, false, 1, 0},
+    [OP_INTERP] = {"OP_INTERP", "reg = one string built from N parts", .packed = 2},
+    [OP_INDEX_GET_INTERP] = {"OP_INDEX_GET_INTERP", "reg = dict[N-part key], key never allocated",
+                             .packed = 3},
+    [OP_RAW_LT_INT_JUMP_IF_FALSE] = {"OP_RAW_LT_INT_JUMP_IF_FALSE", "jump if !(rawi < rawi)",
+                                     .trailing_words = 1},
+    [OP_RAW_LTE_INT_JUMP_IF_FALSE] = {"OP_RAW_LTE_INT_JUMP_IF_FALSE", "jump if !(rawi <= rawi)",
+                                      .trailing_words = 1},
+    [OP_RAW_LT_REAL_JUMP_IF_FALSE] = {"OP_RAW_LT_REAL_JUMP_IF_FALSE", "jump if !(rawr < rawr)",
+                                      .trailing_words = 1},
+    [OP_RAW_LTE_REAL_JUMP_IF_FALSE] = {"OP_RAW_LTE_REAL_JUMP_IF_FALSE", "jump if !(rawr <= rawr)",
+                                       .trailing_words = 1},
+    [OP_RAW_EQ_INT_JUMP_IF_FALSE] = {"OP_RAW_EQ_INT_JUMP_IF_FALSE", "jump if !(rawi == rawi)",
+                                     .trailing_words = 1},
+    [OP_RAW_NEQ_INT_JUMP_IF_FALSE] = {"OP_RAW_NEQ_INT_JUMP_IF_FALSE", "jump if !(rawi != rawi)",
+                                      .trailing_words = 1},
+    [OP_RAW_EQ_REAL_JUMP_IF_FALSE] = {"OP_RAW_EQ_REAL_JUMP_IF_FALSE", "jump if !(rawr == rawr)",
+                                      .trailing_words = 1},
+    [OP_RAW_NEQ_REAL_JUMP_IF_FALSE] = {"OP_RAW_NEQ_REAL_JUMP_IF_FALSE", "jump if !(rawr != rawr)",
+                                       .trailing_words = 1},
     [OP_INDEX_GET_RAW_INT] = {"OP_INDEX_GET_RAW_INT", "rawi = arr[rk] (checked)"},
     [OP_INDEX_SET_RAW_INT] = {"OP_INDEX_SET_RAW_INT", "arr[rk] = rawi (checked)"},
     [OP_INDEX_SET_RAW_REAL] = {"OP_INDEX_SET_RAW_REAL", "arr[rk] = rawr (checked)"},
