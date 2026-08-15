@@ -73,8 +73,7 @@ typedef enum TokenType {
     TOKEN_NULL,
     TOKEN_IMPORT,
 
-    /* Reserved type names, unusable as any identifier. `string` is excluded -- it collides with the stdlib
-       `string` module. */
+    /* Reserved type names, unusable as identifiers. */
 
     TOKEN_COMMA,
     TOKEN_SEMICOLON, /* ;  -- the repeat-literal separator, `[value; count]`, and nothing else */
@@ -84,8 +83,8 @@ typedef enum TokenType {
     TOKEN_NEW_LINE,
     TOKEN_END_OF_FILE,
 
-    /* Emitted for a byte lex() cannot make a token from (already reported via error_at()); always consumes
-       exactly one byte so callers (parser.c's error-recovery skip loop) are guaranteed forward progress. */
+    /* A byte lex() cannot tokenize, already reported. Always consumes exactly one, so the parser's
+       recovery loop makes progress. */
     TOKEN_ERROR,
 } TokenType;
 
@@ -113,21 +112,17 @@ extern Token token;
 const char* current_source_start();
 const char* current_source_cursor();
 
-/* Report a deferred error at a SAVED cursor position: save current_source_cursor() first,
-   override, then restore. Mutates the current File's cursor; does not switch files. */
+/* Reports at a saved cursor: save current_source_cursor(), override, restore. */
 void lexer_set_cursor(const char* pos);
 
-/* Exposed so parser.c can tag each statement's bytecode with its source line (see Chunk.line_mark_offsets,
-   vm.h). */
+/* For tagging each statement's bytecode with its source line. */
 unsigned int current_source_line();
 
-/* Exposed so a file-based `import` can resolve a sibling .aer path relative to the file currently being
-   lexed. */
+/* For resolving an import's path relative to the file being lexed. */
 const char* current_source_name();
 
-/* Captures everything read_file()/indent tracking need to resume the CURRENT file's lexing where it left
-   off after a nested read_file()+lex()+parse() cycle for an imported file completes; opaque outside
-   lexer.c -- only ever saved and restored, never inspected. */
+/* Enough to resume this file's lexing after a nested import's own lex/parse cycle. Opaque: saved
+   and restored, never inspected. */
 typedef struct LexerState LexerState;
 LexerState* lexer_save_state(void);
 void lexer_restore_state(LexerState* state);

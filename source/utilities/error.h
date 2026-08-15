@@ -1,9 +1,7 @@
 #ifndef ERROR_H
 #define ERROR_H
 
-/* Per-thread once the scheduler runs actors in parallel: one worker's error must not be read as
-   another's. Off by default -- see heap_ref.c for why this is a build switch and not just a
-   keyword. */
+/* Per-thread once actors run in parallel, so one worker's error is not read as another's. */
 #ifdef AER_HEAP_REF_TLS
 #define AER_TLS _Thread_local
 #else
@@ -37,8 +35,7 @@ extern AER_TLS bool runtime_had_error;
    so parse-time recovery runs unchanged. Nested vm_run calls save/restore it. */
 extern AerJmpBuf* runtime_error_unwind_target;
 
-/* Incremented by assert() on failure; deliberately not runtime_had_error, since DISPATCH() aborts vm_run
-   on that flag but a failed assertion should report and keep going. */
+/* Deliberately not runtime_had_error: a failed assertion reports and keeps going. */
 extern AER_TLS unsigned int assert_failure_count;
 
 /* Source-line lookup for runtime errors; NULL or a 0 return means "unknown", no line prefix. */
@@ -65,12 +62,10 @@ typedef void (*AerDiagnosticCallback)(unsigned int line, unsigned int col, const
                                       void* userdata);
 void aer_set_diagnostic_callback(AerDiagnosticCallback callback, void* userdata);
 
-/* Terminates the process for a condition error recovery doesn't apply to (OOM) -- routes through the same
-   sink as error()/error_at() first; the only thing here still allowed to call exit(). */
+/* For a condition recovery cannot apply to, such as OOM. The only thing here that calls exit(). */
 void aer_report_fatal(const char* msg);
 
-/* malloc/calloc/realloc/strdup, but fatal (via aer_report_fatal) on failure instead of returning NULL --
-   every call site is spared its own check. */
+/* Fatal on failure rather than returning NULL, so no call site needs its own check. */
 void* xmalloc(size_t size);
 void* xcalloc(size_t count, size_t size);
 void* xrealloc(void* ptr, size_t size);
