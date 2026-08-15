@@ -417,11 +417,8 @@ void vm_init(VM* vm, Chunk* chunk) {
     runtime_filename_lookup = lookup_runtime_filename;
     runtime_function_lookup = lookup_runtime_function;
     runtime_stack_trace_lookup = lookup_runtime_stack_trace;
-    /* Set here too, not just by DISPATCH() -- makes filename/line lookups correct during parsing
-       as well as running (parse happens before vm_run ever dispatches a single opcode). A nested
-       module's own vm_init (aer_vm_instantiate_from_file) correctly overwrites this to itself
-       while it parses/runs; DISPATCH() reasserts the outer VM on the first opcode after control
-       returns, exactly as it already did before this addition. */
+    /* Not only by DISPATCH(): parsing happens before any opcode runs, and its errors need a filename
+       too. A nested module overwrites this while it parses; DISPATCH() reasserts the outer VM. */
     active_vm_for_errors = vm;
     /* Frame 0's register window only ever needs linking once, for the life of the VM (top-level
        usage is open-ended, so it always gets a flat FRAME_REGISTERS reservation) -- everything
@@ -446,11 +443,8 @@ void vm_free(VM* vm) {
     gc_finalize_all_pools(heap);
     vm_set_current_heap(saved_current_heap);
 
-    /* Cached typed-array data buffers (vm.h's own comment on TypedArrayFreeSlot) are stashed here
-       instead of freed the moment they're no longer referenced -- gc_finalize_all_pools above just
-       freed every STILL-LIVE typed array's own data buffer via free_typed_array, but anything
-       already sitting in this cache from an EARLIER free (waiting to be reused) was never a live
-       cell at all, so that pass never touches it. Actually free it now, or it leaks. */
+    /* The free cache holds buffers belonging to no live cell, so the sweep above never reaches
+       them. */
     for (unsigned int i = 0; i < TYPED_ARRAY_FREE_CACHE_SLOTS; i++)
         free(heap->typed_array_free_cache[i].ptr);
 
@@ -520,12 +514,8 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
 /* Type helpers                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Struct instances report their declared name (e.g. "Player") instead of "array" -- used by type(),
-   the way to check a struct's shape (type(x) == "Player"). A packed array reports "Player[]" --
-   distinct from a single instance's own "Player". type_names[]
-   is indexed directly by ValueType, so it must stay exactly as long as the enum's non-specially-
-   handled entries (value.h) -- TYPE_STRUCT/TYPE_PACKED_ARRAY/TYPE_TYPED_ARRAY/TYPE_RESULT are all
-   handled specially, so none of them is ever used to index this array. */
+/* A struct reports its declared name, a packed array that name plus "[]". type_names[] is indexed
+   by ValueType, so it must stay as long as the entries not handled specially above. */
 static const char* vm_type_name(Chunk* c, AerVal v) {
     static const char* type_names[] = {"null",   "boolean",  "integer", "float",
                                        "string", "function", "array",   "hashtable"};
@@ -1584,10 +1574,8 @@ static inline int op_chain2_index(Opcode op) {
     }
 }
 
-/* a, b, cc must already have the same elem_kind and count -- checked by the caller
-   (lbl_typed_array_chain2) before this is ever reached. Returns NULL (not an error -- caller
-   already validated int32/int64 aren't handled by this fast path) only if it's ever called for a
-   non-float kind; every real call site guards against that first. */
+/* The caller has already checked that a, b and cc share an elem_kind and count, and that the kind
+   is float. */
 static AerVal vm_typed_array_chain2(AerTypedArray* a, AerTypedArray* b, AerTypedArray* cc, Opcode op1,
                                     Opcode op2) {
     int i1 = op_chain2_index(op1), i2 = op_chain2_index(op2);
@@ -2266,10 +2254,8 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                                     unsigned int* chosen_max_registers, unsigned short* chosen_frame_bounds) {
     unsigned int site =
         ip - 3; /* this instruction's own word0 offset -- ip already advanced past all 3 words by now */
-    /* Lowest set bit -- which argument register carries the shape-sensitive parameter. Only
-       the first such parameter is ever used to key specialization; a function using more than
-       one parameter for field access still compiles and runs correctly, it just never
-       specializes on the others. */
+    /* Which argument register keys specialization. Only the first shape-sensitive parameter does;
+       the others still work, they just never specialize. */
     int param_index = __builtin_ctz(target_f->shape_sensitive_mask);
     AerVal arg = registers[arg_reg_base + param_index];
     Shape* observed = NULL;
@@ -2669,10 +2655,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
        allocation back to whichever heap was active before it, once it returns. */
     VmHeap* saved_current_heap = vm_current_heap();
     vm_set_current_heap(&vm->heap);
-/* Every exit from this function must restore all three, including the yield exits -- leaving
-   runtime_error_unwind_target pointing at this frame's catch_point after the frame has returned
-   makes the next error longjmp into dead stack, and leaving current_heap set sends the next
-   allocation into a heap this call no longer owns. #undef'd after lbl_halt. */
+/* Every exit restores all three, yields included: a stale unwind target longjmps into dead stack,
+   and a stale heap sends the next allocation somewhere this call no longer owns. */
 #define SLICE_RETURN(result)                                                                                 \
     do {                                                                                                     \
         runtime_error_unwind_target = saved_unwind_target;                                                   \
@@ -2952,9 +2936,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INTERP] = &&lbl_interp,
         [OP_INDEX_GET_INTERP] = &&lbl_index_get_interp,
     };
-/* A plain index. Under PIC the table's address is not a link-time constant and the compiler
-   rebuilds it from `pc` on every opcode, which is what the old r8 pin existed to avoid -- the
-   non-PIE link in the makefile removes the cause instead. */
+/* A plain index; the makefile's non-PIE link is what keeps the table's address a link-time
+   constant. */
 #define DT_AT(op) (dt[(op)])
 
     /* A designated-initializer table leaves an opcode with no entry as NULL, so emitting one jumps
@@ -3297,10 +3280,8 @@ lbl_call: {
     DISPATCH();
 }
 
-/* Its own label rather than a branch inside lbl_call. OP_CALL and OP_TAIL_CALL used to share one,
-   so every ordinary call tested `cur_op == OP_TAIL_CALL` and carried this body in its live range --
-   35.5M ordinary calls across the benchmark suite against zero tail calls. Reuses the current frame
-   instead of pushing, so it needs none of lbl_call's sizing or base-pointer work. */
+/* Its own label, so an ordinary call carries none of this in its live range. Reuses the current
+   frame rather than pushing, so none of lbl_call's sizing work applies. */
 lbl_tail_call: {
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
@@ -3371,9 +3352,8 @@ lbl_return: {
     if (dest_raw_kind == 0)
         registers[dest_reg] = result;
     else if (result.tag != TYPE_INTEGER && result.tag != TYPE_REAL)
-        /* Reached by falling off the end of a function a raw call site expected a number from --
-           the caller has nowhere to put a non-number, and reading null as 0 would turn what used to
-           be a clear error into a wrong answer. */
+        /* Falling off the end of a function a raw call site wanted a number from. Reading the null as 0
+           would turn an error into a wrong answer. */
         error("Expected a number back from this call, got %s", vm_type_name(c, result));
     else if (dest_raw_kind == 1)
         registers[dest_reg] = aer_int((result.tag == TYPE_REAL) ? (int64_t)result.as.d : result.as.i);

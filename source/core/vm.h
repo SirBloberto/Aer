@@ -47,7 +47,7 @@ typedef enum {
     /* Never dispatched -- parser tags for `&&`/`||`, which compile to short-circuit jumps. */
     OP_AND,
     OP_OR,
-    OP_PIPE, /* never dispatched either -- `x |> f(args)` desugars to a call at parse time; kept as a lookup-table tag only, same reason as OP_AND/OP_OR */
+    OP_PIPE, /* also never dispatched -- `x |> f(args)` desugars to a call at parse time */
 
     /* Binary bitwise */
     OP_BITWISE_AND,
@@ -65,10 +65,10 @@ typedef enum {
     OP_JUMP, /* operand: absolute code index */
 
     /* Struct definitions only -- instantiation/field access are register opcodes below. */
-    OP_DEFINE_STRUCT, /* operands: name pool idx, field count, then that many (field-name, default-value) pool-idx pairs -- registers a Shape in the chunk's shape table */
+    OP_DEFINE_STRUCT, /* name idx, field count, then that many (name, default) pairs */
 
     /* Misc */
-    OP_TO_STR, /* used as OP_UNARY's unary_op tag (string interpolation's value-to-string step) -- see vm_to_str() */
+    OP_TO_STR, /* an OP_UNARY tag, not dispatched alone -- see vm_to_str() */
     OP_HALT,
 
     /* ---- register-VM opcodes (packed encoding: see PACK3/PACK_BINARY below). */
@@ -130,7 +130,7 @@ typedef enum {
                               (yields keys) or string (yields chars) */
 
     /* Dict-only two-variable form; val_dest_reg needs its own word (only 3 narrow fields pack). */
-    OP_ITER_NEXT_PAIR, /* col_reg, idx_reg, key_dest_reg, val_dest_reg, end_target -- key is a fresh owned string */
+    OP_ITER_NEXT_PAIR, /* col, idx, key_dest, val_dest, end_target; key is freshly owned */
 
     /* Rotated range-for (Lua's FORLOOP shape): PREP runs once before the loop, LOOP at the loop
        BOTTOM is itself the back-edge (no OP_JUMP). PREP repurposes end_reg/step_reg into a
@@ -457,7 +457,7 @@ static inline uint16_t pack_rk16(int rk) {
 #define UNPACK_STRUCT_HEADER_NAME(word) (((word) >> 8) & 0xFFFFU)
 #define UNPACK_STRUCT_HEADER_COUNT(word) (((word) >> 24) & 0xFFU)
 
-/* OP_CAST operand values -- target type for `x as T` (T=string compiles to OP_TO_STR instead, since that conversion already existed). */
+/* OP_CAST's target type. */
 #define CAST_INTEGER 0
 #define CAST_FLOAT 1
 #define CAST_BOOLEAN 2
@@ -654,8 +654,7 @@ typedef struct {
     uint32_t* code;
     unsigned int count, capacity;
 
-    char*
-        source_filename; /* owned copy; NULL for a chunk with no real file (e.g. aer_run_source on a raw string) */
+    char* source_filename; /* owned; NULL for a chunk with no file */
 
     AerVal* pool; /* constants and variable names -- all deduplicated by value */
     unsigned int pool_count, pool_cap;
@@ -670,10 +669,11 @@ typedef struct {
     double* rawk_d;
     unsigned int rawk_d_count, rawk_d_cap;
 
-    /* name -> pool index, for O(1) dedup of TYPE_STRING pool entries (chunk_add_pool, vm.c); owns an independent copy of each key. */
+    /* name -> pool index, for O(1) string dedup. Owns its keys. */
     HashTable name_index;
 
-    /* Struct type registry appended to by OP_DEFINE_STRUCT; redeclaring a struct appends rather than replaces so old Shape pointers stay valid, and chunk_find_shape() searches newest-first. */
+    /* Appended to by OP_DEFINE_STRUCT. A redeclare appends rather than replaces, so old Shape
+       pointers stay valid; chunk_find_shape searches newest-first. */
     Shape** shapes;
     unsigned int shape_count, shape_cap;
 
@@ -681,7 +681,7 @@ typedef struct {
     ChunkFunction* functions;
     unsigned int function_count, function_cap;
 
-    /* Module names from `import`, parse-time only, tracked on the chunk so a later REPL line still recognizes a module an earlier line imported. */
+    /* Parse-time only, on the chunk so a later REPL line still sees an earlier line's import. */
     char** imported_modules;
     unsigned int import_count, import_cap;
 
@@ -931,10 +931,11 @@ void chunk_init(Chunk* c);
 void chunk_free(Chunk* c);
 void chunk_emit(Chunk* c, uint32_t word);
 
-/* Records that bytecode from `offset` onward belongs to source `line`, once per statement not instruction (see line_mark_offsets); no-op if offset doesn't strictly increase from the last mark. */
+/* Bytecode from `offset` on belongs to `line`. Once per statement; a non-increasing offset is a
+   no-op. */
 void chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line);
 
-/* The source line whose statement contains `offset` (the largest recorded mark at or before it), or 0 if the chunk has no marks yet. */
+/* The line whose statement contains `offset`, or 0 if there are no marks yet. */
 unsigned int chunk_line_for_offset(Chunk* c, unsigned int offset);
 
 /* Formats a real guaranteeing a decimal point/exponent/nan-inf marker survives -- bare "%g"
@@ -1013,7 +1014,7 @@ bool vm_run(VM* vm);
 
 typedef enum {
     VM_SLICE_DONE, /* reached OP_HALT */
-    VM_SLICE_YIELDED, /* max_instructions reached at a loop back-edge or call; vm->ip is a valid resume point */
+    VM_SLICE_YIELDED, /* budget reached at a back-edge or call; vm->ip is a valid resume point */
     VM_SLICE_ERROR, /* runtime error, same as vm_run's false */
 } VmSliceResult;
 

@@ -1,14 +1,7 @@
 #include "vm.h"
 
-/* Which VM's heap is active. It lives in its own translation unit, behind noinline accessors, for
-   one measured reason: vm_run_slice is a single enormous function, and making this variable opaque
-   inside it (which _Thread_local does) shifted register allocation across the whole thing -- 6.68%
-   on fib_bench, a benchmark that never allocates, while allocation-heavy ones were unmoved. An
-   opaque call is something that function already deals with everywhere; an opaque variable is not.
-   -flto would inline these straight back into vm.c and undo that, hence noinline.
-
-   It exists at all so an allocation with no VM* in scope (the lexer, and the parts of the parser
-   that build pooled values before a Chunk's VM exists) still reaches the right heap. */
+/* Which VM's heap is active, for allocations with no VM in scope. Its own TU behind noinline
+   accessors, or _Thread_local reshapes vm_run_slice's register allocation (ARCHITECTURE 5.62). */
 #ifdef AER_HEAP_REF_TLS
 #define HEAP_REF_STORAGE _Thread_local
 #else
@@ -17,8 +10,7 @@
 
 static HEAP_REF_STORAGE VmHeap* current_heap = NULL;
 
-/* For the one case with no VM anywhere yet -- a host calling aer_gc_configure() before creating
-   one. Promoted lazily so nothing dereferences NULL. */
+/* For a host that configures the GC before creating any VM. */
 static VmHeap bootstrap_heap = {0};
 
 __attribute__((noinline)) VmHeap* vm_require_current_heap(void) {

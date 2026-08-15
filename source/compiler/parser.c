@@ -205,10 +205,8 @@ typedef struct Parser {
     int global_regs[FRAME_REGISTERS];
     int global_count;
 
-    /* Set to the assignment target's own name before parsing its RHS, read back after via
-       self_ref_watch_seen. var_lookup_rk hooks it, so a self-reference is caught however deep in
-       the RHS it sits. Distinguishes `total = total + x` (RHS reads the old value -- unsafe to
-       shadow mid-loop) from `total = f()` (does not -- safe). */
+    /* The assignment target's own name, so var_lookup_rk can flag a self-reference however deep in
+       the RHS it sits: `total = total + x` cannot shadow mid-loop, `total = f()` can. */
     unsigned int self_ref_watch_name;
     bool self_ref_watch_seen;
 
@@ -236,10 +234,8 @@ typedef struct Parser {
 } Parser;
 static Parser P;
 
-/* One allocator, one index space. A slot's CLASS says what it holds so the parser can pick an
-   unchecked opcode; it no longer picks a bank, so every class draws from the same stack of
-   registers. Overflow returns -1 and the caller falls back to a dynamically typed value; reg_alloc
-   is the exception and errors, because there is no fallback below that. */
+/* Overflow returns -1 and the caller falls back to a dynamically typed value. reg_alloc errors
+   instead, because nothing is below it to fall back to. */
 static void track_peak(int v) {
     if (v > P.slot_max)
         P.slot_max = v;
@@ -478,9 +474,8 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
    branch-prediction cost (see vm.h). Detected by inspecting what was just compiled and rolling it
    back, so anything else -- and/or, a bare boolean, a spilled operand -- falls through. */
 static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int cond_start) {
-    /* The comparison only has to be the LAST instruction of the condition, not the whole of it --
-       `x * x + y * y > 4.0` computes into raw slots first, and used to miss the fusion entirely
-       because the region was three words rather than two. Everything before it is kept. */
+    /* The comparison need only be the LAST instruction of the condition, not the whole of it:
+       `x * x + y * y > 4.0` computes into raw slots first, and all of that is kept. */
     unsigned int cmp_word_start = cond_start;
     if (P.last_cmp_offset != NO_OFFSET && P.last_cmp_offset >= cond_start &&
         P.last_cmp_offset == c->count - 1) {
@@ -903,11 +898,9 @@ static bool report_if_shadowed_global(Chunk* c, unsigned int name_idx) {
     return false;
 }
 
-/* A new variable's register is P.slot_floor, not P.var_count -- they diverge when a for-loop
-   promotes P.slot_floor for its own iteration registers without registering a name (a fresh
-   variable declared inside that loop's body must land above them, or it silently aliases the
-   loop's own state -- a real bug found this way with nested for-loops). P.var_regs[] is what makes
-   lookup still resolve correctly once the two diverge. */
+/* P.slot_floor, not P.var_count: a for-loop promotes the floor for its own iteration registers
+   without registering a name, so a variable declared in its body must land above them or it aliases
+   the loop's state. P.var_regs[] keeps lookup correct once the two diverge. */
 static int var_slot(Chunk* c, unsigned int name_idx) {
     for (int i = 0; i < P.var_count; i++)
         if (P.var_names[i] == name_idx)
@@ -933,11 +926,9 @@ static int var_slot(Chunk* c, unsigned int name_idx) {
     int reg = P.slot_floor;
     P.var_names[P.var_count] = name_idx;
     P.var_regs[P.var_count] = reg;
-    /* P.var_kind[] is a persistent static array shared across every function's compilation -- a
-       PAST function's raw-tracked local can leave a stale kind at whatever index this new name
-       lands on (save/restore only shrinks P.var_count, never zeroes higher indices). Real bug found
-       this way: a fresh top-level var inherited VAR_RAW_INT from an earlier function's local at
-       the same index. var_slot resets the kind explicitly here, the one place every name is created. */
+    /* P.var_kind[] persists across every function's compilation and save/restore only shrinks
+       P.var_count, so an earlier function's local leaves a stale kind at this index. Reset here,
+       the one place every name is created. */
     P.var_kind[P.var_count] = VAR_BOXED;
     P.var_count++;
     P.slot_floor++; /* permanently protects this register from the temp allocator */
@@ -1011,18 +1002,15 @@ static void raw_release_if_top(int slot) {
     }
 }
 
-/* Forgets that a name's type was known (no-op otherwise) -- needed before any var_slot call whose
-   caller is about to write a non-raw value, since var_slot has no kind awareness (real bug found
-   this way: reusing a raw-int name as a for-in loop variable). The slot itself does not move. */
+/* Forgets a name's known type, which var_slot has no awareness of -- required before writing a
+   non-raw value to an existing name. */
 static void ensure_boxed(unsigned int name_idx) {
     for (int i = 0; i < P.var_count; i++) {
         if (P.var_names[i] != name_idx)
             continue;
-        /* Moving the name off a real-block slot is the point, not a side effect. Those slots hold a
-           real for the frame's life, which is what lets frame entry stamp the tag once; a
-           dynamically typed write into one would leave a tag the unchecked real opcodes then keep,
-           and a loop back-edge can re-run an unchecked write emitted before this. Nothing is copied
-           out: every caller is about to overwrite the variable. */
+        /* Moving off the real slot is the point: those hold a real for the frame's life, and a
+           dynamically typed write would leave a tag the unchecked opcodes keep. Nothing is copied
+           out -- every caller overwrites the variable. */
         if (P.var_kind[i] == VAR_RAW_REAL) {
             if (P.slot_floor >= P.raw_real_next)
                 return error_at("Too many variables (max %d)", FRAME_REGISTERS);
@@ -1209,10 +1197,8 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
         int slot = slot_alloc(RAWK_INT);
         if (slot < 0)
             return -1;
-        /* A literal outside the signed 32-bit range needs the side table -- OP_RAW_LOAD_INT's
-           immediate is a full int32 now (the old 20-bit immediate's truncation bug -- `i < 20000000`
-           silently becoming 77056 -- is closed outright, not just widened again), but AER integers
-           are 64-bit. */
+        /* AER integers are 64-bit and this immediate is int32, so a wider literal needs the side
+           table. */
         if (!wide) {
             chunk_emit(c, PACK1(OP_RAW_LOAD_INT, slot));
             chunk_emit(c, (uint32_t)(int32_t)v);
@@ -1826,10 +1812,8 @@ static bool binary_op_info(TokenType t, unsigned int* prec, Opcode* op) {
             *prec = 10;
             *op = OP_FLOOR_DIV;
             return true;
-        /* `as` no longer exists at all -- primitive casts are integer(x)/float(x)/boolean(x)/
-           string(x) now, struct shape-checks are type(x) == "Name" (both replacing what `x as T`
-           used to emit), and import aliasing is the positional `import alias "path"` (replacing
-           `import "path" as alias`). TOKEN_AS itself has been removed from the lexer. */
+        /* There is no `as`: casts are integer(x)/float(x)/boolean(x)/string(x), shape checks are
+           type(x) == "Name", and import aliasing is `import alias "path"`. */
         default: return false;
     }
 }
@@ -1902,10 +1886,9 @@ static int parse_string_literal(Chunk* c) {
         return (int)pool_idx | RK_CONST_FLAG;
     }
 
-    /* Parts are collected as RK values and emitted as one OP_INTERP at the end -- one dispatch and
-       one allocation instead of a concatenate per part, each of which allocated a string that was
-       garbage by the next one. Beyond INTERP_MAX_PARTS the old left-fold chain still runs, so there
-       is no limit on how long an interpolation may be. */
+    /* Collected as RK values and emitted as one OP_INTERP: one dispatch and one allocation, not a
+       concatenate per part. Past INTERP_MAX_PARTS a left-fold chain takes over, so there is no
+       limit on length. */
     int parts[INTERP_MAX_PARTS];
     int part_count = 0;
 
