@@ -2957,10 +2957,6 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                              (cur == VAR_RAW_REAL && rhs_kind == RAWK_REAL);
             if (same_kind) {
                 int dest_slot = P.var_regs[existing_idx];
-                /* The boxed path below does this too. Writing a statically-typed variable is still a
-                   write: anything proved about the slot's CONTENTS -- a loop-safety proof keyed on
-                   this register, a tracked length -- stops holding, even though its type does not. */
-                invalidate_register(dest_slot);
                 int src_slot = raw_materialize(c, rk_val, rhs_kind);
                 if (src_slot >= 0) {
                     if (src_slot != dest_slot) {
@@ -3079,10 +3075,6 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             }
 
         if (existing_idx >= 0 && P.var_kind[existing_idx] != VAR_BOXED) {
-            /* Once for every branch below, all of which write this slot. Same reason as the plain
-               assignment path: a statically-typed write is still a write, so anything proved about
-               the slot's CONTENTS stops holding even though its type does not. */
-            invalidate_register(P.var_regs[existing_idx]);
             RawKind cur_kind = (P.var_kind[existing_idx] == VAR_RAW_INT) ? RAWK_INT : RAWK_REAL;
             Opcode boxed_op = compound_assign_ops[i].op;
             bool native_op_exists = (boxed_op == OP_ADD || boxed_op == OP_SUB || boxed_op == OP_MUL);
@@ -3983,16 +3975,6 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
             P.range_item_written[P.range_loop_depth] = false;
             P.range_loop_depth++;
         }
-        /* PREP rejects a non-integer bound or step outright and publishes a tagged integer, and LOOP
-           only ever advances it as one -- so this variable is an integer on every path that reaches
-           the body, and saying so lets the body index and compute unchecked. Without it the
-           idiomatic `for i in 0..n` compiled to the generic opcodes while the hand-written
-           `i = 0; for i < n` did not, which measured 15.9% more instructions for the same work. */
-        for (int v = P.var_count - 1; v >= 0; v--)
-            if (P.var_names[v] == loop_var_name && P.var_regs[v] == item_reg) {
-                P.var_kind[v] = VAR_RAW_INT;
-                break;
-            }
         unsigned int body_start = c->count;
         parse_block(c);
         if (parse_had_error) {

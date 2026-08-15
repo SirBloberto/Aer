@@ -2871,33 +2871,46 @@ Both wins in this section came from the same place: a hot loop calling a general
 re-derives what the caller already knows. Neither is exotic, and neither is in the dispatch path
 that most of section 5.16 is about.
 
-### 5.16yq The idiomatic loop form is 15.9% slower, and the obvious fix regressed sieve by 61%
+### 5.16yq The idiomatic loop form is 15.9% slower, and what actually blocks the fix
 
 `for i in 0..n` compiles its body to the generic opcodes while the hand-written `i = 0; for i < n`
 gets the unchecked ones, because the parser does not know the range variable's type. Measured on
 identical work (fill then sum a 4M-element `[0i; N]`): **1.257G instructions for the while form,
-1.457G for the range form**. The benchmark suite hides this completely -- it was hand-converted to
-the while form in an earlier sweep, so nothing in `bench/` pays the penalty that ordinary code does.
+1.457G for the range form**. `bench/` hides this entirely -- it was hand-converted to the while form
+in an earlier sweep, so nothing there pays what ordinary code pays.
 
-The type is provable. `OP_ITER_RANGE_PREP` rejects a non-integer bound or step outright and
-publishes a tagged integer; `OP_ITER_RANGE_LOOP` only ever advances it through `.as.i`. So marking
-the loop variable `VAR_RAW_INT` is sound, and it does produce the unchecked body -- verified.
+The type is provable and the change is small. `OP_ITER_RANGE_PREP` rejects a non-integer bound or
+step outright and publishes a tagged integer; `OP_ITER_RANGE_LOOP` only ever advances it through
+`.as.i`. Marking the loop variable `VAR_RAW_INT` is sound and does produce the unchecked body.
 
-**It still regressed `sieve` by 61.15% and `nbody` by 6.09%, and the reason is worth keeping.**
-Marking the variable typed routes writes to it through the statically-typed assignment paths, and
-those paths never called `invalidate_register` -- only the boxed ones did, because nothing carrying
-a loop-safety proof had ever been statically typed. Two tests caught that immediately
-(`test_range_loop_counter.aer`, `test_loop_bound_hoisting.aer`). Adding the call fixed them and
-caused the regression, because `invalidate_register` also clears `reg_nonneg`, and `sieve`'s inner
-loop advances its index with a compound assignment on every iteration -- so every `j += step` threw
-away the proof that `j >= 0` and forced the checked index path back.
+**It was tried twice and reverted twice, and the second attempt found the real blocker.**
 
-The fix therefore needs a *narrower* signal than `invalidate_register`: a "this slot was written"
-notification that poisons the range-item and safe-loop tracking without touching `reg_nonneg` or
-`reg_elem_kind`. Whether dropping `reg_nonneg` is even required on a compound write is a separate
-question -- `binop_preserves_nonneg` already models which operators keep the property, and the boxed
-path may simply be over-conservative. Answer that before re-attempting; the whole 15.9% depends on
-it, and reverted commit `11afae9` has the working parser change to build on.
+The first attempt added `invalidate_register` to the statically-typed assignment paths, which had
+never invalidated anything -- nothing carrying a loop-safety proof had ever been statically typed.
+Two tests caught the omission immediately. That fixed correctness and cost `sieve` **+61%**. The
+obvious culprit was `reg_nonneg`, since `invalidate_register` clears it and `sieve` re-derives its
+index with a compound assignment every iteration; the second attempt therefore split out a narrower
+`note_slot_written` that poisons the range-item and safe-loop tracking but leaves `reg_nonneg`
+alone, restoring exactly the prior behaviour for it.
+
+**`sieve` regressed by 61.18% again -- to the second decimal.** So `reg_nonneg` was never involved.
+Reading the disassembly instead of theorising showed the actual mechanism in one line: with `p`
+untyped, `is_composite[p]` compiled to `OP_TYPED_INDEX_GET_UNCHECKED`; with `p` typed it compiles to
+`OP_INDEX_GET_RAW_INT`, which is **bounds-checked**. Learning the element type made the parser
+*downgrade* from the proof-based unchecked opcode to the checked one.
+
+That is the gap: the index family has an unchecked-but-untyped member and a typed-but-checked
+member, and no unchecked-and-typed one. Closing it costs either **four new opcodes** (a `_RAW_*_UNCHECKED` GET/SET pair) or making `Parser.reg_elem_kind` **correctness-critical** -- today
+`OP_INDEX_GET_RAW_INT` re-checks the element kind at runtime, so `reg_elem_kind` is only a hint;
+emitting the unchecked opcode and marking its destination typed would promote that hint to a
+load-bearing proof. `reg_elem_kind` is only ever set from a literal `[0i; n]`-style construction and
+cleared on any write to the register, so it looks sound -- but "looks sound" is exactly the standard
+that needs evidence before a runtime check is deleted. A cheap first step: instrument whether
+`OP_INDEX_GET_RAW_INT`'s fallback ever fires across `bench/` + `tests/`. If it never does, the check
+is already dead weight and the question is settled.
+
+Both attempts are in the history (`11afae9`, `f057a43`) with their reverts; the parser change itself
+is correct and reusable, and only the index-family decision is missing.
 
 ### 5.16yp NaN boxing, including the narrow "just the pointers" version
 
