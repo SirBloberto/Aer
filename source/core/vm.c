@@ -13,37 +13,6 @@
 #include "strbuf.h"
 #include "vm.h"
 
-/* Whichever VM's heap is currently active -- set by vm_init(), saved/restored around vm_run_slice
-   exactly like active_vm_for_errors below (same nested-call shape, same fix). Routes every
-   allocation call that has no VM* in scope (the lexer, parts of the parser, which build pooled
-   values before/while a Chunk's own VM exists) to the right heap with no signature changes to the
-   lexer/parser themselves, since vm_init always runs before parsing starts for the Chunk it owns
-   (confirmed: aer_module.c's aer_vm_instantiate_from_file calls vm_init before parse()). */
-static VmHeap* current_heap = NULL;
-
-/* Fallback for the one case with no VM at all yet in the whole process (e.g. a host calling
-   aer_gc_configure() before ever creating a VM) -- lazily promoted to current_heap so nothing
-   dereferences NULL. Mirrors the defensiveness the old vm_pools_init_once() guard already had. */
-static VmHeap bootstrap_heap = {0};
-
-static VmHeap* require_current_heap(void) {
-    if (!current_heap)
-        current_heap = &bootstrap_heap;
-    return current_heap;
-}
-
-/* Lets a caller about to vm_init() a nested VM (a module import, an actor spawn) save and restore
-   the previously-active heap: vm_run_slice's own save/restore brackets only vm_run(), not the
-   vm_init()+parse() before it, which is where current_heap first gets clobbered. Without it, the
-   outer VM's later allocations land in the nested heap -- reachable only from the outer VM's
-   registers, invisible to the nested GC's roots, and silently collected. */
-VmHeap* vm_current_heap(void) {
-    return current_heap;
-}
-void vm_set_current_heap(VmHeap* h) {
-    current_heap = h;
-}
-
 /* Tuning defaults every freshly-initialized heap inherits -- process-wide mutable state, not
    hardcoded constants, specifically so aer_gc_configure()/aer_gc_set_ceiling() work when called
    before any VM exists yet (configure once, then create VMs that pick it up). aer_gc_configure/
@@ -189,10 +158,10 @@ static inline AerVal* vm_rk_ptr8(AerVal* registers, AerVal* pool, uint32_t rk8) 
    and aer_gc_stats act on the current heap. configure/set_ceiling also update process-wide
    defaults, since real usage calls them before any VM exists. */
 void vm_gc_suppress(void) {
-    require_current_heap()->gc_suppress_depth++;
+    vm_require_current_heap()->gc_suppress_depth++;
 }
 void vm_gc_unsuppress(void) {
-    VmHeap* h = require_current_heap();
+    VmHeap* h = vm_require_current_heap();
     if (h->gc_suppress_depth > 0)
         h->gc_suppress_depth--;
 }
@@ -204,7 +173,7 @@ void aer_gc_configure(unsigned int minor_threshold, unsigned int major_every_n_m
         default_major_gc_every_n_minor = major_every_n_minor;
     /* Also apply immediately to whichever heap is already current, if one exists -- so
        reconfiguring an already-running VM takes effect right away, not just for the next one. */
-    VmHeap* heap = require_current_heap();
+    VmHeap* heap = vm_require_current_heap();
     if (minor_threshold) {
         heap->minor_gc_threshold = minor_threshold;
         heap->minor_gc_threshold_floor = minor_threshold;
@@ -215,7 +184,7 @@ void aer_gc_configure(unsigned int minor_threshold, unsigned int major_every_n_m
 
 void aer_gc_set_ceiling(unsigned int max_live_cells) {
     default_gc_live_cell_ceiling = max_live_cells;
-    require_current_heap()->gc_live_cell_ceiling = max_live_cells;
+    vm_require_current_heap()->gc_live_cell_ceiling = max_live_cells;
 }
 
 /* Split from gc_maybe_collect so the dispatch loop can put its own work (syncing vm->ip for error
@@ -237,7 +206,7 @@ static inline __attribute__((always_inline)) void gc_maybe_collect(VM* vm) {
 /* Embedding-facing introspection (include/aer.h); live_cells is a bookkeeping snapshot, not a fresh trace, so it undercounts unswept-but-garbage cells since the last cycle. Reads whichever heap is current -- see vm_gc_suppress's comment. */
 void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
                   unsigned int* major_collections) {
-    VmHeap* heap = require_current_heap();
+    VmHeap* heap = vm_require_current_heap();
     if (live_cells)
         *live_cells = gc_count_live_cells(heap);
     if (minor_collections)
@@ -356,12 +325,12 @@ static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size)
 /* ------------------------------------------------------------------ */
 
 /* Wraps an exclusively-owned (data, length) in a fresh heap box; never copies. Routes to
-   current_heap, guarded via require_current_heap() because the lexer can call this
+   current_heap, guarded via vm_require_current_heap() because the lexer can call this
    (emit_string_token) before any VM/pool exists -- without the guard, an uninitialized heap's
    zero elem_size makes pool_alloc hand back a ~1-byte allocation (confirmed heap-buffer-overflow
    via ASAN, back when this was a single process-global pool). */
 static AerString* aer_string_alloc(unsigned int length) {
-    VmHeap* heap = require_current_heap();
+    VmHeap* heap = vm_require_current_heap();
     vm_heap_init(heap);
     AerString* s = heap_alloc(heap, &heap->string_pool);
     s->length = length;
@@ -394,7 +363,7 @@ AerVal aer_make_string_copy(const char* src, unsigned int length) {
         s->inline_buf[length] = '\0';
         s->data = s->inline_buf;
     } else {
-        char* buf = vm_string_payload_alloc(require_current_heap(), length);
+        char* buf = vm_string_payload_alloc(vm_require_current_heap(), length);
         memcpy(buf, src, length);
         buf[length] = '\0';
         s->data = buf;
@@ -442,7 +411,7 @@ void vm_init(VM* vm, Chunk* chunk) {
        for both its own execution and any parsing that immediately follows for its Chunk (see
        current_heap's own comment). Saved/restored around vm_run_slice for nested/reentrant runs,
        exactly like active_vm_for_errors just below. */
-    current_heap = &vm->heap;
+    vm_set_current_heap(&vm->heap);
     ensure_io_registered();
     runtime_line_lookup = lookup_runtime_line;
     runtime_filename_lookup = lookup_runtime_filename;
@@ -472,10 +441,10 @@ void vm_free(VM* vm) {
        mark state -- the whole heap is going, not just recent garbage.
        current_heap is saved/set/restored for free_typed_array, which stashes buffers into a
        specific heap's cache; without it a stash can land in another live VM's heap. */
-    VmHeap* saved_current_heap = current_heap;
-    current_heap = heap;
+    VmHeap* saved_current_heap = vm_current_heap();
+    vm_set_current_heap(heap);
     gc_finalize_all_pools(heap);
-    current_heap = saved_current_heap;
+    vm_set_current_heap(saved_current_heap);
 
     /* Cached typed-array data buffers (vm.h's own comment on TypedArrayFreeSlot) are stashed here
        instead of freed the moment they're no longer referenced -- gc_finalize_all_pools above just
@@ -507,8 +476,8 @@ void vm_free(VM* vm) {
     free(heap->gc_worklist.items);
     /* If this VM's heap was the active allocation target, it no longer exists -- leaving
        current_heap dangling would be a use-after-free the moment anything allocates next. */
-    if (current_heap == heap)
-        current_heap = NULL;
+    if (vm_current_heap() == heap)
+        vm_set_current_heap(NULL);
     *heap = (VmHeap){0};
 }
 
@@ -855,7 +824,7 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
                 memcpy(stackbuf + as->length, bs->data, bs->length);
                 return aer_make_string_copy(stackbuf, len);
             }
-            char* buf = vm_string_payload_alloc(require_current_heap(), len);
+            char* buf = vm_string_payload_alloc(vm_require_current_heap(), len);
             memcpy(buf, as->data, as->length);
             memcpy(buf + as->length, bs->data, bs->length);
             buf[len] = '\0';
@@ -1071,7 +1040,7 @@ static __attribute__((noinline)) AerVal vm_interp_build(VM* vm, const AerVal* pa
         buf = out->inline_buf;
         out->data = buf;
     } else {
-        buf = vm_string_payload_alloc(require_current_heap(), total);
+        buf = vm_string_payload_alloc(vm_require_current_heap(), total);
         out->data = buf;
     }
     unsigned int at = 0;
@@ -1536,7 +1505,7 @@ static unsigned char* typed_array_data_alloc(VmHeap* heap, size_t size) {
 }
 
 static AerTypedArray* vm_new_typed_array(TypedArrayElemKind kind, unsigned int count) {
-    VmHeap* heap = require_current_heap();
+    VmHeap* heap = vm_require_current_heap();
     AerTypedArray* ta = heap_alloc(heap, &heap->typed_array_pool);
     ta->count = count;
     ta->elem_kind = kind;
@@ -1846,7 +1815,7 @@ static bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
 /* ------------------------------------------------------------------ */
 
 AerArray* vm_new_array(void) {
-    VmHeap* heap = require_current_heap();
+    VmHeap* heap = vm_require_current_heap();
     AerArray* a = heap_alloc(heap, &heap->array_pool);
     /* pool_alloc only zeroes gc_state (byte 0) -- a reused cell's previous occupant's dirty_cards
        pointer would otherwise survive as garbage. Every OTHER field (count/capacity/items/shape/
@@ -1863,7 +1832,7 @@ AerArray* vm_new_array(void) {
 }
 
 AerDict* vm_new_dict(void) {
-    VmHeap* heap = require_current_heap();
+    VmHeap* heap = vm_require_current_heap();
     AerDict* d = heap_alloc(heap, &heap->dict_pool);
     /* Zeroed here, not left to each caller, so setting .pools below can't be wiped out by a
        caller's own zeroing running afterward. */
@@ -1880,7 +1849,7 @@ AerDict* vm_new_dict(void) {
 }
 
 AerVal aer_make_result(AerVal value, AerVal err) {
-    VmHeap* heap = require_current_heap();
+    VmHeap* heap = vm_require_current_heap();
     AerResult* r = heap_alloc(heap, &heap->result_pool);
     r->value = value;
     r->err = err;
@@ -1892,7 +1861,7 @@ AerVal aer_make_error(const char* msg) {
 }
 
 AerFunction* vm_new_function(void) {
-    VmHeap* heap = require_current_heap();
+    VmHeap* heap = vm_require_current_heap();
     return heap_alloc(heap, &heap->function_pool);
 }
 
@@ -2698,8 +2667,8 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     /* Same save/restore shape as active_vm_for_errors just above -- a nested vm_run_slice (module
        instantiation, actor.call) must allocate into ITS OWN heap while it runs, then hand
        allocation back to whichever heap was active before it, once it returns. */
-    VmHeap* saved_current_heap = current_heap;
-    current_heap = &vm->heap;
+    VmHeap* saved_current_heap = vm_current_heap();
+    vm_set_current_heap(&vm->heap);
 /* Every exit from this function must restore all three, including the yield exits -- leaving
    runtime_error_unwind_target pointing at this frame's catch_point after the frame has returned
    makes the next error longjmp into dead stack, and leaving current_heap set sends the next
@@ -2708,7 +2677,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     do {                                                                                                     \
         runtime_error_unwind_target = saved_unwind_target;                                                   \
         active_vm_for_errors = saved_active_vm;                                                              \
-        current_heap = saved_current_heap;                                                                   \
+        vm_set_current_heap(saved_current_heap);                                                             \
         return (result);                                                                                     \
     } while (0)
     if (AER_SETJMP(catch_point) != 0)

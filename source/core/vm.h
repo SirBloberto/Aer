@@ -992,6 +992,9 @@ void vm_free(VM* vm);
    comment in vm.c for why vm_run_slice's save/restore alone isn't enough here. */
 VmHeap* vm_current_heap(void);
 void vm_set_current_heap(VmHeap* heap);
+/* Same variable, for the allocation sites with no VM in scope; promotes a NULL to the bootstrap
+   heap first. All three live in heap_ref.c -- see that file for why. */
+VmHeap* vm_require_current_heap(void);
 
 /* Allocate/release a non-inline string's payload. `length` is the string's length, not the buffer
    size -- both sides derive the same size class from it, so a pooled buffer can never be plain-freed
