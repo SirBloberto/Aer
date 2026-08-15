@@ -2,6 +2,7 @@
 #include <string.h>
 #include "aer.h"
 #include "aer_actor.h"
+#include "aer_thread.h"
 #include "aer_module.h"
 #include "aer_stdlib.h"
 #include "error.h"
@@ -17,8 +18,11 @@ struct Actor {
     Chunk* chunk;
     unsigned int halt_addr;
     unsigned int id;
+    /* The one part of an actor another thread touches: everything else is reached only by whichever
+       worker is running this actor's task. */
     Mailbox* mailbox_head;
     Mailbox* mailbox_tail;
+    aer_mutex mailbox_lock;
     struct Actor* next; /* process-wide registry, for GC root enumeration and free_all */
 };
 
@@ -43,6 +47,7 @@ static Actor* aer_actor_spawn(const char* path) {
     a->id = next_actor_id++;
     a->mailbox_head = NULL;
     a->mailbox_tail = NULL;
+    aer_mutex_init(&a->mailbox_lock);
     a->next = actors;
     actors = a;
     return a;
@@ -122,23 +127,29 @@ static bool aer_actor_send(Actor* actor, const char* message, unsigned int len) 
     memcpy(m->data, message, len);
     m->len = len;
     m->next = NULL;
+    aer_mutex_lock(&actor->mailbox_lock);
     if (actor->mailbox_tail)
         actor->mailbox_tail->next = m;
     else
         actor->mailbox_head = m;
     actor->mailbox_tail = m;
+    aer_mutex_unlock(&actor->mailbox_lock);
     return true;
 }
 
 static bool aer_actor_try_receive(Actor* actor, char** out_message, unsigned int* out_len) {
+    aer_mutex_lock(&actor->mailbox_lock);
     Mailbox* m = actor->mailbox_head;
-    if (!m)
+    if (!m) {
+        aer_mutex_unlock(&actor->mailbox_lock);
         return false;
+    }
     actor->mailbox_head = m->next;
     if (!actor->mailbox_head)
         actor->mailbox_tail = NULL;
     *out_message = m->data;
     *out_len = m->len;
+    aer_mutex_unlock(&actor->mailbox_lock);
     free(m);
     return true;
 }
@@ -165,6 +176,7 @@ static void aer_actor_free(Actor* actor) {
     free(actor->vm);
     free(actor->chunk);
     free_mailbox(actor);
+    aer_mutex_destroy(&actor->mailbox_lock);
     free(actor);
 }
 

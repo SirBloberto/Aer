@@ -26,3 +26,15 @@ __attribute__((noinline)) VmHeap* vm_current_heap(void) {
 __attribute__((noinline)) void vm_set_current_heap(VmHeap* h) {
     current_heap = h;
 }
+
+/* The VM currently dispatching, for error line lookup. Same TU and noinline, same reason. A nested
+   compile+run saves and restores it around the whole cycle, or a failed one leaves it on a freed VM. */
+static HEAP_REF_STORAGE VM* active_error_vm = NULL;
+
+__attribute__((noinline)) VM* vm_active_error_vm(void) {
+    return active_error_vm;
+}
+
+__attribute__((noinline)) void vm_set_active_error_vm(VM* vm) {
+    active_error_vm = vm;
+}

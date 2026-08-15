@@ -6,9 +6,9 @@
 #include "error.h"
 #include "lexer.h"
 
-bool parse_had_error = false;
-bool runtime_had_error = false;
-unsigned int assert_failure_count = 0;
+AER_TLS bool parse_had_error = false;
+AER_TLS bool runtime_had_error = false;
+AER_TLS unsigned int assert_failure_count = 0;
 unsigned int (*runtime_line_lookup)(void) = NULL;
 const char* (*runtime_filename_lookup)(void) = NULL;
 const char* (*runtime_function_lookup)(void) = NULL;
@@ -17,7 +17,7 @@ AerJmpBuf* runtime_error_unwind_target = NULL;
 
 #define ERROR_MSG_MAX 2048
 
-static char last_error_msg[ERROR_MSG_MAX] = "";
+static AER_TLS char last_error_msg[ERROR_MSG_MAX] = "";
 static AerErrorCallback error_callback = NULL;
 static void* error_callback_userdata = NULL;
 static AerDiagnosticCallback diagnostic_callback = NULL;

@@ -219,24 +219,8 @@ void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
 /* Runtime error context -- the callbacks error.c installs              */
 /* ------------------------------------------------------------------ */
 
-/* Whichever VM is currently dispatching, kept fresh by DISPATCH() each opcode; self-corrects after a nested module call's vm_run() returns since the outer VM reasserts itself next dispatch. */
-static VM* active_vm_for_errors = NULL;
-
-/* Exposed so a caller doing a nested compile+run cycle on its own VM+Chunk (aer_module.c's
-   aer_vm_instantiate_from_file) can save/restore this around the WHOLE cycle, not just the
-   vm_run() call vm_run_slice's own save/restore already brackets -- vm_init() unconditionally
-   repoints this at the new VM the moment it's called, before that VM ever runs, so without an
-   explicit save/restore around the entire cycle a failed nested compile leaves this dangling at
-   an already-freed VM. Same shape as vm_current_heap()/vm_set_current_heap(). */
-VM* vm_active_error_vm(void) {
-    return active_vm_for_errors;
-}
-void vm_set_active_error_vm(VM* vm) {
-    active_vm_for_errors = vm;
-}
-
 static unsigned int lookup_runtime_line(void) {
-    VM* vm = active_vm_for_errors;
+    VM* vm = vm_active_error_vm();
     if (!vm)
         return 0;
     /* error_pc is only ever set while that same chunk is executing, so resolving it here is safe --
@@ -248,15 +232,15 @@ static unsigned int lookup_runtime_line(void) {
 }
 
 static const char* lookup_runtime_filename(void) {
-    if (!active_vm_for_errors)
+    if (!vm_active_error_vm())
         return NULL;
-    return active_vm_for_errors->chunk->source_filename;
+    return vm_active_error_vm()->chunk->source_filename;
 }
 
 static const char* lookup_runtime_function(void) {
-    if (!active_vm_for_errors)
+    if (!vm_active_error_vm())
         return NULL;
-    VM* vm = active_vm_for_errors;
+    VM* vm = vm_active_error_vm();
     if (vm->call_depth == 0)
         return NULL;
     ChunkFunction* fn = chunk_find_function_by_offset(vm->chunk, vm->call_stack[vm->call_depth].code_offset);
@@ -271,9 +255,9 @@ static const char* tail_call_note(unsigned int collapsed, char* buf, size_t bufs
 }
 
 static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size) {
-    if (!active_vm_for_errors)
+    if (!vm_active_error_vm())
         return 0;
-    VM* vm = active_vm_for_errors;
+    VM* vm = vm_active_error_vm();
     if (vm->call_depth == 0)
         return 0;
     Chunk* c = vm->chunk;
@@ -410,7 +394,7 @@ void vm_init(VM* vm, Chunk* chunk) {
     /* Every VM now owns its own heap -- this VM's is the active allocation target from here on,
        for both its own execution and any parsing that immediately follows for its Chunk (see
        current_heap's own comment). Saved/restored around vm_run_slice for nested/reentrant runs,
-       exactly like active_vm_for_errors just below. */
+       exactly like vm_active_error_vm() just below. */
     vm_set_current_heap(&vm->heap);
     ensure_io_registered();
     runtime_line_lookup = lookup_runtime_line;
@@ -419,7 +403,7 @@ void vm_init(VM* vm, Chunk* chunk) {
     runtime_stack_trace_lookup = lookup_runtime_stack_trace;
     /* Not only by DISPATCH(): parsing happens before any opcode runs, and its errors need a filename
        too. A nested module overwrites this while it parses; DISPATCH() reasserts the outer VM. */
-    active_vm_for_errors = vm;
+    vm_set_active_error_vm(vm);
     /* Frame 0's register window only ever needs linking once, for the life of the VM (top-level
        usage is open-ended, so it always gets a flat FRAME_REGISTERS reservation) -- everything
        else a fresh run needs is exactly what aer_vm_reset_for_reuse() already does. */
@@ -2648,9 +2632,9 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     runtime_error_unwind_target = &catch_point;
     /* One store here + one restore at each exit, instead of every DISPATCH() -- the VM never
        changes mid-call. */
-    VM* saved_active_vm = active_vm_for_errors;
-    active_vm_for_errors = vm;
-    /* Same save/restore shape as active_vm_for_errors just above -- a nested vm_run_slice (module
+    VM* saved_active_vm = vm_active_error_vm();
+    vm_set_active_error_vm(vm);
+    /* Same save/restore shape as vm_active_error_vm() just above -- a nested vm_run_slice (module
        instantiation, actor.call) must allocate into ITS OWN heap while it runs, then hand
        allocation back to whichever heap was active before it, once it returns. */
     VmHeap* saved_current_heap = vm_current_heap();
@@ -2660,7 +2644,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
 #define SLICE_RETURN(result)                                                                                 \
     do {                                                                                                     \
         runtime_error_unwind_target = saved_unwind_target;                                                   \
-        active_vm_for_errors = saved_active_vm;                                                              \
+        vm_set_active_error_vm(saved_active_vm);                                                             \
         vm_set_current_heap(saved_current_heap);                                                             \
         return (result);                                                                                     \
     } while (0)

@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include "aer_actor.h"
+#include "aer_thread.h"
 #include "aer_module.h"
 #include "aer_stdlib.h"
 #include "error.h"
@@ -24,11 +25,6 @@ typedef struct Task {
 static Task* tasks = NULL;
 static Task* tasks_tail = NULL;
 
-/* Small enough that no single task can visibly starve the others for long, large enough that a
-   round-robin pass isn't dominated by scheduling overhead. Not user-configurable in this pass --
-   see the plan's note on the scheduler being a first cut, not a tuned production scheduler. */
-#define SCHEDULER_SLICE_INSTRUCTIONS 1000
-
 /* Registers fn(args...) as a task to run on actor under the scheduler. False if fn isn't defined
    on actor's script. Must be called before aer_scheduler_run() -- a task can't be added mid-run. */
 static bool aer_scheduler_add(Actor* actor, const char* fn, int arg_count, AerVal* args) {
@@ -47,12 +43,44 @@ static bool aer_scheduler_add(Actor* actor, const char* fn, int arg_count, AerVa
     return true;
 }
 
-/* Runs every added task to completion (or to a runtime error, isolated per task the same way
-   aer_actor_call already isolates one) before returning. Blocks the calling thread for as long as
-   any task takes -- there's no way to observe partial progress from outside; a task that never
-   finishes (e.g. a genuine infinite loop) means this never returns, the same as any other infinite
-   loop in AER already behaves. Clears the task list on return either way. */
-static void aer_scheduler_run(void) {
+/* Two shapes, because "concurrent" means different things per build: with threads a worker owns a
+   task and runs it unbudgeted, without them tasks must take turns to interleave at all. Actors
+   share nothing a worker reaches, so the lock covers only handing out the next task. */
+#define SCHEDULER_SLICE_INSTRUCTIONS 1000
+
+static void scheduler_finish(Task* t) {
+    t->finished = true;
+    /* Isolation, the same two flags aer_actor_call resets: one task's failure must not be read as
+       another's, and both are per-thread in a threaded build. */
+    runtime_had_error = false;
+    parse_had_error = false;
+}
+
+#ifdef AER_HEAP_REF_TLS
+static aer_mutex task_lock;
+static Task* next_task = NULL;
+
+static Task* scheduler_take_task(void) {
+    aer_mutex_lock(&task_lock);
+    Task* t = next_task;
+    if (t)
+        next_task = t->next;
+    aer_mutex_unlock(&task_lock);
+    return t;
+}
+
+static void* scheduler_worker(void* unused) {
+    (void)unused;
+    for (Task* t = scheduler_take_task(); t; t = scheduler_take_task()) {
+        vm_run_slice(aer_actor_vm(t->actor), 0);
+        scheduler_finish(t);
+    }
+    return NULL;
+}
+#endif
+
+/* Round-robin in bounded slices, so no task can starve the others. */
+static void scheduler_run_interleaved(void) {
     bool any_unfinished = true;
     while (any_unfinished) {
         any_unfinished = false;
@@ -60,21 +88,42 @@ static void aer_scheduler_run(void) {
             if (t->finished)
                 continue;
             any_unfinished = true;
-
             vm_gc_suppress();
             VmSliceResult r = vm_run_slice(aer_actor_vm(t->actor), SCHEDULER_SLICE_INSTRUCTIONS);
             vm_gc_unsuppress();
-
-            if (r != VM_SLICE_YIELDED) {
-                t->finished = true;
-                /* Isolation, same reasoning and same two flags as aer_actor_call's own reset --
-                   one task's error must not poison every other task's (or the caller's) exit
-                   status, and runtime_had_error alone isn't enough (see aer_actor.c). */
-                runtime_had_error = false;
-                parse_had_error = false;
-            }
+            if (r != VM_SLICE_YIELDED)
+                scheduler_finish(t);
         }
     }
+}
+
+static void aer_scheduler_run(void) {
+#ifdef AER_HEAP_REF_TLS
+    unsigned int count = 0;
+    for (Task* t = tasks; t; t = t->next)
+        count++;
+    unsigned int workers = aer_thread_hardware_workers();
+    if (workers > count)
+        workers = count;
+    /* One task needs no thread; spawning one would only add the handoff. */
+    if (workers > 1) {
+        aer_mutex_init(&task_lock);
+        next_task = tasks;
+        aer_thread* threads = xmalloc(sizeof(aer_thread) * workers);
+        unsigned int started = 0;
+        for (unsigned int i = 0; i < workers; i++)
+            if (aer_thread_start(&threads[started], scheduler_worker, NULL) == 0)
+                started++;
+        /* This thread takes tasks too, which also covers any that failed to start. */
+        scheduler_worker(NULL);
+        for (unsigned int i = 0; i < started; i++)
+            aer_thread_join(threads[i]);
+        free(threads);
+        aer_mutex_destroy(&task_lock);
+        next_task = NULL;
+    } else
+#endif
+        scheduler_run_interleaved();
 
     while (tasks) {
         Task* next = tasks->next;

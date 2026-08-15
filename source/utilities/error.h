@@ -1,6 +1,15 @@
 #ifndef ERROR_H
 #define ERROR_H
 
+/* Per-thread once the scheduler runs actors in parallel: one worker's error must not be read as
+   another's. Off by default -- see heap_ref.c for why this is a build switch and not just a
+   keyword. */
+#ifdef AER_HEAP_REF_TLS
+#define AER_TLS _Thread_local
+#else
+#define AER_TLS
+#endif
+
 #include <setjmp.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -21,15 +30,15 @@ typedef jmp_buf AerJmpBuf;
 typedef enum Mode { MODE_SHELL, MODE_RUN } Mode;
 
 extern Mode mode;
-extern bool parse_had_error;
-extern bool runtime_had_error;
+extern AER_TLS bool parse_had_error;
+extern AER_TLS bool runtime_had_error;
 
 /* error() unwinds to this when set; NULL (outside any vm_run) means "set flags, return normally"
    so parse-time recovery runs unchanged. Nested vm_run calls save/restore it. */
 extern AerJmpBuf* runtime_error_unwind_target;
 
 /* Incremented by assert() on failure; deliberately not runtime_had_error, since DISPATCH() aborts vm_run on that flag but a failed assertion should report and keep going. */
-extern unsigned int assert_failure_count;
+extern AER_TLS unsigned int assert_failure_count;
 
 /* Source-line lookup for runtime errors; NULL or a 0 return means "unknown", no line prefix. */
 extern unsigned int (*runtime_line_lookup)(void);

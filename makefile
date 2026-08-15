@@ -46,7 +46,14 @@ endif
 # outside a checkout (a release tarball), which is the honest answer rather than a stale hash.
 BUILD_REV := $(shell git describe --always --dirty 2>/dev/null || echo unknown)
 
-FLAGS := -O2 -g -flto -Wall -Wextra -DAER_BUILD_REV=\"$(BUILD_REV)\" $(PIN_FLAGS) $(ARCH_FLAGS) -I include -I source -I source/compiler -I source/core -I source/debug -I source/repl -I source/runtime -I source/stdlib -I source/utilities
+# Parallel actors: per-thread VM state plus the scheduler's worker pool. Off by default -- it
+# costs ~0.4% on single-threaded programs and only pays when a script spawns several actors.
+# Build with `make THREADS=1`.
+ifdef THREADS
+    THREAD_FLAGS := -DAER_HEAP_REF_TLS -pthread
+endif
+
+FLAGS := -O2 -g -flto -Wall -Wextra -DAER_BUILD_REV=\"$(BUILD_REV)\" $(PIN_FLAGS) $(ARCH_FLAGS) $(THREAD_FLAGS) -I include -I source -I source/compiler -I source/core -I source/debug -I source/repl -I source/runtime -I source/stdlib -I source/utilities
 
 SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/debug/*.c source/repl/*.c source/runtime/*.c source/stdlib/*.c source/utilities/*.c)
 OBJECT := $(patsubst source/%.c,object/%.o,$(SOURCE))
