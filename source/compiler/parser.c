@@ -2194,13 +2194,11 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                 if (elem != RAWK_NONE && rk8_fits(rk_start)) {
                     int slot = slot_alloc();
                     if (slot >= 0) {
-                        /* With the loop proof in hand the index needs no bounds check either, and
-                           the kind here is not an inference -- reg_elem_kind is set from watching
-                           the array get built and cleared by any write to that register, unlike
-                           try_rewrite_index_get_raw, which guesses from the consumer and is what
-                           the checked opcode's fallback actually exists to catch (measured: 15
-                           fallbacks in 22.1M, all from that other site). So the unchecked opcode is
-                           safe AND its result can be called typed. */
+                        /* With the loop proof in hand the index needs no bounds check either. The
+                           kind here is not an inference: reg_elem_kind is set from watching the
+                           array get built and cleared by any write to that register, unlike
+                           try_rewrite_index_get_raw's guess from the consumer, which is what the
+                           checked opcode's fallback exists to catch (15 in 22.1M, all from there). */
                         if (index_safe_unchecked(arr_reg, rk_start))
                             chunk_emit(c, PACK3(OP_TYPED_INDEX_GET_UNCHECKED, slot, arr_reg,
                                                 pack_rk8(rk_start)));
