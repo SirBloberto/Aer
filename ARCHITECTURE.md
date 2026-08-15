@@ -2973,13 +2973,26 @@ nbody +7.85%, struct_array_scan +6.76%, and **nothing improved**. One `OP_SET_TA
 unchecked write costs more than the 4-byte store it removes -- a dispatch is not cheaper than a
 store, which inverts the premise.
 
-**The saving only exists if the stamps leave the loop, and they cannot.** Hoisting them into the
-preheader was tried and broke 9 programs, for a structural reason rather than a bug: a preheader
-stamp dominates only the FIRST iteration. If anything in the body retags that slot, the next
-iteration's unchecked write reads the new tag. Making it safe needs loop-invariance analysis of slot
-tags -- knowing, before the body is emitted, that nothing in it will retag a given slot. That is a
-far larger change than the ~8% it recovers, and it is the real reason this is parked rather than
-finished.
+**The saving only exists if the stamps leave the loop.** Hoisting them into the loop preheader broke
+9 programs, for a structural reason rather than a bug: a preheader stamp dominates only the FIRST
+iteration, so anything in the body that retags the slot makes the next iteration's unchecked write
+read the new tag.
+
+**The function prologue does dominate, and getting there works -- it is the register allocator that
+then blocks it.** Stamp every raw slot once at function entry and the domination problem disappears
+outright: entry precedes every loop, and runs once per CALL rather than per iteration. For that to be
+sound a slot's kind must be immutable for the function's lifetime, which means every claim -- temps,
+variables, parameters, and the loop-constant hoist block alike -- must register its kind, and an
+allocation must SKIP a slot already claimed for a different one. Built that way (`tag-once-wip`,
+`7e707ac`) the assertion goes to **0 trips across all 64 programs**, from 32.
+
+The programs are still wrong, and the assertion cannot see it, because every write is correctly
+typed -- just to the wrong register. `OP_CALL` requires its arguments in CONSECUTIVE registers, and
+`arg_materialize` builds that run one `reg_alloc` at a time; one skip mid-run leaves a hole and the
+callee reads an unrelated slot. **Kind-immutable slots and contiguous argument runs cannot both come
+out of a single ascending watermark.** Satisfying both puts raw temps in a region of their own, whose
+base must sit above the dynamic peak -- which is not known until the body has been compiled. That is
+a two-pass compile of every function body, for a ceiling of the ~8% above on two benchmarks.
 
 Five domination bugs surfaced on the way, every one caught by the assertion rather than by a wrong
 answer, and all five worth expecting if this is ever revisited: `retarget_raw_write` rewriting an
