@@ -5,15 +5,22 @@ memory allocation and collection, the register VM, the compiler, and the optimiz
 top of all of it. README.md documents the *language*; this document explains the *implementation*
 underneath it.
 
-Source map: `source/compiler/{lexer,parser}.c` (front end), `source/core/vm.{c,h}` (bytecode
-format + the VM itself, including `vm_run_slice()`, the bounded-instruction-count entry point the
-scheduler below drives), `source/value.h` (value representation and its accessors),
-`source/utilities/pool.{c,h}` (allocator), `source/stdlib/aer_*.c` (built-in library modules:
-math/random/string/time/json/collection/net/regex/actor/scheduler/io), `source/core/aer_module.c`/
-`aer_host.c` (import and host-embedding mechanisms), `source/core/aer_actor.c` (independent VM
-spawning and a host-side mailbox, reachable from AER scripts via the `actor` module),
-`source/core/aer_scheduler.c` (cooperative round-robin scheduler over spawned actors),
-`source/core/disasm.c` (debug-only disassembler/profiler).
+Source map, one job per directory:
+
+| directory | holds |
+|---|---|
+| `source/core/` | `vm.{c,h}` (bytecode format and the VM, including `vm_run_slice()`, the bounded-instruction-count entry point the scheduler drives), `value.h` (the one value type and its accessors), `gc.c`, `chunk.c` |
+| `source/compiler/` | `lexer.c`, `parser.c` -- the whole front end |
+| `source/stdlib/` | `aer_*.c` built-in modules (math/random/string/time/json/collection/net/regex/actor/scheduler/io) and `aer_abi.h`, their wire identities |
+| `source/runtime/` | `aer_module.c` (import) and `aer_host.c` (host embedding) |
+| `source/repl/` | `terminal.{c,h}` -- raw-mode interactive terminal |
+| `source/debug/` | `disasm.c` -- disassembler/profiler, `AER_DEBUG_TOOLS` only, never in a release build |
+| `source/utilities/` | `pool` (allocator), `hashtable`, `strbuf`, `error` |
+| `include/` | `aer.h`, and nothing else: the entire public surface |
+| `source/tools/` | `aer_fmt.c`, `aer_lsp.c` -- separate binaries, deliberately outside the library's own source wildcard so they never link into it |
+
+The split exists so a directory answers a question. `core/` had held the disassembler, the host API
+and 76 stdlib function-id macros; adding a stdlib function meant editing the VM's core header.
 
 ---
 
@@ -1913,7 +1920,7 @@ find an allocation neither reaches. It still does not clear the bar. The win is 
 synthetic, call-overhead-dominated benchmark, paid for by `dict_bench` +1.75% and `log_processing`
 +1.35% — the two most realistic workloads in the suite.
 
-Pinning all three on top of `r8` does not merely regress, it **fails to build**: `source/terminal.c:180:
+Pinning all three on top of `r8` does not merely regress, it **fails to build**: `source/repl/terminal.c:180:
 error: unable to find a register to spill`. That is the concrete form of the ARM32 register-budget
 argument. With `r8` plus three more reserved, roughly seven allocatable registers remain, and
 ordinary C in a file that has nothing to do with the interpreter can no longer be compiled at all.
@@ -3136,7 +3143,7 @@ lever worth pulling is the interpolation/allocation path (§5.13 already took on
   but the GC-managed heap (`string_pool`/`array_pool`/etc., `vm.c`) is one set of pools shared by
   the whole process — two VMs executing simultaneously on separate OS threads would race on the
   allocator and collector. Cooperative, single-threaded concurrency exists instead
-  (`source/core/aer_actor.h/c` + `aer_scheduler.h/c`, reachable from AER scripts via the `actor`/
+  (`source/stdlib/aer_actor.h/c` + `aer_scheduler.h/c`, reachable from AER scripts via the `actor`/
   `scheduler` modules): actors are independent VMs (spawned via `aer_vm_instantiate_from_file`, the
   same primitive `aer_module_load` uses) driven by `vm_run_slice()` — the `vm_run()` dispatch loop,
   refactored to take a bounded instruction count and return `VM_SLICE_YIELDED` instead of running

@@ -1594,11 +1594,11 @@ through the lexer (`shell()` internally) and appends after whatever's already in
 right shape for "run this script," "eval this REPL line," or "call this game hook." It is not the
 right primitive for driving an already-parsed, already-running `VM*` directly (a scheduler resuming
 a suspended actor, for instance) — that case calls `vm_run()`/`vm_run_slice()` on its own, the way
-`source/core/aer_scheduler.c` does.
+`source/stdlib/aer_scheduler.c` does.
 
 **Tearing down file-module imports** — every file loaded via `import` normally lives for the
 process's life (see [Memory and Security](#memory-and-security)), but a host that wants to tear
-down and reuse the process can call `aer_module_free_all()` (`source/core/aer_module.h`) to free
+down and reuse the process can call `aer_module_free_all()` (`source/runtime/aer_module.h`) to free
 every loaded module's VM and Chunk and clear the registry. Nothing calls this during normal script
 execution; it exists purely for this teardown case.
 
@@ -1629,7 +1629,7 @@ past the call. Return the result `AerVal` directly (`aer_int()`/`aer_real()`/`ae
 report an error, call `error()` (`source/utilities/error.h`), the same recoverable path every other
 AER error goes through. Registration is process-global, like the error-reporting state above, and
 must happen before any script that references the module is parsed. See `tests/embed_smoke_test.c`
-for this exercised end-to-end, and `source/core/aer_host.h` for the full registry API.
+for this exercised end-to-end, and `source/runtime/aer_host.h` for the full registry API.
 
 Build and run the embedding smoke test (a minimal, complete example of everything above,
 including the deliberate-error and VM-reuse cases) with `make test-embed`.
@@ -1793,7 +1793,7 @@ operands, small tags) directly into the high bits of one 64-bit word alongside t
 with a flag bit set, an index into the chunk's constant pool — one opcode per operator instead of a
 family of opcodes per operand-kind combination. A handful of opcodes (`OP_LOADK`, `OP_DEFINE_STRUCT`,
 `OP_CALL_MODULE`) can't fit every operand in one word and read one or more trailing plain words
-instead, the same convention `source/core/disasm.c`'s decoder follows.
+instead, the same convention `source/debug/disasm.c`'s decoder follows.
 
 **Registers, not a scope chain:** every function call gets its own contiguous window into one
 shared, bump-pointer `VM.register_stack` (`CallFrame.registers`/`frame_size`) — pushing a frame is
@@ -1865,7 +1865,7 @@ their registers/registries are never reset between lines.
 
 **Native and file-based modules:** the hardcoded native modules (`math`, `random`, `string`, `time`,
 `json`) each dispatch by name from their own file in `source/stdlib/` (`aer_math.c` and friends), all
-routed through `OP_CALL_MODULE`'s shared bridge in `vm.c`. `source/core/aer_module.c` handles
+routed through `OP_CALL_MODULE`'s shared bridge in `vm.c`. `source/runtime/aer_module.c` handles
 file-based imports — each imported file gets its own `Chunk` and `VM`, run to completion once at
 import time; calling one of its functions later uses a small trampoline (`setup_call`) that copies
 arguments across the VM boundary and runs the module's own VM just far enough to execute that one
@@ -2128,8 +2128,8 @@ allowlisting, neither of which exist today.
 | File | Purpose |
 |------|---------|
 | `source/main.c` | Entry point, REPL loop, file runner |
-| `source/terminal.h/c` | Raw-mode interactive REPL terminal |
-| `source/value.h` | `AerVal` — the one tagged-union value type, used internally and at the embedding boundary alike: null / boolean / integer / float / string / function / array / hashtable / packed array, and the `Shape` forward declaration |
+| `source/repl/terminal.h/c` | Raw-mode interactive REPL terminal |
+| `source/core/value.h` | `AerVal` — the one tagged-union value type, used internally and at the embedding boundary alike: null / boolean / integer / float / string / function / array / hashtable / packed array, and the `Shape` forward declaration |
 | `source/compiler/lexer.h/c` | Source text → token stream, indent/dedent tracking |
 | `source/compiler/parser.h/c` | Single-pass compiler: tokens → register-based bytecode, escape processing |
 | `source/core/vm.h/c` | Bytecode chunk, register-based VM (`CallFrame`/bump-pointer register stack), struct-type registry, computed-goto dispatch loop, built-ins |
@@ -2139,10 +2139,10 @@ allowlisting, neither of which exist today.
 | `source/stdlib/aer_json.c` | `json` module — encode/decode, dispatched the same way as the modules above |
 | `source/stdlib/aer_actor_module.c` / `aer_scheduler_module.c` | Script-facing `actor`/`scheduler` modules — thin shims translating `AerVal` args to `aer_actor.c`/`aer_scheduler.c`'s own C signatures |
 | `source/stdlib/aer_io.c` | `io` module (file open/read/write/close) — registered via the generic host-function mechanism (`aer_register_function`), but called by `vm_init()` itself, so it's just as unconditionally available as the hardcoded modules above |
-| `source/core/aer_module.h/c` | File-based `import` — resolution, isolated per-file `Chunk`/`VM`, cross-VM call trampoline; `aer_vm_instantiate_from_file()` is the shared "spin up an independent VM+Chunk and run its top-level code once" primitive this and `aer_actor.c` both use |
-| `source/core/aer_actor.h/c` | Independent long-lived VMs plus a host-side byte-string mailbox — spawn/call/send/receive, reachable from AER scripts via the `actor` module — see [Concurrency](#concurrency) |
-| `source/core/aer_scheduler.h/c` | Cooperative round-robin scheduler over already-spawned actors, driving each queued task in bounded `vm_run_slice()` instruction budgets instead of to completion — see [Concurrency](#concurrency) |
-| `source/core/aer_host.h/c` | Host-registered native function registry (`aer_register_function`) — reached from AER the same way as `math`/`random`/`string` |
+| `source/runtime/aer_module.h/c` | File-based `import` — resolution, isolated per-file `Chunk`/`VM`, cross-VM call trampoline; `aer_vm_instantiate_from_file()` is the shared "spin up an independent VM+Chunk and run its top-level code once" primitive this and `aer_actor.c` both use |
+| `source/stdlib/aer_actor.h/c` | Independent long-lived VMs plus a host-side byte-string mailbox — spawn/call/send/receive, reachable from AER scripts via the `actor` module — see [Concurrency](#concurrency) |
+| `source/stdlib/aer_scheduler.h/c` | Cooperative round-robin scheduler over already-spawned actors, driving each queued task in bounded `vm_run_slice()` instruction budgets instead of to completion — see [Concurrency](#concurrency) |
+| `source/runtime/aer_host.h/c` | Host-registered native function registry (`aer_register_function`) — reached from AER the same way as `math`/`random`/`string` |
 | `source/utilities/hashtable.h/c` | FNV-1a open-addressing hash table backing every `AerDict` and `Chunk`'s own string-constant dedup table, with size-classed slab pools for small key/bucket allocations |
 | `source/utilities/pool.h/c` | Slab (bump/arena) allocator extended for the generational mark-sweep garbage collector — every pool-managed struct (`AerString`/`AerArray`/`AerDict`/`AerFunction`/`AerPackedArray`) carries its own one-byte GC state as its literal first field |
 | `source/utilities/error.h/c` | Error reporting with source location and column pointer; recoverable-error sink (callback or stderr), `aer_report_fatal` for genuinely unrecoverable conditions, `assert_failure_count` |
