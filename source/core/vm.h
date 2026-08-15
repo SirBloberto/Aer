@@ -388,6 +388,16 @@ _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — 
    headroom to spare -- see RK8 below. */
 #define FRAME_REGISTERS 128
 
+/* Real-typed slots grow DOWN from the top of the frame while everything else grows up, so their
+   position is fixed before a body compiles -- which a 7-bit register operand needs, and a
+   per-function size could never give. Frame entry can then tag them once and the unchecked real
+   opcodes store only the payload. A body using any gets a full-size frame; FRAME_BOUNDS names the
+   two edges of the gap that leaves, which is never written, tagged or traced, so the full size
+   costs nothing. Integers need none of this -- their unchecked opcodes still write the tag. */
+#define FRAME_BOUNDS(dyn_end, real_base) ((unsigned short)(((dyn_end) << 8) | (real_base)))
+#define FRAME_DYN_END(bounds) ((unsigned int)((bounds) >> 8))
+#define FRAME_REAL_BASE(bounds) ((unsigned int)((bounds) & 0xFF))
+
 /* Fixed-width, word-granular instruction encoding: every instruction is one or more 32-bit words,
    the shape (1-word, 2-word, ...) fixed per opcode at compile time -- never a variable byte count.
    See ARCHITECTURE.md §3.1-3.2 for the full field vocabulary (PACK3/PACK2/PACK1, RK8, RK16,
@@ -554,6 +564,7 @@ typedef struct {
     SpecKind kind;
     unsigned int code_offset;
     unsigned int max_registers;
+    unsigned short frame_bounds;
 
     /* Optional second specialized body for this shape that also binds up to SPEC_MAX_RAW_PARAMS
        numeric parameters as raw locals. Declines silently to this entry's baseline body when it
@@ -565,6 +576,7 @@ typedef struct {
     ValueType raw_param_types[SPEC_MAX_RAW_PARAMS];
     unsigned int raw_variant_code_offset;
     unsigned int raw_variant_max_registers;
+    unsigned short raw_variant_frame_bounds;
 } SpecEntry;
 #define SPEC_MAX 4
 
@@ -579,6 +591,10 @@ typedef struct {
     /* Real peak register need, patched in after the body compiles; the FRAME_REGISTERS
        placeholder (read only by in-body self-reference) is never an under-allocation. */
     unsigned int max_registers;
+    /* Which slots of that frame frame entry has to touch -- see FRAME_BOUNDS. A body holding real
+       slots gets a full-size frame because those slots sit at its top, and without this every call
+       would tag all 128 of them and the collector would trace all 128 too. */
+    unsigned short frame_bounds;
 
     /* Shape-specializing compilation (lazy, per-call-observed-shape recompiles) -- see
        vm_call_resolve_specialization (vm.c). Bit i set = parameter i was seen used as the base of a
@@ -653,6 +669,7 @@ typedef struct {
     Shape* last_shape;
     unsigned int last_code_offset;
     unsigned int last_max_registers;
+    unsigned short last_frame_bounds;
     /* ARRAY_OF_STRUCTS only: the array (by pointer) and AerArray.generation at the last successful
        homogeneity scan. A later call with both unchanged can skip re-scanning. NULL/0 means never
        verified; only ever set on a scan that fully succeeded, so a failed one never poisons a
@@ -853,16 +870,37 @@ typedef struct {
                it was entered. */
             unsigned char dest_raw_kind;
             bool synthetic_entry; /* set by setup_call() -- return_ip isn't a real caller line */
+            unsigned short frame_bounds; /* FRAME_BOUNDS, above; fits the padding CallFrame had */
         };
         char size_is_a_power_of_two[32];
     };
 } CallFrame;
 
-/* The slots in this frame a heap reference can live in, for the GC to trace -- the whole frame,
-   since every slot is a tagged AerVal whatever its static type. */
+/* Tags the slots a frame about to start running will actually use: the dynamically typed ones hold
+   nothing yet, and the real ones at the top get the tag their unchecked opcodes then rely on --
+   those store a payload and leave the tag exactly as this wrote it. The gap between the two is
+   skipped, and frame_ref_slots stops before it, so a full-size frame costs no more here than the
+   tight one it replaced. */
+static inline void frame_init_tags(AerVal* registers, unsigned int from, unsigned short bounds,
+                                   unsigned int frame_size) {
+    unsigned int i = from, real_base = FRAME_REAL_BASE(bounds);
+    for (unsigned int dyn_end = FRAME_DYN_END(bounds); i < dyn_end; i++)
+        registers[i].tag = TYPE_NULL;
+    if (i < real_base)
+        i = real_base;
+    for (; i < frame_size; i++)
+        registers[i].tag = TYPE_REAL;
+}
+
+/* The slots in this frame a heap reference can live in, for the GC to trace. Every slot is a tagged
+   AerVal whatever its static type, so this stops only where nothing can reach: at the frame's
+   dynamically typed peak, below both the untouched gap and the real slots above it. */
 static inline unsigned int frame_ref_slots(CallFrame* frame, AerVal** out_slots) {
+    unsigned int dyn_end = FRAME_DYN_END(frame->frame_bounds);
     *out_slots = frame->registers;
-    return frame->frame_size;
+    /* Clamped, not trusted: a chunk built by hand rather than by the parser (the embedding tests do
+       this) carries the placeholder bounds, which are wider than its frame. */
+    return dyn_end < frame->frame_size ? dyn_end : frame->frame_size;
 }
 /* Indexing call_stack[] is `base + depth * sizeof(CallFrame)`, and at 44 bytes that compiled to a
    multiply plus a materialized constant per field on 32-bit ARM. A power of two makes it a shift. */

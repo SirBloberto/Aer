@@ -459,6 +459,9 @@ void vm_init(VM* vm, Chunk* chunk) {
        else a fresh run needs is exactly what aer_vm_reset_for_reuse() already does. */
     vm->call_stack[0].registers = &vm->register_stack[0];
     vm->call_stack[0].frame_size = FRAME_REGISTERS;
+    /* Top level gets no gap: its real slots come off the top of the same bank the collector has to
+       trace for top-level variables, and there is no per-call cost here to save by narrowing it. */
+    vm->call_stack[0].frame_bounds = FRAME_BOUNDS(FRAME_REGISTERS, FRAME_REGISTERS);
     aer_vm_reset_for_reuse(vm);
 }
 
@@ -512,6 +515,11 @@ void vm_free(VM* vm) {
 void aer_vm_reset_for_reuse(VM* vm) {
     vm->stack_top = 0;
     vm->call_depth = 0;
+    /* Top level has no caller to tag its frame, so it is done here -- every run, not once at
+       vm_init: a REPL line's real slots come off the top of the frame, where an earlier line may
+       have left a heap reference in a register it used as an ordinary one. */
+    for (unsigned int i = 0; i < FRAME_REGISTERS; i++)
+        vm->call_stack[0].registers[i].tag = TYPE_REAL;
 }
 
 bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
@@ -1168,9 +1176,9 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
         callee->registers[i] = args[i];
     for (int i = arg_count; i < (int)fn->arity; i++)
         callee->registers[i] = vm_default_value(target, fn->defaults[i - fn->min_arity]);
-    /* Same reason as lbl_call's own clear -- everything below frame_size gets traced. */
-    for (unsigned int i = fn->arity; i < fn->max_registers; i++)
-        callee->registers[i].tag = TYPE_NULL;
+    /* Same reason as lbl_call's own -- everything below frame_size gets traced. */
+    frame_init_tags(callee->registers, fn->arity, fn->frame_bounds, fn->max_registers);
+    callee->frame_bounds = fn->frame_bounds;
     callee->return_ip = return_ip;
     callee->dest_reg = 0;
     callee->dest_raw_kind = 0;
@@ -1219,9 +1227,9 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
            Must be refreshed here too, not just on the non-tail push path above. */
         reused->frame_size = f->max_registers;
         /* Growing the reused frame exposes registers the previous occupant never wrote, which
-           mark_vm_roots would still trace -- same clear as the two push paths. */
-        for (unsigned int i = f->arity; i < f->max_registers; i++)
-            reused->registers[i].tag = TYPE_NULL;
+           mark_vm_roots would still trace -- same retagging as the two push paths. */
+        frame_init_tags(reused->registers, f->arity, f->frame_bounds, f->max_registers);
+        reused->frame_bounds = f->frame_bounds;
         reused->tail_calls_collapsed++;
         return;
     }
@@ -1236,9 +1244,9 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         callee->registers[i] = caller->registers[arg_reg_base + i];
     for (int i = arg_count; i < (int)f->arity; i++)
         callee->registers[i] = vm_default_value(vm, f->defaults[i - f->min_arity]);
-    /* Same reason as lbl_call's own clear -- everything below frame_size gets traced. */
-    for (unsigned int i = f->arity; i < f->max_registers; i++)
-        callee->registers[i].tag = TYPE_NULL;
+    /* Same reason as lbl_call's own -- everything below frame_size gets traced. */
+    frame_init_tags(callee->registers, f->arity, f->frame_bounds, f->max_registers);
+    callee->frame_bounds = f->frame_bounds;
     callee->return_ip = return_ip;
     callee->dest_reg = dest_reg;
     callee->dest_raw_kind = 0;
@@ -2308,7 +2316,7 @@ static void chunk_ensure_call_spec_cache(Chunk* c) {
 static void __attribute__((noinline))
 vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
                                     unsigned int ip, unsigned int* chosen_offset,
-                                    unsigned int* chosen_max_registers) {
+                                    unsigned int* chosen_max_registers, unsigned short* chosen_frame_bounds) {
     unsigned int site =
         ip - 3; /* this instruction's own word0 offset -- ip already advanced past all 3 words by now */
     /* Lowest set bit -- which argument register carries the shape-sensitive parameter. Only
@@ -2373,6 +2381,7 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
         if (site_entry->last_shape == observed) {
             *chosen_offset = site_entry->last_code_offset;
             *chosen_max_registers = site_entry->last_max_registers;
+            *chosen_frame_bounds = site_entry->last_frame_bounds;
             entry = site_entry->last_entry;
         } else {
             SpecEntry* found = NULL;
@@ -2413,9 +2422,11 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                 site_entry->last_shape = found->shape;
                 site_entry->last_code_offset = found->code_offset;
                 site_entry->last_max_registers = found->max_registers;
+                site_entry->last_frame_bounds = found->frame_bounds;
                 site_entry->last_entry = found;
                 *chosen_offset = found->code_offset;
                 *chosen_max_registers = found->max_registers;
+                *chosen_frame_bounds = found->frame_bounds;
                 entry = found;
             }
         }
@@ -2458,6 +2469,8 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                 if (matches_existing) {
                     *chosen_offset = entry->raw_variant_code_offset;
                     *chosen_max_registers = entry->raw_variant_max_registers;
+                    *chosen_frame_bounds = entry->raw_variant_frame_bounds;
+                    *chosen_frame_bounds = entry->raw_variant_frame_bounds;
                 } else if (entry->raw_param_count == 0) {
                     /* Never attempted for THIS entry -- try to compile it now. A failure here
                        (raw_ints/raw_reals budget exhausted -- realistic, since this shape's own
@@ -2475,6 +2488,8 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                         chunk_ensure_call_spec_cache(c);
                         entry->raw_variant_code_offset = variant.code_offset;
                         entry->raw_variant_max_registers = variant.max_registers;
+                        entry->raw_variant_frame_bounds = variant.frame_bounds;
+                        entry->raw_variant_frame_bounds = variant.frame_bounds;
                         for (int k = 0; k < cand_count; k++) {
                             entry->raw_param_regs[k] = cand_regs[k];
                             entry->raw_param_types[k] = cand_types[k];
@@ -2482,6 +2497,8 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                         entry->raw_param_count = cand_count;
                         *chosen_offset = entry->raw_variant_code_offset;
                         *chosen_max_registers = entry->raw_variant_max_registers;
+                        *chosen_frame_bounds = entry->raw_variant_frame_bounds;
+                        *chosen_frame_bounds = entry->raw_variant_frame_bounds;
                     } else {
                         entry->raw_param_count = -1;
                     }
@@ -2502,7 +2519,8 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
 static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFunction* target_f,
                                                               AerVal* registers, int arg_reg_base,
                                                               unsigned int* chosen_offset,
-                                                              unsigned int* chosen_max_registers) {
+                                                              unsigned int* chosen_max_registers,
+                                                              unsigned short* chosen_frame_bounds) {
     int cand_regs[SPEC_MAX_RAW_PARAMS];
     ValueType cand_types[SPEC_MAX_RAW_PARAMS];
     int cand_count = 0;
@@ -2532,6 +2550,7 @@ static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFun
                 return; /* a different numeric signature than the one compiled -- stay boxed */
         *chosen_offset = entry->raw_variant_code_offset;
         *chosen_max_registers = entry->raw_variant_max_registers;
+        *chosen_frame_bounds = entry->raw_variant_frame_bounds;
         return;
     }
     if (entry->raw_param_count != 0)
@@ -2554,6 +2573,7 @@ static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFun
     chunk_ensure_call_spec_cache(c);
     entry->raw_variant_code_offset = variant.code_offset;
     entry->raw_variant_max_registers = variant.max_registers;
+    entry->raw_variant_frame_bounds = variant.frame_bounds;
     for (int k = 0; k < cand_count; k++) {
         entry->raw_param_regs[k] = cand_regs[k];
         entry->raw_param_types[k] = cand_types[k];
@@ -2561,6 +2581,8 @@ static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFun
     entry->raw_param_count = cand_count;
     *chosen_offset = entry->raw_variant_code_offset;
     *chosen_max_registers = entry->raw_variant_max_registers;
+    *chosen_frame_bounds = entry->raw_variant_frame_bounds;
+    *chosen_frame_bounds = entry->raw_variant_frame_bounds;
 }
 
 /* The monomorphic case, split off so it does not pay for the full resolver's frame: that one is
@@ -2568,13 +2590,13 @@ static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFun
    both on every call regardless of which path runs. Split here rather than at the call site because
    growing lbl_call reshuffles register allocation across all 153 label bodies -- measured at +6.93%
    cycles on nbody, whose lbl_call is cold, for a call-site version of exactly this test. */
-static void __attribute__((noinline)) vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f,
-                                                                     AerVal* registers, int arg_reg_base,
-                                                                     unsigned int ip,
-                                                                     unsigned int* chosen_offset,
-                                                                     unsigned int* chosen_max_registers) {
+static void __attribute__((noinline))
+vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
+                               unsigned int ip, unsigned int* chosen_offset,
+                               unsigned int* chosen_max_registers, unsigned short* chosen_frame_bounds) {
     if (target_f->shape_sensitive_mask == SHAPE_MASK_NUMERIC_ONLY) {
-        vm_call_resolve_numeric(c, target_f, registers, arg_reg_base, chosen_offset, chosen_max_registers);
+        vm_call_resolve_numeric(c, target_f, registers, arg_reg_base, chosen_offset, chosen_max_registers,
+                                chosen_frame_bounds);
         return;
     }
     unsigned int site = ip - 3;
@@ -2587,10 +2609,11 @@ static void __attribute__((noinline)) vm_call_resolve_specialization(Chunk* c, C
         const CallSpecCacheEntry* hit = &c->call_spec_cache[site];
         *chosen_offset = hit->last_code_offset;
         *chosen_max_registers = hit->last_max_registers;
+        *chosen_frame_bounds = hit->last_frame_bounds;
         return;
     }
     vm_call_resolve_specialization_full(c, target_f, registers, arg_reg_base, ip, chosen_offset,
-                                        chosen_max_registers);
+                                        chosen_max_registers, chosen_frame_bounds);
 }
 
 /* lbl_call_module's cold path, split for the same reason as vm_call_resolve_specialization: inlined
@@ -3272,6 +3295,7 @@ lbl_call: {
        but forward-referenced and self-recursive calls need their opcode chosen before that. */
     unsigned int chosen_offset = (unsigned int)callee_offset;
     unsigned int chosen_max_registers = target_f->max_registers;
+    unsigned short chosen_frame_bounds = target_f->frame_bounds;
 
     if (!target_f->megamorphic && target_f->shape_sensitive_mask != 0) {
         /* The out-params are scoped to this branch on purpose. Taking the address of the chosen_*
@@ -3279,11 +3303,13 @@ lbl_call: {
            cannot live in a register -- so every ordinary call paid stores and address computations
            for a path it never takes. */
         unsigned int spec_offset = chosen_offset, spec_registers = chosen_max_registers;
+        unsigned short spec_bounds = chosen_frame_bounds;
         unsigned int resume_at = (unsigned int)(pc - code);
         vm_call_resolve_specialization(c, target_f, registers, arg_reg_base, resume_at, &spec_offset,
-                                       &spec_registers);
+                                       &spec_registers, &spec_bounds);
         chosen_offset = spec_offset;
         chosen_max_registers = spec_registers;
+        chosen_frame_bounds = spec_bounds;
         /* Compiling a specialized body can realloc any of the chunk's growable arrays, so every
            hoisted pointer into them is refreshed here. const_pool looks safe -- a recompile of the
            same source finds every constant already interned -- but chunk_add_pool dedups
@@ -3305,8 +3331,8 @@ lbl_call: {
         callee->registers[i] = registers[arg_reg_base + i];
     /* mark_vm_roots traces every register below frame_size, so an unfilled one would still hold a
        popped frame's pointer. Only the tag matters -- value_has_cell reads nothing else. */
-    for (unsigned int i = (unsigned int)arg_count; i < chosen_max_registers; i++)
-        callee->registers[i].tag = TYPE_NULL;
+    frame_init_tags(callee->registers, (unsigned int)arg_count, chosen_frame_bounds, chosen_max_registers);
+    callee->frame_bounds = chosen_frame_bounds;
     callee->return_ip =
         (unsigned int)(pc - code); /* already past this instruction's operands -- the correct resume point */
     callee->dest_reg = dest_reg;
@@ -3346,6 +3372,9 @@ lbl_tail_call: {
        computes its child's base from the wrong frame_size and overlaps still-live slots. The base
        pointers are untouched -- same frame, same memory, only the claim changes. */
     reused->frame_size = target_f->max_registers;
+    /* Same as the non-tail push: the block's tags belong to the function now running here. */
+    frame_init_tags(registers, (unsigned int)arg_count, target_f->frame_bounds, target_f->max_registers);
+    reused->frame_bounds = target_f->frame_bounds;
     reused->tail_calls_collapsed++;
     /* Every call (tail or not) is the other place a script can spend unbounded time (recursion
        instead of a loop) -- checked once pc already points at the callee's real entry point, so a
@@ -3425,9 +3454,10 @@ lbl_call_self: {
     for (int i = 0; i < arg_count; i++)
         callee->registers[i] = registers[arg_reg_base + i];
     /* mark_vm_roots traces every slot below frame_size, so the ones this call does not fill must not
-       keep a popped frame's stale references. */
-    for (unsigned int i = (unsigned int)arg_count; i < fsz; i++)
-        callee->registers[i].tag = TYPE_NULL;
+       keep a popped frame's stale references. Self-call, so the callee's block layout is the
+       caller's. */
+    frame_init_tags(callee->registers, (unsigned int)arg_count, caller->frame_bounds, fsz);
+    callee->frame_bounds = caller->frame_bounds;
     callee->return_ip = (unsigned int)(pc - code);
     callee->dest_reg = dest_reg;
     callee->dest_raw_kind = 0;
@@ -5267,12 +5297,15 @@ lbl_raw_load_real: {
         registers[dest] = aer_int(registers[a].as.i op c->rawk_i[k]);                                        \
         DISPATCH();                                                                                          \
     }
+/* Writes the payload and leaves the tag: the destination is a real slot, whose tag frame entry
+   already set and nothing since can have changed (frame_init_tags, vm.h). One 8-byte store instead
+   of a 16-byte one, on the instruction a numeric loop spends most of its dispatches in. */
 #define RAW_ARITH_REAL(name, op)                                                                             \
     lbl_raw_##name##_real : {                                                                                \
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        registers[dest] = aer_real(registers[a].as.d op registers[b].as.d);                                  \
+        registers[dest].as.d = registers[a].as.d op registers[b].as.d;                                       \
         DISPATCH();                                                                                          \
     }
 #define RAW_CMP_INT(name, op)                                                                                \
@@ -5352,7 +5385,7 @@ lbl_raw_floor_div_int: {
         int dest = (int)UNPACK_A(op_word);                                                                   \
         int a = (int)UNPACK_B(op_word);                                                                      \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        registers[dest] = aer_real(registers[dest].as.d op(registers[a].as.d * registers[b].as.d));          \
+        registers[dest].as.d = registers[dest].as.d op(registers[a].as.d * registers[b].as.d);               \
         DISPATCH();                                                                                          \
     }
     RAW_FUSED_MULACC_REAL(fma, +)

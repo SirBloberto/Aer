@@ -200,6 +200,7 @@ void chunk_add_function(Chunk* c, unsigned int name_idx, unsigned int code_offse
     /* Placeholder until parse_function patches in the real peak -- never an under-allocation even
        for in-body self-reference, the one case that reads it early. */
     f->max_registers = FRAME_REGISTERS;
+    f->frame_bounds = FRAME_BOUNDS(FRAME_REGISTERS, FRAME_REGISTERS);
     f->shape_sensitive_mask = 0;
     f->source_span = NULL;
     f->source_span_len = 0;
