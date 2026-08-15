@@ -2200,8 +2200,8 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                            try_rewrite_index_get_raw's guess from the consumer, which is what the
                            checked opcode's fallback exists to catch (15 in 22.1M, all from there). */
                         if (index_safe_unchecked(arr_reg, rk_start))
-                            chunk_emit(c, PACK3(OP_TYPED_INDEX_GET_UNCHECKED, slot, arr_reg,
-                                                pack_rk8(rk_start)));
+                            chunk_emit(
+                                c, PACK3(OP_TYPED_INDEX_GET_UNCHECKED, slot, arr_reg, pack_rk8(rk_start)));
                         else
                             chunk_emit(c,
                                        PACK3(elem == RAWK_INT ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL,
