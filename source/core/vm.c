@@ -966,13 +966,13 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
 }
 
 /* OP_INTERP's builder. noinline on purpose: its scratch would otherwise join vm_run_slice's
-   already-3300-byte frame, and §5.16b records what added pressure there costs. A part is rendered
+   already-3300-byte frame, and §5.18 records what added pressure there costs. A part is rendered
    into `scratch` only if it isn't already a string; unbounded content defers to vm_to_str. */
 /* Formats an interpolated dict key into a stack buffer and probes with the bytes, never building the
    AerString. Returns false (leaving *out alone) when that cannot work, and the caller falls back.
    Must format exactly as vm_interp_build does -- a key written through OP_INTERP and read back
    through here would otherwise silently miss; tests/test_interp_dict_keys.aer guards that.
-   Owns the buffer and the probe so neither lands in vm_run_slice's frame (5.16b). */
+   Owns the buffer and the probe so neither lands in vm_run_slice's frame (5.18). */
 static __attribute__((noinline)) bool vm_dict_get_interp(AerDict* d, const uint32_t* rks, unsigned int count,
                                                          AerVal* registers, AerVal* pool, AerVal* out) {
     char key[INTERP_KEY_MAX];
@@ -2091,7 +2091,7 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
 
 /* vm_dict_get_interp's fallback: builds the key string for real, then takes the general index path.
    Separate and noinline so its parts[] scratch stays out of vm_run_slice's frame. lbl_interp keeps
-   ITS parts[] inline on purpose -- hoisting that one out the same way measured worse (5.16h). */
+   ITS parts[] inline on purpose -- hoisting that one out the same way measured worse (5.24). */
 static __attribute__((noinline)) AerVal vm_index_get_interp_slow(VM* vm, AerVal obj, const uint32_t* rks,
                                                                  unsigned int count, AerVal* registers,
                                                                  AerVal* pool) {
@@ -2675,7 +2675,7 @@ static bool __attribute__((noinline)) vm_call_module_dispatch(VM* vm, Chunk* c, 
 /* Measurement-only: shifts every following function's address, so a benchmark can be run across
    several deliberately different code layouts instead of the single one a build happens to produce.
    Interpreter cycle counts swing several percent purely on how vm_run_slice's ~153 dispatch sites
-   alias in the branch-target buffer (5.16yc), which is not attributable to any source change -- and
+   alias in the branch-target buffer (5.44), which is not attributable to any source change -- and
    comparing one layout against one layout silently folds that in. Never defined by a normal build. */
 #ifdef AER_LAYOUT_PAD
 #define AER_PAD_STR2(x) #x
@@ -5497,7 +5497,7 @@ lbl_raw_load_int_pool: {
 
 /* The operand words are read by the helpers straight out of the instruction stream rather than into
    a local array -- 16 AerVals of scratch here would grow vm_run_slice's frame for every opcode
-   (5.16b). Both helpers read every part before dest is written, so dest may alias a part's register,
+   (5.18). Both helpers read every part before dest is written, so dest may alias a part's register,
    which emit_interp deliberately arranges. */
 lbl_index_get_interp: {
     int dest_reg = (int)UNPACK_A(op_word);

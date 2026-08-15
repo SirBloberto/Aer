@@ -2,7 +2,7 @@
 """Compares two refs across several code layouts, so the branch-layout lottery stops confounding it.
 
 Cycle counts on this interpreter move several percent purely on how vm_run_slice's ~153 dispatch
-sites happen to alias in the branch-target buffer (ARCHITECTURE 5.16yc). That is a property of the
+sites happen to alias in the branch-target buffer (ARCHITECTURE 5.44). That is a property of the
 build, not of the change: any edit shifts every label's address, and the resulting misprediction
 count swings 2-4x in either direction with no relation to what the edit does. Comparing one build
 against one build folds that straight into the answer.

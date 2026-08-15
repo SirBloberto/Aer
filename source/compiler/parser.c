@@ -838,7 +838,7 @@ static bool index_safe_unchecked(int arr_reg, int idx_rk) {
 /* Poisons what a write invalidates about a slot's CONTENTS, keyed on reg as either the index or
    the array half -- the _UNCHECKED opcodes have no runtime check to fall back on. Entries are
    overwritten with -1, not removed, so parse_for_in's push/pop depth counting is untouched.
-   Deliberately leaves reg_nonneg alone; see ARCHITECTURE 5.16yq for what clearing it cost. */
+   Deliberately leaves reg_nonneg alone; see ARCHITECTURE 5.58 for what clearing it cost. */
 static void note_slot_written(int reg) {
     if (reg < 0)
         return;

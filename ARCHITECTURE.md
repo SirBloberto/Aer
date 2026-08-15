@@ -820,7 +820,7 @@ deltas from -0.92% to +1.26%, while instruction counts over the same runs agree 
 Any cycles-based claim below about 1.5% on this hardware is unfalsifiable — use instruction counts
 as the gate, and treat `--event cycles` as a coarse sanity check only.
 
-### 5.16a Building an interpolated string once, and fusing a comparison that ends a condition
+### 5.17 Building an interpolated string once, and fusing a comparison that ends a condition
 
 Two changes that came out of comparing against Luau and LuaJIT's interpreter on equal-length
 benchmarks, both targeting dispatch count rather than the cost of a dispatch.
@@ -833,7 +833,7 @@ constant needing no load, and a non-string part is formatted straight into the r
 through a throwaway string. `lookup_table_bench`'s key went from four dispatches to two.
 `dict_bench` -30.7%, `log_processing` -18.4%, `lookup_table_bench` -17.9%, `small_dict_bench`
 -7.4%, everything else within 0.02%. The builder is `noinline` -- its scratch would otherwise land
-in `vm_run_slice`'s frame, which §5.16b explains the cost of.
+in `vm_run_slice`'s frame, which §5.18 explains the cost of.
 
 **Fusing a comparison that merely *ends* a condition.** `emit_cond_jump_if_false` only fused when
 the comparison *was* the condition -- one word, or two with a constant load before it. Anything
@@ -856,7 +856,7 @@ keys instead of copying them, has been attempted and reverted twice (see the `bo
 borrowed keys` commits); the second attempt fixed both flaws the first was reverted for and still
 did not land. A third attempt needs a new idea, not a retry.
 
-### 5.16b Why `lbl_call` cannot be micro-optimized (measured, three ways)
+### 5.18 Why `lbl_call` cannot be micro-optimized (measured, three ways)
 
 `fib_bench` runs 134.4M dispatches for 8.26B instructions -- 61.5 instructions per dispatch, against
 `mandelbrot`'s 22.0 on the same interpreter -- so the call path looks like obvious low-hanging
@@ -893,7 +893,7 @@ The consequence for anyone picking this up: the remaining lever on call-heavy co
 dispatches**, not a cheaper `lbl_call`. Seven dispatches per `fib` call (compare-and-branch, two
 subtracts, two calls, add, return) is the number to attack, and only through fusion.
 
-### 5.16c Constants as RK operands: where it pays, and where fewer instructions ran slower
+### 5.19 Constants as RK operands: where it pays, and where fewer instructions ran slower
 
 `OP_LOADK` exists only to copy a pool constant into a register because some consuming opcode insists
 on one. It was the 11th hottest opcode in the suite, 60M dispatches, and essentially all of it was
@@ -927,7 +927,7 @@ the wrong way relative to real time, because the change traded instruction *coun
 wall-clock confirmation before it is believed, with a ref-against-itself control run to establish the
 noise floor first.
 
-### 5.16d What a new opcode actually costs, measured twice on one change
+### 5.20 What a new opcode actually costs, measured twice on one change
 
 `OP_INDEX_GET_INTERP` formats `dict["key_{n}"]` into a stack buffer and probes with the bytes
 instead of allocating an `AerString` to hash once and drop -- `hashtable_get_hashed` already takes
@@ -950,14 +950,14 @@ Moving the new label past the raw-compare block it had displaced recovered about
 rest is the price of the opcode existing at all.
 
 So the per-opcode cost is real, but it is *placement*, not size, and not the two things it is usually
-blamed on: 5.16 measures the icache miss rate at 0.02-0.10%, and 5.16b measures a deliberate 23% cut
+blamed on: 5.16 measures the icache miss rate at 0.02-0.10%, and 5.18 measures a deliberate 23% cut
 in branch misses making cycles *worse*. That matters for the standing question of whether to delete
 the ~76 dispatchable opcodes no benchmark reaches (the int32 and bounds-checked corners of the
 field-access matrix, and the `>`/`>=` halves of the raw compare families). Deleting them is a
 maintainability argument, which is a real one -- but it is a layout lottery, not a directed
 optimization, and anyone doing it should expect to measure a shuffle, not a speedup.
 
-### 5.16e The call path, a fourth time; and how many opcodes are actually redundant
+### 5.21 The call path, a fourth time; and how many opcodes are actually redundant
 
 **`fib_bench` costs ~277 instructions per call** (8.26B instructions, 29.86M calls, 4.5 dispatches
 each). `perf annotate` puts it in frame maintenance rather than dispatch: `ldr r0, [sp, #44]`
@@ -1018,7 +1018,7 @@ the dispatch loop indexes, and every big cold array last.**
 What remains in `lbl_call` is structural: the 16-byte `AerVal` argument copy (`ldmia`, 2.4%) and `vm`
 reloading from a stack spill in `lbl_return` (4.0%). Both are consequences of a 16-byte value in a
 C-compiled dispatch loop, which is the deferred value-representation work. Beyond those, the lever is
-fewer dispatches per call -- fusion, a new opcode, priced at about 3% by 5.16d.
+fewer dispatches per call -- fusion, a new opcode, priced at about 3% by 5.20.
 
 **How much of the opcode table is actually redundant: four opcodes, not 76.** A census across
 `bench/` + `tests/` (per-opcode dispatch counts from the debug build) shows 76 of 153 dispatchable
@@ -1043,7 +1043,7 @@ And the performance answer, measured: instructions moved 0.00-0.03% on every ben
 roughly the same amplitude as adding one, in either direction. Trim for size and comprehension, which
 are real goals; do not trim expecting speed, and do not trim anything that carries a capability.
 
-### 5.16f One register file, and why the earlier attempt to build it failed
+### 5.22 One register file, and why the earlier attempt to build it failed
 
 `registers[]`, `raw_ints[]` and `raw_reals[]` were three arrays with three index spaces, and every
 value crossing between them cost an opcode. They are now **one array of tagged `AerVal`s**. An
@@ -1111,7 +1111,7 @@ a measured +250M. Two probes fix the mechanism. Writing the payload without the 
 in 1.95M instructions, so the tag is load-bearing; splitting the write into `.tag =` and `.as.d =`
 instead of storing the struct whole costs +0.36%, so it is not a codegen artifact. Removing it means
 establishing a slot's tag **once** rather than on every write -- not encoding it more narrowly. See
-5.16yp for why a narrower value representation is not available.
+5.60 for why a narrower value representation is not available.
 
 **What the single index space costs.** One slot stack means the parser's alloc/free discipline has to
 be honest about *which* slot it is releasing. Four latent hazards surfaced immediately, all caught by
@@ -1123,7 +1123,7 @@ then overwrote them; and `is_temp` reported false for a statically-typed operand
 never released. None of these are new bugs in the sense of new code being wrong -- they are places
 where "different bank" had been doing the work of "different lifetime".
 
-### 5.16g Non-PIE is worth 0.3-4.3%, and is deliberately not taken
+### 5.23 Non-PIE is worth 0.3-4.3%, and is deliberately not taken
 
 A PIE build reaches the computed-goto label table PC-relatively, so **every dispatch** pays
 `ldr rN,[pc,#imm]; add rN,pc` on top of the table load itself -- 4 ARM32 instructions where a
@@ -1142,7 +1142,7 @@ report a build-flag difference as an interpreter win. Same rules, or the number 
 Recorded because the underlying cost is real and worth knowing: on a computed-goto interpreter,
 position independence is a per-dispatch tax, not a one-off.
 
-### 5.16h Where the stack traffic actually is, and what did not reduce it
+### 5.24 Where the stack traffic actually is, and what did not reduce it
 
 Cycle-weighted inside `vm_run_slice`, loads are 64-86% and stores 7-17%, of which **stack spills are
 17-24%**: `fib_bench` 24.3%, `lookup_table_bench` 23.0%, `nbody` 17.5%. The load share itself is not
@@ -1160,7 +1160,7 @@ out into a noinline helper, the same fix that was right for `OP_INDEX_GET_INTERP
 on the benchmarks that do not interpolate (`mandelbrot`, `fib_bench`, `binary_trees` all 0.00%) and
 cost the ones that do 1.2% (`dict_bench` +1.16%, `small_dict_bench` +1.23%) for the extra call and
 its five arguments. **gcc already overlaps locals whose live ranges do not overlap**, so a per-label
-array is not additive frame cost the way it looks -- 5.16d's +4.52% came from adding a *second* live
+array is not additive frame cost the way it looks -- 5.20's +4.52% came from adding a *second* live
 array alongside an existing one, not from the array's size alone. Reverted.
 
 **What the spill slots actually hold.** Reading the prologue against the sampled slot offsets, the
@@ -1185,7 +1185,7 @@ Three attempts to reduce it, all measured:
 - **Register-allocation flags.** `-fira-region=one` +1.73% on fib, `-fsched-pressure` 0.00%,
   `-fira-algorithm=priority` -0.65% on fib and nothing elsewhere, `--param=max-inline-insns-auto=8`
   far worse. A lottery that would not generalise across compilers, same objection as `ARCH_FLAGS`.
-- **Shrinking the frame** (5.16h above): no effect, gcc overlaps non-overlapping label locals.
+- **Shrinking the frame** (5.24 above): no effect, gcc overlaps non-overlapping label locals.
 
 And note what does *not* follow: **cutting opcodes will not help this.** Register allocation is
 driven by live ranges, not code size -- the dozen values live across every dispatch conflict with
@@ -1217,7 +1217,7 @@ by writing the interpreter in assembly and pinning BASE/PC/DISPATCH to fixed reg
 amount of C-level restructuring reproduces. Further progress here means removing hot uses one at a
 time -- worth 0.4-4.5% each and getting scarcer -- not another structural attempt.
 
-### 5.16i Per-operand-kind opcodes are not worth it (measured with a single probe)
+### 5.25 Per-operand-kind opcodes are not worth it (measured with a single probe)
 
 The standing hypothesis for closing the remaining gap to LuaJIT's interpreter was to split binary
 operators by operand kind, the way LuaJIT has `ADDVV`/`ADDVN`/`ADDNV`. The reasoning looked strong:
@@ -1240,7 +1240,7 @@ branchless `ite` predication that pipelines well, not 16 independent instruction
 instruction count off a disassembly listing overestimated the real cost by 3.5x.
 
 **And the per-opcode tax is larger than the per-opcode win.** One addition cost nine unrelated
-benchmarks more than it gained on its target, which is the same ~3% layout roll 5.16d measured from
+benchmarks more than it gained on its target, which is the same ~3% layout roll 5.20 measured from
 the other direction. Scaling to 16-20 opcodes multiplies the tax while the wins stay confined to
 whichever shapes each one covers.
 
@@ -1248,7 +1248,7 @@ So the last structural idea on the list is closed. LuaJIT's advantage here is no
 itself -- it is that a hand-written assembly interpreter pays no layout lottery and no register
 pressure, so the split is free for them and costs us more than it returns.
 
-### 5.16j A 21% win sitting in sieve, blocked by one unrecognised expression shape
+### 5.26 A 21% win sitting in sieve, blocked by one unrecognised expression shape
 
 Profiling every benchmark **by function** rather than by opcode (the same lens that found the
 redundant `strlen` and the `memcmp` call) turns up one clear outlier:
@@ -1289,7 +1289,7 @@ failed tag compares. Converting the chain to a jump-table `switch` moved `sieve`
 nothing -- and regressed nine other benchmarks 0.5-4.7%. The dispatch was never the cost; the bounds
 check, the element-type validation and the write are. Reverted.
 
-### 5.16k Proving range starts non-negative -- and the segfault that found
+### 5.27 Proving range starts non-negative -- and the segfault that found
 
 `index_safe_unchecked` lets a range-for's body index without bounds checks when the range end IS
 `length(arr)` and the start is provably `>= 0`. The upper half was solid; the lower half was three
@@ -1325,18 +1325,18 @@ while `sieve` kept its -21.38%. So the cost is codegen shift from touching these
 guard's arithmetic (which would be ~3 instructions against the 10.5 per `PREP` the delta implies).
 Landed anyway: it buys a memory-safety fix and 21% on another benchmark.
 
-### 5.16l Taking lbl_call apart: what its 91 instructions are, and what moved them
+### 5.28 Taking lbl_call apart: what its 91 instructions are, and what moved them
 
 Attributing the handler instruction-by-instruction against source (`objdump -dS` over the range
 `perf` identifies as `lbl_call`) rather than guessing. What it is actually made of:
 
-- `add.w r6, r2, ip, lsl #6` -- the `CallFrame` power-of-two shift working as intended (5.16e).
+- `add.w r6, r2, ip, lsl #6` -- the `CallFrame` power-of-two shift working as intended (5.21).
 - `mov.w r3, #328` + `mla r5, r3, r5, r2` -- **`sizeof(ChunkFunction)` is 328, not a power of two**,
   so `functions[func_index]` costs a materialized constant plus a multiply where a shift would do.
   The same defect `CallFrame` had, still present one struct over.
 - `cmp.w ip, #35` + `beq.w` -- the tail-call test, on the hot path.
 - `str r2, [sp, #356]` at entry, reloaded at exit -- `dest_reg` spilled and re-read for nothing.
-- Six frame-field stores at offsets `#2024`-`#2044`, all inside the 12-bit window (5.16e's ordering
+- Six frame-field stores at offsets `#2024`-`#2044`, all inside the 12-bit window (5.21's ordering
   fix holding).
 
 **Splitting `OP_TAIL_CALL` into its own label: neutral.** `OP_CALL` and `OP_TAIL_CALL` shared
@@ -1353,11 +1353,11 @@ a net **+125M instructions** across the two.
 
 `fib_bench` never executes that code -- its `shape_sensitive_mask` is zero, so the branch is never
 taken. The 3.87% is the cost of roughly ten instructions merely *existing* inside `lbl_call`. That is
-the sharpest measurement yet of what 5.16h describes: this handler is at its register-allocation
+the sharpest measurement yet of what 5.24 describes: this handler is at its register-allocation
 limit, and anything added to it is paid for by every call in every program, executed or not. Adding
 to `lbl_call` needs a win larger than ~4% on the benchmark it targets before it breaks even.
 
-### 5.16m The module-call path: where nbody's 9.6% goes, and why it stays there
+### 5.29 The module-call path: where nbody's 9.6% goes, and why it stays there
 
 `math.sqrt` is 9.6% of `nbody` across `vm_call_module_dispatch` + `aer_math_call` +
 `math_pop_double`, over 11.5M `OP_CALL_MODULE` dispatches -- roughly 80 instructions for a
@@ -1383,11 +1383,11 @@ instruction is real.
 
 That is below the 1% bar this step was given, so it was not built. What is left is the four stack
 round-trips, and removing those means either changing the module ABI so arguments pass in registers
-(every module function signature) or a fused opcode for 1-argument numeric math -- and 5.16i prices
+(every module function signature) or a fused opcode for 1-argument numeric math -- and 5.25 prices
 a new opcode at more than it returns. `nbody` already beats both comparison interpreters, so this is
 recorded rather than pursued.
 
-### 5.16n Five benchmarks measured a result nothing checked
+### 5.30 Five benchmarks measured a result nothing checked
 
 `nbody.aer`, the three `nbody_large_*` variants and `typed_array_bench` all computed a result into a
 variable and then printed only their timing. A benchmark whose output cannot change when its answer
@@ -1409,7 +1409,7 @@ per-variant determinism check.
 `typed_array_bench` initially printed `xs[0]`, which its `xs[k] = k * 0.5` fill makes permanently
 `0.0` -- a checksum that could never fail. It prints `total` and `xs[N-1]` instead.
 
-### 5.16o The dict benchmarks re-hash immutable strings (investigated, then built)
+### 5.31 The dict benchmarks re-hash immutable strings (investigated, then built)
 
 `small_dict_bench` runs 8.38B instructions in 2.57s. Its profile is `vm_run_slice` 30.5%,
 `pool_alloc` 14.2%, `hashtable_put_hashed` 10.3%, `vm_index_get_compute` 8.4%, `hashtable_key_dup`
@@ -1426,7 +1426,7 @@ There is a second scan on the same bytes. `lbl_dict_new` computes `hashtable_key
 passes the result to `hashtable_key_dup`, which calls `hashtable_key_true_len` **again** on the
 already-truncated length -- a walk that by construction can no longer find a NUL.
 
-**Why this is not the borrowed-keys idea that failed twice.** 5.16a records two attempts at pointing
+**Why this is not the borrowed-keys idea that failed twice.** 5.17 records two attempts at pointing
 dict keys at constant-pool bytes, both reverted. Those changed *ownership*: a key's lifetime stopped
 matching the table that held it. Caching a hash changes no ownership at all. It memoizes a pure
 function of bytes that never change -- `aer_string_alloc` (`vm.c:333`) is the single site that
@@ -1487,16 +1487,16 @@ pool's rounded stride stays **32**, and `log_processing`'s peak RSS is identical
 
 `fib_bench` is kept despite crossing the 0.30% revert line. It contains no dict or string work at
 all -- one `print` -- so the extra instructions cannot be the cache doing work; it is the
-register-allocation shift 5.16l describes, where changing code anywhere in `vm_run_slice`
+register-allocation shift 5.28 describes, where changing code anywhere in `vm_run_slice`
 re-allocates registers across all 153 label bodies and `fib_bench`'s hot `lbl_call` pays for it.
 
 **A correction.** This section originally justified keeping it with "cycles are lower in the new
-build (4.278B against 4.308B)". That evidence does not survive 5.16p: cycle measurements at
+build (4.278B against 4.308B)". That evidence does not survive 5.32: cycle measurements at
 `--runs 3` carried a head-favouring ordering bias plus ~4% noise, so a 0.7% cycle difference
 measured that way was indistinguishable from nothing. The change is kept on the strength of the
 six instruction wins and the mechanism above, not on that cycle reading.
 
-### 5.16p The benchmark harness was biased toward `head`, and cycles need seven runs
+### 5.32 The benchmark harness was biased toward `head`, and cycles need seven runs
 
 Found while trying to adjudicate a change whose instruction and cycle counts disagreed. Running
 `tools/bench.py --base HEAD --head HEAD` -- the same commit against itself, where every delta must
@@ -1526,9 +1526,9 @@ The working rules this establishes:
 The older "cycles spread ±0.4% ref-against-itself" note that several sections lean on was measured
 before this and is optimistic by roughly an order of magnitude at `--runs 3`. Any conclusion in this
 document that rests on a sub-1.5% cycle difference at low run counts should be treated as unproven;
-5.16o has been corrected on exactly that basis.
+5.31 has been corrected on exactly that basis.
 
-### 5.16q Two more attempts on `vm_run_slice`'s register pressure, both reverted
+### 5.33 Two more attempts on `vm_run_slice`'s register pressure, both reverted
 
 `fib_bench` runs ~234 instructions per call against LuaJIT `-joff`'s ~117, and `perf annotate` blames
 spill traffic rather than dispatch: **25.16% of its samples are stack-slot loads/stores**, with
@@ -1571,14 +1571,14 @@ So the hoists are not excess baggage -- every one of them is load-bearing, and t
 most redundant (`functions`, used only by `lbl_call`; `raw_*`, used by 18 of 153 labels) are the only
 ones where un-hoisting is even arguable. **This closes the "reduce what we pin" line of enquiry.**
 
-Together with 5.16e attempt 4 and 5.16h, that is four independent attempts. The pattern is now firm
+Together with 5.21 attempt 4 and 5.24, that is four independent attempts. The pattern is now firm
 enough to state as a rule: **in `vm_run_slice`, removing work and freeing registers are not the same
 as going faster.** Any edit reshuffles allocation across all 153 labels, and the reshuffle routinely
 outweighs the work removed -- in both directions, unpredictably. Micro-editing this function is a
-lottery; the productive changes have all been *addressing* changes (5.16e's power-of-two frame,
-5.10's struct layout) or work removed *outside* it (5.16o's key scan, 5.16n's string search).
+lottery; the productive changes have all been *addressing* changes (5.21's power-of-two frame,
+5.10's struct layout) or work removed *outside* it (5.31's key scan, 5.30's string search).
 
-### 5.16r The compute-bound gap is codegen, not the VM
+### 5.34 The compute-bound gap is codegen, not the VM
 
 Against LuaJIT `-joff` in instructions: `fib` 1.99x, but `nbody` **1.04x** and `mandelbrot`
 **1.05x** -- and on those two AER uses *fewer* cycles (nbody 5.56B vs 6.41B, mandelbrot 4.62B vs
@@ -1658,7 +1658,7 @@ packed-array parameter, so it never gets one. Both prior attempts at unboxing nu
 measured on `fib`, which unboxes nothing useful -- 12.1% of `mandelbrot`'s dispatches say that was
 the wrong benchmark to judge it on.
 
-### 5.16s Dispatch is eight instructions, and three of them do no work
+### 5.35 Dispatch is eight instructions, and three of them do no work
 
 Disassembling the tail of any label body gives the same eight:
 
@@ -1690,16 +1690,16 @@ single biggest line item anywhere in this document.
 | sieve | 6.313B | 6.495B | **-2.80%** |
 | fib_bench | 6.814B | 6.979B | **-2.36%** |
 
-That is consistent with 5.16g's older 0.3-4.3% range but now has a mechanism behind it rather than
+That is consistent with 5.23's older 0.3-4.3% range but now has a mechanism behind it rather than
 just a number: position-independent code cannot keep a static table's address as a link-time
-constant, and the register allocator (5.16q) has nothing spare to cache it in, so it is rebuilt
+constant, and the register allocator (5.33) has nothing spare to cache it in, so it is rebuilt
 per dispatch.
 
 `orr.w r3, r3, #1` **survives in the non-PIE build**, so the Thumb-bit fixup is not a PIC artifact --
 it is how GCC materialises `&&label` addresses on Thumb-2, and C offers no way to pre-set it in the
 table.
 
-**This is a decision, not a fix.** 5.16g declined non-PIE on fairness, and that argument is
+**This is a decision, not a fix.** 5.23 declined non-PIE on fairness, and that argument is
 unchanged: LuaJIT and Luau on the test machine are both `pie executable`, so a non-PIE AER would win
 comparisons partly on build flags. The two questions are separable, and only the second is
 technical:
@@ -1710,13 +1710,13 @@ technical:
 **Would removing rarely-used opcodes help?** Reasoned, not measured: no. Computed-goto replicates the
 dispatch sequence at every label, so the BTB cost is set by the number of *hot* dispatch sites, which
 deleting cold opcodes does not change. It would shrink code size, and 5.16 already measured that
-interpreter code size is not an icache problem here. 5.16d's finding that *adding* opcodes hurts is
+interpreter code size is not an icache problem here. 5.20's finding that *adding* opcodes hurts is
 about the new label bodies competing for prediction resources, which does not run in reverse for
 opcodes that never execute.
 
-### 5.16t Pinning the dispatch base: the largest win measured here, and why it is reverted
+### 5.36 Pinning the dispatch base: the largest win measured here, and why it is reverted
 
-5.16s identified two of dispatch's eight instructions as rebuilding the table's base from `pc`
+5.35 identified two of dispatch's eight instructions as rebuilding the table's base from `pc`
 because no register was free to cache it. Giving GCC one explicitly --
 `register const void* const* aer_dispatch_base asm("r8")`, chosen because r8 is callee-saved under
 AAPCS -- removed exactly those two instructions. The disassembly confirms it: dispatch became
@@ -1773,7 +1773,7 @@ would keep the base itself if simply asked, or if given room:
 
 Freeing a register changed **nothing** -- the two rows are the same measurement. GCC does not spend a
 freed register on the dispatch base; it had already decided, and naming `dtb` only forces the base
-live at the cost of whatever `mandelbrot`'s hot loop wanted more. This is 5.16q's rule again, and it
+live at the cost of whatever `mandelbrot`'s hot loop wanted more. This is 5.33's rule again, and it
 rules out the polite version of the fix: the win is only available by *taking* a register, not by
 asking for one or making space.
 
@@ -1829,13 +1829,13 @@ billions of iterations. `bench/compile_bound.aer` (6600 lines of declarations, a
 work) makes parsing the dominant term instead, and across the pin it measures **-0.00%**. The
 regressions are specific to hashing and allocation, not general to the front end.
 
-**On fairness**, since 5.16g rejected `-no-pie` on exactly that ground: this is a different kind of
+**On fairness**, since 5.23 rejected `-no-pie` on exactly that ground: this is a different kind of
 change. `-no-pie` alters the shipped binary's security properties, and the interpreters compared
 against ship PIE. `-ffixed-r8` is an implementation choice about AER's own source; the binary stays
 PIE. Pinning interpreter state in fixed registers is standard practice -- LuaJIT pins four
 (`BASE`, `PC`, `DISPATCH`, `KBASE`) by writing its interpreter in assembly. This pins one, from C.
 
-### 5.16u The range-for counter, and why the loop variable stays boxed
+### 5.37 The range-for counter, and why the loop variable stays boxed
 
 `for i in 1..100000000: total += i` compiles `total` into a raw unboxed slot but leaves `i` in an
 ordinary tagged register, so the body uses `OP_RAW_ADD_INT_BOXED` — a tag check per iteration. The
@@ -1848,7 +1848,7 @@ a constant and has no third case. So a raw loop variable would emit an `OP_BOX_I
 `a[i]` and simultaneously forfeit the bounds-proof elision of §5.15 — trading one predictable tag
 check for a whole extra dispatch plus a restored runtime bounds check, on exactly the array-scanning
 loops (`sieve`, `struct_array_scan`, `nbody`) the change was meant to help. Making it pay would mean
-raw-index variants of the whole index-get/set family, which §5.16d already measured as a losing
+raw-index variants of the whole index-get/set family, which §5.20 already measured as a losing
 trade. The tag check stays.
 
 What was actually costing something sat one level up, in `OP_ITER_RANGE_LOOP` itself. It maintained
@@ -1880,14 +1880,14 @@ Instructions, Pi, `--runs 3`:
 | everything else | within ±0.05% |
 
 On cycles `sieve` confirms at -3.1 to -3.9%. `nbody` first read +2.28% and then +0.69% on a repeat,
-which is the §5.16p noise floor talking, not a result — a reminder that a single cycle sample is
+which is the §5.32 noise floor talking, not a result — a reminder that a single cycle sample is
 still not evidence even at seven runs.
 
-### 5.16v The pinning matrix: r8 is the only one worth having
+### 5.38 The pinning matrix: r8 is the only one worth having
 
-5.16t pinned the dispatch base in `r8` and closed with the open question of whether LuaJIT's other
+5.36 pinned the dispatch base in `r8` and closed with the open question of whether LuaJIT's other
 three (`BASE`, `KBASE`, `PC`) were worth the same treatment. They are not. Every remaining
-candidate was built and measured, alone and in combination, since 5.16q established that freeing
+candidate was built and measured, alone and in combination, since 5.33 established that freeing
 registers is not additive — the allocator's response to two reservations is not the sum of its
 response to each.
 
@@ -1957,7 +1957,7 @@ measured. The table above it shows the same value as an *addition* to r8 costing
 true: the base pin is worth roughly nothing either way, and the dispatch pin is worth 1.72%, so
 trading one for the other loses the difference.
 
-**Re-measured after 5.16w**, since merging `code` and `ip` into one pointer removed a live value
+**Re-measured after 5.39**, since merging `code` and `ip` into one pointer removed a live value
 from the hot path and could have made a second reservation affordable:
 
 | variant | nbody | sieve | mandel | fib | dict | log | struct_scan | mean |
@@ -1972,7 +1972,7 @@ The occupant question is settled twice over: `r8` holds the dispatch base, and g
 instead costs +2.56%. The *second* pin question did move -- `pc` in r4 is -0.66% where the best
 addition before was +0.14%.
 
-Re-measured again after 5.16x's hoist, which changes the instruction mix these depend on:
+Re-measured again after 5.40's hoist, which changes the instruction mix these depend on:
 
 | variant | nbody | sieve | mandel | fib | dict | log | struct_scan | mean |
 |---|---|---|---|---|---|---|---|---|
@@ -1989,7 +1989,7 @@ hashing/allocation side. Neither is free -- both reserve a register program-wide
 **Both declined.** A -0.5% mean is thin payment for a permanent program-wide reservation, and the
 same precedent that reverted PGO, SSO twice and `OP_MOD_POW2_INT` applies to a trade this shaped.
 The stronger reason is that pinning treats the symptom: the allocator spills `raw_reals` because the
-live set exceeds the register file, and 5.16ya has since shown that *shrinking the live set* helps
+live set exceeds the register file, and 5.42 has since shown that *shrinking the live set* helps
 broadly where reserving a register helps narrowly and costs everywhere. Reserving a register now
 would also make the next live-set reduction harder to evaluate, since it would be measured against
 an artificially constrained allocator. Revisit only if a live-set reduction stops being available.
@@ -1998,13 +1998,13 @@ an artificially constrained allocator. Revisit only if a live-set reduction stop
 argument register under both Win64 and System V -- clobbered by every libc call -- so the ARM
 register would be the wrong one anyway; a pin would have to use `rbx` or `r12`-`r15`. More to the
 point, nothing needs pinning: x86-64 has a memory-indirect jump, so dispatch compiles to
-`jmp *(%rbx,%rax,8)` with the table base already resident and no Thumb-bit fixup. The 5.16s problem
+`jmp *(%rbx,%rax,8)` with the table base already resident and no Thumb-bit fixup. The 5.35 problem
 -- rebuilding a PIC table base every dispatch, on a machine with no spare register to cache it in --
 is an ARM32 problem, which is why the pin is `#if defined(__arm__)` and why it needs no counterpart.
 
-### 5.16w The program counter is a pointer: dispatch is five instructions
+### 5.39 The program counter is a pointer: dispatch is five instructions
 
-5.16s measured dispatch at eight instructions, three of which did no work, and 5.16t's `r8` pin
+5.35 measured dispatch at eight instructions, three of which did no work, and 5.36's `r8` pin
 removed two of them. Re-disassembling afterwards showed seven, not six -- the pin had also pushed
 `code` out of a register and onto the stack, so every dispatch now began by reloading it:
 
@@ -2018,7 +2018,7 @@ orr.w  r3, r3, #1
 bx     r3
 ```
 
-Giving `code` a register of its own does not fix this: 5.16v measured pinning it at **+2.38%**, worse
+Giving `code` a register of its own does not fix this: 5.38 measured pinning it at **+2.38%**, worse
 than reserving nothing. The register budget cannot afford a fourth resident.
 
 The fix is to stop needing two values. `ip` was an offset into `code`, so every fetch had to
@@ -2058,7 +2058,7 @@ Cycles agree and in one case exceed it: `struct_array_scan` -8.13%, `sieve` -3.8
 -2.14%, `nbody` -1.81%. The fuzzer is incidental corroboration -- the four runs that previously hit
 its 30-second wall-clock backstop now finish inside it.
 
-### 5.16x Hoisting loop-invariant raw constants, and what the preheader costs
+### 5.40 Hoisting loop-invariant raw constants, and what the preheader costs
 
 A literal used inside a loop is re-materialised into a raw slot every iteration, because the slot it
 lands in is clobbered by whatever consumes it. `mandelbrot` reloaded `2.0` and `1` 24.9M times each;
@@ -2104,16 +2104,16 @@ single most common loop constant, the increment. The gate was rejected: it buys 
 making an optimisation silently unavailable in one loop form, which is a permanent behavioural wart
 standing in for a fixable implementation limit.
 
-**The fix is exact-size insertion, and 5.16w just made it reachable.** The skip-jump exists only
+**The fix is exact-size insertion, and 5.39 just made it reachable.** The skip-jump exists only
 because the gap is reserved before its size is known. Inserting exactly the right number of words
 instead would require moving the loop body, which absolute jump targets forbid -- but the program
 counter is now a pointer, which is the precondition for PC-relative jumps. Relative jumps make a
 loop body position-independent, which makes exact-size preheader insertion a memmove, and shrinks
 the jump encoding as a side effect. That is the path forward, not a wider gap.
 
-### 5.16y PC-relative jumps: built, measured, reverted -- and the clearest lottery evidence yet
+### 5.41 PC-relative jumps: built, measured, reverted -- and the clearest lottery evidence yet
 
-5.16w removed the `code` rebuild from *dispatch*, but every taken branch still did `pc = code +
+5.39 removed the `code` rebuild from *dispatch*, but every taken branch still did `pc = code +
 target`, and `code` is spilled -- so each branch paid a stack reload. Making control-flow targets
 signed deltas from the word after the operand turns that into `pc += delta`, removing the reload
 outright. The prediction was a win on anything branch-heavy: `sieve` is 56% loop control, `fib_bench`
@@ -2155,19 +2155,19 @@ read-modify-write, which keeps `pc` live across every branch. Meanwhile `code` w
 added a liveness constraint without removing a value, and in a function where 153 label bodies share
 one register file, that cost more than the load it deleted.
 
-This is worth more than the -0.87% it cost, because it names something 5.16q could only describe as
+This is worth more than the -0.87% it cost, because it names something 5.33 could only describe as
 a lottery: **removing an instruction from a hot path is not the same as removing a value from the
 live set, and only the second reliably helps here.**
 
 Reverted. The secondary motivations do not carry it either: relative jumps would make loop bodies
-relocatable and so allow the exact-size preheader 5.16x wants, but that is worth `nbody`'s +0.55% on
+relocatable and so allow the exact-size preheader 5.40 wants, but that is worth `nbody`'s +0.55% on
 one benchmark, against +0.87% and +0.53% here. A smaller jump encoding remains a real future prize,
 since deltas are small enough to pack into word0 -- but that is a *different* change, and it must be
 justified by the packing, not by the addressing.
 
-### 5.16ya The same change, landed: relative jumps paired with a pointer-valued error PC
+### 5.42 The same change, landed: relative jumps paired with a pointer-valued error PC
 
-5.16y's post-mortem named the defect precisely enough to fix it. Relative jumps added liveness --
+5.41's post-mortem named the defect precisely enough to fix it. Relative jumps added liveness --
 `pc += delta` is a read-modify-write where `pc = code + target` was a pure write -- without removing
 a value, because `SYNC_IP` still needed `code` for `vm->ip = pc - code` at 21 sites. Removing an
 instruction from a hot path is not the same as removing a value from the live set.
@@ -2184,7 +2184,7 @@ With both halves, `code` drops from ~312 references to ~10, all cold:
 | build | `vm_run_slice` instructions | `ldr [sp]` sites |
 |---|---|---|
 | before | 13453 | 972 |
-| relative jumps alone (5.16y) | 13483 | 1064 |
+| relative jumps alone (5.41) | 13483 | 1064 |
 | **both together** | **13070** | **922** |
 
 The identical jump change that regressed six benchmarks now improves eight of eleven:
@@ -2209,7 +2209,7 @@ premise was a misreading: that is a DWARF *location* for a parameter live only n
 other locals read "optimized out" because they have location *lists*, not because they are absent.
 Going below 922 needs those lists decoded properly, not inferred from a summary line.
 
-### 5.16yb The call path, and a multiply hiding in every call
+### 5.43 The call path, and a multiply hiding in every call
 
 `fib_bench` is 44.4% `OP_CALL` + `OP_RETURN` and is the only benchmark that loses to LuaJIT `-joff`
 on *both* platforms by the same margin (0.72x on ARM, 0.69x on x86-64) -- every other benchmark
@@ -2237,7 +2237,7 @@ and the scale never varies. `emit_call` now emits a byte offset instead, and bot
 | `binary_trees` | -0.11% | | | |
 
 Exactly the shape the change predicts: it touches call-heavy code and nothing else. It also recovers
-`fib_bench`'s +0.44% from 5.16ya precisely (6.874B -> 6.844B, its pre-5.16ya figure), so the two
+`fib_bench`'s +0.44% from 5.42 precisely (6.874B -> 6.844B, its pre-5.42 figure), so the two
 changes together improve eight benchmarks and regress none.
 
 **A cache with no reader.** The `VM` struct mirrored the active frame's `registers`/`raw_ints`/
@@ -2276,7 +2276,7 @@ overlaps the windows so the arguments are already in place and the copy disappea
 change most likely to matter for `fib_bench`, and also the one that touches frame layout, GC root
 ranges and the parser's register allocation at once.
 
-### 5.16yc Shrinking ChunkFunction 328 -> 60 bytes: reverted, then taken once measurable
+### 5.44 Shrinking ChunkFunction 328 -> 60 bytes: reverted, then taken once measurable
 
 `SpecEntry specializations[SPEC_MAX]` is 272 of `ChunkFunction`'s 328 bytes -- **83% of the struct**
 -- for a table most functions never use, since only a shape-sensitive parameter triggers
@@ -2290,7 +2290,7 @@ counters refuted that -- cache-misses *fell*, 80,384 to 71,720, on a benchmark w
 five bodies. The cost was branch mispredictions, 13.5M to 45.7M, and the rule applied was: reject a
 change whose instructions show no work removed, whichever way its cycle luck fell.
 
-**The rule was right and the measurement was noise.** 5.16yd then measured the layout band and 5.16yh
+**The rule was right and the measurement was noise.** 5.45 then measured the layout band and 5.50
 found A32. Re-measured against both, the same change reads:
 
 | | `nbody` | `mandelbrot` | `fib_bench` | `sieve` | `binary_trees` |
@@ -2309,7 +2309,7 @@ Instructions remain neutral everywhere (+0.00% to +0.04%).
 because 83% of a struct devoted to a table most instances never allocate is worse code, and the only
 evidence against it turned out to be an artifact of the noisiest measurement in this document.
 
-### 5.16yd How big the layout lottery actually is: measured, and it is enormous
+### 5.45 How big the layout lottery actually is: measured, and it is enormous
 
 That whole argument rested on an unmeasured "several percent". `tools/layout_sweep.py` measures it:
 it builds the *same commit* at several code offsets (`-DAER_LAYOUT_PAD=N`, which shifts every
@@ -2327,7 +2327,7 @@ Five layouts, `HEAD` against itself:
 
 `mandelbrot`'s cycle count varies by a quarter on identical code. Any single-build cycle comparison
 on it is meaningless, and some numbers quoted earlier in this document sit inside their benchmark's
-band: 5.16yb's `fib_bench` -5.7% is smaller than fib's own 5.84% lottery, so it is not evidence that
+band: 5.43's `fib_bench` -5.7% is smaller than fib's own 5.84% lottery, so it is not evidence that
 change helped on cycles -- its -0.43% on *instructions* is the real result. `sieve` -3.86% and
 `binary_trees` movements above ~1% are well outside their bands and can be trusted.
 
@@ -2335,10 +2335,10 @@ change helped on cycles -- its -0.43% on *instructions* is the real result. `sie
 move; `mandelbrot` moves 25%. The plausible reason is how concentrated the hot loop's opcode mix is:
 a loop cycling a handful of dispatch sites lives or dies on whether those few collide in the
 predictor, while a loop spread across many sites averages its own luck out. That also explains why
-5.16d's "adding an opcode taxes everything" and 5.16q's "register allocation lottery" were both real
+5.20's "adding an opcode taxes everything" and 5.33's "register allocation lottery" were both real
 observations of one underlying effect that neither could pin down from a single build.
 
-Practical consequences, superseding the cycle guidance in 5.16p:
+Practical consequences, superseding the cycle guidance in 5.32:
 
 - **Instructions remain the gate.** Near-immunity to layout is why they are trustworthy, not a
   limitation.
@@ -2351,7 +2351,7 @@ Practical consequences, superseding the cycle guidance in 5.16p:
 like the obvious win. It has been built twice and reverted twice. This time it was costed before
 being built, and the arithmetic explains both earlier failures without needing a third.
 
-The working hypothesis was that 5.16x's hoist would rescue it: attempt 2's post-mortem blamed
+The working hypothesis was that 5.40's hoist would rescue it: attempt 2's post-mortem blamed
 compared constants being raw-materialised once a parameter went raw, which defeats compare-and-branch
 fusion, and a hoisted constant costs one load per loop entry instead of one per iteration. **The
 hypothesis is wrong on both halves.** The parser has kept compared literals boxed since 2026-08-02
@@ -2380,7 +2380,7 @@ records them as measured earning nothing -- but that measurement was taken in a 
 nothing *produces* raw-vs-raw comparisons, because parameters stay boxed. Each change is worthless
 alone and they have only ever been evaluated alone. A fourth attempt should build both or neither.
 
-### 5.16aa Loop-invariant raw constants are worth hoisting; the dead copies are not
+### 5.46 Loop-invariant raw constants are worth hoisting; the dead copies are not
 
 `mandelbrot`'s inner loop spends 4 of its 14 dispatches on work that does nothing:
 
@@ -2430,7 +2430,7 @@ of them.
 
 Two routes were weighed. Immediate-operand opcodes (`OP_RAW_ADD_INT_K` and friends) fold the
 constant into the arithmetic instruction and need no analysis at all, but spend opcode surface,
-which 5.16d measured as a real branch-misprediction tax on every program whether it uses them or
+which 5.20 measured as a real branch-misprediction tax on every program whether it uses them or
 not — the same trade `OP_MOD_POW2_INT` was reverted for. A post-emit hoist costs no dispatch
 surface but makes the parser decode instructions it did not just emit, which means a fourth source
 of truth about instruction encoding alongside `emit_*`, the VM labels, and `disasm.c`. The first
@@ -2439,9 +2439,9 @@ restricting the pass to the raw-slot opcode family and bailing out of any loop c
 outside it, with a generated coverage check so a newly added opcode cannot silently fall outside
 the table.
 
-### 5.16ye One dispatch site or 153: measured, and the answer is per-benchmark
+### 5.47 One dispatch site or 153: measured, and the answer is per-benchmark
 
-5.16yd showed cycles are dominated by mispredictions on the computed-goto dispatch, and that
+5.45 showed cycles are dominated by mispredictions on the computed-goto dispatch, and that
 `mandelbrot` swings 25% on layout alone. The obvious lever is the *number* of dispatch sites:
 `DISPATCH()` expands at the end of every handler, so ~153 indirect branches compete for a
 Cortex-A72's finite indirect-predictor entries. `-DAER_SHARED_DISPATCH` builds the opposite endpoint
@@ -2474,7 +2474,7 @@ measurement, but this data says not to expect it to fix the benchmark that needs
 The knob stays as opt-in measurement tooling, never part of a normal build, on the same footing as
 `make pgo` and `debug-tools`.
 
-### 5.16yf A use-after-free found by reading the call path, not by a test
+### 5.48 A use-after-free found by reading the call path, not by a test
 
 `vm_run_slice` hoists `c->pool` into `const_pool`, and a shape-specializing recompile runs the
 parser again while that local is live. `lbl_call` already refreshed `code` and `functions` across
@@ -2516,7 +2516,7 @@ Worth noting how this surfaced: not from a failing test, but from reading `lbl_c
 for something else and asking why one hoisted pointer was refreshed and another was not. The
 comment next to the refresh said "can realloc both", and *both* was the bug.
 
-### 5.16yg Outlining cold handlers, and what code alignment actually buys
+### 5.49 Outlining cold handlers, and what code alignment actually buys
 
 If mispredictions come from dispatch sites aliasing, the tempting fix is to shrink the code between
 them -- outline the ~130 cold opcode bodies so the hot ones pack together. Two cheaper experiments
@@ -2543,7 +2543,7 @@ from cold. Manual outlining would be the only route, and this says nothing else 
 (3.67-3.68B against a 3.885-3.914B spread). That is a genuine effect on call-heavy code, and it cost
 402 instructions of padding to get. Everything loop-heavy pays for it.
 
-**Declined as a default**, on the same footing as PGO and the register pins in 5.16v: a concentrated
+**Declined as a default**, on the same footing as PGO and the register pins in 5.38: a concentrated
 win against broad small losses, on a knob any user with a call-heavy workload can set themselves.
 Recorded rather than deleted so it is not re-derived.
 
@@ -2555,9 +2555,9 @@ expect a different distribution. The only lever measured so far that reduces mis
 unconditionally is reducing the NUMBER of dispatches, which is what fusion, the constant hoist and
 the range-loop work already do.
 
-### 5.16yh The Thumb-bit fixup was not irreducible -- it was Thumb
+### 5.50 The Thumb-bit fixup was not irreducible -- it was Thumb
 
-5.16s catalogued dispatch as eight instructions, three doing no work, and called the Thumb-bit
+5.35 catalogued dispatch as eight instructions, three doing no work, and called the Thumb-bit
 `orr r3, r3, #1` unfixable: it survives a non-PIE build, so it is not a PIC artifact, and C offers no
 way to pre-set bit 0 in a table of `&&label` values. Every later entry repeated that. The word doing
 the work in "irreducible" was doing too much: it is irreducible *within Thumb-2*.
@@ -2583,7 +2583,7 @@ own layout band is 25.58% and a single -27% reading would sit inside it: `mandel
 consistent loser at +0.12%, +3.95%, +0.79%. The A32 builds are also far more stable
 (`mandelbrot` 3.60-3.74B against Thumb-2's 4.94-5.03B).
 
-`mandelbrot` losing **97% of its branch mispredictions** is the same fact 5.16ye and 5.16yd kept
+`mandelbrot` losing **97% of its branch mispredictions** is the same fact 5.47 and 5.45 kept
 circling. Its hot loop cycles a handful of dispatch sites that alias destructively in Thumb-2, where
 instruction lengths vary and site addresses land unevenly; A32's uniform 4-byte encoding spreads them
 predictably and the collisions stop. That also explains why the benchmark with the widest layout band
@@ -2597,9 +2597,9 @@ because most of this binary is one enormous function whose Thumb-2 encoding was 
 machine it is copied to, and A32 does not exist on Cortex-M. It is safe on every `arm-linux-gnueabihf`
 target, where it is the single largest win in this section. Build with `make ARCH_FLAGS=-marm`.
 
-### 5.16yi Is -marm fair, and is there an x86-64 equivalent? Both answered by rebuilding
+### 5.51 Is -marm fair, and is there an x86-64 equivalent? Both answered by rebuilding
 
-5.16g rejected `-no-pie` on fairness, so `-marm` deserved the same scrutiny rather than an
+5.23 rejected `-no-pie` on fairness, so `-marm` deserved the same scrutiny rather than an
 assertion. It could not be settled by inspecting the distro binaries -- they are stripped, and three
 successive tells each measured something else: the ELF entry point reports the C runtime (Thumb on
 armhf even in an A32 build), conditional-suffix counts match Thumb IT-blocks too, and `ldr pc, [...]`
@@ -2645,9 +2645,9 @@ universal default: on ARM it is mixed (`nbody` -2.44% but `fib_bench` +0.47%, `s
 One incidental finding worth more than either flag: **the layout lottery is an ARM problem.** The same
 sweep that moves `mandelbrot` 25.58% on ARM moves it 1.1% on x86-64 (0.609-0.616s across three
 offsets). A larger BTB and better indirect prediction absorb what ARM's cannot -- which is why
-5.16yd's warning about single-build cycle comparisons applies to the Pi and not to the desktop.
+5.45's warning about single-build cycle comparisons applies to the Pi and not to the desktop.
 
-### 5.16yj Every struct construction was doing a linear scan with strcmp
+### 5.52 Every struct construction was doing a linear scan with strcmp
 
 `binary_trees` sits at 0.86x against LuaJIT `-joff`, and a whole session of dispatch and call-path
 work never touched it -- its dispatch share is 6.1%, so all of that aimed at the wrong 6%. Profiling
@@ -2691,7 +2691,7 @@ money is in the handlers.
 *cold* path and split out with `noinline` for exactly that reason, so 6.63% means it is not cold at
 all for struct-passing code.
 
-### 5.16yk Struct construction wrote its fields the slow way
+### 5.53 Struct construction wrote its fields the slow way
 
 Next entry down the same profile: `vm_struct_field_write` at 8.19% of `bench/binary_trees.aer`.
 `lbl_struct_new` called it once per field of every construction, and it is an *externally linked*
@@ -2713,7 +2713,7 @@ field were re-deriving something it had in a register.
 | `struct_array_scan` | **-2.84%** |
 | everything else | within ±0.08% |
 
-### 5.16yl A major collection was walking the whole heap twice
+### 5.54 A major collection was walking the whole heap twice
 
 `gc_count_live_cells` walks every cell of every slab of every pool to size the next minor threshold.
 `gc_run_collection_cycle` called it immediately after a major — and a major sweep *already* visits
@@ -2747,7 +2747,7 @@ counter needs far more runs than instructions to resolve anything; do not quote 
 and the memory-ceiling check after a *minor* (a minor deliberately never inspects old cells, so it
 cannot produce a whole-heap count).
 
-### 5.16ym Prefetching the sweep walk did nothing, and the reason generalizes
+### 5.55 Prefetching the sweep walk did nothing, and the reason generalizes
 
 With the redundant walk gone, `gc_collect` is 9.65% of `binary_trees` and **63% of that sits on two
 instructions** — the `*state & POOL_FREE` load in `pool_sweep`'s major branch (46.5%) and in its
@@ -2777,9 +2777,9 @@ needs O(1) state from a bare pointer, which a side table only gives back via a
 `(ptr - slab_base) / stride` division on a non-power-of-2 stride. The in-cell byte is what makes the
 *barrier* cheap, and the barrier runs far more often than the sweep.
 
-### 5.16yn The same prefetch, on a serial chain, does work
+### 5.56 The same prefetch, on a serial chain, does work
 
-5.16ym's test predicted where prefetching *would* pay: a chain the hardware cannot overlap with
+5.55's test predicted where prefetching *would* pay: a chain the hardware cannot overlap with
 itself. `pool_alloc` is that shape. It pops a cell and immediately reads that cell's next-pointer to
 re-head the free list — and a free cell has been untouched since the sweep that freed it, so the
 walk is `head -> next -> next`, one exposed miss per allocation. perf puts **61% of `pool_alloc` on
@@ -2810,7 +2810,7 @@ So the win is narrow and real: the allocation-heavy benchmark, and nothing else 
 direction. Kept because +0.25% instructions buys -1.4% cycles where allocation dominates, and costs
 no measured cycles anywhere else.
 
-### 5.16yo What a call actually costs, measured rather than inferred
+### 5.57 What a call actually costs, measured rather than inferred
 
 Dividing a benchmark's instructions by its dispatch count needs an assumed cost for every *other*
 opcode, and that assumption silently carries the whole answer — it produced a "150-180 instructions
@@ -2870,7 +2870,7 @@ single 16-byte move it makes at arity 1 — both still open.
 
 Worth recording the measurement trap: on x86-64 wall-clock this read `dict_bench` **+9.09%**, well
 outside its 2.97% layout band, which looked like a real regression. Instructions -- immune to both
-layout and machine drift -- say -0.00%. The x86 bands from 5.16yd bound *layout* variance, not
+layout and machine drift -- say -0.00%. The x86 bands from 5.45 bound *layout* variance, not
 background load, and a 9-run minimum did not filter it. Instructions remain the gate on both
 platforms; the x86 laboratory is better than ARM's, not perfect.
 
@@ -2878,7 +2878,7 @@ Both wins in this section came from the same place: a hot loop calling a general
 re-derives what the caller already knows. Neither is exotic, and neither is in the dispatch path
 that most of section 5.16 is about.
 
-### 5.16yq The idiomatic loop form is 15.9% slower, and what actually blocks the fix
+### 5.58 The idiomatic loop form is 15.9% slower, and what actually blocks the fix
 
 `for i in 0..n` compiles its body to the generic opcodes while the hand-written `i = 0; for i < n`
 gets the unchecked ones, because the parser does not know the range variable's type. Measured on
@@ -2932,9 +2932,9 @@ range-for variable. The two reverted attempts (`11afae9`, `f057a43`) hold the pa
 Both attempts are in the history (`11afae9`, `f057a43`) with their reverts; the parser change itself
 is correct and reusable, and only the index-family decision is missing.
 
-### 5.16yr The tag store cost 8% of mandelbrot on x86, and what it took to stop paying it
+### 5.59 The tag store cost 8% of mandelbrot on x86, and what it took to stop paying it
 
-The merged register file (5.16f) made every unchecked arithmetic opcode write a tag alongside its
+The merged register file (5.22) made every unchecked arithmetic opcode write a tag alongside its
 payload. Measured on **Windows x86-64, min-of-7 wall clock**, across the whole migration:
 
 | regressed | | improved | |
@@ -3007,7 +3007,7 @@ the gap is never written, tagged or traced, so frame entry and the collector cos
 before, and nbody's +8.64% becomes -1.35%.
 
 Final, median over an 8-build layout ensemble (a single build swings +-6% here, which is larger than
-the effect -- see 5.16yd): mandelbrot **-6.15%**, typed_array_bench -2.05%, nbody_large_packed
+the effect -- see 5.45): mandelbrot **-6.15%**, typed_array_bench -2.05%, nbody_large_packed
 -1.64%, nbody -1.35%, fib_bench -3.16%. The isolated effect of the tag store alone, holding the
 allocator constant, is -5.3% on mandelbrot and -5.1% on nbody_large_packed, against a control group
 of benchmarks that never execute those opcodes at **+0.07%** -- which is what makes the rest of the
@@ -3026,7 +3026,7 @@ if-branch not running on the other path; a specialization recompile inheriting t
 table; a call's destination replacing the tag without passing through `reg_alloc` again; and
 `OP_RAW_INT_TO_REAL` silently changing a slot's kind.
 
-### 5.16yp NaN boxing, including the narrow "just the pointers" version
+### 5.60 NaN boxing, including the narrow "just the pointers" version
 
 Raised again once the register file became one array of tagged 16-byte `AerVal`s: the tag is 4 bytes
 plus 4 of padding, pointer values never need to be read as integers, and pointers are pool-allocated
@@ -3038,23 +3038,23 @@ representation section above). The corpus exercises the range for real (`9223372
 `18446744073709550`, `140737488355328`), and `<<`/`&` push values into the high bits deliberately.
 NaN boxing offers roughly 48-52 payload bits, so going back means either heap-allocating large
 integers -- an allocation inside the arithmetic path -- or keeping a second untagged integer world,
-which is exactly the split 5.16f removed. It was also measured as a loss on the way out: -11.2%
+which is exactly the split 5.22 removed. It was also measured as a loss on the way out: -11.2%
 instructions on `nbody` and -3.3x cache misses, moving away from it.
 
 **Narrowing only the pointers saves nothing, and this is the more interesting half.** A slot's width
 is set by its *largest* case. Every slot stays 16 bytes for the int64/double case whether or not a
 pointer could fit in 8, so encoding pointers more cleverly frees no memory at all. It would pay only
 if pointer-typed values lived in a different array from numeric ones -- which is, again, the split
-5.16f removed. The same reasoning applies to `AerArray`'s payload: a general array's elements must be
+5.22 removed. The same reasoning applies to `AerArray`'s payload: a general array's elements must be
 16 bytes because the array can hold anything, and the case where they need not be already has its own
 mechanism (typed and packed arrays).
 
 The instinct behind the question is still right, though: the tag genuinely is dead weight on values
 whose type the compiler already knows. It just cashes out in *time* rather than *space* -- write the
-tag once per slot instead of on every unchecked write, which is what `mandelbrot`'s +3.64% in 5.16f
+tag once per slot instead of on every unchecked write, which is what `mandelbrot`'s +3.64% in 5.22
 is waiting on.
 
-### 5.17 String interning would not fix the dict benchmarks (measured, not built)
+### 5.61 String interning would not fix the dict benchmarks (measured, not built)
 
 Lua interns short strings, so a table lookup's key comparison is a pointer compare rather than a
 hash plus `memcmp`. AER does not intern, which makes interning the obvious explanation for

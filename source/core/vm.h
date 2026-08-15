@@ -471,7 +471,7 @@ static inline uint16_t pack_rk16(int rk) {
    index, so the spare high bits carry a flag. GUARD_NONNEG means this loop's body was compiled
    with UNCHECKED indexing on the strength of a compile-time proof that the start is >= 0
    (Parser.reg_nonneg), so PREP verifies that once here instead of the body checking every index.
-   Only reachable when integer overflow defeated the proof -- see 5.16k. */
+   Only reachable when integer overflow defeated the proof -- see 5.27. */
 #define RANGE_PREP_GUARD_NONNEG 0x80000000u
 #define RANGE_PREP_ITEM_REG(w) ((int)((w) & 0xFFu))
 
@@ -479,7 +479,7 @@ static inline uint16_t pack_rk16(int rk) {
 
 /* Longest interpolated dict key OP_INDEX_GET_INTERP will build without allocating. Anything longer
    falls back to the allocating path -- the buffer lives in a noinline helper's frame, never
-   vm_run_slice's (see 5.16b). */
+   vm_run_slice's (see 5.18). */
 #define INTERP_KEY_MAX 256
 
 #define MAX_STRUCT_FIELDS 16
