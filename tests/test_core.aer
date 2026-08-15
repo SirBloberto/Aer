@@ -287,6 +287,12 @@ assert(string(42) == "42", "integer to string cast")
 # is always `name.function(...)`, so the following '.' is what separates them -- without that test,
 # importing the module made the cast unreachable.
 assert(string.upper("ab") == "AB" and string(7) == "7", "the string module and the string() cast coexist")
+# All four casts are reserved builtin NAMES, not lexer keywords -- one mechanism, so `integer` is a
+# reserved word in exactly the sense `print` is. Binding any of them is an error rather than the
+# silent no-op it used to be: the call site always resolved to the builtin, so the variable a
+# `print = 5` created could never be read back.
+assert(integer(3.7) == 3 and float(2) == 2.0 and boolean(0) == false and string(42) == "42",
+       "the four casts resolve by name, with no reserved token behind them")
 assert(integer(3.7) == 3, "float to integer cast truncates, does not round")
 assert(boolean(0) == false, "0 casts to false")
 assert(boolean(1) == true, "nonzero casts to true")

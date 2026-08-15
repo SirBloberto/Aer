@@ -74,9 +74,6 @@ typedef enum TokenType {
     TOKEN_IMPORT,
 
     /* Reserved type names, unusable as any identifier. `string` is excluded -- it collides with the stdlib `string` module. */
-    TOKEN_TYPE_INTEGER,
-    TOKEN_TYPE_FLOAT,
-    TOKEN_TYPE_BOOLEAN,
 
     TOKEN_COMMA,
     TOKEN_SEMICOLON, /* ;  -- the repeat-literal separator, `[value; count]`, and nothing else */

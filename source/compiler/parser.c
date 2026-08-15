@@ -917,6 +917,13 @@ static int var_slot(Chunk* c, unsigned int name_idx) {
        and an already-local name are exempt. */
     if (report_if_shadowed_global(c, name_idx))
         return -1;
+    /* A reserved name always resolves to its builtin at the call site, so binding one produced a
+       variable that could never be read -- `print = 5` silently did nothing. */
+    if (is_builtin_name(c, name_idx)) {
+        error_at("'%s' is a reserved function name and can't be used as a variable",
+                 aer_as_string(c->pool[name_idx])->data);
+        return -1;
+    }
     /* Checks P.slot_floor, not P.var_count -- P.var_count can lag behind P.slot_floor once a
        for-loop promotes it (see this function's own comment above). */
     if (P.slot_floor >= P.raw_real_next) {
@@ -1992,12 +1999,27 @@ static int parse_string_literal(Chunk* c) {
     return result;
 }
 
-/* Unary operators sit above this in the precedence chain (parse_unary). */
-/* Shared by integer(x)/float(x)/boolean(x)/string(x), replacing what `x as T` used to emit directly
-   (`as` has been removed from the language entirely). Identical codegen either way: box a
-   raw-tracked lhs first (no raw-native cast form exists), then OP_CAST (integer/float/boolean) or
-   OP_UNARY/OP_TO_STR (string, cast_type < 0 --
-   there's no CAST_STRING id since OP_TO_STR already existed as its own opcode before casting did). */
+/* CAST_NONE for any other name. The four casts are ordinary reserved builtin names, not lexer
+   keywords, so this is the only place that spelling is decided. */
+static int cast_type_for_name(AerString* name) {
+    static const struct {
+        const char* word;
+        unsigned int len;
+        int cast;
+    } casts[] = {
+        {"integer", 7, CAST_INTEGER},
+        {"float", 5, CAST_FLOAT},
+        {"boolean", 7, CAST_BOOLEAN},
+        {"string", 6, CAST_STRING},
+    };
+    for (unsigned int i = 0; i < sizeof(casts) / sizeof(*casts); i++)
+        if (name->length == casts[i].len && strncmp(name->data, casts[i].word, casts[i].len) == 0)
+            return casts[i].cast;
+    return CAST_NONE;
+}
+
+/* Shared by all four casts: box a raw-tracked lhs first (no raw-native cast form exists), then
+   OP_CAST, or OP_UNARY/OP_TO_STR for string(), which had its own opcode before casting existed. */
 static int emit_primitive_cast(Chunk* c, int cast_type, int lhs) {
     /* `float(i)` on a raw int is a hardware conversion, not a reason to build an AerVal and tear it
        apart again. Only between the two raw kinds -- a cast from anything else still needs the
@@ -2024,7 +2046,7 @@ static int emit_primitive_cast(Chunk* c, int cast_type, int lhs) {
         lhs = materialize(c, lhs);
         spilled = true;
     }
-    if (cast_type < 0)
+    if (cast_type == CAST_STRING)
         chunk_emit(c, PACK3(OP_UNARY, dest, OP_TO_STR, pack_rk8(lhs)));
     else
         chunk_emit(c, PACK3(OP_CAST, dest, cast_type, pack_rk8(lhs)));
@@ -2033,34 +2055,9 @@ static int emit_primitive_cast(Chunk* c, int cast_type, int lhs) {
     return dest;
 }
 
-/* integer(x)/float(x)/boolean(x) -- TOKEN_TYPE_INTEGER/FLOAT/BOOLEAN are reserved tokens, never
-   identifiers, so they can't go through parse_call's name-based resolution at all; this is the
-   direct equivalent for a primary expression starting with one of them followed by '('. Exactly one
-   argument, enforced by the grammar itself (parse_binary parses one expression, not a list -- a
-   second argument or zero arguments both fall through to a natural "expected ')'"/"expected an
-   expression" error with no extra arity-checking code needed). */
-static int parse_primitive_cast_call(Chunk* c, int cast_type) {
-    lex(); /* consume the type token itself */
-    require(TOKEN_OPEN_PARENTHESE, "expected '(' after type name");
-    int lhs = parse_binary(c, 0);
-    require(TOKEN_CLOSE_PARENTHESE, "expected ')' after cast argument");
-    if (parse_had_error)
-        return 0;
-    return emit_primitive_cast(c, cast_type, lhs);
-}
-
 static int parse_primary_inner(Chunk* c) {
     if (consume(TOKEN_FUNCTION))
         return parse_function_expr(c);
-    /* These 3 reserved tokens have no other valid meaning in primary-expression position now that
-       'as' is gone -- parse_primitive_cast_call's own require(TOKEN_OPEN_PARENTHESE, ...) produces a
-       clear error if '(' doesn't follow, so no 2-token lookahead is needed here. */
-    if (equal(TOKEN_TYPE_INTEGER))
-        return parse_primitive_cast_call(c, CAST_INTEGER);
-    if (equal(TOKEN_TYPE_FLOAT))
-        return parse_primitive_cast_call(c, CAST_FLOAT);
-    if (equal(TOKEN_TYPE_BOOLEAN))
-        return parse_primitive_cast_call(c, CAST_BOOLEAN);
     if (consume(TOKEN_OPEN_PARENTHESE)) {
         int rk = parse_binary(c, 0);
         require(TOKEN_CLOSE_PARENTHESE, "expected ')' after expression");
@@ -2916,6 +2913,13 @@ static const struct {
 /* No indexed/field targets (out of scope). `name` is already consumed by the caller, which
    decided between this, a bare call, and an indexed write via one token of lookahead. */
 static void parse_assignment(Chunk* c, unsigned int name_idx) {
+    /* Checked here rather than in var_slot: the raw-promotion path below registers a name itself and
+       never calls var_slot, so `integer = 5` would slip through. A reserved name always resolves to
+       its builtin at the call site, so binding one made a variable nothing could ever read. */
+    if (is_builtin_name(c, name_idx)) {
+        return error_at("'%s' is a reserved function name and can't be used as a variable",
+                        aer_as_string(c->pool[name_idx])->data);
+    }
     /* Multiple RHS values pack into a real array (OP_ARRAY_NEW); each target reads its own index
        back via OP_INDEX_GET. Targets resolve via var_slot BEFORE the RHS is parsed -- creating a
        variable after a temp is live could hand out that temp's own register. */
@@ -4655,9 +4659,13 @@ static void parse_import(Chunk* c) {
 
 /* Checked against a fixed list, consistent with every other call target resolving at compile
    time. Struct construction is deliberately excluded -- already resolved via is_struct_name. */
+/* Reserved global function names: they always resolve to the builtin, so they cannot be variables
+   either (var_slot rejects them). integer/float/boolean/string are here rather than being reserved
+   lexer tokens -- one mechanism, and three fewer keywords in the language. */
 static bool is_builtin_name(Chunk* c, unsigned int name_idx) {
     AerString* s = aer_as_string(c->pool[name_idx]);
-    static const char* const names[] = {"length", "print", "type", "assert", "panic", "Result"};
+    static const char* const names[] = {"length", "print",  "type",    "assert", "panic",
+                                        "Result", "string", "integer", "float",  "boolean"};
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         size_t len = strlen(names[i]);
         if (s->length == len && strncmp(s->data, names[i], len) == 0)
@@ -4740,18 +4748,16 @@ static unsigned int last_bare_call_end = (unsigned int)-1;
 static unsigned int last_bare_call_start = (unsigned int)-1;
 
 static int parse_call(Chunk* c, unsigned int name_idx) {
-    /* string(x) is a cast (TO_STR), checked before anything else -- matching the exact "immune to
-       shadowing, fixed production, never a name lookup" property `x as string` always had (see
-       emit_primitive_cast's own comment). Not a reserved token like integer/float/boolean (it
-       collides with the stdlib `string` module, so it stayed an ordinary identifier even before),
-       but the parse-time behavior carries over unchanged: exactly one argument, no comma list. */
-    AerString* callee_name = aer_as_string(c->pool[name_idx]);
-    if (callee_name->length == 6 && strncmp(callee_name->data, "string", 6) == 0) {
+    /* The four casts, checked before anything else. Exactly one argument, enforced by the grammar
+       itself: parse_binary parses one expression, so a second argument or none falls through to a
+       natural "expected ')'" rather than needing an arity check here. */
+    int cast_type = cast_type_for_name(aer_as_string(c->pool[name_idx]));
+    if (cast_type != CAST_NONE) {
         int lhs = parse_binary(c, 0);
         require(TOKEN_CLOSE_PARENTHESE, "expected ')' after cast argument");
         if (parse_had_error)
             return 0;
-        return emit_primitive_cast(c, -1, lhs);
+        return emit_primitive_cast(c, cast_type, lhs);
     }
 
     /* Builtins win unconditionally -- length/print/type/assert/panic/Result can never be shadowed. */
@@ -5509,18 +5515,6 @@ static void parse_statement(Chunk* c) {
     if (consume(TOKEN_IMPORT)) {
         parse_import(c);
         return;
-    }
-    {
-        const char* reserved_word = NULL;
-        if (equal(TOKEN_TYPE_INTEGER))
-            reserved_word = "integer";
-        else if (equal(TOKEN_TYPE_FLOAT))
-            reserved_word = "float";
-        else if (equal(TOKEN_TYPE_BOOLEAN))
-            reserved_word = "boolean";
-        if (reserved_word) {
-            return error_at("'%s' is a reserved type name and can't be used as a variable", reserved_word);
-        }
     }
     /* Checked right after the call, alongside the bare-name and field-chain pipe-statement cases
        elsewhere. */

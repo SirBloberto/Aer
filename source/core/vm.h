@@ -461,6 +461,9 @@ static inline uint16_t pack_rk16(int rk) {
 #define CAST_INTEGER 0
 #define CAST_FLOAT 1
 #define CAST_BOOLEAN 2
+/* string() goes to OP_TO_STR rather than OP_CAST, which is why it has no vm_cast case. */
+#define CAST_STRING 3
+#define CAST_NONE (-1)
 
 /* Module, function and builtin ids -- the stdlib's wire identity. */
 #include "aer_abi.h"
