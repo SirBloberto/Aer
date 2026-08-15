@@ -669,8 +669,9 @@ typedef struct {
     double* rawk_d;
     unsigned int rawk_d_count, rawk_d_cap;
 
-    /* name -> pool index, for O(1) string dedup. Owns its keys. */
+    /* name -> pool index, for O(1) string dedup. Owns its keys, and the pools behind them. */
     HashTable name_index;
+    HashPools name_index_pools;
 
     /* Appended to by OP_DEFINE_STRUCT. A redeclare appends rather than replaces, so old Shape
        pointers stay valid; chunk_find_shape searches newest-first. */

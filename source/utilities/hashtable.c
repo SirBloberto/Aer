@@ -387,6 +387,20 @@ void hashtable_clear(HashTable* t) {
     t->count = 0;
 }
 
+/* Frees the slabs behind one owner's pools. Only for a per-owner HashPools whose tables are all
+   already freed -- a VM's own set goes away with its heap instead. */
+void hashtable_pools_free(HashPools* pools) {
+    if (!pools->initialized)
+        return;
+    for (unsigned int i = 0; i < HASH_KEY_TIER_COUNT; i++)
+        pool_destroy(&pools->key_pools[i]);
+    for (unsigned int i = 0; i < HASH_SPARSE_TIER_COUNT; i++)
+        pool_destroy(&pools->sparse_pools[i]);
+    for (unsigned int i = 0; i < HASH_DENSE_TIER_COUNT; i++)
+        pool_destroy(&pools->dense_pools[i]);
+    pools->initialized = false;
+}
+
 void hashtable_free(HashTable* t) {
     HashPools* pools = t->pools;
     hashtable_clear(t);

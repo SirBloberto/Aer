@@ -25,6 +25,7 @@ typedef uint32_t HashValue;
 
 /* Idempotent. */
 void hashtable_pools_init(HashPools* pools);
+void hashtable_pools_free(HashPools* pools);
 
 typedef struct {
     char* key; /* owned; the AerVal payload's heap cells belong to the GC */

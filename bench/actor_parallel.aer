@@ -1,0 +1,28 @@
+import actor
+import collection
+import scheduler
+import time
+
+# Six actors, each with its own VM and heap, doing independent CPU work and sharing nothing. The
+# scheduler interleaves them in slices on ONE OS thread, so this measures the ceiling a parallel
+# scheduler would be lifting: the same total work spread over however many cores are available.
+WORKERS = 6
+ROUNDS = 400
+
+workers = []
+w = 0
+for w < WORKERS:
+    a, err = actor.spawn("bench/actor_worker.aer")
+    if err != null:
+        panic("spawn failed: {err}")
+    collection.append(workers, a)
+    w += 1
+
+start = time.now()
+w = 0
+for w < WORKERS:
+    scheduler.add(workers[w], "work", ROUNDS)
+    w += 1
+scheduler.run()
+dur = time.now() - start
+print("actor_parallel: {WORKERS} actors x {ROUNDS} rounds in {dur}s")

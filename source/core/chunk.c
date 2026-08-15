@@ -7,15 +7,13 @@
 #include "hashtable.h"
 #include "vm.h"
 
-/* Chunk.name_index has no owning VM (a Chunk can conceptually outlive/exist independently of any
-   one VM), so unlike an AerDict -- which gets its key/sparse-array storage from its owning VM's
-   own heap -- every Chunk's name_index shares this single, process-global HashPools instead. */
-static HashPools chunk_name_index_pools;
-
+/* Its own, not a VM's: a Chunk can outlive any one VM. Per-chunk rather than process-global so two
+   actors, which own separate chunks, cannot reach the same pools -- runtime specialization calls
+   chunk_add_pool from inside lbl_call, so a shared set would be written from two threads at once. */
 void chunk_init(Chunk* c) {
     memset(c, 0, sizeof(*c));
-    hashtable_pools_init(&chunk_name_index_pools);
-    c->name_index.pools = &chunk_name_index_pools;
+    hashtable_pools_init(&c->name_index_pools);
+    c->name_index.pools = &c->name_index_pools;
 }
 
 /* Every call site frees the owning VM first (vm_free(vm); chunk_free(chunk);) -- vm_free's
@@ -30,6 +28,7 @@ void chunk_free(Chunk* c) {
     free(c->rawk_i);
     free(c->rawk_d);
     hashtable_free(&c->name_index);
+    hashtable_pools_free(&c->name_index_pools);
     free(c->line_mark_offsets);
     free(c->line_mark_lines);
     for (unsigned int i = 0; i < c->import_count; i++)
