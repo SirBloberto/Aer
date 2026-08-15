@@ -764,13 +764,17 @@ static bool index_safe_unchecked(int arr_reg, int idx_rk) {
    opcodes, which have no runtime check to fall back on. Overwrites with -1 rather than removing,
    so parse_for_in's push/pop depth counting is untouched and a dead slot can never be resurrected.
    The length_tracked_valid and range_item_written updates ride along for the same reason. */
-static void invalidate_register(int reg) {
+/* Everything invalidate_register does EXCEPT clearing reg_nonneg, for the statically-typed write
+   paths. Those never invalidated anything at all before loop variables could be typed, so their
+   slots have always carried a surviving non-negativity proof -- and clearing it outright costs
+   sieve 61%, whose inner loop re-derives its index with a compound assignment every iteration.
+   emit_binary recomputes the proof rather than dropping it (see its own reg_nonneg line); these
+   paths simply keep it, which is exactly what they did before. */
+static void note_slot_written(int reg) {
     if (reg < 0)
         return;
     if (P.length_tracked_valid && reg == P.length_tracked_source_reg)
         P.length_tracked_valid = false;
-    if (reg < FRAME_REGISTERS)
-        P.reg_nonneg[reg] = false;
     if (reg < FRAME_REGISTERS)
         P.reg_elem_kind[reg] = RAWK_NONE;
     for (int i = 0; i < P.safe_loop_depth; i++) {
@@ -782,6 +786,14 @@ static void invalidate_register(int reg) {
     for (int i = 0; i < P.range_loop_depth; i++)
         if (P.range_item_regs[i] == reg)
             P.range_item_written[i] = true;
+}
+
+static void invalidate_register(int reg) {
+    if (reg < 0)
+        return;
+    if (reg < FRAME_REGISTERS)
+        P.reg_nonneg[reg] = false;
+    note_slot_written(reg);
 }
 
 /* Compile-time field lookup against a known Shape, resolving offset and type from the Shape's own
@@ -2966,6 +2978,10 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                              (cur == VAR_RAW_REAL && rhs_kind == RAWK_REAL);
             if (same_kind) {
                 int dest_slot = P.var_regs[existing_idx];
+                /* A statically-typed write is still a write: a loop-safety proof keyed on this
+                   register, or a tracked length, stops holding. Its non-negativity does not --
+                   see note_slot_written. */
+                note_slot_written(dest_slot);
                 int src_slot = raw_materialize(c, rk_val, rhs_kind);
                 if (src_slot >= 0) {
                     if (src_slot != dest_slot) {
@@ -3084,6 +3100,9 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
             }
 
         if (existing_idx >= 0 && P.var_kind[existing_idx] != VAR_BOXED) {
+            /* Once for every branch below, all of which write this slot -- same reason as the
+               plain assignment path above. */
+            note_slot_written(P.var_regs[existing_idx]);
             RawKind cur_kind = (P.var_kind[existing_idx] == VAR_RAW_INT) ? RAWK_INT : RAWK_REAL;
             Opcode boxed_op = compound_assign_ops[i].op;
             bool native_op_exists = (boxed_op == OP_ADD || boxed_op == OP_SUB || boxed_op == OP_MUL);
@@ -3984,6 +4003,16 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
             P.range_item_written[P.range_loop_depth] = false;
             P.range_loop_depth++;
         }
+        /* PREP rejects a non-integer bound or step outright and publishes a tagged integer, and LOOP
+           only ever advances it as one -- so this variable is an integer on every path that reaches
+           the body, and saying so lets the body index and compute unchecked. Without it the
+           idiomatic `for i in 0..n` compiled to the generic opcodes while the hand-written
+           `i = 0; for i < n` did not, which measured 15.9% more instructions for the same work. */
+        for (int v = P.var_count - 1; v >= 0; v--)
+            if (P.var_names[v] == loop_var_name && P.var_regs[v] == item_reg) {
+                P.var_kind[v] = VAR_RAW_INT;
+                break;
+            }
         unsigned int body_start = c->count;
         parse_block(c);
         if (parse_had_error) {
