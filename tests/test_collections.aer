@@ -157,4 +157,30 @@ assert(length(key_list) == 2 and key_list[0] == "alpha" and key_list[1] == "beta
 sorted_here = collection.sort([3, 1, 2])
 assert(sorted_here[0] == 1 and sorted_here[2] == 3, "collection.sort() on numbers (moved from math.sort)")
 
+# Typed arrays slice with the same spelling as arrays and strings, and produce a typed array of the
+# same element kind -- a copy, like the other two, not a view onto the original.
+tslice_src = [0.0; 8]
+tsi = 0
+for tsi < 8:
+    tslice_src[tsi] = float(tsi) * 1.5
+    tsi += 1
+tslice = tslice_src[2:5]
+assert(length(tslice) == 3, "slicing a typed array yields the requested length")
+assert(tslice[0] == 3.0 and tslice[2] == 6.0, "a typed-array slice carries the right elements")
+tslice_src[2] = 99.0
+assert(tslice[0] == 3.0, "a typed-array slice is a copy, so writing the original doesn't change it")
+assert(length(tslice_src[3:3]) == 0, "an empty typed-array slice")
+assert(length(tslice_src[-3:]) == 3, "a negative typed-array slice bound counts from the end")
+tslice_int = [0i; 6]
+tslice_int[4] = 9
+assert(tslice_int[3:6][1] == 9, "slicing preserves the element kind (int32 here)")
+
+# `[fill; n]` accepts a typed array, so a matrix is one expression. Each row must be its own copy --
+# sharing one row `n` times is the trap Python's `[[0] * cols] * rows` is known for.
+mat = [[0.0; 4]; 3]
+assert(length(mat) == 3 and length(mat[0]) == 4, "a nested repeat-literal builds rows x cols")
+mat[1][2] = 7.5
+assert(mat[0][2] == 0.0 and mat[1][2] == 7.5 and mat[2][2] == 0.0,
+       "rows of a nested repeat-literal are independent, not one shared row")
+
 print("test_collections.aer: all assertions passed.")

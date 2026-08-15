@@ -3761,6 +3761,22 @@ lbl_slice_get: {
         unsigned int sub_len = (unsigned int)(end - start);
         registers[dest_reg] = aer_make_string_copy(
             os->data + start, sub_len); /* no chunk_add_pool interning -- see vm_to_str's comment */
+    } else if (aer_type(obj) == TYPE_TYPED_ARRAY) {
+        /* A copy, like the array and string cases -- not a view. A view would have to keep its
+           parent alive and know not to free a buffer it borrowed, and slicing is the same spelling
+           on all three types, so it should not mean something structurally different on one. */
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        int64_t start, end;
+        if (!vm_slice_bounds(start_v, end_v, (int64_t)ta->count, &start, &end)) {
+            registers[dest_reg] = aer_null();
+            DISPATCH();
+        }
+        unsigned int n = (unsigned int)(end - start);
+        AerTypedArray* r = vm_new_typed_array(ta->elem_kind, n);
+        unsigned int w = vm_typed_elem_width(ta->elem_kind);
+        if (n > 0)
+            memcpy(r->data, ta->data + (size_t)start * w, (size_t)n * w);
+        registers[dest_reg] = aer_typed_array_val(r);
     } else {
         error("Cannot slice this type");
         registers[dest_reg] = aer_null();
@@ -4932,9 +4948,34 @@ lbl_array_repeat: {
         for (int64_t e = 0; e < count; e++)
             vm_typed_elem_write(ta->data + (size_t)e * width, kind, fill);
         registers[dest_reg] = aer_typed_array_val(ta);
+    } else if (aer_type(fill) == TYPE_TYPED_ARRAY) {
+        /* `[[0.0; cols]; rows]`. Each row is its own COPY of the fill, never one array referenced
+           `count` times -- sharing it would make `m[0][0] = x` write every row, which is the trap
+           Python's `[[0] * cols] * rows` is famous for. Nothing here collects, so the rows are safe
+           to build before the outer array roots them (gc_maybe_collect runs after). */
+        AerTypedArray* src = aer_as_typed_array(fill);
+        unsigned int width = vm_typed_elem_width(src->elem_kind);
+        AerArray* rows = heap_alloc(&vm->heap, &vm->heap.array_pool);
+        rows->count = (unsigned int)count;
+        rows->capacity = count > 0 ? (unsigned int)count : 4;
+        rows->items = xmalloc(sizeof(AerVal) * rows->capacity);
+        rows->shape = NULL;
+        rows->generation = 0;
+        rows->dirty_cards = NULL;
+        rows->dirty_cards_bytes = 0;
+        rows->dirty_min_byte = (unsigned int)-1;
+        rows->dirty_max_byte = 0;
+        rows->dirty_all = false;
+        for (int64_t e = 0; e < count; e++) {
+            AerTypedArray* row = vm_new_typed_array(src->elem_kind, src->count);
+            if (src->count > 0)
+                memcpy(row->data, src->data, (size_t)src->count * width);
+            rows->items[e] = aer_typed_array_val(row);
+        }
+        registers[dest_reg] = aer_array_val(rows);
     } else {
-        error("Cannot build a repeat-literal array from a %s value -- the fill value must be a struct "
-              "instance or a number",
+        error("Cannot build a repeat-literal array from a %s value -- the fill value must be a "
+              "number, a struct instance, or a typed array",
               vm_type_name(c, fill));
         DISPATCH();
     }
