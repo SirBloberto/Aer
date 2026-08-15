@@ -4199,26 +4199,11 @@ static bool at_module_name(Chunk* c) {
 /* A module name is always a literal identifier, never a runtime value, so it's fully knowable
    here. Returns CALL_MODULE_DYNAMIC for anything not a fixed core built-in. */
 static int module_call_id(AerString* name) {
-    if (name->length == 4 && strncmp(name->data, "math", 4) == 0)
-        return CALL_MODULE_MATH;
-    if (name->length == 6 && strncmp(name->data, "random", 6) == 0)
-        return CALL_MODULE_RANDOM;
-    if (name->length == 6 && strncmp(name->data, "string", 6) == 0)
-        return CALL_MODULE_STRING;
-    if (name->length == 4 && strncmp(name->data, "time", 4) == 0)
-        return CALL_MODULE_TIME;
-    if (name->length == 4 && strncmp(name->data, "json", 4) == 0)
-        return CALL_MODULE_JSON;
-    if (name->length == 10 && strncmp(name->data, "collection", 10) == 0)
-        return CALL_MODULE_COLLECTION;
-    if (name->length == 3 && strncmp(name->data, "net", 3) == 0)
-        return CALL_MODULE_NET;
-    if (name->length == 5 && strncmp(name->data, "regex", 5) == 0)
-        return CALL_MODULE_REGEX;
-    if (name->length == 5 && strncmp(name->data, "actor", 5) == 0)
-        return CALL_MODULE_ACTOR;
-    if (name->length == 9 && strncmp(name->data, "scheduler", 9) == 0)
-        return CALL_MODULE_SCHEDULER;
+#define AER_MODULE_LOOKUP(id, str, call)                                                                     \
+    if (name->length == sizeof(str) - 1 && strncmp(name->data, str, sizeof(str) - 1) == 0)                   \
+        return CALL_MODULE_##id;
+    AER_NATIVE_MODULES(AER_MODULE_LOOKUP)
+#undef AER_MODULE_LOOKUP
     return CALL_MODULE_DYNAMIC;
 }
 

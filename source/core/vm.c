@@ -2605,16 +2605,10 @@ static bool __attribute__((noinline)) vm_call_module_dispatch(VM* vm, Chunk* c, 
     /* module_id/fn_id resolved at parse time -- a switch on two ints instead of a strcmp chain.
        CALL_MODULE_DYNAMIC (host/file module) still resolves by name at runtime. */
     switch (module_id) {
-        case CALL_MODULE_MATH: handled = aer_math_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_RANDOM: handled = aer_random_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_STRING: handled = aer_string_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_TIME: handled = aer_time_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_JSON: handled = aer_json_call(vm, c, fn_id, arg_count); break;
-        case CALL_MODULE_COLLECTION: handled = aer_collection_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_NET: handled = aer_net_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_REGEX: handled = aer_regex_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_ACTOR: handled = aer_actor_module_call(vm, fn_id, arg_count); break;
-        case CALL_MODULE_SCHEDULER: handled = aer_scheduler_module_call(vm, fn_id, arg_count); break;
+#define AER_MODULE_DISPATCH(id, str, call)                                                                   \
+    case CALL_MODULE_##id: handled = call; break;
+        AER_NATIVE_MODULES(AER_MODULE_DISPATCH)
+#undef AER_MODULE_DISPATCH
         default: {
             const char* module = aer_as_string(c->pool[module_idx])->data;
             const char* fn = aer_as_string(c->pool[fn_idx])->data;

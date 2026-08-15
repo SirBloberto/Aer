@@ -7,19 +7,28 @@
    they outnumbered every other kind of constant in vm.h put together. Adding a stdlib function
    should not mean editing the VM's core header. */
 
-/* OP_CALL_MODULE's trailing module_id word, resolved at parse time; CALL_MODULE_DYNAMIC =
-   host/file module, resolved by name at runtime. */
-#define CALL_MODULE_MATH 0
-#define CALL_MODULE_RANDOM 1
-#define CALL_MODULE_STRING 2
-#define CALL_MODULE_TIME 3
-#define CALL_MODULE_JSON 4
-#define CALL_MODULE_COLLECTION 5
-#define CALL_MODULE_NET 6
-#define CALL_MODULE_REGEX 7
-#define CALL_MODULE_ACTOR 8
-#define CALL_MODULE_SCHEDULER 9
-#define CALL_MODULE_DYNAMIC 10
+/* The native modules. The CALL_MODULE_* ids, aer_stdlib_is_native_module's name check, the parser's
+   name lookup and the VM's dispatch switch are all generated from this one list -- stating the set
+   in four places made a missing entry a silent misroute rather than a compile error. The third
+   column is the call itself, so json needing the chunk costs no special case; it expands only where
+   those names are in scope. */
+#define AER_NATIVE_MODULES(X)                                                                                \
+    X(MATH, "math", aer_math_call(vm, fn_id, arg_count))                                                     \
+    X(RANDOM, "random", aer_random_call(vm, fn_id, arg_count))                                               \
+    X(STRING, "string", aer_string_call(vm, fn_id, arg_count))                                               \
+    X(TIME, "time", aer_time_call(vm, fn_id, arg_count))                                                     \
+    X(JSON, "json", aer_json_call(vm, c, fn_id, arg_count))                                                  \
+    X(COLLECTION, "collection", aer_collection_call(vm, fn_id, arg_count))                                   \
+    X(NET, "net", aer_net_call(vm, fn_id, arg_count))                                                        \
+    X(REGEX, "regex", aer_regex_call(vm, fn_id, arg_count))                                                  \
+    X(ACTOR, "actor", aer_actor_module_call(vm, fn_id, arg_count))                                           \
+    X(SCHEDULER, "scheduler", aer_scheduler_module_call(vm, fn_id, arg_count))
+
+/* CALL_MODULE_DYNAMIC (a host or file module, resolved by name at runtime) must stay last -- it is
+   the one id not in the list above. */
+#define AER_MODULE_ID(name, str, call) CALL_MODULE_##name,
+enum { AER_NATIVE_MODULES(AER_MODULE_ID) CALL_MODULE_DYNAMIC };
+#undef AER_MODULE_ID
 
 /* Second trailing word: fn_id within the module (each module owns a flat id space);
    FN_ID_UNKNOWN still errors by name, never misroutes to id 0. */
