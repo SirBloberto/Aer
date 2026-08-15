@@ -30,6 +30,9 @@ bool aer_actor_prepare_call(Actor* actor, const char* fn, int arg_count, AerVal*
    opaque everywhere else. */
 VM* aer_actor_vm(Actor* actor);
 
+/* Rebuilds a value from an actor's heap in whichever heap is current. */
+AerVal aer_actor_copy_result(AerVal v);
+
 /* Frees every actor still alive, each one's whole VM+Chunk with it. The actor-side counterpart to
    aer_module_free_all() (aer_module.h), and called next to it -- an embedding host that spawns
    actors needs both to tear down cleanly, not just the module half. */

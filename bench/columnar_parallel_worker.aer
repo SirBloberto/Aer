@@ -1,0 +1,15 @@
+# One chunk of the scan in columnar_query.aer: same predicate, same aggregate, over a slice of each
+# column. Returns the per-group revenue as a typed array so the caller can fold the chunks together.
+
+function scan(quantity, price, discount, region, groups):
+    revenue = [0.0; groups]
+    n = length(quantity)
+    i = 0
+    for i < n:
+        q = quantity[i]
+        p = price[i]
+        if q > 10 and p < 400.0:
+            g = region[i]
+            revenue[g] = revenue[g] + p * float(q) * (1.0 - discount[i])
+        i += 1
+    return revenue

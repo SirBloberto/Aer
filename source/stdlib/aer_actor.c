@@ -120,6 +120,32 @@ static bool actor_copy_args_into(Actor* actor, int arg_count, AerVal* args) {
     return ok;
 }
 
+/* The mirror of the above, for a result travelling the other way -- it is a cell in the actor's
+   heap, and handing the pointer back puts it in the caller's registers. Runs with the caller's heap
+   current, which is where the copy has to land. */
+AerVal aer_actor_copy_result(AerVal v) {
+    switch (aer_type(v)) {
+        case TYPE_STRING: {
+            AerString* src = aer_as_string(v);
+            return aer_make_string_copy(src->data, src->length);
+        }
+        case TYPE_TYPED_ARRAY: {
+            AerTypedArray* src = aer_as_typed_array(v);
+            AerVal copy = vm_new_typed_array_val(src->elem_kind, src->count);
+            if (src->count)
+                memcpy(aer_as_typed_array(copy)->data, src->data,
+                       (size_t)src->count * vm_typed_elem_width(src->elem_kind));
+            return copy;
+        }
+        /* Anything else with a cell behind it never got in, so it cannot come back out. */
+        default:
+            return aer_type(v) == TYPE_NULL || aer_type(v) == TYPE_BOOLEAN || aer_type(v) == TYPE_INTEGER ||
+                           aer_type(v) == TYPE_REAL
+                       ? v
+                       : aer_null();
+    }
+}
+
 bool aer_actor_prepare_call(Actor* actor, const char* fn, int arg_count, AerVal* args) {
     ChunkFunction* fnreg = chunk_find_function(actor->chunk, fn);
     if (!fnreg)
@@ -159,7 +185,9 @@ bool aer_actor_call(Actor* actor, const char* fn, int arg_count, AerVal* args, A
     if (!ok)
         return false;
 
-    *out_result = mv->call_stack[0].registers[0];
+    /* Copied, not handed over: the value lives in the actor's heap. current_heap is the caller's
+       again by now, since vm_run restored it. */
+    *out_result = aer_actor_copy_result(mv->call_stack[0].registers[0]);
     return true;
 }
 

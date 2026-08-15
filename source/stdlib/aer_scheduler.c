@@ -19,6 +19,7 @@
 typedef struct Task {
     Actor* actor;
     bool finished;
+    AerVal result;
     struct Task* next;
 } Task;
 
@@ -34,6 +35,7 @@ static bool aer_scheduler_add(Actor* actor, const char* fn, int arg_count, AerVa
     Task* t = xmalloc(sizeof(Task));
     t->actor = actor;
     t->finished = false;
+    t->result = aer_null();
     t->next = NULL;
     if (tasks_tail)
         tasks_tail->next = t;
@@ -49,6 +51,9 @@ static bool aer_scheduler_add(Actor* actor, const char* fn, int arg_count, AerVa
 #define SCHEDULER_SLICE_INSTRUCTIONS 1000
 
 static void scheduler_finish(Task* t) {
+    /* From the actor's frame while it is still the one that ran, exactly where aer_actor_call
+       looks. Rebuilt in the caller's heap later, once every task is done. */
+    t->result = aer_actor_vm(t->actor)->call_stack[0].registers[0];
     t->finished = true;
     /* Isolation, the same two flags aer_actor_call resets: one task's failure must not be read as
        another's, and both are per-thread in a threaded build. */
@@ -97,7 +102,10 @@ static void scheduler_run_interleaved(void) {
     }
 }
 
-static void aer_scheduler_run(void) {
+/* Every task's return value, in the order they were added -- work split across actors is only
+   useful if its answers come back. Each is rebuilt in the caller's heap, since it was produced in
+   the actor's. */
+static AerVal aer_scheduler_run_collect(void) {
 #ifdef AER_HEAP_REF_TLS
     unsigned int count = 0;
     for (Task* t = tasks; t; t = t->next)
@@ -125,12 +133,30 @@ static void aer_scheduler_run(void) {
 #endif
         scheduler_run_interleaved();
 
+    unsigned int n = 0;
+    for (Task* t = tasks; t; t = t->next)
+        n++;
+    AerArray* out = vm_new_array();
+    out->count = n;
+    out->capacity = n ? n : 4;
+    out->items = xmalloc(sizeof(AerVal) * out->capacity);
+    out->shape = NULL;
+    out->generation = 0;
+    out->dirty_cards = NULL;
+    out->dirty_cards_bytes = 0;
+    out->dirty_min_byte = (unsigned int)-1;
+    out->dirty_max_byte = 0;
+    out->dirty_all = false;
+
+    unsigned int i = 0;
     while (tasks) {
         Task* next = tasks->next;
+        out->items[i++] = aer_actor_copy_result(tasks->result);
         free(tasks);
         tasks = next;
     }
     tasks_tail = NULL;
+    return aer_array_val(out);
 }
 
 /* ------------------------------------------------------------------ */
@@ -169,8 +195,7 @@ __attribute__((noinline)) bool aer_scheduler_module_call(VM* vm, int fn_id, int 
     }
 
     if (fn_id == FN_SCHEDULER_RUN && arg_count == 0) {
-        aer_scheduler_run();
-        vm_stack_push(vm, aer_null());
+        vm_stack_push(vm, aer_scheduler_run_collect());
         return true;
     }
 

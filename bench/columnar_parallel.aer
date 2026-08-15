@@ -1,0 +1,55 @@
+import actor
+import scheduler
+import collection
+import time
+
+# columnar_query.aer's scan, split across actors. Build with `make THREADS=1` for it to actually run
+# in parallel; without it the same tasks interleave on one thread and the answer is identical.
+N = 4000000
+GROUPS = 8
+WORKERS = 6
+
+region = [0i; N]
+quantity = [0i; N]
+price = [0.0; N]
+discount = [0.0; N]
+i = 0
+for i < N:
+    region[i] = i % GROUPS
+    quantity[i] = (i % 50) + 1
+    price[i] = float(i % 1000) * 0.5 + 1.0
+    discount[i] = float(i % 20) * 0.01
+    i += 1
+
+workers = []
+w = 0
+for w < WORKERS:
+    a, err = actor.spawn("bench/columnar_parallel_worker.aer")
+    if err != null:
+        panic("spawn failed: {err}")
+    collection.append(workers, a)
+    w += 1
+
+per = N // WORKERS
+start = time.now()
+w = 0
+for w < WORKERS:
+    lo = w * per
+    hi = lo + per
+    if w == WORKERS - 1:
+        hi = N
+    scheduler.add(workers[w], "scan", quantity[lo:hi], price[lo:hi], discount[lo:hi], region[lo:hi], GROUPS)
+    w += 1
+results = scheduler.run()
+
+total = 0.0
+r = 0
+for r < length(results):
+    part = results[r]
+    g = 0
+    for g < GROUPS:
+        total = total + part[g]
+        g += 1
+    r += 1
+dur = time.now() - start
+print("columnar_parallel: {N} rows across {WORKERS} actors in {dur}s, revenue={total}")
