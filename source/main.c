@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
     } else if (strcmp(argv[1], "help") == 0) {
         help();
     } else if (strcmp(argv[1], "version") == 0) {
-        printf("Aer %s\n", VERSION);
+        printf("Aer %s (%s)\n", VERSION, AER_BUILD_REV);
     } else {
         /* Everything after the script path belongs to the script, via io.args(). */
         aer_io_set_args(argc - 2, argv + 2);

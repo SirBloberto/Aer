@@ -6,6 +6,20 @@
 
 #define VERSION "1.0"
 
+/* Set by the makefile from `git describe`; a build made outside a checkout says so rather than
+   lying about which commit it is. Reported by `aer version` and recorded in every benchmark table
+   tools/compare_languages.py prints, so a result always carries the build it came from. */
+#ifndef AER_BUILD_REV
+#define AER_BUILD_REV "unknown"
+#endif
+
+/* Set by the makefile from `git describe`; a build made outside a checkout says so rather than
+   lying about which commit it is. Reported by `aer version` and by tools/compare_languages.py, so a
+   benchmark table always records the build it came from. */
+#ifndef AER_BUILD_REV
+#define AER_BUILD_REV "unknown"
+#endif
+
 /* Embedding: error reporting. By default every parse/runtime error and fatal condition prints to stderr; a runtime error does not terminate the process (vm_run() returns cleanly). This state is process-global, not per-VM, and not thread-safe. */
 
 /* Registers a sink for every message error()/error_at()/aer_report_fatal() would otherwise print to stderr. `message` is a NUL-terminated, fully formatted string owned by AER -- copy it if it must outlive the callback call. Pass NULL to restore the default (stderr), also the behavior with no call at all. */

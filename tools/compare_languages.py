@@ -105,6 +105,21 @@ def time_once(argv, host, remote_dir):
     return elapsed, (_peak_rss_windows(proc) if os.name == "nt" else 0)
 
 
+def aer_build(aer, host):
+    """The commit the aer binary under test was built from. A table that doesn't say which build
+    produced it can't be compared against an older one, which is the whole use for these numbers."""
+    argv = [aer, "version"]
+    try:
+        if host:
+            p = subprocess.run(["ssh", host, " ".join(argv)], capture_output=True, text=True,
+                               timeout=30)
+        else:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        return p.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def measure(argv, runs, host, remote_dir):
     """(mean seconds, peak-to-peak spread as a percentage, mean peak RSS in KB).
 
@@ -170,7 +185,8 @@ def main():
 
     cols = [label for label, _, _, _ in available]
     width = 50 + 16 * len(cols)
-    print("\n%-20s %8s %6s %7s %s"
+    print("\n%s" % aer_build(args.aer, args.host))
+    print("%-20s %8s %6s %7s %s"
           % ("benchmark", "aer", "±", "mem", " ".join("%15s" % c for c in cols)))
     print("-" * width)
 
