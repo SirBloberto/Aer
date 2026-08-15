@@ -1177,7 +1177,7 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
     for (int i = arg_count; i < (int)fn->arity; i++)
         callee->registers[i] = vm_default_value(target, fn->defaults[i - fn->min_arity]);
     /* Same reason as lbl_call's own -- everything below frame_size gets traced. */
-    frame_init_tags(callee->registers, fn->arity, fn->frame_bounds, fn->max_registers);
+    frame_init_tags(callee->registers, fn->arity, fn->frame_bounds);
     callee->frame_bounds = fn->frame_bounds;
     callee->return_ip = return_ip;
     callee->dest_reg = 0;
@@ -1228,7 +1228,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         reused->frame_size = f->max_registers;
         /* Growing the reused frame exposes registers the previous occupant never wrote, which
            mark_vm_roots would still trace -- same retagging as the two push paths. */
-        frame_init_tags(reused->registers, f->arity, f->frame_bounds, f->max_registers);
+        frame_init_tags(reused->registers, f->arity, f->frame_bounds);
         reused->frame_bounds = f->frame_bounds;
         reused->tail_calls_collapsed++;
         return;
@@ -1245,7 +1245,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     for (int i = arg_count; i < (int)f->arity; i++)
         callee->registers[i] = vm_default_value(vm, f->defaults[i - f->min_arity]);
     /* Same reason as lbl_call's own -- everything below frame_size gets traced. */
-    frame_init_tags(callee->registers, f->arity, f->frame_bounds, f->max_registers);
+    frame_init_tags(callee->registers, f->arity, f->frame_bounds);
     callee->frame_bounds = f->frame_bounds;
     callee->return_ip = return_ip;
     callee->dest_reg = dest_reg;
@@ -3331,7 +3331,7 @@ lbl_call: {
         callee->registers[i] = registers[arg_reg_base + i];
     /* mark_vm_roots traces every register below frame_size, so an unfilled one would still hold a
        popped frame's pointer. Only the tag matters -- value_has_cell reads nothing else. */
-    frame_init_tags(callee->registers, (unsigned int)arg_count, chosen_frame_bounds, chosen_max_registers);
+    frame_init_tags(callee->registers, (unsigned int)arg_count, chosen_frame_bounds);
     callee->frame_bounds = chosen_frame_bounds;
     callee->return_ip =
         (unsigned int)(pc - code); /* already past this instruction's operands -- the correct resume point */
@@ -3373,7 +3373,7 @@ lbl_tail_call: {
        pointers are untouched -- same frame, same memory, only the claim changes. */
     reused->frame_size = target_f->max_registers;
     /* Same as the non-tail push: the block's tags belong to the function now running here. */
-    frame_init_tags(registers, (unsigned int)arg_count, target_f->frame_bounds, target_f->max_registers);
+    frame_init_tags(registers, (unsigned int)arg_count, target_f->frame_bounds);
     reused->frame_bounds = target_f->frame_bounds;
     reused->tail_calls_collapsed++;
     /* Every call (tail or not) is the other place a script can spend unbounded time (recursion
@@ -3456,7 +3456,7 @@ lbl_call_self: {
     /* mark_vm_roots traces every slot below frame_size, so the ones this call does not fill must not
        keep a popped frame's stale references. Self-call, so the callee's block layout is the
        caller's. */
-    frame_init_tags(callee->registers, (unsigned int)arg_count, caller->frame_bounds, fsz);
+    frame_init_tags(callee->registers, (unsigned int)arg_count, caller->frame_bounds);
     callee->frame_bounds = caller->frame_bounds;
     callee->return_ip = (unsigned int)(pc - code);
     callee->dest_reg = dest_reg;

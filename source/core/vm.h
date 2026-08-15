@@ -881,14 +881,13 @@ typedef struct {
    those store a payload and leave the tag exactly as this wrote it. The gap between the two is
    skipped, and frame_ref_slots stops before it, so a full-size frame costs no more here than the
    tight one it replaced. */
-static inline void frame_init_tags(AerVal* registers, unsigned int from, unsigned short bounds,
-                                   unsigned int frame_size) {
-    unsigned int i = from, real_base = FRAME_REAL_BASE(bounds);
-    for (unsigned int dyn_end = FRAME_DYN_END(bounds); i < dyn_end; i++)
+static inline void frame_init_tags(AerVal* registers, unsigned int from, unsigned short bounds) {
+    for (unsigned int i = from, dyn_end = FRAME_DYN_END(bounds); i < dyn_end; i++)
         registers[i].tag = TYPE_NULL;
-    if (i < real_base)
-        i = real_base;
-    for (; i < frame_size; i++)
+    /* Runs to FRAME_REGISTERS, not to the frame size, because only a frame that IS full size has
+       real slots -- for any other, real_base is already FRAME_REGISTERS and this does nothing. That
+       keeps the frame size off the call path entirely. */
+    for (unsigned int i = FRAME_REAL_BASE(bounds); i < FRAME_REGISTERS; i++)
         registers[i].tag = TYPE_REAL;
 }
 
