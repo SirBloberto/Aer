@@ -1526,6 +1526,12 @@ static unsigned char* typed_array_data_alloc(VmHeap* heap, size_t size) {
             return p;
         }
     }
+    /* A miss charges the collector for what it actually cost. Its trigger counts CELLS, and a typed
+       array is one cell however many megabytes hang off it -- so `a = (a + b) * half` in a loop ran
+       thousands of fresh mallocs between collections while the free cache above sat empty, since
+       nothing reached it until a cycle ran. Charging by size pulls the next cycle in and turns those
+       mallocs into cache hits. Only on a miss: a hit allocated nothing to collect. */
+    heap->pool_alloc_count += (unsigned int)(size / TYPED_ARRAY_ALLOC_CHARGE_BYTES);
     return xmalloc(size);
 }
 

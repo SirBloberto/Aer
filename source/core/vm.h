@@ -777,6 +777,10 @@ typedef struct {
    retaining memory. Checked by vm_new_typed_array, populated by free_typed_array. */
 #define TYPED_ARRAY_FREE_CACHE_SLOTS 8
 #define TYPED_ARRAY_FREE_CACHE_MAX_BYTES (4u * 1024 * 1024)
+/* Bytes of freshly-malloc'd typed-array payload that count as one cell against the collector's
+   trigger -- see typed_array_data_alloc. Roughly a page, so a buffer costs about what faulting it
+   in costs. */
+#define TYPED_ARRAY_ALLOC_CHARGE_BYTES 4096u
 
 typedef struct {
     size_t size; /* 0 = empty slot */
