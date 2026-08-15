@@ -307,7 +307,8 @@ char* handle_terminal() {
                 buffer = xrealloc(buffer, buffer_length);
             }
             buffer[length] = '\n';
-            /* Backspace leaves stale bytes past `length` -- NUL-terminate or strlen reads a longer edit's tail. */
+            /* Backspace leaves stale bytes past `length` -- NUL-terminate or strlen reads a longer edit's
+               tail. */
             buffer[length + 1] = '\0';
             if (length != 0) {
                 /* Persist to history file */

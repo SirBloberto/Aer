@@ -15,7 +15,8 @@
 static int io_argc = 0;
 static char** io_argv = NULL;
 
-/* stdin (or any non-seekable stream) can't be pre-sized via fseek/ftell, so read until EOF into a growing buffer. */
+/* stdin (or any non-seekable stream) can't be pre-sized via fseek/ftell, so read until EOF into a growing
+   buffer. */
 static AerVal io_read_until_eof(FILE* fp) {
     size_t cap = 4096, len = 0;
     char* buf = xmalloc(cap);

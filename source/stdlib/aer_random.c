@@ -69,7 +69,8 @@ bool aer_random_call(VM* vm, int fn_id, int arg_count) {
             return true;
         }
         uint64_t span = (uint64_t)(hi_n - lo_n) + 1;
-        /* span 0 means the full 64-bit range (hi-lo overflowed to UINT64_MAX) -- rng_next() itself is already uniform there. */
+        /* span 0 means the full 64-bit range (hi-lo overflowed to UINT64_MAX) -- rng_next() itself is
+           already uniform there. */
         uint64_t r = span == 0 ? rng_next() : rng_below(span);
         vm_stack_push(vm, aer_int(lo_n + (int64_t)r));
         return true;
@@ -109,7 +110,8 @@ bool aer_random_call(VM* vm, int fn_id, int arg_count) {
             return true;
         }
         AerArray* a = aer_as_array(arr);
-        /* Fisher-Yates, in place; swapping within one array never needs a GC write barrier -- no value becomes newly reachable from it. */
+        /* Fisher-Yates, in place; swapping within one array never needs a GC write barrier -- no value
+           becomes newly reachable from it. */
         for (unsigned int i = a->count; i > 1; i--) {
             uint64_t j = rng_below(i);
             AerVal tmp = a->items[i - 1];

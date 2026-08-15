@@ -141,7 +141,8 @@ void* pool_alloc(Pool* p) {
 }
 
 void pool_free(Pool* p, void* cell) {
-    /* Discards whatever mark/generation bits the cell had -- neither is consulted on the free-list, and pool_alloc zeroes the byte again on reuse anyway. */
+    /* Discards whatever mark/generation bits the cell had -- neither is consulted on the free-list, and
+       pool_alloc zeroes the byte again on reuse anyway. */
     *(unsigned char*)cell = POOL_FREE;
     *(void**)((char*)cell + sizeof(void*)) =
         p->free_list; /* see pool_free's own comment on why not offset 0 */

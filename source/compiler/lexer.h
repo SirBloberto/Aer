@@ -73,7 +73,8 @@ typedef enum TokenType {
     TOKEN_NULL,
     TOKEN_IMPORT,
 
-    /* Reserved type names, unusable as any identifier. `string` is excluded -- it collides with the stdlib `string` module. */
+    /* Reserved type names, unusable as any identifier. `string` is excluded -- it collides with the stdlib
+       `string` module. */
 
     TOKEN_COMMA,
     TOKEN_SEMICOLON, /* ;  -- the repeat-literal separator, `[value; count]`, and nothing else */
@@ -83,7 +84,8 @@ typedef enum TokenType {
     TOKEN_NEW_LINE,
     TOKEN_END_OF_FILE,
 
-    /* Emitted for a byte lex() cannot make a token from (already reported via error_at()); always consumes exactly one byte so callers (parser.c's error-recovery skip loop) are guaranteed forward progress. */
+    /* Emitted for a byte lex() cannot make a token from (already reported via error_at()); always consumes
+       exactly one byte so callers (parser.c's error-recovery skip loop) are guaranteed forward progress. */
     TOKEN_ERROR,
 } TokenType;
 
@@ -115,13 +117,17 @@ const char* current_source_cursor();
    override, then restore. Mutates the current File's cursor; does not switch files. */
 void lexer_set_cursor(const char* pos);
 
-/* Exposed so parser.c can tag each statement's bytecode with its source line (see Chunk.line_mark_offsets, vm.h). */
+/* Exposed so parser.c can tag each statement's bytecode with its source line (see Chunk.line_mark_offsets,
+   vm.h). */
 unsigned int current_source_line();
 
-/* Exposed so a file-based `import` can resolve a sibling .aer path relative to the file currently being lexed. */
+/* Exposed so a file-based `import` can resolve a sibling .aer path relative to the file currently being
+   lexed. */
 const char* current_source_name();
 
-/* Captures everything read_file()/indent tracking need to resume the CURRENT file's lexing where it left off after a nested read_file()+lex()+parse() cycle for an imported file completes; opaque outside lexer.c -- only ever saved and restored, never inspected. */
+/* Captures everything read_file()/indent tracking need to resume the CURRENT file's lexing where it left
+   off after a nested read_file()+lex()+parse() cycle for an imported file completes; opaque outside
+   lexer.c -- only ever saved and restored, never inspected. */
 typedef struct LexerState LexerState;
 LexerState* lexer_save_state(void);
 void lexer_restore_state(LexerState* state);

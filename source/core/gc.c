@@ -14,7 +14,8 @@
    null/boolean/integer/float, which have no cell to point at all. */
 static bool value_has_cell(AerVal v);
 
-/* True if v's own pooled cell is young; null/boolean/real (and inline integers) have no cell, so they're trivially "not young". */
+/* True if v's own pooled cell is young; null/boolean/real (and inline integers) have no cell, so they're
+   trivially "not young". */
 static bool value_is_young(AerVal v) {
     return value_has_cell(v) && pool_is_young(v.as.ptr);
 }
@@ -147,7 +148,8 @@ static void worklist_push(VmHeap* heap, AerVal v, bool minor) {
     wl->items[wl->count++] = v;
 }
 
-/* Shared by TYPE_FUNCTION marking and CallFrame root marking (a frame's executing function is a raw AerFunction*, not a wrapped AerVal). */
+/* Shared by TYPE_FUNCTION marking and CallFrame root marking (a frame's executing function is a raw
+   AerFunction*, not a wrapped AerVal). */
 static void mark_function(AerFunction* f) {
     pool_mark(f);
 }
@@ -234,7 +236,8 @@ static void mark_vm_roots(VmHeap* heap, VM* vm, bool minor) {
     }
 }
 
-/* Chunk.pool and every Shape's field_defaults are permanent roots, walked fresh every cycle since mark bits are cleared each sweep. */
+/* Chunk.pool and every Shape's field_defaults are permanent roots, walked fresh every cycle since mark
+   bits are cleared each sweep. */
 static void mark_chunk_roots(VmHeap* heap, Chunk* chunk, bool minor) {
     for (unsigned int i = 0; i < chunk->pool_count; i++)
         worklist_push(heap, chunk->pool[i], minor);

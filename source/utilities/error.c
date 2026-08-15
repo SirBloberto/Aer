@@ -76,7 +76,8 @@ void aer_clear_error(void) {
     last_error_msg[0] = '\0';
 }
 
-/* The only thing left in this codebase allowed to exit() -- for OOM; doesn't solve recoverable OOM, just guarantees a host-registered sink sees the message before the process goes down. */
+/* The only thing left in this codebase allowed to exit() -- for OOM; doesn't solve recoverable OOM, just
+   guarantees a host-registered sink sees the message before the process goes down. */
 void aer_report_fatal(const char* msg) {
     char buf[ERROR_MSG_MAX];
     snprintf(buf, sizeof(buf), "Error: %s\n", msg);

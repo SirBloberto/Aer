@@ -84,7 +84,9 @@ static bool time_parse_impl(const char* input, const char* fmt, struct tm* tm) {
 
 bool aer_time_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_TIME_NOW && arg_count == 0) {
-        /* Sub-second epoch time via clock_gettime(CLOCK_REALTIME), not time()'s whole seconds, so scripts can measure short durations; used since C11's timespec_get() isn't available on this project's MinGW-w64 target. */
+        /* Sub-second epoch time via clock_gettime(CLOCK_REALTIME), not time()'s whole seconds, so scripts
+           can measure short durations; used since C11's timespec_get() isn't available on this project's
+           MinGW-w64 target. */
         struct timespec ts = {0};
         clock_gettime(CLOCK_REALTIME, &ts);
         vm_stack_push(vm, aer_real((double)ts.tv_sec + (double)ts.tv_nsec / 1e9));

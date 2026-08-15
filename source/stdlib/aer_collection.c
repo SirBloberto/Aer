@@ -4,7 +4,8 @@
 #include "error.h"
 #include "hashtable.h"
 
-/* qsort() comparator for sort() -- only called once the caller has verified every element is TYPE_STRING or every element is numeric, so no type-mismatch case needs handling here. */
+/* qsort() comparator for sort() -- only called once the caller has verified every element is TYPE_STRING
+   or every element is numeric, so no type-mismatch case needs handling here. */
 static int sort_cmp(const void* pa, const void* pb) {
     const AerVal* a = (const AerVal*)pa;
     const AerVal* b = (const AerVal*)pb;
@@ -260,7 +261,8 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             vm_stack_push(vm, aer_null());
             return true;
         }
-        /* Ordering across mixed types has no sensible answer, so it's rejected up front rather than falling back to an arbitrary tie-break. */
+        /* Ordering across mixed types has no sensible answer, so it's rejected up front rather than
+           falling back to an arbitrary tie-break. */
         bool numeric = true, stringy = true;
         for (unsigned int i = 0; i < a->count; i++) {
             if (aer_type(a->items[i]) != TYPE_INTEGER && aer_type(a->items[i]) != TYPE_REAL)

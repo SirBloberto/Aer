@@ -46,7 +46,8 @@ void chunk_free(Chunk* c) {
     for (unsigned int i = 0; i < c->shape_count; i++)
         free(c->shapes[i]);
     free(c->shapes);
-    /* Not each entry's shape -- every populated slot's Shape* is owned by c->shapes, never separately owned. */
+    /* Not each entry's shape -- every populated slot's Shape* is owned by c->shapes, never separately
+       owned. */
     free(c->field_cache);
     free(c->call_spec_cache);
     free(c->shape_by_name);
@@ -102,7 +103,8 @@ static unsigned int chunk_pool_append(Chunk* c, AerVal v) {
 }
 
 unsigned int chunk_add_pool(Chunk* c, AerVal v) {
-    /* Strings dominate call volume and the REPL never resets the pool between lines, so dedup them via name_index (O(1)) instead of the O(n) linear scan below, kept for rarer non-string literals. */
+    /* Strings dominate call volume and the REPL never resets the pool between lines, so dedup them via
+       name_index (O(1)) instead of the O(n) linear scan below, kept for rarer non-string literals. */
     if (aer_type(v) == TYPE_STRING) {
         /* vs->data works as the lookup key directly: every string reaching here was built by
            aer_make_string_copy, which always NUL-terminates, inline or heap. */
@@ -173,7 +175,8 @@ unsigned int chunk_add_rawk_real(Chunk* c, double v) {
     return c->rawk_d_count++;
 }
 
-/* Newest-first so a redeclared struct (e.g. re-running a REPL block) shadows the old one for new lookups, without invalidating instances still pointing at the old Shape. */
+/* Newest-first so a redeclared struct (e.g. re-running a REPL block) shadows the old one for new lookups,
+   without invalidating instances still pointing at the old Shape. */
 Shape* chunk_find_shape(Chunk* c, const char* name) {
     for (unsigned int i = c->shape_count; i > 0; i--) {
         Shape* s = c->shapes[i - 1];
@@ -257,7 +260,8 @@ bool chunk_add_import(Chunk* c, const char* name, unsigned int len, const char* 
         error_at("File-based import is disabled for this run (--no-import)");
         return false;
     }
-    /* Anything not a native/host module is attempted as a file-based import; aer_module_load() reports its own errors for that path. */
+    /* Anything not a native/host module is attempted as a file-based import; aer_module_load() reports its
+       own errors for that path. */
     if (!is_native_or_host && !aer_module_load(name, len, path_name, path_len)) {
         return false;
     }

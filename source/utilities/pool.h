@@ -70,7 +70,8 @@ void pool_finalize_all(Pool* p, void (*on_free)(void* cell));
    heap going away), not for freeing one cell (see pool_free). Leaves *p zeroed, safe to reuse. */
 void pool_destroy(Pool* p);
 
-/* Returns uninitialized memory, like malloc -- caller fills it in; always born young, whether reused from the free-list or carved from a fresh slab. */
+/* Returns uninitialized memory, like malloc -- caller fills it in; always born young, whether reused from
+   the free-list or carved from a fresh slab. */
 void* pool_alloc(Pool* p);
 
 void pool_free(Pool* p, void* cell);
@@ -78,12 +79,14 @@ void pool_free(Pool* p, void* cell);
 /* All five below read/write only *cell's own state byte -- no Pool* needed, since gc_state lives in
    the object itself, not a side table (see this file's own top comment). */
 
-/* Sets cell's mark bit; returns true if already set -- the mark phase's guard against recursing into an already-visited cell. */
+/* Sets cell's mark bit; returns true if already set -- the mark phase's guard against recursing into an
+   already-visited cell. */
 bool pool_mark(void* cell);
 
 bool pool_is_young(void* cell);
 
-/* True if cell is already on the free-list -- a remembered-set entry can outlive its cell (entries are never removed, see vm.c), so retracing the set must check this before dereferencing. */
+/* True if cell is already on the free-list -- a remembered-set entry can outlive its cell (entries are
+   never removed, see vm.c), so retracing the set must check this before dereferencing. */
 bool pool_is_freed(void* cell);
 
 /* True if cell's remembered-set bit is already set. */
@@ -92,7 +95,9 @@ bool pool_is_remembered(void* cell);
 /* Sets cell's remembered-set bit. Never cleared -- see the comment above. */
 void pool_mark_remembered(void* cell);
 
-/* Walks every carved-out cell; free-listed cells are always skipped, and if young_only, old cells too (a minor collection assumes old cells are live). Unmarked cells go to on_free then the free-list; marked cells are promoted with their mark bit cleared for next cycle. */
+/* Walks every carved-out cell; free-listed cells are always skipped, and if young_only, old cells too (a
+   minor collection assumes old cells are live). Unmarked cells go to on_free then the free-list; marked
+   cells are promoted with their mark bit cleared for next cycle. */
 /* live_out, when non-NULL on a MAJOR pass, accumulates the cells that survive. A major already
    visits every cell and decides each one's fate, so counting there costs a increment and saves the
    separate full-heap pass gc_count_live_cells would otherwise make right afterwards. Meaningless on

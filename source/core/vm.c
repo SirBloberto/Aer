@@ -153,7 +153,7 @@ static inline AerVal* vm_rk_ptr8(AerVal* registers, AerVal* pool, uint32_t rk8) 
 /* GC policy -- suppression, tuning, and the collection trigger         */
 /* ------------------------------------------------------------------ */
 
-/* True if v's own pooled cell is young; null/boolean/real (and inline integers) have no cell, so they're trivially "not young". */
+/* Young only if v has a pooled cell at all -- numbers and booleans have none. */
 /* None of these take a VM* -- adding one would break every existing embedder. Suppress/unsuppress
    and aer_gc_stats act on the current heap. configure/set_ceiling also update process-wide
    defaults, since real usage calls them before any VM exists. */
@@ -197,13 +197,13 @@ static inline __attribute__((always_inline)) bool gc_should_collect(VM* vm) {
     return heap->pool_alloc_count >= heap->minor_gc_threshold;
 }
 
-/* Called from every allocating opcode; kept tiny and always_inline so the common case costs nothing beyond what's already inlined into the dispatch loop. gc_run_collection_cycle (the rare, actual-collection path) lives in gc.c. */
+/* Tiny and always_inline, so the common case costs nothing. gc.c holds the collection itself. */
 static inline __attribute__((always_inline)) void gc_maybe_collect(VM* vm) {
     if (gc_should_collect(vm))
         gc_run_collection_cycle(vm);
 }
 
-/* Embedding-facing introspection (include/aer.h); live_cells is a bookkeeping snapshot, not a fresh trace, so it undercounts unswept-but-garbage cells since the last cycle. Reads whichever heap is current -- see vm_gc_suppress's comment. */
+/* live_cells is bookkeeping, not a fresh trace, so it counts garbage not yet swept. */
 void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
                   unsigned int* major_collections) {
     VmHeap* heap = vm_require_current_heap();
@@ -723,7 +723,8 @@ static const char* binop_symbol(Opcode op) {
 static AerVal vm_typed_array_binary_op(AerTypedArray* ta, AerTypedArray* tb, Opcode op);
 
 static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
-    /* Checked before null-handling below so `null in arr` isn't intercepted by the "null op anything-else errors" rule, which is about direct comparison, not container search. */
+    /* Before the null handling below, so `null in arr` is a container search rather than a
+       comparison error. */
     if (op == OP_IN)
         return vm_in(a, b);
 
@@ -802,7 +803,7 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
             memcpy(buf, as->data, as->length);
             memcpy(buf + as->length, bs->data, bs->length);
             buf[len] = '\0';
-            /* aer_make_string takes ownership of buf directly; no pool interning needed since this string is used once, right here (see vm_to_str's comment). */
+            /* aer_make_string takes ownership of buf. Used once here, so no interning. */
             return aer_make_string(buf, len);
         }
         if (op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE) {
@@ -876,7 +877,8 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
 
     if (aer_type(v) == TYPE_ARRAY || aer_type(v) == TYPE_DICT || aer_type(v) == TYPE_STRUCT ||
         aer_type(v) == TYPE_PACKED_ARRAY || aer_type(v) == TYPE_TYPED_ARRAY || aer_type(v) == TYPE_RESULT) {
-        /* Unbounded recursive content doesn't fit the fixed buffer below, so reuse print()'s formatter; sb.buf is already a fresh allocation, handed to aer_make_string as-is. */
+        /* Recursive content has no bounded size, so this reuses print()'s formatter and hands over
+           its buffer as-is. */
         StrBuf sb;
         strbuf_init(&sb);
         vm_format_value(vm->chunk, v, false, &sb);
@@ -901,7 +903,8 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
             case TYPE_RESULT: break; /* handled above */
             case TYPE_ANY: break; /* never a real AerVal's tag -- only Shape.field_types[] uses it */
         }
-        /* No chunk_add_pool interning: this string is used once and never looked up by pool index again. Interning would grow the pool/name_index forever per unique value — measured 7x slower for 100k unique casts vs. 10 distinct ones. */
+        /* Not interned: a runtime string is used once, and interning would grow the pool forever --
+           7x slower for 100k unique casts than for 10 distinct ones. */
         return aer_make_string_copy(buf, (unsigned int)strlen(buf));
     }
     /* No chunk_add_pool interning -- same reasoning as above. */
@@ -1027,7 +1030,7 @@ static __attribute__((noinline)) AerVal vm_interp_build(VM* vm, const AerVal* pa
     return aer_string_val(out);
 }
 
-/* Resolves a[start:end] bounds against length `len`; either bound may be TYPE_NULL (defaults to 0/len). Clamps out-of-range bounds instead of erroring, Python-slice style. */
+/* Either bound may be null, meaning 0 or len. Out-of-range clamps rather than errors, Python-style. */
 /* ------------------------------------------------------------------ */
 /* Slices and default values                                        */
 /* ------------------------------------------------------------------ */
@@ -1881,7 +1884,7 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
             if (arg_count != 1)
                 return false;
             const char* tn = vm_type_name(c, args[0]);
-            /* Copies rather than pointing at a static literal or the chunk's pool data -- AerString always owns its data, no exceptions. */
+            /* Copies: an AerString always owns its data, with no exceptions. */
             *out = aer_make_string_copy(
                 tn, (unsigned int)strlen(tn)); /* no chunk_add_pool interning -- see vm_to_str's comment */
             return true;
@@ -1989,7 +1992,7 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
             *out = aer_null();
             return;
         }
-        /* A single character is a length-1 string (AER has no char type); copies the byte since AerString must always own its data, even after obj is later collected. */
+        /* A character is a length-1 string; the byte is copied, since obj may be collected later. */
         *out = aer_make_string_copy(os->data + i, 1);
         return; /* no chunk_add_pool interning -- see vm_to_str's comment */
     } else if (aer_type(obj) == TYPE_RESULT) {

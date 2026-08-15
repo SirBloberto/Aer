@@ -17,7 +17,8 @@ typedef struct File {
     unsigned int line_base;
 } File;
 
-/* Array of File* (not File values) -- nested imports save a raw File* across their own lex/parse/run cycle via lexer_save_state, so growing this array must never move an already-issued File's address. */
+/* File* rather than File, because a nested import saves a raw File* across its own lex/parse/run
+   cycle -- growing this array must never move an already-issued address. */
 static File** files_storage = NULL;
 static int file_capacity = 0;
 static int file_index = 0;
@@ -29,7 +30,8 @@ static int indent_depth;
 static int pending_dedents;
 static bool at_line_start;
 
-/* Nesting depth of unclosed (/[/{ -- while > 0, newlines are whitespace instead of statement terminators, letting calls/literals span multiple lines. */
+/* Depth of unclosed (/[/{. Above zero, a newline is whitespace rather than a statement end, which
+   is what lets a call or literal span lines. */
 static int bracket_depth;
 
 static void indent_reset() {
@@ -56,7 +58,7 @@ void lexer_set_cursor(const char* pos) {
     current->buffer = (char*)pos;
 }
 
-/* For parser.c to tag bytecode with its source line (Chunk.line_mark_offsets) -- same scan as error_at(), just returning the number. */
+/* The line number, for tagging bytecode. Same scan as error_at(). */
 unsigned int current_source_line() {
     unsigned int line = 1;
     for (const char* p = current->start; p < current->buffer; p++)
@@ -278,7 +280,8 @@ static void lex_number() {
     if (buf[0] == '0' && (buf[1] == 'x' || buf[1] == 'X')) {
         if (!isxdigit((unsigned char)buf[2])) {
             error_at("Expected hex digits after '0x'");
-            /* Consume "0x" ourselves -- whether strtoll backs off to just "0" here is libc-defined, not something to rely on for forward progress. */
+            /* Consume "0x" ourselves: whether strtoll backs off to "0" is libc-defined, and
+               forward progress cannot rest on it. */
             return emit(TOKEN_ERROR, 2);
         }
         char* end;
@@ -291,7 +294,8 @@ static void lex_number() {
         return emit_integer(val, (unsigned int)(end - buf));
     }
 
-    /* lex() only calls lex_number() on a digit, so int_len is always >= 1 -- safe to fall through from error_at() below without an explicit return. */
+    /* lex() only reaches here on a digit, so int_len >= 1 -- safe to fall through from error_at()
+       below with no explicit return. */
     char* end;
     errno = 0;
     int64_t int_val = strtoll(buf, &end, 10);
@@ -404,7 +408,8 @@ static void lex_string() {
     current->buffer++; /* skip closing " */
 }
 
-/* """triple-quoted""" strings: unlike lex_string(), raw newlines are allowed and only a run of three quotes ends it; escapes/interpolation are handled later, same as lex_string(). */
+/* """triple-quoted""" strings: raw newlines are allowed and only three quotes end it. Escapes and
+   interpolation are handled later, the same as lex_string(). */
 static void lex_multiline_string() {
     current->buffer += 3; /* skip opening """ */
     char* start = current->buffer;
@@ -609,7 +614,8 @@ void lex() {
         case '^': return emit(TOKEN_BITWISE_XOR, 1);
     }
 
-    /* Unrecognized byte: error_at() doesn't exit in MODE_SHELL, so it must still be consumed here or parser.c's error-recovery loop spins forever re-lexing it. */
+    /* error_at() does not exit in MODE_SHELL, so the byte must still be consumed here or the
+       parser's recovery loop re-lexes it forever. */
     error_at("Unknown character: '%c'", *b);
     emit(TOKEN_ERROR, 1);
 }

@@ -130,10 +130,11 @@ int main(int argc, char** argv) {
     return status;
 }
 
-/* Parse and run all statements in the current source buffer; resets bytecode each call, but name/constant pools persist so indices stay stable across REPL calls. */
+/* Parses and runs the current source buffer. Bytecode resets each call; the name and constant
+   pools persist, so indices stay stable across REPL lines. */
 
 static void run() {
-    /* Append new code after any previous bytecode -- preserves function bodies compiled in earlier REPL calls. */
+    /* After any previous bytecode, so earlier REPL lines' function bodies survive. */
     aer_vm_reset_for_reuse(&vm);
     vm.ip = chunk.count;
     lex();
@@ -262,7 +263,8 @@ static bool run_file(char* path) {
             fclose(dump_out);
     }
 #endif
-    /* A runtime error doesn't terminate the process (see error.c) -- the CLI decides to exit nonzero here; a failed assert() doesn't set aer_had_error() on purpose (see error.h), so it's checked separately. */
+    /* A runtime error does not terminate the process, so the CLI decides the exit code. A failed
+       assert() deliberately does not set aer_had_error(), hence the separate check. */
     return !aer_had_error() && aer_assert_failure_count() == 0;
 }
 

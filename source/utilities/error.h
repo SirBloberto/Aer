@@ -37,7 +37,8 @@ extern AER_TLS bool runtime_had_error;
    so parse-time recovery runs unchanged. Nested vm_run calls save/restore it. */
 extern AerJmpBuf* runtime_error_unwind_target;
 
-/* Incremented by assert() on failure; deliberately not runtime_had_error, since DISPATCH() aborts vm_run on that flag but a failed assertion should report and keep going. */
+/* Incremented by assert() on failure; deliberately not runtime_had_error, since DISPATCH() aborts vm_run
+   on that flag but a failed assertion should report and keep going. */
 extern AER_TLS unsigned int assert_failure_count;
 
 /* Source-line lookup for runtime errors; NULL or a 0 return means "unknown", no line prefix. */
@@ -64,10 +65,12 @@ typedef void (*AerDiagnosticCallback)(unsigned int line, unsigned int col, const
                                       void* userdata);
 void aer_set_diagnostic_callback(AerDiagnosticCallback callback, void* userdata);
 
-/* Terminates the process for a condition error recovery doesn't apply to (OOM) -- routes through the same sink as error()/error_at() first; the only thing here still allowed to call exit(). */
+/* Terminates the process for a condition error recovery doesn't apply to (OOM) -- routes through the same
+   sink as error()/error_at() first; the only thing here still allowed to call exit(). */
 void aer_report_fatal(const char* msg);
 
-/* malloc/calloc/realloc/strdup, but fatal (via aer_report_fatal) on failure instead of returning NULL -- every call site is spared its own check. */
+/* malloc/calloc/realloc/strdup, but fatal (via aer_report_fatal) on failure instead of returning NULL --
+   every call site is spared its own check. */
 void* xmalloc(size_t size);
 void* xcalloc(size_t count, size_t size);
 void* xrealloc(void* ptr, size_t size);

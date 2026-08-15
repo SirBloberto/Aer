@@ -3043,7 +3043,8 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
                 if (slot >= 0) {
                     int src_slot = raw_materialize(c, rk_val, rhs_kind);
                     if (src_slot < 0) {
-                        /* Budget exhausted mid-materialize -- release the reservation, fall through to boxed. */
+                        /* Budget exhausted mid-materialize -- release the reservation, fall through to
+                           boxed. */
                         raw_unreserve_one(rhs_kind);
                     } else {
                         if (src_slot != slot) {

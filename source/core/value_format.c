@@ -65,7 +65,8 @@ unsigned int aer_format_int(long long v, char* buf, size_t bufsize) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Value formatting -- shared by print() and vm_to_str() (interpolation, +, etc.) for one consistent recursive rendering, not a terse "<array[3]>" fallback. */
+/* Value formatting -- shared by print() and vm_to_str() (interpolation, +, etc.) for one consistent
+   recursive rendering, not a terse "<array[3]>" fallback. */
 /* ------------------------------------------------------------------ */
 
 void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
@@ -176,7 +177,8 @@ void vm_print_value(Chunk* c, AerVal v, bool in_collection) {
     free(sb.buf);
 }
 
-/* Structural/reference equality with no error path -- unlike OP_EQ, a type mismatch here just means "not this one, keep looking." Used by OP_IN's array scan and collection.index_of (aer_collection.c). */
+/* Structural/reference equality with no error path -- unlike OP_EQ, a type mismatch here just means "not
+   this one, keep looking." Used by OP_IN's array scan and collection.index_of (aer_collection.c). */
 bool values_equal(AerVal a, AerVal b) {
     if (aer_type(a) != aer_type(b))
         return false;

@@ -21,12 +21,14 @@ typedef struct {
     unsigned int halt_addr; /* return address for the cross-VM call trampoline in aer_module_call() */
 } FileModule;
 
-/* Both arrays below grow the same way append() does (start small, double on overflow) rather than capping at a fixed file count, since there's no principled limit on how many files a program imports. */
+/* Both arrays below grow the same way append() does (start small, double on overflow) rather than capping
+   at a fixed file count, since there's no principled limit on how many files a program imports. */
 static FileModule* modules = NULL;
 static int module_count = 0;
 static int module_capacity = 0;
 
-/* "Currently loading" stack -- detects A-imports-B-imports-A cycles instead of recursing until the process runs out of file slots or stack space. */
+/* "Currently loading" stack -- detects A-imports-B-imports-A cycles instead of recursing until the process
+   runs out of file slots or stack space. */
 static char** loading_stack = NULL;
 static int loading_depth = 0;
 static int loading_capacity = 0;
@@ -136,7 +138,8 @@ void aer_module_free_all(void) {
     loading_depth = loading_capacity = 0;
 }
 
-/* Pushes a null placeholder onto the CALLING vm's stack -- every failure path in aer_module_call reports its error and still needs to leave exactly one result behind, matching the core builtins' convention. */
+/* Pushes a null placeholder onto the CALLING vm's stack -- every failure path in aer_module_call reports
+   its error and still needs to leave exactly one result behind, matching the core builtins' convention. */
 static void push_null_result(VM* vm) {
     if (vm->stack_top < VM_STACK_MAX)
         vm->stack[vm->stack_top++] = aer_null();
@@ -319,7 +322,13 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
     vm_gc_suppress();
     vm_run(mv);
     vm_gc_unsuppress();
-    /* runtime_had_error deliberately stays true on failure here (unlike aer_module_load's parse-time path) -- the called module's vm_run(mv) already caught its own error locally (its own catch point, installed and restored inside vm_run itself) and returned cleanly, so nothing automatically aborts the CALLING vm too anymore now that DISPATCH() no longer polls this flag every instruction. Propagate explicitly: longjmp to whatever vm_run() call is now the current unwind target (the calling vm's own, since vm_run(mv)'s return already restored it) -- exactly like a same-VM call error, just raised here instead of noticed passively. */
+    /* runtime_had_error deliberately stays true on failure here (unlike aer_module_load's parse-time path)
+       -- the called module's vm_run(mv) already caught its own error locally (its own catch point,
+       installed and restored inside vm_run itself) and returned cleanly, so nothing automatically aborts
+       the CALLING vm too anymore now that DISPATCH() no longer polls this flag every instruction.
+       Propagate explicitly: longjmp to whatever vm_run() call is now the current unwind target (the
+       calling vm's own, since vm_run(mv)'s return already restored it) -- exactly like a same-VM call
+       error, just raised here instead of noticed passively. */
     if (runtime_had_error) {
         push_null_result(vm);
         if (runtime_error_unwind_target)
