@@ -349,9 +349,9 @@ static bool rk_nonneg(Chunk* c, int rk) {
         AerVal v = c->pool[rk & ~RK_CONST_FLAG];
         return aer_type(v) == TYPE_INTEGER && aer_as_int(v) >= 0;
     }
-    if (rk & (RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))
-        return false;
-    return rk >= 0 && rk < FRAME_REGISTERS && P.reg_nonneg[rk];
+    /* A statically-typed operand is an ordinary register, so its proof is read the same way. */
+    int reg = drop_raw_marks(rk);
+    return reg >= 0 && reg < FRAME_REGISTERS && P.reg_nonneg[reg];
 }
 
 /* Non-negativity survives + * // and %, and only those: subtraction and left-shift can produce a
@@ -367,7 +367,7 @@ static bool binop_preserves_nonneg(Opcode op) {
 
 /* A plain register below the parameter count -- parameters occupy the frame's first registers. */
 static bool rk_param(int rk) {
-    return !(rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) && rk < P.current_param_count;
+    return !(rk & RK_CONST_FLAG) && drop_raw_marks(rk) < P.current_param_count;
 }
 
 static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
@@ -749,10 +749,14 @@ static void mark_shape_sensitive(int reg) {
    Packed-array field callers additionally require arr_reg == P.hint_param_reg (the field offset
    is only valid for that one specialized parameter); typed-array callers do not. */
 static bool index_safe_unchecked(int arr_reg, int idx_rk) {
-    if (idx_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))
+    if (idx_rk & RK_CONST_FLAG)
         return false;
+    /* The static-type marks name a register now, not a separate bank, so a typed index is still an
+       ordinary register and this proof is keyed on register identity. Rejecting it outright left
+       sieve's marking loop on the generic OP_INDEX_SET the moment its loop variable became typed. */
+    int idx_reg = drop_raw_marks(idx_rk);
     for (int i = 0; i < P.safe_loop_depth; i++) {
-        if (P.safe_loop_item_regs[i] == idx_rk && P.safe_loop_array_regs[i] == arr_reg)
+        if (P.safe_loop_item_regs[i] == idx_reg && P.safe_loop_array_regs[i] == arr_reg)
             return true;
     }
     return false;
@@ -1371,6 +1375,11 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
     if (dest < 0)
         return false;
     chunk_emit(c, PACK3(raw_op, dest, slot_lhs, rhs_field));
+    /* Carry the non-negativity proof exactly as emit_binary does for the checked form. Skipping it
+       here meant an expression silently lost the proof the moment it became eligible for unchecked
+       arithmetic -- `p*p` as a range start being the case that found it. */
+    if (dest >= 0 && dest < FRAME_REGISTERS)
+        P.reg_nonneg[dest] = binop_preserves_nonneg(op) && rk_nonneg(c, rk_lhs) && rk_nonneg(c, rk_rhs);
     note_raw_write(c, dest, int_kind ? RAWK_INT : RAWK_REAL);
     *out_rk = (int_kind ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest;
     return true;
@@ -3938,10 +3947,11 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
            non-negative constant. Both fail closed -- an unrecognized shape just compiles as before. */
         bool bound_safe = false;
         int bound_array_reg = -1;
-        if (P.length_tracked_valid && !(rk_end & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) {
+        if (P.length_tracked_valid && !(rk_end & RK_CONST_FLAG)) {
             for (int vi = 0; vi < P.var_count; vi++) {
-                if (P.var_names[vi] == P.length_tracked_name && P.var_kind[vi] == VAR_BOXED &&
-                    P.var_regs[vi] == rk_end) {
+                /* Any kind, not just VAR_BOXED: what matters is that this name still reads the
+                   length, which knowing its type does not change. */
+                if (P.var_names[vi] == P.length_tracked_name && P.var_regs[vi] == drop_raw_marks(rk_end)) {
                     bound_safe = true;
                     bound_array_reg = P.length_tracked_source_reg;
                     break;
