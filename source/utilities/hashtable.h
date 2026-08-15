@@ -6,11 +6,9 @@
 #include "pool.h"
 #include "value.h"
 
-/* Every hashtable's key storage and sparse probe array come from a HashPools instance -- never a
-   single process-global set, since a HashTable can belong to a specific VM's own heap (an AerDict)
-   or have no owning VM at all (a Chunk's name_index, which outlives/exists independently of any
-   one VM). Each owner supplies its own HashPools (a VM's own, embedded in VmHeap; a process-global
-   one for Chunk.name_index) and every HashTable records which one it was created with. */
+/* Key and probe-array storage for the tables one owner creates. Never process-global: a table can
+   belong to a VM's heap (an AerDict) or to no VM at all (a Chunk's name_index, which outlives any
+   of them), and a key duped from one HashPools and freed into another corrupts both. */
 #define HASH_KEY_TIER_COUNT 4
 #define HASH_SPARSE_TIER_COUNT 5
 #define HASH_DENSE_TIER_COUNT 6
@@ -21,93 +19,65 @@ typedef struct {
     bool initialized;
 } HashPools;
 
-/* FNV-1a's 32-bit form. Narrow on purpose: it lets AerString memoize a key's hash in padding the
-   string pool already rounds up to, and 32-bit ARM multiplies it with one `mul` rather than the
-   `umull`+`mla` pair a 64-bit multiply needs. */
+/* FNV-1a, 32-bit on purpose: it fits the padding AerString already rounds up to, so a key can
+   memoize its own hash for free. */
 typedef uint32_t HashValue;
 
-/* Idempotent -- safe to call every time a HashPools might not be initialized yet. */
+/* Idempotent. */
 void hashtable_pools_init(HashPools* pools);
 
-/* Compact hashtable backing Chunk's name_index and AerDict: a small sparse array of probe indices
-   (cache-resident even at large table sizes) pointing into a dense array of the actual entries,
-   packed in insertion order with no holes. Growing the table only ever touches the sparse array --
-   the dense array's entries are never moved by a rehash, only appended to. The table owns only the
-   key; the AerVal payload's heap cells belong to the GC. `hash` is cached at insertion so a rehash
-   or remove's repair walk never recomputes it. */
 typedef struct {
-    char* key;
+    char* key; /* owned; the AerVal payload's heap cells belong to the GC */
     unsigned int length;
-    HashValue hash;
+    HashValue hash; /* cached at insertion, so a rehash never recomputes it */
     AerVal payload;
 } HashTableEntry;
 
+/* A small sparse array of probe indices pointing into a dense array of entries packed in insertion
+   order. Growing touches only the sparse side -- dense entries are appended, never moved, which is
+   what lets AerDict's card marking index them by dense position. */
 typedef struct {
-    HashTableEntry* dense; /* insertion-appended, packed [0, count), no holes */
-    unsigned int* sparse; /* capacity-sized probe array; UINT32_MAX = empty,
-                                        otherwise a dense-array index */
-    unsigned int count; /* live entries -- also dense's used length */
-    unsigned int dense_capacity; /* allocated length of dense -- grows independently of capacity */
-    unsigned int capacity; /* allocated length of sparse; power of two */
-    HashPools* pools; /* set once at creation -- see HashPools' own comment above */
+    HashTableEntry* dense; /* packed [0, count), no holes */
+    unsigned int* sparse; /* UINT32_MAX = empty, else a dense index */
+    unsigned int count;
+    unsigned int dense_capacity;
+    unsigned int capacity; /* of sparse; power of two */
+    HashPools* pools;
 } HashTable;
 
-/* `length` must be the key's TRUE length -- i.e. already truncated at any embedded NUL via
-   hashtable_key_true_len below, the same length hashtable_key_dup would produce. get/put/remove
-   must all agree on this same truncated length for a given key's bytes, or a lookup and its own
-   prior insert can silently disagree (get/put pairs originating from the same source bytes should
-   always call hashtable_key_true_len once and reuse the result for both). */
+/* `length` must be the key's TRUE length (hashtable_key_true_len). get/put/remove disagreeing on it
+   for the same bytes makes a lookup silently miss its own insert. */
 void hashtable_put(HashTable* t, char* key, unsigned int length, AerVal value);
 AerVal* hashtable_get(HashTable* t, const char* key, unsigned int length);
 void hashtable_remove(HashTable* t, const char* key, unsigned int length);
 void hashtable_clear(HashTable* t);
 void hashtable_free(HashTable* t);
 
-/* Pre-sizes both the sparse and dense arrays for an expected final entry count known up front (a
-   dict literal's pair_count, at parse time) -- t->pools must already be set. Skips the incremental
-   growth every hashtable_put would otherwise do one entry at a time; a no-op if the table's
-   already at least this big. Never shrinks anything. */
+/* Pre-sizes both arrays for a count known up front, skipping incremental growth. Never shrinks. */
 void hashtable_reserve(HashTable* t, unsigned int expected_count);
 
-/* Same contract as the plain versions above, but the caller has already computed (or cached) the
-   key's hash itself -- e.g. an AerString reused as a dict key many times, or an existing
-   HashTableEntry's own cached .hash when copying it into another table -- and skips this table's
-   own hash_bytes() call. `hash` MUST equal hash_bytes(key, length) exactly, or this table's probe
-   sequence silently disagrees with a plain hashtable_get/put's, corrupting lookups. The plain
-   versions are defined in terms of these, not the other way around. */
+/* For a caller holding a cached hash. It MUST equal hashtable_hash_bytes(key, length), or this
+   table's probe sequence disagrees with the plain versions' and lookups corrupt. */
 void hashtable_put_hashed(HashTable* t, char* key, unsigned int length, HashValue hash, AerVal value);
 AerVal* hashtable_get_hashed(HashTable* t, const char* key, unsigned int length, HashValue hash);
 
-/* Same probe as hashtable_get_hashed, but returns the entry's dense-array index (or -1) instead of
-   a payload pointer -- see its own comment, hashtable.c, for why the GC's write barrier needs this. */
+/* The entry's dense index, or -1 -- what the GC write barrier needs instead of a payload pointer. */
 int hashtable_get_index_hashed(HashTable* t, const char* key, unsigned int length, HashValue hash);
 
-/* The exact hash function every HashTable in this codebase uses -- exposed so a caller can
-   precompute (and cache) a hash to pass to the _hashed calls above, using the identical algorithm
-   this file's own internal hash_key() already used before this existed. */
 HashValue hashtable_hash_bytes(const char* key, unsigned int length);
 
-/* Every owned key copy must go through this pair (they use `pools`' size-class pools, and the pool
-   lookup needs alloc size == free size). Truncates at the first embedded NUL; `len` is the
-   strlen-equivalent, the NUL is accounted for internally. `pools` must match whatever HashTable the
-   key will eventually be put into (or was removed from) -- a key duped from one HashPools and
-   freed into another would corrupt both. */
+/* Every owned key copy goes through this pair: they use size-class pools, so alloc size must equal
+   free size. Truncates at the first embedded NUL. */
 char* hashtable_key_dup(HashPools* pools, const char* data, unsigned int len, unsigned int* out_len);
-
-/* For callers that already hold hashtable_key_true_len's result: skips re-walking the key to find a
-   NUL that, by construction, is no longer there. `true_len` MUST already be truncated. */
 char* hashtable_key_dup_known(HashPools* pools, const char* data, unsigned int true_len);
 void hashtable_key_free(HashPools* pools, char* key, unsigned int len);
 
-/* The length hashtable_key_dup would truncate `data`/`len` to (first embedded NUL, or `len`
-   itself if none). A caller that needs the true length before deciding whether to look up or
-   insert -- rather than going through hashtable_key_dup, which only reports it after copying --
-   calls this directly. */
+/* Where hashtable_key_dup would truncate, for a caller that needs the length before deciding
+   whether to look up or insert. */
 unsigned int hashtable_key_true_len(const char* data, unsigned int len);
 
-/* An AerString used as a dict key, hashed once and remembered. Strings are immutable after
-   aer_string_alloc, so the memo can never go stale; see AerString.hash for why the truncated case
-   opts out rather than caching a hash the key's own length disagrees with. */
+/* Strings are immutable after allocation, so the memo cannot go stale; a truncated key opts out
+   rather than caching a hash its own length disagrees with. */
 static inline HashValue hashtable_string_hash(AerString* s, unsigned int true_len) {
     if (true_len != s->length)
         return hashtable_hash_bytes(s->data, true_len);
