@@ -4169,12 +4169,20 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
        is exactly what tests/test_nonneg_range_start.aer caught. */
     if (!rk_is_int_const(c, rk_start, 0) || !rk_is_int_const(c, rk_step, 1))
         return false;
-    if (P.reg_elem_kind[array_reg] != RAWK_INT)
+    RawKind ek = P.reg_elem_kind[array_reg];
+    if (ek != RAWK_INT && ek != RAWK_REAL)
         return false;
+    bool is_int = ek == RAWK_INT;
+
+    Opcode op_add = is_int ? OP_RAW_ADD_INT : OP_RAW_ADD_REAL;
+    Opcode op_sub = is_int ? OP_RAW_SUB_INT : OP_RAW_SUB_REAL;
+    Opcode op_mul = is_int ? OP_RAW_MUL_INT : OP_RAW_MUL_REAL;
+    Opcode op_get = is_int ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL;
 
     struct {
         Opcode op;
         uint8_t d, x, y;
+        bool accumulate;
     } ops[VEC_MAX_OPS];
     int n = 0;
     for (unsigned int at = body_start; at < body_end; at++) {
@@ -4182,38 +4190,37 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
             return false;
         uint32_t w = c->code[at];
         Opcode op = (Opcode)(w & 0xFF);
-        if (op != OP_INDEX_GET_RAW_INT && op != OP_TYPED_INDEX_GET_UNCHECKED && op != OP_RAW_ADD_INT &&
-            op != OP_RAW_SUB_INT && op != OP_RAW_MUL_INT && op != OP_RAW_ADD_INT_K && op != OP_RAW_SUB_INT_K)
+        bool k_form = is_int && (op == OP_RAW_ADD_INT_K || op == OP_RAW_SUB_INT_K);
+        if (op != op_get && op != OP_TYPED_INDEX_GET_UNCHECKED && op != op_add && op != op_sub &&
+            op != op_mul && !k_form)
             return false;
         /* The K forms carry a bare index into the chunk's raw-int table where the others carry a
            register, so it is read back to a value here rather than passed through as an operand. */
-        if ((op == OP_RAW_ADD_INT_K || op == OP_RAW_SUB_INT_K) && UNPACK_C(w) >= c->rawk_i_count)
+        if (k_form && UNPACK_C(w) >= c->rawk_i_count)
             return false;
         ops[n].op = op;
         ops[n].d = (uint8_t)UNPACK_A(w);
         ops[n].x = (uint8_t)UNPACK_B(w);
         ops[n].y = (uint8_t)UNPACK_C(w);
+        ops[n].accumulate = false;
         n++;
     }
     if (n < 2)
         return false;
 
-    /* The last instruction has to be the accumulate itself, reading a value built from the array. */
-    if (ops[n - 1].op != OP_RAW_ADD_INT || ops[n - 1].d != ops[n - 1].x)
-        return false;
-    uint8_t acc = ops[n - 1].d, tail = ops[n - 1].y;
-
-    /* -1 = not array-derived. The accumulator must appear nowhere but that final instruction: if
-       the body reads it mid-expression the running total is part of the arithmetic, and a single
-       whole-array pass cannot reproduce that. */
+    /* -1 = not array-derived. A body may hold several independent statements -- `sx = sx + a[i]`
+       and `sy = sy + b[i]` in one loop are two reductions, not one -- so an accumulate is
+       recognised wherever it appears rather than only as the last instruction. */
     int from_array[FRAME_REGISTERS];
-    for (int i = 0; i < FRAME_REGISTERS; i++)
+    bool is_acc_slot[FRAME_REGISTERS];
+    for (int i = 0; i < FRAME_REGISTERS; i++) {
         from_array[i] = -1;
-    for (int i = 0; i < n - 1; i++) {
+        is_acc_slot[i] = false;
+    }
+    int acc_count = 0;
+    for (int i = 0; i < n; i++) {
         bool k_form = ops[i].op == OP_RAW_ADD_INT_K || ops[i].op == OP_RAW_SUB_INT_K;
-        if (ops[i].d == acc || ops[i].x == acc || (!k_form && ops[i].y == acc))
-            return false;
-        if (ops[i].op == OP_INDEX_GET_RAW_INT || ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED) {
+        if (ops[i].op == op_get || ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED) {
             if (ops[i].y != (uint8_t)item_reg)
                 return false;
             /* A second column may join in, but only once its length is known to match the one the
@@ -4224,34 +4231,73 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
                   P.reg_elem_kind[ops[i].x] == P.reg_elem_kind[array_reg]))
                 return false;
             from_array[ops[i].d] = ops[i].x;
-        } else if (k_form) {
+            continue;
+        }
+        /* `t = t + <array-derived>` where t is not itself array-derived closes a statement. */
+        if (ops[i].op == op_add && ops[i].d == ops[i].x && from_array[ops[i].x] < 0 &&
+            !RK8_IS_CONST(ops[i].y) && from_array[ops[i].y] >= 0) {
+            ops[i].accumulate = true;
+            is_acc_slot[ops[i].d] = true;
+            acc_count++;
+            continue;
+        }
+        if (k_form) {
             /* The constant is the whole of the right operand, so only the left can carry the array. */
             if (RK8_IS_CONST(ops[i].x) || from_array[ops[i].x] < 0)
                 return false;
             from_array[ops[i].d] = 1;
-        } else {
-            /* At least one side has to carry the array. The other may be a second column of the
-               same length, a constant, or a loop-invariant scalar -- the array-level operators
-               handle all three, the last two by broadcasting. */
-            bool ax = !RK8_IS_CONST(ops[i].x) && from_array[ops[i].x] >= 0;
-            bool ay = !RK8_IS_CONST(ops[i].y) && from_array[ops[i].y] >= 0;
-            if (!ax && !ay)
-                return false;
-            from_array[ops[i].d] = 1; /* a real register is filled in during emission */
+            continue;
         }
+        /* At least one side has to carry the array. The other may be a second column of the same
+           length, a constant, or a loop-invariant scalar -- the array-level operators handle all
+           three, the last two by broadcasting. */
+        bool ax = !RK8_IS_CONST(ops[i].x) && from_array[ops[i].x] >= 0;
+        bool ay = !RK8_IS_CONST(ops[i].y) && from_array[ops[i].y] >= 0;
+        if (!ax && !ay)
+            return false;
+        from_array[ops[i].d] = 1; /* a real register is filled in during emission */
     }
-    if (RK8_IS_CONST(tail) || from_array[tail] < 0)
+    if (acc_count == 0)
         return false;
+    /* An accumulator may only ever be read as its own running total. Anywhere else and the total is
+       part of the arithmetic, which one pass over the array cannot reproduce. */
+    for (int i = 0; i < n; i++) {
+        if (ops[i].accumulate)
+            continue;
+        bool k_form = ops[i].op == OP_RAW_ADD_INT_K || ops[i].op == OP_RAW_SUB_INT_K;
+        if (is_acc_slot[ops[i].d] || (!RK8_IS_CONST(ops[i].x) && is_acc_slot[ops[i].x]) ||
+            (!k_form && !RK8_IS_CONST(ops[i].y) && is_acc_slot[ops[i].y]))
+            return false;
+    }
 
     /* Committed: the loop's own bytecode goes, and the array-level form takes its place. The
        registers the body claimed stay claimed, which wastes a few and cannot misbehave. */
     c->count = prep_at;
+    unsigned int mod_idx = chunk_add_pool(c, aer_make_string_copy("collection", 10));
+    unsigned int fn_idx = chunk_add_pool(c, aer_make_string_copy("sum", 3));
     int value[FRAME_REGISTERS];
     for (int i = 0; i < FRAME_REGISTERS; i++)
         value[i] = -1;
-    for (int i = 0; i < n - 1; i++) {
-        if (ops[i].op == OP_INDEX_GET_RAW_INT || ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED) {
+
+    for (int i = 0; i < n; i++) {
+        if (ops[i].op == op_get || ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED) {
             value[ops[i].d] = ops[i].x; /* the array itself replaces the element load */
+            continue;
+        }
+        if (ops[i].accumulate) {
+            int sum_reg = reg_alloc();
+            if (sum_reg < 0)
+                return false;
+            chunk_emit(c, PACK2(OP_MOVE, sum_reg, value[ops[i].y]));
+            chunk_emit(c, PACK3(OP_CALL_MODULE, sum_reg, sum_reg, 1));
+            chunk_emit(c, (uint32_t)mod_idx);
+            chunk_emit(c, (uint32_t)fn_idx);
+            chunk_emit(c, PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_SUM));
+            int tmp = slot_alloc(ek);
+            if (tmp < 0)
+                return false;
+            chunk_emit(c, PACK3(is_int ? OP_UNBOX_INT : OP_UNBOX_REAL, tmp, sum_reg, 0));
+            chunk_emit(c, PACK3(op_add, ops[i].d, ops[i].d, tmp));
             continue;
         }
         bool k_form = ops[i].op == OP_RAW_ADD_INT_K || ops[i].op == OP_RAW_SUB_INT_K;
@@ -4264,9 +4310,9 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
             rk_y = RK8_IS_CONST(ops[i].y) ? (int)(RK_CONST_FLAG | RK8_INDEX(ops[i].y))
                                           : (value[ops[i].y] >= 0 ? value[ops[i].y] : (int)ops[i].y);
         Opcode boxed;
-        if (ops[i].op == OP_RAW_ADD_INT || ops[i].op == OP_RAW_ADD_INT_K)
+        if (ops[i].op == op_add || ops[i].op == OP_RAW_ADD_INT_K)
             boxed = OP_ADD;
-        else if (ops[i].op == OP_RAW_SUB_INT || ops[i].op == OP_RAW_SUB_INT_K)
+        else if (ops[i].op == op_sub || ops[i].op == OP_RAW_SUB_INT_K)
             boxed = OP_SUB;
         else
             boxed = OP_MUL;
@@ -4274,27 +4320,9 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
         if (dest < 0)
             return false;
         emit_binary(c, dest, boxed, rk_x, rk_y);
-        P.reg_elem_kind[dest] = RAWK_INT; /* elementwise over a typed array yields a typed array */
+        P.reg_elem_kind[dest] = ek; /* elementwise over a typed array yields a typed array */
         value[ops[i].d] = dest;
     }
-
-    int arr_rk = value[tail];
-    int sum_reg = reg_alloc();
-    if (sum_reg < 0)
-        return false;
-    chunk_emit(c, PACK2(OP_MOVE, sum_reg, arr_rk));
-    unsigned int mod_idx = chunk_add_pool(c, aer_make_string_copy("collection", 10));
-    unsigned int fn_idx = chunk_add_pool(c, aer_make_string_copy("sum", 3));
-    chunk_emit(c, PACK3(OP_CALL_MODULE, sum_reg, sum_reg, 1));
-    chunk_emit(c, (uint32_t)mod_idx);
-    chunk_emit(c, (uint32_t)fn_idx);
-    chunk_emit(c, PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_SUM));
-
-    int tmp = slot_alloc(RAWK_INT);
-    if (tmp < 0)
-        return false;
-    chunk_emit(c, PACK3(OP_UNBOX_INT, tmp, sum_reg, 0));
-    chunk_emit(c, PACK3(OP_RAW_ADD_INT, acc, acc, tmp));
     return true;
 }
 

@@ -152,12 +152,45 @@ for i in 0..length(empty):
     t = t + empty[i]
 assert(t == 99, "an empty range adds nothing")
 
-# A float accumulator is deliberately left alone: collection.sum reassociates, so vectorizing it
-# would silently change the answer's low bits.
+# Float accumulators vectorize too. collection.sum keeps four partial sums rather than one running
+# total, which reassociates -- measured MORE accurate than sequential addition, not less, but not
+# bit-for-bit what the loop produced.
 f = [1.5; 4]
 ft = 0.0
 for i in 0..length(f):
     ft = ft + f[i]
-assert(ft == 6.0, "a float accumulator still runs as a loop")
+assert(ft == 6.0, "vectorized sum over a float array")
+
+fa = [0.0; 6]
+fb = [0.0; 6]
+fi = 0
+for fi < 6:
+    fa[fi] = float(fi)
+    fb[fi] = float(fi) * 2.0
+    fi += 1
+fn = length(fa)
+
+ft = 0.0
+for i in 0..fn:
+    ft = ft + fa[i] * fb[i]
+assert(ft == 110.0, "vectorized float dot product")
+
+# Several independent accumulators in one body are several reductions, not one.
+ax = 0.0
+ay = 0.0
+az = 0.0
+for i in 0..fn:
+    ax = ax + fa[i]
+    ay = ay + fb[i]
+    az = az + fa[i] * fb[i]
+assert(ax == 15.0 and ay == 30.0 and az == 110.0, "three accumulators in one body all vectorize")
+
+# Mixing an accumulator into another statement's arithmetic still has to decline.
+bx = 0
+by = 0
+for i in 0..n:
+    bx = bx + a[i]
+    by = by + bx
+assert(bx == 140 and by == 336, "an accumulator read by a second statement is not vectorized")
 
 print("test_loop_vectorization.aer: all assertions passed.")

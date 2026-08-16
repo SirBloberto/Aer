@@ -1397,6 +1397,28 @@ wide accumulator also measures slightly faster, so nothing is traded for it.
 `append`, `insert`, `delete` and `reserve` are the four that a typed array rejects -- its length is
 fixed when it is created.
 
+### Loops that become whole-array reductions
+
+A `for i in 0..n:` whose body only accumulates over typed arrays is compiled as if you had written
+the reduction directly, so it runs the vectorized kernel rather than five dispatches per element:
+
+```
+for i in 0..length(a):
+    total = total + a[i] * b[i]     # compiled as: total = total + collection.sum(a * b)
+```
+
+Over 4M elements that is 0.053s of loop against 0.0063s. Several independent accumulators in one
+body each become their own reduction. The bound must be the array's own `length()`, the range must
+start at 0 and step by 1, and every array involved must be provably the same length -- built from
+one count value. Anything else compiles as an ordinary loop, including a body with a branch, a
+`break`, an index other than the loop variable, or a running total that appears inside its own
+expression.
+
+One consequence worth knowing: `collection.sum` keeps four partial sums rather than one running
+total, so a **float** reduction is reassociated. Measured against Kahan summation this is *more*
+accurate than sequential addition, not less (1.3e-13 against 5.4e-13 over 1e8 elements) -- but it
+is not bit-for-bit what a hand-written loop produces. Integer reductions are exact either way.
+
 `collection.sort(arr)` requires every element to be a number (compared numerically, integer and
 float mix freely) or every element to be a string (compared lexicographically) — mixing the two is
 rejected rather than falling back to some arbitrary tie-break.
