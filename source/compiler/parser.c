@@ -4107,6 +4107,134 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
     assert_variables_below_floor("for-loop body");
 }
 
+#define VEC_MAX_OPS 16
+
+/* Rewrites a range-for into one whole-array reduction -- `for i in 0..length(a): t = t + a[i] * 2`
+   becomes `t = t + collection.sum(a * 2)`. Called with the body already compiled, and rewinds over
+   it on success; an unrecognised instruction returns false and leaves the loop exactly as it was.
+
+   Integer accumulators only, on purpose: integer addition is associative and exact, so the four
+   partial sums collection.sum keeps answer bit-identically, which a float accumulator would not. */
+/* Every opcode accepted below is one word, which is what makes walking the body safe -- an
+   unrecognised one stops the walk before its length would have mattered. */
+static bool rk_is_int_const(Chunk* c, int rk, int64_t want) {
+    if (!(rk & RK_CONST_FLAG))
+        return false;
+    AerVal v = c->pool[rk & ~RK_CONST_FLAG];
+    return aer_type(v) == TYPE_INTEGER && aer_as_int(v) == want;
+}
+
+static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int body_start,
+                                    unsigned int body_end, int item_reg, int array_reg, int rk_start,
+                                    int rk_step) {
+    if (array_reg < 0 || array_reg >= FRAME_REGISTERS || item_reg < 0 || item_reg >= FRAME_REGISTERS)
+        return false;
+    /* The reduction covers the whole array, so the loop has to as well. A start of `(i * i)` or a
+       step of 2 visits a subset, and summing everything would answer a different question -- which
+       is exactly what tests/test_nonneg_range_start.aer caught. */
+    if (!rk_is_int_const(c, rk_start, 0) || !rk_is_int_const(c, rk_step, 1))
+        return false;
+    if (P.reg_elem_kind[array_reg] != RAWK_INT)
+        return false;
+
+    struct {
+        Opcode op;
+        uint8_t d, x, y;
+    } ops[VEC_MAX_OPS];
+    int n = 0;
+    for (unsigned int at = body_start; at < body_end; at++) {
+        if (n >= VEC_MAX_OPS)
+            return false;
+        uint32_t w = c->code[at];
+        Opcode op = (Opcode)(w & 0xFF);
+        if (op != OP_INDEX_GET_RAW_INT && op != OP_TYPED_INDEX_GET_UNCHECKED && op != OP_RAW_ADD_INT &&
+            op != OP_RAW_SUB_INT && op != OP_RAW_MUL_INT)
+            return false;
+        ops[n].op = op;
+        ops[n].d = (uint8_t)UNPACK_A(w);
+        ops[n].x = (uint8_t)UNPACK_B(w);
+        ops[n].y = (uint8_t)UNPACK_C(w);
+        n++;
+    }
+    if (n < 2)
+        return false;
+
+    /* The last instruction has to be the accumulate itself, reading a value built from the array. */
+    if (ops[n - 1].op != OP_RAW_ADD_INT || ops[n - 1].d != ops[n - 1].x)
+        return false;
+    uint8_t acc = ops[n - 1].d, tail = ops[n - 1].y;
+
+    /* -1 = not array-derived. The accumulator must appear nowhere but that final instruction: if
+       the body reads it mid-expression the running total is part of the arithmetic, and a single
+       whole-array pass cannot reproduce that. */
+    int from_array[FRAME_REGISTERS];
+    for (int i = 0; i < FRAME_REGISTERS; i++)
+        from_array[i] = -1;
+    for (int i = 0; i < n - 1; i++) {
+        if (ops[i].d == acc || ops[i].x == acc || ops[i].y == acc)
+            return false;
+        if (ops[i].op == OP_INDEX_GET_RAW_INT || ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED) {
+            if (ops[i].x != (uint8_t)array_reg || ops[i].y != (uint8_t)item_reg)
+                return false;
+            from_array[ops[i].d] = array_reg;
+        } else {
+            /* One side must carry the array; the other may be a constant or a loop-invariant
+               scalar, which broadcasts. Two array operands would be a different array's element,
+               which this phase does not prove the length of. */
+            bool ax = !RK8_IS_CONST(ops[i].x) && from_array[ops[i].x] >= 0;
+            bool ay = !RK8_IS_CONST(ops[i].y) && from_array[ops[i].y] >= 0;
+            if (ax == ay)
+                return false;
+            from_array[ops[i].d] = 1; /* a real register is filled in during emission */
+        }
+    }
+    if (RK8_IS_CONST(tail) || from_array[tail] < 0)
+        return false;
+
+    /* Committed: the loop's own bytecode goes, and the array-level form takes its place. The
+       registers the body claimed stay claimed, which wastes a few and cannot misbehave. */
+    c->count = prep_at;
+    int value[FRAME_REGISTERS];
+    for (int i = 0; i < FRAME_REGISTERS; i++)
+        value[i] = -1;
+    for (int i = 0; i < n - 1; i++) {
+        if (ops[i].op == OP_INDEX_GET_RAW_INT || ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED) {
+            value[ops[i].d] = array_reg;
+            continue;
+        }
+        int rk_x = RK8_IS_CONST(ops[i].x) ? (int)(RK_CONST_FLAG | RK8_INDEX(ops[i].x))
+                                          : (value[ops[i].x] >= 0 ? value[ops[i].x] : (int)ops[i].x);
+        int rk_y = RK8_IS_CONST(ops[i].y) ? (int)(RK_CONST_FLAG | RK8_INDEX(ops[i].y))
+                                          : (value[ops[i].y] >= 0 ? value[ops[i].y] : (int)ops[i].y);
+        Opcode boxed = ops[i].op == OP_RAW_ADD_INT ? OP_ADD : (ops[i].op == OP_RAW_SUB_INT ? OP_SUB : OP_MUL);
+        int dest = reg_alloc();
+        if (dest < 0)
+            return false;
+        emit_binary(c, dest, boxed, rk_x, rk_y);
+        P.reg_elem_kind[dest] = RAWK_INT; /* elementwise over a typed array yields a typed array */
+        value[ops[i].d] = dest;
+    }
+
+    int arr_rk = value[tail];
+    int sum_reg = reg_alloc();
+    if (sum_reg < 0)
+        return false;
+    chunk_emit(c, PACK2(OP_MOVE, sum_reg, arr_rk));
+    unsigned int mod_idx = chunk_add_pool(c, aer_make_string_copy("collection", 10));
+    unsigned int fn_idx = chunk_add_pool(c, aer_make_string_copy("sum", 3));
+    chunk_emit(c, PACK3(OP_CALL_MODULE, sum_reg, sum_reg, 1));
+    chunk_emit(c, (uint32_t)mod_idx);
+    chunk_emit(c, (uint32_t)fn_idx);
+    chunk_emit(c, PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_SUM));
+
+    int tmp = slot_alloc(RAWK_INT);
+    if (tmp < 0)
+        return false;
+    chunk_emit(c, PACK3(OP_UNBOX_INT, tmp, sum_reg, 0));
+    chunk_emit(c, PACK3(OP_RAW_ADD_INT, acc, acc, tmp));
+    return true;
+}
+
 /* No exit-time cleanup needed -- col_reg/idx_reg are ordinary registers. Reserves the loop
    variable's register BEFORE compiling the collection expression, so later temps can never
    alias it. */
@@ -4252,6 +4380,22 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
         bool body_wrote_item = !range_tracked || P.range_item_written[P.range_loop_depth - 1];
         if (range_tracked)
             P.range_loop_depth--;
+
+        /* Attempted before LOOP is emitted, so a success rewinds over PREP and the body together.
+           Requires the loop's own bound proof: the whole-array reduction reads length(array)
+           elements, which is only the same work when the loop ran exactly that many. */
+        if (this_loop_safe && !body_wrote_item && P.loop_stack[P.loop_depth - 1].patch_count == 0 &&
+            P.loop_stack[P.loop_depth - 1].continue_patch_count == 0 &&
+            try_vectorize_reduction(c, prep_at, body_start, c->count, item_reg, bound_array_reg, rk_start,
+                                    rk_step)) {
+            P.loop_depth--;
+            hoist_end(c, prep_at, hoisting);
+            if (P.slot_floor == raised_reserved_floor) {
+                P.slot_floor = saved_reserved_floor;
+                P.slot_next = saved_reserved_floor;
+            }
+            return;
+        }
 
         unsigned int loop_bottom = c->count;
         /* PREP already left the start value in item_reg, so when the body never writes that register

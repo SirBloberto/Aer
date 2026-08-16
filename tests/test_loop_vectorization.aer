@@ -1,0 +1,106 @@
+# A range-for that only accumulates over one array is rewritten into a single whole-array reduction
+# (try_vectorize_reduction, parser.c). Most of what matters here is the shapes it must DECLINE: the
+# rewrite is invisible, so a case it wrongly accepts produces a wrong number rather than a crash.
+
+a = [0i; 8]
+ai = 0
+for ai < 8:
+    a[ai] = ai * ai
+    ai += 1
+n = length(a)
+# a is [0, 1, 4, 9, 16, 25, 36, 49]; the elements sum to 140.
+
+# --- shapes it rewrites ---
+t = 0
+for i in 0..n:
+    t = t + a[i]
+assert(t == 140, "vectorized sum over a typed int array")
+
+t = 0
+for i in 0..n:
+    t = t + a[i] * 2
+assert(t == 280, "vectorized sum of a scaled element")
+
+# --- shapes it must decline, each still producing the loop's own answer ---
+t = 0
+for i in 0..n:
+    t = t + a[i]
+    t = t + 1
+assert(t == 148, "a second statement in the body is not vectorized")
+
+t = 0
+for i in 0..n:
+    if a[i] > 4:
+        t = t + a[i]
+assert(t == 135, "a branch in the body is not vectorized")
+
+t = 0
+for i in 0..n:
+    t = t + a[0]
+assert(t == 0, "indexing by something other than the loop variable is not vectorized")
+
+t = 0
+for i in 0..n:
+    if i > 3:
+        break
+    t = t + a[i]
+assert(t == 14, "a break in the body is not vectorized")
+
+t = 0
+for i in 0..4:
+    t = t + a[i]
+assert(t == 14, "a bound that is not the array's length is not vectorized")
+
+# The running total is itself an operand, so no single pass over the array can reproduce it.
+t = 0
+for i in 0..n:
+    t = t + a[i] + t
+assert(t == 685, "an accumulator read inside the expression is not vectorized")
+
+t = 0
+for i in 0..n:
+    t = t + a[i] * a[i]
+assert(t == 4676, "two array operands are not vectorized in this phase")
+
+# The loop variable outliving the loop still has to hold what the loop left in it.
+last = -1
+t = 0
+for i in 0..n:
+    t = t + a[i]
+    last = i
+assert(last == 7 and t == 140, "a body that also writes another variable is not vectorized")
+
+# The reduction covers the whole array, so a loop over only part of it must not be rewritten. This
+# is the case that got through review: `for j in (i * i)..n` summed the entire array instead.
+t = 0
+for i in 2..n:
+    t = t + a[i]
+assert(t == 139, "a range that does not start at zero is not vectorized")
+
+t = 0
+start = 3
+for i in start..n:
+    t = t + a[i]
+assert(t == 135, "a variable start is not vectorized")
+
+t = 0
+for i in 0..n..2:
+    t = t + a[i]
+assert(t == 56, "a step other than one is not vectorized")
+
+# An empty range contributes nothing, exactly as the loop would.
+empty = [0i; 0]
+t = 99
+for i in 0..length(empty):
+    t = t + empty[i]
+assert(t == 99, "an empty range adds nothing")
+
+# A float accumulator is deliberately left alone: collection.sum reassociates, so vectorizing it
+# would silently change the answer's low bits.
+f = [1.5; 4]
+ft = 0.0
+for i in 0..length(f):
+    ft = ft + f[i]
+assert(ft == 6.0, "a float accumulator still runs as a loop")
+
+print("test_loop_vectorization.aer: all assertions passed.")
