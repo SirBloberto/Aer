@@ -244,4 +244,64 @@ for i in 0..n:
     by = by + bx
 assert(bx == 140 and by == 336, "an accumulator read by a second statement is not vectorized")
 
+# A GROUP BY written as a loop -- `revenue[g] = revenue[g] + x` -- becomes one scattering pass that
+# ADDS into the same array, so it keeps its identity and anything else referring to it sees the
+# updates, exactly as the loop left them.
+G = 4
+gr_region = [0.0; 8]
+gr_value = [0.0; 8]
+gr_other = [0.0; 8]
+gri = 0
+for gri < 8:
+    gr_region[gri] = float(gri % G)
+    gr_value[gri] = float(gri) + 1.0
+    gr_other[gri] = 2.0
+    gri += 1
+gn = length(gr_region)
+
+g1 = [0.0; G]
+for i in 0..gn:
+    g = integer(gr_region[i])
+    g1[g] = g1[g] + gr_value[i]
+assert(g1[0] == 6.0 and g1[1] == 8.0 and g1[2] == 10.0 and g1[3] == 12.0, "a grouped accumulate")
+
+g2 = [0.0; G]
+for i in 0..gn:
+    g = integer(gr_region[i])
+    g2[g] = g2[g] + gr_value[i] * gr_other[i]
+assert(g2[0] == 12.0 and g2[3] == 24.0, "a grouped accumulate over an expression")
+
+# It adds to what is already there rather than replacing it.
+g3 = [100.0; G]
+for i in 0..gn:
+    g = integer(gr_region[i])
+    g3[g] = g3[g] + gr_value[i]
+assert(g3[0] == 106.0 and g3[3] == 112.0, "accumulating on top of existing totals")
+
+# The array keeps its identity, so another name for it sees the same updates.
+g4 = [0.0; G]
+alias = g4
+for i in 0..gn:
+    g = integer(gr_region[i])
+    g4[g] = g4[g] + gr_value[i]
+assert(alias[0] == 6.0 and alias[3] == 12.0, "the accumulated array is mutated, not replaced")
+
+# --- must decline, each still producing the loop's own answer ---
+g5 = [1.0; G]
+for i in 0..gn:
+    g = integer(gr_region[i])
+    g5[g] = g5[g] * gr_value[i]
+assert(g5[0] == 5.0 and g5[1] == 12.0, "a multiplying group step is not an accumulation")
+
+g6 = [0.0; G]
+for i in 0..gn:
+    g6[0] = g6[0] + gr_value[i]
+assert(g6[0] == 36.0, "a constant index is not a group")
+
+g7 = [0.0; G]
+for i in 0..gn:
+    g = integer(gr_region[i])
+    g7[g] = gr_value[i]
+assert(g7[0] == 5.0 and g7[1] == 6.0, "a plain store keeps last-wins, not a total")
+
 print("test_loop_vectorization.aer: all assertions passed.")

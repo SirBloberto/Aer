@@ -4458,6 +4458,156 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
     return true;
 }
 
+/* `for i in 0..n: g = integer(region[i]); revenue[g] = revenue[g] + <expr>` -- a GROUP BY written
+   as a loop. Becomes one scattering pass that adds into revenue exactly where the loop did, so the
+   array keeps its identity and anything else referring to it sees the same updates.
+
+   Kept apart from try_vectorize_reduction because the shape is different in kind: it ends in an
+   indexed STORE whose index is another column's element, not in a scalar accumulate. */
+static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsigned int body_start,
+                                           unsigned int body_end, int item_reg, int array_reg, int rk_start,
+                                           int rk_step) {
+    if (array_reg < 0 || array_reg >= FRAME_REGISTERS || item_reg < 0 || item_reg >= FRAME_REGISTERS)
+        return false;
+    if (!rk_is_int_const(c, rk_start, 0) || !rk_is_int_const(c, rk_step, 1))
+        return false;
+
+    struct {
+        Opcode op;
+        uint8_t d, x, y;
+    } ops[VEC_MAX_OPS];
+    int n = 0;
+    for (unsigned int at = body_start; at < body_end; at++) {
+        if (n >= VEC_MAX_OPS)
+            return false;
+        uint32_t w = c->code[at];
+        Opcode op = (Opcode)(w & 0xFF);
+        if (op != OP_TYPED_INDEX_GET_UNCHECKED && op != OP_INDEX_GET_RAW_REAL && op != OP_RAW_REAL_TO_INT &&
+            op != OP_RAW_ADD_REAL && op != OP_RAW_SUB_REAL && op != OP_RAW_MUL_REAL &&
+            op != OP_INDEX_SET_RAW_REAL)
+            return false;
+        ops[n].op = op;
+        ops[n].d = (uint8_t)UNPACK_A(w);
+        ops[n].x = (uint8_t)UNPACK_B(w);
+        ops[n].y = (uint8_t)UNPACK_C(w);
+        n++;
+    }
+    if (n < 4 || ops[n - 1].op != OP_INDEX_SET_RAW_REAL)
+        return false;
+
+    /* from_col[r]: r holds an element of that column. group_of[r]: r is an index built from one. */
+    int from_col[FRAME_REGISTERS], group_of[FRAME_REGISTERS];
+    for (int i = 0; i < FRAME_REGISTERS; i++) {
+        from_col[i] = -1;
+        group_of[i] = -1;
+    }
+    /* INDEX_SET carries array, index, value in A, B, C -- unlike the arithmetic forms, whose A is a
+       destination. */
+    uint8_t target = ops[n - 1].d, gidx = ops[n - 1].x, stored = ops[n - 1].y;
+    int total_reg = -1; /* the `revenue[g]` read whose value the store adds to */
+
+    /* Stops before the last two: the accumulate and the store are checked on their own below, and
+       the accumulate is the one instruction allowed to read the running total. */
+    for (int i = 0; i < n - 2; i++) {
+        uint8_t d = ops[i].d, x = ops[i].x, y = ops[i].y;
+        if (RK8_IS_CONST(x) || RK8_IS_CONST(y))
+            return false;
+        if (ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED || ops[i].op == OP_INDEX_GET_RAW_REAL) {
+            if (y == (uint8_t)item_reg) {
+                /* A column read: this row's element of x. */
+                if (x != (uint8_t)array_reg &&
+                    !(P.reg_len_class[x] != 0 && P.reg_len_class[x] == P.reg_len_class[array_reg]))
+                    return false;
+                from_col[d] = x;
+            } else if (x == target && y == gidx && total_reg < 0) {
+                total_reg = d; /* the running total for this group */
+            } else {
+                return false;
+            }
+            continue;
+        }
+        if (ops[i].op == OP_RAW_REAL_TO_INT) {
+            if (from_col[x] < 0)
+                return false;
+            group_of[d] = from_col[x]; /* the column this index came from */
+            continue;
+        }
+        /* Arithmetic: at least one side must vary per row, and the running total must not be part
+           of it -- `t[g] = t[g] * x` is not an accumulation and cannot be scattered in one pass. */
+        if ((total_reg >= 0 && (x == (uint8_t)total_reg || y == (uint8_t)total_reg)))
+            return false;
+        if (from_col[x] < 0 && from_col[y] < 0)
+            return false;
+        from_col[d] = 1;
+    }
+
+    /* The stored value has to be exactly `running total + <per-row value>`. */
+    if (total_reg < 0 || group_of[gidx] < 0)
+        return false;
+    int add = n - 2;
+    if (add < 0 || ops[add].op != OP_RAW_ADD_REAL || ops[add].d != stored)
+        return false;
+    uint8_t sum_x = ops[add].x, sum_y = ops[add].y;
+    uint8_t value_reg;
+    if (sum_x == (uint8_t)total_reg)
+        value_reg = sum_y;
+    else if (sum_y == (uint8_t)total_reg)
+        value_reg = sum_x;
+    else
+        return false;
+    if (from_col[value_reg] < 0 || target == (uint8_t)array_reg)
+        return false;
+
+    /* Emit before discarding: three contiguous registers are needed for the call. */
+    int base = reg_alloc(), taken = base >= 0 ? 1 : 0;
+    for (int i = 0; base >= 0 && i < 2; i++) {
+        if (reg_alloc() != base + 1 + i) {
+            base = -1;
+            break;
+        }
+        taken++;
+    }
+    if (base < 0) {
+        if (taken)
+            reg_free(taken);
+        return false;
+    }
+
+    c->count = prep_at;
+    int value[FRAME_REGISTERS];
+    for (int i = 0; i < FRAME_REGISTERS; i++)
+        value[i] = -1;
+    for (int i = 0; i < n - 2; i++) {
+        if (ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED || ops[i].op == OP_INDEX_GET_RAW_REAL) {
+            if (ops[i].y == (uint8_t)item_reg)
+                value[ops[i].d] = ops[i].x;
+            continue;
+        }
+        if (ops[i].op == OP_RAW_REAL_TO_INT)
+            continue; /* group_sum takes the column itself, so the conversion is not needed */
+        int rx = value[ops[i].x] >= 0 ? value[ops[i].x] : (int)ops[i].x;
+        int ry = value[ops[i].y] >= 0 ? value[ops[i].y] : (int)ops[i].y;
+        Opcode boxed =
+            ops[i].op == OP_RAW_ADD_REAL ? OP_ADD : (ops[i].op == OP_RAW_SUB_REAL ? OP_SUB : OP_MUL);
+        int dest = reg_alloc();
+        if (dest < 0)
+            return false;
+        emit_binary(c, dest, boxed, rx, ry);
+        P.reg_elem_kind[dest] = RAWK_REAL;
+        value[ops[i].d] = dest;
+    }
+
+    chunk_emit(c, PACK2(OP_MOVE, base, target));
+    chunk_emit(c, PACK2(OP_MOVE, base + 1, value[value_reg] >= 0 ? value[value_reg] : (int)value_reg));
+    chunk_emit(c, PACK2(OP_MOVE, base + 2, group_of[gidx]));
+    chunk_emit(c, PACK3(OP_CALL_MODULE, base, base, 3));
+    chunk_emit(c, (uint32_t)chunk_add_pool(c, aer_make_string_copy("collection", 10)));
+    chunk_emit(c, (uint32_t)chunk_add_pool(c, aer_make_string_copy("group_sum", 9)));
+    chunk_emit(c, PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_GROUP_SUM_INTO));
+    reg_free(2);
+    return true;
+}
+
 /* No exit-time cleanup needed -- col_reg/idx_reg are ordinary registers. Reserves the loop
    variable's register BEFORE compiling the collection expression, so later temps can never
    alias it. */
@@ -4609,8 +4759,10 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
            elements, which is only the same work when the loop ran exactly that many. */
         if (this_loop_safe && !body_wrote_item && P.loop_stack[P.loop_depth - 1].patch_count == 0 &&
             P.loop_stack[P.loop_depth - 1].continue_patch_count == 0 &&
-            try_vectorize_reduction(c, prep_at, body_start, c->count, item_reg, bound_array_reg, rk_start,
-                                    rk_step)) {
+            (try_vectorize_reduction(c, prep_at, body_start, c->count, item_reg, bound_array_reg, rk_start,
+                                     rk_step) ||
+             try_vectorize_group_accumulate(c, prep_at, body_start, c->count, item_reg, bound_array_reg,
+                                            rk_start, rk_step))) {
             P.loop_depth--;
             hoist_end(c, prep_at, hoisting);
             if (P.slot_floor == raised_reserved_floor) {

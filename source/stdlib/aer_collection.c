@@ -335,6 +335,34 @@ static bool sum_chain_eval(AerVal* operand, int n, uint64_t packed, unsigned int
 }
 
 bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
+    if (fn_id == FN_COLLECTION_GROUP_SUM_INTO && arg_count == 3) {
+        AerVal grp_v = vm_stack_pop(vm);
+        AerVal val_v = vm_stack_pop(vm);
+        AerVal tgt_v = vm_stack_pop(vm);
+        if (aer_type(tgt_v) != TYPE_TYPED_ARRAY || aer_type(val_v) != TYPE_TYPED_ARRAY ||
+            aer_type(grp_v) != TYPE_TYPED_ARRAY) {
+            error("group accumulation needs three typed arrays");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        AerTypedArray* tgt = aer_as_typed_array(tgt_v);
+        AerTypedArray* val = aer_as_typed_array(val_v);
+        AerTypedArray* grp = aer_as_typed_array(grp_v);
+        if (val->count != grp->count || tgt->elem_kind != val->elem_kind) {
+            error("group accumulation needs matching lengths and element kinds");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        /* Adds into what the target already holds, exactly as the loop's `t[g] = t[g] + v` did --
+           no zeroing, and the array's own length is the group count. */
+        if (val->count > 0 && !group_sum_run(val, grp, tgt, tgt->count)) {
+            error("group index outside 0..%u", tgt->count - 1);
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        vm_stack_push(vm, tgt_v);
+        return true;
+    }
     if (fn_id == FN_COLLECTION_SUM_CHAIN && arg_count >= 3) {
         AerVal operand[CHAIN_MAX_OPERANDS];
         int n = arg_count - 1;
