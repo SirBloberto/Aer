@@ -499,6 +499,25 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
     return patch;
 }
 
+/* The rotated back-edge branches on the complement of the entry guard: "leave if !(i < n)" becomes
+   "go round again if i < n", spelled as jump-if-false of `n <= i`.
+
+   Ordering tests complement by swapping their operands, which is why reals are excluded: against a
+   NaN both `a < b` and `b <= a` are false, so the guard would fall through and the back-edge would
+   branch -- the loop would never end. Equality complements exactly at any type. */
+static bool complement_branch(Opcode op, Opcode* out, bool* swap) {
+    *swap = false;
+    switch (op) {
+        case OP_RAW_LT_INT_JUMP_IF_FALSE: *out = OP_RAW_LTE_INT_JUMP_IF_FALSE, *swap = true; return true;
+        case OP_RAW_LTE_INT_JUMP_IF_FALSE: *out = OP_RAW_LT_INT_JUMP_IF_FALSE, *swap = true; return true;
+        case OP_RAW_EQ_INT_JUMP_IF_FALSE: *out = OP_RAW_NEQ_INT_JUMP_IF_FALSE; return true;
+        case OP_RAW_NEQ_INT_JUMP_IF_FALSE: *out = OP_RAW_EQ_INT_JUMP_IF_FALSE; return true;
+        case OP_RAW_EQ_REAL_JUMP_IF_FALSE: *out = OP_RAW_NEQ_REAL_JUMP_IF_FALSE; return true;
+        case OP_RAW_NEQ_REAL_JUMP_IF_FALSE: *out = OP_RAW_EQ_REAL_JUMP_IF_FALSE; return true;
+        default: return false;
+    }
+}
+
 unsigned int emit_jump_if_false_reg(Chunk* c, int reg) {
     chunk_emit(c, PACK1(OP_JUMP_IF_FALSE_REG, reg));
     unsigned int patch_offset = c->count;
@@ -3918,6 +3937,32 @@ static void parse_loop_body(Chunk* c, unsigned int loop_top, unsigned int patch_
     loop_pop_and_patch(c, c->count);
 }
 
+/* Rotated form of parse_loop_body: the condition is re-emitted after the body and branches back,
+   so an iteration costs one branch instead of a branch plus an unconditional jump. Evaluation
+   count is unchanged -- the guard runs once and the back-edge runs once per iteration, which is
+   the same N+1 the top-tested form ran, so a condition that can raise raises exactly as often. */
+static void parse_loop_body_rotated(Chunk* c, unsigned int body_top, unsigned int patch_exit, Opcode back_op,
+                                    uint8_t lhs, uint8_t rhs) {
+    if (!loop_push_rotated())
+        return;
+    parse_block(c);
+    if (parse_had_error) {
+        P.loop_depth--;
+        return;
+    }
+
+    unsigned int cond_pos = c->count;
+    chunk_emit(c, PACK3(back_op, 0, lhs, rhs));
+    unsigned int patch_back = c->count;
+    chunk_emit(c, 0);
+    patch_jump(c, patch_back, body_top);
+
+    patch_jump(c, patch_exit, c->count);
+    /* `continue` lands on the re-emitted condition, not on the body's first instruction -- it must
+       still test before going round again. */
+    loop_pop_and_patch_rotated(c, c->count, cond_pos);
+}
+
 static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
     require(TOKEN_COLON, "expected ':' after for/while condition");
     if (parse_had_error)
@@ -3926,6 +3971,29 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
     /* Emitted BEFORE the floor is raised below: the compare/branch fusion only fires when the
        preceding LOADK wrote a temp, and raising the floor first disqualifies every such loop. */
     unsigned int patch_exit = emit_cond_jump_if_false(c, rk_cond, loop_top);
+
+    /* Rotatable only when the whole condition IS the fused branch. Anything computed ahead of it
+       would have to be duplicated at the back-edge too, and copying that region is a separate
+       problem: a jump inside it that leaves it carries a delta only valid where it was emitted. */
+    Opcode back_op = OP_HALT;
+    uint8_t back_lhs = 0, back_rhs = 0;
+    bool rotate = false;
+    if (patch_exit == loop_top + 1) {
+        uint32_t w = c->code[loop_top];
+        bool swap;
+        if (complement_branch((Opcode)(w & 0xFF), &back_op, &swap)) {
+            uint8_t a = (uint8_t)UNPACK_B(w), b = (uint8_t)UNPACK_C(w);
+            /* These opcodes take a constant in the right operand only, so an ordering test against
+               a literal bound (`for i < 5:`) cannot be complemented by swapping -- the complement
+               of `i < K` wants K on the left. Such loops keep the top-tested shape. */
+            bool swap_encodable = !RK8_IS_CONST(a) && !RK8_IS_CONST(b);
+            if (!swap || swap_encodable) {
+                back_lhs = swap ? b : a;
+                back_rhs = swap ? a : b;
+                rotate = true;
+            }
+        }
+    }
 
     /* The back-edge re-runs the condition, so holding the floor above the temps it writes stops a
        shadowing assignment in the body from claiming one as a permanent variable. */
@@ -3938,7 +4006,10 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
             P.slot_next = P.slot_floor;
     }
 
-    parse_loop_body(c, loop_top, patch_exit);
+    if (rotate)
+        parse_loop_body_rotated(c, patch_exit + 1, patch_exit, back_op, back_lhs, back_rhs);
+    else
+        parse_loop_body(c, loop_top, patch_exit);
 
     /* Only give the condition's registers back if the body claimed nothing above them. AER scopes
        variables to the whole function, so a name first assigned inside the body outlives the loop
