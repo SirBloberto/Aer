@@ -1300,7 +1300,14 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
         /* Real only. An integer raw side composed with a boxed real must promote the whole result
            to real, which an int slot cannot hold -- OP_UNBOX_REAL widens an integer the same way
            the boxed arithmetic does, so only that direction is safe here. */
-        if ((lhs_raw ? kind_lhs : kind_rhs) == RAWK_REAL &&
+        /* A register known to hold a typed array is not a number awaiting an unbox: `a * 2.0`
+           broadcasts the scalar across it, so it has to stay on the boxed path that reaches
+           vm_typed_array_scalar_op. Unboxing it raised "Cannot apply this operator to float and
+           float32[]" one opcode early instead. */
+        int boxed_reg = drop_raw_marks(boxed_rk);
+        bool boxed_is_typed_array = !(boxed_rk & RK_CONST_FLAG) && boxed_reg >= 0 &&
+                                    boxed_reg < FRAME_REGISTERS && P.reg_elem_kind[boxed_reg] != RAWK_NONE;
+        if ((lhs_raw ? kind_lhs : kind_rhs) == RAWK_REAL && !boxed_is_typed_array &&
             !(boxed_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) {
             release_if_top(boxed_rk);
             int tmp = slot_alloc(RAWK_REAL);
@@ -2852,12 +2859,27 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             continue;
         }
 
+        /* Elementwise arithmetic on a typed array yields a typed array of the same kind, and the
+           result has to say so or the next operator in the chain sees an unproven register and
+           unboxes it -- `(a - 1.0) * 2.0` failed on exactly that. Read before the registers are
+           freed, since dest may be handed one of them. */
+        RawKind chain_elem = RAWK_NONE;
+        if (op == OP_ADD || op == OP_SUB || op == OP_MUL) {
+            int lr = drop_raw_marks(lhs), rr = drop_raw_marks(rhs);
+            if (!(lhs & RK_CONST_FLAG) && lr >= 0 && lr < FRAME_REGISTERS)
+                chain_elem = P.reg_elem_kind[lr];
+            if (chain_elem == RAWK_NONE && !(rhs & RK_CONST_FLAG) && rr >= 0 && rr < FRAME_REGISTERS)
+                chain_elem = P.reg_elem_kind[rr];
+        }
+
         /* Free-then-allocate, RHS then LHS, matching compile_node's own discipline exactly. */
         release_if_top(rhs);
         release_if_top(lhs);
 
         int dest = reg_alloc();
         emit_binary(c, dest, op, lhs, rhs);
+        if (dest >= 0 && dest < FRAME_REGISTERS)
+            P.reg_elem_kind[dest] = chain_elem;
         lhs = dest;
         lhs_start = c->count;
     }

@@ -707,6 +707,7 @@ static const char* binop_symbol(Opcode op) {
 /* Defined below vm_typed_elem_width/read/write, which it needs; forward-declared here since
    vm_binary_cold (this function) is defined first in the file. */
 static AerVal vm_typed_array_binary_op(AerTypedArray* ta, AerTypedArray* tb, Opcode op);
+static AerVal vm_typed_array_scalar_op(AerTypedArray* a, AerVal scalar, Opcode op, bool flip);
 
 static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
     /* Before the null handling below, so `null in arr` is a container search rather than a
@@ -826,6 +827,16 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
             return vm_typed_array_binary_op(tta, ttb, op);
         error("Operator not valid for typed arrays");
         return aer_bool(false);
+    }
+
+    /* One side a typed array, the other a plain number: broadcast it across the array. */
+    if ((op == OP_ADD || op == OP_SUB || op == OP_MUL)) {
+        bool a_arr = aer_type(a) == TYPE_TYPED_ARRAY, b_arr = aer_type(b) == TYPE_TYPED_ARRAY;
+        bool a_num = ta == TYPE_INTEGER || ta == TYPE_REAL, b_num = tb == TYPE_INTEGER || tb == TYPE_REAL;
+        if (a_arr && b_num)
+            return vm_typed_array_scalar_op(aer_as_typed_array(a), b, op, false);
+        if (b_arr && a_num)
+            return vm_typed_array_scalar_op(aer_as_typed_array(b), a, op, true);
     }
 
     if (aer_type(a) == TYPE_DICT && aer_type(b) == TYPE_DICT) {
@@ -1423,8 +1434,38 @@ AER_TYPED_ELEMENTWISE_FASTMATH(typed_add_f32, float, a[i] + b[i])
 AER_TYPED_ELEMENTWISE_FASTMATH(typed_sub_f32, float, a[i] - b[i])
 AER_TYPED_ELEMENTWISE_FASTMATH(typed_mul_f32, float, a[i] * b[i])
 
+/* The same kernels against one broadcast value rather than a second array. `s` is passed already
+   narrowed to the element type, so the loop body is the element type throughout and vectorizes as
+   the two-array form does. Subtraction needs both orders; add and multiply commute. */
+#define AER_TYPED_SCALAR(name, ctype, op_expr)                                                               \
+    static __attribute__((optimize("O3", "tree-vectorize"))) void name(                                      \
+        ctype* restrict c, const ctype* restrict a, ctype s, unsigned int n) {                               \
+        for (unsigned int i = 0; i < n; i++)                                                                 \
+            c[i] = op_expr;                                                                                  \
+    }
+#define AER_TYPED_SCALAR_FASTMATH(name, ctype, op_expr)                                                      \
+    static __attribute__((optimize("O3", "tree-vectorize", "fast-math"))) void name(                         \
+        ctype* restrict c, const ctype* restrict a, ctype s, unsigned int n) {                               \
+        for (unsigned int i = 0; i < n; i++)                                                                 \
+            c[i] = op_expr;                                                                                  \
+    }
+
+#define AER_TYPED_SCALAR_SET(sfx, ctype, DEF)                                                                \
+    DEF(typed_adds_##sfx, ctype, a[i] + s)                                                                   \
+    DEF(typed_subs_##sfx, ctype, a[i] - s)                                                                   \
+    DEF(typed_rsubs_##sfx, ctype, s - a[i])                                                                  \
+    DEF(typed_muls_##sfx, ctype, a[i] * s)
+
+AER_TYPED_SCALAR_SET(i32, int32_t, AER_TYPED_SCALAR)
+AER_TYPED_SCALAR_SET(i64, int64_t, AER_TYPED_SCALAR)
+AER_TYPED_SCALAR_SET(f64, double, AER_TYPED_SCALAR)
+AER_TYPED_SCALAR_SET(f32, float, AER_TYPED_SCALAR_FASTMATH)
+
 #undef AER_TYPED_ELEMENTWISE
 #undef AER_TYPED_ELEMENTWISE_FASTMATH
+#undef AER_TYPED_SCALAR
+#undef AER_TYPED_SCALAR_FASTMATH
+#undef AER_TYPED_SCALAR_SET
 
 /* Checks the free-cache (vm.h's own comment on TypedArrayFreeSlot) for a buffer of EXACTLY this
    size before falling back to xmalloc -- linear scan over a handful of slots, cheap regardless of
@@ -1612,6 +1653,40 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
                 typed_mul_f64(rc, ra, rb, a->count);
             break;
         }
+    }
+    return aer_typed_array_val(r);
+}
+
+/* `a * 2.0` and `2.0 * a`. Broadcasting the scalar rather than requiring a second array of it is
+   what lets a whole-array expression carry a constant at all -- without it any loop body with a
+   literal in it has no array-level form to be written as. `flip` is set when the scalar was the
+   left operand, which only changes subtraction. */
+static AerVal vm_typed_array_scalar_op(AerTypedArray* a, AerVal scalar, Opcode op, bool flip) {
+    double s = aer_type(scalar) == TYPE_INTEGER ? (double)aer_as_int(scalar) : aer_as_real(scalar);
+    AerTypedArray* r = vm_new_typed_array(a->elem_kind, a->count);
+    unsigned int n = a->count;
+    bool rsub = (op == OP_SUB && flip);
+    switch (a->elem_kind) {
+#define AER_SCALAR_CASE(KIND, sfx, ctype)                                                                    \
+    case KIND: {                                                                                             \
+        ctype* rc = (ctype*)r->data;                                                                         \
+        const ctype* ra = (const ctype*)a->data;                                                             \
+        ctype sv = (ctype)s;                                                                                 \
+        if (op == OP_ADD)                                                                                    \
+            typed_adds_##sfx(rc, ra, sv, n);                                                                 \
+        else if (op == OP_MUL)                                                                               \
+            typed_muls_##sfx(rc, ra, sv, n);                                                                 \
+        else if (rsub)                                                                                       \
+            typed_rsubs_##sfx(rc, ra, sv, n);                                                                \
+        else                                                                                                 \
+            typed_subs_##sfx(rc, ra, sv, n);                                                                 \
+        break;                                                                                               \
+    }
+        AER_SCALAR_CASE(TYPED_ELEM_INT32, i32, int32_t)
+        AER_SCALAR_CASE(TYPED_ELEM_INT64, i64, int64_t)
+        AER_SCALAR_CASE(TYPED_ELEM_FLOAT32, f32, float)
+        AER_SCALAR_CASE(TYPED_ELEM_FLOAT64, f64, double)
+#undef AER_SCALAR_CASE
     }
     return aer_typed_array_val(r);
 }

@@ -140,4 +140,21 @@ assert(xs32 != ys32, "!= is true for two distinct typed array objects, even with
 # bad = [1i; 3] + [1i; 5]         # would error: Typed arrays must have the same length (got 3 and 5)
 # bad = [1i; 3] + [1.0; 3]        # would error: Cannot combine typed arrays of different element kinds
 
+# A number on either side of a typed array broadcasts across it. Only subtraction cares which side.
+bc = [10.0; 3]
+assert((bc + 3.0)[0] == 13.0 and (3.0 + bc)[0] == 13.0, "scalar add broadcasts from either side")
+assert((bc * 3.0)[0] == 30.0 and (3.0 * bc)[0] == 30.0, "scalar multiply broadcasts from either side")
+assert((bc - 3.0)[0] == 7.0, "array minus scalar")
+assert((3.0 - bc)[0] == -7.0, "scalar minus array keeps the operand order")
+
+bc_i = [10i; 3]
+assert((bc_i - 3)[0] == 7 and (3 - bc_i)[0] == -7, "scalar broadcast over an int32 array")
+assert((bc * 2)[0] == 20.0, "an integer scalar broadcasts over a float array")
+assert(length(bc * 2.0) == 3, "broadcasting preserves the length")
+
+# The result of one broadcast is still a typed array, so it can carry the next operator. Without
+# that the chain's second operator saw an unproven register and tried to unbox it.
+assert(((bc - 1.0) * 2.0)[0] == 18.0, "a broadcast result chains into the next operator")
+assert(((bc * 2.0) + bc)[0] == 30.0, "a broadcast result combines with a whole array")
+
 print("test_typed_arrays.aer: all assertions passed.")
