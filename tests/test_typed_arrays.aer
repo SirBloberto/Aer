@@ -202,4 +202,33 @@ import collection
 assert(collection.sum(cmp_a < 350.0) == 4.0, "summing a mask counts the matches")
 assert(collection.sum(cmp_a * (cmp_a < 350.0)) == 600.0, "value times mask is a filtered total")
 
+# collection.sum() of a chain of array operators is folded into one tiled pass, so no intermediate
+# is ever materialised. The fused and unfused spellings must agree exactly.
+fu_a = [0.0; 12]
+fu_b = [0.0; 12]
+fu_c = [0.0; 12]
+fui = 0
+for fui < 12:
+    fu_a[fui] = float(fui) + 1.0
+    fu_b[fui] = 2.0
+    fu_c[fui] = 0.5
+    fui += 1
+
+step = fu_a * fu_b
+step = step * fu_c
+assert(collection.sum(fu_a * fu_b * fu_c) == collection.sum(step),
+       "a fused chain agrees with the same chain computed step by step")
+assert(collection.sum(fu_a * fu_b * fu_c) == 78.0, "and with the arithmetic done by hand")
+assert(collection.sum(fu_a + fu_b + fu_c) == 108.0, "addition chains fuse too")
+assert(collection.sum(fu_a * fu_b - fu_c) == 150.0, "mixed operators keep their order")
+
+# A scalar operand broadcasts inside the fused pass exactly as it does outside it.
+assert(collection.sum(fu_a * fu_b * 2.0) == 312.0, "a scalar in the chain broadcasts")
+
+# Chains over one element and empty arrays are the degenerate cases.
+one_a = [3.0; 1]
+assert(collection.sum(one_a * one_a * one_a) == 27.0, "a single-element chain")
+none_a = [1.0; 0]
+assert(collection.sum(none_a * none_a * none_a) == 0.0, "an empty chain sums to zero")
+
 print("test_typed_arrays.aer: all assertions passed.")

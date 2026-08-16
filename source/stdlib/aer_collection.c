@@ -145,6 +145,55 @@ static bool group_sum_run(AerTypedArray* val, AerTypedArray* grp, AerTypedArray*
 #undef GS_BY_GROUP
 }
 
+/* `collection.sum(a * b * c)` in one pass rather than one whole-array pass per operator, each of
+   which writes a full-size intermediate the next reads straight back. Tiled rather than enumerated:
+   a kernel per operator combination is 27 shapes before element kinds are counted, while a block at
+   a time keeps every intermediate in L1 and covers any chain. */
+#define CHAIN_TILE 1024u
+#define CHAIN_MAX_OPERANDS 8
+
+static double as_number(AerVal v);
+
+/* Two bits per operator, innermost first, as parse_module_call packs them. */
+static Opcode chain_op_at(uint64_t packed, int i) {
+    switch ((packed >> (2 * i)) & 3u) {
+        case 0: return OP_ADD;
+        case 1: return OP_SUB;
+        default: return OP_MUL;
+    }
+}
+
+static void chain_load_tile(double* restrict dst, AerVal v, unsigned int at, unsigned int len) {
+    if (aer_type(v) != TYPE_TYPED_ARRAY) {
+        double s = as_number(v);
+        for (unsigned int i = 0; i < len; i++)
+            dst[i] = s;
+        return;
+    }
+    AerTypedArray* t = aer_as_typed_array(v);
+    if (t->elem_kind == TYPED_ELEM_FLOAT64) {
+        memcpy(dst, (const double*)t->data + at, (size_t)len * sizeof(double));
+    } else {
+        const float* f = (const float*)t->data + at;
+        for (unsigned int i = 0; i < len; i++)
+            dst[i] = (double)f[i];
+    }
+}
+
+REDUCE_ATTR static void chain_apply(double* restrict acc, const double* restrict rhs, Opcode op,
+                                    unsigned int len) {
+    if (op == OP_ADD) {
+        for (unsigned int i = 0; i < len; i++)
+            acc[i] += rhs[i];
+    } else if (op == OP_SUB) {
+        for (unsigned int i = 0; i < len; i++)
+            acc[i] -= rhs[i];
+    } else {
+        for (unsigned int i = 0; i < len; i++)
+            acc[i] *= rhs[i];
+    }
+}
+
 static double as_number(AerVal v) {
     return aer_type(v) == TYPE_INTEGER ? (double)aer_as_int(v) : aer_as_real(v);
 }
@@ -258,7 +307,74 @@ static bool boxed_reduce(AerArray* a, int fn_id, const char* fname, AerVal* out)
     return true;
 }
 
+/* One tiled pass over the whole chain: load a block of the first operand, apply every operator to
+   that block, add it up, move on. Nothing full-size is ever written. Float operands only -- an
+   integer chain would have to answer as an integer, which a double accumulator cannot promise. */
+static bool sum_chain_eval(AerVal* operand, int n, uint64_t packed, unsigned int count, double* out) {
+    double lhs[CHAIN_TILE], rhs[CHAIN_TILE];
+    double t0 = 0, t1 = 0;
+    for (unsigned int at = 0; at < count; at += CHAIN_TILE) {
+        unsigned int len = count - at < CHAIN_TILE ? count - at : CHAIN_TILE;
+        chain_load_tile(lhs, operand[0], at, len);
+        for (int k = 1; k < n; k++) {
+            chain_load_tile(rhs, operand[k], at, len);
+            chain_apply(lhs, rhs, chain_op_at(packed, k - 1), len);
+        }
+        /* Two partial sums, matching collection.sum's own reassociation rather than inventing a
+           different one -- the fused and unfused spellings must agree. */
+        unsigned int i = 0;
+        for (; i + 2 <= len; i += 2) {
+            t0 += lhs[i];
+            t1 += lhs[i + 1];
+        }
+        for (; i < len; i++)
+            t0 += lhs[i];
+    }
+    *out = t0 + t1;
+    return true;
+}
+
 bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
+    if (fn_id == FN_COLLECTION_SUM_CHAIN && arg_count >= 3) {
+        AerVal operand[CHAIN_MAX_OPERANDS];
+        int n = arg_count - 1;
+        if (n > CHAIN_MAX_OPERANDS) {
+            error("sum() chain too long to fuse");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        for (int i = n - 1; i >= 0; i--)
+            operand[i] = vm_stack_pop(vm);
+        AerVal packed_v = vm_stack_pop(vm);
+        unsigned int count = 0;
+        bool sized = false;
+        for (int i = 0; i < n; i++) {
+            if (aer_type(operand[i]) == TYPE_TYPED_ARRAY) {
+                AerTypedArray* t = aer_as_typed_array(operand[i]);
+                if (t->elem_kind != TYPED_ELEM_FLOAT32 && t->elem_kind != TYPED_ELEM_FLOAT64) {
+                    error("sum() over a chain fuses float columns only");
+                    vm_stack_push(vm, aer_null());
+                    return true;
+                }
+                if (sized && t->count != count) {
+                    error("Typed arrays must have the same length (got %u and %u)", count, t->count);
+                    vm_stack_push(vm, aer_null());
+                    return true;
+                }
+                count = t->count;
+                sized = true;
+            } else if (aer_type(operand[i]) != TYPE_INTEGER && aer_type(operand[i]) != TYPE_REAL) {
+                error("sum() over a chain needs numbers and typed arrays");
+                vm_stack_push(vm, aer_null());
+                return true;
+            }
+        }
+        double total = 0.0;
+        if (sized && count > 0)
+            sum_chain_eval(operand, n, (uint64_t)aer_as_int(packed_v), count, &total);
+        vm_stack_push(vm, aer_real(total));
+        return true;
+    }
     if (fn_id == FN_COLLECTION_GROUP_SUM && arg_count == 3) {
         AerVal ngroups_v = vm_stack_pop(vm);
         AerVal grp_v = vm_stack_pop(vm);

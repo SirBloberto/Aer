@@ -97,6 +97,9 @@ enum { AER_NATIVE_MODULES(AER_MODULE_ID) CALL_MODULE_DYNAMIC };
 #define FN_COLLECTION_MIN 9
 #define FN_COLLECTION_MAX 10
 #define FN_COLLECTION_GROUP_SUM 11
+/* Compiler-emitted only: collection.sum() of a chain of array operators, fused. No source spells
+   it, so it has no entry in the parser's name lookup. */
+#define FN_COLLECTION_SUM_CHAIN 12
 
 #define FN_NET_CONNECT 0
 #define FN_NET_SEND 1
