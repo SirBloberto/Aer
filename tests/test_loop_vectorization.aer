@@ -78,6 +78,57 @@ for i in 0..length(r):
     t = t + r[i] * s[i]
 assert(t == 24, "a count reassigned between constructions does not prove equal length")
 
+# An `if` wrapping the whole body is a filter, and a filter has an array form: the condition becomes
+# a 1/0 mask and the accumulate sums the value times it. The bound has to be in a register, which is
+# where the loop preheader hoists a literal anyway.
+fbound = 4
+t = 0
+for i in 0..n:
+    if a[i] > fbound:
+        t = t + a[i]
+assert(t == 135, "a filtered accumulate vectorizes through a mask")
+
+t = 0
+for i in 0..n:
+    if a[i] > fbound:
+        t = t + a[i] * 2
+assert(t == 270, "with an expression under the guard")
+
+# Several accumulates under one guard share the mask.
+fx = 0
+fy = 0
+for i in 0..n:
+    if a[i] > fbound:
+        fx = fx + a[i]
+        fy = fy + 1
+assert(fx == 135 and fy == 5, "two accumulates under one guard")
+
+# `and` compiles to a branch per conjunct; the masks multiply.
+lo = 4
+hi = 40
+t = 0
+for i in 0..n:
+    if a[i] > lo and a[i] < hi:
+        t = t + a[i]
+assert(t == 86, "two conditions multiply their masks")
+
+# An else-branch is real control flow, not a filter, and must stay a loop.
+t = 0
+for i in 0..n:
+    if a[i] > fbound:
+        t = t + a[i]
+    else:
+        t = t + 1
+assert(t == 138, "an if/else is not a filter and stays a loop")
+
+# Work after the guard closes is not covered by the mask.
+t = 0
+for i in 0..n:
+    if a[i] > fbound:
+        t = t + a[i]
+    t = t + 1
+assert(t == 143, "a statement after the guard keeps the loop")
+
 # --- shapes it must decline, each still producing the loop's own answer ---
 t = 0
 for i in 0..n:

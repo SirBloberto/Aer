@@ -4152,6 +4152,22 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
    partial sums collection.sum keeps answer bit-identically, which a float accumulator would not. */
 /* Every opcode accepted below is one word, which is what makes walking the body safe -- an
    unrecognised one stops the walk before its length would have mattered. */
+/* The fused compare-and-branch forms, mapped to the operator whose 1/0 mask says the same thing.
+   The branch jumps when the condition is FALSE, so the mask is the condition itself. */
+static bool vec_guard_mask_op(Opcode op, Opcode* out) {
+    switch (op) {
+        case OP_RAW_LT_INT_JUMP_IF_FALSE:
+        case OP_RAW_LT_REAL_JUMP_IF_FALSE:
+        case OP_LT_JUMP_IF_FALSE: *out = OP_LT; return true;
+        case OP_RAW_LTE_INT_JUMP_IF_FALSE:
+        case OP_RAW_LTE_REAL_JUMP_IF_FALSE:
+        case OP_LTE_JUMP_IF_FALSE: *out = OP_LTE; return true;
+        case OP_GT_JUMP_IF_FALSE: *out = OP_GT; return true;
+        case OP_GTE_JUMP_IF_FALSE: *out = OP_GTE; return true;
+        default: return false;
+    }
+}
+
 static bool rk_is_int_const(Chunk* c, int rk, int64_t want) {
     if (!(rk & RK_CONST_FLAG))
         return false;
@@ -4183,14 +4199,35 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
         Opcode op;
         uint8_t d, x, y;
         bool accumulate;
+        bool guard;
     } ops[VEC_MAX_OPS];
     int n = 0;
+    int guard_at = -1;
     for (unsigned int at = body_start; at < body_end; at++) {
         if (n >= VEC_MAX_OPS)
             return false;
         uint32_t w = c->code[at];
         Opcode op = (Opcode)(w & 0xFF);
         bool k_form = is_int && (op == OP_RAW_ADD_INT_K || op == OP_RAW_SUB_INT_K);
+        /* `if <cond>:` wrapping the rest of the body is a filter, and a filter has an array form:
+           the condition becomes a 1/0 mask and the accumulate sums the value times it. Only when
+           the branch skips to the END of the body -- anything else is real control flow. */
+        Opcode mask_op;
+        if (vec_guard_mask_op(op, &mask_op)) {
+            unsigned int target = (unsigned int)((int)at + 2 + (int)(int32_t)c->code[at + 1]);
+            if (target != body_end)
+                return false;
+            ops[n].op = mask_op;
+            ops[n].d = 0;
+            ops[n].x = (uint8_t)UNPACK_B(w);
+            ops[n].y = (uint8_t)UNPACK_C(w);
+            ops[n].accumulate = false;
+            ops[n].guard = true;
+            guard_at = n;
+            n++;
+            at++; /* the branch's own target word */
+            continue;
+        }
         if (op != op_get && op != OP_TYPED_INDEX_GET_UNCHECKED && op != op_add && op != op_sub &&
             op != op_mul && !k_form)
             return false;
@@ -4203,6 +4240,7 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
         ops[n].x = (uint8_t)UNPACK_B(w);
         ops[n].y = (uint8_t)UNPACK_C(w);
         ops[n].accumulate = false;
+        ops[n].guard = false;
         n++;
     }
     if (n < 2)
@@ -4220,6 +4258,18 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
     int acc_count = 0;
     for (int i = 0; i < n; i++) {
         bool k_form = ops[i].op == OP_RAW_ADD_INT_K || ops[i].op == OP_RAW_SUB_INT_K;
+        if (ops[i].guard) {
+            /* A constant here indexes the RAW constant table, not the pool the array-level operator
+               would read -- decoding it as a pool entry produced a string. A literal bound is
+               normally hoisted into a register by the loop preheader anyway, which is the form this
+               accepts; an un-hoisted one declines rather than being mis-resolved. */
+            if (RK8_IS_CONST(ops[i].x) || RK8_IS_CONST(ops[i].y))
+                return false;
+            /* The mask has to vary per row, so at least one side must come from a column. */
+            if (from_array[ops[i].x] < 0 && from_array[ops[i].y] < 0)
+                return false;
+            continue;
+        }
         if (ops[i].op == op_get || ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED) {
             if (ops[i].y != (uint8_t)item_reg)
                 return false;
@@ -4262,7 +4312,7 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
     /* An accumulator may only ever be read as its own running total. Anywhere else and the total is
        part of the arithmetic, which one pass over the array cannot reproduce. */
     for (int i = 0; i < n; i++) {
-        if (ops[i].accumulate)
+        if (ops[i].accumulate || ops[i].guard)
             continue;
         bool k_form = ops[i].op == OP_RAW_ADD_INT_K || ops[i].op == OP_RAW_SUB_INT_K;
         if (is_acc_slot[ops[i].d] || (!RK8_IS_CONST(ops[i].x) && is_acc_slot[ops[i].x]) ||
@@ -4278,17 +4328,50 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
     int value[FRAME_REGISTERS];
     for (int i = 0; i < FRAME_REGISTERS; i++)
         value[i] = -1;
+    int mask_reg = -1;
 
     for (int i = 0; i < n; i++) {
         if (ops[i].op == op_get || ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED) {
             value[ops[i].d] = ops[i].x; /* the array itself replaces the element load */
             continue;
         }
+        if (ops[i].guard) {
+            /* Both are plain registers -- validation refused a constant operand above. */
+            int gx = value[ops[i].x] >= 0 ? value[ops[i].x] : (int)ops[i].x;
+            int gy = value[ops[i].y] >= 0 ? value[ops[i].y] : (int)ops[i].y;
+            int one_mask = reg_alloc();
+            if (one_mask < 0)
+                return false;
+            emit_binary(c, one_mask, ops[i].op, gx, gy);
+            P.reg_elem_kind[one_mask] = ek; /* 1 or 0 in the element's own type */
+            if (mask_reg < 0) {
+                mask_reg = one_mask;
+            } else {
+                /* `and` compiles to one branch per conjunct, all skipping to the same place, so
+                   several guards multiply: 1 only where every one of them held. */
+                int combined = reg_alloc();
+                if (combined < 0)
+                    return false;
+                emit_binary(c, combined, OP_MUL, mask_reg, one_mask);
+                P.reg_elem_kind[combined] = ek;
+                mask_reg = combined;
+            }
+            continue;
+        }
         if (ops[i].accumulate) {
+            int summed = value[ops[i].y];
+            if (mask_reg >= 0) {
+                int masked = reg_alloc();
+                if (masked < 0)
+                    return false;
+                emit_binary(c, masked, OP_MUL, summed, mask_reg);
+                P.reg_elem_kind[masked] = ek;
+                summed = masked;
+            }
             int sum_reg = reg_alloc();
             if (sum_reg < 0)
                 return false;
-            chunk_emit(c, PACK2(OP_MOVE, sum_reg, value[ops[i].y]));
+            chunk_emit(c, PACK2(OP_MOVE, sum_reg, summed));
             chunk_emit(c, PACK3(OP_CALL_MODULE, sum_reg, sum_reg, 1));
             chunk_emit(c, (uint32_t)mod_idx);
             chunk_emit(c, (uint32_t)fn_idx);
