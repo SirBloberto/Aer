@@ -97,13 +97,12 @@ enum { AER_NATIVE_MODULES(AER_MODULE_ID) CALL_MODULE_DYNAMIC };
 #define FN_COLLECTION_MIN 9
 #define FN_COLLECTION_MAX 10
 #define FN_COLLECTION_GROUP_SUM 11
-/* Compiler-emitted only: collection.sum() of a chain of array operators, fused. No source spells
-   it, so it has no entry in the parser's name lookup. */
+/* Compiler-emitted only, so absent from the parser's name lookup: a fused array expression under
+   sum() or group_sum(), and the group_sum that ADDS into an array the caller already has (returning
+   a fresh one would rebind the name and change what every other reference to it sees). */
 #define FN_COLLECTION_SUM_CHAIN 12
-/* Also compiler-emitted only: group_sum that ADDS into an array the caller already has, which is
-   what `revenue[g] = revenue[g] + x` in a loop does. Returning a fresh array instead would rebind
-   the name and change what any other reference to it sees. */
 #define FN_COLLECTION_GROUP_SUM_INTO 13
+#define FN_COLLECTION_GROUP_SUM_CHAIN 14
 
 #define FN_NET_CONNECT 0
 #define FN_NET_SEND 1

@@ -257,4 +257,52 @@ gs_sparse = collection.group_sum(gs_v, gs_g, 5)
 assert(length(gs_sparse) == 5 and gs_sparse[3] == 0.0 and gs_sparse[4] == 0.0,
        "groups nothing landed in are zero")
 
+# An array expression handed to sum() or group_sum() is evaluated a tile at a time and never written
+# out at full size. The fusion is invisible, so what matters is that it agrees with the unfused
+# spelling everywhere -- especially where operand ORDER decides the answer.
+fa = [0.0; 6]
+fb = [0.0; 6]
+fd = [0.0; 6]
+fg = [0.0; 6]
+fi = 0
+for fi < 6:
+    fa[fi] = float(fi) + 1.0
+    fb[fi] = float(fi) * 2.0
+    fd[fi] = float(fi) * 0.1
+    fg[fi] = float(fi % 3)
+    fi += 1
+
+# A tree, not a left-associative run: the second operator opens a fresh subexpression.
+assert(collection.sum(fa * fb * (1.0 - fd) * fa) == 403.2, "sum over an operator tree")
+
+# The subtraction compiles before `fb` is ever mentioned, so taking the stack in emission order
+# would compute (fa * fd) - fb instead. Non-commutative operators are where that shows.
+assert(collection.sum(fb - (fa * fd)) == 23.0, "a subtree on the left of a non-commutative operator")
+assert(collection.sum((fa - fb) * fd) == -4.0, "subtraction inside a product")
+
+# A comparison inside the expression is a filter, and costs no pass of its own.
+assert(collection.sum((fa > fb) * fa) == 1.0, "a comparison against another column")
+assert(collection.sum((fa > 2.0) * (fb < 9.0) * fa) == 12.0, "two comparisons and a constant")
+
+# The first group lands a shade under 16.8 either way -- `1.0 - fd` already carries a rounding error
+# -- so this brackets the value rather than asking the decimal to come out exact.
+gt = collection.group_sum(fa * fb * (1.0 - fd), fg, 3)
+assert(gt[0] > 16.79 and gt[0] < 16.81 and gt[1] > 27.59 and gt[1] < 27.61 and
+       gt[2] > 39.59 and gt[2] < 39.61, "group_sum over an operator tree")
+
+gm = collection.group_sum(fa * (fa > 2.0), fg, 3)
+assert(gm[0] == 4.0 and gm[1] == 5.0 and gm[2] == 9.0, "group_sum under a filter")
+
+# A named intermediate is read twice, so folding it would evaluate it twice per tile. It must stay
+# materialised -- and either way the answer is the same.
+shared = fa * fb
+assert(collection.sum(shared * shared) == 5936.0, "a shared subexpression is not folded")
+
+# One operator is below the threshold where fusing pays; it still has to be right.
+assert(collection.sum(fa * fb) == 140.0, "a single operator is left alone")
+
+# The fused and unfused spellings agree on an empty column, where there is nothing to tile.
+none = [0.0; 0]
+assert(collection.sum(none * none * none) == 0.0, "an empty column sums to zero")
+
 print("test_collections.aer: all assertions passed.")

@@ -111,6 +111,10 @@ typedef struct Parser {
     int reg_value_class[FRAME_REGISTERS];
     int reg_len_class[FRAME_REGISTERS];
     int next_value_class;
+    /* Where the first argument of the call being parsed stopped emitting. Only a call that folds
+       one argument and reads the rest as they are needs it -- collection.group_sum, whose values
+       fuse but whose group column and group count do not. */
+    unsigned int first_arg_end;
     /* Side channel from the index-get site to parse_assignment, keyed on exact register equality
    rather than a flag. */
     int last_plain_index_dest_reg;
@@ -1688,15 +1692,18 @@ static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base, 
     int base = -1;
     int count = 0;
     *out_base_is_temp = true;
+    P.first_arg_end = 0;
     if (!equal(close_tok)) {
         int rk = parse_binary(c, 0);
         if (!equal(TOKEN_COMMA)) {
             base = materialize(c, rk);
             *out_base_is_temp = is_temp(base);
             *out_base = base;
+            P.first_arg_end = c->count;
             return 1;
         }
         base = arg_materialize(c, rk);
+        P.first_arg_end = c->count;
         count = 1;
         while (consume(TOKEN_COMMA)) {
             arg_materialize(c, parse_binary(c, 0));
@@ -4154,53 +4161,127 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
    unrecognised one stops the walk before its length would have mattered. */
 #define CHAIN_MAX_LEAVES 8
 
-/* Recognises `a op b op c ...` as a left-associative run of array operators over plain registers,
-   returning the leaf count (0 for anything else) and packing the operators two bits apiece.
-   Deliberately linear: a parenthesised term is its own sub-expression, so `p * q * (1.0 - d) * k`
-   is a tree, and folding trees needs a scratch buffer per live intermediate. */
-static int chain_of_array_ops(Chunk* c, unsigned int start, int result_reg, int* leaf, uint64_t* packed) {
-    unsigned int at = start;
-    int nleaf = 0, nops = 0;
-    int prev_dest = -1;
-    while (at < c->count) {
-        uint32_t w = c->code[at];
-        Opcode op = (Opcode)(w & 0xFF);
-        if (op != OP_ADD && op != OP_SUB && op != OP_MUL)
-            return 0;
-        uint8_t d = (uint8_t)UNPACK_A(w), x = (uint8_t)UNPACK_B(w), y = (uint8_t)UNPACK_C(w);
-        if (RK8_IS_CONST(x) || RK8_IS_CONST(y))
-            return 0; /* a constant operand indexes the pool, which the fused call cannot carry */
-        if (nleaf == 0) {
-            if (nleaf + 2 > CHAIN_MAX_LEAVES)
-                return 0;
-            leaf[nleaf++] = x;
-            leaf[nleaf++] = y;
-        } else {
-            if (x != (uint8_t)prev_dest || nleaf + 1 > CHAIN_MAX_LEAVES)
-                return 0; /* not a left-associative run */
-            leaf[nleaf++] = y;
-        }
-        if (nops >= 24)
-            return 0;
-        *packed |= (uint64_t)(op == OP_ADD ? 0u : (op == OP_SUB ? 1u : 2u)) << (2 * nops);
-        nops++;
-        prev_dest = d;
-        at++;
+/* Each accepted operator's postfix token, matching aer_collection.c's CHAIN_TOK_*. Comparisons are
+   in because a filter is the outermost operator of most array expressions worth fusing: without them
+   `(quantity > 10) * (price < 400)` costs three whole-array passes to build a mask the expression
+   that follows reads once. */
+static bool chain_token_for(Opcode op, unsigned int* tok) {
+    switch (op) {
+        case OP_ADD: *tok = 1; return true;
+        case OP_SUB: *tok = 2; return true;
+        case OP_MUL: *tok = 3; return true;
+        case OP_LT: *tok = 4; return true;
+        case OP_LTE: *tok = 5; return true;
+        case OP_GT: *tok = 6; return true;
+        case OP_GTE: *tok = 7; return true;
+        default: return false;
     }
-    /* Every leaf must still hold what it held: the run above only wrote prev_dest. */
+}
+
+typedef struct {
+    unsigned int tok;
+    /* Resolved when the operator is walked, not looked up afterwards: the parser reuses temp
+       registers freely, so `reg7` names three different values across one expression and only the
+       reader at the time knows which. */
+    int child[2]; /* the node that produced this operand, or -1 for a leaf */
+    int rk[2]; /* the leaf's operand, register or pool constant, when child is -1 */
+} ChainNode;
+
+/* Post-order, left child before right, so the tile evaluator's stack holds the two operands the
+   right way round. Emission order alone would not: `mask * (a - b)` compiles the subtraction before
+   it ever mentions mask, which puts the operands on the stack backwards -- harmless for `*`, wrong
+   for every operator that is not commutative. */
+static bool chain_postfix(const ChainNode* node, int idx, int* leaf, int* nleaf, uint64_t* prog, int* ntok) {
+    for (int s = 0; s < 2; s++) {
+        if (node[idx].child[s] >= 0) {
+            if (!chain_postfix(node, node[idx].child[s], leaf, nleaf, prog, ntok))
+                return false;
+        } else {
+            if (*nleaf >= CHAIN_MAX_LEAVES)
+                return false;
+            leaf[(*nleaf)++] = node[idx].rk[s];
+            (*ntok)++; /* CHAIN_TOK_PUSH is zero, so a push contributes no bits */
+        }
+    }
+    *prog |= (uint64_t)node[idx].tok << (4 * (*ntok));
+    (*ntok)++;
+    return true;
+}
+
+/* Recognises the compiled argument as a TREE of array operators -- `p * q * (1.0 - d) * k`, whose
+   second operator starts a fresh subexpression, so the left-associative run this used to accept
+   declined the very query that most wanted fusing. Returns the leaf count (0 for anything else) and
+   the postfix program four bits per token; leaves are RK operands, so a constant is a leaf like any
+   other and the tile evaluator broadcasts it. */
+static int chain_of_array_ops(Chunk* c, unsigned int start, unsigned int end, int result_reg, int* leaf,
+                              uint64_t* prog) {
+    ChainNode node[CHAIN_MAX_LEAVES];
+    int refs[CHAIN_MAX_LEAVES];
+    int producer[FRAME_REGISTERS];
+    bool written[FRAME_REGISTERS];
+    for (int i = 0; i < FRAME_REGISTERS; i++) {
+        producer[i] = -1;
+        written[i] = false;
+    }
+
+    int nops = 0;
+    for (unsigned int at = start; at < end; at++) {
+        uint32_t w = c->code[at];
+        unsigned int tok;
+        if (!chain_token_for((Opcode)(w & 0xFF), &tok))
+            return 0;
+        uint8_t d = (uint8_t)UNPACK_A(w), side[2] = {(uint8_t)UNPACK_B(w), (uint8_t)UNPACK_C(w)};
+        /* A tree over k leaves has k-1 operators, so this bound follows from the leaf bound. */
+        if (nops >= CHAIN_MAX_LEAVES || d >= FRAME_REGISTERS)
+            return 0;
+        node[nops].tok = tok;
+        refs[nops] = 0;
+        for (int s = 0; s < 2; s++) {
+            if (RK8_IS_CONST(side[s])) {
+                node[nops].child[s] = -1;
+                node[nops].rk[s] = (int)(RK_CONST_FLAG | RK8_INDEX(side[s]));
+                continue;
+            }
+            node[nops].child[s] = producer[side[s]];
+            node[nops].rk[s] = side[s];
+            if (producer[side[s]] >= 0)
+                refs[producer[side[s]]]++;
+        }
+        producer[d] = nops;
+        written[d] = true;
+        nops++;
+    }
     /* Two operators minimum: that is where fusing was measured to pay (0.0514s -> 0.0237s on four
        terms). At one it only saves a single materialisation, which the tile copies here give back. */
-    if (nops < 2 || prev_dest != result_reg)
+    if (nops < 2 || result_reg < 0 || result_reg >= FRAME_REGISTERS || producer[result_reg] != nops - 1)
         return 0;
+    /* One tree with the last operator at its root: every other result feeds exactly one operator. A
+       result read twice is a shared subexpression, and the tile evaluator would compute it twice. */
+    for (int i = 0; i < nops; i++)
+        if (refs[i] != (i == nops - 1 ? 0 : 1))
+            return 0;
+
+    int nleaf = 0, ntok = 0;
+    if (!chain_postfix(node, nops - 1, leaf, &nleaf, prog, &ntok) || ntok != 2 * nleaf - 1)
+        return 0;
+    /* Every leaf must still hold what it held at call time -- a register the expression also writes
+       holds the later value by then, not the one the leaf was read for. */
     for (int i = 0; i < nleaf; i++)
-        if (leaf[i] == prev_dest)
+        if (!(leaf[i] & RK_CONST_FLAG) && written[leaf[i]])
             return 0;
     /* At least one operand has to be a typed array, or this is scalar arithmetic. */
-    bool any_array = false;
     for (int i = 0; i < nleaf; i++)
-        if (leaf[i] >= 0 && leaf[i] < FRAME_REGISTERS && P.reg_elem_kind[leaf[i]] == RAWK_REAL)
-            any_array = true;
-    return any_array ? nleaf : 0;
+        if (!(leaf[i] & RK_CONST_FLAG) && P.reg_elem_kind[leaf[i]] == RAWK_REAL)
+            return nleaf;
+    return 0;
+}
+
+/* Leaves arrive as RK operands, so a constant loads from the pool where a register only moves. */
+static void chain_emit_leaf(Chunk* c, int dest, int rk) {
+    if (rk & RK_CONST_FLAG)
+        chunk_emit(c, PACK_OP_A_W16(OP_LOADK, dest, (unsigned int)(rk & ~RK_CONST_FLAG)));
+    else
+        chunk_emit(c, PACK2(OP_MOVE, dest, rk));
 }
 
 /* The fused compare-and-branch forms, mapped to the operator whose 1/0 mask says the same thing.
@@ -5194,6 +5275,80 @@ static int parse_module_call(Chunk* c) {
         return dest;
     }
 
+    /* `collection.group_sum(price * quantity * (1 - discount) * mask, region, G)` -- the values are
+       the longest expression in a query and the scatter that consumes them is nearly free beside it,
+       so the values fold into the scatter and are never written out. Its arguments are parsed one at
+       a time rather than as one contiguous run: the values' own code has to be recognised and
+       discarded before the group column is ever compiled, which the shared path gives no point to
+       do. Only the first argument folds; the other two are read as they are. */
+    if (module_id == CALL_MODULE_COLLECTION && fn_id == FN_COLLECTION_GROUP_SUM &&
+        !equal(TOKEN_CLOSE_PARENTHESE)) {
+        unsigned int values_start = c->count;
+        int values_rk = parse_binary(c, 0);
+        int leaf[CHAIN_MAX_LEAVES];
+        uint64_t prog = 0;
+        int nleaf = (parse_had_error || (values_rk & RK_CONST_FLAG))
+                        ? 0
+                        : chain_of_array_ops(c, values_start, c->count, values_rk, leaf, &prog);
+        /* The whole run is secured BEFORE anything is discarded -- once the values' code is gone
+           there is no ordinary path left to fall back to. */
+        int base = -1, taken = 0;
+        if (nleaf > 0) {
+            base = reg_alloc();
+            taken = base >= 0 ? 1 : 0;
+            for (int i = 0; base >= 0 && i < nleaf + 2; i++) {
+                if (reg_alloc() != base + 1 + i) {
+                    base = -1;
+                    break;
+                }
+                taken++;
+            }
+        }
+        if (base >= 0) {
+            c->count = values_start; /* the per-operator passes go; every leaf still holds its own */
+            int groups = -1, ngroups = -1;
+            if (consume(TOKEN_COMMA))
+                groups = materialize(c, parse_binary(c, 0));
+            if (consume(TOKEN_COMMA))
+                ngroups = materialize(c, parse_binary(c, 0));
+            require(TOKEN_CLOSE_PARENTHESE, "expected ')' after module call arguments");
+            if (parse_had_error || groups < 0 || ngroups < 0)
+                return 0;
+            chunk_emit(c, PACK_OP_A_W16(OP_LOADK, base, chunk_add_pool(c, aer_int((int64_t)prog))));
+            chunk_emit(c, PACK2(OP_MOVE, base + 1, groups));
+            chunk_emit(c, PACK2(OP_MOVE, base + 2, ngroups));
+            for (int i = 0; i < nleaf; i++)
+                chain_emit_leaf(c, base + 3 + i, leaf[i]);
+            chunk_emit(c, PACK3(OP_CALL_MODULE, base, base, nleaf + 3));
+            chunk_emit(c, (uint32_t)module_idx);
+            chunk_emit(c, (uint32_t)fn_idx);
+            chunk_emit(c,
+                       PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_GROUP_SUM_CHAIN));
+            reg_free(nleaf + 2);
+            P.reg_elem_kind[base] = RAWK_REAL;
+            return base;
+        }
+        if (taken)
+            reg_free(taken);
+        /* Unfused: place the values first in a contiguous run, exactly as the shared path would. */
+        int argbase = arg_materialize(c, values_rk);
+        int argc = 1;
+        while (consume(TOKEN_COMMA)) {
+            arg_materialize(c, parse_binary(c, 0));
+            argc++;
+        }
+        require(TOKEN_CLOSE_PARENTHESE, "expected ')' after module call arguments");
+        if (parse_had_error)
+            return 0;
+        if (argc > 1)
+            reg_free(argc - 1);
+        chunk_emit(c, PACK3(OP_CALL_MODULE, argbase, argbase, argc));
+        chunk_emit(c, (uint32_t)module_idx);
+        chunk_emit(c, (uint32_t)fn_idx);
+        chunk_emit(c, PACK_2X16((uint16_t)module_id, (uint16_t)fn_id));
+        return argbase;
+    }
+
     unsigned int arg_code_start = c->count;
     int arg_reg_base;
     bool arg_base_is_temp;
@@ -5208,7 +5363,7 @@ static int parse_module_call(Chunk* c) {
     if (module_id == CALL_MODULE_COLLECTION && fn_id == FN_COLLECTION_SUM && arg_count == 1) {
         int leaf[CHAIN_MAX_LEAVES];
         uint64_t packed = 0;
-        int nleaf = chain_of_array_ops(c, arg_code_start, arg_reg_base, leaf, &packed);
+        int nleaf = chain_of_array_ops(c, arg_code_start, c->count, arg_reg_base, leaf, &packed);
         /* The run must be contiguous, and that is settled BEFORE anything is discarded -- once the
            argument's own code is gone there is no ordinary path left to fall back to. */
         int base = -1, taken = 0;
@@ -5227,7 +5382,7 @@ static int parse_module_call(Chunk* c) {
             c->count = arg_code_start; /* the per-operator passes go; the fused call replaces them */
             chunk_emit(c, PACK_OP_A_W16(OP_LOADK, base, chunk_add_pool(c, aer_int((int64_t)packed))));
             for (int i = 0; i < nleaf; i++)
-                chunk_emit(c, PACK2(OP_MOVE, base + 1 + i, leaf[i]));
+                chain_emit_leaf(c, base + 1 + i, leaf[i]);
             chunk_emit(c, PACK3(OP_CALL_MODULE, base, base, nleaf + 1));
             chunk_emit(c, (uint32_t)module_idx);
             chunk_emit(c, (uint32_t)fn_idx);
