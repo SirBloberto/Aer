@@ -196,11 +196,17 @@ bool aer_actor_call(Actor* actor, const char* fn, int arg_count, AerVal* args, A
    json.encode()/json.decode() calls) is entirely up to the AER code on each end; the mailbox
    itself only ever moves bytes. send() copies message; try_receive() hands back an owned buffer
    the caller must free(). */
-static bool aer_actor_send_bytes(Actor* actor, const char* message, unsigned int len, bool is_typed_array,
-                                 TypedArrayElemKind kind, unsigned int count) {
+/* owned != NULL hands the buffer over instead of copying it -- the caller must have given up its
+   only reference first. Everything else about the mailbox entry is unchanged. */
+static bool aer_actor_send_owned(Actor* actor, char* owned, const char* message, unsigned int len,
+                                 bool is_typed_array, TypedArrayElemKind kind, unsigned int count) {
     Mailbox* m = xmalloc(sizeof(Mailbox));
-    m->data = xmalloc(len ? len : 1);
-    memcpy(m->data, message, len);
+    if (owned) {
+        m->data = owned;
+    } else {
+        m->data = xmalloc(len ? len : 1);
+        memcpy(m->data, message, len);
+    }
     m->len = len;
     m->is_typed_array = is_typed_array;
     m->elem_kind = kind;
@@ -214,6 +220,11 @@ static bool aer_actor_send_bytes(Actor* actor, const char* message, unsigned int
     actor->mailbox_tail = m;
     aer_mutex_unlock(&actor->mailbox_lock);
     return true;
+}
+
+static bool aer_actor_send_bytes(Actor* actor, const char* message, unsigned int len, bool is_typed_array,
+                                 TypedArrayElemKind kind, unsigned int count) {
+    return aer_actor_send_owned(actor, NULL, message, len, is_typed_array, kind, count);
 }
 
 static bool aer_actor_send(Actor* actor, const char* message, unsigned int len) {
@@ -299,6 +310,32 @@ __attribute__((noinline)) bool aer_actor_module_call(VM* vm, int fn_id, int arg_
         vm_stack_push(vm, vm->kept);
         return true;
     }
+    /* Hands a typed array's payload to another actor instead of copying it. Safe only because the
+       sender gives up its own reference in the same breath -- the array is left empty here, so the
+       buffer has exactly one owner throughout and neither collector can free what the other holds.
+       That single-owner rule is why this is a separate verb rather than a flag on send(). */
+    if (fn_id == FN_ACTOR_GIVE && arg_count == 2) {
+        AerVal value_v = vm_stack_pop(vm);
+        AerVal handle_v = vm_stack_pop(vm);
+        if (aer_type(value_v) != TYPE_TYPED_ARRAY) {
+            error("actor.give() moves a typed array; use actor.send() for anything else");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        Actor* a = aer_actor_resolve(handle_v);
+        if (!a) {
+            error("actor.give(): no actor with that handle");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        AerTypedArray* ta = aer_as_typed_array(value_v);
+        unsigned int width = vm_typed_elem_width(ta->elem_kind);
+        aer_actor_send_owned(a, (char*)ta->data, NULL, ta->count * width, true, ta->elem_kind, ta->count);
+        ta->data = NULL; /* given away: this array is now empty, and frees nothing */
+        ta->count = 0;
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
     if (fn_id == FN_ACTOR_SPAWN && arg_count == 1) {
         AerVal path_v = vm_stack_pop(vm);
         if (aer_type(path_v) != TYPE_STRING) {
@@ -364,6 +401,19 @@ __attribute__((noinline)) bool aer_actor_module_call(VM* vm, int fn_id, int arg_
            existing "missing dict key returns null" idiom, not a Result. */
         if (!aer_actor_try_receive(a, &message, &len, &typed, &kind, &count)) {
             vm_stack_push(vm, aer_null());
+            return true;
+        }
+        if (typed && count) {
+            /* try_receive hands this buffer over -- the caller frees it -- so the array adopts the
+               allocation rather than copying it and freeing the original. One copy fewer on every
+               typed-array receive, and the whole point of actor.give, which does not copy on the
+               way in either. */
+            AerVal arr = vm_new_typed_array_val(kind, 0);
+            AerTypedArray* ta = aer_as_typed_array(arr);
+            free(ta->data);
+            ta->data = (unsigned char*)message;
+            ta->count = count;
+            vm_stack_push(vm, arr);
             return true;
         }
         if (typed) {

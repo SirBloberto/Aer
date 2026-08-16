@@ -130,4 +130,30 @@ mine, _m = actor.call(keeper, "stash_sum")
 theirs, _t = actor.call(keeper2, "stash_sum")
 assert(mine == 12.0 and theirs == 3.0, "each actor keeps its own value")
 
+# actor.give moves a typed array's payload instead of copying it. Safe only because the sender gives
+# up its own reference at the same moment, so the buffer has exactly one owner throughout.
+import collection
+mover, move_err = actor.spawn("tests/actor_worker.aer")
+assert(move_err == null, "spawned an actor for the give checks")
+
+given = [7.0; 4]
+actor.give(mover, given)
+assert(length(given) == 0, "the sender is left empty -- it gave the payload away")
+assert(collection.sum(given) == 0.0, "and the emptied array is still usable, just empty")
+
+taken = actor.receive(mover)
+assert(length(taken) == 4 and taken[0] == 7.0, "the receiver got the data, not a copy of nothing")
+
+# The receiving heap now owns the buffer; the sending heap must not free it. Churning the sender
+# hard is what would expose a double-owner.
+big = [3.0; 20000]
+actor.give(mover, big)
+churn = 0
+for churn < 150:
+    junk = [0.0; 5000]
+    churn += 1
+survived = actor.receive(mover)
+assert(length(survived) == 20000 and collection.sum(survived) == 60000.0,
+       "a given buffer survives collections in the heap that gave it away")
+
 print("test_actor.aer: all assertions passed.")

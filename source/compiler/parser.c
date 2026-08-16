@@ -4929,6 +4929,8 @@ static int module_fn_id(int module_id, AerString* name) {
                 return FN_ACTOR_KEEP;
             if (NAME_IS("kept"))
                 return FN_ACTOR_KEPT;
+            if (NAME_IS("give"))
+                return FN_ACTOR_GIVE;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_SCHEDULER:
             if (NAME_IS("add"))
