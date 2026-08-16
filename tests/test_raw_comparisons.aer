@@ -390,4 +390,19 @@ nb = negative_literal_bound()
 assert(nb[0] == true and nb[1] == true, "raw real against negative literal bounds on both sides")
 assert(nb[2] == true and nb[3] == false, "raw int against a negative literal bound at equality")
 
+# A comparison kept as a VALUE rather than branched on: an `if` fuses its comparison into the
+# branch, so this is the only shape that still emits the standalone raw-real forms.
+function raw_real_compare_values():
+    a = 1.5
+    b = 2.5
+    ne = a != b
+    eq = a == b
+    lt = a < b
+    return [ne, eq, lt]
+
+rrv = raw_real_compare_values()
+assert(rrv[0] == true, "raw real != as a value")
+assert(rrv[1] == false, "raw real == as a value")
+assert(rrv[2] == true, "raw real < as a value")
+
 print("test_raw_comparisons.aer: all assertions passed.")

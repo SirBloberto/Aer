@@ -3875,16 +3875,83 @@ static void parse_block(Chunk* c) {
     parse_had_error = false;
 }
 
+#define COND_PATCH_MAX 32
+
+/* Every jump that has to land where the condition turned out false. */
+typedef struct {
+    unsigned int at[COND_PATCH_MAX];
+    int count;
+} CondFalse;
+
+static bool cond_add(CondFalse* f, unsigned int patch) {
+    if (f->count >= COND_PATCH_MAX) {
+        error_at("Condition too large to compile (more than 32 and/or operands)");
+        return false;
+    }
+    f->at[f->count++] = patch;
+    return true;
+}
+
+/* Compiles a condition for truth alone, so each comparison fuses with its own branch: `and` sends
+   every conjunct's false-jump to one place, `or` sends an alternative's to the next alternative.
+   compile_and cannot, because `and` yields the operand rather than a bool -- it must materialize
+   each one, and its short-circuit jump then lands ON the second comparison, which is what stops
+   emit_cond_jump_if_false folding that comparison into the branch it targets. */
+static bool compile_condition(Chunk* c, CondFalse* out) {
+    out->count = 0;
+    unsigned int true_at[COND_PATCH_MAX];
+    int true_count = 0;
+    for (;;) {
+        CondFalse alt;
+        alt.count = 0;
+        for (;;) {
+            unsigned int start = c->count;
+            /* Precedence 2 stops at `and` itself and at the two prec-1 operators below it. */
+            int rk = parse_binary(c, 2);
+            if (parse_had_error || !cond_add(&alt, emit_cond_jump_if_false(c, rk, start)))
+                return false;
+            if (!equal(TOKEN_AND))
+                break;
+            lex();
+        }
+        /* `|>` binds looser than `and`, so here it would pipe the whole chain's value -- which this
+           lowering deliberately never produces. Nothing useful can be written that way anyway
+           (`x |> f() > 0` already parses as `x |> (f() > 0)`), so it is refused, not miscompiled. */
+        if (equal(TOKEN_PIPE)) {
+            error_at("'|>' cannot be applied to a condition; parenthesise the piped expression");
+            return false;
+        }
+        if (!equal(TOKEN_OR)) {
+            for (int i = 0; i < alt.count; i++)
+                if (!cond_add(out, alt.at[i]))
+                    return false;
+            break;
+        }
+        lex();
+        /* This alternative held, so the body runs and the remaining ones are skipped. */
+        chunk_emit(c, OP_JUMP);
+        if (true_count >= COND_PATCH_MAX) {
+            error_at("Condition too large to compile (more than 32 and/or operands)");
+            return false;
+        }
+        true_at[true_count++] = c->count;
+        chunk_emit(c, 0);
+        for (int i = 0; i < alt.count; i++)
+            patch_jump(c, alt.at[i], c->count);
+    }
+    for (int i = 0; i < true_count; i++)
+        patch_jump(c, true_at[i], c->count);
+    return true;
+}
+
 static void parse_if(Chunk* c) {
-    unsigned int cond_start = c->count;
-    int rk_cond = parse_binary(c, 0);
+    CondFalse cond;
+    bool ok = compile_condition(c, &cond);
     require(TOKEN_COLON, "expected ':' after if condition");
     /* require() can't abort on failure -- without this, a malformed condition still compiles a
        real branch. */
-    if (parse_had_error)
+    if (!ok || parse_had_error)
         return;
-
-    unsigned int patch_jif = emit_cond_jump_if_false(c, rk_cond, cond_start);
 
     /* P.branch_depth disqualifies a variable assigned while nonzero from ever being raw-tracked --
        a name assigned different types down mutually-exclusive branches can't be resolved without
@@ -3902,13 +3969,15 @@ static void parse_if(Chunk* c) {
         chunk_emit(c, OP_JUMP);
         unsigned int patch_jmp = c->count;
         chunk_emit(c, 0);
-        patch_jump(c, patch_jif, c->count);
+        for (int i = 0; i < cond.count; i++)
+            patch_jump(c, cond.at[i], c->count);
         P.branch_depth++;
         parse_block(c);
         P.branch_depth--;
         patch_jump(c, patch_jmp, c->count);
     } else {
-        patch_jump(c, patch_jif, c->count);
+        for (int i = 0; i < cond.count; i++)
+            patch_jump(c, cond.at[i], c->count);
     }
 }
 
