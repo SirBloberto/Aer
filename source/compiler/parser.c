@@ -4148,7 +4148,11 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
         uint32_t w = c->code[at];
         Opcode op = (Opcode)(w & 0xFF);
         if (op != OP_INDEX_GET_RAW_INT && op != OP_TYPED_INDEX_GET_UNCHECKED && op != OP_RAW_ADD_INT &&
-            op != OP_RAW_SUB_INT && op != OP_RAW_MUL_INT)
+            op != OP_RAW_SUB_INT && op != OP_RAW_MUL_INT && op != OP_RAW_ADD_INT_K && op != OP_RAW_SUB_INT_K)
+            return false;
+        /* The K forms carry a bare index into the chunk's raw-int table where the others carry a
+           register, so it is read back to a value here rather than passed through as an operand. */
+        if ((op == OP_RAW_ADD_INT_K || op == OP_RAW_SUB_INT_K) && UNPACK_C(w) >= c->rawk_i_count)
             return false;
         ops[n].op = op;
         ops[n].d = (uint8_t)UNPACK_A(w);
@@ -4171,12 +4175,18 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
     for (int i = 0; i < FRAME_REGISTERS; i++)
         from_array[i] = -1;
     for (int i = 0; i < n - 1; i++) {
-        if (ops[i].d == acc || ops[i].x == acc || ops[i].y == acc)
+        bool k_form = ops[i].op == OP_RAW_ADD_INT_K || ops[i].op == OP_RAW_SUB_INT_K;
+        if (ops[i].d == acc || ops[i].x == acc || (!k_form && ops[i].y == acc))
             return false;
         if (ops[i].op == OP_INDEX_GET_RAW_INT || ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED) {
             if (ops[i].x != (uint8_t)array_reg || ops[i].y != (uint8_t)item_reg)
                 return false;
             from_array[ops[i].d] = array_reg;
+        } else if (k_form) {
+            /* The constant is the whole of the right operand, so only the left can carry the array. */
+            if (RK8_IS_CONST(ops[i].x) || from_array[ops[i].x] < 0)
+                return false;
+            from_array[ops[i].d] = 1;
         } else {
             /* One side must carry the array; the other may be a constant or a loop-invariant
                scalar, which broadcasts. Two array operands would be a different array's element,
@@ -4202,11 +4212,22 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
             value[ops[i].d] = array_reg;
             continue;
         }
+        bool k_form = ops[i].op == OP_RAW_ADD_INT_K || ops[i].op == OP_RAW_SUB_INT_K;
         int rk_x = RK8_IS_CONST(ops[i].x) ? (int)(RK_CONST_FLAG | RK8_INDEX(ops[i].x))
                                           : (value[ops[i].x] >= 0 ? value[ops[i].x] : (int)ops[i].x);
-        int rk_y = RK8_IS_CONST(ops[i].y) ? (int)(RK_CONST_FLAG | RK8_INDEX(ops[i].y))
+        int rk_y;
+        if (k_form)
+            rk_y = (int)(RK_CONST_FLAG | chunk_add_pool(c, aer_int(c->rawk_i[ops[i].y])));
+        else
+            rk_y = RK8_IS_CONST(ops[i].y) ? (int)(RK_CONST_FLAG | RK8_INDEX(ops[i].y))
                                           : (value[ops[i].y] >= 0 ? value[ops[i].y] : (int)ops[i].y);
-        Opcode boxed = ops[i].op == OP_RAW_ADD_INT ? OP_ADD : (ops[i].op == OP_RAW_SUB_INT ? OP_SUB : OP_MUL);
+        Opcode boxed;
+        if (ops[i].op == OP_RAW_ADD_INT || ops[i].op == OP_RAW_ADD_INT_K)
+            boxed = OP_ADD;
+        else if (ops[i].op == OP_RAW_SUB_INT || ops[i].op == OP_RAW_SUB_INT_K)
+            boxed = OP_SUB;
+        else
+            boxed = OP_MUL;
         int dest = reg_alloc();
         if (dest < 0)
             return false;

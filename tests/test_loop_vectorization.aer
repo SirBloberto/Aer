@@ -21,6 +21,25 @@ for i in 0..n:
     t = t + a[i] * 2
 assert(t == 280, "vectorized sum of a scaled element")
 
+# The const-operand arithmetic forms (OP_RAW_ADD_INT_K / _SUB_INT_K) carry their constant as an
+# index into the chunk's raw-int table rather than as a register, so they need reading back.
+t = 0
+for i in 0..n:
+    t = t + (a[i] + 5)
+assert(t == 180, "vectorized sum with a constant added per element")
+
+t = 0
+for i in 0..n:
+    t = t + (a[i] - 1) * 3
+assert(t == 396, "vectorized sum of a nested constant expression")
+
+# Without the parentheses this is `(t + a[i]) - 1`, which subtracts once per iteration rather than
+# once per element -- not one sum, and correctly left as a loop.
+t = 0
+for i in 0..n:
+    t = t + a[i] - 1
+assert(t == 132, "a constant applied to the accumulator, not the element, stays a loop")
+
 # --- shapes it must decline, each still producing the loop's own answer ---
 t = 0
 for i in 0..n:
