@@ -1122,9 +1122,11 @@ int main(void) {
         Chunk c;
         chunk_init(&c);
         VM vm;
-        bool ok = run_source(&c, &vm, "x = \"42\"\ny = integer(x)\n");
+        bool ok = run_source(&c, &vm, "x = 42.9\ny = integer(x)\n");
         check(ok, "real source 'integer(x)' ran without error");
-        check(aer_as_int(var_of(&vm, &c, "y")) == 42, "y == 42");
+        check(aer_as_int(var_of(&vm, &c, "y")) == 42,
+              "y == 42 -- integer() truncates a real; parsing a string is string.to_integer's job, "
+              "since only that can fail and so only that returns an error alongside the value");
         chunk_free(&c);
     }
     {
