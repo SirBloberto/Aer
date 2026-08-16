@@ -101,6 +101,16 @@ typedef struct Parser {
     /* Element kind of a typed array a register holds, from a `[numeric; count]` literal -- a
    parse-time fact, so the read can go straight to a raw slot. */
     RawKind reg_elem_kind[FRAME_REGISTERS];
+
+    /* Two arrays built from ONE count value are the same length. value_class identifies what a
+   register currently holds and changes on every write to it; len_class records the count's
+   value_class at construction, so equal nonzero len_classes mean equal lengths. Read only by
+   try_vectorize_reduction, where it is a correctness precondition rather than an optimization:
+   folding a loop over several columns into one whole-array pass is only the same work when they
+   really are the same length. */
+    int reg_value_class[FRAME_REGISTERS];
+    int reg_len_class[FRAME_REGISTERS];
+    int next_value_class;
     /* Side channel from the index-get site to parse_assignment, keyed on exact register equality
    rather than a flag. */
     int last_plain_index_dest_reg;
@@ -800,6 +810,19 @@ static void mark_shape_sensitive(int reg) {
         P.shape_sensitive_param[src] = true;
 }
 
+/* A nonzero id for the value an operand holds right now. Two reads of one untouched register, or of
+   one pool constant, give the same id; any write to that register gives a fresh one. */
+static int value_class_of(int rk) {
+    if (rk & RK_CONST_FLAG)
+        return -((rk & ~RK_CONST_FLAG) + 1);
+    int reg = drop_raw_marks(rk);
+    if (reg < 0 || reg >= FRAME_REGISTERS)
+        return 0;
+    if (P.reg_value_class[reg] == 0)
+        P.reg_value_class[reg] = ++P.next_value_class;
+    return P.reg_value_class[reg];
+}
+
 /* True iff (arr_reg, idx_rk) matches a pair on the safe_loop_item/array_regs stack. Both halves
    must match: a bound proven for array A must never be trusted for a different array B that
    happens to reuse the same index register. idx_rk must be a plain register.
@@ -828,8 +851,13 @@ static void note_slot_written(int reg) {
         return;
     if (P.length_tracked_valid && reg == P.length_tracked_source_reg)
         P.length_tracked_valid = false;
-    if (reg < FRAME_REGISTERS)
+    if (reg < FRAME_REGISTERS) {
         P.reg_elem_kind[reg] = RAWK_NONE;
+        /* Whatever it held is gone, so it is no longer that array; and a count read from it after
+           this is a different value, which must not match one read before. */
+        P.reg_len_class[reg] = 0;
+        P.reg_value_class[reg] = ++P.next_value_class;
+    }
     for (int i = 0; i < P.safe_loop_depth; i++) {
         if (P.safe_loop_item_regs[i] == reg)
             P.safe_loop_item_regs[i] = -1;
@@ -1646,6 +1674,7 @@ static int arg_materialize(Chunk* c, int rk) {
         chunk_emit(c, PACK2(OP_MOVE, target, rk));
         if (rk >= 0 && rk < FRAME_REGISTERS)
             P.reg_elem_kind[target] = P.reg_elem_kind[rk];
+        P.reg_len_class[target] = P.reg_len_class[rk];
     }
     return target;
 }
@@ -2084,12 +2113,15 @@ static int parse_primary_inner(Chunk* c) {
                          "count encoding's range)");
                 return 0;
             }
+            /* Taken before the register is released, since dest may be handed the very same one. */
+            int count_class = value_class_of(rk_count);
             /* Strict LIFO free order -- rk_count was allocated (if a temp at all) after fill_reg. */
             release_if_top(rk_count);
             release_if_top(fill_reg);
             int dest = reg_alloc();
             emit_array_repeat(c, dest, fill_reg, narrow_flag, rk_count);
             P.reg_elem_kind[dest] = fill_kind;
+            P.reg_len_class[dest] = count_class;
             return dest;
         }
 
@@ -3152,10 +3184,12 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         /* Read before anything clears it. A `[numeric; count]` literal is built straight into the
            register var_slot then hands this name, so source and destination are usually the SAME
            one -- and invalidate_register below would wipe the fact this line is preserving. */
-        RawKind rhs_elem = (!(rk_val & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) && rk_val >= 0 &&
-                            rk_val < FRAME_REGISTERS)
-                               ? P.reg_elem_kind[rk_val]
-                               : RAWK_NONE;
+        bool rhs_plain_reg = !(rk_val & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) &&
+                             rk_val >= 0 && rk_val < FRAME_REGISTERS;
+        RawKind rhs_elem = rhs_plain_reg ? P.reg_elem_kind[rk_val] : RAWK_NONE;
+        /* Preserved across invalidate_register for the same reason rhs_elem is: the literal was
+           usually built straight into the register this name is about to be given. */
+        int rhs_len_class = rhs_plain_reg ? P.reg_len_class[rk_val] : 0;
         /* See invalidate_safe_loop_reg's own comment -- without this, `reg` staying on
            safe_loop_item_regs after this reassignment would let a later arr[reg].field inside the
            same loop body keep trusting an index register that may no longer hold what the loop's
@@ -3180,6 +3214,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         }
         P.last_plain_index_dest_reg = -1;
         P.reg_elem_kind[reg] = rhs_elem;
+        P.reg_len_class[reg] = rhs_len_class;
         if (rk_val & RK_CONST_FLAG) {
             chunk_emit(c, PACK_OP_A_W16(OP_LOADK, reg, (unsigned int)(rk_val & ~RK_CONST_FLAG)));
         } else if (reg != rk_val) {
@@ -4179,21 +4214,28 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
         if (ops[i].d == acc || ops[i].x == acc || (!k_form && ops[i].y == acc))
             return false;
         if (ops[i].op == OP_INDEX_GET_RAW_INT || ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED) {
-            if (ops[i].x != (uint8_t)array_reg || ops[i].y != (uint8_t)item_reg)
+            if (ops[i].y != (uint8_t)item_reg)
                 return false;
-            from_array[ops[i].d] = array_reg;
+            /* A second column may join in, but only once its length is known to match the one the
+               loop was bounded by -- otherwise the whole-array pass would read a different number
+               of elements than the loop did. Both being built from one count value proves it. */
+            if (ops[i].x != (uint8_t)array_reg &&
+                !(P.reg_len_class[ops[i].x] != 0 && P.reg_len_class[ops[i].x] == P.reg_len_class[array_reg] &&
+                  P.reg_elem_kind[ops[i].x] == P.reg_elem_kind[array_reg]))
+                return false;
+            from_array[ops[i].d] = ops[i].x;
         } else if (k_form) {
             /* The constant is the whole of the right operand, so only the left can carry the array. */
             if (RK8_IS_CONST(ops[i].x) || from_array[ops[i].x] < 0)
                 return false;
             from_array[ops[i].d] = 1;
         } else {
-            /* One side must carry the array; the other may be a constant or a loop-invariant
-               scalar, which broadcasts. Two array operands would be a different array's element,
-               which this phase does not prove the length of. */
+            /* At least one side has to carry the array. The other may be a second column of the
+               same length, a constant, or a loop-invariant scalar -- the array-level operators
+               handle all three, the last two by broadcasting. */
             bool ax = !RK8_IS_CONST(ops[i].x) && from_array[ops[i].x] >= 0;
             bool ay = !RK8_IS_CONST(ops[i].y) && from_array[ops[i].y] >= 0;
-            if (ax == ay)
+            if (!ax && !ay)
                 return false;
             from_array[ops[i].d] = 1; /* a real register is filled in during emission */
         }
@@ -4209,7 +4251,7 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
         value[i] = -1;
     for (int i = 0; i < n - 1; i++) {
         if (ops[i].op == OP_INDEX_GET_RAW_INT || ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED) {
-            value[ops[i].d] = array_reg;
+            value[ops[i].d] = ops[i].x; /* the array itself replaces the element load */
             continue;
         }
         bool k_form = ops[i].op == OP_RAW_ADD_INT_K || ops[i].op == OP_RAW_SUB_INT_K;
@@ -5367,6 +5409,7 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     P.last_length_call_result_reg = -1;
     P.last_length_call_arg_reg = -1;
     P.safe_loop_depth = 0;
+    P.next_value_class = 0;
 
     /* Before the parameters, not after: a specialization recompile enters through
        parser_save_state, which zeroes the whole parser, and var_slot reads the region's low end as

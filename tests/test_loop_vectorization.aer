@@ -40,6 +40,44 @@ for i in 0..n:
     t = t + a[i] - 1
 assert(t == 132, "a constant applied to the accumulator, not the element, stays a loop")
 
+# A second column joins in only once its length is known to match. Both being built from one count
+# value proves it; nothing else does.
+b = [0i; 8]
+bi = 0
+for bi < 8:
+    b[bi] = bi * 2
+    bi += 1
+
+t = 0
+for i in 0..n:
+    t = t + a[i] * b[i]
+assert(t == 1568, "vectorized dot product over two columns of proven-equal length")
+
+t = 0
+for i in 0..n:
+    t = t + (a[i] + b[i]) * 2
+assert(t == 392, "vectorized sum over an expression in two columns")
+
+# Different count values, so the lengths are not known to match and the loop stands.
+short_n = 4
+long_n = 9
+p = [2i; short_n]
+q = [3i; long_n]
+t = 0
+for i in 0..length(p):
+    t = t + p[i] * q[i]
+assert(t == 24, "columns of different length are not folded together")
+
+# Same count VARIABLE, but written in between, so the two lengths are unrelated.
+k = 4
+r = [2i; k]
+k = 9
+s = [3i; k]
+t = 0
+for i in 0..length(r):
+    t = t + r[i] * s[i]
+assert(t == 24, "a count reassigned between constructions does not prove equal length")
+
 # --- shapes it must decline, each still producing the loop's own answer ---
 t = 0
 for i in 0..n:
