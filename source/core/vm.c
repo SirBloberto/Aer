@@ -823,14 +823,16 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
             return aer_bool(tta == ttb);
         if (op == OP_NEQ)
             return aer_bool(tta != ttb);
-        if (op == OP_ADD || op == OP_SUB || op == OP_MUL)
+        if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_LT || op == OP_LTE || op == OP_GT ||
+            op == OP_GTE)
             return vm_typed_array_binary_op(tta, ttb, op);
         error("Operator not valid for typed arrays");
         return aer_bool(false);
     }
 
     /* One side a typed array, the other a plain number: broadcast it across the array. */
-    if ((op == OP_ADD || op == OP_SUB || op == OP_MUL)) {
+    if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_LT || op == OP_LTE || op == OP_GT ||
+        op == OP_GTE || op == OP_EQ || op == OP_NEQ) {
         bool a_arr = aer_type(a) == TYPE_TYPED_ARRAY, b_arr = aer_type(b) == TYPE_TYPED_ARRAY;
         bool a_num = ta == TYPE_INTEGER || ta == TYPE_REAL, b_num = tb == TYPE_INTEGER || tb == TYPE_REAL;
         if (a_arr && b_num)
@@ -1461,6 +1463,45 @@ AER_TYPED_SCALAR_SET(i64, int64_t, AER_TYPED_SCALAR)
 AER_TYPED_SCALAR_SET(f64, double, AER_TYPED_SCALAR)
 AER_TYPED_SCALAR_SET(f32, float, AER_TYPED_SCALAR_FASTMATH)
 
+/* Comparisons answer 1 or 0 in the ELEMENT's own type rather than a separate boolean array, which
+   is what lets a mask compose with the arithmetic already here: `sum(price * (price < 400.0))` is a
+   filtered total with no new reduction and no new opcode. Fast-math is deliberately NOT applied --
+   it lets the compiler assume no NaN, and a comparison is exactly where that shows. */
+#define AER_TYPED_CMP(name, ctype, op)                                                                       \
+    static __attribute__((optimize("O3", "tree-vectorize"))) void name(                                      \
+        ctype* restrict r, const ctype* restrict a, const ctype* restrict b, unsigned int n) {               \
+        for (unsigned int i = 0; i < n; i++)                                                                 \
+            r[i] = (ctype)(a[i] op b[i] ? 1 : 0);                                                            \
+    }
+#define AER_TYPED_CMP_SCALAR(name, ctype, op)                                                                \
+    static __attribute__((optimize("O3", "tree-vectorize"))) void name(                                      \
+        ctype* restrict r, const ctype* restrict a, ctype s, unsigned int n) {                               \
+        for (unsigned int i = 0; i < n; i++)                                                                 \
+            r[i] = (ctype)(a[i] op s ? 1 : 0);                                                               \
+    }
+
+#define AER_TYPED_CMP_SET(sfx, ctype)                                                                        \
+    AER_TYPED_CMP(typed_lt_##sfx, ctype, <)                                                                  \
+    AER_TYPED_CMP(typed_lte_##sfx, ctype, <=)                                                                \
+    AER_TYPED_CMP(typed_gt_##sfx, ctype, >)                                                                  \
+    AER_TYPED_CMP(typed_gte_##sfx, ctype, >=)                                                                \
+    AER_TYPED_CMP(typed_eq_##sfx, ctype, ==)                                                                 \
+    AER_TYPED_CMP(typed_ne_##sfx, ctype, !=)                                                                 \
+    AER_TYPED_CMP_SCALAR(typed_lts_##sfx, ctype, <)                                                          \
+    AER_TYPED_CMP_SCALAR(typed_ltes_##sfx, ctype, <=)                                                        \
+    AER_TYPED_CMP_SCALAR(typed_gts_##sfx, ctype, >)                                                          \
+    AER_TYPED_CMP_SCALAR(typed_gtes_##sfx, ctype, >=)                                                        \
+    AER_TYPED_CMP_SCALAR(typed_eqs_##sfx, ctype, ==)                                                         \
+    AER_TYPED_CMP_SCALAR(typed_nes_##sfx, ctype, !=)
+
+AER_TYPED_CMP_SET(i32, int32_t)
+AER_TYPED_CMP_SET(i64, int64_t)
+AER_TYPED_CMP_SET(f32, float)
+AER_TYPED_CMP_SET(f64, double)
+
+#undef AER_TYPED_CMP
+#undef AER_TYPED_CMP_SCALAR
+#undef AER_TYPED_CMP_SET
 #undef AER_TYPED_ELEMENTWISE
 #undef AER_TYPED_ELEMENTWISE_FASTMATH
 #undef AER_TYPED_SCALAR
@@ -1604,11 +1645,33 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
         return aer_bool(false);
     }
     AerTypedArray* r = vm_new_typed_array(a->elem_kind, a->count);
+/* A comparison answers in the element type, so it slots into the same per-kind branch. */
+#define AER_CMP_DISPATCH(sfx, rc, ra, rb, n)                                                                 \
+    if (op == OP_LT) {                                                                                       \
+        typed_lt_##sfx(rc, ra, rb, n);                                                                       \
+        break;                                                                                               \
+    } else if (op == OP_LTE) {                                                                               \
+        typed_lte_##sfx(rc, ra, rb, n);                                                                      \
+        break;                                                                                               \
+    } else if (op == OP_GT) {                                                                                \
+        typed_gt_##sfx(rc, ra, rb, n);                                                                       \
+        break;                                                                                               \
+    } else if (op == OP_GTE) {                                                                               \
+        typed_gte_##sfx(rc, ra, rb, n);                                                                      \
+        break;                                                                                               \
+    } else if (op == OP_EQ) {                                                                                \
+        typed_eq_##sfx(rc, ra, rb, n);                                                                       \
+        break;                                                                                               \
+    } else if (op == OP_NEQ) {                                                                               \
+        typed_ne_##sfx(rc, ra, rb, n);                                                                       \
+        break;                                                                                               \
+    }
     switch (a->elem_kind) {
         case TYPED_ELEM_INT32: {
             int32_t* rc = (int32_t*)r->data;
             const int32_t* ra = (const int32_t*)a->data;
             const int32_t* rb = (const int32_t*)b->data;
+            AER_CMP_DISPATCH(i32, rc, ra, rb, a->count)
             if (op == OP_ADD)
                 typed_add_i32(rc, ra, rb, a->count);
             else if (op == OP_SUB)
@@ -1621,6 +1684,7 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
             int64_t* rc = (int64_t*)r->data;
             const int64_t* ra = (const int64_t*)a->data;
             const int64_t* rb = (const int64_t*)b->data;
+            AER_CMP_DISPATCH(i64, rc, ra, rb, a->count)
             if (op == OP_ADD)
                 typed_add_i64(rc, ra, rb, a->count);
             else if (op == OP_SUB)
@@ -1633,6 +1697,7 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
             float* rc = (float*)r->data;
             const float* ra = (const float*)a->data;
             const float* rb = (const float*)b->data;
+            AER_CMP_DISPATCH(f32, rc, ra, rb, a->count)
             if (op == OP_ADD)
                 typed_add_f32(rc, ra, rb, a->count);
             else if (op == OP_SUB)
@@ -1645,6 +1710,7 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
             double* rc = (double*)r->data;
             const double* ra = (const double*)a->data;
             const double* rb = (const double*)b->data;
+            AER_CMP_DISPATCH(f64, rc, ra, rb, a->count)
             if (op == OP_ADD)
                 typed_add_f64(rc, ra, rb, a->count);
             else if (op == OP_SUB)
@@ -1654,6 +1720,7 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
             break;
         }
     }
+#undef AER_CMP_DISPATCH
     return aer_typed_array_val(r);
 }
 
@@ -1666,12 +1733,46 @@ static AerVal vm_typed_array_scalar_op(AerTypedArray* a, AerVal scalar, Opcode o
     AerTypedArray* r = vm_new_typed_array(a->elem_kind, a->count);
     unsigned int n = a->count;
     bool rsub = (op == OP_SUB && flip);
+    /* With the scalar on the left the comparison reads the other way round: `400.0 > price` asks
+       what `price < 400.0` asks. */
+    Opcode cmp = op;
+    if (flip) {
+        if (op == OP_LT)
+            cmp = OP_GT;
+        else if (op == OP_GT)
+            cmp = OP_LT;
+        else if (op == OP_LTE)
+            cmp = OP_GTE;
+        else if (op == OP_GTE)
+            cmp = OP_LTE;
+    }
+#define AER_CMPS_DISPATCH(sfx, rc, ra, sv, n)                                                                \
+    if (cmp == OP_LT) {                                                                                      \
+        typed_lts_##sfx(rc, ra, sv, n);                                                                      \
+        break;                                                                                               \
+    } else if (cmp == OP_LTE) {                                                                              \
+        typed_ltes_##sfx(rc, ra, sv, n);                                                                     \
+        break;                                                                                               \
+    } else if (cmp == OP_GT) {                                                                               \
+        typed_gts_##sfx(rc, ra, sv, n);                                                                      \
+        break;                                                                                               \
+    } else if (cmp == OP_GTE) {                                                                              \
+        typed_gtes_##sfx(rc, ra, sv, n);                                                                     \
+        break;                                                                                               \
+    } else if (cmp == OP_EQ) {                                                                               \
+        typed_eqs_##sfx(rc, ra, sv, n);                                                                      \
+        break;                                                                                               \
+    } else if (cmp == OP_NEQ) {                                                                              \
+        typed_nes_##sfx(rc, ra, sv, n);                                                                      \
+        break;                                                                                               \
+    }
     switch (a->elem_kind) {
 #define AER_SCALAR_CASE(KIND, sfx, ctype)                                                                    \
     case KIND: {                                                                                             \
         ctype* rc = (ctype*)r->data;                                                                         \
         const ctype* ra = (const ctype*)a->data;                                                             \
         ctype sv = (ctype)s;                                                                                 \
+        AER_CMPS_DISPATCH(sfx, rc, ra, sv, n)                                                                \
         if (op == OP_ADD)                                                                                    \
             typed_adds_##sfx(rc, ra, sv, n);                                                                 \
         else if (op == OP_MUL)                                                                               \

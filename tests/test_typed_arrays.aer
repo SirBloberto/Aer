@@ -157,4 +157,39 @@ assert(length(bc * 2.0) == 3, "broadcasting preserves the length")
 assert(((bc - 1.0) * 2.0)[0] == 18.0, "a broadcast result chains into the next operator")
 assert(((bc * 2.0) + bc)[0] == 30.0, "a broadcast result combines with a whole array")
 
+# Comparing typed arrays answers 1 or 0 in the ELEMENT's own type rather than a separate boolean
+# array. That is what lets a mask compose with the arithmetic already here: a filtered total is
+# `sum(value * mask)`, needing no new reduction.
+cmp_a = [0.0; 6]
+ci = 0
+for ci < 6:
+    cmp_a[ci] = float(ci) * 100.0
+    ci += 1
+# cmp_a = [0, 100, 200, 300, 400, 500]
+
+lt = cmp_a < 350.0
+assert(lt[0] == 1.0 and lt[3] == 1.0, "elements under the bound mask to 1")
+assert(lt[4] == 0.0 and lt[5] == 0.0, "elements over the bound mask to 0")
+assert((cmp_a > 350.0)[4] == 1.0, "greater-than against a scalar")
+assert((cmp_a >= 400.0)[4] == 1.0 and (cmp_a <= 0.0)[0] == 1.0, "the inclusive forms")
+
+# With the scalar on the left the comparison has to read the other way round.
+assert((350.0 > cmp_a)[3] == 1.0 and (350.0 > cmp_a)[4] == 0.0, "a scalar on the left flips the test")
+assert((350.0 < cmp_a)[4] == 1.0, "less-than with the scalar on the left")
+
+assert((cmp_a < (cmp_a + 1.0))[0] == 1.0, "comparing two arrays elementwise")
+assert((cmp_a == 200.0)[2] == 1.0 and (cmp_a != 200.0)[2] == 0.0, "equality against a scalar masks elementwise")
+# Between two ARRAYS, == and != keep their existing meaning: identity, not an elementwise mask.
+assert((cmp_a == cmp_a) == true and (cmp_a != cmp_a) == false, "array == array is still identity")
+
+cmp_i = [0i; 4]
+cmp_i[0] = 5
+cmp_i[1] = 15
+assert((cmp_i > 10)[1] == 1 and (cmp_i > 10)[0] == 0, "masks over an int array stay integers")
+
+# The point of all of it: a filtered total with no new reduction.
+import collection
+assert(collection.sum(cmp_a < 350.0) == 4.0, "summing a mask counts the matches")
+assert(collection.sum(cmp_a * (cmp_a < 350.0)) == 600.0, "value times mask is a filtered total")
+
 print("test_typed_arrays.aer: all assertions passed.")

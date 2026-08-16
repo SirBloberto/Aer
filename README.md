@@ -1397,6 +1397,22 @@ wide accumulator also measures slightly faster, so nothing is traded for it.
 `append`, `insert`, `delete` and `reserve` are the four that a typed array rejects -- its length is
 fixed when it is created.
 
+### Masks
+
+Comparing a typed array answers **1 or 0 in the element's own type**, not a separate boolean array.
+That is what lets a mask compose with ordinary arithmetic, so a filtered total needs no new
+operation:
+
+```
+mask  = price < 400.0            # [1.0, 1.0, 0.0, ...]
+count = collection.sum(mask)     # how many matched
+total = collection.sum(price * mask)   # sum of just those
+```
+
+`<`, `<=`, `>` and `>=` work between two arrays or an array and a number, either way round.
+`==` and `!=` mask elementwise against a **number**, but between two **arrays** they keep their
+existing meaning — identity, answering whether they are the same array.
+
 ### Loops that become whole-array reductions
 
 A `for i in 0..n:` whose body only accumulates over typed arrays is compiled as if you had written
