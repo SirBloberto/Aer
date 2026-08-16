@@ -273,9 +273,7 @@ void aer_actor_free_all(void) {
         aer_actor_free(actors);
 }
 
-/* ------------------------------------------------------------------ */
 /* Script-facing `actor` module                                         */
-/* ------------------------------------------------------------------ */
 
 /* Script-facing surface over aer_actor.c's host-only primitives -- spawn/send/receive/call, same
    fixed CALL_MODULE_* dispatch shape as every other stdlib module. Adds no concurrency of its own:

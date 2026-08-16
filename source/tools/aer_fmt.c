@@ -14,9 +14,7 @@
 #include <io.h>
 #endif
 
-/* ------------------------------------------------------------------ */
 /* Tokenizing                                                           */
-/* ------------------------------------------------------------------ */
 
 typedef enum { T_WORD, T_NUMBER, T_STRING, T_COMMENT, T_OP, T_EOF } TokType;
 
@@ -141,11 +139,9 @@ static TokList tokenize(const char* src) {
     return tl;
 }
 
-/* ------------------------------------------------------------------ */
 /* Logical lines -- one statement, possibly spanning several source     */
 /* lines while a ( [ { is still open, exactly like the real lexer's     */
 /* own bracket_depth-gated newline handling.                            */
-/* ------------------------------------------------------------------ */
 
 typedef struct {
     unsigned int start, end;
@@ -255,9 +251,7 @@ static void compute_depths(LLineList* lines, TokList* tl) {
     }
 }
 
-/* ------------------------------------------------------------------ */
 /* Emission                                                             */
-/* ------------------------------------------------------------------ */
 
 /* Flow/structural keywords never leave a value behind for '-' to subtract from, so '-' right
    after one of these is unary negate, not binary subtract -- unlike true/false/null (real value
@@ -363,8 +357,6 @@ static void format_file(const char* src, FILE* out) {
     free(tl.items);
     free(lines.items);
 }
-
-/* ------------------------------------------------------------------ */
 
 static char* read_whole_file(const char* path) {
     FILE* fp = fopen(path, "rb");

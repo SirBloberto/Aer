@@ -150,9 +150,7 @@ static inline AerVal* vm_rk_ptr8(AerVal* registers, AerVal* pool, uint32_t rk8) 
     return &registers[rk8 & RK8_INDEX_MASK];
 }
 
-/* ------------------------------------------------------------------ */
 /* GC policy -- suppression, tuning, and the collection trigger         */
-/* ------------------------------------------------------------------ */
 
 /* Young only if v has a pooled cell at all -- numbers and booleans have none. */
 /* None of these take a VM* -- adding one would break every existing embedder. Suppress/unsuppress
@@ -216,9 +214,7 @@ void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
         *major_collections = heap->major_collections_run;
 }
 
-/* ------------------------------------------------------------------ */
 /* Runtime error context -- the callbacks error.c installs              */
-/* ------------------------------------------------------------------ */
 
 static unsigned int lookup_runtime_line(void) {
     VM* vm = vm_active_error_vm();
@@ -305,9 +301,7 @@ static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size)
     return pos;
 }
 
-/* ------------------------------------------------------------------ */
 /* String construction                                              */
-/* ------------------------------------------------------------------ */
 
 /* Wraps an exclusively-owned (data, length) in a fresh heap box; never copies. Routes to
    current_heap, guarded via vm_require_current_heap() because the lexer can call this
@@ -356,9 +350,7 @@ AerVal aer_make_string_copy(const char* src, unsigned int length) {
     return aer_string_val(s);
 }
 
-/* ------------------------------------------------------------------ */
 /* VM lifecycle                                                         */
-/* ------------------------------------------------------------------ */
 
 /* Registered here, once per process regardless of how many VMs get created (module loading spins
    up a fresh one per import), so io is exactly as always-on as collection/math/string/etc. with no
@@ -479,11 +471,9 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
        interned token) lands in whatever heap some OTHER, unrelated VM last left active instead of
        this one's own -- exactly the cross-heap contamination per-VM heaps exist to prevent. */
     vm_set_current_heap(&vm->heap);
-    /* Re-seeded on every call, not just at vm_init: aer_run_source is the "run more code into an
-       already-initialized VM" entry point (REPL, embedding), and the documented capability-toggle
-       pattern is to flip aer_set_io_enabled/net_enabled(false), run one thing, then flip it back --
-       on an existing vm, not a freshly created one (see embed_smoke_test.c). Without this, that
-       pattern would silently do nothing once the vm's own fields were seeded once at vm_init. */
+    /* Re-seeded every call, not just at vm_init: the documented toggle pattern flips the global,
+       runs one thing, then flips it back, all on an EXISTING vm (embed_smoke_test.c) -- which
+       seeding once would silently ignore. */
     vm->io_enabled = aer_io_enabled;
     vm->net_enabled = aer_net_enabled;
     aer_vm_reset_for_reuse(vm);
@@ -496,9 +486,7 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
     return vm_run(vm);
 }
 
-/* ------------------------------------------------------------------ */
 /* Type helpers                                                         */
-/* ------------------------------------------------------------------ */
 
 /* A struct reports its declared name, a packed array that name plus "[]". type_names[] is indexed
    by ValueType, so it must stay as long as the entries not handled specially above. */
@@ -524,8 +512,6 @@ static const char* vm_type_name(Chunk* c, AerVal v) {
         return "Result";
     return type_names[aer_type(v)];
 }
-
-/* ------------------------------------------------------------------ */
 
 static inline __attribute__((always_inline)) bool vm_truthy(AerVal v) {
     switch (aer_type(v)) {
@@ -581,9 +567,7 @@ static inline double aer_mod_double(double l, double rv) {
     return r;
 }
 
-/* ------------------------------------------------------------------ */
 /* Operator semantics -- what +, ==, in, ... actually do                */
-/* ------------------------------------------------------------------ */
 
 /* Int/int and real/real fast path shared by every struct-field-fusion opcode. A plain `inline`
    hint, not always_inline: with 7 call sites, forcing it made lbl_binary_field/lbl_field_binary
@@ -866,9 +850,7 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
     return aer_bool(false);
 }
 
-/* ------------------------------------------------------------------ */
 /* Value stringification                                            */
-/* ------------------------------------------------------------------ */
 
 static AerVal vm_to_str(VM* vm, AerVal v) {
     if (aer_type(v) == TYPE_STRING)
@@ -1033,9 +1015,7 @@ static __attribute__((noinline)) AerVal vm_interp_build(VM* vm, const AerVal* pa
 }
 
 /* Either bound may be null, meaning 0 or len. Out-of-range clamps rather than errors, Python-style. */
-/* ------------------------------------------------------------------ */
 /* Slices and default values                                        */
-/* ------------------------------------------------------------------ */
 
 static bool vm_slice_bounds(AerVal start_v, AerVal end_v, int64_t len, int64_t* out_start, int64_t* out_end) {
     if (aer_type(start_v) != TYPE_NULL && aer_type(start_v) != TYPE_INTEGER) {
@@ -1099,9 +1079,7 @@ static AerVal vm_default_value(VM* vm, AerVal dflt) {
    since this isn't inside vm_run's dispatch loop. dest_reg fixed at 0 sets up the frame right
    above target's own frame 0, so once vm_run(target) drains back to depth 0, the result sits
    in target->call_stack[0].registers[0]. */
-/* ------------------------------------------------------------------ */
 /* Call setup                                                       */
-/* ------------------------------------------------------------------ */
 
 bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsigned int return_ip) {
     if (arg_count < (int)fn->min_arity || arg_count > (int)fn->arity) {
@@ -1209,9 +1187,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
 /* Resolves field_idx within shape via the per-site inline cache (keyed by bytecode offset) --
    shared by both boxed-struct and packed-array callers, since a field's slot within a given
    Shape is identical either way. False (error reported) if shape has no such field. */
-/* ------------------------------------------------------------------ */
 /* Field and element access -- struct, packed, typed                */
-/* ------------------------------------------------------------------ */
 
 static inline __attribute__((always_inline)) bool
 vm_resolve_field_by_shape(Chunk* c, unsigned int site, Shape* shape, int field_idx, int* out_slot,
@@ -1278,13 +1254,9 @@ static inline void vm_packed_slot_write(unsigned char* slot, ValueType ftype, Ae
     memcpy(slot, &v.as, 8);
 }
 
-/* One element of a TYPE_TYPED_ARRAY (AerTypedArray) -- a completely separate function from
-   vm_packed_slot_read/write above, deliberately NOT merged into one wider-switch helper: that
-   function's own comment documents a real, measured ARM regression from adding exactly this kind of
-   branch to its hot path, and struct-field access (already tuned, already fusion-opcode-heavy) has
-   nothing to gain from sharing code with a brand new, unrelated value kind. */
-/* Not file-static -- see its own declaration, vm.h, for why (gc.c's free_typed_array needs it
-   too). -flto still inlines this at every one of vm.c's own hot call sites, same as before. */
+/* Deliberately not merged with vm_packed_slot_read/write above: that function's own comment records
+   a measured ARM regression from adding exactly this kind of branch to its hot path. Not
+   file-static because gc.c needs it; -flto still inlines it at vm.c's own call sites. */
 unsigned int vm_typed_elem_width(TypedArrayElemKind kind) {
     return (kind == TYPED_ELEM_INT32 || kind == TYPED_ELEM_FLOAT32) ? 4 : 8;
 }
@@ -1422,12 +1394,9 @@ vm_packed_raw_elem_unchecked(AerVal obj, AerVal* idx, unsigned int foffset) {
     return pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
 }
 
-/* Elementwise add/sub/mul over two same-kind typed arrays. Each (kind, op) pair is its own
-   branch-free loop over flat contiguous memory -- the shape GCC's auto-vectorizer turns into SIMD
-   with no intrinsics. Plain -O2 vectorizes none of these and -O3 alone skips the float kinds, so
-   each function carries its own `optimize` attribute, plus fast-math on the two float32 ones only
-   -- scoped there so every other float operation keeps strict IEEE 754. Measured ~2.2-2.4x while
-   cache-resident; past cache the loop is bandwidth-bound and the win disappears. */
+/* -O2 vectorizes none of these and -O3 alone skips the float kinds, hence the per-function
+   attribute; fast-math is on the float32 pair only, so every other float op keeps strict IEEE 754.
+   Worth ~2.2-2.4x while cache-resident, nothing past it -- the loop is bandwidth-bound there. */
 #define AER_TYPED_ELEMENTWISE(name, ctype, op_expr)                                                          \
     static __attribute__((optimize("O3", "tree-vectorize"))) void name(                                      \
         ctype* restrict c, const ctype* restrict a, const ctype* restrict b, unsigned int n) {               \
@@ -1461,9 +1430,7 @@ AER_TYPED_ELEMENTWISE_FASTMATH(typed_mul_f32, float, a[i] * b[i])
    size before falling back to xmalloc -- linear scan over a handful of slots, cheap regardless of
    hit or miss. Claimed slots are cleared (size = 0) so a later free_typed_array (gc.c) can reuse
    them for a different buffer. */
-/* ------------------------------------------------------------------ */
 /* Typed arrays -- allocation and elementwise ops                   */
-/* ------------------------------------------------------------------ */
 
 static unsigned char* typed_array_data_alloc(VmHeap* heap, size_t size) {
     for (unsigned int i = 0; i < TYPED_ARRAY_FREE_CACHE_SLOTS; i++) {
@@ -1475,11 +1442,9 @@ static unsigned char* typed_array_data_alloc(VmHeap* heap, size_t size) {
             return p;
         }
     }
-    /* A miss charges the collector for what it actually cost. Its trigger counts CELLS, and a typed
-       array is one cell however many megabytes hang off it -- so `a = (a + b) * half` in a loop ran
-       thousands of fresh mallocs between collections while the free cache above sat empty, since
-       nothing reached it until a cycle ran. Charging by size pulls the next cycle in and turns those
-       mallocs into cache hits. Only on a miss: a hit allocated nothing to collect. */
+    /* The collector's trigger counts cells, and a typed array is one cell however many megabytes
+       hang off it -- so charging a miss by size is what pulls the next cycle in soon enough for the
+       cache above to be populated. A hit allocated nothing, so it is charged nothing. */
     heap->pool_alloc_count += (unsigned int)(size / TYPED_ARRAY_ALLOC_CHARGE_BYTES);
     return xmalloc(size);
 }
@@ -1655,9 +1620,7 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
    narrow reader/writer for a 4-byte one, a 16-byte memcpy for TYPE_ANY. Declared in vm.h because
    aer_json.c needs it too. Looks offset/ftype/narrow up fresh, so opcode call sites should use
    vm_struct_field_read_at below once the field cache has already resolved them. */
-/* ------------------------------------------------------------------ */
 /* Struct field read/write -- boxed and narrow                      */
-/* ------------------------------------------------------------------ */
 
 AerVal vm_struct_field_read(AerStruct* s, unsigned int slot) {
     ValueType ftype = s->shape->field_types[slot];
@@ -1781,9 +1744,7 @@ static inline void vm_struct_field_write_at(AerStruct* s, unsigned int offset, V
 /* Returns an owned copy of dense[*idx]'s key. Shared by array-iteration's dict branch and
    pair-iteration. False once exhausted -- the dense array has no holes, so this is a plain
    bounds check, not a scan. */
-/* ------------------------------------------------------------------ */
 /* Dict iteration                                                   */
-/* ------------------------------------------------------------------ */
 
 static bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
     if ((uint64_t)*idx >= d->map.count)
@@ -1794,9 +1755,7 @@ static bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
     return true;
 }
 
-/* ------------------------------------------------------------------ */
 /* Value constructors                                               */
-/* ------------------------------------------------------------------ */
 
 AerArray* vm_new_array(void) {
     VmHeap* heap = vm_require_current_heap();
@@ -1850,9 +1809,7 @@ AerFunction* vm_new_function(void) {
 }
 
 /* builtin_id resolved at parse time. Returns true if arg_count matched, result in *out. */
-/* ------------------------------------------------------------------ */
 /* Builtin function calls                                           */
-/* ------------------------------------------------------------------ */
 
 static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_count, AerVal* out) {
     *out = aer_null();
@@ -2179,9 +2136,7 @@ static AerVal vm_cast(AerVal v, int cast_type) {
     return r;
 }
 
-/* ------------------------------------------------------------------ */
 /* Dispatch loop -- computed goto                                       */
-/* ------------------------------------------------------------------ */
 
 /* GCC direct-threaded dispatch: each instruction jumps straight to the next handler, so the branch
    predictor learns per-instruction patterns instead of funnelling every opcode through one switch.

@@ -4,9 +4,7 @@
 #include "pool.h"
 #include "vm.h"
 
-/* ------------------------------------------------------------------ */
 /* Generational GC -- write barrier and remembered set                   */
-/* ------------------------------------------------------------------ */
 
 /* Every pooled cell's gc_state byte lives at the cell itself (offset 0, see pool.h), not in a
    side table -- so unlike a lookup keyed by which pool a value belongs to, checking any of these
@@ -106,9 +104,7 @@ void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value) {
     gc_remember(heap, d, REMEMBERED_DICT);
 }
 
-/* ------------------------------------------------------------------ */
 /* Generational GC -- mark phase                                        */
-/* ------------------------------------------------------------------ */
 
 /* null/boolean/integer/float reference no heap cell (integers are never boxed under the tagged
    representation) -- filtering them out here, once, means every caller (register/stack roots,
@@ -248,9 +244,7 @@ static void mark_chunk_roots(VmHeap* heap, Chunk* chunk, bool minor) {
     }
 }
 
-/* ------------------------------------------------------------------ */
 /* Generational GC -- sweep finalizers                                  */
-/* ------------------------------------------------------------------ */
 
 /* An inline string owns nothing separate; anything longer holds a payload from
    vm_string_payload_alloc, which re-derives the same size class from `length`. current_heap is this
@@ -344,9 +338,7 @@ void gc_finalize_all_pools(VmHeap* heap) {
         pool_finalize_all(pool_at(heap, pool_table[i].offset), pool_table[i].on_free);
 }
 
-/* ------------------------------------------------------------------ */
 /* Generational GC -- collection                                        */
-/* ------------------------------------------------------------------ */
 
 /* Collects only vm's own heap, against only vm's own roots -- each VM now owns an independent
    heap, so there is no other VM's state to fan out into (file-modules and actors used to be marked
@@ -455,9 +447,7 @@ static void gc_collect(VM* vm, bool minor, unsigned int* live_out) {
         pool_sweep(pool_at(heap, pool_table[i].offset), minor, pool_table[i].on_free, live_out);
 }
 
-/* ------------------------------------------------------------------ */
 /* Generational GC -- trigger                                           */
-/* ------------------------------------------------------------------ */
 
 /* Tuning defaults (DEFAULT_MINOR_GC_THRESHOLD/DEFAULT_MAJOR_GC_EVERY_N_MINOR, overridable per-heap
    via aer_gc_configure()) are applied in vm_heap_init (vm.c) -- VmHeap's zero-init obviously can't

@@ -990,9 +990,7 @@ void aer_disassemble(Chunk* c, FILE* out) {
     free(by_line);
 }
 
-/* ------------------------------------------------------------------ */
 /* Per-pool memory report                                              */
-/* ------------------------------------------------------------------ */
 
 /* aer_gc_stats() only counts live cells, which understates real usage -- string/array/dict
    payloads are separate xmalloc'd allocations the pool doesn't track. */

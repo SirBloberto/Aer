@@ -6,9 +6,7 @@
 #include "error.h"
 #include "strbuf.h"
 
-/* ------------------------------------------------------------------ */
 /* encode                                                              */
-/* ------------------------------------------------------------------ */
 
 static void json_encode_string(StrBuf* b, const char* s, unsigned int len) {
     strbuf_append_char(b, '"');
@@ -110,9 +108,7 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
     return true;
 }
 
-/* ------------------------------------------------------------------ */
 /* decode -- small recursive-descent parser                            */
-/* ------------------------------------------------------------------ */
 
 typedef struct {
     const char* s;
@@ -435,9 +431,7 @@ static AerVal json_decode(AerString* input, char** err_out) {
     return p.err ? aer_null() : result;
 }
 
-/* ------------------------------------------------------------------ */
 /* dispatch                                                            */
-/* ------------------------------------------------------------------ */
 
 bool aer_json_call(VM* vm, Chunk* c, int fn_id, int arg_count) {
     if (fn_id == FN_JSON_ENCODE && arg_count == 1) {

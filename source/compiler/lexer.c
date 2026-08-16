@@ -97,9 +97,7 @@ void lexer_restore_state(LexerState* s) {
     free(s);
 }
 
-/* ------------------------------------------------------------------ */
 /* File loading                                                         */
-/* ------------------------------------------------------------------ */
 
 void read_file(char* filename) {
     FILE* fp = fopen(filename, "rb");
@@ -212,9 +210,7 @@ void lexer_begin_span(const char* text, unsigned int len, unsigned int start_lin
     at_line_start = false;
 }
 
-/* ------------------------------------------------------------------ */
 /* Token helpers                                                        */
-/* ------------------------------------------------------------------ */
 
 static void emit(TokenType type, unsigned int length) {
     token.type = type;
@@ -245,9 +241,7 @@ static void emit_boolean(TokenType type) {
     emit(type, type == TOKEN_TRUE ? sizeof("true") - 1 : sizeof("false") - 1);
 }
 
-/* ------------------------------------------------------------------ */
 /* Lexing helpers                                                       */
-/* ------------------------------------------------------------------ */
 
 static void skip_whitespace() {
     while (*current->buffer == ' ' || *current->buffer == '\t')
@@ -435,9 +429,7 @@ static void lex_identifier() {
         emit_string_token(TOKEN_IDENTIFIER, length);
 }
 
-/* ------------------------------------------------------------------ */
 /* Main lex function                                                    */
-/* ------------------------------------------------------------------ */
 
 void lex() {
     /* Emit queued DEDENTs before anything else */
@@ -620,9 +612,7 @@ void lex() {
     emit(TOKEN_ERROR, 1);
 }
 
-/* ------------------------------------------------------------------ */
 /* Token matching utilities */
-/* ------------------------------------------------------------------ */
 
 bool equal(TokenType match) {
     return token.type == match;

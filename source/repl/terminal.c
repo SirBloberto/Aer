@@ -46,9 +46,7 @@
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 
-/* ------------------------------------------------------------------ */
 /* State                                                                */
-/* ------------------------------------------------------------------ */
 
 static FILE* history;
 static char history_buffer[COMMAND_SIZE];
@@ -95,9 +93,7 @@ static void clear();
 static void reset();
 static void die(const char* message);
 
-/* ------------------------------------------------------------------ */
 /* Public API                                                           */
-/* ------------------------------------------------------------------ */
 
 void set_terminal_prompt(const char* p) {
     prompt = p;
@@ -377,9 +373,7 @@ void end_terminal() {
 #endif
 }
 
-/* ------------------------------------------------------------------ */
 /* Internal                                                             */
-/* ------------------------------------------------------------------ */
 
 static void refresh() {
     printf("\x1b[?25l"); /* hide cursor while drawing */

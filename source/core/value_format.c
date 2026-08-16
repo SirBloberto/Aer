@@ -64,10 +64,8 @@ unsigned int aer_format_int(long long v, char* buf, size_t bufsize) {
     return (unsigned int)len;
 }
 
-/* ------------------------------------------------------------------ */
 /* Value formatting -- shared by print() and vm_to_str() (interpolation, +, etc.) for one consistent
    recursive rendering, not a terse "<array[3]>" fallback. */
-/* ------------------------------------------------------------------ */
 
 void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
     char tmp[64];

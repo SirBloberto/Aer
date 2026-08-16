@@ -159,9 +159,7 @@ static AerVal aer_scheduler_run_collect(void) {
     return aer_array_val(out);
 }
 
-/* ------------------------------------------------------------------ */
 /* Script-facing `scheduler` module                                     */
-/* ------------------------------------------------------------------ */
 
 /* noinline -- see aer_host_call's own comment (aer_host.c): same 4KB VM_STACK_MAX-array,
    single-call-site shape that was inflating vm_run_slice's stack frame via LTO. */

@@ -31,9 +31,7 @@ struct Group {
     int alt_cap;
 };
 
-/* ------------------------------------------------------------------ */
 /* Parsing -- pattern -> a tree of Groups/Seqs/Nodes                    */
-/* ------------------------------------------------------------------ */
 
 static const char* p; /* parser cursor -- not reentrant, fine for this single-threaded VM */
 static bool parse_failed;
@@ -267,9 +265,7 @@ static void free_seq(Seq* seq) {
     free(seq->nodes);
 }
 
-/* ------------------------------------------------------------------ */
 /* Matching -- continuation-passing backtracker                        */
-/* ------------------------------------------------------------------ */
 
 /* Every match function threads an `end` out-parameter through: on success it's set to the text
    position where the whole chain finally bottomed out (frame == NULL), which is the match's real
@@ -405,9 +401,7 @@ static const char* regex_search(Group* g, const char* subject_true_start, const 
     }
 }
 
-/* ------------------------------------------------------------------ */
 /* Public API -- regex.match/find/replace                              */
-/* ------------------------------------------------------------------ */
 
 bool aer_regex_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_REGEX_MATCH && arg_count == 2) {

@@ -21,9 +21,7 @@
 Token token;
 Mode mode;
 
-/* ------------------------------------------------------------------ */
 /* Minimal JSON -- only what the specific LSP methods below need        */
-/* ------------------------------------------------------------------ */
 
 /* Finds "key":"value" or "key":123 for a top-level-ish key anywhere in the text (a plain
    substring/bracket-depth-free scan, not a real parser) -- sufficient for the fixed, predictable
@@ -95,9 +93,7 @@ static long json_get_int(const char* json, const char* key, long fallback) {
     return strtol(p, NULL, 10);
 }
 
-/* ------------------------------------------------------------------ */
 /* Content-Length framed stdio                                          */
-/* ------------------------------------------------------------------ */
 
 static char* read_message(void) {
     long content_length = -1;
@@ -124,10 +120,8 @@ static void send_message(const char* json_body) {
     fflush(stdout);
 }
 
-/* ------------------------------------------------------------------ */
 /* Open-document table -- small, linear, fine for how many files a      */
 /* human actually has open at once.                                     */
-/* ------------------------------------------------------------------ */
 
 #define MAX_OPEN_DOCS 64
 typedef struct {
@@ -159,9 +153,7 @@ static const char* get_document(const char* uri) {
     return NULL;
 }
 
-/* ------------------------------------------------------------------ */
 /* Diagnostics -- the real compiler, import disabled, never run         */
-/* ------------------------------------------------------------------ */
 
 typedef struct {
     unsigned int line, col;
@@ -269,10 +261,8 @@ static void publish_diagnostics(const char* uri) {
 #undef APPEND
 }
 
-/* ------------------------------------------------------------------ */
 /* Symbol scan -- coarse, token-based, reuses the real lexer directly   */
 /* (comments/whitespace don't matter here, unlike aer_fmt.c)            */
-/* ------------------------------------------------------------------ */
 
 typedef struct {
     char name[128];
@@ -336,9 +326,7 @@ static const ModuleFns MODULE_FNS[] = {
     {"io", {"read", "write", "append", "exists", "remove", "stdin", "args", NULL}},
     {NULL, {NULL}}};
 
-/* ------------------------------------------------------------------ */
 /* Method handlers                                                      */
-/* ------------------------------------------------------------------ */
 
 static void handle_initialize(const char* msg) {
     long id = json_get_int(msg, "id", 0);
@@ -499,8 +487,6 @@ static void handle_completion(const char* msg) {
     free(buf);
     free(uri);
 }
-
-/* ------------------------------------------------------------------ */
 
 /* Every diagnostic already reaches the client structured, via aer_set_diagnostic_callback in
    run_diagnostics() -- without registering this too, the plain-text sink's default (stderr) would

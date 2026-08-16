@@ -83,7 +83,6 @@ typedef struct Parser {
     unsigned int var_names[FRAME_REGISTERS];
     int var_regs[FRAME_REGISTERS];
     int var_count;
-    /* Per-variable storage kind -- see VarKind's own comment above. */
     VarKind var_kind[FRAME_REGISTERS];
 
     /* Which of this function's parameters were used as the base of a struct-field access, directly or
@@ -173,7 +172,6 @@ typedef struct Parser {
     bool range_item_written[LOOP_MAX];
     int range_loop_depth;
 
-    /* One entry per enclosing loop, innermost last -- see LoopHoist and hoist_begin. */
     LoopHoist hoist_stack[LOOP_MAX];
     int hoist_depth;
 
@@ -193,7 +191,6 @@ typedef struct Parser {
     PendingCall* pending_calls;
     int pending_count, pending_cap;
 
-    /* break/continue loop-context stack -- see LoopContext's own comment above. */
     LoopContext loop_stack[LOOP_MAX];
     int loop_depth;
 
@@ -376,14 +373,12 @@ static bool rk8_fits(int rk) {
     return (rk & ~RK_CONST_FLAG) <= RK8_MAX_INDEX;
 }
 
-/* Forward-declared so emit_binary (which needs it) can come before it. */
 static int drop_raw_marks(int rk);
 
 /* Every binary-operator emission funnels through here. Boxes any raw-flagged operand first
    (a no-op for a plain register or constant) -- only parse_binary_ops's own raw-composing path
    (try_emit_binary_raw) tries the native route before reaching here. */
 static int materialize(Chunk* c, int rk);
-/* Forward-declared so emit_cond_jump_if_false (below) can come before it. */
 static bool is_temp(int rk);
 static void release_if_top(int rk);
 static int drop_raw_marks(int rk);
@@ -745,10 +740,8 @@ void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, 
     chunk_emit(c, (uint32_t)field_name_pool_idx);
 }
 
-/* ------------------------------------------------------------------ */
 /* Recursive-descent compiler: the full grammar, from the lexer's token stream straight to
    register bytecode. */
-/* ------------------------------------------------------------------ */
 
 static int parse_primary_inner(Chunk* c);
 static int parse_primary(Chunk* c);

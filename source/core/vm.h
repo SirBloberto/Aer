@@ -617,12 +617,10 @@ typedef struct {
     bool megamorphic;
 } ChunkFunction;
 
-/* ------------------------------------------------------------------ */
 /* Bytecode chunk                                                       */
 /* Flat 32-bit word array: one descriptor word (opcode + narrow packed fields) plus, per opcode's
    own fixed shape, zero or more trailing wide-field words -- see the fixed-width encoding comment
    above chunk_emit_word/read_word (vm.c). */
-/* ------------------------------------------------------------------ */
 
 /* offset/ftype/narrow are pure functions of (shape, slot), cached here so a hit reads them from the
    entry it already touched for the shape check rather than indirecting through Shape again. */
@@ -716,9 +714,7 @@ typedef struct {
     unsigned int debug_hits_cap;
 } Chunk;
 
-/* ------------------------------------------------------------------ */
 /* Per-VM heap -- every pool a VM allocates from, plus its own GC state. */
-/* ------------------------------------------------------------------ */
 
 typedef enum { REMEMBERED_ARRAY, REMEMBERED_DICT, REMEMBERED_STRUCT } RememberedKind;
 typedef struct {
@@ -805,9 +801,7 @@ typedef struct {
     HashPools dict_hash_pools;
 } VmHeap;
 
-/* ------------------------------------------------------------------ */
 /* Virtual machine                                                      */
-/* ------------------------------------------------------------------ */
 
 #define VM_STACK_MAX 256
 #define VM_CALL_MAX 64
