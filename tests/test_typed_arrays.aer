@@ -187,6 +187,16 @@ cmp_i[0] = 5
 cmp_i[1] = 15
 assert((cmp_i > 10)[1] == 1 and (cmp_i > 10)[0] == 0, "masks over an int array stay integers")
 
+# Compiling a function body overwrites the per-register tables for its own registers. It used to
+# leave the enclosing scope's behind, and since "this register holds a typed array" is what stops
+# `1.0 - discount` unboxing the array, a function defined between an array's construction and its
+# use was enough to make the next broadcast fail at runtime.
+function unrelated_definition(a, b):
+    return a + b
+
+assert((1.0 - cmp_a)[0] == 1.0, "a typed array survives a function definition in between")
+assert((cmp_a * 2.0)[1] == 200.0, "and so does its element kind, for broadcasting")
+
 # The point of all of it: a filtered total with no new reduction.
 import collection
 assert(collection.sum(cmp_a < 350.0) == 4.0, "summing a mask counts the matches")

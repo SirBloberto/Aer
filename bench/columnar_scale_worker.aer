@@ -1,0 +1,15 @@
+# One chunk of columnar_scale.aer's query, scanned a row at a time -- the shape a hand-written
+# engine loop has. Returns per-group revenue so the caller can fold the chunks together.
+
+function scan(quantity, price, discount, region, groups):
+    revenue = [0.0; groups]
+    n = length(quantity)
+    i = 0
+    for i < n:
+        q = quantity[i]
+        p = price[i]
+        if q > 10.0 and p < 400.0:
+            g = integer(region[i])
+            revenue[g] = revenue[g] + p * q * (1.0 - discount[i])
+        i += 1
+    return revenue

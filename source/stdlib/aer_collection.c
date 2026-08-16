@@ -90,6 +90,61 @@ static AerVal typed_reduce(AerTypedArray* ta, int fn_id) {
     }
 }
 
+/* GROUP BY in one pass. What whole-array arithmetic cannot do is scatter -- send each element to an
+   accumulator chosen by another column -- so expressed with masks it costs one pass PER GROUP,
+   which turned a 2.9x win into a 0.72x loss (bench/columnar_scale.aer measures both forms).
+   Deliberately no vectorization attribute: a scatter does not vectorize; the win is the pass count. */
+#define DEFINE_GROUP_SUM(name, vt, gt)                                                                       \
+    static bool name(vt* restrict out, const vt* restrict v, const gt* restrict g, unsigned int n,           \
+                     unsigned int ngroups) {                                                                 \
+        for (unsigned int i = 0; i < n; i++) {                                                               \
+            long long k = (long long)g[i];                                                                   \
+            if (k < 0 || (unsigned long long)k >= (unsigned long long)ngroups)                               \
+                return false;                                                                                \
+            out[k] += v[i];                                                                                  \
+        }                                                                                                    \
+        return true;                                                                                         \
+    }
+
+#define DEFINE_GROUP_SUM_SET(vsfx, vt)                                                                       \
+    DEFINE_GROUP_SUM(gsum_##vsfx##_i32, vt, int32_t)                                                         \
+    DEFINE_GROUP_SUM(gsum_##vsfx##_i64, vt, int64_t)                                                         \
+    DEFINE_GROUP_SUM(gsum_##vsfx##_f32, vt, float)                                                           \
+    DEFINE_GROUP_SUM(gsum_##vsfx##_f64, vt, double)
+
+DEFINE_GROUP_SUM_SET(i32, int32_t)
+DEFINE_GROUP_SUM_SET(i64, int64_t)
+DEFINE_GROUP_SUM_SET(f32, float)
+DEFINE_GROUP_SUM_SET(f64, double)
+
+/* Dispatches on both element kinds -- the values decide the result's kind, the groups only supply
+   an index. Returns false on a group index outside 0..ngroups, which the caller reports. */
+static bool group_sum_run(AerTypedArray* val, AerTypedArray* grp, AerTypedArray* out, unsigned int ngroups) {
+    unsigned int n = val->count;
+#define GS_BY_GROUP(vsfx, vt)                                                                                \
+    switch (grp->elem_kind) {                                                                                \
+        case TYPED_ELEM_INT32:                                                                               \
+            return gsum_##vsfx##_i32((vt*)out->data, (const vt*)val->data, (const int32_t*)grp->data, n,     \
+                                     ngroups);                                                               \
+        case TYPED_ELEM_INT64:                                                                               \
+            return gsum_##vsfx##_i64((vt*)out->data, (const vt*)val->data, (const int64_t*)grp->data, n,     \
+                                     ngroups);                                                               \
+        case TYPED_ELEM_FLOAT32:                                                                             \
+            return gsum_##vsfx##_f32((vt*)out->data, (const vt*)val->data, (const float*)grp->data, n,       \
+                                     ngroups);                                                               \
+        default:                                                                                             \
+            return gsum_##vsfx##_f64((vt*)out->data, (const vt*)val->data, (const double*)grp->data, n,      \
+                                     ngroups);                                                               \
+    }
+    switch (val->elem_kind) {
+        case TYPED_ELEM_INT32: GS_BY_GROUP(i32, int32_t)
+        case TYPED_ELEM_INT64: GS_BY_GROUP(i64, int64_t)
+        case TYPED_ELEM_FLOAT32: GS_BY_GROUP(f32, float)
+        default: GS_BY_GROUP(f64, double)
+    }
+#undef GS_BY_GROUP
+}
+
 static double as_number(AerVal v) {
     return aer_type(v) == TYPE_INTEGER ? (double)aer_as_int(v) : aer_as_real(v);
 }
@@ -204,6 +259,40 @@ static bool boxed_reduce(AerArray* a, int fn_id, const char* fname, AerVal* out)
 }
 
 bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
+    if (fn_id == FN_COLLECTION_GROUP_SUM && arg_count == 3) {
+        AerVal ngroups_v = vm_stack_pop(vm);
+        AerVal grp_v = vm_stack_pop(vm);
+        AerVal val_v = vm_stack_pop(vm);
+        if (aer_type(val_v) != TYPE_TYPED_ARRAY || aer_type(grp_v) != TYPE_TYPED_ARRAY) {
+            error("group_sum() needs a typed array of values and a typed array of group numbers");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        if (aer_type(ngroups_v) != TYPE_INTEGER || aer_as_int(ngroups_v) <= 0) {
+            error("group_sum() group count must be a positive integer");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        AerTypedArray* val = aer_as_typed_array(val_v);
+        AerTypedArray* grp = aer_as_typed_array(grp_v);
+        if (val->count != grp->count) {
+            error("group_sum() values and groups must be the same length (got %u and %u)", val->count,
+                  grp->count);
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        unsigned int ngroups = (unsigned int)aer_as_int(ngroups_v);
+        AerVal out_v = vm_new_typed_array_val(val->elem_kind, ngroups);
+        AerTypedArray* out = aer_as_typed_array(out_v);
+        memset(out->data, 0, (size_t)ngroups * vm_typed_elem_width(val->elem_kind));
+        if (val->count > 0 && !group_sum_run(val, grp, out, ngroups)) {
+            error("group_sum() found a group number outside 0..%u", ngroups - 1);
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        vm_stack_push(vm, out_v);
+        return true;
+    }
     if ((fn_id == FN_COLLECTION_SUM || fn_id == FN_COLLECTION_MIN || fn_id == FN_COLLECTION_MAX) &&
         arg_count == 1) {
         const char* fname = fn_id == FN_COLLECTION_SUM ? "sum" : (fn_id == FN_COLLECTION_MIN ? "min" : "max");

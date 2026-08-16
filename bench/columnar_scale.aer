@@ -1,0 +1,156 @@
+#!/usr/bin/env aer
+# columnar_query.aer's query at a size where the four ways of running it separate clearly:
+#
+#   SELECT region, SUM(price * quantity * (1 - discount))
+#   FROM sales WHERE quantity > 10 AND price < 400 GROUP BY region
+#
+# Four variants, same answer from each:
+#   base        one row at a time, one thread
+#   actors      the same loop, chunked across actors
+#   vectorized  whole-array masks and reductions, one thread
+#   both        vectorized chunks across actors
+#
+# Every column is float64 here, not the mixed int/float of columnar_query.aer, because a mask has
+# to share its operands' element kind -- combining an int32 predicate with a float64 column is
+# rejected. Small integers are exact in a double, so the query's answer is unchanged.
+#
+# Actors only run concurrently in a threaded build (the default); with THREADS=0 the same tasks
+# interleave on one thread and every number below stays correct, just serial.
+
+import actor
+import scheduler
+import collection
+import time
+
+N = 32000000
+GROUPS = 8
+WORKERS = 6
+PASSES = 45
+
+region = [0.0; N]
+quantity = [0.0; N]
+price = [0.0; N]
+discount = [0.0; N]
+i = 0
+for i < N:
+    region[i] = float(i % GROUPS)
+    quantity[i] = float((i % 50) + 1)
+    price[i] = float(i % 1000) * 0.5 + 1.0
+    discount[i] = float(i % 20) * 0.01
+    i += 1
+print("columnar_scale: {N} rows x {PASSES} passes, {GROUPS} groups, {WORKERS} actors")
+
+function fold(results, groups):
+    total = 0.0
+    r = 0
+    for r < length(results):
+        part = results[r]
+        g = 0
+        for g < groups:
+            total += part[g]
+            g += 1
+        r += 1
+    return total
+
+function run_actors(path, q_col, p_col, d_col, r_col, n, groups, workers, passes):
+    pool = []
+    w = 0
+    for w < workers:
+        a, err = actor.spawn(path)
+        if err != null:
+            panic("spawn failed: {err}")
+        collection.append(pool, a)
+        w += 1
+    per = n // workers
+    start = time.now()
+    p = 0
+    total = 0.0
+    for p < passes:
+        w = 0
+        for w < workers:
+            lo = w * per
+            hi = lo + per
+            if w == workers - 1:
+                hi = n
+            scheduler.add(pool[w], "scan", q_col[lo:hi], p_col[lo:hi], d_col[lo:hi], r_col[lo:hi],
+                          groups)
+            w += 1
+        total = fold(scheduler.run(), groups)
+        p += 1
+    return [time.now() - start, total]
+
+# ---- 1. base: one row at a time ----
+base_total = 0.0
+start = time.now()
+p = 0
+for p < PASSES:
+    revenue = [0.0; GROUPS]
+    i = 0
+    for i < N:
+        q = quantity[i]
+        pr = price[i]
+        if q > 10.0 and pr < 400.0:
+            g = integer(region[i])
+            revenue[g] = revenue[g] + pr * q * (1.0 - discount[i])
+        i += 1
+    base_total = 0.0
+    g = 0
+    for g < GROUPS:
+        base_total += revenue[g]
+        g += 1
+    p += 1
+base = time.now() - start
+print("base          {base}s   revenue={base_total}")
+
+# ---- 2a. vectorized WITHOUT the group-by, to separate the two costs ----
+# Whole-array work with one pass over the data. This is what vectorization is worth here.
+flat_total = 0.0
+start = time.now()
+p = 0
+for p < PASSES:
+    keep = (quantity > 10.0) * (price < 400.0)
+    flat_total = collection.sum(price * quantity * (1.0 - discount) * keep)
+    p += 1
+flat = time.now() - start
+print("vec, no group {flat}s   revenue={flat_total}   {base / flat}x over base")
+
+# ---- 2b. vectorized WITH the group-by, one masked pass per group ----
+# What GROUP BY costs when the only tool is a mask: GROUPS extra passes over every column, and two
+# full-size temporaries each time. Kept as a measured comparison against 2c below.
+mask_total = 0.0
+start = time.now()
+p = 0
+for p < PASSES:
+    keep = (quantity > 10.0) * (price < 400.0)
+    value = price * quantity * (1.0 - discount) * keep
+    mask_total = 0.0
+    g = 0
+    for g < GROUPS:
+        mask_total += collection.sum(value * (region == float(g)))
+        g += 1
+    p += 1
+masked = time.now() - start
+print("vec, per-group {masked}s  revenue={mask_total}   {base / masked}x over base")
+
+# ---- 2c. vectorized WITH the group-by, one scattering pass ----
+# collection.group_sum sends each element to the accumulator its group names -- the one thing array
+# operations cannot express, and the whole reason 2b had to loop over groups.
+vec_total = 0.0
+start = time.now()
+p = 0
+for p < PASSES:
+    keep = (quantity > 10.0) * (price < 400.0)
+    value = price * quantity * (1.0 - discount) * keep
+    vec_total = collection.sum(collection.group_sum(value, region, GROUPS))
+    p += 1
+vec = time.now() - start
+print("vec, grouped  {vec}s   revenue={vec_total}   {base / vec}x over base")
+
+# ---- 3 and 4: the same two, chunked across actors ----
+act = run_actors("bench/columnar_scale_worker.aer", quantity, price, discount, region, N, GROUPS,
+                 WORKERS, PASSES)
+print("actors        {act[0]}s   revenue={act[1]}   {base / act[0]}x over base")
+
+both = run_actors("bench/columnar_scale_vec_worker.aer", quantity, price, discount, region, N,
+                  GROUPS, WORKERS, PASSES)
+print("both          {both[0]}s   revenue={both[1]}   {base / both[0]}x over base")

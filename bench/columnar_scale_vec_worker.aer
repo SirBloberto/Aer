@@ -1,0 +1,15 @@
+# The same chunk as columnar_scale_worker.aer, expressed as whole-array operations instead of a
+# per-row loop. The predicate becomes a mask, and the group-by becomes one masked pass per group --
+# more arithmetic than the loop does, but all of it vectorized.
+
+import collection
+
+# `1.0 - discount` is deliberately not written that way: broadcasting a scalar needs the parser to
+# KNOW the register holds a typed array, which it does for a local `[0.0; n]` and cannot for a
+# parameter. Array-to-array arithmetic dispatches on the runtime types instead, so the ones column
+# is built here -- and its cost counted here.
+function scan(quantity, price, discount, region, groups):
+    ones = [1.0; length(discount)]
+    keep = (quantity > 10.0) * (price < 400.0)
+    value = price * quantity * (ones - discount) * keep
+    return collection.group_sum(value, region, groups)

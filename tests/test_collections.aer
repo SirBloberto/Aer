@@ -226,4 +226,35 @@ assert(srt[0] == 3.5 and srt_copy[0] == 99.0, "copy of a typed array is independ
 collection.sort(srt)
 assert(srt[0] == 1.5 and srt[1] == 2.5 and srt[2] == 3.5, "sort orders a typed array in place")
 
+# group_sum scatters: each element lands in the accumulator its group names. That is the one thing
+# whole-array arithmetic cannot express, and without it a GROUP BY costs one masked pass per group.
+gs_v = [0.0; 8]
+gs_g = [0.0; 8]
+gsi = 0
+for gsi < 8:
+    gs_v[gsi] = float(gsi) + 1.0
+    gs_g[gsi] = float(gsi % 3)
+    gsi += 1
+# values 1..8, groups 0,1,2,0,1,2,0,1
+gs_r = collection.group_sum(gs_v, gs_g, 3)
+assert(gs_r[0] == 12.0 and gs_r[1] == 15.0 and gs_r[2] == 9.0, "group_sum totals each group")
+assert(collection.sum(gs_r) == 36.0, "and every element lands in exactly one group")
+assert(length(gs_r) == 3, "the result has one entry per group")
+
+# Integer values and integer groups keep their kind.
+gsi_v = [0i; 6]
+gsi_g = [0i; 6]
+gsi = 0
+for gsi < 6:
+    gsi_v[gsi] = gsi + 1
+    gsi_g[gsi] = gsi % 2
+    gsi += 1
+gsi_r = collection.group_sum(gsi_v, gsi_g, 2)
+assert(gsi_r[0] == 9 and gsi_r[1] == 12, "group_sum over integer columns stays integer")
+
+# A group with no rows is zero, not missing.
+gs_sparse = collection.group_sum(gs_v, gs_g, 5)
+assert(length(gs_sparse) == 5 and gs_sparse[3] == 0.0 and gs_sparse[4] == 0.0,
+       "groups nothing landed in are zero")
+
 print("test_collections.aer: all assertions passed.")

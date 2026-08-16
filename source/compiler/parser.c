@@ -4806,6 +4806,8 @@ static int module_fn_id(int module_id, AerString* name) {
                 return FN_COLLECTION_MIN;
             if (NAME_IS("max"))
                 return FN_COLLECTION_MAX;
+            if (NAME_IS("group_sum"))
+                return FN_COLLECTION_GROUP_SUM;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_NET:
             if (NAME_IS("connect"))
@@ -5412,6 +5414,15 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     int saved_max_slot_used = P.slot_max;
     int saved_raw_real_next = P.raw_real_next, saved_raw_real_floor = P.raw_real_floor;
     int saved_raw_real_low = P.raw_real_low;
+    /* Per-register facts about the ENCLOSING scope's values, which the body is about to overwrite
+       for its own registers. Losing reg_elem_kind used only to cost an optimization; since a
+       register known to hold a typed array is also what stops `1.0 - discount` unboxing it, losing
+       it now emits an unbox that fails at runtime -- a function defined between an array's
+       construction and its use was enough. */
+    RawKind saved_elem_kind[FRAME_REGISTERS];
+    int saved_len_class[FRAME_REGISTERS];
+    memcpy(saved_elem_kind, P.reg_elem_kind, sizeof(saved_elem_kind));
+    memcpy(saved_len_class, P.reg_len_class, sizeof(saved_len_class));
     memcpy(saved_var_names, P.var_names, sizeof(unsigned int) * (size_t)P.var_count);
     memcpy(saved_var_regs, P.var_regs, sizeof(int) * (size_t)P.var_count);
     memcpy(saved_var_kind, P.var_kind, sizeof(VarKind) * (size_t)P.var_count);
@@ -5500,6 +5511,8 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     P.raw_real_next = saved_raw_real_next;
     P.raw_real_floor = saved_raw_real_floor;
     P.raw_real_low = saved_raw_real_low;
+    memcpy(P.reg_elem_kind, saved_elem_kind, sizeof(saved_elem_kind));
+    memcpy(P.reg_len_class, saved_len_class, sizeof(saved_len_class));
 }
 
 /* Named functions can't nest. Once one parameter has a default, every parameter after it must

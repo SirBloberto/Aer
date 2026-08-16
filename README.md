@@ -1381,7 +1381,14 @@ collection.sort(arr)          # sorts in place (ascending) and returns the array
 collection.sum(arr)           # adds every element; 0 for an empty array
 collection.min(arr)           # smallest element; an error on an empty array
 collection.max(arr)           # largest element; an error on an empty array
+collection.group_sum(values, groups, n)  # per-group totals; groups[i] picks values[i]'s bucket
 ```
+
+`group_sum` is the `GROUP BY` of the set — each element is added to the accumulator its group names,
+in one pass. It is the one thing whole-array arithmetic cannot express, because arithmetic maps
+element *i* to element *i* and never scatters. Without it a grouped query has to run one masked pass
+per group, which on `bench/columnar_scale.aer` turned a 2.9x vectorization win into a 0.76x loss;
+with it the same query runs 2.7x, so grouping costs about 6% rather than 3.6x.
 
 `sum`, `min`, `max`, `index_of`, `copy` and `sort` all accept a typed array (`[0.0f; n]`) as well as
 an ordinary one, so a caller need not know which of the two it was handed. On a typed array the
