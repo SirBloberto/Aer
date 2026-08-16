@@ -339,12 +339,11 @@ void reg_free(int count) {
         P.slot_next = P.slot_floor;
 }
 
-#ifdef AER_DEBUG_TOOLS
+#ifdef AER_CHECKED
 /* Registers below reserved_floor are variables; at or above it they are the temp allocator's to
    hand out. Breaking that hands a live variable's register to the next expression as scratch --
    the failure mode is a variable silently reading back some unrelated intermediate value, never a
-   crash. Gated on the debug build so it costs nothing in a normal compile; CI runs the whole
-   bench/ and tests/ corpus through that build for check-opcode-coverage, so it is exercised. */
+   crash. Compiled only into the sanitiser builds, which run the whole corpus in CI. */
 static void assert_variables_below_floor(const char* where) {
     for (int i = 0; i < P.var_count; i++) {
         /* A real-typed variable is exempt: it lives at the TOP of the frame, deliberately above

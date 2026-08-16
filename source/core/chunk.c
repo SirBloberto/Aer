@@ -51,9 +51,7 @@ void chunk_free(Chunk* c) {
     free(c->field_cache);
     free(c->call_spec_cache);
     free(c->shape_by_name);
-#ifdef AER_DEBUG_TOOLS
     free(c->debug_hits);
-#endif
     memset(c, 0, sizeof(*c));
 }
 

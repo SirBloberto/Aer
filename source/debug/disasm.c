@@ -1,4 +1,3 @@
-#ifdef AER_DEBUG_TOOLS
 #include <stdlib.h>
 #include <string.h>
 #include "aer.h"
@@ -1101,5 +1100,3 @@ void aer_debug_memory_report(FILE* out) {
     aer_gc_stats(&live, &minor, &major);
     fprintf(out, "  %u live cells, %u minor collections, %u major collections\n", live, minor, major);
 }
-
-#endif

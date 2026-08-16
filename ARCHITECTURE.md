@@ -14,7 +14,7 @@ Source map, one job per directory:
 | `source/stdlib/` | `aer_*.c` built-in modules (math/random/string/time/json/collection/net/regex/actor/scheduler/io) and `aer_abi.h`, their wire identities |
 | `source/runtime/` | `aer_module.c` (import) and `aer_host.c` (host embedding) |
 | `source/repl/` | `terminal.{c,h}` -- raw-mode interactive terminal |
-| `source/debug/` | `disasm.c` -- disassembler/profiler, `AER_DEBUG_TOOLS` only, never in a release build |
+| `source/debug/` | `disasm.c` -- disassembler, in every build; `--debug-path` dumps it after a run |
 | `source/utilities/` | `pool` (allocator), `hashtable`, `strbuf`, `error` |
 | `include/` | `aer.h`, and nothing else: the entire public surface |
 | `source/tools/` | `aer_fmt.c`, `aer_lsp.c` -- separate binaries, deliberately outside the library's own source wildcard so they never link into it |
@@ -155,7 +155,7 @@ individually `xmalloc`/`xrealloc`'d allocation the pool system doesn't track at 
 - `AerFunction.defaults` — only when the function has default parameters.
 
 Each corresponds to one line in `aer_debug_memory_report`'s "header vs. payload" breakdown
-(debug-tools only) — `aer_gc_stats()` alone only gives a live *cell* count, which understates real
+(`--debug-path`) — `aer_gc_stats()` alone only gives a live *cell* count, which understates real
 memory usage for exactly these variable-payload types.
 
 ### 2.3 Per-cell bookkeeping: `cell_state`
@@ -2472,7 +2472,7 @@ tail, keep hot opcodes replicated -- targets the wrong end: cold opcodes are not
 measurement, but this data says not to expect it to fix the benchmark that needs it most.
 
 The knob stays as opt-in measurement tooling, never part of a normal build, on the same footing as
-`make pgo` and `debug-tools`.
+`make pgo` and `make profile`.
 
 ### 5.48 A use-after-free found by reading the call path, not by a test
 
@@ -3472,7 +3472,7 @@ lever worth pulling is the interpolation/allocation path (§5.13 already took on
   narrow the result back down on write, so a narrow field specializes exactly like a wide one would.
   `shape_find_field` (parser.c) reports a field's narrowness precisely so all 5 specialization
   call sites can select the right opcode variant. One real bug found and fixed along the way: the
-  debug-tools disassembler's `OP_DEFINE_STRUCT` decode indexed a type-name array with the RAW
+  disassembler's `OP_DEFINE_STRUCT` decode indexed a type-name array with the RAW
   (un-masked) field-type word, an out-of-bounds read/crash the moment a narrow field's `0x100`
   marker bit was set -- masking it out (mirroring the real VM decode) fixed it. The narrow int32
   raw-opcode SET/COMPOUND family does not range-check on overflow (silently truncates), matching
@@ -3552,7 +3552,7 @@ Two entirely separate allocation lifetimes exist in this codebase. Don't conflat
 | `chunk_add_pool` (string path) | `name_index` hashmap entries (`xmalloc`'d key + index box) | first occurrence of a given string literal (dedup — later occurrences just look up the existing pool index) | `hashmap_free` in `chunk_free` |
 | `chunk_mark_line` | `line_mark_offsets[]`/`line_mark_lines[]` (doubling) | once per compiled *statement* (not instruction) | `chunk_free` |
 | `chunk_ensure_field_cache` | `field_cache_shape[]`/`field_cache_slot[]` | lazily, once per `vm_run` call, grown to cover the whole chunk | `chunk_free` |
-| `chunk_ensure_debug_hits` (debug-tools build only) | `debug_hits[]` | same as above, debug builds only | `chunk_free` |
+| `chunk_ensure_debug_hits` (`make profile` only) | `debug_hits[]` | same as above, and only once `--debug-path` asked for counters | `chunk_free` |
 | `func_register`/`chunk_add_function` | `Chunk.functions[]` (doubling) + that function's own `defaults` array | once per `function` declaration compiled | **Not freed** — same append-only, outlive-the-parser design as `shapes` (see README: struct/function registrations grow monotonically for the process's life, deliberately, so REPL persistence works) |
 | `parse_struct`/`OP_DEFINE_STRUCT` handler | `Chunk.shapes[]` (doubling) + one `xmalloc(sizeof(Shape))` per declaration | once per `struct` declaration | **Not freed**, same reasoning |
 | `chunk_add_import` | `Chunk.imported_modules[]` (doubling), each entry an owned `xstrdup` | once per `import` statement | `chunk_free` |

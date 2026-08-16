@@ -23,9 +23,7 @@ static void run_shell();
 static bool run_file(char* path);
 static void help();
 
-#ifdef AER_DEBUG_TOOLS
 static const char* debug_dump_path = NULL;
-#endif
 
 /* --max-instructions: 0 means unbounded, the default for every ordinary run. A budget turns "this
    program does not terminate" into an exact, machine-independent fact instead of a wall-clock
@@ -75,9 +73,7 @@ int main(int argc, char** argv) {
         static const char no_import[] = "--no-import";
         static const char mem_size[] = "--memory-size=";
         static const char max_instr[] = "--max-instructions=";
-#ifdef AER_DEBUG_TOOLS
         static const char debug_path[] = "--debug-path=";
-#endif
         if (strcmp(argv[i], no_io) == 0) {
             aer_set_io_enabled(false);
         } else if (strcmp(argv[i], no_net) == 0) {
@@ -88,10 +84,9 @@ int main(int argc, char** argv) {
             aer_gc_set_ceiling(parse_memory_size(argv[i] + sizeof(mem_size) - 1));
         } else if (strncmp(argv[i], max_instr, sizeof(max_instr) - 1) == 0) {
             max_instructions = (unsigned int)strtoul(argv[i] + sizeof(max_instr) - 1, NULL, 10);
-#ifdef AER_DEBUG_TOOLS
         } else if (strncmp(argv[i], debug_path, sizeof(debug_path) - 1) == 0) {
             debug_dump_path = argv[i] + sizeof(debug_path) - 1;
-#endif
+            aer_profile_enable();
         } else {
             real_argv[real_argc++] = argv[i];
         }
@@ -248,7 +243,6 @@ static bool run_file(char* path) {
        lexer's current file -- calling run() anyway would lex/parse a null or stale File*. */
     if (!aer_had_error())
         run();
-#ifdef AER_DEBUG_TOOLS
     /* After run() so the dump has both the bytecode and the run's hit counts; "-" means stderr */
     const char* dump_path = debug_dump_path;
     if (dump_path) {
@@ -262,7 +256,6 @@ static bool run_file(char* path) {
         if (dump_out != stderr)
             fclose(dump_out);
     }
-#endif
     /* A runtime error does not terminate the process, so the CLI decides the exit code. A failed
        assert() deliberately does not set aer_had_error(), hence the separate check. */
     return !aer_had_error() && aer_assert_failure_count() == 0;
@@ -282,8 +275,6 @@ static void help() {
     printf(
         "  --memory-size=<N>[K|M|G]  Cap live GC cells (not bytes) at N; suffix multiplies by 1e3/1e6/1e9\n"
         "  --max-instructions=<N>    Stop after N instructions and exit 3; 0 (default) is unbounded\n");
-#ifdef AER_DEBUG_TOOLS
-    printf("  --debug-path=<path>  Write a disassembly + hit-count/memory dump here after running\n");
-    printf("                       <file> (\"-\" for stderr)\n");
-#endif
+    printf("  --debug-path=<path>  Write a disassembly + memory dump here after running <file>\n");
+    printf("                       (\"-\" for stderr); per-opcode hit counts need `make profile`\n");
 }

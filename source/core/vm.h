@@ -710,11 +710,10 @@ typedef struct {
     Shape** shape_by_name;
     unsigned int shape_by_name_cap;
 
-#ifdef AER_DEBUG_TOOLS
-    /* Per-word dispatch counters (debug-tools only); only opcode words increment. */
+    /* Per-word dispatch counters, allocated only when --debug-path asked for them; only opcode
+       words increment. NULL is the signal DISPATCH() tests, so this must stay NULL otherwise. */
     uint64_t* debug_hits;
     unsigned int debug_hits_cap;
-#endif
 } Chunk;
 
 /* ------------------------------------------------------------------ */
@@ -1076,18 +1075,19 @@ AerFunction* vm_new_function(void);
 /* Test-only register readback (tests/smoke_test.c). */
 AerVal register_get(VM* vm, int slot);
 
-#ifdef AER_DEBUG_TOOLS
 #include <stdio.h>
-/* Byte-accurate per-pool memory breakdown; debug-tools only. */
+/* Byte-accurate per-pool memory breakdown. */
 void aer_debug_memory_report(FILE* out);
 
 /* Prints, in order: a full annotated disassembly of c->code (offset, opcode name, one-line
    description, decoded operands, and -- if c->debug_hits is populated -- a hit count and source
    line for that instruction); a per-opcode summary table (name -> total hits, sorted descending);
-   and a per-source-line hot-spot rollup (line -> total hits, sorted descending). Debug-build only --
-   see the AER_DEBUG_TOOLS-gated Chunk.debug_hits field above. */
+   and a per-source-line hot-spot rollup (line -> total hits, sorted descending). */
 void aer_disassemble(Chunk* c, FILE* out);
 
-#endif
+/* Turns on the per-instruction counters DISPATCH() feeds. Must be called before the chunk runs;
+   a run started without it never allocates the counters and never tests anything but a register. */
+void aer_profile_enable(void);
+bool aer_profile_is_enabled(void);
 
 #endif

@@ -2186,20 +2186,33 @@ static AerVal vm_cast(AerVal v, int cast_type) {
    `goto *dispatch_table[op]` needs every `lbl_*` label in the same function, and a label's address
    is only takeable within the function declaring it. Everything above this banner can move freely. */
 
-#ifdef AER_DEBUG_TOOLS
+/* Only ever true in an AER_PROFILE build; elsewhere it keeps Chunk.debug_hits NULL, which is
+   what stops the disassembler printing counts nobody collected. */
+static bool profiling = false;
+
+void aer_profile_enable(void) {
+#ifdef AER_PROFILE
+    profiling = true;
+#endif
+}
+
+bool aer_profile_is_enabled(void) {
+    return profiling;
+}
+
 /* Grows debug_hits to cover c->code, zero-filling the new region; a no-op once already covered
-   (REPL appends code across calls). */
+   (REPL appends code across calls) and while profiling is off, which is what keeps the pointer
+   NULL and the dispatch check free. */
 static void chunk_ensure_debug_hits(Chunk* c) {
-    if (c->count <= c->debug_hits_cap)
+    if (!profiling || c->count <= c->debug_hits_cap)
         return;
     unsigned int old_cap = c->debug_hits_cap;
     c->debug_hits_cap = c->count;
     c->debug_hits = xrealloc(c->debug_hits, sizeof(uint64_t) * c->debug_hits_cap);
     memset(c->debug_hits + old_cap, 0, sizeof(uint64_t) * (c->debug_hits_cap - old_cap));
 }
-#endif
 
-/* Same growth idiom as chunk_ensure_debug_hits, but always-on (a real perf feature, not debug). */
+/* Same growth idiom as chunk_ensure_debug_hits, but unconditional -- a perf feature, not a probe. */
 static void chunk_ensure_field_cache(Chunk* c) {
     if (c->count <= c->field_cache_cap)
         return;
@@ -2324,11 +2337,9 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                                                0)) {
                     /* The recompile appended code to this running chunk, so every per-word cache
                        must cover the new size before any site dispatches. debug_hits[] included:
-                       DISPATCH() writes it per opcode under AER_DEBUG_TOOLS, so skipping the resize
-                       is a silent out-of-bounds write in that build. */
-#ifdef AER_DEBUG_TOOLS
+                       DISPATCH() writes it per opcode while profiling, so skipping the resize is a
+                       silent out-of-bounds write under --debug-path. */
                     chunk_ensure_debug_hits(c);
-#endif
                     chunk_ensure_field_cache(c);
                     chunk_ensure_call_spec_cache(c);
                     site_entry =
@@ -2407,9 +2418,7 @@ vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* r
                     SpecEntry variant;
                     if (parser_specialize_function(c, target_f, observed, kind, param_index, &variant,
                                                    cand_regs, cand_types, cand_count)) {
-#ifdef AER_DEBUG_TOOLS
                         chunk_ensure_debug_hits(c);
-#endif
                         chunk_ensure_field_cache(c);
                         chunk_ensure_call_spec_cache(c);
                         entry->raw_variant_code_offset = variant.code_offset;
@@ -2492,9 +2501,7 @@ static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFun
         entry->raw_param_count = -1;
         return;
     }
-#ifdef AER_DEBUG_TOOLS
     chunk_ensure_debug_hits(c);
-#endif
     chunk_ensure_field_cache(c);
     chunk_ensure_call_spec_cache(c);
     entry->raw_variant_code_offset = variant.code_offset;
@@ -2688,10 +2695,12 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     /* Only ever read/decremented at the handful of yield-checkpoints below; never touched when
        max_instructions is 0. */
     unsigned int slice_budget = max_instructions;
-#ifdef AER_DEBUG_TOOLS
     chunk_ensure_debug_hits(c);
-#endif
     chunk_ensure_field_cache(c);
+#ifdef AER_PROFILE
+    /* Hoisted beside `code` and refreshed with it: a specialized recompile reallocs both. */
+    uint64_t* hits = c->debug_hits;
+#endif
 
 #define READ() (*pc++)
 #define PUSH(v)                                                                                              \
@@ -2703,21 +2712,9 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         vm->stack[vm->stack_top++] = (v);                                                                    \
     } while (0)
 #define POP() (vm->stack_top > 0 ? vm->stack[--vm->stack_top] : (error("Stack underflow"), aer_null()))
-#ifdef AER_DEBUG_TOOLS
-/* Not called from DISPATCH() -- each allocating label calls it right after storing its result
-   into a VM-visible root. Labels that can never allocate (confirmed by inspection) have no call
-   at all, a real zero-cost dispatch for the common case. */
-/* No error check here -- error()/error_at() longjmp straight to this call's catch_point on
-   fault, so DISPATCH() itself never needs to poll anything. */
-#define DISPATCH()                                                                                           \
-    do {                                                                                                     \
-        unsigned int op_ip = (unsigned int)(pc - code);                                                      \
-        op_word = READ();                                                                                    \
-        cur_op = (Opcode)(op_word & 0xFF);                                                                   \
-        c->debug_hits[op_ip]++;                                                                              \
-        goto* DT_AT(cur_op);                                                                                 \
-    } while (0)
-#else
+/* Neither a GC nor an error poll here: allocating labels call gc_maybe_collect themselves right
+   after storing their result into a VM-visible root, and error() longjmps straight to this call's
+   catch_point rather than setting a flag every dispatch would have to test. */
 /* Full 8-bit mask -- opcode is unambiguously its own byte now (OP_OPCODE_COUNT_MARKER's static
    assert guarantees <=256), no reason to ever mask narrower. */
 /* Replicated on purpose: expanding this at the end of every handler gives each opcode its own
@@ -2726,6 +2723,17 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
    question, not a settled one -- AER_SHARED_DISPATCH builds the other endpoint to measure. */
 #ifdef AER_SHARED_DISPATCH
 #define DISPATCH() goto shared_dispatch
+#else
+#ifdef AER_PROFILE
+#define DISPATCH()                                                                                           \
+    do {                                                                                                     \
+        const uint32_t* hit_pc = pc;                                                                         \
+        op_word = READ();                                                                                    \
+        cur_op = (Opcode)(op_word & 0xFF);                                                                   \
+        if (__builtin_expect(hits != NULL, 0))                                                               \
+            hits[hit_pc - code]++;                                                                           \
+        goto* DT_AT(cur_op);                                                                                 \
+    } while (0)
 #else
 #define DISPATCH()                                                                                           \
     do {                                                                                                     \
@@ -3239,6 +3247,9 @@ lbl_call: {
            TYPE_FUNCTION on code_offset, and a specialized body's function expressions sit at NEW
            offsets. A callee containing a lambda therefore appends, and can move the pool. */
         code = c->code;
+#ifdef AER_PROFILE
+        hits = c->debug_hits;
+#endif
         pc = code + resume_at;
         functions = c->functions;
     }

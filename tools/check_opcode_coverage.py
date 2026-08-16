@@ -12,10 +12,9 @@ test never takes still counts. That is deliberate -- the check is a tripwire for
 with no test at all, which is the failure that actually happened, and a stricter definition would
 need per-opcode hit counts that vary with input data.
 
-The debug-tools build's disassembler is the source of truth for what a program emitted, so this
-needs `make debug-tools` first.
+The disassembler is the source of truth for what a program emitted, so this needs a build first.
 
-Usage: python3 tools/check_opcode_coverage.py [--binary binary/aer-debug] [--update-baseline]
+Usage: python3 tools/check_opcode_coverage.py [--binary binary/aer] [--update-baseline]
 """
 import argparse
 import glob
@@ -62,7 +61,7 @@ def emitted_opcodes(binary, programs):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", default=os.path.join("binary", "aer-debug"))
+    ap.add_argument("--binary", default=os.path.join("binary", "aer"))
     ap.add_argument("--update-baseline", action="store_true")
     args = ap.parse_args()
 
@@ -70,7 +69,7 @@ def main():
     if not os.path.exists(binary) and os.path.exists(binary + ".exe"):
         binary += ".exe"
     if not os.path.exists(binary):
-        sys.exit("%s not found -- run `make debug-tools` first" % args.binary)
+        sys.exit("%s not found -- run `make` first" % args.binary)
     # Absolute and native-separator: Windows CreateProcess refuses a relative path spelled with
     # forward slashes, which is what a make/MSYS2 invocation passes in.
     binary = os.path.normpath(os.path.abspath(binary))

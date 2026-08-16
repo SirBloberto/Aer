@@ -46,21 +46,19 @@ endif
 # outside a checkout (a release tarball), which is the honest answer rather than a stale hash.
 BUILD_REV := $(shell git describe --always --dirty 2>/dev/null || echo unknown)
 
-# Parallel actors: per-thread VM state plus the scheduler's worker pool. Off by default -- it
-# costs ~0.4% on single-threaded programs and only pays when a script spawns several actors.
-# Build with `make THREADS=1`.
-ifdef THREADS
+# Parallel actors: per-thread VM state plus the scheduler's worker pool. On by default -- the
+# thread-local storage it needs was measured free on single-threaded programs (four-layout link
+# ensemble: fib_bench -0.56%, binary_trees -0.39%, mandelbrot +0.14%), so there is no reason to
+# ship a second binary for it. `make THREADS=0` for a toolchain without pthreads.
+THREADS ?= 1
+ifneq ($(THREADS),0)
     THREAD_FLAGS := -DAER_HEAP_REF_TLS -pthread
 endif
 
 # Toggling THREADS changes a type's storage class without changing any file, so make would happily
 # link objects built both ways -- which fails at LTO if you are lucky and misbehaves if you are not.
 # This stamp changes whenever the setting does, and every object depends on it.
-THREAD_STAMP := object/.threads-$(if $(THREADS),on,off)
-$(THREAD_STAMP):
-	@mkdir -p object
-	@rm -f object/.threads-on object/.threads-off
-	@touch $@
+THREAD_STAMP := object/.threads-$(if $(filter-out 0,$(THREADS)),on,off)
 
 FLAGS := -O2 -g -flto -Wall -Wextra -DAER_BUILD_REV=\"$(BUILD_REV)\" $(PIN_FLAGS) $(ARCH_FLAGS) $(THREAD_FLAGS) -I include -I source -I source/compiler -I source/core -I source/debug -I source/repl -I source/runtime -I source/stdlib -I source/utilities
 
@@ -83,10 +81,20 @@ object/%.o: source/%.c $(HEADERS) $(THREAD_STAMP)
 	@mkdir -p $(dir $@)
 	gcc $(FLAGS) -c $< -o $@
 
-# Disassembler/profiler build (AER_DEBUG_TOOLS): pass --debug-path=<path|-> to dump after a run.
-debug-tools: $(SOURCE)
+# Below `all` deliberately: the first rule in the file is make's default goal, so a stamp rule
+# above it makes a bare `make` build the stamp and no binary.
+$(THREAD_STAMP):
+	@mkdir -p object
+	@rm -f object/.threads-on object/.threads-off
+	@touch $@
+
+# The disassembler is in the ordinary binary -- `aer --debug-path=<path|-> file.aer` dumps it after
+# a run, at no cost, since none of that code is reachable from the interpreter loop. Per-opcode hit
+# counts are the one part that is not free: counting needs a live register in vm_run_slice, worth
+# +7.5% on struct_array_scan and +3.5% on nbody (four-layout ensemble), so it gets its own build.
+profile: $(SOURCE)
 	@mkdir -p binary
-	gcc $(FLAGS) -DAER_DEBUG_TOOLS -o binary/aer-debug$(EXE) $(SOURCE) -lm $(WINLIBS)
+	gcc $(FLAGS) -DAER_PROFILE -o binary/aer-profile$(EXE) $(SOURCE) -lm $(WINLIBS)
 
 TESTS := tests/test_core.aer \
          tests/test_collections.aer \
@@ -235,10 +243,15 @@ pgo:
 	gcc $(FLAGS) -fprofile-use -fprofile-correction -o binary/aer-pgo$(EXE) $(patsubst source/%.c,$(PGO_OBJDIR)/%.o,$(SOURCE)) -lm $(WINLIBS)
 	@echo "PGO build complete: binary/aer-pgo$(EXE) (training binary binary/aer-pgo-gen$(EXE) left in place too)"
 
+# AER_CHECKED adds compile-time invariant assertions too expensive for a shipping build -- see
+# assert_variables_below_floor (parser.c). Both sanitiser builds carry them, and CI runs the whole
+# corpus through test-ubsan, so they are exercised without a build target of their own.
+CHECK_FLAGS := -DAER_CHECKED
+
 # ASAN build for tests/fuzz.py; may not link on a bare MinGW install (needs libasan).
 asan: $(SOURCE)
 	@mkdir -p binary
-	gcc $(FLAGS) -fsanitize=address -fno-omit-frame-pointer -o binary/aer-asan$(EXE) $(SOURCE) -lm $(WINLIBS)
+	gcc $(FLAGS) $(CHECK_FLAGS) -fsanitize=address -fno-omit-frame-pointer -o binary/aer-asan$(EXE) $(SOURCE) -lm $(WINLIBS)
 
 # UBSan catches what ASAN structurally cannot: misaligned loads (raw struct fields are read out of
 # a byte buffer at computed offsets), and invalid shifts/conversions. Signed overflow is EXCLUDED
@@ -250,7 +263,7 @@ UBSAN_SKIP   := signed-integer-overflow,shift-base
 
 ubsan: $(SOURCE)
 	@mkdir -p binary
-	gcc $(FLAGS) -fsanitize=$(UBSAN_CHECKS) -fno-sanitize=$(UBSAN_SKIP) \
+	gcc $(FLAGS) $(CHECK_FLAGS) -fsanitize=$(UBSAN_CHECKS) -fno-sanitize=$(UBSAN_SKIP) \
 	    -fno-omit-frame-pointer -o binary/aer-ubsan$(EXE) $(SOURCE) -lm $(WINLIBS)
 
 # Runs the whole .aer suite under UBSan; any diagnostic aborts, so a clean run means no finding.
@@ -281,10 +294,10 @@ check-format:
 check-comments:
 	python3 tools/check_comments.py
 
-# Fails when an opcode has no test or benchmark that emits it. Needs the disassembler build, so it
-# is not folded into check-style (which must stay a source-only, no-build check).
-check-opcode-coverage: debug-tools
-	python3 tools/check_opcode_coverage.py --binary binary/aer-debug$(EXE)
+# Fails when an opcode has no test or benchmark that emits it. Needs a build, so it is not folded
+# into check-style (which must stay a source-only, no-build check).
+check-opcode-coverage: all
+	python3 tools/check_opcode_coverage.py --binary binary/aer$(EXE)
 
 # Runs the tests/differential/ pairs against a second implementation of the same semantics. Skips
 # itself when lua is absent so it never blocks a local run; CI always has it.
@@ -293,6 +306,11 @@ test-differential: all
 	python3 tools/check_differential.py --binary binary/aer$(EXE) --lua $(LUA)
 
 check-style: check-format check-comments
+
+# Everything CI runs that needs no second toolchain. `make test` alone misses the C-level tests,
+# which is how a stale assertion in tests/smoke_test.c survived a green local run.
+check: check-style test test-embed test-smoke test-roundtrip test-fmt check-opcode-coverage
+	@echo "check: all local gates passed"
 
 # Clean-builds both refs on the Pi and prints a per-benchmark delta table. Always use this rather
 # than comparing against a checkout that happens to be lying around -- tar preserves mtimes, so a
