@@ -1,0 +1,6 @@
+# An import compiles to no code, so the statement after it starts at the same offset. The line mark
+# for that offset used to be kept for the import and the later one dropped, which made every runtime
+# error in a file that opened with an import report line 1.
+import collection
+
+x = collection.keys([])   #!error: keys() requires a hashtable

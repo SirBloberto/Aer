@@ -733,13 +733,14 @@ typedef struct {
     unsigned int count, cap;
 } MarkWorklist;
 
-/* Size-keyed free-list cache for typed-array data buffers -- the variable-sized payload, not the
-   header, which is pooled like every other GC object. Repeated same-shape transforms would
-   otherwise churn malloc/free every pass at a size that never changes. Bounded by a handful of
-   linearly-scanned slots and a per-buffer size ceiling, so one huge allocation cannot sit here
-   retaining memory. Checked by vm_new_typed_array, populated by free_typed_array. */
+/* Size-keyed free-list cache for typed-array data buffers -- the payload, not the header, which is
+   pooled like every other GC object. Checked by vm_new_typed_array, populated by free_typed_array.
+
+   Budgeted by total bytes rather than per buffer: a per-buffer ceiling turned away the single 16MB
+   buffer a 4M-element transform recycles every pass, costing a fresh mmap and 4096 page faults
+   each time, while still admitting eight buffers sitting just under it. */
 #define TYPED_ARRAY_FREE_CACHE_SLOTS 8
-#define TYPED_ARRAY_FREE_CACHE_MAX_BYTES (4u * 1024 * 1024)
+#define TYPED_ARRAY_FREE_CACHE_MAX_TOTAL_BYTES (32u * 1024 * 1024)
 /* Bytes of freshly-malloc'd typed-array payload that count as one cell against the collector's
    trigger -- see typed_array_data_alloc. Roughly a page, so a buffer costs about what faulting it
    in costs. */
@@ -768,6 +769,7 @@ typedef struct {
     bool pools_initialized;
 
     TypedArrayFreeSlot typed_array_free_cache[TYPED_ARRAY_FREE_CACHE_SLOTS];
+    size_t typed_array_free_cache_bytes;
 
     /* Old objects a write barrier caught holding a young reference; entries are only ever
        added/deduped, never removed, and re-traced as extra roots on every minor collection

@@ -103,6 +103,7 @@ static void vm_heap_init(VmHeap* heap) {
         heap->typed_array_free_cache[i].size = 0;
         heap->typed_array_free_cache[i].ptr = NULL;
     }
+    heap->typed_array_free_cache_bytes = 0;
     heap->minor_gc_threshold = default_minor_gc_threshold;
     heap->minor_gc_threshold_floor = default_minor_gc_threshold;
     heap->major_gc_every_n_minor = default_major_gc_every_n_minor;
@@ -431,6 +432,7 @@ void vm_free(VM* vm) {
        them. */
     for (unsigned int i = 0; i < TYPED_ARRAY_FREE_CACHE_SLOTS; i++)
         free(heap->typed_array_free_cache[i].ptr);
+    heap->typed_array_free_cache_bytes = 0;
 
     pool_destroy(&heap->string_pool);
     pool_destroy(&heap->array_pool);
@@ -1469,6 +1471,7 @@ static unsigned char* typed_array_data_alloc(VmHeap* heap, size_t size) {
             unsigned char* p = heap->typed_array_free_cache[i].ptr;
             heap->typed_array_free_cache[i].size = 0;
             heap->typed_array_free_cache[i].ptr = NULL;
+            heap->typed_array_free_cache_bytes -= size;
             return p;
         }
     }

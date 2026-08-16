@@ -56,8 +56,14 @@ void chunk_free(Chunk* c) {
 }
 
 void chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line) {
-    if (c->line_mark_count > 0 && c->line_mark_offsets[c->line_mark_count - 1] >= offset)
+    if (c->line_mark_count > 0 && c->line_mark_offsets[c->line_mark_count - 1] >= offset) {
+        /* Same offset means the previous statement compiled to nothing -- an import, say -- so this
+           one owns the code that lands here and the mark has to move to it. Dropping it instead
+           left every runtime error in the file reporting that earlier, codeless line. */
+        if (c->line_mark_offsets[c->line_mark_count - 1] == offset)
+            c->line_mark_lines[c->line_mark_count - 1] = line;
         return;
+    }
     if (c->line_mark_count >= c->line_mark_cap) {
         c->line_mark_cap = c->line_mark_cap ? c->line_mark_cap * 2 : 64;
         c->line_mark_offsets = xrealloc(c->line_mark_offsets, sizeof(unsigned int) * c->line_mark_cap);

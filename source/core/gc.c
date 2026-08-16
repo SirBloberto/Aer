@@ -289,11 +289,13 @@ static void free_typed_array(void* cell) {
         return;
     size_t size = (size_t)ta->count * vm_typed_elem_width(ta->elem_kind);
     VmHeap* heap = vm_current_heap();
-    if (heap && size > 0 && size <= TYPED_ARRAY_FREE_CACHE_MAX_BYTES) {
+    if (heap && size > 0 &&
+        heap->typed_array_free_cache_bytes + size <= TYPED_ARRAY_FREE_CACHE_MAX_TOTAL_BYTES) {
         for (unsigned int i = 0; i < TYPED_ARRAY_FREE_CACHE_SLOTS; i++) {
             if (heap->typed_array_free_cache[i].size == 0) {
                 heap->typed_array_free_cache[i].size = size;
                 heap->typed_array_free_cache[i].ptr = ta->data;
+                heap->typed_array_free_cache_bytes += size;
                 return;
             }
         }
