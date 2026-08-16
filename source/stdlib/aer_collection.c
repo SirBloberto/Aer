@@ -16,10 +16,236 @@ static int sort_cmp(const void* pa, const void* pb) {
     return da < db ? -1 : (da > db ? 1 : 0);
 }
 
+/* Same treatment vm.c's typed-array kernels get: -O3 with vectorization on these loops only, rather
+   than raising it for the whole file. */
+#define REDUCE_ATTR __attribute__((optimize("O3", "tree-vectorize")))
+
+/* Four running totals rather than one, so the loop has four independent dependency chains and can
+   vectorize. That is a throughput trick, not an accuracy one -- what protects the answer is the
+   WIDTH of the total. Summing float32 elements into a float32 total is 66% wrong by 1e8 elements,
+   because the total outgrows the values still being added and they round away to nothing; the same
+   loop accumulating into a double lands within 2e-12, and measures faster besides. */
+#define DEFINE_SUM(name, ctype, acctype)                                                                     \
+    REDUCE_ATTR static acctype name(const ctype* restrict a, unsigned int n) {                               \
+        acctype t0 = 0, t1 = 0, t2 = 0, t3 = 0;                                                              \
+        unsigned int i = 0;                                                                                  \
+        for (; i + 4 <= n; i += 4) {                                                                         \
+            t0 += a[i];                                                                                      \
+            t1 += a[i + 1];                                                                                  \
+            t2 += a[i + 2];                                                                                  \
+            t3 += a[i + 3];                                                                                  \
+        }                                                                                                    \
+        for (; i < n; i++)                                                                                   \
+            t0 += a[i];                                                                                      \
+        return (t0 + t1) + (t2 + t3);                                                                        \
+    }
+
+DEFINE_SUM(sum_i32, int32_t, int64_t)
+DEFINE_SUM(sum_i64, int64_t, int64_t)
+DEFINE_SUM(sum_f32, float, double)
+DEFINE_SUM(sum_f64, double, double)
+
+/* n == 0 is rejected before these are reached -- an empty range has no least or greatest element. */
+#define DEFINE_EXTREME(name, ctype, cmp)                                                                     \
+    REDUCE_ATTR static ctype name(const ctype* restrict a, unsigned int n) {                                 \
+        ctype best = a[0];                                                                                   \
+        for (unsigned int i = 1; i < n; i++)                                                                 \
+            if (a[i] cmp best)                                                                               \
+                best = a[i];                                                                                 \
+        return best;                                                                                         \
+    }
+
+DEFINE_EXTREME(min_i32, int32_t, <)
+DEFINE_EXTREME(max_i32, int32_t, >)
+DEFINE_EXTREME(min_i64, int64_t, <)
+DEFINE_EXTREME(max_i64, int64_t, >)
+DEFINE_EXTREME(min_f32, float, <)
+DEFINE_EXTREME(max_f32, float, >)
+DEFINE_EXTREME(min_f64, double, <)
+DEFINE_EXTREME(max_f64, double, >)
+
+/* FN_COLLECTION_SUM/MIN/MAX over a typed array. Integer elements answer as an integer and float
+   elements as a real, so the result matches what indexing the same array would have given. */
+static AerVal typed_reduce(AerTypedArray* ta, int fn_id) {
+    const void* d = ta->data;
+    unsigned int n = ta->count;
+    switch (ta->elem_kind) {
+        case TYPED_ELEM_INT32:
+            if (fn_id == FN_COLLECTION_SUM)
+                return aer_int(sum_i32(d, n));
+            return aer_int(fn_id == FN_COLLECTION_MIN ? min_i32(d, n) : max_i32(d, n));
+        case TYPED_ELEM_INT64:
+            if (fn_id == FN_COLLECTION_SUM)
+                return aer_int(sum_i64(d, n));
+            return aer_int(fn_id == FN_COLLECTION_MIN ? min_i64(d, n) : max_i64(d, n));
+        case TYPED_ELEM_FLOAT32:
+            if (fn_id == FN_COLLECTION_SUM)
+                return aer_real(sum_f32(d, n));
+            return aer_real((double)(fn_id == FN_COLLECTION_MIN ? min_f32(d, n) : max_f32(d, n)));
+        case TYPED_ELEM_FLOAT64:
+        default:
+            if (fn_id == FN_COLLECTION_SUM)
+                return aer_real(sum_f64(d, n));
+            return aer_real(fn_id == FN_COLLECTION_MIN ? min_f64(d, n) : max_f64(d, n));
+    }
+}
+
+static double as_number(AerVal v) {
+    return aer_type(v) == TYPE_INTEGER ? (double)aer_as_int(v) : aer_as_real(v);
+}
+
+/* A typed array's length is fixed at construction, so append/insert/delete/reserve can never apply
+   to one. Worth saying outright: "requires an array" on a value that plainly is an array sends the
+   reader looking for the wrong mistake. */
+static bool reject_fixed_length(VM* vm, AerVal v, const char* fname) {
+    if (aer_type(v) != TYPE_TYPED_ARRAY)
+        return false;
+    error("%s() cannot resize a typed array -- its length is fixed when it is created", fname);
+    vm_stack_push(vm, aer_null());
+    return true;
+}
+
+#define DEFINE_TYPED_CMP(name, ctype)                                                                        \
+    static int name(const void* pa, const void* pb) {                                                        \
+        ctype x = *(const ctype*)pa, y = *(const ctype*)pb;                                                  \
+        return x < y ? -1 : (x > y ? 1 : 0);                                                                 \
+    }
+
+DEFINE_TYPED_CMP(cmp_i32, int32_t)
+DEFINE_TYPED_CMP(cmp_i64, int64_t)
+DEFINE_TYPED_CMP(cmp_f32, float)
+DEFINE_TYPED_CMP(cmp_f64, double)
+
+/* Matched in the element's own type where it can be: widening an int64 element to double to compare
+   it would start reporting false matches past 2^53. */
+#define DEFINE_TYPED_FIND(name, ctype, integral)                                                             \
+    static int64_t name(const unsigned char* d, unsigned int n, AerVal want) {                               \
+        bool exact = (integral) && aer_type(want) == TYPE_INTEGER;                                           \
+        int64_t wi = exact ? aer_as_int(want) : 0;                                                           \
+        double wd = as_number(want);                                                                         \
+        for (unsigned int i = 0; i < n; i++) {                                                               \
+            ctype v;                                                                                         \
+            memcpy(&v, d + (size_t)i * sizeof(ctype), sizeof(ctype));                                        \
+            if (exact ? ((int64_t)v == wi) : ((double)v == wd))                                              \
+                return (int64_t)i;                                                                           \
+        }                                                                                                    \
+        return -1;                                                                                           \
+    }
+
+DEFINE_TYPED_FIND(find_i32, int32_t, true)
+DEFINE_TYPED_FIND(find_i64, int64_t, true)
+DEFINE_TYPED_FIND(find_f32, float, false)
+DEFINE_TYPED_FIND(find_f64, double, false)
+
+static int64_t typed_index_of(AerTypedArray* t, AerVal want) {
+    if (aer_type(want) != TYPE_INTEGER && aer_type(want) != TYPE_REAL)
+        return -1;
+    switch (t->elem_kind) {
+        case TYPED_ELEM_INT32: return find_i32(t->data, t->count, want);
+        case TYPED_ELEM_INT64: return find_i64(t->data, t->count, want);
+        case TYPED_ELEM_FLOAT32: return find_f32(t->data, t->count, want);
+        case TYPED_ELEM_FLOAT64:
+        default: return find_f64(t->data, t->count, want);
+    }
+}
+
+static int (*typed_cmp_for(TypedArrayElemKind k))(const void*, const void*) {
+    switch (k) {
+        case TYPED_ELEM_INT32: return cmp_i32;
+        case TYPED_ELEM_INT64: return cmp_i64;
+        case TYPED_ELEM_FLOAT32: return cmp_f32;
+        case TYPED_ELEM_FLOAT64:
+        default: return cmp_f64;
+    }
+}
+
+/* The same three over an ordinary array. It stays integer-exact while every element is an integer,
+   and widens to double the moment one is not -- so summing whole numbers cannot drift, and the
+   float case still gets the wide total the typed kernels use. */
+static bool boxed_reduce(AerArray* a, int fn_id, const char* fname, AerVal* out) {
+    for (unsigned int i = 0; i < a->count; i++) {
+        ValueType t = aer_type(a->items[i]);
+        if (t != TYPE_INTEGER && t != TYPE_REAL) {
+            error("%s() requires every element to be a number", fname);
+            return false;
+        }
+    }
+    bool all_int = true;
+    for (unsigned int i = 0; i < a->count; i++)
+        if (aer_type(a->items[i]) != TYPE_INTEGER)
+            all_int = false;
+
+    if (all_int) {
+        int64_t acc = aer_as_int(a->items[0]);
+        for (unsigned int i = 1; i < a->count; i++) {
+            int64_t v = aer_as_int(a->items[i]);
+            if (fn_id == FN_COLLECTION_SUM)
+                acc += v;
+            else if (fn_id == FN_COLLECTION_MIN)
+                acc = v < acc ? v : acc;
+            else
+                acc = v > acc ? v : acc;
+        }
+        *out = aer_int(acc);
+        return true;
+    }
+    double acc = as_number(a->items[0]);
+    for (unsigned int i = 1; i < a->count; i++) {
+        double v = as_number(a->items[i]);
+        if (fn_id == FN_COLLECTION_SUM)
+            acc += v;
+        else if (fn_id == FN_COLLECTION_MIN)
+            acc = v < acc ? v : acc;
+        else
+            acc = v > acc ? v : acc;
+    }
+    *out = aer_real(acc);
+    return true;
+}
+
 bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
+    if ((fn_id == FN_COLLECTION_SUM || fn_id == FN_COLLECTION_MIN || fn_id == FN_COLLECTION_MAX) &&
+        arg_count == 1) {
+        const char* fname = fn_id == FN_COLLECTION_SUM ? "sum" : (fn_id == FN_COLLECTION_MIN ? "min" : "max");
+        AerVal src = vm_stack_pop(vm);
+        unsigned int count;
+        if (aer_type(src) == TYPE_TYPED_ARRAY)
+            count = aer_as_typed_array(src)->count;
+        else if (aer_type(src) == TYPE_ARRAY && !aer_as_array(src)->shape)
+            count = aer_as_array(src)->count;
+        else {
+            error("%s() requires an array of numbers", fname);
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
+        if (count == 0) {
+            /* Summing nothing is 0; there is no honest least or greatest of nothing. */
+            if (fn_id != FN_COLLECTION_SUM) {
+                error("%s() of an empty array has no answer", fname);
+                vm_stack_push(vm, aer_null());
+                return true;
+            }
+            bool floaty = aer_type(src) == TYPE_TYPED_ARRAY &&
+                          (aer_as_typed_array(src)->elem_kind == TYPED_ELEM_FLOAT32 ||
+                           aer_as_typed_array(src)->elem_kind == TYPED_ELEM_FLOAT64);
+            vm_stack_push(vm, floaty ? aer_real(0.0) : aer_int(0));
+            return true;
+        }
+        if (aer_type(src) == TYPE_TYPED_ARRAY) {
+            vm_stack_push(vm, typed_reduce(aer_as_typed_array(src), fn_id));
+            return true;
+        }
+        AerVal out;
+        if (!boxed_reduce(aer_as_array(src), fn_id, fname, &out))
+            out = aer_null();
+        vm_stack_push(vm, out);
+        return true;
+    }
     if (fn_id == FN_COLLECTION_APPEND && arg_count == 2) {
         AerVal val = vm_stack_pop(vm);
         AerVal arr = vm_stack_pop(vm);
+        if (reject_fixed_length(vm, arr, "append"))
+            return true;
         if (aer_type(arr) != TYPE_ARRAY) {
             error("append() requires an array");
             vm_stack_push(vm, aer_null());
@@ -44,6 +270,8 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_COLLECTION_RESERVE && arg_count == 2) {
         AerVal n_v = vm_stack_pop(vm);
         AerVal arr = vm_stack_pop(vm);
+        if (reject_fixed_length(vm, arr, "reserve"))
+            return true;
         if (aer_type(arr) != TYPE_ARRAY) {
             error("reserve() requires an array");
             vm_stack_push(vm, aer_null());
@@ -81,6 +309,8 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_COLLECTION_DELETE && arg_count == 2) {
         AerVal key = vm_stack_pop(vm);
         AerVal obj = vm_stack_pop(vm);
+        if (reject_fixed_length(vm, obj, "delete"))
+            return true;
         if (aer_type(obj) == TYPE_DICT) {
             if (aer_type(key) != TYPE_STRING) {
                 error("delete() key must be a string");
@@ -163,6 +393,15 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
             vm_stack_push(vm, aer_dict_val(r));
             return true;
         }
+        if (aer_type(src) == TYPE_TYPED_ARRAY) {
+            AerTypedArray* t = aer_as_typed_array(src);
+            AerVal out = vm_new_typed_array_val(t->elem_kind, t->count);
+            if (t->count > 0)
+                memcpy(aer_as_typed_array(out)->data, t->data,
+                       (size_t)t->count * vm_typed_elem_width(t->elem_kind));
+            vm_stack_push(vm, out);
+            return true;
+        }
         /* A struct instance is deliberately excluded -- construct a fresh one instead (a shaped
            copy would also land in the wrong GC pool, see gc_barrier_array's pool split, vm.c). */
         error("copy() requires an array or dict");
@@ -173,6 +412,8 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         AerVal val = vm_stack_pop(vm);
         AerVal idx = vm_stack_pop(vm);
         AerVal arr = vm_stack_pop(vm);
+        if (reject_fixed_length(vm, arr, "insert"))
+            return true;
         if (aer_type(arr) != TYPE_ARRAY || aer_as_array(arr)->shape) {
             error("insert() requires an array");
             vm_stack_push(vm, aer_null());
@@ -212,6 +453,10 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
     if (fn_id == FN_COLLECTION_INDEX_OF && arg_count == 2) {
         AerVal val = vm_stack_pop(vm);
         AerVal arr = vm_stack_pop(vm);
+        if (aer_type(arr) == TYPE_TYPED_ARRAY) {
+            vm_stack_push(vm, aer_int(typed_index_of(aer_as_typed_array(arr), val)));
+            return true;
+        }
         if (aer_type(arr) != TYPE_ARRAY || aer_as_array(arr)->shape) {
             error("index_of() requires an array");
             vm_stack_push(vm, aer_null());
@@ -250,6 +495,12 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
     }
     if (fn_id == FN_COLLECTION_SORT && arg_count == 1) {
         AerVal arr = vm_stack_pop(vm);
+        if (aer_type(arr) == TYPE_TYPED_ARRAY) {
+            AerTypedArray* t = aer_as_typed_array(arr);
+            qsort(t->data, t->count, vm_typed_elem_width(t->elem_kind), typed_cmp_for(t->elem_kind));
+            vm_stack_push(vm, arr);
+            return true;
+        }
         if (aer_type(arr) != TYPE_ARRAY) {
             error("sort() requires an array");
             vm_stack_push(vm, aer_null());

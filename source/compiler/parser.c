@@ -4481,6 +4481,12 @@ static int module_fn_id(int module_id, AerString* name) {
                 return FN_COLLECTION_SORT;
             if (NAME_IS("reserve"))
                 return FN_COLLECTION_RESERVE;
+            if (NAME_IS("sum"))
+                return FN_COLLECTION_SUM;
+            if (NAME_IS("min"))
+                return FN_COLLECTION_MIN;
+            if (NAME_IS("max"))
+                return FN_COLLECTION_MAX;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_NET:
             if (NAME_IS("connect"))

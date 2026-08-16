@@ -1378,7 +1378,24 @@ collection.index_of(arr, x)   # index of the first element equal to x, or -1
 collection.copy(x)            # a new array/hashtable with the same entries — a shallow copy, one level deep
 collection.keys(d)            # a hashtable's keys as a new array (unspecified order — sort it for determinism)
 collection.sort(arr)          # sorts in place (ascending) and returns the array
+collection.sum(arr)           # adds every element; 0 for an empty array
+collection.min(arr)           # smallest element; an error on an empty array
+collection.max(arr)           # largest element; an error on an empty array
 ```
+
+`sum`, `min`, `max`, `index_of`, `copy` and `sort` all accept a typed array (`[0.0f; n]`) as well as
+an ordinary one, so a caller need not know which of the two it was handed. On a typed array the
+first three run as a single vectorized pass -- `collection.sum(a)` over 4M `float32` elements takes
+0.0027s against 0.057s for the same addition written as a loop. There is no separate dot product:
+`collection.sum(a * b)` already reads as one, and runs 5x faster than the equivalent loop.
+
+`sum` accumulates into a `double` (integers into an `int64`) whatever the elements are, which is
+not merely a rounding detail: a `float32` running total over 100M `float32` elements comes out 66%
+wrong, because the total outgrows the values still being added and they round away to nothing. The
+wide accumulator also measures slightly faster, so nothing is traded for it.
+
+`append`, `insert`, `delete` and `reserve` are the four that a typed array rejects -- its length is
+fixed when it is created.
 
 `collection.sort(arr)` requires every element to be a number (compared numerically, integer and
 float mix freely) or every element to be a string (compared lexicographically) — mixing the two is

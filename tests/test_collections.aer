@@ -183,4 +183,47 @@ mat[1][2] = 7.5
 assert(mat[0][2] == 0.0 and mat[1][2] == 7.5 and mat[2][2] == 0.0,
        "rows of a nested repeat-literal are independent, not one shared row")
 
+# sum/min/max read the same on either storage, so a caller need not know which one they hold.
+red_t = [0.0f; 5]
+redi = 0
+for redi < 5:
+    red_t[redi] = float(redi) + 1.0
+    redi += 1
+assert(collection.sum(red_t) == 15.0, "sum over a typed float array")
+assert(collection.min(red_t) == 1.0 and collection.max(red_t) == 5.0, "min/max over a typed float array")
+
+red_i = [0i; 4]
+red_i[0] = 7
+red_i[1] = 3
+red_i[2] = -2
+red_i[3] = 12
+assert(collection.sum(red_i) == 20, "sum over a typed int array stays an integer")
+assert(collection.min(red_i) == -2 and collection.max(red_i) == 12, "min/max over a typed int array")
+
+assert(collection.sum([4, 1, 9, 2]) == 16, "sum over an ordinary integer array")
+assert(collection.min([4, 1, 9, 2]) == 1 and collection.max([4, 1, 9, 2]) == 9,
+       "min/max over an ordinary array")
+assert(collection.sum([1, 2.5, 3]) == 6.5, "one real element widens the whole sum to a real")
+assert(collection.sum([]) == 0, "summing nothing is zero")
+
+# The accumulator is always a double, never the element type. One float32 step at 1e7 is ~1.19, so
+# every 0.1 here would vanish into a float32 running total and the answer would stay at 1e7 exactly.
+wide = [0.1f; 20001]
+wide[0] = 10000000.0
+assert(collection.sum(wide) > 10001000.0,
+       "the total is accumulated in a double, so addends far smaller than one step of the element type still count")
+
+# Everything that can work on a typed array does; the four that resize say why they cannot.
+srt = [0.0f; 3]
+srt[0] = 3.5
+srt[1] = 1.5
+srt[2] = 2.5
+assert(collection.index_of(srt, 2.5) == 2, "index_of finds an element of a typed array")
+assert(collection.index_of(srt, 9.9) == -1, "index_of reports a miss on a typed array")
+srt_copy = collection.copy(srt)
+srt_copy[0] = 99.0
+assert(srt[0] == 3.5 and srt_copy[0] == 99.0, "copy of a typed array is independent of the original")
+collection.sort(srt)
+assert(srt[0] == 1.5 and srt[1] == 2.5 and srt[2] == 3.5, "sort orders a typed array in place")
+
 print("test_collections.aer: all assertions passed.")
