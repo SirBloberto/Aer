@@ -102,4 +102,32 @@ actor.send(handle, empty_arr)
 back_empty = actor.receive(handle)
 assert(type(back_empty) == "float[]" and length(back_empty) == 0, "an empty typed array survives too")
 
+# An actor holds one value between calls, in its OWN heap. That is what lets data be sent once and
+# reused, rather than copied across the heap boundary on every call -- half the hand-off cost.
+keeper, keep_err = actor.spawn("tests/actor_worker.aer")
+assert(keep_err == null, "spawned an actor for the keep/kept checks")
+
+fresh, _fe = actor.call(keeper, "stash_is_null")
+assert(fresh == true, "an actor starts with nothing kept")
+
+kept_len, _kl = actor.call(keeper, "stash", [2.0; 5])
+assert(kept_len == 5, "keep() returns what was handed to it, and kept() reads it back")
+
+first, _f1 = actor.call(keeper, "stash_sum")
+second, _f2 = actor.call(keeper, "stash_sum")
+assert(first == 10.0 and second == 10.0, "the kept value survives across separate calls")
+
+# Replacing it drops the old one; nothing accumulates.
+replaced, _r = actor.call(keeper, "stash", [3.0; 4])
+assert(replaced == 4, "keep() replaces rather than appends")
+after, _a = actor.call(keeper, "stash_sum")
+assert(after == 12.0, "and later calls see the replacement")
+
+# Two actors from the same script keep their own, exactly as they have their own heaps.
+keeper2, _k2 = actor.spawn("tests/actor_worker.aer")
+_x, _xe = actor.call(keeper2, "stash", [1.0; 3])
+mine, _m = actor.call(keeper, "stash_sum")
+theirs, _t = actor.call(keeper2, "stash_sum")
+assert(mine == 12.0 and theirs == 3.0, "each actor keeps its own value")
+
 print("test_actor.aer: all assertions passed.")

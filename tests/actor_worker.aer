@@ -1,5 +1,27 @@
+import actor
+
 function add(a, b):
     return a + b
+
+# actor.keep/actor.kept: the one value this actor holds between calls. A function cannot reach a
+# top-level variable, so this is the only place an actor can put something it wants to reuse --
+# without it, work that revisits the same data has to be handed it again on every call.
+function stash(v):
+    actor.keep(v)
+    return length(actor.kept())
+
+function stash_sum():
+    d = actor.kept()
+    n = length(d)
+    s = 0.0
+    i = 0
+    for i < n:
+        s = s + d[i]
+        i += 1
+    return s
+
+function stash_is_null():
+    return actor.kept() == null
 
 function crash():
     return 1 / 0

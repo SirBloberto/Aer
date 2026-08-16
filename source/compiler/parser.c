@@ -4925,6 +4925,10 @@ static int module_fn_id(int module_id, AerString* name) {
                 return FN_ACTOR_RECEIVE;
             if (NAME_IS("call"))
                 return FN_ACTOR_CALL;
+            if (NAME_IS("keep"))
+                return FN_ACTOR_KEEP;
+            if (NAME_IS("kept"))
+                return FN_ACTOR_KEPT;
             return FN_ID_UNKNOWN;
         case CALL_MODULE_SCHEDULER:
             if (NAME_IS("add"))

@@ -900,6 +900,12 @@ typedef struct {
     AerVal stack[VM_STACK_MAX];
     int stack_top;
 
+    /* One value this VM holds onto between calls (actor.keep/actor.kept). Functions cannot reach a
+       top-level variable, so without this an actor has nowhere to put data it wants to reuse and
+       every call has to be handed it again -- which for a column meant copying it across the heap
+       boundary every time. A GC root, and it outlives aer_vm_reset_for_reuse deliberately. */
+    AerVal kept;
+
     /* One shared register bank for the whole chain (calls bump a base pointer). Same worst-case
        size as a flat design, but the actually-touched working set is far smaller. */
     AerVal register_stack[VM_CALL_MAX * FRAME_REGISTERS];

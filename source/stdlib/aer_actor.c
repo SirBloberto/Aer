@@ -286,6 +286,19 @@ void aer_actor_free_all(void) {
    popped[VM_STACK_MAX]` local was one of three such arrays LTO was folding into vm_run_slice's own
    frame, since each of the three has exactly one call site. */
 __attribute__((noinline)) bool aer_actor_module_call(VM* vm, int fn_id, int arg_count) {
+    /* Hold one value across calls, in THIS vm's own heap. An actor's functions cannot reach a
+       top-level variable, so without somewhere to put it, work that reuses the same data had to be
+       handed it again every call -- and for a column that meant copying it across the heap boundary
+       each time, measured at half the whole hand-off cost. */
+    if (fn_id == FN_ACTOR_KEEP && arg_count == 1) {
+        vm->kept = vm_stack_pop(vm);
+        vm_stack_push(vm, vm->kept);
+        return true;
+    }
+    if (fn_id == FN_ACTOR_KEPT && arg_count == 0) {
+        vm_stack_push(vm, vm->kept);
+        return true;
+    }
     if (fn_id == FN_ACTOR_SPAWN && arg_count == 1) {
         AerVal path_v = vm_stack_pop(vm);
         if (aer_type(path_v) != TYPE_STRING) {

@@ -218,6 +218,7 @@ static void mark_drain(VmHeap* heap, bool minor) {
 static void mark_vm_roots(VmHeap* heap, VM* vm, bool minor) {
     for (int i = 0; i < vm->stack_top; i++)
         worklist_push(heap, vm->stack[i], minor);
+    worklist_push(heap, vm->kept, minor); /* actor.keep's value, live between calls */
 
     /* Scanned unconditionally (zero-init decodes as harmless TYPE_NULL), bounded to the live call
        chain (0..call_depth) and, within a frame, to the slots that can hold a reference at all --
