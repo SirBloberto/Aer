@@ -4149,7 +4149,9 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
     assert_variables_below_floor("for-loop body");
 }
 
-#define VEC_MAX_OPS 16
+/* A query's loop body runs longer than a reduction's: two aggregates and a count under one filter
+   is around eighteen instructions, and at sixteen the recogniser gave up before reaching them. */
+#define VEC_MAX_OPS 32
 
 /* Rewrites a range-for into one whole-array reduction -- `for i in 0..length(a): t = t + a[i] * 2`
    becomes `t = t + collection.sum(a * 2)`. Called with the body already compiled, and rewinds over
@@ -4587,12 +4589,46 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
     return true;
 }
 
-/* `for i in 0..n: g = integer(region[i]); revenue[g] = revenue[g] + <expr>` -- a GROUP BY written
-   as a loop. Becomes one scattering pass that adds into revenue exactly where the loop did, so the
-   array keeps its identity and anything else referring to it sees the same updates.
+/* A GROUP BY with a WHERE clause and more than one aggregate -- what a query actually looks like.
+   Becomes one scattering pass per aggregate, all sharing one filter, adding into the arrays the loop
+   did so their identity survives. Kept apart from try_vectorize_reduction because these statements
+   end in an indexed STORE whose index is another column's element; a scalar accumulate alongside
+   them is recognised too, since COUNT(*) is always written that way. */
+#define VEC_MAX_STORES 4
+#define VEC_MAX_ACCS 4
 
-   Kept apart from try_vectorize_reduction because the shape is different in kind: it ends in an
-   indexed STORE whose index is another column's element, not in a scalar accumulate. */
+/* One aggregate's worth of emission, so the walk that drives them stays readable. `slot` advances
+   through the contiguous run the caller reserved. */
+static void emit_group_scatter(Chunk* c, int* slot, int argc, int target, int group_col, int values,
+                               int mask_reg, unsigned int mod_idx, unsigned int fn_idx) {
+    chunk_emit(c, PACK2(OP_MOVE, *slot, target));
+    chunk_emit(c, PACK2(OP_MOVE, *slot + 1, values));
+    chunk_emit(c, PACK2(OP_MOVE, *slot + 2, group_col));
+    if (mask_reg >= 0)
+        chunk_emit(c, PACK2(OP_MOVE, *slot + 3, mask_reg));
+    chunk_emit(c, PACK3(OP_CALL_MODULE, *slot, *slot, argc));
+    chunk_emit(c, (uint32_t)mod_idx);
+    chunk_emit(c, (uint32_t)fn_idx);
+    chunk_emit(c, PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_GROUP_SUM_INTO));
+    *slot += argc;
+}
+
+static bool emit_scalar_reduction(Chunk* c, int* slot, int acc_reg, int values, unsigned int mod_idx,
+                                  unsigned int fn_idx) {
+    chunk_emit(c, PACK2(OP_MOVE, *slot, values));
+    chunk_emit(c, PACK3(OP_CALL_MODULE, *slot, *slot, 1));
+    chunk_emit(c, (uint32_t)mod_idx);
+    chunk_emit(c, (uint32_t)fn_idx);
+    chunk_emit(c, PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_SUM));
+    int tmp = slot_alloc(RAWK_REAL);
+    if (tmp < 0)
+        return false;
+    chunk_emit(c, PACK3(OP_UNBOX_REAL, tmp, *slot, 0));
+    chunk_emit(c, PACK3(OP_RAW_ADD_REAL, acc_reg, acc_reg, tmp));
+    *slot += 2;
+    return true;
+}
+
 static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsigned int body_start,
                                            unsigned int body_end, int item_reg, int array_reg, int rk_start,
                                            int rk_step) {
@@ -4645,23 +4681,29 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
         ops[n].real_const = false;
         n++;
     }
-    if (n < 4 + guards || ops[n - 1].op != OP_INDEX_SET_RAW_REAL)
-        return false;
 
-    /* from_col[r]: r holds an element of that column. group_of[r]: r is an index built from one. */
+    /* from_col[r]: r holds an element of that column (or 1 for something derived from one).
+       group_of[r]: r indexes a group, and names the column the index came from.
+       total_of[r]: r is a `t[g]` read, and names which t and which g. */
     int from_col[FRAME_REGISTERS], group_of[FRAME_REGISTERS];
+    int total_target[FRAME_REGISTERS], total_gidx[FRAME_REGISTERS];
+    int closes_total[FRAME_REGISTERS], closes_gidx[FRAME_REGISTERS], closes_value[FRAME_REGISTERS];
+    bool is_acc[FRAME_REGISTERS];
     for (int i = 0; i < FRAME_REGISTERS; i++) {
         from_col[i] = -1;
         group_of[i] = -1;
+        total_target[i] = -1;
+        total_gidx[i] = -1;
+        closes_total[i] = -1;
+        closes_gidx[i] = -1;
+        closes_value[i] = -1;
+        is_acc[i] = false;
     }
-    /* INDEX_SET carries array, index, value in A, B, C -- unlike the arithmetic forms, whose A is a
-       destination. */
-    uint8_t target = ops[n - 1].d, gidx = ops[n - 1].x, stored = ops[n - 1].y;
-    int total_reg = -1; /* the `revenue[g]` read whose value the store adds to */
+    /* Only the counts are needed: what each aggregate scatters is settled during emission, where the
+       registers holding it are still current. These bound the argument run reserved below. */
+    int nstore = 0, naccum = 0;
 
-    /* Stops before the last two: the accumulate and the store are checked on their own below, and
-       the accumulate is the one instruction allowed to read the running total. */
-    for (int i = 0; i < n - 2; i++) {
+    for (int i = 0; i < n; i++) {
         uint8_t d = ops[i].d, x = ops[i].x, y = ops[i].y;
         if (ops[i].guard) {
             /* A constant here indexes the RAW constant table, which the array-level comparison
@@ -4678,13 +4720,17 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
             return false;
         if (ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED || ops[i].op == OP_INDEX_GET_RAW_REAL) {
             if (y == (uint8_t)item_reg) {
-                /* A column read: this row's element of x. */
+                /* A column read: this row's element of x. A second column joins in only once its
+                   length is known to match the one the loop was bounded by. */
                 if (x != (uint8_t)array_reg &&
                     !(P.reg_len_class[x] != 0 && P.reg_len_class[x] == P.reg_len_class[array_reg]))
                     return false;
                 from_col[d] = x;
-            } else if (x == target && y == gidx && total_reg < 0) {
-                total_reg = d; /* the running total for this group */
+                total_target[d] = -1;
+            } else if (group_of[y] >= 0) {
+                total_target[d] = x; /* a running total for one group of x */
+                total_gidx[d] = y;
+                from_col[d] = -1;
             } else {
                 return false;
             }
@@ -4693,52 +4739,95 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
         if (ops[i].op == OP_RAW_REAL_TO_INT) {
             if (from_col[x] < 0)
                 return false;
-            group_of[d] = from_col[x]; /* the column this index came from */
+            group_of[d] = from_col[x];
             continue;
         }
-        /* Naming the group index (`g = integer(region[i])`) copies it into the variable's own slot,
-           so what the store indexes by is one move removed from what built it. */
+        /* Naming the group index copies it into the variable's own slot, so what a store indexes by
+           is one move removed from what built it. */
         if (ops[i].op == OP_RAW_MOVE_INT || ops[i].op == OP_RAW_MOVE_REAL || ops[i].op == OP_MOVE) {
             from_col[d] = from_col[x];
             group_of[d] = group_of[x];
+            total_target[d] = total_target[x];
+            total_gidx[d] = total_gidx[x];
             continue;
         }
-        /* Arithmetic: at least one side must vary per row, and the running total must not be part
-           of it -- `t[g] = t[g] * x` is not an accumulation and cannot be scattered in one pass. */
-        if ((total_reg >= 0 && (x == (uint8_t)total_reg || y == (uint8_t)total_reg)))
+        if (ops[i].op == OP_INDEX_SET_RAW_REAL) {
+            /* INDEX_SET carries array, index, value in A, B, C -- unlike the arithmetic forms,
+               whose A is a destination. */
+            if (nstore >= VEC_MAX_STORES || group_of[x] < 0 || d == (uint8_t)array_reg)
+                return false;
+            /* Whatever is being stored has to be this group's own running total plus a per-row
+               value, which the add below recorded when it saw the total. */
+            if (closes_total[y] != (int)d || closes_gidx[y] != (int)x)
+                return false;
+            nstore++;
+            continue;
+        }
+        /* An add that reads exactly one running total is the write-back half of a grouped store, and
+           is the ONLY instruction allowed to read one. It cannot be judged here -- the store that
+           follows says which array and which group it belonged to -- so it is recorded and checked
+           there. */
+        if (ops[i].op == OP_RAW_ADD_REAL && (total_target[x] >= 0) != (total_target[y] >= 0)) {
+            uint8_t total = total_target[x] >= 0 ? x : y, val = total_target[x] >= 0 ? y : x;
+            if (total_target[val] >= 0 || is_acc[val] || is_acc[d])
+                return false;
+            /* A constant addend (`counts[g] += 1`) carries no column to scatter, so the filter's own
+               1/0 column stands in for it -- which means an unfiltered constant has nothing to
+               stand in and is left as a loop. */
+            if (from_col[val] < 0 && guards == 0)
+                return false;
+            closes_total[d] = total_target[total];
+            closes_gidx[d] = total_gidx[total];
+            closes_value[d] = val;
+            continue;
+        }
+        /* `t = t + <per-row value>` where t is neither a column nor a running total closes a scalar
+           accumulate -- COUNT(*) and SUM(x) over the whole result are both written that way. */
+        if (ops[i].op == OP_RAW_ADD_REAL && d == x && from_col[x] < 0 && total_target[x] < 0 &&
+            total_target[y] < 0 && !is_acc[y] && (from_col[y] >= 0 || guards > 0)) {
+            if (naccum >= VEC_MAX_ACCS)
+                return false;
+            naccum++;
+            is_acc[d] = true;
+            continue;
+        }
+        /* Anything else has to be per-row arithmetic over columns, and must not read a running
+           total or an accumulator -- one pass over the array cannot reproduce either. */
+        if (total_target[x] >= 0 || total_target[y] >= 0 || is_acc[x] || is_acc[y])
             return false;
         if (from_col[x] < 0 && from_col[y] < 0)
             return false;
         from_col[d] = 1;
     }
+    if (nstore == 0 && naccum == 0)
+        return false;
+    /* An accumulator may only ever be read as its own running total, and a stored group total only
+       by the add that writes it back. */
+    for (int i = 0; i < n; i++) {
+        if (ops[i].guard || ops[i].op == OP_INDEX_SET_RAW_REAL)
+            continue;
+        bool is_the_acc = ops[i].op == OP_RAW_ADD_REAL && ops[i].d == ops[i].x && is_acc[ops[i].d];
+        if (is_the_acc)
+            continue;
+        if (is_acc[ops[i].d])
+            return false;
+    }
 
-    /* The stored value has to be exactly `running total + <per-row value>`. */
-    if (total_reg < 0 || group_of[gidx] < 0)
-        return false;
-    int add = n - 2;
-    if (add < 0 || ops[add].op != OP_RAW_ADD_REAL || ops[add].d != stored)
-        return false;
-    uint8_t sum_x = ops[add].x, sum_y = ops[add].y;
-    uint8_t value_reg;
-    if (sum_x == (uint8_t)total_reg)
-        value_reg = sum_y;
-    else if (sum_y == (uint8_t)total_reg)
-        value_reg = sum_x;
-    else
-        return false;
-    if (from_col[value_reg] < 0 || target == (uint8_t)array_reg)
-        return false;
-
-    /* Emit before discarding: the call needs its arguments in a contiguous run, and a filtered form
-       carries the mask as a fourth. */
+    /* Emit before discarding: the calls need contiguous argument runs, and every one of them is
+       secured first -- once the loop's own code is gone there is no ordinary path to fall back to. */
     int argc = guards > 0 ? 4 : 3;
-    int base = reg_alloc(), taken = base >= 0 ? 1 : 0;
-    for (int i = 0; base >= 0 && i < argc - 1; i++) {
-        if (reg_alloc() != base + 1 + i) {
-            base = -1;
-            break;
+    int need = nstore * argc + naccum * 2;
+    int base = -1, taken = 0;
+    if (need > 0) {
+        base = reg_alloc();
+        taken = base >= 0 ? 1 : 0;
+        for (int i = 0; base >= 0 && i < need - 1; i++) {
+            if (reg_alloc() != base + 1 + i) {
+                base = -1;
+                break;
+            }
+            taken++;
         }
-        taken++;
     }
     if (base < 0) {
         if (taken)
@@ -4747,11 +4836,19 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
     }
 
     c->count = prep_at;
-    int value[FRAME_REGISTERS];
-    for (int i = 0; i < FRAME_REGISTERS; i++)
+    unsigned int mod_idx = chunk_add_pool(c, aer_make_string_copy("collection", 10));
+    unsigned int gs_idx = chunk_add_pool(c, aer_make_string_copy("group_sum", 9));
+    unsigned int sum_idx = chunk_add_pool(c, aer_make_string_copy("sum", 3));
+    int slot = base;
+    /* value[r]: the whole-array register standing in for what r held per row.
+       snap[r]: the values an aggregate will scatter, captured where they are still current. */
+    int value[FRAME_REGISTERS], snap[FRAME_REGISTERS];
+    for (int i = 0; i < FRAME_REGISTERS; i++) {
         value[i] = -1;
+        snap[i] = -1;
+    }
     int mask_reg = -1;
-    for (int i = 0; i < n - 2; i++) {
+    for (int i = 0; i < n; i++) {
         if (ops[i].guard) {
             int gx = RK8_IS_CONST(ops[i].x) ? vec_guard_const(c, ops[i].x, ops[i].real_const)
                                             : (value[ops[i].x] >= 0 ? value[ops[i].x] : (int)ops[i].x);
@@ -4778,13 +4875,58 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
         }
         if (ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED || ops[i].op == OP_INDEX_GET_RAW_REAL) {
             if (ops[i].y == (uint8_t)item_reg)
-                value[ops[i].d] = ops[i].x;
+                value[ops[i].d] = ops[i].x; /* the array itself replaces the element load */
             continue;
         }
         if (ops[i].op == OP_RAW_REAL_TO_INT)
             continue; /* group_sum takes the column itself, so the conversion is not needed */
         if (ops[i].op == OP_RAW_MOVE_INT || ops[i].op == OP_RAW_MOVE_REAL || ops[i].op == OP_MOVE) {
             value[ops[i].d] = value[ops[i].x];
+            continue;
+        }
+        if (ops[i].op == OP_INDEX_SET_RAW_REAL) {
+            emit_group_scatter(c, &slot, argc, ops[i].d, group_of[ops[i].x], snap[ops[i].y], mask_reg,
+                               mod_idx, gs_idx);
+            continue;
+        }
+        /* The adds that close a store or an accumulate contribute no array-level work of their own:
+           the scatter and the reduction do that adding. The value each one carries is captured HERE
+           rather than at the end, because the parser reuses a temp register freely -- reading it
+           later gave a grouped total the NEXT statement's values, silently doubling it. */
+        if (ops[i].op == OP_RAW_ADD_REAL && closes_total[ops[i].d] >= 0) {
+            snap[ops[i].d] = value[closes_value[ops[i].d]];
+            if (snap[ops[i].d] < 0) {
+                /* A constant addend: every surviving row contributes the same, so the filter's own
+                   1/0 column scaled by it is exactly the column to scatter. */
+                int scaled = reg_alloc();
+                if (scaled < 0)
+                    return false;
+                emit_binary(c, scaled, OP_MUL, mask_reg, closes_value[ops[i].d]);
+                P.reg_elem_kind[scaled] = RAWK_REAL;
+                snap[ops[i].d] = scaled;
+            }
+            continue;
+        }
+        if (ops[i].op == OP_RAW_ADD_REAL && is_acc[ops[i].d]) {
+            int v = value[ops[i].y];
+            if (v < 0) {
+                v = reg_alloc();
+                if (v < 0)
+                    return false;
+                emit_binary(c, v, OP_MUL, mask_reg, (int)ops[i].y);
+                P.reg_elem_kind[v] = RAWK_REAL;
+            } else if (mask_reg >= 0) {
+                /* Rejected rows must contribute nothing, and for a reduction multiplying by the
+                   1/0 filter says exactly that. */
+                int masked = reg_alloc();
+                if (masked < 0)
+                    return false;
+                emit_binary(c, masked, OP_MUL, v, mask_reg);
+                P.reg_elem_kind[masked] = RAWK_REAL;
+                v = masked;
+            }
+            if (!emit_scalar_reduction(c, &slot, ops[i].d, v, mod_idx, sum_idx))
+                return false;
             continue;
         }
         int rx = value[ops[i].x] >= 0 ? value[ops[i].x] : (int)ops[i].x;
@@ -4801,16 +4943,7 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
     if ((guards > 0) != (mask_reg >= 0))
         return false;
 
-    chunk_emit(c, PACK2(OP_MOVE, base, target));
-    chunk_emit(c, PACK2(OP_MOVE, base + 1, value[value_reg] >= 0 ? value[value_reg] : (int)value_reg));
-    chunk_emit(c, PACK2(OP_MOVE, base + 2, group_of[gidx]));
-    if (mask_reg >= 0)
-        chunk_emit(c, PACK2(OP_MOVE, base + 3, mask_reg));
-    chunk_emit(c, PACK3(OP_CALL_MODULE, base, base, argc));
-    chunk_emit(c, (uint32_t)chunk_add_pool(c, aer_make_string_copy("collection", 10)));
-    chunk_emit(c, (uint32_t)chunk_add_pool(c, aer_make_string_copy("group_sum", 9)));
-    chunk_emit(c, PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_GROUP_SUM_INTO));
-    reg_free(argc - 1);
+    reg_free(need - 1);
     return true;
 }
 

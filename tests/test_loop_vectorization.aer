@@ -373,4 +373,48 @@ for i in 0..gn:
         gq7[0] = gq7[0] + 100.0
 assert(gq7[0] == 305.0 and gq7[1] == 6.0, "an if/else is not a filter and stays a loop")
 
+# A query has more than one aggregate. Two grouped totals and a scalar count under one filter become
+# a scatter each plus a reduction, all sharing the one mask.
+mq_rev = [0.0; G]
+mq_cnt = [0.0; G]
+mq_matched = 0.0
+for i in 0..gn:
+    q = gr_value[i]
+    if q > 2.0:
+        g = integer(gr_region[i])
+        mq_rev[g] = mq_rev[g] + q * gr_other[i]
+        mq_cnt[g] = mq_cnt[g] + 1.0
+        mq_matched = mq_matched + 1.0
+assert(mq_rev[0] == 10.0 and mq_rev[1] == 12.0 and mq_rev[2] == 20.0 and mq_rev[3] == 24.0,
+       "the first of two grouped aggregates")
+assert(mq_cnt[0] == 1.0 and mq_cnt[2] == 2.0, "a counting aggregate beside it")
+assert(mq_matched == 6.0, "and a scalar count sharing the same filter")
+
+# Two grouped totals with no filter at all, one carrying a value and one a scalar reduction.
+mq2 = [0.0; G]
+mq2_sum = 0.0
+for i in 0..gn:
+    g = integer(gr_region[i])
+    mq2[g] = mq2[g] + gr_value[i]
+    mq2_sum = mq2_sum + gr_value[i] * gr_other[i]
+assert(mq2[0] == 6.0 and mq2[3] == 12.0, "an unfiltered grouped total")
+assert(mq2_sum == 72.0, "with a scalar reduction beside it")
+
+# A constant addend has no column to scatter, so it borrows the filter's own 1/0 column. With no
+# filter there is nothing to borrow, and the loop has to stand.
+mq3 = [0.0; G]
+for i in 0..gn:
+    g = integer(gr_region[i])
+    mq3[g] = mq3[g] + 1.0
+assert(mq3[0] == 2.0 and mq3[3] == 2.0, "an unfiltered constant addend stays a loop")
+
+# An accumulator feeding a grouped store is not a per-row value -- no single pass reproduces it.
+mq4 = [0.0; G]
+mq4_run = 0.0
+for i in 0..gn:
+    g = integer(gr_region[i])
+    mq4_run = mq4_run + gr_value[i]
+    mq4[g] = mq4[g] + mq4_run
+assert(mq4[0] == 16.0 and mq4[1] == 24.0, "a running total inside a grouped store stays a loop")
+
 print("test_loop_vectorization.aer: all assertions passed.")
