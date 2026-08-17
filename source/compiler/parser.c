@@ -104,10 +104,9 @@ typedef struct Parser {
 
     /* Two arrays built from ONE count value are the same length. value_class identifies what a
    register currently holds and changes on every write to it; len_class records the count's
-   value_class at construction, so equal nonzero len_classes mean equal lengths. Read only by
-   try_vectorize_reduction, where it is a correctness precondition rather than an optimization:
-   folding a loop over several columns into one whole-array pass is only the same work when they
-   really are the same length. */
+   value_class at construction, so equal nonzero len_classes mean equal lengths. len_class had one
+   reader, the loop rewrite that is now gone -- it is still maintained here but nothing consults it,
+   and it should follow. */
     int reg_value_class[FRAME_REGISTERS];
     int reg_len_class[FRAME_REGISTERS];
     int next_value_class;

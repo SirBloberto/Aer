@@ -1420,22 +1420,25 @@ total = collection.sum(price * mask)   # sum of just those
 `==` and `!=` mask elementwise against a **number**, but between two **arrays** they keep their
 existing meaning — identity, answering whether they are the same array.
 
-### Loops that become whole-array reductions
+### Bulk numeric work goes through the array vocabulary
 
-A `for i in 0..n:` whose body only accumulates over typed arrays is compiled as if you had written
-the reduction directly, so it runs the vectorized kernel rather than five dispatches per element:
+A loop costs what it looks like it costs: one pass through the interpreter per element. For bulk
+numeric work over typed arrays, say so directly and the whole operation runs as one pass of compiled
+C over the array:
 
 ```
-for i in 0..length(a):
-    total = total + a[i] * b[i]     # compiled as: total = total + collection.sum(a * b)
+total = collection.sum(a * b)          # one tiled pass, nothing materialised in between
+revenue = collection.group_sum(price * quantity * (price < 400.0), region, GROUPS)
 ```
 
-Over 4M elements that is 0.053s of loop against 0.0063s. Several independent accumulators in one
-body each become their own reduction. The bound must be the array's own `length()`, the range must
-start at 0 and step by 1, and every array involved must be provably the same length -- built from
-one count value. Anything else compiles as an ordinary loop, including a body with a branch, a
-`break`, an index other than the loop variable, or a running total that appears inside its own
-expression.
+`collection.sum(a * b * c)` is evaluated a block at a time rather than one whole-array pass per
+operator, so the intermediates never exist at full size. A comparison inside such an expression is a
+filter, and when it keeps few enough rows the value columns are read only where a row survived
+rather than everywhere.
+
+There is deliberately no compiler pass that turns a loop into these calls behind your back. One
+existed and was removed: a loop that is sometimes not a loop takes away the thing a reader most
+relies on, and which loops qualified was undiscoverable.
 
 One consequence worth knowing: `collection.sum` keeps four partial sums rather than one running
 total, so a **float** reduction is reassociated. Measured against Kahan summation this is *more*

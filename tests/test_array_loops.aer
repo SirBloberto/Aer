@@ -1,6 +1,8 @@
-# A range-for that only accumulates over one array is rewritten into a single whole-array reduction
-# (try_vectorize_reduction, parser.c). Most of what matters here is the shapes it must DECLINE: the
-# rewrite is invisible, so a case it wrongly accepts produces a wrong number rather than a crash.
+# Loops over typed arrays, and the answers they have to produce. Most of this was written to pin
+# down a compiler rewrite that turned such loops into whole-array operations; that rewrite is gone,
+# but the cases outlived it -- filters, several accumulators, grouped totals, partial ranges and
+# non-unit steps are exactly where an off-by-one or a misread bound would show, and every assertion
+# here states what the LOOP itself must compute.
 
 a = [0i; 8]
 ai = 0
@@ -417,4 +419,4 @@ for i in 0..gn:
     mq4[g] = mq4[g] + mq4_run
 assert(mq4[0] == 16.0 and mq4[1] == 24.0, "a running total inside a grouped store stays a loop")
 
-print("test_loop_vectorization.aer: all assertions passed.")
+print("test_array_loops.aer: all assertions passed.")
