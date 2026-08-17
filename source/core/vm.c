@@ -823,16 +823,16 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
             return aer_bool(tta == ttb);
         if (op == OP_NEQ)
             return aer_bool(tta != ttb);
-        if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_LT || op == OP_LTE || op == OP_GT ||
-            op == OP_GTE)
+        if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV || op == OP_LT || op == OP_LTE ||
+            op == OP_GT || op == OP_GTE)
             return vm_typed_array_binary_op(tta, ttb, op);
         error("Operator not valid for typed arrays");
         return aer_bool(false);
     }
 
     /* One side a typed array, the other a plain number: broadcast it across the array. */
-    if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_LT || op == OP_LTE || op == OP_GT ||
-        op == OP_GTE || op == OP_EQ || op == OP_NEQ) {
+    if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV || op == OP_LT || op == OP_LTE ||
+        op == OP_GT || op == OP_GTE || op == OP_EQ || op == OP_NEQ) {
         bool a_arr = aer_type(a) == TYPE_TYPED_ARRAY, b_arr = aer_type(b) == TYPE_TYPED_ARRAY;
         bool a_num = ta == TYPE_INTEGER || ta == TYPE_REAL, b_num = tb == TYPE_INTEGER || tb == TYPE_REAL;
         if (a_arr && b_num)
@@ -1463,6 +1463,69 @@ AER_TYPED_SCALAR_SET(i64, int64_t, AER_TYPED_SCALAR)
 AER_TYPED_SCALAR_SET(f64, double, AER_TYPED_SCALAR)
 AER_TYPED_SCALAR_SET(f32, float, AER_TYPED_SCALAR_FASTMATH)
 
+/* Division answers in float64 whatever it divides, because `5 / 2` is 2.5 everywhere else in the
+   language and a column should not be the exception. That makes it the one operator whose result
+   kind is not its operands', so it is dispatched apart from the kinds-preserving set above.
+   A zero divisor is collected as a flag rather than branched on, which keeps the loop vectorizing;
+   the caller reports it with the same message the scalar path uses. */
+#define AER_TYPED_DIV(name, ctype)                                                                           \
+    static __attribute__((optimize("O3", "tree-vectorize"))) int name(                                       \
+        double* restrict c, const ctype* restrict a, const ctype* restrict b, unsigned int n) {              \
+        int zero = 0;                                                                                        \
+        for (unsigned int i = 0; i < n; i++) {                                                               \
+            zero |= (b[i] == 0);                                                                             \
+            c[i] = (double)a[i] / (double)b[i];                                                              \
+        }                                                                                                    \
+        return zero;                                                                                         \
+    }
+#define AER_TYPED_DIV_SCALAR(name, ctype, num, den)                                                          \
+    static __attribute__((optimize("O3", "tree-vectorize"))) void name(                                      \
+        double* restrict c, const ctype* restrict a, double s, unsigned int n) {                             \
+        for (unsigned int i = 0; i < n; i++)                                                                 \
+            c[i] = (num) / (den);                                                                            \
+    }
+
+#define AER_TYPED_DIV_SET(sfx, ctype)                                                                        \
+    AER_TYPED_DIV(typed_div_##sfx, ctype)                                                                    \
+    AER_TYPED_DIV_SCALAR(typed_divs_##sfx, ctype, (double)a[i], s)                                           \
+    AER_TYPED_DIV_SCALAR(typed_rdivs_##sfx, ctype, s, (double)a[i])
+
+AER_TYPED_DIV_SET(i32, int32_t)
+AER_TYPED_DIV_SET(i64, int64_t)
+AER_TYPED_DIV_SET(f32, float)
+AER_TYPED_DIV_SET(f64, double)
+
+/* Both directions over any element kind, so the two dispatch sites read as one line each. */
+#define TYPED_DIV_CALL(sfx, ctype)                                                                           \
+    return typed_div_##sfx(out, (const ctype*)a->data, (const ctype*)b->data, a->count)
+
+static int typed_div_run(double* out, const AerTypedArray* a, const AerTypedArray* b) {
+    switch (a->elem_kind) {
+        case TYPED_ELEM_INT32: TYPED_DIV_CALL(i32, int32_t);
+        case TYPED_ELEM_INT64: TYPED_DIV_CALL(i64, int64_t);
+        case TYPED_ELEM_FLOAT32: TYPED_DIV_CALL(f32, float);
+        default: TYPED_DIV_CALL(f64, double);
+    }
+}
+#undef TYPED_DIV_CALL
+
+#define TYPED_DIVS_CALL(sfx, ctype)                                                                          \
+    if (flip)                                                                                                \
+        typed_rdivs_##sfx(out, (const ctype*)a->data, s, a->count);                                          \
+    else                                                                                                     \
+        typed_divs_##sfx(out, (const ctype*)a->data, s, a->count);                                           \
+    break
+
+static void typed_divs_run(double* out, const AerTypedArray* a, double s, bool flip) {
+    switch (a->elem_kind) {
+        case TYPED_ELEM_INT32: TYPED_DIVS_CALL(i32, int32_t);
+        case TYPED_ELEM_INT64: TYPED_DIVS_CALL(i64, int64_t);
+        case TYPED_ELEM_FLOAT32: TYPED_DIVS_CALL(f32, float);
+        default: TYPED_DIVS_CALL(f64, double);
+    }
+}
+#undef TYPED_DIVS_CALL
+
 /* Comparisons answer 1 or 0 in the ELEMENT's own type rather than a separate boolean array, which
    is what lets a mask compose with the arithmetic already here: `sum(price * (price < 400.0))` is a
    filtered total with no new reduction and no new opcode. Fast-math is deliberately NOT applied --
@@ -1644,6 +1707,14 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
         error("Typed arrays must have the same length (got %u and %u)", a->count, b->count);
         return aer_bool(false);
     }
+    if (op == OP_DIV) {
+        AerVal out = aer_typed_array_val(vm_new_typed_array(TYPED_ELEM_FLOAT64, a->count));
+        if (a->count > 0 && typed_div_run((double*)aer_as_typed_array(out)->data, a, b)) {
+            error("Division by zero");
+            return aer_bool(false);
+        }
+        return out;
+    }
     AerTypedArray* r = vm_new_typed_array(a->elem_kind, a->count);
 /* A comparison answers in the element type, so it slots into the same per-kind branch. */
 #define AER_CMP_DISPATCH(sfx, rc, ra, rb, n)                                                                 \
@@ -1730,6 +1801,16 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
    left operand, which only changes subtraction. */
 static AerVal vm_typed_array_scalar_op(AerTypedArray* a, AerVal scalar, Opcode op, bool flip) {
     double s = aer_type(scalar) == TYPE_INTEGER ? (double)aer_as_int(scalar) : aer_as_real(scalar);
+    if (op == OP_DIV) {
+        /* Only the scalar can be a zero divisor here, so it is checked once rather than per row. */
+        if (!flip && s == 0.0) {
+            error("Division by zero");
+            return aer_bool(false);
+        }
+        AerVal out = aer_typed_array_val(vm_new_typed_array(TYPED_ELEM_FLOAT64, a->count));
+        typed_divs_run((double*)aer_as_typed_array(out)->data, a, s, flip);
+        return out;
+    }
     AerTypedArray* r = vm_new_typed_array(a->elem_kind, a->count);
     unsigned int n = a->count;
     bool rsub = (op == OP_SUB && flip);

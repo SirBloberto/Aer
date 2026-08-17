@@ -253,16 +253,131 @@ static bool reject_fixed_length(VM* vm, AerVal v, const char* fname) {
     return true;
 }
 
-#define DEFINE_TYPED_CMP(name, ctype)                                                                        \
-    static int name(const void* pa, const void* pb) {                                                        \
-        ctype x = *(const ctype*)pa, y = *(const ctype*)pb;                                                  \
-        return x < y ? -1 : (x > y ? 1 : 0);                                                                 \
+/* Sorting a column, specialised per element kind so the comparison inlines -- qsort's indirect call
+   per comparison measured 4.6x slower than NumPy over 16M elements. Three-way partitioning, because
+   a column is where duplicates concentrate: 4M rows over a thousand distinct prices sends every
+   equal element to the middle in one pass rather than recursing through them. Recursion is always
+   into the smaller side, so the depth stays logarithmic without an explicit stack. */
+#define TYPED_SORT_SMALL 24
+#define TYPED_MED3(x, y, z)                                                                                  \
+    ((x) < (y) ? ((y) < (z) ? (y) : ((x) < (z) ? (z) : (x))) : ((x) < (z) ? (x) : ((y) < (z) ? (z) : (y))))
+
+#define DEFINE_TYPED_SORT(name, ctype)                                                                       \
+    static void name##_heap(ctype* a, size_t n) {                                                            \
+        for (size_t start = n / 2; start > 0;) {                                                             \
+            start--;                                                                                         \
+            for (size_t r = start;;) {                                                                       \
+                size_t c = 2 * r + 1;                                                                        \
+                if (c >= n)                                                                                  \
+                    break;                                                                                   \
+                if (c + 1 < n && a[c] < a[c + 1])                                                            \
+                    c++;                                                                                     \
+                if (!(a[r] < a[c]))                                                                          \
+                    break;                                                                                   \
+                ctype t = a[r];                                                                              \
+                a[r] = a[c];                                                                                 \
+                a[c] = t;                                                                                    \
+                r = c;                                                                                       \
+            }                                                                                                \
+        }                                                                                                    \
+        for (size_t end = n; end > 1;) {                                                                     \
+            end--;                                                                                           \
+            ctype t = a[0];                                                                                  \
+            a[0] = a[end];                                                                                   \
+            a[end] = t;                                                                                      \
+            for (size_t r = 0;;) {                                                                           \
+                size_t c = 2 * r + 1;                                                                        \
+                if (c >= end)                                                                                \
+                    break;                                                                                   \
+                if (c + 1 < end && a[c] < a[c + 1])                                                          \
+                    c++;                                                                                     \
+                if (!(a[r] < a[c]))                                                                          \
+                    break;                                                                                   \
+                ctype u = a[r];                                                                              \
+                a[r] = a[c];                                                                                 \
+                a[c] = u;                                                                                    \
+                r = c;                                                                                       \
+            }                                                                                                \
+        }                                                                                                    \
+    }                                                                                                        \
+    static void name##_run(ctype* a, size_t n, int depth) {                                                  \
+        while (n > TYPED_SORT_SMALL) {                                                                       \
+            if (depth-- <= 0) {                                                                              \
+                name##_heap(a, n);                                                                           \
+                return;                                                                                      \
+            }                                                                                                \
+            /* Sample positions have to be irregular. Any fixed stride aliases against a column that      \
+               repeats with a period -- `(i % 1000) * 0.5` against a stride of n/8 lands on the same       \
+               phase nine times out of nine and hands back the minimum, which is how a median-of-nine      \
+               measured 2.3x SLOWER than the qsort it replaced. The seed is derived from the range         \
+               itself so the choice stays deterministic and needs no shared state. */ \
+            size_t r = (size_t)((uintptr_t)a >> 3) ^ (n * (size_t)0x9E3779B97F4A7C15ULL);                    \
+            ctype p;                                                                                         \
+            if (n > 128) {                                                                                   \
+                ctype v[3];                                                                                  \
+                for (int k = 0; k < 3; k++) {                                                                \
+                    r ^= r >> 30;                                                                            \
+                    r *= (size_t)0xBF58476D1CE4E5B9ULL;                                                      \
+                    r ^= r >> 27;                                                                            \
+                    v[k] = a[r % n];                                                                         \
+                }                                                                                            \
+                p = TYPED_MED3(v[0], v[1], v[2]);                                                            \
+            } else {                                                                                         \
+                p = TYPED_MED3(a[0], a[n / 2], a[n - 1]);                                                    \
+            }                                                                                                \
+            size_t lt = 0, i = 0, gt = n;                                                                    \
+            while (i < gt) {                                                                                 \
+                if (a[i] < p) {                                                                              \
+                    ctype t = a[lt];                                                                         \
+                    a[lt++] = a[i];                                                                          \
+                    a[i++] = t;                                                                              \
+                } else if (p < a[i]) {                                                                       \
+                    ctype t = a[--gt];                                                                       \
+                    a[gt] = a[i];                                                                            \
+                    a[i] = t;                                                                                \
+                } else {                                                                                     \
+                    i++; /* equal to the pivot, and already where it belongs */                              \
+                }                                                                                            \
+            }                                                                                                \
+            if (lt < n - gt) {                                                                               \
+                name##_run(a, lt, depth);                                                                    \
+                a += gt;                                                                                     \
+                n -= gt;                                                                                     \
+            } else {                                                                                         \
+                name##_run(a + gt, n - gt, depth);                                                           \
+                n = lt;                                                                                      \
+            }                                                                                                \
+        }                                                                                                    \
+        for (size_t k = 1; k < n; k++) {                                                                     \
+            ctype v = a[k];                                                                                  \
+            size_t j = k;                                                                                    \
+            while (j > 0 && v < a[j - 1]) {                                                                  \
+                a[j] = a[j - 1];                                                                             \
+                j--;                                                                                         \
+            }                                                                                                \
+            a[j] = v;                                                                                        \
+        }                                                                                                    \
+    }                                                                                                        \
+    static void name(ctype* a, size_t n) {                                                                   \
+        int depth = 0;                                                                                       \
+        for (size_t m = n; m > 1; m >>= 1)                                                                   \
+            depth++;                                                                                         \
+        name##_run(a, n, 2 * depth);                                                                         \
     }
 
-DEFINE_TYPED_CMP(cmp_i32, int32_t)
-DEFINE_TYPED_CMP(cmp_i64, int64_t)
-DEFINE_TYPED_CMP(cmp_f32, float)
-DEFINE_TYPED_CMP(cmp_f64, double)
+DEFINE_TYPED_SORT(sort_i32, int32_t)
+DEFINE_TYPED_SORT(sort_i64, int64_t)
+DEFINE_TYPED_SORT(sort_f32, float)
+DEFINE_TYPED_SORT(sort_f64, double)
+
+static void typed_sort(AerTypedArray* t) {
+    switch (t->elem_kind) {
+        case TYPED_ELEM_INT32: sort_i32((int32_t*)t->data, t->count); break;
+        case TYPED_ELEM_INT64: sort_i64((int64_t*)t->data, t->count); break;
+        case TYPED_ELEM_FLOAT32: sort_f32((float*)t->data, t->count); break;
+        default: sort_f64((double*)t->data, t->count); break;
+    }
+}
 
 /* Matched in the element's own type where it can be: widening an int64 element to double to compare
    it would start reporting false matches past 2^53. */
@@ -294,16 +409,6 @@ static int64_t typed_index_of(AerTypedArray* t, AerVal want) {
         case TYPED_ELEM_FLOAT32: return find_f32(t->data, t->count, want);
         case TYPED_ELEM_FLOAT64:
         default: return find_f64(t->data, t->count, want);
-    }
-}
-
-static int (*typed_cmp_for(TypedArrayElemKind k))(const void*, const void*) {
-    switch (k) {
-        case TYPED_ELEM_INT32: return cmp_i32;
-        case TYPED_ELEM_INT64: return cmp_i64;
-        case TYPED_ELEM_FLOAT32: return cmp_f32;
-        case TYPED_ELEM_FLOAT64:
-        default: return cmp_f64;
     }
 }
 
@@ -881,7 +986,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         AerVal arr = vm_stack_pop(vm);
         if (aer_type(arr) == TYPE_TYPED_ARRAY) {
             AerTypedArray* t = aer_as_typed_array(arr);
-            qsort(t->data, t->count, vm_typed_elem_width(t->elem_kind), typed_cmp_for(t->elem_kind));
+            typed_sort(t);
             vm_stack_push(vm, arr);
             return true;
         }

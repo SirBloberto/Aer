@@ -305,4 +305,65 @@ assert(collection.sum(fa * fb) == 140.0, "a single operator is left alone")
 none = [0.0; 0]
 assert(collection.sum(none * none * none) == 0.0, "an empty column sums to zero")
 
+# Sorting a column runs a per-kind three-way quicksort rather than qsort. The shapes below are the
+# ones a quicksort gets wrong: all-equal and already-ordered input degenerate a two-way partition,
+# and a column that repeats with a period defeats any fixed-stride pivot sample.
+so_empty = [0.0; 0]
+collection.sort(so_empty)
+assert(length(so_empty) == 0, "sorting an empty column")
+
+so_one = [5.0; 1]
+collection.sort(so_one)
+assert(so_one[0] == 5.0, "sorting a single element")
+
+so_same = [7.0; 64]
+collection.sort(so_same)
+assert(so_same[0] == 7.0 and so_same[63] == 7.0, "every element equal")
+
+so_n = 600
+so_asc = [0.0; so_n]
+so_desc = [0.0; so_n]
+so_cycle = [0.0; so_n]
+soi = 0
+for soi < so_n:
+    so_asc[soi] = float(soi)
+    so_desc[soi] = float(so_n - soi)
+    # Periodic, which is what defeated a fixed-stride pivot: every sample landed on the same phase.
+    so_cycle[soi] = float(soi % 50) * 0.5
+    soi += 1
+collection.sort(so_asc)
+collection.sort(so_desc)
+collection.sort(so_cycle)
+assert(so_asc[0] == 0.0 and so_asc[so_n - 1] == 599.0, "already ascending")
+assert(so_desc[0] == 1.0 and so_desc[so_n - 1] == 600.0, "exactly descending")
+assert(so_cycle[0] == 0.0 and so_cycle[so_n - 1] == 24.5, "a periodic column")
+
+# Ordered throughout, not merely at the ends, and holding the same elements it started with.
+so_ordered = true
+soi = 1
+for soi < so_n:
+    if so_cycle[soi] < so_cycle[soi - 1]:
+        so_ordered = false
+    soi += 1
+assert(so_ordered, "sorted at every position, not just the ends")
+assert(collection.sum(so_cycle) == 7350.0, "a sort neither loses nor invents elements")
+
+so_mix = [0.0; 5]
+so_mix[0] = 3.5
+so_mix[1] = -2.0
+so_mix[2] = 0.0
+so_mix[3] = -100.25
+so_mix[4] = -2.0
+collection.sort(so_mix)
+assert(so_mix[0] == -100.25 and so_mix[1] == -2.0 and so_mix[2] == -2.0 and so_mix[4] == 3.5,
+       "negatives and duplicates together")
+
+so_ints = [0i; 4]
+so_ints[0] = 5
+so_ints[1] = -3
+so_ints[2] = 12
+so_ints[3] = -3
+collection.sort(so_ints)
+assert(so_ints[0] == -3 and so_ints[1] == -3 and so_ints[3] == 12, "an integer column")
+
 print("test_collections.aer: all assertions passed.")

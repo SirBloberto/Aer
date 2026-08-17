@@ -231,4 +231,35 @@ assert(collection.sum(one_a * one_a * one_a) == 27.0, "a single-element chain")
 none_a = [1.0; 0]
 assert(collection.sum(none_a * none_a * none_a) == 0.0, "an empty chain sums to zero")
 
+# Division over columns. It answers in float whatever it divides, because `5 / 2` is 2.5 everywhere
+# else in the language and a column should not be the exception -- it is the one operator whose
+# result kind is not its operands'.
+dv_f = [0.0; 4]
+dv_i = [0i; 4]
+dvi = 0
+for dvi < 4:
+    dv_f[dvi] = float(dvi) + 1.0
+    dv_i[dvi] = dvi + 1
+    dvi += 1
+
+dv_q = dv_f / 2.0
+assert(dv_q[0] == 0.5 and dv_q[3] == 2.0, "a float column divided by a scalar")
+
+dv_r = 12.0 / dv_f
+assert(dv_r[0] == 12.0 and dv_r[3] == 3.0, "a scalar divided by a float column")
+
+dv_s = dv_i / 2
+assert(dv_s[0] == 0.5 and dv_s[3] == 2.0, "an integer column divides to reals")
+assert(type(dv_s) == "float[]", "and answers as a float column")
+
+dv_t = dv_f / dv_f
+assert(dv_t[0] == 1.0 and dv_t[3] == 1.0, "column by column")
+
+dv_u = dv_i / dv_i
+assert(dv_u[0] == 1.0 and dv_u[3] == 1.0, "integer column by integer column")
+
+# The scalar path can rule out a zero divisor once; the column path has to look at every element.
+dv_z = [0.0; 0]
+assert(length(dv_z / 2.0) == 0, "dividing an empty column is empty, not an error")
+
 print("test_typed_arrays.aer: all assertions passed.")

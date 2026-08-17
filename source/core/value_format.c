@@ -6,10 +6,18 @@
 #include "strbuf.h"
 #include "vm.h"
 
-/* Returns the rendered length. Both formatters already know it, and every hot caller went on to
-   call strlen() on the buffer they had just filled -- 2.3% of lookup_table_bench on its own. */
+/* Returns the rendered length; every hot caller used to call strlen() straight after -- 2.3% of
+   lookup_table_bench on its own. Prints the shortest spelling that reads back as the same double,
+   as Python, Rust and JavaScript do: plain `%g` shows six significant digits, so a summed column
+   came out as 3.58329e+09 and two engines computing different totals looked identical. 15 digits
+   covers any double written as a decimal, and is tried first so the common value costs one pass. */
 unsigned int aer_format_real(double d, char* buf, size_t bufsize) {
-    int written = snprintf(buf, bufsize, "%g", d);
+    int written = snprintf(buf, bufsize, "%.15g", d);
+    for (int digits = 16; digits <= 17 && written > 0 && (size_t)written < bufsize; digits++) {
+        if (strtod(buf, NULL) == d)
+            break;
+        written = snprintf(buf, bufsize, "%.*g", digits, d);
+    }
     size_t len = (written < 0) ? strlen(buf) : (size_t)written;
     /* Skip nan/inf spellings -- they should never get a trailing ".0". */
     if (!strpbrk(buf, ".eEnNiI")) {
