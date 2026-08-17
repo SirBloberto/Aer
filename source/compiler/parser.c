@@ -3465,6 +3465,198 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
    place instead of allocating fresh -- reg_free is a pure LIFO decrement, so an older temp can
    never free while a newer one must stay live. Only the first hop and a non-temp leading index
    still need a genuinely fresh register. */
+/* Where a chain like `a[i].f[j]` has got to: the register holding the object so far, whether
+   that is still the variable's own, and the one step not yet resolved. The walk mutates all of
+   this; a statement form that ENDS the chain only reads it. */
+typedef struct {
+    int obj_reg;
+    bool obj_is_base;
+    bool pending_is_field;
+    unsigned int pending_field_idx;
+    int pending_rk_idx;
+} ChainTarget;
+
+/* `a[i].f = value` -- the chain's last step becomes a SET. */
+static void parse_chain_store(Chunk* c, ChainTarget t) {
+    int obj_reg = t.obj_reg;
+    bool obj_is_base = t.obj_is_base;
+    bool pending_is_field = t.pending_is_field;
+    unsigned int pending_field_idx = t.pending_field_idx;
+    int pending_rk_idx = t.pending_rk_idx;
+    if (consume(TOKEN_ASSIGN)) {
+        int rk_val = parse_binary(c, 0);
+        if (parse_had_error)
+            return;
+
+        /* Only a direct `param.field = ...` (obj_is_base, no preceding chain step) marks the
+           parameter shape-sensitive -- an intermediate chain register (`a.b.c = ...`) isn't a
+           parameter itself, and its own provenance isn't tracked (only the one-hop alias case,
+           `local = param[idx]`, is -- see P.alias_source_param). */
+        if (pending_is_field && obj_is_base) {
+            mark_shape_sensitive(obj_reg);
+            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.reg_known_shape[obj_reg] : NULL;
+            unsigned int foffset;
+            ValueType ftype;
+            bool field_narrow_bit;
+            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit)) {
+                RawKind field_kind = (ftype == TYPE_INTEGER) ? RAWK_INT
+                                     : (ftype == TYPE_REAL)  ? RAWK_REAL
+                                                             : RAWK_NONE;
+                if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
+                    int slot = raw_materialize(c, rk_val, field_kind);
+                    if (slot >= 0) {
+                        Opcode op = field_narrow_bit ? ((field_kind == RAWK_INT) ? OP_FIELD_SET_RAW_INT32
+                                                                                 : OP_FIELD_SET_RAW_FLOAT32)
+                                                     : ((field_kind == RAWK_INT) ? OP_FIELD_SET_RAW_INT
+                                                                                 : OP_FIELD_SET_RAW_REAL);
+                        chunk_emit(c, PACK3(op, obj_reg, 0, 0));
+                        chunk_emit(c, foffset);
+                        chunk_emit(c, (uint32_t)slot);
+                        raw_release_if_top(slot);
+                        return; /* obj_is_base is always true here, so no reg_free(1) for it needed */
+                    }
+                }
+            }
+        }
+        if (pending_is_field) {
+            emit_field_set(c, obj_reg, pending_field_idx, rk_val);
+        } else if (index_safe_unchecked(obj_reg, pending_rk_idx)) {
+            /* An already-raw value stores straight out of its slot -- boxing it here only to have
+               the store tear the AerVal apart again is the whole cost this avoids. */
+            RawKind val_kind = rk_raw_kind(c, rk_val);
+            if (val_kind != RAWK_NONE) {
+                int slot = raw_materialize(c, rk_val, val_kind);
+                if (slot >= 0) {
+                    chunk_emit(c, PACK3(val_kind == RAWK_INT ? OP_INDEX_SET_RAW_INT : OP_INDEX_SET_RAW_REAL,
+                                        obj_reg, pack_rk8(pending_rk_idx), slot));
+                    raw_release_if_top(slot);
+                    release_if_top(pending_rk_idx);
+                    if (!obj_is_base)
+                        reg_free(1);
+                    return;
+                }
+            }
+            /* pending_rk_idx already guaranteed a plain register by index_safe_unchecked -- always
+               fits RK8 directly. rk_val can be anything, so it still needs emit_index_set's own
+               box/spill handling, just with the opcode swapped. */
+            int rk_val_boxed = drop_raw_marks(rk_val);
+            int spilled = 0;
+            if (!rk8_fits(rk_val_boxed)) {
+                rk_val_boxed = materialize(c, rk_val_boxed);
+                spilled++;
+            }
+            chunk_emit(c, PACK3(OP_TYPED_INDEX_SET_UNCHECKED, obj_reg, pack_rk8(pending_rk_idx),
+                                pack_rk8(rk_val_boxed)));
+            if (spilled)
+                reg_free(spilled);
+        } else {
+            emit_index_set(c, obj_reg, pending_rk_idx, rk_val);
+        }
+
+        release_if_top(rk_val);
+        release_if_top(pending_rk_idx);
+        if (!obj_is_base)
+            reg_free(1);
+        return;
+    }
+}
+/* `a[i].f += value` -- read-modify-write through the same fusion opcodes the plain
+   store uses, so there is no dedicated compound opcode per shape. */
+static void parse_chain_compound(Chunk* c, ChainTarget t) {
+    int obj_reg = t.obj_reg;
+    bool obj_is_base = t.obj_is_base;
+    bool pending_is_field = t.pending_is_field;
+    unsigned int pending_field_idx = t.pending_field_idx;
+    int pending_rk_idx = t.pending_rk_idx;
+    for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
+        if (!consume(compound_assign_ops[i].tok))
+            continue;
+
+        if (pending_is_field) {
+            if (obj_is_base)
+                mark_shape_sensitive(obj_reg);
+
+            /* Same compile-time field lookup the plain '=' branch above uses -- only meaningful
+               when obj_is_base (this register really is the shape-sensitive parameter/alias, not
+               an intermediate chain link -- P.reg_known_shape is never seeded for those). */
+            Shape* known = (obj_is_base && obj_reg >= 0 && obj_reg < FRAME_REGISTERS)
+                               ? P.reg_known_shape[obj_reg]
+                               : NULL;
+            unsigned int foffset = 0;
+            ValueType ftype = TYPE_ANY;
+            bool field_narrow_bit = false;
+            RawKind field_kind = RAWK_NONE;
+            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit)) {
+                if (ftype == TYPE_INTEGER)
+                    field_kind = RAWK_INT;
+                else if (ftype == TYPE_REAL)
+                    field_kind = RAWK_REAL;
+            }
+
+            int rk_rhs = parse_binary(c, 0);
+            if (parse_had_error)
+                return;
+
+            Opcode bin_op = compound_assign_ops[i].op;
+            /* Decomposing into raw GET + arithmetic + SET was tried and measured WORSE on
+               nbody.aer whenever the rhs needed boxing first -- see the fused index-field-compound
+               site's identical reasoning above. But when the rhs is ALREADY raw at this point (a
+               raw local, or try_emit_arith_raw_boxed's fusion result), OP_FIELD_COMPOUND_RAW_INT/
+               REAL reads/computes/writes the field raw AND takes rk_rhs raw directly -- no boxing
+               to avoid paying for, only upside. */
+            bool native_op_exists = (bin_op == OP_ADD || bin_op == OP_SUB || bin_op == OP_MUL);
+            bool specialized = false;
+            if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
+                int slot = raw_materialize(c, rk_rhs, field_kind);
+                if (slot >= 0) {
+                    Opcode op = field_narrow_bit ? ((field_kind == RAWK_INT) ? OP_FIELD_COMPOUND_RAW_INT32
+                                                                             : OP_FIELD_COMPOUND_RAW_FLOAT32)
+                                                 : ((field_kind == RAWK_INT) ? OP_FIELD_COMPOUND_RAW_INT
+                                                                             : OP_FIELD_COMPOUND_RAW_REAL);
+                    chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
+                    chunk_emit(c, foffset);
+                    chunk_emit(c, (uint32_t)slot);
+                    raw_release_if_top(slot);
+                    specialized = true;
+                }
+            }
+            if (!specialized) {
+                /* One fused OP_FIELD_COMPOUND -- read, compute, and write back in a single
+                   dispatch, a single vm_resolve_field call. No temp register needed: the result
+                   writes straight back into the same field, never through a register at all. */
+                rk_rhs = drop_raw_marks(rk_rhs);
+
+                if (!rk16_fits(rk_rhs)) {
+                    return error_at(
+                        "Expression too large to compile (register/constant index exceeds the fused "
+                        "field-op encoding's range)");
+                }
+                chunk_emit(c, PACK3(OP_FIELD_COMPOUND, obj_reg, bin_op, 0));
+                chunk_emit(c, PACK_2X16(pending_field_idx, pack_rk16(rk_rhs)));
+                release_if_top(rk_rhs);
+            }
+        } else {
+            int item_reg = reg_alloc();
+            emit_index_get(c, item_reg, obj_reg, pending_rk_idx);
+
+            int rk_rhs = parse_binary(c, 0);
+            if (parse_had_error)
+                return;
+
+            emit_binary(c, item_reg, compound_assign_ops[i].op, item_reg, rk_rhs);
+            release_if_top(rk_rhs);
+
+            emit_index_set(c, obj_reg, pending_rk_idx, item_reg);
+            reg_free(1); /* item_reg */
+        }
+
+        release_if_top(pending_rk_idx);
+        if (!obj_is_base)
+            reg_free(1);
+        return;
+    }
+}
+
 static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_is_index) {
     int obj_reg;
     bool obj_is_base; /* true while obj_reg is still name_idx's own permanent register */
@@ -3716,172 +3908,11 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             return;
     }
 
-    if (consume(TOKEN_ASSIGN)) {
-        int rk_val = parse_binary(c, 0);
-        if (parse_had_error)
-            return;
-
-        /* Only a direct `param.field = ...` (obj_is_base, no preceding chain step) marks the
-           parameter shape-sensitive -- an intermediate chain register (`a.b.c = ...`) isn't a
-           parameter itself, and its own provenance isn't tracked (only the one-hop alias case,
-           `local = param[idx]`, is -- see P.alias_source_param). */
-        if (pending_is_field && obj_is_base) {
-            mark_shape_sensitive(obj_reg);
-            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.reg_known_shape[obj_reg] : NULL;
-            unsigned int foffset;
-            ValueType ftype;
-            bool field_narrow_bit;
-            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit)) {
-                RawKind field_kind = (ftype == TYPE_INTEGER) ? RAWK_INT
-                                     : (ftype == TYPE_REAL)  ? RAWK_REAL
-                                                             : RAWK_NONE;
-                if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
-                    int slot = raw_materialize(c, rk_val, field_kind);
-                    if (slot >= 0) {
-                        Opcode op = field_narrow_bit ? ((field_kind == RAWK_INT) ? OP_FIELD_SET_RAW_INT32
-                                                                                 : OP_FIELD_SET_RAW_FLOAT32)
-                                                     : ((field_kind == RAWK_INT) ? OP_FIELD_SET_RAW_INT
-                                                                                 : OP_FIELD_SET_RAW_REAL);
-                        chunk_emit(c, PACK3(op, obj_reg, 0, 0));
-                        chunk_emit(c, foffset);
-                        chunk_emit(c, (uint32_t)slot);
-                        raw_release_if_top(slot);
-                        return; /* obj_is_base is always true here, so no reg_free(1) for it needed */
-                    }
-                }
-            }
-        }
-        if (pending_is_field) {
-            emit_field_set(c, obj_reg, pending_field_idx, rk_val);
-        } else if (index_safe_unchecked(obj_reg, pending_rk_idx)) {
-            /* An already-raw value stores straight out of its slot -- boxing it here only to have
-               the store tear the AerVal apart again is the whole cost this avoids. */
-            RawKind val_kind = rk_raw_kind(c, rk_val);
-            if (val_kind != RAWK_NONE) {
-                int slot = raw_materialize(c, rk_val, val_kind);
-                if (slot >= 0) {
-                    chunk_emit(c, PACK3(val_kind == RAWK_INT ? OP_INDEX_SET_RAW_INT : OP_INDEX_SET_RAW_REAL,
-                                        obj_reg, pack_rk8(pending_rk_idx), slot));
-                    raw_release_if_top(slot);
-                    release_if_top(pending_rk_idx);
-                    if (!obj_is_base)
-                        reg_free(1);
-                    return;
-                }
-            }
-            /* pending_rk_idx already guaranteed a plain register by index_safe_unchecked -- always
-               fits RK8 directly. rk_val can be anything, so it still needs emit_index_set's own
-               box/spill handling, just with the opcode swapped. */
-            int rk_val_boxed = drop_raw_marks(rk_val);
-            int spilled = 0;
-            if (!rk8_fits(rk_val_boxed)) {
-                rk_val_boxed = materialize(c, rk_val_boxed);
-                spilled++;
-            }
-            chunk_emit(c, PACK3(OP_TYPED_INDEX_SET_UNCHECKED, obj_reg, pack_rk8(pending_rk_idx),
-                                pack_rk8(rk_val_boxed)));
-            if (spilled)
-                reg_free(spilled);
-        } else {
-            emit_index_set(c, obj_reg, pending_rk_idx, rk_val);
-        }
-
-        release_if_top(rk_val);
-        release_if_top(pending_rk_idx);
-        if (!obj_is_base)
-            reg_free(1);
-        return;
-    }
-
-    /* Read-modify-write via the same fusion opcodes the single-level cases use -- no dedicated
-       OP_INDEX_BINARY fusion exists. */
-    for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
-        if (!consume(compound_assign_ops[i].tok))
-            continue;
-
-        if (pending_is_field) {
-            if (obj_is_base)
-                mark_shape_sensitive(obj_reg);
-
-            /* Same compile-time field lookup the plain '=' branch above uses -- only meaningful
-               when obj_is_base (this register really is the shape-sensitive parameter/alias, not
-               an intermediate chain link -- P.reg_known_shape is never seeded for those). */
-            Shape* known = (obj_is_base && obj_reg >= 0 && obj_reg < FRAME_REGISTERS)
-                               ? P.reg_known_shape[obj_reg]
-                               : NULL;
-            unsigned int foffset = 0;
-            ValueType ftype = TYPE_ANY;
-            bool field_narrow_bit = false;
-            RawKind field_kind = RAWK_NONE;
-            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit)) {
-                if (ftype == TYPE_INTEGER)
-                    field_kind = RAWK_INT;
-                else if (ftype == TYPE_REAL)
-                    field_kind = RAWK_REAL;
-            }
-
-            int rk_rhs = parse_binary(c, 0);
-            if (parse_had_error)
-                return;
-
-            Opcode bin_op = compound_assign_ops[i].op;
-            /* Decomposing into raw GET + arithmetic + SET was tried and measured WORSE on
-               nbody.aer whenever the rhs needed boxing first -- see the fused index-field-compound
-               site's identical reasoning above. But when the rhs is ALREADY raw at this point (a
-               raw local, or try_emit_arith_raw_boxed's fusion result), OP_FIELD_COMPOUND_RAW_INT/
-               REAL reads/computes/writes the field raw AND takes rk_rhs raw directly -- no boxing
-               to avoid paying for, only upside. */
-            bool native_op_exists = (bin_op == OP_ADD || bin_op == OP_SUB || bin_op == OP_MUL);
-            bool specialized = false;
-            if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
-                int slot = raw_materialize(c, rk_rhs, field_kind);
-                if (slot >= 0) {
-                    Opcode op = field_narrow_bit ? ((field_kind == RAWK_INT) ? OP_FIELD_COMPOUND_RAW_INT32
-                                                                             : OP_FIELD_COMPOUND_RAW_FLOAT32)
-                                                 : ((field_kind == RAWK_INT) ? OP_FIELD_COMPOUND_RAW_INT
-                                                                             : OP_FIELD_COMPOUND_RAW_REAL);
-                    chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
-                    chunk_emit(c, foffset);
-                    chunk_emit(c, (uint32_t)slot);
-                    raw_release_if_top(slot);
-                    specialized = true;
-                }
-            }
-            if (!specialized) {
-                /* One fused OP_FIELD_COMPOUND -- read, compute, and write back in a single
-                   dispatch, a single vm_resolve_field call. No temp register needed: the result
-                   writes straight back into the same field, never through a register at all. */
-                rk_rhs = drop_raw_marks(rk_rhs);
-
-                if (!rk16_fits(rk_rhs)) {
-                    return error_at(
-                        "Expression too large to compile (register/constant index exceeds the fused "
-                        "field-op encoding's range)");
-                }
-                chunk_emit(c, PACK3(OP_FIELD_COMPOUND, obj_reg, bin_op, 0));
-                chunk_emit(c, PACK_2X16(pending_field_idx, pack_rk16(rk_rhs)));
-                release_if_top(rk_rhs);
-            }
-        } else {
-            int item_reg = reg_alloc();
-            emit_index_get(c, item_reg, obj_reg, pending_rk_idx);
-
-            int rk_rhs = parse_binary(c, 0);
-            if (parse_had_error)
-                return;
-
-            emit_binary(c, item_reg, compound_assign_ops[i].op, item_reg, rk_rhs);
-            release_if_top(rk_rhs);
-
-            emit_index_set(c, obj_reg, pending_rk_idx, item_reg);
-            reg_free(1); /* item_reg */
-        }
-
-        release_if_top(pending_rk_idx);
-        if (!obj_is_base)
-            reg_free(1);
-        return;
-    }
+    ChainTarget target = {obj_reg, obj_is_base, pending_is_field, pending_field_idx, pending_rk_idx};
+    if (equal(TOKEN_ASSIGN))
+        return parse_chain_store(c, target);
+    if (at_compound_assign())
+        return parse_chain_compound(c, target);
 
     /* Finish the pending step as a GET, falling through to a general expression statement. */
     if (!equal(TOKEN_OPEN_PARENTHESE) && !equal(TOKEN_PIPE)) {
