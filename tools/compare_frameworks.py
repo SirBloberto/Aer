@@ -56,7 +56,7 @@ dur = time.now() - start
 total = 0.0
 for gi in 0..GROUPS:
     total += revenue[gi]
-print("RESULT {{dur}} {{matched}} {{total}}")
+print("RESULT {{dur}} {{matched}} {{integer(total * 100.0)}}")
 """
 
 AER_ARRAY = """import time
@@ -86,7 +86,7 @@ dur = time.now() - start
 total = 0.0
 for gi in 0..GROUPS:
     total += revenue[gi]
-print("RESULT {{dur}} {{matched}} {{total}}")
+print("RESULT {{dur}} {{matched}} {{integer(total * 100.0)}}")
 """
 
 
@@ -102,6 +102,7 @@ def run_aer(binary, source, n, repeat):
             if not line:
                 raise RuntimeError("aer produced no result:\n%s%s" % (out.stdout, out.stderr))
             _, dur, matched, total = line[0].split()
+            total = float(total) / 100.0  # AER prints floats at six significant digits
             best = float(dur) if best is None else min(best, float(dur))
             answer = (float(matched), float(total))
     finally:

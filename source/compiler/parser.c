@@ -4300,6 +4300,15 @@ static bool vec_guard_mask_op(Opcode op, Opcode* out) {
     }
 }
 
+/* A raw comparison's constant operand indexes the chunk's raw int/real table, which the array-level
+   operator cannot read -- it takes pool entries. Decoding one as the other is what once turned
+   `price < 400.0` into "Cannot apply '<' to float[] and string". */
+static int vec_guard_const(Chunk* c, uint8_t rk8, bool real) {
+    unsigned int at = RK8_INDEX(rk8);
+    AerVal v = real ? aer_real(c->rawk_d[at]) : aer_int(c->rawk_i[at]);
+    return (int)(RK_CONST_FLAG | chunk_add_pool(c, v));
+}
+
 static bool rk_is_int_const(Chunk* c, int rk, int64_t want) {
     if (!(rk & RK_CONST_FLAG))
         return false;
@@ -4556,24 +4565,48 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
     struct {
         Opcode op;
         uint8_t d, x, y;
+        bool guard;
+        bool real_const; /* a guard's constant lives in the raw REAL table rather than the int one */
     } ops[VEC_MAX_OPS];
-    int n = 0;
+    int n = 0, guards = 0;
     for (unsigned int at = body_start; at < body_end; at++) {
         if (n >= VEC_MAX_OPS)
             return false;
         uint32_t w = c->code[at];
         Opcode op = (Opcode)(w & 0xFF);
+        /* `if <cond>:` around the rest of the body is a filter -- a WHERE clause -- and the array
+           form carries it as a 1/0 mask beside the values. Only when the branch skips to the END of
+           the body; anything else is real control flow. */
+        Opcode mask_op;
+        if (vec_guard_mask_op(op, &mask_op)) {
+            if ((unsigned int)((int)at + 2 + (int)(int32_t)c->code[at + 1]) != body_end)
+                return false;
+            ops[n].op = mask_op;
+            ops[n].d = 0;
+            ops[n].x = (uint8_t)UNPACK_B(w);
+            ops[n].y = (uint8_t)UNPACK_C(w);
+            ops[n].guard = true;
+            ops[n].real_const = op == OP_RAW_LT_REAL_JUMP_IF_FALSE || op == OP_RAW_LTE_REAL_JUMP_IF_FALSE ||
+                                op == OP_LT_JUMP_IF_FALSE || op == OP_LTE_JUMP_IF_FALSE ||
+                                op == OP_GT_JUMP_IF_FALSE || op == OP_GTE_JUMP_IF_FALSE;
+            n++;
+            guards++;
+            at++; /* the branch's own target word */
+            continue;
+        }
         if (op != OP_TYPED_INDEX_GET_UNCHECKED && op != OP_INDEX_GET_RAW_REAL && op != OP_RAW_REAL_TO_INT &&
             op != OP_RAW_ADD_REAL && op != OP_RAW_SUB_REAL && op != OP_RAW_MUL_REAL &&
-            op != OP_INDEX_SET_RAW_REAL)
+            op != OP_INDEX_SET_RAW_REAL && op != OP_RAW_MOVE_INT && op != OP_RAW_MOVE_REAL && op != OP_MOVE)
             return false;
         ops[n].op = op;
         ops[n].d = (uint8_t)UNPACK_A(w);
         ops[n].x = (uint8_t)UNPACK_B(w);
         ops[n].y = (uint8_t)UNPACK_C(w);
+        ops[n].guard = false;
+        ops[n].real_const = false;
         n++;
     }
-    if (n < 4 || ops[n - 1].op != OP_INDEX_SET_RAW_REAL)
+    if (n < 4 + guards || ops[n - 1].op != OP_INDEX_SET_RAW_REAL)
         return false;
 
     /* from_col[r]: r holds an element of that column. group_of[r]: r is an index built from one. */
@@ -4591,6 +4624,17 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
        the accumulate is the one instruction allowed to read the running total. */
     for (int i = 0; i < n - 2; i++) {
         uint8_t d = ops[i].d, x = ops[i].x, y = ops[i].y;
+        if (ops[i].guard) {
+            /* A constant here indexes the RAW constant table, which the array-level comparison
+               cannot read -- it is resolved to a pool entry at emission. What cannot be resolved is
+               a mask that does not vary per row, so one side has to come from a column. */
+            bool cx = RK8_IS_CONST(x), cy = RK8_IS_CONST(y);
+            if (cx && cy)
+                return false;
+            if ((cx || from_col[x] < 0) && (cy || from_col[y] < 0))
+                return false;
+            continue;
+        }
         if (RK8_IS_CONST(x) || RK8_IS_CONST(y))
             return false;
         if (ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED || ops[i].op == OP_INDEX_GET_RAW_REAL) {
@@ -4611,6 +4655,13 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
             if (from_col[x] < 0)
                 return false;
             group_of[d] = from_col[x]; /* the column this index came from */
+            continue;
+        }
+        /* Naming the group index (`g = integer(region[i])`) copies it into the variable's own slot,
+           so what the store indexes by is one move removed from what built it. */
+        if (ops[i].op == OP_RAW_MOVE_INT || ops[i].op == OP_RAW_MOVE_REAL || ops[i].op == OP_MOVE) {
+            from_col[d] = from_col[x];
+            group_of[d] = group_of[x];
             continue;
         }
         /* Arithmetic: at least one side must vary per row, and the running total must not be part
@@ -4639,9 +4690,11 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
     if (from_col[value_reg] < 0 || target == (uint8_t)array_reg)
         return false;
 
-    /* Emit before discarding: three contiguous registers are needed for the call. */
+    /* Emit before discarding: the call needs its arguments in a contiguous run, and a filtered form
+       carries the mask as a fourth. */
+    int argc = guards > 0 ? 4 : 3;
     int base = reg_alloc(), taken = base >= 0 ? 1 : 0;
-    for (int i = 0; base >= 0 && i < 2; i++) {
+    for (int i = 0; base >= 0 && i < argc - 1; i++) {
         if (reg_alloc() != base + 1 + i) {
             base = -1;
             break;
@@ -4658,7 +4711,32 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
     int value[FRAME_REGISTERS];
     for (int i = 0; i < FRAME_REGISTERS; i++)
         value[i] = -1;
+    int mask_reg = -1;
     for (int i = 0; i < n - 2; i++) {
+        if (ops[i].guard) {
+            int gx = RK8_IS_CONST(ops[i].x) ? vec_guard_const(c, ops[i].x, ops[i].real_const)
+                                            : (value[ops[i].x] >= 0 ? value[ops[i].x] : (int)ops[i].x);
+            int gy = RK8_IS_CONST(ops[i].y) ? vec_guard_const(c, ops[i].y, ops[i].real_const)
+                                            : (value[ops[i].y] >= 0 ? value[ops[i].y] : (int)ops[i].y);
+            int one = reg_alloc();
+            if (one < 0)
+                return false;
+            emit_binary(c, one, ops[i].op, gx, gy);
+            P.reg_elem_kind[one] = RAWK_REAL;
+            if (mask_reg < 0) {
+                mask_reg = one;
+            } else {
+                /* `and` compiles to one branch per conjunct, all skipping to the same place, so
+                   several guards multiply: 1 only where every one of them held. */
+                int both = reg_alloc();
+                if (both < 0)
+                    return false;
+                emit_binary(c, both, OP_MUL, mask_reg, one);
+                P.reg_elem_kind[both] = RAWK_REAL;
+                mask_reg = both;
+            }
+            continue;
+        }
         if (ops[i].op == OP_TYPED_INDEX_GET_UNCHECKED || ops[i].op == OP_INDEX_GET_RAW_REAL) {
             if (ops[i].y == (uint8_t)item_reg)
                 value[ops[i].d] = ops[i].x;
@@ -4666,6 +4744,10 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
         }
         if (ops[i].op == OP_RAW_REAL_TO_INT)
             continue; /* group_sum takes the column itself, so the conversion is not needed */
+        if (ops[i].op == OP_RAW_MOVE_INT || ops[i].op == OP_RAW_MOVE_REAL || ops[i].op == OP_MOVE) {
+            value[ops[i].d] = value[ops[i].x];
+            continue;
+        }
         int rx = value[ops[i].x] >= 0 ? value[ops[i].x] : (int)ops[i].x;
         int ry = value[ops[i].y] >= 0 ? value[ops[i].y] : (int)ops[i].y;
         Opcode boxed =
@@ -4677,15 +4759,19 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
         P.reg_elem_kind[dest] = RAWK_REAL;
         value[ops[i].d] = dest;
     }
+    if ((guards > 0) != (mask_reg >= 0))
+        return false;
 
     chunk_emit(c, PACK2(OP_MOVE, base, target));
     chunk_emit(c, PACK2(OP_MOVE, base + 1, value[value_reg] >= 0 ? value[value_reg] : (int)value_reg));
     chunk_emit(c, PACK2(OP_MOVE, base + 2, group_of[gidx]));
-    chunk_emit(c, PACK3(OP_CALL_MODULE, base, base, 3));
+    if (mask_reg >= 0)
+        chunk_emit(c, PACK2(OP_MOVE, base + 3, mask_reg));
+    chunk_emit(c, PACK3(OP_CALL_MODULE, base, base, argc));
     chunk_emit(c, (uint32_t)chunk_add_pool(c, aer_make_string_copy("collection", 10)));
     chunk_emit(c, (uint32_t)chunk_add_pool(c, aer_make_string_copy("group_sum", 9)));
     chunk_emit(c, PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_GROUP_SUM_INTO));
-    reg_free(2);
+    reg_free(argc - 1);
     return true;
 }
 

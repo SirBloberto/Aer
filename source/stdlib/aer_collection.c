@@ -100,13 +100,17 @@ static double typed_elem(const AerTypedArray* t, unsigned int i) {
 }
 
 /* GROUP BY in one pass. What whole-array arithmetic cannot do is scatter -- send each element to an
-   accumulator chosen by another column -- so expressed with masks it costs one pass PER GROUP,
-   which turned a 2.9x win into a 0.72x loss (bench/columnar_scale.aer measures both forms).
-   Deliberately no vectorization attribute: a scatter does not vectorize; the win is the pass count. */
+   accumulator chosen by another column -- so expressed with masks it costs one pass PER GROUP, which
+   turned a 2.9x win into a 0.72x loss (bench/columnar_scale.aer measures both forms). Deliberately
+   no vectorization attribute: a scatter does not vectorize; the win is the pass count. A filter
+   SKIPS its rejected rows rather than adding zero for them -- a row the loop's `if` never reached
+   may hold a group number outside the target, and even a masked-off zero has to index by it. */
 #define DEFINE_GROUP_SUM(name, vt, gt)                                                                       \
-    static bool name(vt* restrict out, const vt* restrict v, const gt* restrict g, unsigned int n,           \
-                     unsigned int ngroups) {                                                                 \
+    static bool name(vt* restrict out, const vt* restrict v, const gt* restrict g, const uint8_t* keep,      \
+                     unsigned int n, unsigned int ngroups) {                                                 \
         for (unsigned int i = 0; i < n; i++) {                                                               \
+            if (keep && !keep[i])                                                                            \
+                continue;                                                                                    \
             long long k = (long long)g[i];                                                                   \
             if (k < 0 || (unsigned long long)k >= (unsigned long long)ngroups)                               \
                 return false;                                                                                \
@@ -128,22 +132,23 @@ DEFINE_GROUP_SUM_SET(f64, double)
 
 /* Dispatches on both element kinds -- the values decide the result's kind, the groups only supply
    an index. Returns false on a group index outside 0..ngroups, which the caller reports. */
-static bool group_sum_run(AerTypedArray* val, AerTypedArray* grp, AerTypedArray* out, unsigned int ngroups) {
+static bool group_sum_run(AerTypedArray* val, AerTypedArray* grp, AerTypedArray* out, const uint8_t* keep,
+                          unsigned int ngroups) {
     unsigned int n = val->count;
 #define GS_BY_GROUP(vsfx, vt)                                                                                \
     switch (grp->elem_kind) {                                                                                \
         case TYPED_ELEM_INT32:                                                                               \
-            return gsum_##vsfx##_i32((vt*)out->data, (const vt*)val->data, (const int32_t*)grp->data, n,     \
-                                     ngroups);                                                               \
+            return gsum_##vsfx##_i32((vt*)out->data, (const vt*)val->data, (const int32_t*)grp->data, keep,  \
+                                     n, ngroups);                                                            \
         case TYPED_ELEM_INT64:                                                                               \
-            return gsum_##vsfx##_i64((vt*)out->data, (const vt*)val->data, (const int64_t*)grp->data, n,     \
-                                     ngroups);                                                               \
+            return gsum_##vsfx##_i64((vt*)out->data, (const vt*)val->data, (const int64_t*)grp->data, keep,  \
+                                     n, ngroups);                                                            \
         case TYPED_ELEM_FLOAT32:                                                                             \
-            return gsum_##vsfx##_f32((vt*)out->data, (const vt*)val->data, (const float*)grp->data, n,       \
+            return gsum_##vsfx##_f32((vt*)out->data, (const vt*)val->data, (const float*)grp->data, keep, n, \
                                      ngroups);                                                               \
         default:                                                                                             \
-            return gsum_##vsfx##_f64((vt*)out->data, (const vt*)val->data, (const double*)grp->data, n,      \
-                                     ngroups);                                                               \
+            return gsum_##vsfx##_f64((vt*)out->data, (const vt*)val->data, (const double*)grp->data, keep,   \
+                                     n, ngroups);                                                            \
     }
     switch (val->elem_kind) {
         case TYPED_ELEM_INT32: GS_BY_GROUP(i32, int32_t)
@@ -351,6 +356,13 @@ static bool push_null(VM* vm) {
     return true;
 }
 
+/* Reports and answers null in one statement -- these handlers reject on several counts each, and
+   three lines per rejection buried what was actually being checked. */
+static bool push_error(VM* vm, const char* msg) {
+    error("%s", msg);
+    return push_null(vm);
+}
+
 /* Every operand is either a float column or a scalar to broadcast, and the columns agree on length.
    Float only: an integer expression would have to answer as an integer, which the double the tile
    evaluator carries cannot promise. */
@@ -441,30 +453,39 @@ static bool group_sum_chain_eval(AerVal* operand, int n, uint64_t prog, AerTyped
 }
 
 bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
-    if (fn_id == FN_COLLECTION_GROUP_SUM_INTO && arg_count == 3) {
+    if (fn_id == FN_COLLECTION_GROUP_SUM_INTO && (arg_count == 3 || arg_count == 4)) {
+        AerVal keep_v = arg_count == 4 ? vm_stack_pop(vm) : aer_null();
         AerVal grp_v = vm_stack_pop(vm);
         AerVal val_v = vm_stack_pop(vm);
         AerVal tgt_v = vm_stack_pop(vm);
         if (aer_type(tgt_v) != TYPE_TYPED_ARRAY || aer_type(val_v) != TYPE_TYPED_ARRAY ||
-            aer_type(grp_v) != TYPE_TYPED_ARRAY) {
-            error("group accumulation needs three typed arrays");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
+            aer_type(grp_v) != TYPE_TYPED_ARRAY || (arg_count == 4 && aer_type(keep_v) != TYPE_TYPED_ARRAY))
+            return push_error(vm, "group accumulation needs typed arrays");
         AerTypedArray* tgt = aer_as_typed_array(tgt_v);
         AerTypedArray* val = aer_as_typed_array(val_v);
         AerTypedArray* grp = aer_as_typed_array(grp_v);
-        if (val->count != grp->count || tgt->elem_kind != val->elem_kind) {
-            error("group accumulation needs matching lengths and element kinds");
-            vm_stack_push(vm, aer_null());
-            return true;
+        AerTypedArray* keep = arg_count == 4 ? aer_as_typed_array(keep_v) : NULL;
+        if (val->count != grp->count || tgt->elem_kind != val->elem_kind ||
+            (keep && keep->count != val->count))
+            return push_error(vm, "group accumulation needs matching lengths and element kinds");
+        /* The filter arrives as 1/0 in whichever element kind the comparison produced. Flattening it
+           to a byte per row costs a pass but keeps the scatter kernels from needing a variant per
+           mask kind on top of the value and group kinds they already carry. */
+        uint8_t* flags = NULL;
+        if (keep && val->count > 0) {
+            flags = (uint8_t*)malloc(val->count);
+            if (!flags)
+                return push_error(vm, "out of memory building a group filter");
+            for (unsigned int i = 0; i < val->count; i++)
+                flags[i] = (uint8_t)(typed_elem(keep, i) != 0.0);
         }
         /* Adds into what the target already holds, exactly as the loop's `t[g] = t[g] + v` did --
            no zeroing, and the array's own length is the group count. */
-        if (val->count > 0 && !group_sum_run(val, grp, tgt, tgt->count)) {
+        bool ok = val->count == 0 || group_sum_run(val, grp, tgt, flags, tgt->count);
+        free(flags);
+        if (!ok) {
             error("group index outside 0..%u", tgt->count - 1);
-            vm_stack_push(vm, aer_null());
-            return true;
+            return push_null(vm);
         }
         vm_stack_push(vm, tgt_v);
         return true;
@@ -559,7 +580,7 @@ bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
         AerVal out_v = vm_new_typed_array_val(val->elem_kind, ngroups);
         AerTypedArray* out = aer_as_typed_array(out_v);
         memset(out->data, 0, (size_t)ngroups * vm_typed_elem_width(val->elem_kind));
-        if (val->count > 0 && !group_sum_run(val, grp, out, ngroups)) {
+        if (val->count > 0 && !group_sum_run(val, grp, out, NULL, ngroups)) {
             error("group_sum() found a group number outside 0..%u", ngroups - 1);
             vm_stack_push(vm, aer_null());
             return true;

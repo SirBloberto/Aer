@@ -304,4 +304,73 @@ for i in 0..gn:
     g7[g] = gr_value[i]
 assert(g7[0] == 5.0 and g7[1] == 6.0, "a plain store keeps last-wins, not a total")
 
+# An `if` around a grouped accumulate is a WHERE clause. The array form carries it as a 1/0 mask and
+# SKIPS the rejected rows rather than adding zero for them -- see the out-of-range case below for
+# why that distinction is not merely an optimization.
+gq1 = [0.0; G]
+for i in 0..gn:
+    if gr_value[i] > 3.0:
+        g = integer(gr_region[i])
+        gq1[g] = gq1[g] + gr_value[i]
+assert(gq1[0] == 5.0 and gq1[1] == 6.0 and gq1[2] == 7.0 and gq1[3] == 12.0, "a filtered group sum")
+
+# A literal threshold lives in the raw constant table rather than the pool, and has to be resolved
+# across before the array-level comparison can read it.
+gq_lim = 3.0
+gq2 = [0.0; G]
+for i in 0..gn:
+    if gr_value[i] > gq_lim:
+        g = integer(gr_region[i])
+        gq2[g] = gq2[g] + gr_value[i]
+assert(gq2[0] == 5.0 and gq2[1] == 6.0, "the same threshold held in a register")
+
+# `and` compiles to one branch per conjunct, so the masks multiply.
+gq3 = [0.0; G]
+for i in 0..gn:
+    if gr_value[i] > 2.0 and gr_other[i] < 3.0:
+        g = integer(gr_region[i])
+        gq3[g] = gq3[g] + gr_value[i]
+assert(gq3[0] == 5.0 and gq3[1] == 6.0 and gq3[2] == 10.0, "two conditions multiply their masks")
+
+gq4 = [0.0; G]
+for i in 0..gn:
+    if gr_other[i] < gr_value[i]:
+        g = integer(gr_region[i])
+        gq4[g] = gq4[g] + gr_value[i]
+assert(gq4[0] == 5.0 and gq4[1] == 6.0 and gq4[2] == 10.0, "a filter comparing two columns")
+
+gq5 = [0.0; G]
+for i in 0..gn:
+    if gr_value[i] > 99.0:
+        g = integer(gr_region[i])
+        gq5[g] = gq5[g] + gr_value[i]
+assert(gq5[0] == 0.0 and gq5[3] == 0.0, "a filter that rejects every row adds nothing")
+
+# The case that decides the whole design. A REJECTED row here names group 999, which the target has
+# no room for. The loop never indexes by it, so the rewrite must not either -- multiplying the value
+# by a zero mask would still index, and would fail on a query the loop ran cleanly.
+gq_bad = [0.0; 8]
+gbi = 0
+for gbi < 8:
+    gq_bad[gbi] = float(gbi % G)
+    gbi += 1
+gq_bad[5] = 999.0
+gq6 = [0.0; G]
+for i in 0..gn:
+    if gr_value[i] < 5.0:
+        g = integer(gq_bad[i])
+        gq6[g] = gq6[g] + gr_value[i]
+assert(gq6[0] == 1.0 and gq6[1] == 2.0 and gq6[2] == 3.0 and gq6[3] == 4.0,
+       "a rejected row's group number is never looked at")
+
+# An else-branch is control flow, not a filter, and must keep the loop.
+gq7 = [0.0; G]
+for i in 0..gn:
+    if gr_value[i] > 3.0:
+        g = integer(gr_region[i])
+        gq7[g] = gq7[g] + gr_value[i]
+    else:
+        gq7[0] = gq7[0] + 100.0
+assert(gq7[0] == 305.0 and gq7[1] == 6.0, "an if/else is not a filter and stays a loop")
+
 print("test_loop_vectorization.aer: all assertions passed.")
