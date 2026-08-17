@@ -22,7 +22,10 @@ def functions(path):
         if START.match(lines[i]) and not SKIP.match(lines[i]):
             for j in range(i + 1, len(lines)):
                 if lines[j] == "}":
-                    name = re.sub(r"\s*\(.*", "", lines[i]).split()[-1].lstrip("*")
+                    # The name precedes the LAST parameter list, so an __attribute__((...)) prefix
+                    # is not mistaken for it.
+                    head = lines[i][: lines[i].rindex("(", 0, lines[i].rindex(")"))]
+                    name = head.split()[-1].lstrip("*") if head.split() else lines[i]
                     out.append((j - i + 1, name, i + 1))
                     i = j
                     break

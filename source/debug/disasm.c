@@ -490,24 +490,14 @@ static bool binary_op_dispatched(Opcode op) {
     }
 }
 
-static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
-    uint32_t op_word = c->code[offset];
-    /* Full 8-bit mask must match DISPATCH()'s exactly -- opcode is unambiguously its own byte now. */
-    Opcode op = (Opcode)(op_word & 0xFF);
+/* strings built from parts, and the variable-length forms whose operand count is in the word itself */
+static bool disasm_interp(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
     const OpInfo* info = &op_info[op];
-    /* %-47s must stay >= the longest Opcode enum member's name (currently
-       OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED, 45 chars) -- a shorter width doesn't truncate,
-       it just lets that one line's description column start later than every other line's, since
-       printf only pads a short name, never cuts a long one. Bump this if a future opcode name
-       exceeds it. */
-    fprintf(out, "%6u  %-47s  %s", offset, opcode_name(op), info->desc);
-
-    unsigned int pos = offset + 1;
     if (op == OP_INTERP) {
         unsigned int count = UNPACK_B(op_word);
         fprintf(out, "  reg=%u  parts=%u  [", UNPACK_A(op_word), count);
         for (unsigned int i = 0; i < count; i++) {
-            uint32_t rk = c->code[pos++];
+            uint32_t rk = c->code[(*pos)++];
             fprintf(out, "%s", i ? ", " : "");
             if (RK16_IS_CONST(rk))
                 fprintf(out, "const:%u", (unsigned int)RK16_INDEX(rk));
@@ -519,7 +509,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         unsigned int count = UNPACK_C(op_word);
         fprintf(out, "  reg=%u  obj=r%u  parts=%u  [", UNPACK_A(op_word), UNPACK_B(op_word), count);
         for (unsigned int i = 0; i < count; i++) {
-            uint32_t rk = c->code[pos++];
+            uint32_t rk = c->code[(*pos)++];
             fprintf(out, "%s", i ? ", " : "");
             if (RK16_IS_CONST(rk))
                 print_pool_value(out, c->pool[RK16_INDEX(rk)]);
@@ -535,7 +525,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         static const char* const field_type_names[] = {"null",   "boolean",  "integer", "float",
                                                        "string", "function", "array",   "hashtable"};
         for (int i = 0; i < field_count; i++) {
-            uint32_t name_default_word = c->code[pos++];
+            uint32_t name_default_word = c->code[(*pos)++];
             int fname_idx = (int)UNPACK_2X16_HI(name_default_word);
             int fdefault_idx = (int)UNPACK_2X16_LO(name_default_word);
             /* Low byte is the ValueType tag, bit 0x100 is the narrow (`i`/`f`-suffixed-literal)
@@ -543,7 +533,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
                (parser.c). Masking this out is required, not cosmetic: indexing field_type_names[]
                with the raw (un-masked) word is an out-of-bounds read the moment a narrow field's
                0x100 bit is set. */
-            uint32_t ftype_word = (uint32_t)c->code[pos++];
+            uint32_t ftype_word = (uint32_t)c->code[(*pos)++];
             int ftype = (int)(ftype_word & 0xFF);
             bool narrow = (ftype_word & 0x100) != 0;
             if (i > 0)
@@ -555,7 +545,14 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
             print_pool_value(out, c->pool[fdefault_idx]);
         }
         fprintf(out, "]");
-    } else if (binary_op_dispatched(op)) {
+    } else {
+        return false;
+    }
+    return true;
+}
+/* operators, and the compare-and-branch forms whose constant may live in a raw table */
+static bool disasm_compare(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
+    if (binary_op_dispatched(op)) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rk8(out, c, UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
@@ -563,18 +560,25 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
                op == OP_GT_JUMP_IF_FALSE || op == OP_LTE_JUMP_IF_FALSE || op == OP_GTE_JUMP_IF_FALSE) {
         print_rk8(out, c, UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
-        print_jump(out, c->code[pos], pos + 1), pos++;
+        print_jump(out, c->code[(*pos)], (*pos) + 1), (*pos)++;
     } else if (op == OP_RAW_LT_INT_JUMP_IF_FALSE || op == OP_RAW_LTE_INT_JUMP_IF_FALSE ||
                op == OP_RAW_EQ_INT_JUMP_IF_FALSE || op == OP_RAW_NEQ_INT_JUMP_IF_FALSE) {
         print_rawi(out, (int)UNPACK_B(op_word));
         print_rawk_i(out, c, UNPACK_C(op_word));
-        print_jump(out, c->code[pos], pos + 1), pos++;
+        print_jump(out, c->code[(*pos)], (*pos) + 1), (*pos)++;
     } else if (op == OP_RAW_LT_REAL_JUMP_IF_FALSE || op == OP_RAW_LTE_REAL_JUMP_IF_FALSE ||
                op == OP_RAW_EQ_REAL_JUMP_IF_FALSE || op == OP_RAW_NEQ_REAL_JUMP_IF_FALSE) {
         print_rawr(out, (int)UNPACK_B(op_word));
         print_rawk_d(out, c, UNPACK_C(op_word));
-        print_jump(out, c->code[pos], pos + 1), pos++;
-    } else if (op == OP_INDEX_GET || op == OP_TYPED_INDEX_GET_UNCHECKED) {
+        print_jump(out, c->code[(*pos)], (*pos) + 1), (*pos)++;
+    } else {
+        return false;
+    }
+    return true;
+}
+/* indexing an array, in every checked, unchecked and raw combination */
+static bool disasm_indexing(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
+    if (op == OP_INDEX_GET || op == OP_TYPED_INDEX_GET_UNCHECKED) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_rk8(out, c, UNPACK_C(op_word));
@@ -613,35 +617,42 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     } else if (op == OP_SLICE_GET) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        uint32_t bounds_word = c->code[pos++];
+        uint32_t bounds_word = c->code[(*pos)++];
         print_rk16(out, c, UNPACK_2X16_HI(bounds_word));
         print_rk16(out, c, UNPACK_2X16_LO(bounds_word));
-    } else if (op == OP_FIELD_GET) {
+    } else {
+        return false;
+    }
+    return true;
+}
+/* reading and writing a struct field, directly or through an index */
+static bool disasm_field(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
+    if (op == OP_FIELD_GET) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        int field_idx = (int)c->code[pos++];
+        int field_idx = (int)c->code[(*pos)++];
         print_field(out, c, FLD_NAME, field_idx);
     } else if (op == OP_FIELD_SET) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rk16(out, c, UNPACK_W16(op_word));
-        int field_idx = (int)c->code[pos++];
+        int field_idx = (int)c->code[(*pos)++];
         print_field(out, c, FLD_NAME, field_idx);
     } else if (op == OP_ARRAY_REPEAT) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_COUNT, (int)UNPACK_C(op_word));
-        uint32_t count_word = c->code[pos++];
+        uint32_t count_word = c->code[(*pos)++];
         print_rk16(out, c, count_word & 0xFFFFU);
     } else if (op == OP_INDEX_FIELD_GET) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        uint32_t field_rk_word = c->code[pos++];
+        uint32_t field_rk_word = c->code[(*pos)++];
         print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_rk_word));
         print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
     } else if (op == OP_INDEX_FIELD_SET) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rk16(out, c, UNPACK_W16(op_word));
-        uint32_t field_val_word = c->code[pos++];
+        uint32_t field_val_word = c->code[(*pos)++];
         print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_val_word));
         print_rk16(out, c, UNPACK_2X16_LO(field_val_word));
     } else if (op == OP_INDEX_FIELD_GET_RAW_INT || op == OP_INDEX_FIELD_GET_RAW_REAL ||
@@ -657,7 +668,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         else
             print_rawr(out, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        uint32_t field_rk_word = c->code[pos++];
+        uint32_t field_rk_word = c->code[(*pos)++];
         fprintf(out, "  off=%u", UNPACK_2X16_HI(field_rk_word));
         print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
     } else if (op == OP_FIELD_GET_RAW_INT || op == OP_FIELD_GET_RAW_REAL || op == OP_FIELD_GET_RAW_INT32 ||
@@ -668,7 +679,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         else
             print_rawr(out, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        unsigned int foffset = c->code[pos++];
+        unsigned int foffset = c->code[(*pos)++];
         fprintf(out, "  off=%u", foffset);
     } else if (op == OP_INDEX_FIELD_SET_RAW_INT || op == OP_INDEX_FIELD_SET_RAW_REAL ||
                op == OP_INDEX_FIELD_SET_RAW_INT32 || op == OP_INDEX_FIELD_SET_RAW_FLOAT32 ||
@@ -680,7 +691,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
              op == OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED || op == OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED);
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_rk16(out, c, UNPACK_W16(op_word));
-        uint32_t off_slot_word = c->code[pos++];
+        uint32_t off_slot_word = c->code[(*pos)++];
         fprintf(out, "  off=%u", UNPACK_2X16_HI(off_slot_word));
         if (is_int)
             print_rawi(out, (int)UNPACK_2X16_LO(off_slot_word));
@@ -690,9 +701,9 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
                op == OP_FIELD_SET_RAW_FLOAT32) {
         bool is_int = (op == OP_FIELD_SET_RAW_INT || op == OP_FIELD_SET_RAW_INT32);
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        unsigned int foffset = c->code[pos++];
+        unsigned int foffset = c->code[(*pos)++];
         fprintf(out, "  off=%u", foffset);
-        int slot = (int)c->code[pos++];
+        int slot = (int)c->code[(*pos)++];
         if (is_int)
             print_rawi(out, slot);
         else
@@ -700,32 +711,39 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
     } else if (op == OP_INDEX_FIELD_COMPOUND) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
-        uint32_t field_idx_word = c->code[pos++];
+        uint32_t field_idx_word = c->code[(*pos)++];
         print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_idx_word));
         print_rk16(out, c, UNPACK_2X16_LO(field_idx_word));
-        uint32_t rhs_word = c->code[pos++];
+        uint32_t rhs_word = c->code[(*pos)++];
         print_rk16(out, c, UNPACK_2X16_LO(rhs_word));
-    } else if (op == OP_ITER_NEXT_ARRAY) {
+    } else {
+        return false;
+    }
+    return true;
+}
+/* iterating, calling, and the forms that name something in the pool */
+static bool disasm_call(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
+    if (op == OP_ITER_NEXT_ARRAY) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
-        print_jump(out, c->code[pos], pos + 1);
-        pos++;
+        print_jump(out, c->code[(*pos)], (*pos) + 1);
+        (*pos)++;
     } else if (op == OP_ITER_NEXT_PAIR || op == OP_ITER_RANGE_PREP || op == OP_ITER_RANGE_LOOP) {
         /* 3 regs in word0, a 4th register its own trailing word, then a dedicated target word. */
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
-        int fourth_reg = (int)c->code[pos++];
+        int fourth_reg = (int)c->code[(*pos)++];
         print_field(out, c, FLD_REG, fourth_reg);
-        print_jump(out, c->code[pos], pos + 1);
-        pos++;
+        print_jump(out, c->code[(*pos)], (*pos) + 1);
+        (*pos)++;
     } else if (op == OP_CALL_VALUE || op == OP_TAIL_CALL_VALUE) {
         /* callee_reg is never a patched target, so nothing else trails. */
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_COUNT, (int)UNPACK_C(op_word));
-        int callee_reg = (int)c->code[pos++];
+        int callee_reg = (int)c->code[(*pos)++];
         print_field(out, c, FLD_REG, callee_reg);
     } else if (op == OP_UNARY) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
@@ -739,7 +757,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_COUNT, (int)UNPACK_C(op_word));
-        int name_idx = (int)c->code[pos++];
+        int name_idx = (int)c->code[(*pos)++];
         print_field(out, c, FLD_NAME, name_idx);
     } else if (op == OP_CALL_MODULE) {
         static const char* const call_module_id_names[] = {"math",  "random",     "string", "time",
@@ -748,11 +766,11 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_COUNT, (int)UNPACK_C(op_word));
-        int module_idx = (int)c->code[pos++];
-        int fn_idx = (int)c->code[pos++];
+        int module_idx = (int)c->code[(*pos)++];
+        int fn_idx = (int)c->code[(*pos)++];
         print_field(out, c, FLD_NAME, module_idx);
         print_field(out, c, FLD_NAME, fn_idx);
-        uint32_t ids_word = c->code[pos++];
+        uint32_t ids_word = c->code[(*pos)++];
         int module_id = (int)UNPACK_2X16_HI(ids_word);
         int fn_id = (int16_t)UNPACK_2X16_LO(ids_word);
         fprintf(out, "  id=%s fn_id=%d", call_module_id_names[module_id], fn_id);
@@ -762,39 +780,46 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_COUNT, (int)UNPACK_C(op_word));
-        int name_idx = (int)c->code[pos++];
+        int name_idx = (int)c->code[(*pos)++];
         print_field(out, c, FLD_NAME, name_idx);
-        int builtin_id = (int)c->code[pos++];
+        int builtin_id = (int)c->code[(*pos)++];
         fprintf(out, "  id=%s", call_builtin_id_names[builtin_id]);
     } else if (op == OP_FIELD_BINARY) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_C(op_word));
-        uint32_t field_rk_word = c->code[pos++];
+        uint32_t field_rk_word = c->code[(*pos)++];
         print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_rk_word));
         print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
     } else if (op == OP_FIELD_COMPOUND) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
-        uint32_t field_rk_word = c->code[pos++];
+        uint32_t field_rk_word = c->code[(*pos)++];
         print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_rk_word));
         print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
-    } else if (op == OP_TYPED_ARRAY_CHAIN2) {
+    } else {
+        return false;
+    }
+    return true;
+}
+/* the raw slot arithmetic, where operands are slots rather than registers */
+static bool disasm_raw(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
+    if (op == OP_TYPED_ARRAY_CHAIN2) {
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
         print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
-        uint32_t word1 = c->code[pos++];
+        uint32_t word1 = c->code[(*pos)++];
         print_field(out, c, FLD_BINOP, (int)UNPACK_2X16_HI(word1));
         print_field(out, c, FLD_REG, (int)UNPACK_2X16_LO(word1));
-        uint32_t op2 = c->code[pos++];
+        uint32_t op2 = c->code[(*pos)++];
         print_field(out, c, FLD_BINOP, (int)op2);
     } else if (op == OP_RAW_LOAD_INT) {
         print_rawi(out, (int)UNPACK_A(op_word));
-        int32_t imm = (int32_t)c->code[pos++];
+        int32_t imm = (int32_t)c->code[(*pos)++];
         fprintf(out, "  imm=%d", imm);
     } else if (op == OP_RAW_LOAD_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
-        fprintf(out, "  val=%g", c->rawk_d[c->code[pos++]]);
+        fprintf(out, "  val=%g", c->rawk_d[c->code[(*pos)++]]);
     } else if (op == OP_RAW_ADD_INT_K || op == OP_RAW_SUB_INT_K) {
         print_rawi(out, (int)UNPACK_A(op_word));
         print_rawi(out, (int)UNPACK_B(op_word));
@@ -840,9 +865,9 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
         bool is_int = (op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_INT32);
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
-        unsigned int foffset = c->code[pos++];
+        unsigned int foffset = c->code[(*pos)++];
         fprintf(out, "  off=%u", foffset);
-        int slot = (int)c->code[pos++];
+        int slot = (int)c->code[(*pos)++];
         if (is_int)
             print_rawi(out, slot);
         else
@@ -858,18 +883,41 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
                        op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED);
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
-        uint32_t field_rk_word = c->code[pos++];
+        uint32_t field_rk_word = c->code[(*pos)++];
         fprintf(out, "  off=%u", UNPACK_2X16_HI(field_rk_word));
         print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
-        int slot = (int)c->code[pos++];
+        int slot = (int)c->code[(*pos)++];
         if (is_int)
             print_rawi(out, slot);
         else
             print_rawr(out, slot);
     } else if (op == OP_RAW_LOAD_INT_POOL) {
         print_rawi(out, (int)UNPACK_A(op_word));
-        fprintf(out, "  val=%lld", (long long)c->rawk_i[c->code[pos++]]);
+        fprintf(out, "  val=%lld", (long long)c->rawk_i[c->code[(*pos)++]]);
     } else {
+        return false;
+    }
+    return true;
+}
+
+static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
+    uint32_t op_word = c->code[offset];
+    /* Full 8-bit mask must match DISPATCH()'s exactly -- opcode is unambiguously its own byte now. */
+    Opcode op = (Opcode)(op_word & 0xFF);
+    const OpInfo* info = &op_info[op];
+    /* %-47s must stay >= the longest Opcode enum member's name (currently
+       OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED, 45 chars) -- a shorter width doesn't truncate,
+       it just lets that one line's description column start later than every other line's, since
+       printf only pads a short name, never cuts a long one. Bump this if a future opcode name
+       exceeds it. */
+    fprintf(out, "%6u  %-47s  %s", offset, opcode_name(op), info->desc);
+
+    unsigned int pos = offset + 1;
+    /* Each family prints the operands of the opcodes that share a shape; the last takes what is
+       left, which is every opcode whose operands the field table already describes. */
+    if (!disasm_interp(out, c, op, op_word, &pos) && !disasm_compare(out, c, op, op_word, &pos) &&
+        !disasm_indexing(out, c, op, op_word, &pos) && !disasm_field(out, c, op, op_word, &pos) &&
+        !disasm_call(out, c, op, op_word, &pos) && !disasm_raw(out, c, op, op_word, &pos)) {
         /* Generic path -- the handful of opcodes whose fields all fit the plain PACK3 shape
            (op+up to 3 byte fields) with nothing trailing, or nothing at all. */
         int i = 0;
