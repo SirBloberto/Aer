@@ -4357,6 +4357,84 @@ static bool rk_is_int_const(Chunk* c, int rk, int64_t want) {
     return aer_type(v) == TYPE_INTEGER && aer_as_int(v) == want;
 }
 
+typedef struct {
+    Opcode op;
+    uint8_t d, x, y;
+    bool guard;
+    bool accumulate; /* a reduction's op that closes a scalar accumulate */
+    bool real_const; /* a guard whose constant lives in the raw REAL table rather than the int one */
+} VecOp;
+
+/* Which instructions a recogniser will even look at. Given the whole word because one of them has to
+   range-check a constant table index it carries. */
+typedef bool (*VecAccepts)(Chunk*, uint32_t, Opcode, const void*);
+
+/* Walks a loop body into a flat op list. Shared because both recognisers need exactly this, and the
+   filter handling is the fiddly part: `if <cond>:` compiles to a branch occupying two words which
+   must skip to the very END of the body, or it is control flow rather than a WHERE clause. Returns
+   the op count, or -1 for a body neither can use. */
+static int vec_collect_body(Chunk* c, unsigned int body_start, unsigned int body_end, VecOp* ops,
+                            int* out_guards, VecAccepts accepts, const void* ctx) {
+    int n = 0, guards = 0;
+    for (unsigned int at = body_start; at < body_end; at++) {
+        if (n >= VEC_MAX_OPS)
+            return -1;
+        uint32_t w = c->code[at];
+        Opcode op = (Opcode)(w & 0xFF);
+        Opcode mask_op;
+        if (vec_guard_mask_op(op, &mask_op)) {
+            if ((unsigned int)((int)at + 2 + (int)(int32_t)c->code[at + 1]) != body_end)
+                return -1;
+            ops[n] = (VecOp){.op = mask_op,
+                             .x = (uint8_t)UNPACK_B(w),
+                             .y = (uint8_t)UNPACK_C(w),
+                             .guard = true,
+                             .real_const = op == OP_RAW_LT_REAL_JUMP_IF_FALSE ||
+                                           op == OP_RAW_LTE_REAL_JUMP_IF_FALSE || op == OP_LT_JUMP_IF_FALSE ||
+                                           op == OP_LTE_JUMP_IF_FALSE || op == OP_GT_JUMP_IF_FALSE ||
+                                           op == OP_GTE_JUMP_IF_FALSE};
+            n++;
+            guards++;
+            at++; /* the branch's own target word */
+            continue;
+        }
+        if (!accepts(c, w, op, ctx))
+            return -1;
+        ops[n] = (VecOp){
+            .op = op, .d = (uint8_t)UNPACK_A(w), .x = (uint8_t)UNPACK_B(w), .y = (uint8_t)UNPACK_C(w)};
+        n++;
+    }
+    *out_guards = guards;
+    return n;
+}
+
+/* The arithmetic a reduction accepts depends on the element's kind, so the kind rides along. */
+typedef struct {
+    bool is_int;
+} VecReduceCtx;
+
+static bool vec_accepts_reduction(Chunk* c, uint32_t w, Opcode op, const void* vctx) {
+    bool is_int = ((const VecReduceCtx*)vctx)->is_int;
+    bool k_form = is_int && (op == OP_RAW_ADD_INT_K || op == OP_RAW_SUB_INT_K);
+    if (op != (is_int ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL) && op != OP_TYPED_INDEX_GET_UNCHECKED &&
+        op != (is_int ? OP_RAW_ADD_INT : OP_RAW_ADD_REAL) &&
+        op != (is_int ? OP_RAW_SUB_INT : OP_RAW_SUB_REAL) &&
+        op != (is_int ? OP_RAW_MUL_INT : OP_RAW_MUL_REAL) && !k_form)
+        return false;
+    /* The K forms carry a bare index into the chunk's raw-int table where the others carry a
+       register, so it is read back to a value later rather than passed through as an operand. */
+    return !(k_form && UNPACK_C(w) >= c->rawk_i_count);
+}
+
+static bool vec_accepts_group(Chunk* c, uint32_t w, Opcode op, const void* ctx) {
+    (void)c;
+    (void)w;
+    (void)ctx;
+    return op == OP_TYPED_INDEX_GET_UNCHECKED || op == OP_INDEX_GET_RAW_REAL || op == OP_RAW_REAL_TO_INT ||
+           op == OP_RAW_ADD_REAL || op == OP_RAW_SUB_REAL || op == OP_RAW_MUL_REAL ||
+           op == OP_INDEX_SET_RAW_REAL || op == OP_RAW_MOVE_INT || op == OP_RAW_MOVE_REAL || op == OP_MOVE;
+}
+
 static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int body_start,
                                     unsigned int body_end, int item_reg, int array_reg, int rk_start,
                                     int rk_step) {
@@ -4374,55 +4452,12 @@ static bool try_vectorize_reduction(Chunk* c, unsigned int prep_at, unsigned int
 
     Opcode op_add = is_int ? OP_RAW_ADD_INT : OP_RAW_ADD_REAL;
     Opcode op_sub = is_int ? OP_RAW_SUB_INT : OP_RAW_SUB_REAL;
-    Opcode op_mul = is_int ? OP_RAW_MUL_INT : OP_RAW_MUL_REAL;
     Opcode op_get = is_int ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL;
 
-    struct {
-        Opcode op;
-        uint8_t d, x, y;
-        bool accumulate;
-        bool guard;
-    } ops[VEC_MAX_OPS];
-    int n = 0;
-    for (unsigned int at = body_start; at < body_end; at++) {
-        if (n >= VEC_MAX_OPS)
-            return false;
-        uint32_t w = c->code[at];
-        Opcode op = (Opcode)(w & 0xFF);
-        bool k_form = is_int && (op == OP_RAW_ADD_INT_K || op == OP_RAW_SUB_INT_K);
-        /* `if <cond>:` wrapping the rest of the body is a filter, and a filter has an array form:
-           the condition becomes a 1/0 mask and the accumulate sums the value times it. Only when
-           the branch skips to the END of the body -- anything else is real control flow. */
-        Opcode mask_op;
-        if (n < VEC_MAX_OPS && vec_guard_mask_op(op, &mask_op)) {
-            unsigned int target = (unsigned int)((int)at + 2 + (int)(int32_t)c->code[at + 1]);
-            if (target != body_end)
-                return false;
-            ops[n].op = mask_op;
-            ops[n].d = 0;
-            ops[n].x = (uint8_t)UNPACK_B(w);
-            ops[n].y = (uint8_t)UNPACK_C(w);
-            ops[n].accumulate = false;
-            ops[n].guard = true;
-            n++;
-            at++; /* the branch's own target word */
-            continue;
-        }
-        if (op != op_get && op != OP_TYPED_INDEX_GET_UNCHECKED && op != op_add && op != op_sub &&
-            op != op_mul && !k_form)
-            return false;
-        /* The K forms carry a bare index into the chunk's raw-int table where the others carry a
-           register, so it is read back to a value here rather than passed through as an operand. */
-        if (k_form && UNPACK_C(w) >= c->rawk_i_count)
-            return false;
-        ops[n].op = op;
-        ops[n].d = (uint8_t)UNPACK_A(w);
-        ops[n].x = (uint8_t)UNPACK_B(w);
-        ops[n].y = (uint8_t)UNPACK_C(w);
-        ops[n].accumulate = false;
-        ops[n].guard = false;
-        n++;
-    }
+    VecOp ops[VEC_MAX_OPS];
+    VecReduceCtx accept_ctx = {is_int};
+    int guards = 0;
+    int n = vec_collect_body(c, body_start, body_end, ops, &guards, vec_accepts_reduction, &accept_ctx);
     if (n < 2)
         return false;
 
@@ -4637,50 +4672,11 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
     if (!rk_is_int_const(c, rk_start, 0) || !rk_is_int_const(c, rk_step, 1))
         return false;
 
-    struct {
-        Opcode op;
-        uint8_t d, x, y;
-        bool guard;
-        bool real_const; /* a guard's constant lives in the raw REAL table rather than the int one */
-    } ops[VEC_MAX_OPS];
-    int n = 0, guards = 0;
-    for (unsigned int at = body_start; at < body_end; at++) {
-        if (n >= VEC_MAX_OPS)
-            return false;
-        uint32_t w = c->code[at];
-        Opcode op = (Opcode)(w & 0xFF);
-        /* `if <cond>:` around the rest of the body is a filter -- a WHERE clause -- and the array
-           form carries it as a 1/0 mask beside the values. Only when the branch skips to the END of
-           the body; anything else is real control flow. */
-        Opcode mask_op;
-        if (vec_guard_mask_op(op, &mask_op)) {
-            if ((unsigned int)((int)at + 2 + (int)(int32_t)c->code[at + 1]) != body_end)
-                return false;
-            ops[n].op = mask_op;
-            ops[n].d = 0;
-            ops[n].x = (uint8_t)UNPACK_B(w);
-            ops[n].y = (uint8_t)UNPACK_C(w);
-            ops[n].guard = true;
-            ops[n].real_const = op == OP_RAW_LT_REAL_JUMP_IF_FALSE || op == OP_RAW_LTE_REAL_JUMP_IF_FALSE ||
-                                op == OP_LT_JUMP_IF_FALSE || op == OP_LTE_JUMP_IF_FALSE ||
-                                op == OP_GT_JUMP_IF_FALSE || op == OP_GTE_JUMP_IF_FALSE;
-            n++;
-            guards++;
-            at++; /* the branch's own target word */
-            continue;
-        }
-        if (op != OP_TYPED_INDEX_GET_UNCHECKED && op != OP_INDEX_GET_RAW_REAL && op != OP_RAW_REAL_TO_INT &&
-            op != OP_RAW_ADD_REAL && op != OP_RAW_SUB_REAL && op != OP_RAW_MUL_REAL &&
-            op != OP_INDEX_SET_RAW_REAL && op != OP_RAW_MOVE_INT && op != OP_RAW_MOVE_REAL && op != OP_MOVE)
-            return false;
-        ops[n].op = op;
-        ops[n].d = (uint8_t)UNPACK_A(w);
-        ops[n].x = (uint8_t)UNPACK_B(w);
-        ops[n].y = (uint8_t)UNPACK_C(w);
-        ops[n].guard = false;
-        ops[n].real_const = false;
-        n++;
-    }
+    VecOp ops[VEC_MAX_OPS];
+    int guards = 0;
+    int n = vec_collect_body(c, body_start, body_end, ops, &guards, vec_accepts_group, NULL);
+    if (n < 0)
+        return false;
 
     /* from_col[r]: r holds an element of that column (or 1 for something derived from one).
        group_of[r]: r indexes a group, and names the column the index came from.
