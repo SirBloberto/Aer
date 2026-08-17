@@ -69,13 +69,7 @@ def density(path):
     return (comment * 100 // nonblank) if nonblank else 0
 
 
-def scan_density():
-    """Files whose comment density has grown past what the baseline recorded.
-
-    A ratchet rather than a limit. MAX_BLOCK only kills essays, and the density that actually
-    happened was death by a thousand three-line paragraphs, every one of which passes that check.
-    An absolute threshold cannot work either: vm.h sits near half comment legitimately, because 149
-    opcodes carry their operand shapes one line each."""
+def read_density_baseline():
     recorded = {}
     if os.path.exists(DENSITY_BASELINE):
         with open(DENSITY_BASELINE, encoding="utf-8") as fh:
@@ -84,6 +78,17 @@ def scan_density():
                 if raw and not raw.startswith("#"):
                     rel, pct = raw.rsplit(" ", 1)
                     recorded[rel] = int(pct)
+    return recorded
+
+
+def scan_density():
+    """Files whose comment density has grown past what the baseline recorded.
+
+    A ratchet rather than a limit. MAX_BLOCK only kills essays, and the density that actually
+    happened was death by a thousand three-line paragraphs, every one of which passes that check.
+    An absolute threshold cannot work either: vm.h sits near half comment legitimately, because 149
+    opcodes carry their operand shapes one line each."""
+    recorded = read_density_baseline()
     grown = []
     for rel, path in all_sources():
         if rel in recorded and density(path) > recorded[rel] + DENSITY_SLACK:
@@ -140,10 +145,58 @@ def dangling_enum_comments():
     return out
 
 
+def comment_blocks_ending_at(lines):
+    """Maps a comment block's last line number to its (start, end)."""
+    ends, start = {}, None
+    for n, raw in enumerate(lines, 1):
+        s = raw.strip()
+        if start is None:
+            if s.startswith("//") or (s.startswith("/*") and "*/" in s[2:]):
+                ends[n] = (n, n)
+            elif s.startswith("/*"):
+                start = n
+        elif "*/" in s:
+            ends[n] = (start, n)
+            start = None
+    return ends
+
+
+def dangling_label_comments():
+    """The same failure as dangling_enum_comments, one file over: a dispatch label in vm.c preceded
+    by two separate comment blocks. Deleting an opcode's handler leaves its paragraph behind, where
+    it then reads as documentation for whichever label follows. Two of these were found by hand, one
+    describing a struct cast sitting above lbl_dict_new."""
+    path = os.path.join(ROOT, "source", "core", "vm.c")
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().split("\n")
+    ends = comment_blocks_ending_at(lines)
+
+    out = []
+    for n, raw in enumerate(lines, 1):
+        if not re.match(r"^lbl_[A-Za-z0-9_]+:", raw):
+            continue
+        cur, found = n - 1, []
+        while cur >= 1:
+            if not lines[cur - 1].strip():
+                cur -= 1
+            elif cur in ends:
+                start, _ = ends[cur]
+                found.append(start)
+                cur = start - 1
+            else:
+                break
+        if len(found) >= 2:
+            out.append((found[-1], raw.strip()[:40], lines[found[-1] - 1].strip()[:60]))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max", type=int, default=MAX_BLOCK)
     ap.add_argument("--update-baseline", action="store_true")
+    ap.add_argument("--allow-raise", action="store_true", help="record densities that grew, not just ones that fell")
     args = ap.parse_args()
 
     found = scan(args.max)
@@ -152,12 +205,24 @@ def main():
         with open(BASELINE, "w", encoding="utf-8") as fh:
             for rel, line, length in found:
                 fh.write("%s:%d\n" % (rel, length))
+        # Lower-only unless asked otherwise. Rewriting every entry to today's value also banks the
+        # drift that stayed under DENSITY_SLACK, in files the cleanup never touched -- which loosens
+        # the ratchet that running a cleanup was meant to tighten.
+        recorded = read_density_baseline()
+        raised = []
         with open(DENSITY_BASELINE, "w", encoding="utf-8") as fh:
             fh.write("# Comment lines as a percent of non-blank, per file. A ratchet: free to fall,\n")
             fh.write("# may not rise by more than %d without being re-recorded here.\n" % DENSITY_SLACK)
             for rel, path in all_sources():
-                fh.write("%s %d\n" % (rel, density(path)))
+                now = density(path)
+                was = recorded.get(rel)
+                if was is not None and now > was and not args.allow_raise:
+                    raised.append((rel, was, now))
+                    now = was
+                fh.write("%s %d\n" % (rel, now))
         print("baseline: %d block(s) over %d lines, plus per-file density" % (len(found), args.max))
+        for rel, was, now in raised:
+            print("  kept %s at %d%% (now %d%%) -- pass --allow-raise to record the rise" % (rel, was, now))
         return 0
 
     # Grandfathers the blocks that already existed, keyed by file+length rather than line number so
@@ -204,6 +269,15 @@ def main():
             print("  source/core/vm.h:%d  %s" % (line, text))
         print("\nAn opcode was deleted and its paragraph stayed. Delete it, or attach it to the")
         print("opcode it actually describes.")
+        return 1
+
+    orphaned = dangling_label_comments()
+    if orphaned:
+        print("Dispatch labels in vm.c preceded by two separate comment blocks:\n")
+        for line, label, text in orphaned:
+            print("  source/core/vm.c:%d  %s  above %s" % (line, text, label))
+        print("\nThe first block almost certainly documents a handler that no longer follows it.")
+        print("Delete it, or merge it into the comment for the label it actually describes.")
         return 1
 
     print("comment check: clean (%d grandfathered block(s) remaining)" % len(found))
