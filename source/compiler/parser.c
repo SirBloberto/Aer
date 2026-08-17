@@ -2945,17 +2945,18 @@ static const struct {
 
 /* No indexed/field targets (out of scope). `name` is already consumed by the caller, which
    decided between this, a bare call, and an indexed write via one token of lookahead. */
-static void parse_assignment(Chunk* c, unsigned int name_idx) {
-    /* Checked here rather than in var_slot: the raw-promotion path below registers a name itself and
-       never calls var_slot, so `integer = 5` would slip through. A reserved name always resolves to
-       its builtin at the call site, so binding one made a variable nothing could ever read. */
-    if (is_builtin_name(c, name_idx)) {
-        return error_at("'%s' is a reserved function name and can't be used as a variable",
-                        aer_as_string(c->pool[name_idx])->data);
-    }
-    /* Multiple RHS values pack into a real array (OP_ARRAY_NEW); each target reads its own index
-       back via OP_INDEX_GET. Targets resolve via var_slot BEFORE the RHS is parsed -- creating a
-       variable after a temp is live could hand out that temp's own register. */
+/* Whether the next token opens a compound assignment. The handler consumes it; this only looks,
+   so the dispatcher can choose without the handler having to report back. */
+static bool at_compound_assign(void) {
+    for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++)
+        if (equal(compound_assign_ops[i].tok))
+            return true;
+    return false;
+}
+
+/* `a, b = ...`. Targets resolve BEFORE the right-hand side is parsed -- creating a variable
+   while a temp is live could hand out that temp's own register. */
+static void parse_assign_destructuring(Chunk* c, unsigned int name_idx) {
     if (equal(TOKEN_COMMA)) {
         unsigned int names[MAX_DESTRUCT];
         names[0] = name_idx;
@@ -3036,7 +3037,9 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         reg_free(1); /* arr_reg -- always a temp, guaranteed by arg_materialize */
         return;
     }
-
+}
+/* `x = ...`, including the raw-slot promotion a numeric value earns. */
+static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
     if (consume(TOKEN_ASSIGN)) {
         /* Watches for a self-reference during the RHS parse -- see self_ref_watch_name's own
            comment (top of file) for why and what consumes self_ref_watch_seen just below. */
@@ -3233,7 +3236,10 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         /* reg == rk_val: the RHS already landed where var_slot reserved -- skip the no-op MOVE. */
         return;
     }
-
+}
+/* `x += ...` and friends. Answers whether it matched an operator, since a bare name followed
+   by something else is still a legal statement. */
+static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
     for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
         if (!consume(compound_assign_ops[i].tok))
             continue;
@@ -3406,6 +3412,9 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
     }
 
     /* A pipe chain from a bare name used as a statement -- non-creating lookup. */
+}
+/* A pipe chain from a bare name used as a statement -- a lookup that never creates. */
+static void parse_assign_pipe(Chunk* c, unsigned int name_idx) {
     if (equal(TOKEN_PIPE)) {
         int reg;
         unsigned int lhs_start = c->count;
@@ -3424,6 +3433,29 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         discard_statement_result(c, rk_result);
         return;
     }
+
+    error_at("Only plain 'name = expr' or compound assignment is supported here (no field access)");
+}
+
+static void parse_assignment(Chunk* c, unsigned int name_idx) {
+    /* Checked here rather than in var_slot: the raw-promotion path below registers a name itself and
+       never calls var_slot, so `integer = 5` would slip through. A reserved name always resolves to
+       its builtin at the call site, so binding one made a variable nothing could ever read. */
+    if (is_builtin_name(c, name_idx)) {
+        return error_at("'%s' is a reserved function name and can't be used as a variable",
+                        aer_as_string(c->pool[name_idx])->data);
+    }
+    /* Multiple RHS values pack into a real array (OP_ARRAY_NEW); each target reads its own index
+       back via OP_INDEX_GET. Targets resolve via var_slot BEFORE the RHS is parsed -- creating a
+       variable after a temp is live could hand out that temp's own register. */
+    if (equal(TOKEN_COMMA))
+        return parse_assign_destructuring(c, name_idx);
+    if (equal(TOKEN_ASSIGN))
+        return parse_assign_plain(c, name_idx);
+    if (at_compound_assign())
+        return parse_assign_compound(c, name_idx);
+    if (equal(TOKEN_PIPE))
+        return parse_assign_pipe(c, name_idx);
 
     error_at("Only plain 'name = expr' or compound assignment is supported here (no field access)");
 }
