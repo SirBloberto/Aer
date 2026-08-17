@@ -671,472 +671,501 @@ static bool group_sum_chain_eval(AerVal* operand, int n, uint64_t word, AerTyped
     return !stop;
 }
 
-bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
-    if (fn_id == FN_COLLECTION_GROUP_SUM_INTO && (arg_count == 3 || arg_count == 4)) {
-        AerVal keep_v = arg_count == 4 ? vm_stack_pop(vm) : aer_null();
-        AerVal grp_v = vm_stack_pop(vm);
-        AerVal val_v = vm_stack_pop(vm);
-        AerVal tgt_v = vm_stack_pop(vm);
-        if (aer_type(tgt_v) != TYPE_TYPED_ARRAY || aer_type(val_v) != TYPE_TYPED_ARRAY ||
-            aer_type(grp_v) != TYPE_TYPED_ARRAY || (arg_count == 4 && aer_type(keep_v) != TYPE_TYPED_ARRAY))
-            return push_error(vm, "group accumulation needs typed arrays");
-        AerTypedArray* tgt = aer_as_typed_array(tgt_v);
-        AerTypedArray* val = aer_as_typed_array(val_v);
-        AerTypedArray* grp = aer_as_typed_array(grp_v);
-        AerTypedArray* keep = arg_count == 4 ? aer_as_typed_array(keep_v) : NULL;
-        if (val->count != grp->count || tgt->elem_kind != val->elem_kind ||
-            (keep && keep->count != val->count))
-            return push_error(vm, "group accumulation needs matching lengths and element kinds");
-        /* The filter arrives as 1/0 in whichever element kind the comparison produced. Flattening it
+static bool collection_group_sum_into(VM* vm, int arg_count) {
+    AerVal keep_v = arg_count == 4 ? vm_stack_pop(vm) : aer_null();
+    AerVal grp_v = vm_stack_pop(vm);
+    AerVal val_v = vm_stack_pop(vm);
+    AerVal tgt_v = vm_stack_pop(vm);
+    if (aer_type(tgt_v) != TYPE_TYPED_ARRAY || aer_type(val_v) != TYPE_TYPED_ARRAY ||
+        aer_type(grp_v) != TYPE_TYPED_ARRAY || (arg_count == 4 && aer_type(keep_v) != TYPE_TYPED_ARRAY))
+        return push_error(vm, "group accumulation needs typed arrays");
+    AerTypedArray* tgt = aer_as_typed_array(tgt_v);
+    AerTypedArray* val = aer_as_typed_array(val_v);
+    AerTypedArray* grp = aer_as_typed_array(grp_v);
+    AerTypedArray* keep = arg_count == 4 ? aer_as_typed_array(keep_v) : NULL;
+    if (val->count != grp->count || tgt->elem_kind != val->elem_kind || (keep && keep->count != val->count))
+        return push_error(vm, "group accumulation needs matching lengths and element kinds");
+    /* The filter arrives as 1/0 in whichever element kind the comparison produced. Flattening it
            to a byte per row costs a pass but keeps the scatter kernels from needing a variant per
            mask kind on top of the value and group kinds they already carry. */
-        uint8_t* flags = NULL;
-        if (keep && val->count > 0) {
-            flags = (uint8_t*)malloc(val->count);
-            if (!flags)
-                return push_error(vm, "out of memory building a group filter");
-            for (unsigned int i = 0; i < val->count; i++)
-                flags[i] = (uint8_t)(typed_elem(keep, i) != 0.0);
-        }
-        /* Adds into what the target already holds, exactly as the loop's `t[g] = t[g] + v` did --
-           no zeroing, and the array's own length is the group count. */
-        bool ok = val->count == 0 || group_sum_run(val, grp, tgt, flags, tgt->count);
-        free(flags);
-        if (!ok) {
-            error("group index outside 0..%u", tgt->count - 1);
-            return push_null(vm);
-        }
-        vm_stack_push(vm, tgt_v);
-        return true;
+    uint8_t* flags = NULL;
+    if (keep && val->count > 0) {
+        flags = (uint8_t*)malloc(val->count);
+        if (!flags)
+            return push_error(vm, "out of memory building a group filter");
+        for (unsigned int i = 0; i < val->count; i++)
+            flags[i] = (uint8_t)(typed_elem(keep, i) != 0.0);
     }
+    /* Adds into what the target already holds, exactly as the loop's `t[g] = t[g] + v` did --
+           no zeroing, and the array's own length is the group count. */
+    bool ok = val->count == 0 || group_sum_run(val, grp, tgt, flags, tgt->count);
+    free(flags);
+    if (!ok) {
+        error("group index outside 0..%u", tgt->count - 1);
+        return push_null(vm);
+    }
+    vm_stack_push(vm, tgt_v);
+    return true;
+}
+static bool collection_group_sum_chain(VM* vm, int arg_count) {
     /* `group_sum(price * quantity * (1 - discount) * mask, region, G)` -- the values never exist as
        an array. Answers in float64 regardless of what the columns were, since the tile evaluator
        carries doubles; group_sum's unfused form takes its result kind from the values, and a fused
        expression's values are always the evaluator's. */
-    if (fn_id == FN_COLLECTION_GROUP_SUM_CHAIN && arg_count >= 5) {
-        AerVal operand[CHAIN_MAX_OPERANDS];
-        int n = arg_count - 3;
-        if (n > CHAIN_MAX_OPERANDS) {
-            error("group_sum() chain too long to fuse");
-            return push_null(vm);
-        }
-        for (int i = n - 1; i >= 0; i--)
-            operand[i] = vm_stack_pop(vm);
-        AerVal ngroups_v = vm_stack_pop(vm);
-        AerVal grp_v = vm_stack_pop(vm);
-        AerVal prog_v = vm_stack_pop(vm);
-        if (aer_type(grp_v) != TYPE_TYPED_ARRAY) {
-            error("group_sum() needs a typed array of group numbers");
-            return push_null(vm);
-        }
-        if (aer_type(ngroups_v) != TYPE_INTEGER || aer_as_int(ngroups_v) <= 0) {
-            error("group_sum() group count must be a positive integer");
-            return push_null(vm);
-        }
-        unsigned int count = 0;
-        if (!chain_operands_ok(operand, n, &count))
-            return push_null(vm);
-        AerTypedArray* grp = aer_as_typed_array(grp_v);
-        if (count != grp->count) {
-            error("group_sum() values and groups must be the same length (got %u and %u)", count, grp->count);
-            return push_null(vm);
-        }
-        unsigned int ngroups = (unsigned int)aer_as_int(ngroups_v);
-        AerVal out_v = vm_new_typed_array_val(TYPED_ELEM_FLOAT64, ngroups);
-        double* out = (double*)aer_as_typed_array(out_v)->data;
-        memset(out, 0, (size_t)ngroups * sizeof(double));
-        if (count > 0 &&
-            !group_sum_chain_eval(operand, n, (uint64_t)aer_as_int(prog_v), grp, out, ngroups, count)) {
-            error("group_sum() found a group number outside 0..%u", ngroups - 1);
-            return push_null(vm);
-        }
-        vm_stack_push(vm, out_v);
+    AerVal operand[CHAIN_MAX_OPERANDS];
+    int n = arg_count - 3;
+    if (n > CHAIN_MAX_OPERANDS) {
+        error("group_sum() chain too long to fuse");
+        return push_null(vm);
+    }
+    for (int i = n - 1; i >= 0; i--)
+        operand[i] = vm_stack_pop(vm);
+    AerVal ngroups_v = vm_stack_pop(vm);
+    AerVal grp_v = vm_stack_pop(vm);
+    AerVal prog_v = vm_stack_pop(vm);
+    if (aer_type(grp_v) != TYPE_TYPED_ARRAY) {
+        error("group_sum() needs a typed array of group numbers");
+        return push_null(vm);
+    }
+    if (aer_type(ngroups_v) != TYPE_INTEGER || aer_as_int(ngroups_v) <= 0) {
+        error("group_sum() group count must be a positive integer");
+        return push_null(vm);
+    }
+    unsigned int count = 0;
+    if (!chain_operands_ok(operand, n, &count))
+        return push_null(vm);
+    AerTypedArray* grp = aer_as_typed_array(grp_v);
+    if (count != grp->count) {
+        error("group_sum() values and groups must be the same length (got %u and %u)", count, grp->count);
+        return push_null(vm);
+    }
+    unsigned int ngroups = (unsigned int)aer_as_int(ngroups_v);
+    AerVal out_v = vm_new_typed_array_val(TYPED_ELEM_FLOAT64, ngroups);
+    double* out = (double*)aer_as_typed_array(out_v)->data;
+    memset(out, 0, (size_t)ngroups * sizeof(double));
+    if (count > 0 &&
+        !group_sum_chain_eval(operand, n, (uint64_t)aer_as_int(prog_v), grp, out, ngroups, count)) {
+        error("group_sum() found a group number outside 0..%u", ngroups - 1);
+        return push_null(vm);
+    }
+    vm_stack_push(vm, out_v);
+    return true;
+}
+static bool collection_sum_chain(VM* vm, int arg_count) {
+    AerVal operand[CHAIN_MAX_OPERANDS];
+    int n = arg_count - 1;
+    if (n > CHAIN_MAX_OPERANDS) {
+        error("sum() chain too long to fuse");
+        vm_stack_push(vm, aer_null());
         return true;
     }
-    if (fn_id == FN_COLLECTION_SUM_CHAIN && arg_count >= 3) {
-        AerVal operand[CHAIN_MAX_OPERANDS];
-        int n = arg_count - 1;
-        if (n > CHAIN_MAX_OPERANDS) {
-            error("sum() chain too long to fuse");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        for (int i = n - 1; i >= 0; i--)
-            operand[i] = vm_stack_pop(vm);
-        AerVal packed_v = vm_stack_pop(vm);
-        unsigned int count = 0;
-        if (!chain_operands_ok(operand, n, &count))
-            return push_null(vm);
-        double total = 0.0;
-        if (count > 0)
-            sum_chain_eval(operand, n, (uint64_t)aer_as_int(packed_v), count, &total);
-        vm_stack_push(vm, aer_real(total));
+    for (int i = n - 1; i >= 0; i--)
+        operand[i] = vm_stack_pop(vm);
+    AerVal packed_v = vm_stack_pop(vm);
+    unsigned int count = 0;
+    if (!chain_operands_ok(operand, n, &count))
+        return push_null(vm);
+    double total = 0.0;
+    if (count > 0)
+        sum_chain_eval(operand, n, (uint64_t)aer_as_int(packed_v), count, &total);
+    vm_stack_push(vm, aer_real(total));
+    return true;
+}
+static bool collection_group_sum(VM* vm) {
+    AerVal ngroups_v = vm_stack_pop(vm);
+    AerVal grp_v = vm_stack_pop(vm);
+    AerVal val_v = vm_stack_pop(vm);
+    if (aer_type(val_v) != TYPE_TYPED_ARRAY || aer_type(grp_v) != TYPE_TYPED_ARRAY) {
+        error("group_sum() needs a typed array of values and a typed array of group numbers");
+        vm_stack_push(vm, aer_null());
         return true;
     }
-    if (fn_id == FN_COLLECTION_GROUP_SUM && arg_count == 3) {
-        AerVal ngroups_v = vm_stack_pop(vm);
-        AerVal grp_v = vm_stack_pop(vm);
-        AerVal val_v = vm_stack_pop(vm);
-        if (aer_type(val_v) != TYPE_TYPED_ARRAY || aer_type(grp_v) != TYPE_TYPED_ARRAY) {
-            error("group_sum() needs a typed array of values and a typed array of group numbers");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        if (aer_type(ngroups_v) != TYPE_INTEGER || aer_as_int(ngroups_v) <= 0) {
-            error("group_sum() group count must be a positive integer");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        AerTypedArray* val = aer_as_typed_array(val_v);
-        AerTypedArray* grp = aer_as_typed_array(grp_v);
-        if (val->count != grp->count) {
-            error("group_sum() values and groups must be the same length (got %u and %u)", val->count,
-                  grp->count);
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        unsigned int ngroups = (unsigned int)aer_as_int(ngroups_v);
-        AerVal out_v = vm_new_typed_array_val(val->elem_kind, ngroups);
-        AerTypedArray* out = aer_as_typed_array(out_v);
-        memset(out->data, 0, (size_t)ngroups * vm_typed_elem_width(val->elem_kind));
-        if (val->count > 0 && !group_sum_run(val, grp, out, NULL, ngroups)) {
-            error("group_sum() found a group number outside 0..%u", ngroups - 1);
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        vm_stack_push(vm, out_v);
+    if (aer_type(ngroups_v) != TYPE_INTEGER || aer_as_int(ngroups_v) <= 0) {
+        error("group_sum() group count must be a positive integer");
+        vm_stack_push(vm, aer_null());
         return true;
     }
-    if ((fn_id == FN_COLLECTION_SUM || fn_id == FN_COLLECTION_MIN || fn_id == FN_COLLECTION_MAX) &&
-        arg_count == 1) {
-        const char* fname = fn_id == FN_COLLECTION_SUM ? "sum" : (fn_id == FN_COLLECTION_MIN ? "min" : "max");
-        AerVal src = vm_stack_pop(vm);
-        unsigned int count;
-        if (aer_type(src) == TYPE_TYPED_ARRAY)
-            count = aer_as_typed_array(src)->count;
-        else if (aer_type(src) == TYPE_ARRAY && !aer_as_array(src)->shape)
-            count = aer_as_array(src)->count;
-        else {
-            error("%s() requires an array of numbers", fname);
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        if (count == 0) {
-            /* Summing nothing is 0; there is no honest least or greatest of nothing. */
-            if (fn_id != FN_COLLECTION_SUM) {
-                error("%s() of an empty array has no answer", fname);
-                vm_stack_push(vm, aer_null());
-                return true;
-            }
-            bool floaty = aer_type(src) == TYPE_TYPED_ARRAY &&
-                          (aer_as_typed_array(src)->elem_kind == TYPED_ELEM_FLOAT32 ||
-                           aer_as_typed_array(src)->elem_kind == TYPED_ELEM_FLOAT64);
-            vm_stack_push(vm, floaty ? aer_real(0.0) : aer_int(0));
-            return true;
-        }
-        if (aer_type(src) == TYPE_TYPED_ARRAY) {
-            vm_stack_push(vm, typed_reduce(aer_as_typed_array(src), fn_id));
-            return true;
-        }
-        AerVal out;
-        if (!boxed_reduce(aer_as_array(src), fn_id, fname, &out))
-            out = aer_null();
-        vm_stack_push(vm, out);
+    AerTypedArray* val = aer_as_typed_array(val_v);
+    AerTypedArray* grp = aer_as_typed_array(grp_v);
+    if (val->count != grp->count) {
+        error("group_sum() values and groups must be the same length (got %u and %u)", val->count,
+              grp->count);
+        vm_stack_push(vm, aer_null());
         return true;
     }
-    if (fn_id == FN_COLLECTION_APPEND && arg_count == 2) {
-        AerVal val = vm_stack_pop(vm);
-        AerVal arr = vm_stack_pop(vm);
-        if (reject_fixed_length(vm, arr, "append"))
-            return true;
-        if (aer_type(arr) != TYPE_ARRAY) {
-            error("append() requires an array");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        AerArray* a = aer_as_array(arr);
-        if (a->shape) {
-            error("append() cannot add fields to a struct instance — structs have a fixed shape");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        if (a->count >= a->capacity) {
-            a->capacity = a->capacity ? a->capacity * 2 : 4;
-            a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
-        }
-        gc_barrier_array(vm, a, a->count, val);
-        a->items[a->count++] = val;
-        a->generation++; /* see AerArray.generation's own comment, value.h */
-        vm_stack_push(vm, arr);
+    unsigned int ngroups = (unsigned int)aer_as_int(ngroups_v);
+    AerVal out_v = vm_new_typed_array_val(val->elem_kind, ngroups);
+    AerTypedArray* out = aer_as_typed_array(out_v);
+    memset(out->data, 0, (size_t)ngroups * vm_typed_elem_width(val->elem_kind));
+    if (val->count > 0 && !group_sum_run(val, grp, out, NULL, ngroups)) {
+        error("group_sum() found a group number outside 0..%u", ngroups - 1);
+        vm_stack_push(vm, aer_null());
         return true;
     }
-    if (fn_id == FN_COLLECTION_RESERVE && arg_count == 2) {
-        AerVal n_v = vm_stack_pop(vm);
-        AerVal arr = vm_stack_pop(vm);
-        if (reject_fixed_length(vm, arr, "reserve"))
-            return true;
-        if (aer_type(arr) != TYPE_ARRAY) {
-            error("reserve() requires an array");
+    vm_stack_push(vm, out_v);
+    return true;
+}
+static bool collection_sum(VM* vm, int fn_id) {
+    const char* fname = fn_id == FN_COLLECTION_SUM ? "sum" : (fn_id == FN_COLLECTION_MIN ? "min" : "max");
+    AerVal src = vm_stack_pop(vm);
+    unsigned int count;
+    if (aer_type(src) == TYPE_TYPED_ARRAY)
+        count = aer_as_typed_array(src)->count;
+    else if (aer_type(src) == TYPE_ARRAY && !aer_as_array(src)->shape)
+        count = aer_as_array(src)->count;
+    else {
+        error("%s() requires an array of numbers", fname);
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    if (count == 0) {
+        /* Summing nothing is 0; there is no honest least or greatest of nothing. */
+        if (fn_id != FN_COLLECTION_SUM) {
+            error("%s() of an empty array has no answer", fname);
             vm_stack_push(vm, aer_null());
             return true;
         }
-        AerArray* a = aer_as_array(arr);
-        if (a->shape) {
-            error("reserve() cannot resize a struct instance — structs have a fixed shape");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        if (aer_type(n_v) != TYPE_INTEGER) {
-            error("reserve() count must be an integer");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        int64_t n = aer_as_int(n_v);
-        if (n < 0) {
-            error("reserve() count cannot be negative");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        /* Pre-sizes items[] once, up front, to skip append()'s incremental double-on-overflow
+        bool floaty =
+            aer_type(src) == TYPE_TYPED_ARRAY && (aer_as_typed_array(src)->elem_kind == TYPED_ELEM_FLOAT32 ||
+                                                  aer_as_typed_array(src)->elem_kind == TYPED_ELEM_FLOAT64);
+        vm_stack_push(vm, floaty ? aer_real(0.0) : aer_int(0));
+        return true;
+    }
+    if (aer_type(src) == TYPE_TYPED_ARRAY) {
+        vm_stack_push(vm, typed_reduce(aer_as_typed_array(src), fn_id));
+        return true;
+    }
+    AerVal out;
+    if (!boxed_reduce(aer_as_array(src), fn_id, fname, &out))
+        out = aer_null();
+    vm_stack_push(vm, out);
+    return true;
+}
+static bool collection_append(VM* vm) {
+    AerVal val = vm_stack_pop(vm);
+    AerVal arr = vm_stack_pop(vm);
+    if (reject_fixed_length(vm, arr, "append"))
+        return true;
+    if (aer_type(arr) != TYPE_ARRAY) {
+        error("append() requires an array");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    AerArray* a = aer_as_array(arr);
+    if (a->shape) {
+        error("append() cannot add fields to a struct instance — structs have a fixed shape");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    if (a->count >= a->capacity) {
+        a->capacity = a->capacity ? a->capacity * 2 : 4;
+        a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
+    }
+    gc_barrier_array(vm, a, a->count, val);
+    a->items[a->count++] = val;
+    a->generation++; /* see AerArray.generation's own comment, value.h */
+    vm_stack_push(vm, arr);
+    return true;
+}
+static bool collection_reserve(VM* vm) {
+    AerVal n_v = vm_stack_pop(vm);
+    AerVal arr = vm_stack_pop(vm);
+    if (reject_fixed_length(vm, arr, "reserve"))
+        return true;
+    if (aer_type(arr) != TYPE_ARRAY) {
+        error("reserve() requires an array");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    AerArray* a = aer_as_array(arr);
+    if (a->shape) {
+        error("reserve() cannot resize a struct instance — structs have a fixed shape");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    if (aer_type(n_v) != TYPE_INTEGER) {
+        error("reserve() count must be an integer");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    int64_t n = aer_as_int(n_v);
+    if (n < 0) {
+        error("reserve() count cannot be negative");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    /* Pre-sizes items[] once, up front, to skip append()'s incremental double-on-overflow
            growth for the common "build a huge array via many appends" pattern -- mirrors
            hashtable_reserve's own contract (hashtable.c): never shrinks, a no-op if already big
            enough. Doesn't touch count -- unlike a packed array's fixed-size construction, this is
            purely a capacity hint; elements still only exist once actually appended/assigned. */
-        if ((unsigned int)n > a->capacity) {
-            a->capacity = (unsigned int)n;
-            a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
-        }
-        vm_stack_push(vm, arr);
-        return true;
+    if ((unsigned int)n > a->capacity) {
+        a->capacity = (unsigned int)n;
+        a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
     }
-    if (fn_id == FN_COLLECTION_DELETE && arg_count == 2) {
-        AerVal key = vm_stack_pop(vm);
-        AerVal obj = vm_stack_pop(vm);
-        if (reject_fixed_length(vm, obj, "delete"))
+    vm_stack_push(vm, arr);
+    return true;
+}
+static bool collection_delete(VM* vm) {
+    AerVal key = vm_stack_pop(vm);
+    AerVal obj = vm_stack_pop(vm);
+    if (reject_fixed_length(vm, obj, "delete"))
+        return true;
+    if (aer_type(obj) == TYPE_DICT) {
+        if (aer_type(key) != TYPE_STRING) {
+            error("delete() key must be a string");
+            vm_stack_push(vm, aer_null());
             return true;
-        if (aer_type(obj) == TYPE_DICT) {
-            if (aer_type(key) != TYPE_STRING) {
-                error("delete() key must be a string");
-                vm_stack_push(vm, aer_null());
-                return true;
-            }
-            AerString* ks = aer_as_string(key);
-            unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
-            /* hashtable_remove swap-compacts the dense array (moves the last entry into the
+        }
+        AerString* ks = aer_as_string(key);
+        unsigned int klen = hashtable_key_true_len(ks->data, ks->length);
+        /* hashtable_remove swap-compacts the dense array (moves the last entry into the
                vacated slot), which invalidates any existing per-index dirty-card state -- rather
                than fix up the one moved entry's card (real complexity for a rare path), dirty_all
                just forces a full rescan next cycle if this dict is remembered (harmless, cheap,
                no-op otherwise). See AerDict.dirty_cards's own comment, vm.h. */
-            aer_as_dict(obj)->dirty_all = true;
-            hashtable_remove(&aer_as_dict(obj)->map, ks->data, klen);
-            vm_stack_push(vm, obj);
-            return true;
-        }
-        if (aer_type(obj) == TYPE_ARRAY) {
-            AerArray* a = aer_as_array(obj);
-            if (a->shape) {
-                error("delete() cannot remove fields from a struct instance — structs have a fixed shape");
-                vm_stack_push(vm, aer_null());
-                return true;
-            }
-            if (aer_type(key) != TYPE_INTEGER) {
-                error("Array delete() index must be an integer");
-                vm_stack_push(vm, aer_null());
-                return true;
-            }
-            int64_t i = aer_as_int(key);
-            if (i < 0)
-                i += (int64_t)a->count;
-            if (i < 0 || (uint64_t)i >= a->count) {
-                error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(key), a->count);
-                vm_stack_push(vm, aer_null());
-                return true;
-            }
-            /* Shifts every element after i down by one -- same dirty_all reasoning as the dict
-               branch above (see AerArray.dirty_cards's own comment, value.h). */
-            a->dirty_all = true;
-            memmove(&a->items[i], &a->items[i + 1], (size_t)(a->count - (uint64_t)i - 1) * sizeof(AerVal));
-            a->count--;
-            a->generation++; /* see AerArray.generation's own comment, value.h */
-            vm_stack_push(vm, obj);
-            return true;
-        }
-        error("delete() requires a hashtable or array");
-        vm_stack_push(vm, aer_null());
+        aer_as_dict(obj)->dirty_all = true;
+        hashtable_remove(&aer_as_dict(obj)->map, ks->data, klen);
+        vm_stack_push(vm, obj);
         return true;
     }
-    if (fn_id == FN_COLLECTION_COPY && arg_count == 1) {
-        AerVal src = vm_stack_pop(vm);
-        if (aer_type(src) == TYPE_ARRAY && !aer_as_array(src)->shape) {
-            AerArray* a = aer_as_array(src);
-            AerArray* r = vm_new_array();
-            r->count = a->count;
-            r->capacity = a->count ? a->count : 4;
-            r->items = xmalloc(sizeof(AerVal) * r->capacity);
-            r->shape = NULL;
-            r->generation = 0;
-            memcpy(r->items, a->items, sizeof(AerVal) * a->count);
-            vm_stack_push(vm, aer_array_val(r));
-            return true;
-        }
-        if (aer_type(src) == TYPE_DICT) {
-            AerDict* d = aer_as_dict(src);
-            AerDict* r = vm_new_dict();
-            if (d->map.count > 0)
-                hashtable_reserve(&r->map, d->map.count);
-            for (unsigned int i = 0; i < d->map.count; i++) {
-                /* Duped into r's own pools, not d's -- the copy owns r->map, not the original.
-                   Each source entry's own .hash was already computed once at its original
-                   insertion (cached right there in the dense array, not on any AerString) --
-                   reused here instead of hashing the same bytes again. */
-                char* k = hashtable_key_dup_known(r->map.pools, d->map.dense[i].key, d->map.dense[i].length);
-                hashtable_put_hashed(&r->map, k, d->map.dense[i].length, d->map.dense[i].hash,
-                                     d->map.dense[i].payload);
-            }
-            vm_stack_push(vm, aer_dict_val(r));
-            return true;
-        }
-        if (aer_type(src) == TYPE_TYPED_ARRAY) {
-            AerTypedArray* t = aer_as_typed_array(src);
-            AerVal out = vm_new_typed_array_val(t->elem_kind, t->count);
-            if (t->count > 0)
-                memcpy(aer_as_typed_array(out)->data, t->data,
-                       (size_t)t->count * vm_typed_elem_width(t->elem_kind));
-            vm_stack_push(vm, out);
-            return true;
-        }
-        /* A struct instance is deliberately excluded -- construct a fresh one instead (a shaped
-           copy would also land in the wrong GC pool, see gc_barrier_array's pool split, vm.c). */
-        error("copy() requires an array or dict");
-        vm_stack_push(vm, aer_null());
-        return true;
-    }
-    if (fn_id == FN_COLLECTION_INSERT && arg_count == 3) {
-        AerVal val = vm_stack_pop(vm);
-        AerVal idx = vm_stack_pop(vm);
-        AerVal arr = vm_stack_pop(vm);
-        if (reject_fixed_length(vm, arr, "insert"))
-            return true;
-        if (aer_type(arr) != TYPE_ARRAY || aer_as_array(arr)->shape) {
-            error("insert() requires an array");
+    if (aer_type(obj) == TYPE_ARRAY) {
+        AerArray* a = aer_as_array(obj);
+        if (a->shape) {
+            error("delete() cannot remove fields from a struct instance — structs have a fixed shape");
             vm_stack_push(vm, aer_null());
             return true;
         }
-        if (aer_type(idx) != TYPE_INTEGER) {
-            error("insert() index must be an integer");
+        if (aer_type(key) != TYPE_INTEGER) {
+            error("Array delete() index must be an integer");
             vm_stack_push(vm, aer_null());
             return true;
         }
-        AerArray* a = aer_as_array(arr);
-        int64_t i = aer_as_int(idx);
+        int64_t i = aer_as_int(key);
         if (i < 0)
             i += (int64_t)a->count;
-        /* i == count is valid: insert at the end, same as append(). */
-        if (i < 0 || (uint64_t)i > a->count) {
-            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count);
+        if (i < 0 || (uint64_t)i >= a->count) {
+            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(key), a->count);
             vm_stack_push(vm, aer_null());
             return true;
         }
-        if (a->count >= a->capacity) {
-            a->capacity = a->capacity ? a->capacity * 2 : 4;
-            a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
-        }
-        /* Shifts every element from i onward up by one -- same dirty_all reasoning as delete's own
-           (see AerArray.dirty_cards's own comment, value.h); gc_barrier_array's own per-index card
-           for the new value at i is harmless but redundant once dirty_all forces a full rescan. */
+        /* Shifts every element after i down by one -- same dirty_all reasoning as the dict
+               branch above (see AerArray.dirty_cards's own comment, value.h). */
         a->dirty_all = true;
-        gc_barrier_array(vm, a, (unsigned int)i, val);
-        memmove(&a->items[i + 1], &a->items[i], (size_t)(a->count - (uint64_t)i) * sizeof(AerVal));
-        a->items[i] = val;
-        a->count++;
+        memmove(&a->items[i], &a->items[i + 1], (size_t)(a->count - (uint64_t)i - 1) * sizeof(AerVal));
+        a->count--;
         a->generation++; /* see AerArray.generation's own comment, value.h */
-        vm_stack_push(vm, arr);
+        vm_stack_push(vm, obj);
         return true;
     }
-    if (fn_id == FN_COLLECTION_INDEX_OF && arg_count == 2) {
-        AerVal val = vm_stack_pop(vm);
-        AerVal arr = vm_stack_pop(vm);
-        if (aer_type(arr) == TYPE_TYPED_ARRAY) {
-            vm_stack_push(vm, aer_int(typed_index_of(aer_as_typed_array(arr), val)));
-            return true;
-        }
-        if (aer_type(arr) != TYPE_ARRAY || aer_as_array(arr)->shape) {
-            error("index_of() requires an array");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        AerArray* a = aer_as_array(arr);
-        int64_t found = -1;
-        for (unsigned int i = 0; i < a->count; i++)
-            if (values_equal(val, a->items[i])) {
-                found = (int64_t)i;
-                break;
-            }
-        vm_stack_push(vm, aer_int(found));
-        return true;
-    }
-    if (fn_id == FN_COLLECTION_KEYS && arg_count == 1) {
-        AerVal src = vm_stack_pop(vm);
-        if (aer_type(src) != TYPE_DICT) {
-            error("keys() requires a hashtable");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        AerDict* d = aer_as_dict(src);
+    error("delete() requires a hashtable or array");
+    vm_stack_push(vm, aer_null());
+    return true;
+}
+static bool collection_copy(VM* vm) {
+    AerVal src = vm_stack_pop(vm);
+    if (aer_type(src) == TYPE_ARRAY && !aer_as_array(src)->shape) {
+        AerArray* a = aer_as_array(src);
         AerArray* r = vm_new_array();
-        r->count = 0;
-        r->capacity = d->map.count ? d->map.count : 4;
+        r->count = a->count;
+        r->capacity = a->count ? a->count : 4;
         r->items = xmalloc(sizeof(AerVal) * r->capacity);
         r->shape = NULL;
         r->generation = 0;
-        for (unsigned int i = 0; i < d->map.count; i++) {
-            unsigned int n = d->map.dense[i].length;
-            r->items[r->count++] = aer_make_string_copy(d->map.dense[i].key, n);
-        }
+        memcpy(r->items, a->items, sizeof(AerVal) * a->count);
         vm_stack_push(vm, aer_array_val(r));
         return true;
     }
-    if (fn_id == FN_COLLECTION_SORT && arg_count == 1) {
-        AerVal arr = vm_stack_pop(vm);
-        if (aer_type(arr) == TYPE_TYPED_ARRAY) {
-            AerTypedArray* t = aer_as_typed_array(arr);
-            typed_sort(t);
-            vm_stack_push(vm, arr);
-            return true;
+    if (aer_type(src) == TYPE_DICT) {
+        AerDict* d = aer_as_dict(src);
+        AerDict* r = vm_new_dict();
+        if (d->map.count > 0)
+            hashtable_reserve(&r->map, d->map.count);
+        for (unsigned int i = 0; i < d->map.count; i++) {
+            /* Duped into r's own pools, not d's -- the copy owns r->map, not the original.
+                   Each source entry's own .hash was already computed once at its original
+                   insertion (cached right there in the dense array, not on any AerString) --
+                   reused here instead of hashing the same bytes again. */
+            char* k = hashtable_key_dup_known(r->map.pools, d->map.dense[i].key, d->map.dense[i].length);
+            hashtable_put_hashed(&r->map, k, d->map.dense[i].length, d->map.dense[i].hash,
+                                 d->map.dense[i].payload);
         }
-        if (aer_type(arr) != TYPE_ARRAY) {
-            error("sort() requires an array");
-            vm_stack_push(vm, aer_null());
-            return true;
+        vm_stack_push(vm, aer_dict_val(r));
+        return true;
+    }
+    if (aer_type(src) == TYPE_TYPED_ARRAY) {
+        AerTypedArray* t = aer_as_typed_array(src);
+        AerVal out = vm_new_typed_array_val(t->elem_kind, t->count);
+        if (t->count > 0)
+            memcpy(aer_as_typed_array(out)->data, t->data,
+                   (size_t)t->count * vm_typed_elem_width(t->elem_kind));
+        vm_stack_push(vm, out);
+        return true;
+    }
+    /* A struct instance is deliberately excluded -- construct a fresh one instead (a shaped
+           copy would also land in the wrong GC pool, see gc_barrier_array's pool split, vm.c). */
+    error("copy() requires an array or dict");
+    vm_stack_push(vm, aer_null());
+    return true;
+}
+static bool collection_insert(VM* vm) {
+    AerVal val = vm_stack_pop(vm);
+    AerVal idx = vm_stack_pop(vm);
+    AerVal arr = vm_stack_pop(vm);
+    if (reject_fixed_length(vm, arr, "insert"))
+        return true;
+    if (aer_type(arr) != TYPE_ARRAY || aer_as_array(arr)->shape) {
+        error("insert() requires an array");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    if (aer_type(idx) != TYPE_INTEGER) {
+        error("insert() index must be an integer");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    AerArray* a = aer_as_array(arr);
+    int64_t i = aer_as_int(idx);
+    if (i < 0)
+        i += (int64_t)a->count;
+    /* i == count is valid: insert at the end, same as append(). */
+    if (i < 0 || (uint64_t)i > a->count) {
+        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count);
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    if (a->count >= a->capacity) {
+        a->capacity = a->capacity ? a->capacity * 2 : 4;
+        a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
+    }
+    /* Shifts every element from i onward up by one -- same dirty_all reasoning as delete's own
+           (see AerArray.dirty_cards's own comment, value.h); gc_barrier_array's own per-index card
+           for the new value at i is harmless but redundant once dirty_all forces a full rescan. */
+    a->dirty_all = true;
+    gc_barrier_array(vm, a, (unsigned int)i, val);
+    memmove(&a->items[i + 1], &a->items[i], (size_t)(a->count - (uint64_t)i) * sizeof(AerVal));
+    a->items[i] = val;
+    a->count++;
+    a->generation++; /* see AerArray.generation's own comment, value.h */
+    vm_stack_push(vm, arr);
+    return true;
+}
+static bool collection_index_of(VM* vm) {
+    AerVal val = vm_stack_pop(vm);
+    AerVal arr = vm_stack_pop(vm);
+    if (aer_type(arr) == TYPE_TYPED_ARRAY) {
+        vm_stack_push(vm, aer_int(typed_index_of(aer_as_typed_array(arr), val)));
+        return true;
+    }
+    if (aer_type(arr) != TYPE_ARRAY || aer_as_array(arr)->shape) {
+        error("index_of() requires an array");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    AerArray* a = aer_as_array(arr);
+    int64_t found = -1;
+    for (unsigned int i = 0; i < a->count; i++)
+        if (values_equal(val, a->items[i])) {
+            found = (int64_t)i;
+            break;
         }
-        AerArray* a = aer_as_array(arr);
-        if (a->shape) {
-            error("sort() cannot sort a struct instance");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        /* Ordering across mixed types has no sensible answer, so it's rejected up front rather than
-           falling back to an arbitrary tie-break. */
-        bool numeric = true, stringy = true;
-        for (unsigned int i = 0; i < a->count; i++) {
-            if (aer_type(a->items[i]) != TYPE_INTEGER && aer_type(a->items[i]) != TYPE_REAL)
-                numeric = false;
-            if (aer_type(a->items[i]) != TYPE_STRING)
-                stringy = false;
-        }
-        if (a->count > 0 && !numeric && !stringy) {
-            error("sort() requires all elements to be numbers, or all to be strings");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        /* Arbitrary reorder -- same dirty_all reasoning as delete/insert above (see
-           AerArray.dirty_cards's own comment, value.h); a string element is a real heap reference
-           (unlike a number), so this matters even though sort() never replaces a value. */
-        a->dirty_all = true;
-        qsort(a->items, a->count, sizeof(AerVal), sort_cmp);
+    vm_stack_push(vm, aer_int(found));
+    return true;
+}
+static bool collection_keys(VM* vm) {
+    AerVal src = vm_stack_pop(vm);
+    if (aer_type(src) != TYPE_DICT) {
+        error("keys() requires a hashtable");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    AerDict* d = aer_as_dict(src);
+    AerArray* r = vm_new_array();
+    r->count = 0;
+    r->capacity = d->map.count ? d->map.count : 4;
+    r->items = xmalloc(sizeof(AerVal) * r->capacity);
+    r->shape = NULL;
+    r->generation = 0;
+    for (unsigned int i = 0; i < d->map.count; i++) {
+        unsigned int n = d->map.dense[i].length;
+        r->items[r->count++] = aer_make_string_copy(d->map.dense[i].key, n);
+    }
+    vm_stack_push(vm, aer_array_val(r));
+    return true;
+}
+static bool collection_sort(VM* vm) {
+    AerVal arr = vm_stack_pop(vm);
+    if (aer_type(arr) == TYPE_TYPED_ARRAY) {
+        AerTypedArray* t = aer_as_typed_array(arr);
+        typed_sort(t);
         vm_stack_push(vm, arr);
         return true;
     }
+    if (aer_type(arr) != TYPE_ARRAY) {
+        error("sort() requires an array");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    AerArray* a = aer_as_array(arr);
+    if (a->shape) {
+        error("sort() cannot sort a struct instance");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    /* Ordering across mixed types has no sensible answer, so it's rejected up front rather than
+           falling back to an arbitrary tie-break. */
+    bool numeric = true, stringy = true;
+    for (unsigned int i = 0; i < a->count; i++) {
+        if (aer_type(a->items[i]) != TYPE_INTEGER && aer_type(a->items[i]) != TYPE_REAL)
+            numeric = false;
+        if (aer_type(a->items[i]) != TYPE_STRING)
+            stringy = false;
+    }
+    if (a->count > 0 && !numeric && !stringy) {
+        error("sort() requires all elements to be numbers, or all to be strings");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    /* Arbitrary reorder -- same dirty_all reasoning as delete/insert above (see
+           AerArray.dirty_cards's own comment, value.h); a string element is a real heap reference
+           (unlike a number), so this matters even though sort() never replaces a value. */
+    a->dirty_all = true;
+    qsort(a->items, a->count, sizeof(AerVal), sort_cmp);
+    vm_stack_push(vm, arr);
+    return true;
+}
+
+/* One arm per stdlib entry point. Each was already independent -- they shared nothing but the
+   two arguments -- so the chain below reads as the module's index, and each handler is judged on
+   its own. */
+bool aer_collection_call(VM* vm, int fn_id, int arg_count) {
+    if (fn_id == FN_COLLECTION_GROUP_SUM_INTO && (arg_count == 3 || arg_count == 4))
+        return collection_group_sum_into(vm, arg_count);
+    if (fn_id == FN_COLLECTION_GROUP_SUM_CHAIN && arg_count >= 5)
+        return collection_group_sum_chain(vm, arg_count);
+    if (fn_id == FN_COLLECTION_SUM_CHAIN && arg_count >= 3)
+        return collection_sum_chain(vm, arg_count);
+    if (fn_id == FN_COLLECTION_GROUP_SUM && arg_count == 3)
+        return collection_group_sum(vm);
+    if ((fn_id == FN_COLLECTION_SUM || fn_id == FN_COLLECTION_MIN || fn_id == FN_COLLECTION_MAX) &&
+        arg_count == 1)
+        return collection_sum(vm, fn_id);
+    if (fn_id == FN_COLLECTION_APPEND && arg_count == 2)
+        return collection_append(vm);
+    if (fn_id == FN_COLLECTION_RESERVE && arg_count == 2)
+        return collection_reserve(vm);
+    if (fn_id == FN_COLLECTION_DELETE && arg_count == 2)
+        return collection_delete(vm);
+    if (fn_id == FN_COLLECTION_COPY && arg_count == 1)
+        return collection_copy(vm);
+    if (fn_id == FN_COLLECTION_INSERT && arg_count == 3)
+        return collection_insert(vm);
+    if (fn_id == FN_COLLECTION_INDEX_OF && arg_count == 2)
+        return collection_index_of(vm);
+    if (fn_id == FN_COLLECTION_KEYS && arg_count == 1)
+        return collection_keys(vm);
+    if (fn_id == FN_COLLECTION_SORT && arg_count == 1)
+        return collection_sort(vm);
 
     return false;
 }
