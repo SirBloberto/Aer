@@ -175,6 +175,204 @@ static void unregister_socket(unsigned int id) {
     }
 }
 
+static bool net_connect(VM* vm) {
+    AerVal port_v = vm_stack_pop(vm);
+    AerVal host_v = vm_stack_pop(vm);
+    if (aer_type(host_v) != TYPE_STRING || aer_type(port_v) != TYPE_INTEGER) {
+        error("net.connect() requires a host string and an integer port");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    ensure_socket_layer();
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%lld", (long long)aer_as_int(port_v));
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = NULL;
+    int gai = getaddrinfo(aer_as_string(host_v)->data, port_str, &hints, &res);
+    if (gai != 0) {
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(gai_strerror(gai))));
+        return true;
+    }
+
+    sock_t s = SOCK_INVALID;
+    for (struct addrinfo* p = res; p; p = p->ai_next) {
+        s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (s == SOCK_INVALID)
+            continue;
+        if (connect_with_timeout(s, p->ai_addr, (socklen_t)p->ai_addrlen))
+            break;
+        sock_close(s);
+        s = SOCK_INVALID;
+    }
+    freeaddrinfo(res);
+    if (s == SOCK_INVALID) {
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
+        return true;
+    }
+    vm_stack_push(vm, aer_make_result(aer_int((int64_t)register_socket(s)), aer_null()));
+    return true;
+}
+static bool net_send(VM* vm) {
+    AerVal data_v = vm_stack_pop(vm);
+    AerVal handle_v = vm_stack_pop(vm);
+    if (aer_type(handle_v) != TYPE_INTEGER || aer_type(data_v) != TYPE_STRING) {
+        error("net.send() requires a connection handle and a string");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    sock_t s;
+    if (!resolve_socket(handle_v, &s)) {
+        error("net.send(): no such connection handle");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    AerString* str = aer_as_string(data_v);
+    if (!wait_ready(s, true, NET_TIMEOUT_SECONDS)) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "net.send() timed out after %ds", NET_TIMEOUT_SECONDS);
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
+        return true;
+    }
+    long sent = send(s, str->data, (int)str->length, 0);
+    if (sent < 0) {
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
+        return true;
+    }
+    vm_stack_push(vm, aer_make_result(aer_int((int64_t)sent), aer_null()));
+    return true;
+}
+static bool net_recv(VM* vm) {
+    AerVal max_v = vm_stack_pop(vm);
+    AerVal handle_v = vm_stack_pop(vm);
+    if (aer_type(handle_v) != TYPE_INTEGER || aer_type(max_v) != TYPE_INTEGER || aer_as_int(max_v) <= 0) {
+        error("net.recv() requires a connection handle and a positive max-byte count");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    sock_t s;
+    if (!resolve_socket(handle_v, &s)) {
+        error("net.recv(): no such connection handle");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    int64_t max_bytes = aer_as_int(max_v);
+    if (!wait_ready(s, false, NET_TIMEOUT_SECONDS)) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "net.recv() timed out after %ds", NET_TIMEOUT_SECONDS);
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
+        return true;
+    }
+    char* buf = xmalloc((size_t)max_bytes);
+    long got = recv(s, buf, (int)max_bytes, 0);
+    if (got < 0) {
+        free(buf);
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
+        return true;
+    }
+    /* got == 0 means the peer closed the connection -- an empty string, not an error,
+           matching io.read()'s own "EOF is just an empty read" convention. */
+    buf = xrealloc(buf, (size_t)got + 1);
+    buf[got] = '\0';
+    vm_stack_push(vm, aer_make_result(aer_make_string(buf, (unsigned int)got), aer_null()));
+    return true;
+}
+static bool net_close(VM* vm) {
+    AerVal handle_v = vm_stack_pop(vm);
+    sock_t s;
+    if (!resolve_socket(handle_v, &s)) {
+        error("net.close(): no such connection handle");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    sock_close(s);
+    unregister_socket((unsigned int)aer_as_int(handle_v));
+    vm_stack_push(vm, aer_null());
+    return true;
+}
+static bool net_listen(VM* vm) {
+    AerVal port_v = vm_stack_pop(vm);
+    if (aer_type(port_v) != TYPE_INTEGER) {
+        error("net.listen() requires an integer port");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    ensure_socket_layer();
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%lld", (long long)aer_as_int(port_v));
+
+    /* IPv4 only, not AF_UNSPEC -- an AF_UNSPEC+AI_PASSIVE lookup can resolve to the IPv6
+           wildcard first, and Windows binds that IPv6-only by default, silently refusing IPv4
+           clients (e.g. net.connect("127.0.0.1", ...)). Forcing IPv4 keeps this deterministic and
+           matches every other net-facing test in this codebase, which already targets 127.0.0.1. */
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    struct addrinfo* res = NULL;
+    int gai = getaddrinfo(NULL, port_str, &hints, &res);
+    if (gai != 0) {
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(gai_strerror(gai))));
+        return true;
+    }
+
+    sock_t s = SOCK_INVALID;
+    for (struct addrinfo* p = res; p; p = p->ai_next) {
+        s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (s == SOCK_INVALID)
+            continue;
+        int yes = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+        if (bind(s, p->ai_addr, (socklen_t)p->ai_addrlen) == 0 && listen(s, 16) == 0)
+            break;
+        sock_close(s);
+        s = SOCK_INVALID;
+    }
+    freeaddrinfo(res);
+    if (s == SOCK_INVALID) {
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
+        return true;
+    }
+    vm_stack_push(vm, aer_make_result(aer_int((int64_t)register_socket(s)), aer_null()));
+    return true;
+}
+static bool net_accept(VM* vm) {
+    AerVal handle_v = vm_stack_pop(vm);
+    if (aer_type(handle_v) != TYPE_INTEGER) {
+        error("net.accept() requires a listening handle");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    sock_t s;
+    if (!resolve_socket(handle_v, &s)) {
+        error("net.accept(): no such connection handle");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    /* Bounded, not indefinite: an unbounded accept() would freeze the whole cooperative
+           scheduler, not just this actor -- a server script polls by calling accept() again on a
+           timeout, exactly like a client script retries connect(). */
+    if (!wait_ready(s, false, NET_TIMEOUT_SECONDS)) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "net.accept() timed out after %ds", NET_TIMEOUT_SECONDS);
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
+        return true;
+    }
+    sock_t conn = accept(s, NULL, NULL);
+    if (conn == SOCK_INVALID) {
+        vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
+        return true;
+    }
+    vm_stack_push(vm, aer_make_result(aer_int((int64_t)register_socket(conn)), aer_null()));
+    return true;
+}
+
 bool aer_net_call(VM* vm, int fn_id, int arg_count) {
     if (!vm->net_enabled) {
         for (int i = 0; i < arg_count; i++)
@@ -183,208 +381,18 @@ bool aer_net_call(VM* vm, int fn_id, int arg_count) {
         vm_stack_push(vm, aer_null());
         return true;
     }
-    if (fn_id == FN_NET_CONNECT && arg_count == 2) {
-        AerVal port_v = vm_stack_pop(vm);
-        AerVal host_v = vm_stack_pop(vm);
-        if (aer_type(host_v) != TYPE_STRING || aer_type(port_v) != TYPE_INTEGER) {
-            error("net.connect() requires a host string and an integer port");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        ensure_socket_layer();
-
-        char port_str[16];
-        snprintf(port_str, sizeof(port_str), "%lld", (long long)aer_as_int(port_v));
-
-        struct addrinfo hints;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        struct addrinfo* res = NULL;
-        int gai = getaddrinfo(aer_as_string(host_v)->data, port_str, &hints, &res);
-        if (gai != 0) {
-            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(gai_strerror(gai))));
-            return true;
-        }
-
-        sock_t s = SOCK_INVALID;
-        for (struct addrinfo* p = res; p; p = p->ai_next) {
-            s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-            if (s == SOCK_INVALID)
-                continue;
-            if (connect_with_timeout(s, p->ai_addr, (socklen_t)p->ai_addrlen))
-                break;
-            sock_close(s);
-            s = SOCK_INVALID;
-        }
-        freeaddrinfo(res);
-        if (s == SOCK_INVALID) {
-            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
-            return true;
-        }
-        vm_stack_push(vm, aer_make_result(aer_int((int64_t)register_socket(s)), aer_null()));
-        return true;
-    }
-
-    if (fn_id == FN_NET_SEND && arg_count == 2) {
-        AerVal data_v = vm_stack_pop(vm);
-        AerVal handle_v = vm_stack_pop(vm);
-        if (aer_type(handle_v) != TYPE_INTEGER || aer_type(data_v) != TYPE_STRING) {
-            error("net.send() requires a connection handle and a string");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        sock_t s;
-        if (!resolve_socket(handle_v, &s)) {
-            error("net.send(): no such connection handle");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        AerString* str = aer_as_string(data_v);
-        if (!wait_ready(s, true, NET_TIMEOUT_SECONDS)) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "net.send() timed out after %ds", NET_TIMEOUT_SECONDS);
-            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
-            return true;
-        }
-        long sent = send(s, str->data, (int)str->length, 0);
-        if (sent < 0) {
-            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
-            return true;
-        }
-        vm_stack_push(vm, aer_make_result(aer_int((int64_t)sent), aer_null()));
-        return true;
-    }
-
-    if (fn_id == FN_NET_RECV && arg_count == 2) {
-        AerVal max_v = vm_stack_pop(vm);
-        AerVal handle_v = vm_stack_pop(vm);
-        if (aer_type(handle_v) != TYPE_INTEGER || aer_type(max_v) != TYPE_INTEGER || aer_as_int(max_v) <= 0) {
-            error("net.recv() requires a connection handle and a positive max-byte count");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        sock_t s;
-        if (!resolve_socket(handle_v, &s)) {
-            error("net.recv(): no such connection handle");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        int64_t max_bytes = aer_as_int(max_v);
-        if (!wait_ready(s, false, NET_TIMEOUT_SECONDS)) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "net.recv() timed out after %ds", NET_TIMEOUT_SECONDS);
-            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
-            return true;
-        }
-        char* buf = xmalloc((size_t)max_bytes);
-        long got = recv(s, buf, (int)max_bytes, 0);
-        if (got < 0) {
-            free(buf);
-            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
-            return true;
-        }
-        /* got == 0 means the peer closed the connection -- an empty string, not an error,
-           matching io.read()'s own "EOF is just an empty read" convention. */
-        buf = xrealloc(buf, (size_t)got + 1);
-        buf[got] = '\0';
-        vm_stack_push(vm, aer_make_result(aer_make_string(buf, (unsigned int)got), aer_null()));
-        return true;
-    }
-
-    if (fn_id == FN_NET_CLOSE && arg_count == 1) {
-        AerVal handle_v = vm_stack_pop(vm);
-        sock_t s;
-        if (!resolve_socket(handle_v, &s)) {
-            error("net.close(): no such connection handle");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        sock_close(s);
-        unregister_socket((unsigned int)aer_as_int(handle_v));
-        vm_stack_push(vm, aer_null());
-        return true;
-    }
-
-    if (fn_id == FN_NET_LISTEN && arg_count == 1) {
-        AerVal port_v = vm_stack_pop(vm);
-        if (aer_type(port_v) != TYPE_INTEGER) {
-            error("net.listen() requires an integer port");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        ensure_socket_layer();
-
-        char port_str[16];
-        snprintf(port_str, sizeof(port_str), "%lld", (long long)aer_as_int(port_v));
-
-        /* IPv4 only, not AF_UNSPEC -- an AF_UNSPEC+AI_PASSIVE lookup can resolve to the IPv6
-           wildcard first, and Windows binds that IPv6-only by default, silently refusing IPv4
-           clients (e.g. net.connect("127.0.0.1", ...)). Forcing IPv4 keeps this deterministic and
-           matches every other net-facing test in this codebase, which already targets 127.0.0.1. */
-        struct addrinfo hints;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        hints.ai_flags = AI_PASSIVE;
-        struct addrinfo* res = NULL;
-        int gai = getaddrinfo(NULL, port_str, &hints, &res);
-        if (gai != 0) {
-            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(gai_strerror(gai))));
-            return true;
-        }
-
-        sock_t s = SOCK_INVALID;
-        for (struct addrinfo* p = res; p; p = p->ai_next) {
-            s = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-            if (s == SOCK_INVALID)
-                continue;
-            int yes = 1;
-            setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
-            if (bind(s, p->ai_addr, (socklen_t)p->ai_addrlen) == 0 && listen(s, 16) == 0)
-                break;
-            sock_close(s);
-            s = SOCK_INVALID;
-        }
-        freeaddrinfo(res);
-        if (s == SOCK_INVALID) {
-            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
-            return true;
-        }
-        vm_stack_push(vm, aer_make_result(aer_int((int64_t)register_socket(s)), aer_null()));
-        return true;
-    }
-
-    if (fn_id == FN_NET_ACCEPT && arg_count == 1) {
-        AerVal handle_v = vm_stack_pop(vm);
-        if (aer_type(handle_v) != TYPE_INTEGER) {
-            error("net.accept() requires a listening handle");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        sock_t s;
-        if (!resolve_socket(handle_v, &s)) {
-            error("net.accept(): no such connection handle");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        /* Bounded, not indefinite: an unbounded accept() would freeze the whole cooperative
-           scheduler, not just this actor -- a server script polls by calling accept() again on a
-           timeout, exactly like a client script retries connect(). */
-        if (!wait_ready(s, false, NET_TIMEOUT_SECONDS)) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "net.accept() timed out after %ds", NET_TIMEOUT_SECONDS);
-            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(msg)));
-            return true;
-        }
-        sock_t conn = accept(s, NULL, NULL);
-        if (conn == SOCK_INVALID) {
-            vm_stack_push(vm, aer_make_result(aer_null(), aer_make_error(sock_errmsg())));
-            return true;
-        }
-        vm_stack_push(vm, aer_make_result(aer_int((int64_t)register_socket(conn)), aer_null()));
-        return true;
-    }
+    if (fn_id == FN_NET_CONNECT && arg_count == 2)
+        return net_connect(vm);
+    if (fn_id == FN_NET_SEND && arg_count == 2)
+        return net_send(vm);
+    if (fn_id == FN_NET_RECV && arg_count == 2)
+        return net_recv(vm);
+    if (fn_id == FN_NET_CLOSE && arg_count == 1)
+        return net_close(vm);
+    if (fn_id == FN_NET_LISTEN && arg_count == 1)
+        return net_listen(vm);
+    if (fn_id == FN_NET_ACCEPT && arg_count == 1)
+        return net_accept(vm);
 
     return false;
 }
