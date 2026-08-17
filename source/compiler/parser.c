@@ -5009,6 +5009,161 @@ static bool try_vectorize_group_accumulate(Chunk* c, unsigned int prep_at, unsig
 /* No exit-time cleanup needed -- col_reg/idx_reg are ordinary registers. Reserves the loop
    variable's register BEFORE compiling the collection expression, so later temps can never
    alias it. */
+/* `for i in a..b`, with an optional step. Direction is inferred at runtime from cur vs end
+   rather than from the step's sign, which is why this is for-loop-specific and not a value. */
+static void parse_for_range(Chunk* c, unsigned int loop_var_name, int item_reg, int rk_start) {
+    int rk_end = parse_binary(c, 0);
+    int rk_step;
+    if (consume(TOKEN_DOT_DOT))
+        rk_step = parse_binary(c, 0);
+    else
+        rk_step = (int)chunk_add_pool(c, aer_int(1)) | RK_CONST_FLAG;
+
+    require(TOKEN_COLON, "expected ':' after for-in clause");
+    if (parse_had_error)
+        return;
+
+    /* Checked before arg_materialize, which may copy rk_start/rk_end into fresh registers that
+           no longer identify their source. bound_safe: rk_end reads exactly the local proven ==
+           length(P), and bound_array_reg records which P. start_safe: rk_start is literal 0, an
+           enclosing safe loop's item register proven for that SAME array, or that plus a
+           non-negative constant. Both fail closed -- an unrecognized shape just compiles as before. */
+    bool bound_safe = false;
+    int bound_array_reg = -1;
+    if (P.length_tracked_valid && !(rk_end & RK_CONST_FLAG)) {
+        for (int vi = 0; vi < P.var_count; vi++) {
+            /* Any kind, not just VAR_BOXED: what matters is that this name still reads the
+                   length, which knowing its type does not change. */
+            if (P.var_names[vi] == P.length_tracked_name && P.var_regs[vi] == drop_raw_marks(rk_end)) {
+                bound_safe = true;
+                bound_array_reg = P.length_tracked_source_reg;
+                break;
+            }
+        }
+    }
+    /* bound_safe proves the upper bound (the end IS length(arr)); this proves the lower one. Any
+           expression the compiler can show is >= 0 will do -- see Parser.reg_nonneg, which replaced
+           three hand-decoded special cases (literal, bare safe register, and `safe_reg + const`
+           matched by inspecting the emitted OP_ADD word) with one composable predicate. It now also
+           covers `p*p`, `i*i+j`, `(p+1)*2` and anything else built from + * // %. */
+    bool start_safe = bound_safe && rk_nonneg(c, rk_start);
+    bool this_loop_safe = bound_safe && start_safe && P.safe_loop_depth < LOOP_MAX;
+
+    /* Snapshotted once, matching Lua/Python's range-for semantics -- a later mutation of the
+           source variable has no effect on an already-running loop. Used to reuse a plain register
+           via materialize(), which meant `for i in 0..n:` silently re-read `n` every iteration (an
+           undocumented, untested quirk) and forced OP_ITER_RANGE_LOOP to re-validate types every
+           dispatch; the snapshot removes both. */
+    int cur_reg = arg_materialize(c, rk_start);
+    int end_reg = arg_materialize(c, rk_end);
+    int step_reg = arg_materialize(c, rk_step);
+
+    /* Promotes temps to permanent status for the loop's duration -- without it, a fresh variable
+           inside the body could alias cur_reg/step_reg (real bug with nested ranged loops).
+           Restored to the pre-loop watermark once the loop's bytecode is emitted. */
+    int saved_reserved_floor = P.slot_floor;
+    P.slot_floor = P.slot_next;
+    int raised_reserved_floor = P.slot_floor;
+
+    bool hoisting = hoist_begin(c);
+    unsigned int prep_at = c->count;
+    /* Loop-rotated: PREP once before the loop, LOOP at the bottom of the body -- the one form
+           whose continue must defer-patch instead of jumping to a known target. */
+    unsigned int patch_empty = emit_iter_range_prep(c, cur_reg, end_reg, step_reg, item_reg, this_loop_safe);
+
+    if (!loop_push_rotated()) {
+        hoist_end(c, prep_at, hoisting);
+        P.slot_floor = saved_reserved_floor;
+        P.slot_next = saved_reserved_floor;
+        return;
+    }
+    /* Pushed/popped exactly around this one loop's own body -- see safe_loop_item_regs's own
+           comment (Parser struct) for why this is a small stack, not a whole-frame table. */
+    if (this_loop_safe) {
+        P.safe_loop_array_regs[P.safe_loop_depth] = bound_array_reg;
+        P.safe_loop_item_regs[P.safe_loop_depth] = item_reg;
+        P.safe_loop_depth++;
+        /* Accepting the loop required a non-negative start, and the step is positive, so
+               every value this register takes is >= 0. */
+        if (item_reg >= 0 && item_reg < FRAME_REGISTERS)
+            P.reg_nonneg[item_reg] = true;
+    }
+    /* Same push/pop discipline as safe_loop_* above; invalidate_register does the recording. */
+    bool range_tracked = P.range_loop_depth < LOOP_MAX;
+    if (range_tracked) {
+        P.range_item_regs[P.range_loop_depth] = item_reg;
+        P.range_item_written[P.range_loop_depth] = false;
+        P.range_loop_depth++;
+    }
+    /* PREP rejects a non-integer bound or step outright and publishes a tagged integer, and LOOP
+           only ever advances it as one -- so this variable is an integer on every path that reaches
+           the body, and saying so lets the body index and compute unchecked. Without it the
+           idiomatic `for i in 0..n` compiled to the generic opcodes while the hand-written
+           `i = 0; for i < n` did not, which measured 15.9% more instructions for the same work. */
+    for (int v = P.var_count - 1; v >= 0; v--)
+        if (P.var_names[v] == loop_var_name && P.var_regs[v] == item_reg) {
+            P.var_kind[v] = VAR_RAW_INT;
+            break;
+        }
+    unsigned int body_start = c->count;
+    parse_block(c);
+    if (parse_had_error) {
+        hoist_end(c, prep_at, hoisting);
+        if (range_tracked)
+            P.range_loop_depth--;
+        if (this_loop_safe)
+            P.safe_loop_depth--;
+        P.loop_depth--;
+        P.slot_floor = saved_reserved_floor;
+        P.slot_next = saved_reserved_floor;
+        return;
+    }
+    if (this_loop_safe)
+        P.safe_loop_depth--;
+    bool body_wrote_item = !range_tracked || P.range_item_written[P.range_loop_depth - 1];
+    if (range_tracked)
+        P.range_loop_depth--;
+
+    /* Attempted before LOOP is emitted, so a success rewinds over PREP and the body together.
+           Requires the loop's own bound proof: the whole-array reduction reads length(array)
+           elements, which is only the same work when the loop ran exactly that many. */
+    if (this_loop_safe && !body_wrote_item && P.loop_stack[P.loop_depth - 1].patch_count == 0 &&
+        P.loop_stack[P.loop_depth - 1].continue_patch_count == 0 &&
+        (try_vectorize_reduction(c, prep_at, body_start, c->count, item_reg, bound_array_reg, rk_start,
+                                 rk_step) ||
+         try_vectorize_group_accumulate(c, prep_at, body_start, c->count, item_reg, bound_array_reg, rk_start,
+                                        rk_step))) {
+        P.loop_depth--;
+        hoist_end(c, prep_at, hoisting);
+        if (P.slot_floor == raised_reserved_floor) {
+            P.slot_floor = saved_reserved_floor;
+            P.slot_next = saved_reserved_floor;
+        }
+        return;
+    }
+
+    unsigned int loop_bottom = c->count;
+    /* PREP already left the start value in item_reg, so when the body never writes that register
+           the loop's counter can live there and LOOP maintains one register instead of two. PREP's
+           own cur operand stays cur_reg either way -- it only ever reads it. */
+    emit_iter_range_loop(c, body_wrote_item ? cur_reg : item_reg, end_reg, step_reg, item_reg, body_start);
+
+    unsigned int exit_pos = c->count;
+    patch_jump(c, patch_empty, exit_pos);
+    loop_pop_and_patch_rotated(c, exit_pos, loop_bottom);
+    hoist_end(c, prep_at, hoisting);
+
+    /* Conditional for the same reason the while-form's restore is: a name first assigned in the
+           body outlives the loop, so lowering past its register would hand a live variable to the
+           next statement as a temp. */
+    if (P.slot_floor == raised_reserved_floor) {
+        P.slot_floor = saved_reserved_floor;
+        P.slot_next = saved_reserved_floor;
+    }
+    assert_variables_below_floor("range-for body");
+    return;
+}
+
 static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
     /* A for-in loop variable always holds a plain item, never a value of known type -- an existing
        typed name of the same spelling must forget its type first. */
@@ -5038,160 +5193,8 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
 
     /* Direction is inferred at runtime from cur vs end, not step's sign. `..` is for-loop-specific
        syntax here. */
-    if (consume(TOKEN_DOT_DOT)) {
-        int rk_end = parse_binary(c, 0);
-        int rk_step;
-        if (consume(TOKEN_DOT_DOT))
-            rk_step = parse_binary(c, 0);
-        else
-            rk_step = (int)chunk_add_pool(c, aer_int(1)) | RK_CONST_FLAG;
-
-        require(TOKEN_COLON, "expected ':' after for-in clause");
-        if (parse_had_error)
-            return;
-
-        /* Checked before arg_materialize, which may copy rk_start/rk_end into fresh registers that
-           no longer identify their source. bound_safe: rk_end reads exactly the local proven ==
-           length(P), and bound_array_reg records which P. start_safe: rk_start is literal 0, an
-           enclosing safe loop's item register proven for that SAME array, or that plus a
-           non-negative constant. Both fail closed -- an unrecognized shape just compiles as before. */
-        bool bound_safe = false;
-        int bound_array_reg = -1;
-        if (P.length_tracked_valid && !(rk_end & RK_CONST_FLAG)) {
-            for (int vi = 0; vi < P.var_count; vi++) {
-                /* Any kind, not just VAR_BOXED: what matters is that this name still reads the
-                   length, which knowing its type does not change. */
-                if (P.var_names[vi] == P.length_tracked_name && P.var_regs[vi] == drop_raw_marks(rk_end)) {
-                    bound_safe = true;
-                    bound_array_reg = P.length_tracked_source_reg;
-                    break;
-                }
-            }
-        }
-        /* bound_safe proves the upper bound (the end IS length(arr)); this proves the lower one. Any
-           expression the compiler can show is >= 0 will do -- see Parser.reg_nonneg, which replaced
-           three hand-decoded special cases (literal, bare safe register, and `safe_reg + const`
-           matched by inspecting the emitted OP_ADD word) with one composable predicate. It now also
-           covers `p*p`, `i*i+j`, `(p+1)*2` and anything else built from + * // %. */
-        bool start_safe = bound_safe && rk_nonneg(c, rk_start);
-        bool this_loop_safe = bound_safe && start_safe && P.safe_loop_depth < LOOP_MAX;
-
-        /* Snapshotted once, matching Lua/Python's range-for semantics -- a later mutation of the
-           source variable has no effect on an already-running loop. Used to reuse a plain register
-           via materialize(), which meant `for i in 0..n:` silently re-read `n` every iteration (an
-           undocumented, untested quirk) and forced OP_ITER_RANGE_LOOP to re-validate types every
-           dispatch; the snapshot removes both. */
-        int cur_reg = arg_materialize(c, rk_start);
-        int end_reg = arg_materialize(c, rk_end);
-        int step_reg = arg_materialize(c, rk_step);
-
-        /* Promotes temps to permanent status for the loop's duration -- without it, a fresh variable
-           inside the body could alias cur_reg/step_reg (real bug with nested ranged loops).
-           Restored to the pre-loop watermark once the loop's bytecode is emitted. */
-        int saved_reserved_floor = P.slot_floor;
-        P.slot_floor = P.slot_next;
-        int raised_reserved_floor = P.slot_floor;
-
-        bool hoisting = hoist_begin(c);
-        unsigned int prep_at = c->count;
-        /* Loop-rotated: PREP once before the loop, LOOP at the bottom of the body -- the one form
-           whose continue must defer-patch instead of jumping to a known target. */
-        unsigned int patch_empty =
-            emit_iter_range_prep(c, cur_reg, end_reg, step_reg, item_reg, this_loop_safe);
-
-        if (!loop_push_rotated()) {
-            hoist_end(c, prep_at, hoisting);
-            P.slot_floor = saved_reserved_floor;
-            P.slot_next = saved_reserved_floor;
-            return;
-        }
-        /* Pushed/popped exactly around this one loop's own body -- see safe_loop_item_regs's own
-           comment (Parser struct) for why this is a small stack, not a whole-frame table. */
-        if (this_loop_safe) {
-            P.safe_loop_array_regs[P.safe_loop_depth] = bound_array_reg;
-            P.safe_loop_item_regs[P.safe_loop_depth] = item_reg;
-            P.safe_loop_depth++;
-            /* Accepting the loop required a non-negative start, and the step is positive, so
-               every value this register takes is >= 0. */
-            if (item_reg >= 0 && item_reg < FRAME_REGISTERS)
-                P.reg_nonneg[item_reg] = true;
-        }
-        /* Same push/pop discipline as safe_loop_* above; invalidate_register does the recording. */
-        bool range_tracked = P.range_loop_depth < LOOP_MAX;
-        if (range_tracked) {
-            P.range_item_regs[P.range_loop_depth] = item_reg;
-            P.range_item_written[P.range_loop_depth] = false;
-            P.range_loop_depth++;
-        }
-        /* PREP rejects a non-integer bound or step outright and publishes a tagged integer, and LOOP
-           only ever advances it as one -- so this variable is an integer on every path that reaches
-           the body, and saying so lets the body index and compute unchecked. Without it the
-           idiomatic `for i in 0..n` compiled to the generic opcodes while the hand-written
-           `i = 0; for i < n` did not, which measured 15.9% more instructions for the same work. */
-        for (int v = P.var_count - 1; v >= 0; v--)
-            if (P.var_names[v] == loop_var_name && P.var_regs[v] == item_reg) {
-                P.var_kind[v] = VAR_RAW_INT;
-                break;
-            }
-        unsigned int body_start = c->count;
-        parse_block(c);
-        if (parse_had_error) {
-            hoist_end(c, prep_at, hoisting);
-            if (range_tracked)
-                P.range_loop_depth--;
-            if (this_loop_safe)
-                P.safe_loop_depth--;
-            P.loop_depth--;
-            P.slot_floor = saved_reserved_floor;
-            P.slot_next = saved_reserved_floor;
-            return;
-        }
-        if (this_loop_safe)
-            P.safe_loop_depth--;
-        bool body_wrote_item = !range_tracked || P.range_item_written[P.range_loop_depth - 1];
-        if (range_tracked)
-            P.range_loop_depth--;
-
-        /* Attempted before LOOP is emitted, so a success rewinds over PREP and the body together.
-           Requires the loop's own bound proof: the whole-array reduction reads length(array)
-           elements, which is only the same work when the loop ran exactly that many. */
-        if (this_loop_safe && !body_wrote_item && P.loop_stack[P.loop_depth - 1].patch_count == 0 &&
-            P.loop_stack[P.loop_depth - 1].continue_patch_count == 0 &&
-            (try_vectorize_reduction(c, prep_at, body_start, c->count, item_reg, bound_array_reg, rk_start,
-                                     rk_step) ||
-             try_vectorize_group_accumulate(c, prep_at, body_start, c->count, item_reg, bound_array_reg,
-                                            rk_start, rk_step))) {
-            P.loop_depth--;
-            hoist_end(c, prep_at, hoisting);
-            if (P.slot_floor == raised_reserved_floor) {
-                P.slot_floor = saved_reserved_floor;
-                P.slot_next = saved_reserved_floor;
-            }
-            return;
-        }
-
-        unsigned int loop_bottom = c->count;
-        /* PREP already left the start value in item_reg, so when the body never writes that register
-           the loop's counter can live there and LOOP maintains one register instead of two. PREP's
-           own cur operand stays cur_reg either way -- it only ever reads it. */
-        emit_iter_range_loop(c, body_wrote_item ? cur_reg : item_reg, end_reg, step_reg, item_reg,
-                             body_start);
-
-        unsigned int exit_pos = c->count;
-        patch_jump(c, patch_empty, exit_pos);
-        loop_pop_and_patch_rotated(c, exit_pos, loop_bottom);
-        hoist_end(c, prep_at, hoisting);
-
-        /* Conditional for the same reason the while-form's restore is: a name first assigned in the
-           body outlives the loop, so lowering past its register would hand a live variable to the
-           next statement as a temp. */
-        if (P.slot_floor == raised_reserved_floor) {
-            P.slot_floor = saved_reserved_floor;
-            P.slot_next = saved_reserved_floor;
-        }
-        assert_variables_below_floor("range-for body");
-        return;
-    }
+    if (consume(TOKEN_DOT_DOT))
+        return parse_for_range(c, loop_var_name, item_reg, rk_start);
 
     require(TOKEN_COLON, "expected ':' after for-in clause");
     if (parse_had_error)
