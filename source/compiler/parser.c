@@ -3628,6 +3628,35 @@ static void parse_chain_compound(Chunk* c, ChainTarget t) {
     }
 }
 
+/* One hop along an assignment target's chain: reads the pending index/field step into a register,
+   which becomes the base the next step reads from. Claims a fresh register only on the first hop --
+   after that the chain's own running temp is dead and gets reused in place, as does a dying index
+   temp. */
+static void chain_advance(Chunk* c, int* obj_reg, bool* obj_is_base, bool pending_is_field,
+                          unsigned int pending_field_idx, int pending_rk_idx) {
+    bool reuse_pending_idx_reg = !pending_is_field && is_temp(pending_rk_idx);
+    int dest_reg;
+    if (!*obj_is_base)
+        dest_reg = *obj_reg;
+    else if (reuse_pending_idx_reg)
+        dest_reg = pending_rk_idx;
+    else
+        dest_reg = reg_alloc();
+
+    if (pending_is_field)
+        emit_field_get(c, dest_reg, *obj_reg, pending_field_idx);
+    else
+        emit_index_get(c, dest_reg, *obj_reg, pending_rk_idx);
+
+    /* Only free the index temp when it is a different register than dest_reg -- otherwise it was
+       already folded in. */
+    if (reuse_pending_idx_reg && dest_reg != pending_rk_idx)
+        reg_free(1);
+
+    *obj_reg = dest_reg;
+    *obj_is_base = false;
+}
+
 static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_is_index) {
     int obj_reg;
     bool obj_is_base; /* true while obj_reg is still name_idx's own permanent register */
@@ -3817,48 +3846,13 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
 
         /* Replicates what the general loop's first iteration would do for a pending index step
            immediately followed by '.field', then falls through to the same general machinery. */
-        bool reuse_pending_idx_reg = is_temp(pending_rk_idx);
-        int dest_reg;
-        if (!obj_is_base)
-            dest_reg = obj_reg;
-        else if (reuse_pending_idx_reg)
-            dest_reg = pending_rk_idx;
-        else
-            dest_reg = reg_alloc();
-
-        emit_index_get(c, dest_reg, obj_reg, pending_rk_idx);
-
-        if (reuse_pending_idx_reg && dest_reg != pending_rk_idx)
-            reg_free(1);
-
-        obj_reg = dest_reg;
-        obj_is_base = false;
+        chain_advance(c, &obj_reg, &obj_is_base, false, 0, pending_rk_idx);
         pending_is_field = true;
         pending_field_idx = fused_field_idx;
     }
 
     while (equal(TOKEN_OPEN_BRACKET) || equal(TOKEN_DOT)) {
-        bool reuse_pending_idx_reg = !pending_is_field && is_temp(pending_rk_idx);
-        int dest_reg;
-        if (!obj_is_base)
-            dest_reg = obj_reg; /* reuse the chain's running temp in place */
-        else if (reuse_pending_idx_reg)
-            dest_reg = pending_rk_idx; /* reuse the (dying) index temp's register */
-        else
-            dest_reg = reg_alloc(); /* first hop, nothing safe to reuse */
-
-        if (pending_is_field)
-            emit_field_get(c, dest_reg, obj_reg, pending_field_idx);
-        else
-            emit_index_get(c, dest_reg, obj_reg, pending_rk_idx);
-
-        /* Only free the index temp when it's a different register than dest_reg -- otherwise it was
-           already folded in. */
-        if (reuse_pending_idx_reg && dest_reg != pending_rk_idx)
-            reg_free(1);
-
-        obj_reg = dest_reg;
-        obj_is_base = false;
+        chain_advance(c, &obj_reg, &obj_is_base, pending_is_field, pending_field_idx, pending_rk_idx);
 
         if (consume(TOKEN_OPEN_BRACKET)) {
             pending_is_field = false;
@@ -3891,29 +3885,11 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                         "continuation after this chain");
     }
 
-    {
-        bool reuse_pending_idx_reg = !pending_is_field && is_temp(pending_rk_idx);
-        int dest_reg;
-        if (!obj_is_base)
-            dest_reg = obj_reg;
-        else if (reuse_pending_idx_reg)
-            dest_reg = pending_rk_idx;
-        else
-            dest_reg = reg_alloc();
-
-        if (pending_is_field)
-            emit_field_get(c, dest_reg, obj_reg, pending_field_idx);
-        else
-            emit_index_get(c, dest_reg, obj_reg, pending_rk_idx);
-
-        if (reuse_pending_idx_reg && dest_reg != pending_rk_idx)
-            reg_free(1);
-
-        int rk = parse_postfix_chain(c, dest_reg);
-        unsigned int lhs_start = c->count;
-        rk = parse_binary_ops(c, 0, rk, lhs_start);
-        discard_statement_result(c, rk);
-    }
+    chain_advance(c, &obj_reg, &obj_is_base, pending_is_field, pending_field_idx, pending_rk_idx);
+    int rk = parse_postfix_chain(c, obj_reg);
+    unsigned int lhs_start = c->count;
+    rk = parse_binary_ops(c, 0, rk, lhs_start);
+    discard_statement_result(c, rk);
 }
 
 /* Called when the skip-to-boundary loop stops at a plain NEWLINE, not already a boundary -- a
