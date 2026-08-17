@@ -2268,7 +2268,8 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         unsigned int width = vm_typed_elem_width(ta->elem_kind);
         *out = vm_typed_elem_read(ta->data + (size_t)i * width, ta->elem_kind);
     } else {
-        error("Cannot index type");
+        error("This value cannot be indexed — indexing reads from an array, a column, a hashtable, "
+              "a string, or a Result (0 for the value, 1 for the error)");
         *out = aer_null();
     }
 }
@@ -2371,7 +2372,7 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         unsigned int width = vm_typed_elem_width(ta->elem_kind);
         vm_typed_elem_write(ta->data + (size_t)i * width, ta->elem_kind, val);
     } else {
-        error("Cannot index type");
+        error("This value cannot be assigned to by index — an array, a column or a hashtable can");
     }
 }
 
@@ -2389,7 +2390,10 @@ static AerVal vm_cast(AerVal v, int cast_type) {
                           "string with string.to_integer(), which returns (value, err)");
                     r = aer_int(0);
                     break;
-                default: error("Cannot convert this type to integer"); r = aer_int(0);
+                default:
+                    error("integer() accepts a number or a boolean");
+                    r = aer_int(0);
+                    break;
             }
             break;
         case CAST_FLOAT:
@@ -2402,7 +2406,10 @@ static AerVal vm_cast(AerVal v, int cast_type) {
                           "string with string.to_float(), which returns (value, err)");
                     r = aer_real(0.0);
                     break;
-                default: error("Cannot convert this type to float"); r = aer_real(0.0);
+                default:
+                    error("float() accepts a number or a boolean");
+                    r = aer_real(0.0);
+                    break;
             }
             break;
         case CAST_BOOLEAN: r = aer_bool(vm_truthy(v)); break;
