@@ -306,8 +306,7 @@ static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size)
 /* Wraps an exclusively-owned (data, length) in a fresh heap box; never copies. Routes to
    current_heap, guarded via vm_require_current_heap() because the lexer can call this
    (emit_string_token) before any VM/pool exists -- without the guard, an uninitialized heap's
-   zero elem_size makes pool_alloc hand back a ~1-byte allocation (confirmed heap-buffer-overflow
-   via ASAN, back when this was a single process-global pool). */
+   zero elem_size makes pool_alloc hand back a ~1-byte allocation (ASAN heap-buffer-overflow). */
 static AerString* aer_string_alloc(unsigned int length) {
     VmHeap* heap = vm_require_current_heap();
     vm_heap_init(heap);
@@ -3645,11 +3644,10 @@ lbl_call_self: {
 lbl_raw_math_real: {
     int dest = (int)UNPACK_A(op_word);
     double x = registers[UNPACK_B(op_word)].as.d;
-    /* sqrt is one machine instruction and the overwhelming majority of the traffic. Calling out for
-       it put a real call in the dispatch loop, which costs far more than the call itself: every
-       hoisted pointer becomes call-clobbered, and the register allocator pessimizes accordingly.
-       nbody was executing 13% fewer instructions than before this opcode existed and still spending
-       10% more cycles. The rest are rare enough to keep paying for the call. */
+    /* sqrt is one machine instruction and the overwhelming majority of the traffic. A real call in
+       the dispatch loop costs far more than the call itself -- every hoisted pointer becomes
+       call-clobbered and the register allocator pessimizes accordingly, which on nbody was worth
+       10% of cycles against a 13% instruction saving. The rest are rare enough to keep the call. */
     if (UNPACK_C(op_word) == FN_MATH_SQRT && x >= 0) {
         registers[dest] = aer_real(sqrt(x));
         DISPATCH();
@@ -3978,7 +3976,6 @@ lbl_slice_get: {
     DISPATCH();
 }
 
-/* Errors unless src_reg holds exactly that struct type; never converts. */
 /* Dict literal -- each key stored as an owned copy, never an alias into the source string. */
 lbl_dict_new: {
     int dest_reg = (int)UNPACK_A(op_word);
@@ -4262,10 +4259,9 @@ lbl_field_get: {
     DISPATCH();
 }
 
-/* `x OP y.field` no longer has its own opcode -- parse_binary_ops canonicalizes it into this
-   opcode's own `field OP' x` form at compile time instead (see that function's own comment, and
-   OP_FIELD_BINARY's, vm.h, for why that's exact, not an approximation, for every operator that
-   reaches here). */
+/* `x OP y.field` reaches here too: parse_binary_ops canonicalizes it into this opcode's `field OP' x`
+   form at compile time (see that function's own comment, and OP_FIELD_BINARY's, vm.h, for why that
+   is exact, not an approximation, for every operator that reaches here). */
 lbl_field_binary: {
     unsigned int site = (unsigned int)(pc - code) - 1;
     int dest_reg = (int)UNPACK_A(op_word);
@@ -4292,9 +4288,8 @@ lbl_field_binary: {
     DISPATCH();
 }
 
-/* `struct.field OP= rhs` -- resolves the field exactly ONCE (one vm_resolve_field/cache lookup),
-   reads it, computes, type-checks, and writes back, instead of the two full field resolutions
-   (OP_FIELD_BINARY's read + a separate OP_FIELD_SET's write) this used to compile to. */
+/* `struct.field OP= rhs` -- one vm_resolve_field/cache lookup covers the read, the compute, the
+   type check and the write back, where a separate read and write would each pay their own. */
 lbl_field_compound: {
     unsigned int site = (unsigned int)(pc - code) - 1;
     int struct_reg = (int)UNPACK_A(op_word);
@@ -5059,14 +5054,9 @@ lbl_index_field_compound_raw_float32_unchecked: {
     DISPATCH();
 }
 
-/* Unconditional, untagged unbox -- see this opcode's own comment, vm.h. Only ever appears once per
-   raw-bound parameter, at the very start of a specialized body's "raw-numeric variant"; lbl_call
-   already proved the argument's runtime type before choosing to jump here, so there's nothing left
-   to check. */
-/* `[value; count]` -- replaces the old `Type[count]` (OP_PACKED_ARRAY_NEW) entirely. fill_reg has
-   already been evaluated exactly once by the parser's own codegen; this handler just branches on
-   its RUNTIME type. Eligibility (every field a fixed primitive) is checked here for the same reason
-   the old opcode checked it here -- a Shape is only fully known once its OP_DEFINE_STRUCT has run. */
+/* `[value; count]` -- fill_reg is already evaluated exactly once by the parser, so this branches on
+   its RUNTIME type. Eligibility (every field a fixed primitive) has to be checked here rather than
+   at compile time: a Shape is only fully known once its OP_DEFINE_STRUCT has run. */
 lbl_array_repeat: {
     int dest_reg = (int)UNPACK_A(op_word);
     int fill_reg = (int)UNPACK_B(op_word);
@@ -5114,9 +5104,9 @@ lbl_array_repeat: {
         /* Every eligible field is raw -- 8 bytes, or 4 if narrow (TYPE_ANY, the only field kind
            needing a full boxed AerVal, was already rejected above) -- so src->fields IS one
            element's worth of bytes at exactly instance_bytes, laid out identically to a packed
-           element: a straight memcpy per element, not a field-by-field copy. This is also the real
-           capability gain over the old opcode: src's OWN field values are replicated, not the
-           Shape's static defaults, so `[Particle(1.0, 2.0); n]` now differs from `[Particle(); n]`. */
+           element: a straight memcpy per element, not a field-by-field copy. src's OWN field values
+           are replicated, not the Shape's defaults, so `[Particle(1.0, 2.0); n]` differs from
+           `[Particle(); n]`. */
         for (int64_t e = 0; e < count; e++)
             memcpy(pa->data + (size_t)e * element_size, src->fields, element_size);
         registers[dest_reg] = aer_packed_array_val(pa);
@@ -5303,10 +5293,8 @@ lbl_index_field_set: {
 
 /* `obj[index].field OP= rk_rhs` -- resolves the index+field exactly once (same dual packed-array/
    struct-instance dispatch as lbl_index_field_get/set), reads, computes, type-checks, and writes
-   back in one dispatch. Before this existed, the parser emitted OP_INDEX_FIELD_GET (read) followed
-   by a separate OP_INDEX_FIELD_SET (a second index+field resolution just to write the same slot
-   back) -- exactly the nbody-style `bodies[j].vx += dx * mi` pattern, twice resolved for one
-   logical operation. */
+   back in one dispatch. One resolution, not the two a separate read and write would each pay --
+   the nbody-style `bodies[j].vx += dx * mi` pattern. */
 lbl_index_field_compound: {
     unsigned int site = (unsigned int)(pc - code) - 1;
     int obj_reg = (int)UNPACK_A(op_word);
@@ -5467,9 +5455,8 @@ lbl_raw_real_to_int: {
    type at compile time. None allocate: integers/reals/booleans never have heap cells. */
 lbl_raw_load_int: {
     int dest = (int)UNPACK_A(op_word);
-    /* Full 32-bit signed immediate, its own dedicated word -- closes the old 20-bit-immediate
-       truncation bug outright (a 20M-iteration bound once silently became 77056) rather than
-       just widening it again. */
+    /* Full 32-bit signed immediate in its own dedicated word, so no literal reaching here can
+       truncate -- a narrower field silently turned a 20M-iteration bound into 77056. */
     registers[dest] = aer_int((int32_t)READ());
     DISPATCH();
 }
@@ -5626,9 +5613,8 @@ lbl_raw_div_real: {
     RAW_CMP_REAL(eq, ==)
     RAW_CMP_REAL(neq, !=)
 
-/* The only bridge from raw storage back to a tagged AerVal register. */
-/* The error wording says the operator, not "unbox", because that is what the source line reads as
-   and what the boxed arithmetic this replaces reported. */
+/* Checks a slot whose type nothing proved, so every opcode after it can skip the check. The error
+   wording names the operator, not "unbox", because that is what the source line reads as. */
 lbl_unbox_int: {
     int dest = (int)UNPACK_A(op_word);
     AerVal* v = &registers[UNPACK_B(op_word)];

@@ -290,9 +290,9 @@ static inline AerResult* aer_as_result(AerVal v) {
 
 /* Byte-index of needle at or after `from`, or haylen when there is no match. Searches rather than
    scans: memchr jumps straight to each candidate first byte instead of asking "is it here?" at every
-   position. The per-position call into libc was the cost, not the comparison -- splitting a line on
-   " " used to make one memcmp call per character -- so this is O(matches) calls, not O(length), for
-   every needle length. Raw pointers so the stdlib's split/replace can share it. */
+   position. The per-position call into libc is the cost, not the comparison, so this is O(matches)
+   calls rather than O(length) for every needle length. Raw pointers so the stdlib's split/replace
+   can share it. */
 static inline unsigned int aer_bytes_find(const char* hay, unsigned int haylen, const char* needle,
                                           unsigned int nlen, unsigned int from) {
     if (nlen == 0)

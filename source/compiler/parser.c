@@ -1849,11 +1849,9 @@ static int parse_interpolated_expr(Chunk* c, const char* text, unsigned int len)
     return rk;
 }
 
-/* Literal segments and interpolated values concatenate via OP_ADD; interpolation's
-   value-to-string step goes through OP_UNARY's folded-in OP_TO_STR. */
-/* One OP_INTERP over `parts`. The parts' temps are released before the destination is claimed so
-   it reuses the lowest of them, the same trick the concatenate chain used; safe because the opcode
-   reads every part before writing its destination. */
+/* One OP_INTERP over `parts`. The parts' temps are released before the destination is claimed so it
+   reuses the lowest of them -- safe because the opcode reads every part before writing its
+   destination. */
 static int emit_interp(Chunk* c, const int* parts, int part_count) {
     int temps = 0;
     for (int i = 0; i < part_count; i++)
@@ -1966,8 +1964,8 @@ static int parse_string_literal(Chunk* c) {
             i++;
             continue;
         }
-        /* No OP_TO_STR: OP_INTERP formats an int/real/bool/null part directly into the result, so
-           the throwaway string that step used to allocate never exists. */
+        /* No OP_TO_STR: OP_INTERP formats an int/real/bool/null part directly into the result,
+           allocating no throwaway string. */
         if (part_count == INTERP_MAX_PARTS) {
             int folded = emit_interp(c, parts, part_count);
             part_count = 0;
@@ -2490,7 +2488,7 @@ static bool retarget_last_cmp(Chunk* c, int reg_rhs, int dest) {
     c->code[P.last_cmp_offset] = PACK3((Opcode)(w & 0xFF), dest, UNPACK_B(w), UNPACK_C(w));
     /* This comparison is now the last word emitted, which would let an enclosing if/while fuse its
        branch with it -- but it sits behind the short circuit and only runs when the left operand was
-       truthy. The move being emitted here is what used to make that impossible. */
+       truthy, so the fusion would be wrong. */
     P.last_cmp_offset = NO_OFFSET;
     return true;
 }
@@ -4248,10 +4246,9 @@ static bool chain_postfix(const ChainNode* node, int idx, int* leaf, int* nleaf,
 }
 
 /* Recognises the compiled argument as a TREE of array operators -- `p * q * (1.0 - d) * k`, whose
-   second operator starts a fresh subexpression, so the left-associative run this used to accept
-   declined the very query that most wanted fusing. Returns the leaf count (0 for anything else) and
-   the postfix program four bits per token; leaves are RK operands, so a constant is a leaf like any
-   other and the tile evaluator broadcasts it. */
+   second operator starts a fresh subexpression rather than continuing a left-associative run.
+   Returns the leaf count (0 for anything else) and the postfix program four bits per token; leaves
+   are RK operands, so a constant is a leaf like any other and the tile evaluator broadcasts it. */
 static int chain_of_array_ops(Chunk* c, unsigned int start, unsigned int end, int result_reg, int* leaf,
                               uint64_t* prog, int* mask_leaves) {
     ChainNode node[CHAIN_MAX_LEAVES];
@@ -4669,8 +4666,8 @@ static void parse_for_while(Chunk* c) {
    variable, so var_slot/func_lookup must never see it.
 
    The following '.' is part of the test, not just an expectation: `string` and `time` are module
-   names AND builtin casts/functions, so `import string` used to make `string(42)` unreachable. A
-   module use is always `name.function(...)`, so the dot is what tells the two apart. */
+   names AND builtin casts/functions, so without it `import string` makes `string(42)` unreachable.
+   A module use is always `name.function(...)`, so the dot is what tells the two apart. */
 static bool at_module_name(Chunk* c) {
     if (token.type != TOKEN_IDENTIFIER ||
         !chunk_is_imported(c, aer_as_string(token.value)->data, aer_as_string(token.value)->length))
@@ -4988,9 +4985,9 @@ static int parse_module_call(Chunk* c) {
 /* The quoted form, for paths the dotted form can't express (explicit relative components, an
    absolute path). Used exactly as written, never dot-converted. Bare native module names aren't
    reachable this way -- a quoted path always means "look on disk". `alias`/`alias_len` are already
-   known (from the identifier `parse_import` found immediately before this string -- `import alias
-   "path"`, Go's own import-alias convention, replacing the old `import "path" as alias`) if
-   `alias_len > 0`; otherwise the bound name is derived from the path's own last segment. */
+   known when `alias_len > 0`, from the identifier `parse_import` found immediately before this
+   string (`import alias "path"`, Go's import-alias convention); otherwise the bound name is derived
+   from the path's own last segment. */
 static void parse_import_path(Chunk* c, const char* alias, unsigned int alias_len) {
     AerString* path_str = aer_as_string(token.value);
     unsigned int path_len = path_str->length;

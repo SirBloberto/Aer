@@ -6,8 +6,8 @@
 #include "strbuf.h"
 #include "vm.h"
 
-/* Returns the rendered length; every hot caller used to call strlen() straight after -- 2.3% of
-   lookup_table_bench on its own. Prints the shortest spelling that reads back as the same double,
+/* Returns the rendered length, saving every hot caller a strlen() -- worth 2.3% of
+   lookup_table_bench. Prints the shortest spelling that reads back as the same double,
    as Python, Rust and JavaScript do: plain `%g` shows six significant digits, so a summed column
    came out as 3.58329e+09 and two engines computing different totals looked identical. 15 digits
    covers any double written as a decimal, and is tried first so the common value costs one pass. */

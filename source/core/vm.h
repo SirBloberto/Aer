@@ -158,15 +158,13 @@ typedef enum {
     OP_ARRAY_REPEAT, /* word0: dest_reg, fill_reg, narrow_flag -- word1: rk_count (RK16) */
 
     /* Fused `obj[index].field` get/set -- packed arrays have no standalone element reference, so
-       the parser emits these only for the exact `expr[index].field` pattern. Ordinary arrays
-       take the same opcodes with behavior identical to the old two-step sequence. */
+       the parser emits these only for the exact `expr[index].field` pattern. */
     OP_INDEX_FIELD_GET, /* operands: dest_reg, obj_reg, field_name_pool_idx, rk_idx */
     OP_INDEX_FIELD_SET, /* operands: obj_reg, field_name_pool_idx, rk_idx, rk_val */
 
-    /* `obj[index].field OP= rk_rhs` -- resolves the index+field exactly once (one dispatch), instead
-       of the OP_INDEX_FIELD_GET (read) + OP_INDEX_FIELD_SET (a second, redundant index+field
-       resolution just to write the same slot back) pair this used to compile to. This is the
-       pattern nbody-style code hits constantly (`bodies[j].vx += dx * mi`). */
+    /* `obj[index].field OP= rk_rhs` -- resolves the index+field exactly once, where a separate read
+       and write each resolve it. The pattern nbody-style code hits constantly
+       (`bodies[j].vx += dx * mi`). */
     OP_INDEX_FIELD_COMPOUND, /* operands: obj_reg, field_name_pool_idx, rk_idx, bin_op, rk_rhs */
 
     /* unary_op reuses OP_NEGATE/OP_NOT/OP_BITWISE_NOT/OP_TO_STR as its tag, like bin_op. */
@@ -183,11 +181,9 @@ typedef enum {
        order-sensitive ones don't fuse in that order at all. */
     OP_FIELD_BINARY, /* dest_reg, struct_reg, field_name_pool_idx, bin_op, rk_rhs */
 
-    /* `struct.field OP= rhs` -- reads, computes, and writes back in one dispatch, one
-       vm_resolve_field call. Before this existed, the parser emitted OP_FIELD_BINARY (read+compute
-       into a temp) followed by a separate OP_FIELD_SET (a second, redundant field resolution just
-       to write the same field back) -- two inline-cache lookups for one logical operation. Same
-       operand shape as OP_FIELD_BINARY (dest slot unused, no destination register needed). */
+    /* `struct.field OP= rhs` -- reads, computes and writes back in one dispatch and one
+       vm_resolve_field call, where a separate read and write cost two inline-cache lookups for one
+       logical operation. Same operand shape as OP_FIELD_BINARY (dest slot unused). */
     OP_FIELD_COMPOUND, /* struct_reg, field_name_pool_idx, bin_op, rk_rhs */
 
     /* Fuses `(A op1 B) op2 C` written as one expression: parse_binary_ops truncates the inner op and
@@ -394,8 +390,7 @@ _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — 
    See ARCHITECTURE.md §3.1-3.2 for the full field vocabulary (PACK3/PACK2/PACK1, RK8, RK16,
    PACK_2X16) and why this design was chosen over a wider bit-packed word. */
 
-/* op(8) | A(8) | B(8) | C(8), low byte first -- generic 1-4 byte-field packer, unchanged in spirit
-   from the old scheme's own PACK3 (which already only used the low 32 bits of its wider word). */
+/* op(8) | A(8) | B(8) | C(8), low byte first -- generic 1-4 byte-field packer. */
 #define PACK3(op, a, b, cc)                                                                                  \
     (((uint32_t)(op) & 0xFF) | (((uint32_t)(a) & 0xFF) << 8) | (((uint32_t)(b) & 0xFF) << 16) |              \
      (((uint32_t)(cc) & 0xFF) << 24))
@@ -601,7 +596,7 @@ typedef struct {
     char* source_span;
     unsigned int source_span_len;
     /* Absolute line of the span's first character, so a recompile's bytecode carries true line
-       numbers rather than ones relative to the span (an error inside a variant used to misreport). */
+       numbers rather than ones relative to the span. */
     unsigned int source_span_line;
     /* Small, bounded table of already-compiled specialized bodies, keyed by the shape observed for
        this function's shape-sensitive parameter(s). Checked (via the call site's own
@@ -702,9 +697,9 @@ typedef struct {
     unsigned int call_spec_cache_cap;
 
     /* Struct-name -> Shape*, keyed by POOL index: chunk_add_pool dedups strings, so every site
-       building the same struct shares one. Replaces a newest-first scan with a strcmp per shape,
-       which was 1.63% of binary_trees. Cleared wholesale when a shape is registered, so a redeclare
-       cannot keep resolving to the old one -- definitions are rare, constructions are not. */
+       building the same struct shares one. Saves a newest-first scan with a strcmp per shape, worth
+       1.63% of binary_trees. Cleared wholesale when a shape is registered, so a redeclare cannot
+       keep resolving to the shape it shadowed -- definitions are rare, constructions are not. */
     Shape** shape_by_name;
     unsigned int shape_by_name_cap;
 
@@ -791,13 +786,12 @@ typedef struct {
     int gc_suppress_depth;
 
     /* Cells allocated since gc_reset_alloc_counts -- gc_maybe_collect checks this against
-       minor_gc_threshold. Was a single process-global counter (pool.c); now one per heap. */
+       minor_gc_threshold. One per heap. */
     unsigned int pool_alloc_count;
 
-    /* Every AerDict this heap owns gets its key/sparse-array storage from here -- was a single
-       process-global HashPools (hashtable.c); now one per heap, same as the 7 GC pools above.
-       Chunk.name_index (no owning VM) uses its own separate, still-process-global HashPools --
-       see vm.c's chunk_name_index_pools. */
+    /* Every AerDict this heap owns gets its key/sparse-array storage from here, one per heap like
+       the 7 GC pools above. Chunk.name_index has no owning VM, so it uses its own process-global
+       HashPools -- see vm.c's chunk_name_index_pools. */
     HashPools dict_hash_pools;
 } VmHeap;
 
@@ -871,10 +865,10 @@ _Static_assert((sizeof(CallFrame) & (sizeof(CallFrame) - 1)) == 0,
 
 typedef struct {
     /* First. A Thumb-2 `ldr` reaches a 12-bit displacement, so a field past 4095 bytes needs its
-       offset materialized into a register first, and call_stack itself is 4096 bytes. The active
-       frame's registers/raw_ints/raw_reals used to be mirrored here too; they were a cache with no
-       hot reader -- mark_vm_roots scans call_stack[f].registers, not the mirror -- so keeping it
-       current cost three stores per call and three per return to serve only cold consumers. */
+       offset materialized into a register first, and call_stack itself is 4096 bytes. Nothing
+       mirrors the active frame's registers here: mark_vm_roots scans call_stack[f].registers
+       directly, so a mirror would cost three stores per call and per return to serve no hot
+       reader. */
     int call_depth;
 
     Chunk* chunk;
@@ -1026,10 +1020,7 @@ typedef enum {
 VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions);
 
 /* A counter, not a flag -- imports/module-calls nest. Operates on whichever heap is current (see
-   vm.c's current_heap); each VM now collects only its own independent heap, so this no longer
-   guards against one VM's collection reaching into another's not-yet-rooted state (structurally
-   impossible now, separate heaps) -- aer_module.c's two call sites predate that split and are kept
-   as harmless no-ops rather than removed speculatively. */
+   vm.c's current_heap). */
 void vm_gc_suppress(void);
 void vm_gc_unsuppress(void);
 

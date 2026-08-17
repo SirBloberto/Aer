@@ -106,12 +106,10 @@ void start_terminal(char* name) {
 #ifdef _WIN32
     hStdin = GetStdHandle(STD_INPUT_HANDLE);
     hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
-    /* A redirected/piped stdin is a valid handle but not a console, so GetConsoleMode fails --
-       that used to hit die() unconditionally, crashing on `aer.exe < script.txt`. Same fallback
-       applied on POSIX (isatty) below in case the equivalent gap exists there too, just
-       unexercised. Raw mode, history, and screen-size queries are all meaningless without a real
-       console to render them on, so the piped path skips straight to allocating the line buffer
-       handle_terminal_piped() needs and returns. */
+    /* A redirected/piped stdin is a valid handle but not a console, so GetConsoleMode fails and
+       must not be treated as fatal -- `aer.exe < script.txt`. The POSIX side (isatty) takes the
+       same fallback. Raw mode, history and screen-size queries are all meaningless without a
+       console, so the piped path allocates only the line buffer handle_terminal_piped() needs. */
     piped_stdin = !GetConsoleMode(hStdin, &original_in_mode);
 #else
     piped_stdin = !isatty(STDIN_FILENO);

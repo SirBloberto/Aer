@@ -341,10 +341,9 @@ void gc_finalize_all_pools(VmHeap* heap) {
 
 /* Generational GC -- collection                                        */
 
-/* Collects only vm's own heap, against only vm's own roots -- each VM now owns an independent
-   heap, so there is no other VM's state to fan out into (file-modules and actors used to be marked
-   here too, since they all shared one heap; each now collects itself the same way, whenever ITS
-   OWN gc_maybe_collect fires). */
+/* Collects only vm's own heap, against only vm's own roots -- each VM owns an independent heap, so
+   there is no other VM's state to fan out into. File-modules and actors each collect themselves the
+   same way, whenever THEIR OWN gc_maybe_collect fires. */
 static void gc_collect(VM* vm, bool minor, unsigned int* live_out) {
     VmHeap* heap = &vm->heap;
 

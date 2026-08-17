@@ -192,12 +192,8 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
     if (ok) {
         runtime_had_error = false;
         mvm->ip = 0;
-        /* mvm now collects only its own independent heap (see vm.c's VmHeap), so a collection
-           triggered by this nested run can no longer reach anything belonging to the caller's
-           heap at all -- this suppress/unsuppress pairing predates that split, from when every VM
-           shared one heap and the caller's own chunk/VM (not yet registered as a root at this
-           point) could be swept by mistake. Left in place as a harmless, still-correct no-op
-           rather than removed speculatively; see vm_gc_suppress's comment in vm.h. */
+        /* The caller's chunk/VM is not a root at this point; mvm collects its own heap, so this
+           pairing is defensive rather than load-bearing. */
         vm_gc_suppress();
         vm_run(mvm);
         vm_gc_unsuppress();
@@ -314,11 +310,7 @@ bool aer_module_call(VM* vm, const char* module, const char* fn, int arg_count) 
         return true;
     }
 
-    /* mv now collects only its own independent heap (see vm.c's VmHeap), so mv's own GC can no
-       longer reach anything belonging to vm's heap at all -- this suppress/unsuppress pairing
-       predates that split, from when every VM shared one heap and mv's collection had to be kept
-       from sweeping vm's not-yet-rooted state. Left in place as a harmless, still-correct no-op
-       rather than removed speculatively; see vm_gc_suppress's comment in vm.h. */
+    /* vm's not-yet-rooted state is not reachable from mv's heap; this pairing is defensive. */
     vm_gc_suppress();
     vm_run(mv);
     vm_gc_unsuppress();
