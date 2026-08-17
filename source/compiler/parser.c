@@ -102,14 +102,6 @@ typedef struct Parser {
    parse-time fact, so the read can go straight to a raw slot. */
     RawKind reg_elem_kind[FRAME_REGISTERS];
 
-    /* Two arrays built from ONE count value are the same length. value_class identifies what a
-   register currently holds and changes on every write to it; len_class records the count's
-   value_class at construction, so equal nonzero len_classes mean equal lengths. len_class had one
-   reader, the loop rewrite that is now gone -- it is still maintained here but nothing consults it,
-   and it should follow. */
-    int reg_value_class[FRAME_REGISTERS];
-    int reg_len_class[FRAME_REGISTERS];
-    int next_value_class;
     /* Where the first argument of the call being parsed stopped emitting. Only a call that folds
        one argument and reads the rest as they are needs it -- collection.group_sum, whose values
        fuse but whose group column and group count do not. */
@@ -813,19 +805,6 @@ static void mark_shape_sensitive(int reg) {
         P.shape_sensitive_param[src] = true;
 }
 
-/* A nonzero id for the value an operand holds right now. Two reads of one untouched register, or of
-   one pool constant, give the same id; any write to that register gives a fresh one. */
-static int value_class_of(int rk) {
-    if (rk & RK_CONST_FLAG)
-        return -((rk & ~RK_CONST_FLAG) + 1);
-    int reg = drop_raw_marks(rk);
-    if (reg < 0 || reg >= FRAME_REGISTERS)
-        return 0;
-    if (P.reg_value_class[reg] == 0)
-        P.reg_value_class[reg] = ++P.next_value_class;
-    return P.reg_value_class[reg];
-}
-
 /* True iff (arr_reg, idx_rk) matches a pair on the safe_loop_item/array_regs stack. Both halves
    must match: a bound proven for array A must never be trusted for a different array B that
    happens to reuse the same index register. idx_rk must be a plain register.
@@ -858,8 +837,6 @@ static void note_slot_written(int reg) {
         P.reg_elem_kind[reg] = RAWK_NONE;
         /* Whatever it held is gone, so it is no longer that array; and a count read from it after
            this is a different value, which must not match one read before. */
-        P.reg_len_class[reg] = 0;
-        P.reg_value_class[reg] = ++P.next_value_class;
     }
     for (int i = 0; i < P.safe_loop_depth; i++) {
         if (P.safe_loop_item_regs[i] == reg)
@@ -1677,7 +1654,6 @@ static int arg_materialize(Chunk* c, int rk) {
         chunk_emit(c, PACK2(OP_MOVE, target, rk));
         if (rk >= 0 && rk < FRAME_REGISTERS)
             P.reg_elem_kind[target] = P.reg_elem_kind[rk];
-        P.reg_len_class[target] = P.reg_len_class[rk];
     }
     return target;
 }
@@ -2119,15 +2095,12 @@ static int parse_primary_inner(Chunk* c) {
                          "count encoding's range)");
                 return 0;
             }
-            /* Taken before the register is released, since dest may be handed the very same one. */
-            int count_class = value_class_of(rk_count);
             /* Strict LIFO free order -- rk_count was allocated (if a temp at all) after fill_reg. */
             release_if_top(rk_count);
             release_if_top(fill_reg);
             int dest = reg_alloc();
             emit_array_repeat(c, dest, fill_reg, narrow_flag, rk_count);
             P.reg_elem_kind[dest] = fill_kind;
-            P.reg_len_class[dest] = count_class;
             return dest;
         }
 
@@ -3198,7 +3171,6 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
         RawKind rhs_elem = rhs_plain_reg ? P.reg_elem_kind[rk_val] : RAWK_NONE;
         /* Preserved across invalidate_register for the same reason rhs_elem is: the literal was
            usually built straight into the register this name is about to be given. */
-        int rhs_len_class = rhs_plain_reg ? P.reg_len_class[rk_val] : 0;
         /* See invalidate_safe_loop_reg's own comment -- without this, `reg` staying on
            safe_loop_item_regs after this reassignment would let a later arr[reg].field inside the
            same loop body keep trusting an index register that may no longer hold what the loop's
@@ -3223,7 +3195,6 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
         }
         P.last_plain_index_dest_reg = -1;
         P.reg_elem_kind[reg] = rhs_elem;
-        P.reg_len_class[reg] = rhs_len_class;
         if (rk_val & RK_CONST_FLAG) {
             chunk_emit(c, PACK_OP_A_W16(OP_LOADK, reg, (unsigned int)(rk_val & ~RK_CONST_FLAG)));
         } else if (reg != rk_val) {
@@ -5510,9 +5481,7 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
        it now emits an unbox that fails at runtime -- a function defined between an array's
        construction and its use was enough. */
     RawKind saved_elem_kind[FRAME_REGISTERS];
-    int saved_len_class[FRAME_REGISTERS];
     memcpy(saved_elem_kind, P.reg_elem_kind, sizeof(saved_elem_kind));
-    memcpy(saved_len_class, P.reg_len_class, sizeof(saved_len_class));
     memcpy(saved_var_names, P.var_names, sizeof(unsigned int) * (size_t)P.var_count);
     memcpy(saved_var_regs, P.var_regs, sizeof(int) * (size_t)P.var_count);
     memcpy(saved_var_kind, P.var_kind, sizeof(VarKind) * (size_t)P.var_count);
@@ -5538,7 +5507,6 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     P.last_length_call_result_reg = -1;
     P.last_length_call_arg_reg = -1;
     P.safe_loop_depth = 0;
-    P.next_value_class = 0;
 
     /* Before the parameters, not after: a specialization recompile enters through
        parser_save_state, which zeroes the whole parser, and var_slot reads the region's low end as
@@ -5602,7 +5570,6 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     P.raw_real_floor = saved_raw_real_floor;
     P.raw_real_low = saved_raw_real_low;
     memcpy(P.reg_elem_kind, saved_elem_kind, sizeof(saved_elem_kind));
-    memcpy(P.reg_len_class, saved_len_class, sizeof(saved_len_class));
 }
 
 /* Named functions can't nest. Once one parameter has a default, every parameter after it must
