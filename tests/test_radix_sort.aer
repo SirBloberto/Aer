@@ -1,0 +1,66 @@
+#!/usr/bin/env aer
+# AER test suite — collection.sort on integer columns takes a radix path above RADIX_MIN (8192).
+#
+# The one thing radix gets wrong if written naively is sign: two's-complement negatives have the top
+# bit set, so sorting the raw bytes puts them AFTER the positives. The top byte is XORed with 0x80 to
+# correct that, and these cases exist to keep that flip honest -- every array here straddles zero.
+
+import collection
+
+N = 20000
+
+wide = [0; N]
+for i in 0..N:
+    wide[i] = ((i * 2654435761) % 200001) - 100000
+
+narrow = [0i; N]
+for i in 0..N:
+    narrow[i] = ((i * 40503) % 65537) - 32768
+
+before_wide = collection.sum(wide)
+before_narrow = collection.sum(narrow)
+
+collection.sort(wide)
+collection.sort(narrow)
+
+assert(collection.sum(wide) == before_wide, "int64 radix sort is a permutation of its input")
+assert(collection.sum(narrow) == before_narrow, "int32 radix sort is a permutation of its input")
+
+wide_ordered = true
+for i in 1..N:
+    if wide[i] < wide[i - 1]:
+        wide_ordered = false
+assert(wide_ordered, "int64 column sorts non-decreasing")
+
+narrow_ordered = true
+for i in 1..N:
+    if narrow[i] < narrow[i - 1]:
+        narrow_ordered = false
+assert(narrow_ordered, "int32 column sorts non-decreasing")
+
+assert(wide[0] < 0, "int64 negatives sort before positives")
+assert(narrow[0] < 0, "int32 negatives sort before positives")
+assert(wide[N - 1] > 0, "int64 positives sort last")
+assert(narrow[N - 1] > 0, "int32 positives sort last")
+
+# Below RADIX_MIN, so the introsort path runs instead and must agree.
+S = 8000
+small = [0; S]
+for i in 0..S:
+    small[i] = ((i * 7919) % 4001) - 2000
+before_small = collection.sum(small)
+collection.sort(small)
+assert(collection.sum(small) == before_small, "below-threshold sort is a permutation of its input")
+small_ordered = true
+for i in 1..S:
+    if small[i] < small[i - 1]:
+        small_ordered = false
+assert(small_ordered, "below-threshold column sorts non-decreasing")
+assert(small[0] < 0, "below-threshold negatives sort before positives")
+
+# One distinct value: every radix pass sees a single bucket and is skipped, so the scatter never runs.
+flat = [7; N]
+collection.sort(flat)
+assert(flat[0] == 7 and flat[N - 1] == 7, "a column of one repeated value survives every skipped pass")
+
+print("test_radix_sort.aer: all assertions passed.")

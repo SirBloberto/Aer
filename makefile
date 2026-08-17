@@ -120,6 +120,7 @@ TESTS := tests/test_core.aer \
          tests/test_packed_arrays.aer \
          tests/test_typed_arrays.aer \
          tests/test_typed_array_chain2.aer \
+         tests/test_radix_sort.aer \
          tests/test_array_loops.aer \
          tests/test_narrow_fields.aer \
          tests/test_shape_specialization.aer \

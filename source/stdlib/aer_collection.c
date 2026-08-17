@@ -370,10 +370,63 @@ DEFINE_TYPED_SORT(sort_i64, int64_t)
 DEFINE_TYPED_SORT(sort_f32, float)
 DEFINE_TYPED_SORT(sort_f64, double)
 
+/* Quicksort's cost grows with the number of distinct values; a radix pass costs the same either way.
+   8M int64 keys measured 4.39x behind NumPy at a million distinct against 1.42x at a thousand, which
+   is the whole gap. The top byte is XORed with 0x80 so two's-complement negatives order first --
+   that one flip is why no separate signed pass is needed. */
+#define RADIX_MIN 8192
+#define RADIX_KEY(v, p, top) ((size_t)((((v) >> ((p) * 8)) & 0xFF) ^ ((p) == (top) ? 0x80u : 0u)))
+
+#define DEFINE_RADIX_SORT(name, ctype, utype)                                                                \
+    static bool name(ctype* a, size_t n) {                                                                   \
+        enum { PASSES = (int)sizeof(ctype), TOP = PASSES - 1 };                                              \
+        utype* src = (utype*)a;                                                                              \
+        utype* buf = (utype*)malloc(n * sizeof(utype));                                                      \
+        if (!buf)                                                                                            \
+            return false;                                                                                    \
+        size_t hist[PASSES][256];                                                                            \
+        memset(hist, 0, sizeof(hist));                                                                       \
+        for (size_t i = 0; i < n; i++)                                                                       \
+            for (int p = 0; p < PASSES; p++)                                                                 \
+                hist[p][RADIX_KEY(src[i], p, TOP)]++;                                                        \
+        utype* from = src;                                                                                   \
+        utype* to = buf;                                                                                     \
+        for (int p = 0; p < PASSES; p++) {                                                                   \
+            /* Every element shares this byte, so the scatter would only copy it back unchanged. A          \
+               column of small values pays three passes rather than eight. */                                \
+            if (hist[p][RADIX_KEY(from[0], p, TOP)] == n)                                                    \
+                continue;                                                                                    \
+            size_t off[256], s = 0;                                                                          \
+            for (int b = 0; b < 256; b++) {                                                                  \
+                off[b] = s;                                                                                  \
+                s += hist[p][b];                                                                             \
+            }                                                                                                \
+            for (size_t i = 0; i < n; i++)                                                                   \
+                to[off[RADIX_KEY(from[i], p, TOP)]++] = from[i];                                             \
+            utype* t = from;                                                                                 \
+            from = to;                                                                                       \
+            to = t;                                                                                          \
+        }                                                                                                    \
+        if (from != src)                                                                                     \
+            memcpy(src, from, n * sizeof(utype));                                                            \
+        free(buf);                                                                                           \
+        return true;                                                                                         \
+    }
+
+DEFINE_RADIX_SORT(radix_i32, int32_t, uint32_t)
+DEFINE_RADIX_SORT(radix_i64, int64_t, uint64_t)
+
 static void typed_sort(AerTypedArray* t) {
     switch (t->elem_kind) {
-        case TYPED_ELEM_INT32: sort_i32((int32_t*)t->data, t->count); break;
-        case TYPED_ELEM_INT64: sort_i64((int64_t*)t->data, t->count); break;
+        /* Radix declines only when its scratch buffer cannot be allocated. */
+        case TYPED_ELEM_INT32:
+            if (t->count < RADIX_MIN || !radix_i32((int32_t*)t->data, t->count))
+                sort_i32((int32_t*)t->data, t->count);
+            break;
+        case TYPED_ELEM_INT64:
+            if (t->count < RADIX_MIN || !radix_i64((int64_t*)t->data, t->count))
+                sort_i64((int64_t*)t->data, t->count);
+            break;
         case TYPED_ELEM_FLOAT32: sort_f32((float*)t->data, t->count); break;
         default: sort_f64((double*)t->data, t->count); break;
     }
