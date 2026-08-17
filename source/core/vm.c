@@ -826,7 +826,9 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
         if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV || op == OP_LT || op == OP_LTE ||
             op == OP_GT || op == OP_GTE)
             return vm_typed_array_binary_op(tta, ttb, op);
-        error("Operator not valid for typed arrays");
+        error("'%s' is not defined between two columns — columns support + - * / and the comparisons "
+              "(== and != between two columns ask whether they are the same column, not elementwise)",
+              binop_symbol(op));
         return aer_bool(false);
     }
 
@@ -856,6 +858,21 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
         if (op == OP_NEQ)
             return aer_bool(aer_as_result(a) != aer_as_result(b));
         error("Operator not valid for Results");
+        return aer_bool(false);
+    }
+
+    /* A column reaching here failed for a reason the generic message hides: either the operator is
+       not one columns have, or the other side is not a number to broadcast. Saying which saves the
+       reader looking for a type error that isn't there. */
+    if (aer_type(a) == TYPE_TYPED_ARRAY || aer_type(b) == TYPE_TYPED_ARRAY) {
+        bool other_is_num = (aer_type(a) == TYPE_TYPED_ARRAY ? tb : ta) == TYPE_INTEGER ||
+                            (aer_type(a) == TYPE_TYPED_ARRAY ? tb : ta) == TYPE_REAL;
+        if (other_is_num)
+            error("'%s' is not defined on a column — columns support + - * / and the comparisons",
+                  binop_symbol(op));
+        else
+            error("'%s' needs a number or another column on the other side, not %s", binop_symbol(op),
+                  vm_type_name(c, aer_type(a) == TYPE_TYPED_ARRAY ? b : a));
         return aer_bool(false);
     }
 
