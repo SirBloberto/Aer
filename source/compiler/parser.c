@@ -2639,14 +2639,17 @@ static int compile_pipe(Chunk* c, int lhs) {
     lex();
 
     if (equal(TOKEN_DOT)) {
-        error_at("Unknown module (must be imported before use)");
+        error_at("'%s' is not an imported module — add 'import %s' at the top level first",
+                 aer_as_string(c->pool[name_idx])->data, aer_as_string(c->pool[name_idx])->data);
         return lhs;
     }
 
     bool is_struct = is_struct_name(name_idx);
     unsigned int func_offset = 0, func_index = 0;
     if (!is_struct && !func_lookup(c, name_idx, &func_offset, &func_index)) {
-        error_at("Unknown function or struct type (must be defined before use)");
+        error_at("Unknown function or struct type '%s' — a pipe target must already be defined "
+                 "(unlike a plain call, which may forward-reference)",
+                 aer_as_string(c->pool[name_idx])->data);
         return lhs;
     }
 
@@ -5436,7 +5439,8 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
             if (consume(TOKEN_ASSIGN)) {
                 bool unused_narrow;
                 if (!parse_literal_default(c, &param_defaults[param_count], &unused_narrow)) {
-                    return error_at("Parameter defaults must be a literal value");
+                    return error_at("A parameter default must be a literal: a number, true, false, null, a "
+                                    "string, an empty array [] or an empty hashtable {}");
                 }
                 seen_default = true;
             } else if (seen_default) {
@@ -5815,7 +5819,8 @@ static void parse_struct(Chunk* c) {
         AerVal dflt;
         bool narrow;
         if (!parse_literal_default(c, &dflt, &narrow)) {
-            return error_at("Struct field defaults must be a literal value");
+            return error_at("A struct field default must be a literal: a number, true, false, null, a "
+                            "string, an empty array [] or an empty hashtable {}");
         }
         field_names[field_count] = fname;
         field_defaults[field_count] = dflt;
