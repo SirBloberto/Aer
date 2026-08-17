@@ -497,12 +497,60 @@ static bool chain_operands_ok(const AerVal* operand, int n, unsigned int* count)
     return true;
 }
 
+/* The filter's leaf count rides in the program word's top bits (parser.c, CHAIN_SPLIT_SHIFT): a
+   nonzero count means the leading leaves and tokens are a filter, and the rest are the values. */
+#define CHAIN_SPLIT_SHIFT 60
+#define CHAIN_PROG_MASK (((uint64_t)1 << CHAIN_SPLIT_SHIFT) - 1)
+
+/* Below this share of rows surviving, reading the value columns only where the filter kept a row
+   beats reading all of them and multiplying by zero. Measured on a 16M-row grouped query: a masked
+   pass costs the same at 1% as at 80%, where NumPy and Polars both get ~7x cheaper, and the two
+   approaches cross at roughly this point. Cache lines are why it is not lower -- a surviving row
+   pulls in its whole line either way, so gathering stops paying well above the naive 1/8. */
+#define CHAIN_GATHER_MAX_KEPT 0.15
+
 /* Evaluates the postfix program over rows [at, at+len), leaving the block's values in stack[0]. The
    stack never exceeds one entry per operand, and a tile is small enough that the whole stack stays in
    L1 -- which is the entire point: no intermediate is ever written at full size. */
+static void chain_load_gather(double* restrict dst, AerVal v, const unsigned int* idx, unsigned int len) {
+    if (aer_type(v) != TYPE_TYPED_ARRAY) {
+        double s = as_number(v);
+        for (unsigned int i = 0; i < len; i++)
+            dst[i] = s;
+        return;
+    }
+    AerTypedArray* t = aer_as_typed_array(v);
+    if (t->elem_kind == TYPED_ELEM_FLOAT64) {
+        const double* d = (const double*)t->data;
+        for (unsigned int i = 0; i < len; i++)
+            dst[i] = d[idx[i]];
+    } else {
+        const float* f = (const float*)t->data;
+        for (unsigned int i = 0; i < len; i++)
+            dst[i] = (double)f[idx[i]];
+    }
+}
+
+/* `idx` selects the rows to read; NULL reads [at, at+len) straight through. Everything above the
+   loads is identical either way, which is what keeps the filtered and unfiltered answers the same. */
 static void chain_eval_tile(double stack[][CHAIN_TILE], const AerVal* operand, uint64_t prog, int ntok,
-                            unsigned int at, unsigned int len) {
+                            unsigned int at, const unsigned int* idx, unsigned int len) {
     int sp = 0, next_leaf = 0;
+    /* The two loops differ only in how a leaf is loaded, but the choice is fixed for the whole call
+       and testing it per token left the contiguous path measurably slower than before gathering
+       existed. Hoisting it keeps that path exactly what it was. */
+    if (idx) {
+        for (int t = 0; t < ntok; t++) {
+            unsigned int tok = (unsigned int)((prog >> (4 * t)) & 0xFu);
+            if (tok == CHAIN_TOK_PUSH) {
+                chain_load_gather(stack[sp++], operand[next_leaf++], idx, len);
+            } else {
+                sp--;
+                chain_apply(stack[sp - 1], stack[sp], tok, len);
+            }
+        }
+        return;
+    }
     for (int t = 0; t < ntok; t++) {
         unsigned int tok = (unsigned int)((prog >> (4 * t)) & 0xFu);
         if (tok == CHAIN_TOK_PUSH) {
@@ -514,25 +562,96 @@ static void chain_eval_tile(double stack[][CHAIN_TILE], const AerVal* operand, u
     }
 }
 
+/* How the split rides in the program word, unpacked once per call. */
+/* The program is laid out values, filter, multiply -- so the values are a prefix and the filter a
+   suffix, and either can be run alone without moving anything. */
+typedef struct {
+    uint64_t full_prog; /* values, filter and the multiply joining them -- runnable as one */
+    int full_tokens;
+    uint64_t mask_prog; /* just the filter, to find out how much it keeps */
+    int mask_tokens;
+    int mask_leaf0;
+    uint64_t value_prog; /* just the values, for reading only the rows the filter kept */
+    int value_tokens;
+    bool filtered;
+} ChainSplit;
+
+static ChainSplit chain_split(uint64_t word, int n) {
+    ChainSplit s;
+    int ml = (int)((word >> CHAIN_SPLIT_SHIFT) & 7u);
+    s.full_prog = word & CHAIN_PROG_MASK;
+    s.full_tokens = 2 * n - 1;
+    s.filtered = ml > 0 && ml < n;
+    s.value_prog = s.full_prog;
+    s.value_tokens = s.filtered ? 2 * (n - ml) - 1 : s.full_tokens;
+    s.mask_leaf0 = n - ml;
+    s.mask_tokens = s.filtered ? 2 * ml - 1 : 0;
+    s.mask_prog = s.full_prog >> (4 * s.value_tokens);
+    return s;
+}
+
+/* A rejected row is SKIPPED rather than multiplied by zero, in both paths. That keeps the filtered
+   and unfiltered spellings identical where zero times the value would not have been -- an infinity
+   in a row the filter threw away would otherwise poison the total as a NaN, which the loop this
+   compiles from never does. */
+/* The choice is made per TILE, not once for the whole column. A tile is where both the filter's
+   answer and the value columns are already in cache, so it costs nothing to decide there -- and
+   deciding globally needed a full extra pass over the predicate plus a byte per row, which measured
+   50% SLOWER at high selectivity than the masked pass it was meant to improve on. Per tile also
+   adapts to a filter whose survivors clump, and lets a tile that keeps nothing skip reading the
+   value columns at all. */
+#define CHAIN_DRIVE(consume_row)                                                                                \
+    ChainSplit s = chain_split(word, n);                                                                        \
+    double stack[CHAIN_MAX_OPERANDS][CHAIN_TILE];                                                               \
+    unsigned int idx[CHAIN_TILE];                                                                               \
+    bool gather = false;                                                                                        \
+    if (s.filtered && count > 0) {                                                                              \
+        /* One tile decides it. A wrong guess costs speed and never an answer, which is what makes a         \
+           sample acceptable here -- and it keeps a filter that keeps most rows on exactly the single        \
+           fused pass it used before any of this existed. */ \
+        unsigned int probe = count < CHAIN_TILE ? count : CHAIN_TILE, kept = 0;                                 \
+        chain_eval_tile(stack, operand + s.mask_leaf0, s.mask_prog, s.mask_tokens, 0, NULL, probe);             \
+        for (unsigned int i = 0; i < probe; i++)                                                                \
+            kept += (stack[0][i] != 0.0);                                                                       \
+        gather = (double)kept < (double)probe * CHAIN_GATHER_MAX_KEPT;                                          \
+    }                                                                                                           \
+    bool stop = false;                                                                                          \
+    for (unsigned int at = 0; at < count && !stop; at += CHAIN_TILE) {                                          \
+        unsigned int len = count - at < CHAIN_TILE ? count - at : CHAIN_TILE;                                   \
+        unsigned int rows = len;                                                                                \
+        const unsigned int* gidx = NULL;                                                                        \
+        if (gather) {                                                                                           \
+            chain_eval_tile(stack, operand + s.mask_leaf0, s.mask_prog, s.mask_tokens, at, NULL, len);          \
+            rows = 0;                                                                                           \
+            for (unsigned int i = 0; i < len; i++)                                                              \
+                if (stack[0][i] != 0.0)                                                                         \
+                    idx[rows++] = at + i;                                                                       \
+            if (rows == 0)                                                                                      \
+                continue; /* nothing survived, so the value columns go unread at all */                         \
+            gidx = idx;                                                                                         \
+        }                                                                                                       \
+        chain_eval_tile(stack, operand, gather ? s.value_prog : s.full_prog,                                    \
+                        gather ? s.value_tokens : s.full_tokens, at, gidx, rows);                               \
+        for (unsigned int i = 0; i < rows && !stop; i++) {                                                      \
+            unsigned int row = gidx ? gidx[i] : at + i;                                                         \
+            double v = stack[0][i];                                                                             \
+            consume_row;                                                                                        \
+        }                                                                                                       \
+    }
+
 /* One tiled pass over the whole expression. Float operands only -- an integer chain would have to
    answer as an integer, which a double accumulator cannot promise. */
-static bool sum_chain_eval(AerVal* operand, int n, uint64_t prog, unsigned int count, double* out) {
-    double stack[CHAIN_MAX_OPERANDS][CHAIN_TILE];
-    int ntok = 2 * n - 1;
+static bool sum_chain_eval(AerVal* operand, int n, uint64_t word, unsigned int count, double* out) {
+    /* Two partial sums, matching collection.sum's own reassociation rather than inventing a
+       different one -- the fused and unfused spellings must agree. */
     double t0 = 0, t1 = 0;
-    for (unsigned int at = 0; at < count; at += CHAIN_TILE) {
-        unsigned int len = count - at < CHAIN_TILE ? count - at : CHAIN_TILE;
-        chain_eval_tile(stack, operand, prog, ntok, at, len);
-        /* Two partial sums, matching collection.sum's own reassociation rather than inventing a
-           different one -- the fused and unfused spellings must agree. */
-        unsigned int i = 0;
-        for (; i + 2 <= len; i += 2) {
-            t0 += stack[0][i];
-            t1 += stack[0][i + 1];
-        }
-        for (; i < len; i++)
-            t0 += stack[0][i];
-    }
+    CHAIN_DRIVE({
+        (void)row;
+        if (i & 1u)
+            t1 += v;
+        else
+            t0 += v;
+    })
     *out = t0 + t1;
     return true;
 }
@@ -540,21 +659,16 @@ static bool sum_chain_eval(AerVal* operand, int n, uint64_t prog, unsigned int c
 /* The same tiled evaluation, scattered into per-group totals instead of summed. This is the shape a
    filtered GROUP BY actually has, and it is where the fusion pays most: the query that motivated it
    wrote seven full-size intermediates to compute values the scatter consumed once. */
-static bool group_sum_chain_eval(AerVal* operand, int n, uint64_t prog, AerTypedArray* grp,
+static bool group_sum_chain_eval(AerVal* operand, int n, uint64_t word, AerTypedArray* grp,
                                  double* restrict out, unsigned int ngroups, unsigned int count) {
-    double stack[CHAIN_MAX_OPERANDS][CHAIN_TILE];
-    int ntok = 2 * n - 1;
-    for (unsigned int at = 0; at < count; at += CHAIN_TILE) {
-        unsigned int len = count - at < CHAIN_TILE ? count - at : CHAIN_TILE;
-        chain_eval_tile(stack, operand, prog, ntok, at, len);
-        for (unsigned int i = 0; i < len; i++) {
-            long long k = (long long)typed_elem(grp, at + i);
-            if (k < 0 || (unsigned long long)k >= (unsigned long long)ngroups)
-                return false;
-            out[k] += stack[0][i];
-        }
-    }
-    return true;
+    CHAIN_DRIVE({
+        long long k = (long long)typed_elem(grp, row);
+        if (k < 0 || (unsigned long long)k >= (unsigned long long)ngroups)
+            stop = true;
+        else
+            out[k] += v;
+    })
+    return !stop;
 }
 
 bool aer_collection_call(VM* vm, int fn_id, int arg_count) {

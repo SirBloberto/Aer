@@ -262,4 +262,73 @@ assert(dv_u[0] == 1.0 and dv_u[3] == 1.0, "integer column by integer column")
 dv_z = [0.0; 0]
 assert(length(dv_z / 2.0) == 0, "dividing an empty column is empty, not an error")
 
+# A filter inside a fused expression is evaluated on its own first, and how much it keeps decides
+# whether the value columns are read straight through or only where a row survived. Both strategies
+# have to give the loop's answer, so these sweep across the point where the choice flips.
+sw_n = 40000
+sw_g = 4
+sw_reg = [0.0; sw_n]
+sw_val = [0.0; sw_n]
+sw_oth = [0.0; sw_n]
+swi = 0
+for swi < sw_n:
+    sw_reg[swi] = float(swi % sw_g)
+    sw_val[swi] = float(swi % 977) + 1.0
+    sw_oth[swi] = float(swi % 101)
+    swi += 1
+
+sw_lims = [0.0; 7]
+sw_lims[0] = 0.0
+sw_lims[1] = 5.0
+sw_lims[2] = 60.0
+sw_lims[3] = 150.0
+sw_lims[4] = 500.0
+sw_lims[5] = 900.0
+sw_lims[6] = 2000.0
+
+sw_ok = true
+sw_li = 0
+for sw_li < 7:
+    sw_lim = sw_lims[sw_li]
+    sw_want = [0.0; sw_g]
+    sw_want_sum = 0.0
+    swi = 0
+    for swi < sw_n:
+        if sw_val[swi] < sw_lim:
+            sw_gi = integer(sw_reg[swi])
+            sw_want[sw_gi] = sw_want[sw_gi] + sw_val[swi] * sw_oth[swi]
+            sw_want_sum += sw_val[swi] * sw_oth[swi]
+        swi += 1
+    sw_got = collection.group_sum(sw_val * sw_oth * (sw_val < sw_lim), sw_reg, sw_g)
+    if collection.sum(sw_val * sw_oth * (sw_val < sw_lim)) != sw_want_sum:
+        sw_ok = false
+    sw_gi = 0
+    for sw_gi < sw_g:
+        if sw_got[sw_gi] != sw_want[sw_gi]:
+            sw_ok = false
+        sw_gi += 1
+    sw_li += 1
+assert(sw_ok, "a filtered expression agrees with the loop at every selectivity")
+
+# The filter reading a different column from the values, so the split has to send each to its side.
+sw_cross = collection.group_sum(sw_val * sw_oth * (sw_oth < 10.0), sw_reg, sw_g)
+sw_cw = [0.0; sw_g]
+swi = 0
+for swi < sw_n:
+    if sw_oth[swi] < 10.0:
+        sw_gi = integer(sw_reg[swi])
+        sw_cw[sw_gi] = sw_cw[sw_gi] + sw_val[swi] * sw_oth[swi]
+    swi += 1
+assert(sw_cross[0] == sw_cw[0] and sw_cross[3] == sw_cw[3], "the filter names another column")
+
+# Written on the left, so it is the other child of the multiply.
+sw_lhs = collection.sum((sw_val < 100.0) * sw_val * sw_oth)
+sw_lw = 0.0
+swi = 0
+for swi < sw_n:
+    if sw_val[swi] < 100.0:
+        sw_lw += sw_val[swi] * sw_oth[swi]
+    swi += 1
+assert(sw_lhs == sw_lw, "the filter written before the values")
+
 print("test_typed_arrays.aer: all assertions passed.")
