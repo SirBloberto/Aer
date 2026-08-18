@@ -2635,6 +2635,9 @@ static int compile_pipe(Chunk* c, int lhs) {
         return dest;
     }
 
+    /* Captured before the name is consumed: pending_call_add reports at this cursor, and by the time
+       it is called the argument list has been consumed too. */
+    const char* call_site_cursor = current_source_cursor();
     unsigned int name_idx = chunk_add_pool(c, token.value);
     lex();
 
@@ -2646,12 +2649,10 @@ static int compile_pipe(Chunk* c, int lhs) {
 
     bool is_struct = is_struct_name(name_idx);
     unsigned int func_offset = 0, func_index = 0;
-    if (!is_struct && !func_lookup(c, name_idx, &func_offset, &func_index)) {
-        error_at("Unknown function or struct type '%s' — a pipe target must already be defined "
-                 "(unlike a plain call, which may forward-reference)",
-                 aer_as_string(c->pool[name_idx])->data);
-        return lhs;
-    }
+    /* A name defined further down the file emits against a placeholder that parse() patches once it
+       has seen the whole file, the same deferral a plain call gets -- `x |> f()` and `f(x)` resolve
+       identically. A name never defined anywhere is reported by that sweep, not here. */
+    bool is_forward_ref = !is_struct && !func_lookup(c, name_idx, &func_offset, &func_index);
 
     require(TOKEN_OPEN_PARENTHESE, "expected '(' after piped function name");
     if (parse_had_error)
@@ -2680,7 +2681,9 @@ static int compile_pipe(Chunk* c, int lhs) {
     if (is_struct) {
         emit_struct_new(c, dest, name_idx, arg_reg_base, arg_count);
     } else {
-        emit_call(c, dest, func_offset, arg_reg_base, arg_count, func_index);
+        unsigned int patch_offset = emit_call(c, dest, func_offset, arg_reg_base, arg_count, func_index);
+        if (is_forward_ref)
+            pending_call_add(name_idx, patch_offset, call_site_cursor);
         compile_pipe_guard_end(c, patch_skip_call);
     }
     return dest;

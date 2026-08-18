@@ -1,0 +1,38 @@
+#!/usr/bin/env aer
+# AER test suite — `x |> f()` resolves a function defined further down the file, the same deferral
+# `f(x)` gets. Both spellings go through pending_call_add, patched once parse() has seen the file.
+
+import collection
+
+# Every call below is written BEFORE its callee is defined. That is the whole point of the file.
+five = 5
+doubled = five |> double_it()
+assert(doubled == 10, "pipe resolves a function defined later in the file")
+
+plain = double_it(five)
+assert(plain == doubled, "pipe and plain call agree on a forward reference")
+
+chained = five |> double_it() |> add_one()
+assert(chained == 11, "a chain of forward-referencing pipes resolves left to right")
+
+with_args = five |> scale_by(3)
+assert(with_args == 15, "a forward-referencing pipe carries its own extra arguments")
+
+# Structs are deliberately NOT covered here: a struct name is only known once its declaration has
+# been parsed, so a forward-referencing constructor defers as a function call and the pending sweep
+# cannot resolve it. That is true of `Holder(7)` as well, not something the pipe form changed.
+
+# Backward references must keep working exactly as before.
+back = five |> double_it()
+assert(back == 10, "an already-defined target still resolves")
+
+function double_it(n):
+    return n * 2
+
+function add_one(n):
+    return n + 1
+
+function scale_by(n, factor):
+    return n * factor
+
+print("test_pipe_forward_ref.aer: all assertions passed.")
