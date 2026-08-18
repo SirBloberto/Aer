@@ -10,7 +10,12 @@ jobs:
 
       - name: Check formatting and comment density (ARCHITECTURE.md conventions)
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq clang-format
+          # Pinned. Unversioned `clang-format` is whatever the runner image ships, so the whole tree
+          # starts failing the day GitHub bumps ubuntu-latest, and a different machine disagrees with
+          # CI for the same source -- clang-format 14 on the Pi reports 151 violations against a tree
+          # CI passes. Bump this deliberately, with the reformat as its own commit.
+          sudo apt-get update -qq && sudo apt-get install -y -qq clang-format-18
+          sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
           make check-style
 
       - name: Build
