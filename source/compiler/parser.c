@@ -23,6 +23,7 @@ typedef struct {
    registers the caller already owns, so no stack-balancing pop is needed on an early exit. */
 #define LOOP_MAX 16
 #define BREAK_MAX 32
+#define EXPR_DEPTH_MAX 256
 typedef struct {
     unsigned int
         top; /* continue's target -- same value passed to parse_for_body/for_in -- meaningless when rotated (see below) */
@@ -153,6 +154,9 @@ typedef struct Parser {
     int branch_depth;
     /* Nonzero while compiling a function body -- lets parse_return reject a top-level return. */
     int function_depth;
+    /* Bounds parse_binary's recursion; statement nesting is already bounded by the lexer's own
+       indentation cap. */
+    int expr_depth;
 
     /* Loop-bound-hoisting safety tracking -- lets a `for i in 0..n:` loop skip an array's
        index-side runtime checks when n is proven == length() of the SAME array it indexes. Every
@@ -2902,9 +2906,16 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
 }
 
 static int parse_binary(Chunk* c, unsigned int min_prec) {
+    if (P.expr_depth >= EXPR_DEPTH_MAX) {
+        error_at("Expression nests too deeply (max %d)", EXPR_DEPTH_MAX);
+        return 0;
+    }
+    P.expr_depth++;
     unsigned int lhs_start = c->count;
     int lhs = parse_unary(c);
-    return parse_binary_ops(c, min_prec, lhs, lhs_start);
+    int rk = parse_binary_ops(c, min_prec, lhs, lhs_start);
+    P.expr_depth--;
+    return rk;
 }
 
 /* The 6 arithmetic compound-assign operators (bitwise OP= forms were deliberately dropped -- a
@@ -3924,6 +3935,7 @@ static void parse_block(Chunk* c) {
         if (consume(TOKEN_NEW_LINE))
             continue;
         parse_had_error = false;
+        P.expr_depth = 0;
         P.recovered_at_boundary = false;
         unsigned int saved = c->count;
         unsigned int saved_marks = c->line_mark_count;
@@ -5993,6 +6005,8 @@ void parser_reset(void) {
     P.pending_count = 0;
     P.function_depth = 0;
     P.loop_depth = 0;
+    P.expr_depth = 0;
+    aer_reset_parse_error_count();
     parse_had_error = false;
     /* Function registrations live on the Chunk, not parser statics -- isolation follows each
        program's own fresh Chunk. */
@@ -6046,12 +6060,14 @@ void parser_restore_state(ParserState* s) {
    OP_HALT -- patching only the jump target would still run the call's side effects. */
 void parse(Chunk* c) {
     P.any_compile_error = false;
+    aer_reset_parse_error_count();
     while (!equal(TOKEN_END_OF_FILE)) {
         if (consume(TOKEN_NEW_LINE))
             continue;
         if (consume(TOKEN_DEDENT))
             continue;
         parse_had_error = false;
+        P.expr_depth = 0;
         P.recovered_at_boundary = false;
         unsigned int saved = c->count;
         unsigned int saved_marks = c->line_mark_count;

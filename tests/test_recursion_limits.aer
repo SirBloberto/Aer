@@ -1,0 +1,35 @@
+# A value that reaches itself used to recurse until the C stack overflowed, taking the process
+# down with no error. Rendering and JSON both cap their depth instead.
+
+import collection
+import json
+import string
+
+cyclic = []
+collection.append(cyclic, cyclic)
+rendered = "{cyclic}"
+assert(string.contains(rendered, "..."), "cyclic array truncates")
+
+d = {}
+d["self"] = d
+rendered_dict = "{d}"
+assert(string.contains(rendered_dict, "..."), "cyclic dict truncates")
+
+# Deep but acyclic hits the same cap, which is what makes the cap the whole guarantee.
+nested = []
+outer = nested
+for i in 0..200:
+    step = []
+    collection.append(outer, step)
+    outer = step
+assert(string.contains("{nested}", "..."), "deep nesting truncates")
+
+deep_json = string.repeat("[", 300)
+decoded, decode_err = json.decode(deep_json)
+assert(decode_err != null, "json.decode rejects deeply nested input")
+
+shallow, shallow_err = json.decode("[[[1]]]")
+assert(shallow_err == null, "ordinary nesting still decodes")
+assert(shallow[0][0][0] == 1, "decoded value intact")
+
+print("test_recursion_limits.aer: all assertions passed.")

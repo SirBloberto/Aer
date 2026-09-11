@@ -17,11 +17,22 @@ AerJmpBuf* runtime_error_unwind_target = NULL;
 
 #define ERROR_MSG_MAX 2048
 
+/* One malformed expression cascades an error per enclosing level, and the recovery loop then
+   re-enters the same line, so a pathological file reports quadratically without this. */
+#define PARSE_ERROR_MAX 20
+static AER_TLS unsigned int parse_error_count = 0;
+
+#define ERROR_LINE_MAX 200
+
 static AER_TLS char last_error_msg[ERROR_MSG_MAX] = "";
 static AerErrorCallback error_callback = NULL;
 static void* error_callback_userdata = NULL;
 static AerDiagnosticCallback diagnostic_callback = NULL;
 static void* diagnostic_callback_userdata = NULL;
+
+void aer_reset_parse_error_count(void) {
+    parse_error_count = 0;
+}
 
 void aer_set_diagnostic_callback(AerDiagnosticCallback callback, void* userdata) {
     diagnostic_callback = callback;
@@ -158,6 +169,16 @@ void error(const char* format, ...) {
 
 /* Print a message pinpointing the current token in the source. */
 void error_at(const char* format, ...) {
+    if (++parse_error_count > PARSE_ERROR_MAX) {
+        if (parse_error_count == PARSE_ERROR_MAX + 1)
+            emit_error("Error: too many errors; further messages suppressed\n");
+        parse_had_error = true;
+        runtime_had_error = true;
+        if (runtime_error_unwind_target)
+            AER_LONGJMP(*runtime_error_unwind_target, 1);
+        return;
+    }
+
     const char* start = current_source_start();
     const char* cursor = current_source_cursor();
 
@@ -177,6 +198,15 @@ void error_at(const char* format, ...) {
 
     unsigned int line_len = (unsigned int)(line_end - line_start);
     unsigned int col = (unsigned int)(cursor - line_start);
+    /* Slide the window so a long line's caret stays visible, and so the echo cannot crowd the
+       message itself out of buf. */
+    if (col > ERROR_LINE_MAX) {
+        line_start += col - ERROR_LINE_MAX;
+        line_len -= col - ERROR_LINE_MAX;
+        col = ERROR_LINE_MAX;
+    }
+    if (line_len > ERROR_LINE_MAX * 2)
+        line_len = ERROR_LINE_MAX * 2;
 
     char buf[ERROR_MSG_MAX];
     size_t pos = 0;

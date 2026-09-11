@@ -1,0 +1,6 @@
+# json_encode_value's depth cap -- a value that reaches itself has no finite encoding.
+import collection
+import json
+a = []
+collection.append(a, a)
+s = json.encode(a)   #!error: exceeded the maximum nesting depth

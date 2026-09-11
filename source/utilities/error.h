@@ -53,6 +53,9 @@ extern unsigned int (*runtime_stack_trace_lookup)(char* out, unsigned int out_si
 void error(const char* format, ...) __attribute__((cold));
 void error_at(const char* format, ...) __attribute__((cold));
 
+/* Clears error_at's per-compile suppression counter; call once per parse(). */
+void aer_reset_parse_error_count(void);
+
 /* Structured alongside the plain-text sink above (aer_set_error_callback, include/aer.h) -- for a
    tool that wants (line, column, message) fields directly instead of scraping them back out of a
    formatted "N | source line\n    ^\nError: msg" string. line/col are 1-based; col 0 means

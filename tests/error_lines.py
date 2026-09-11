@@ -29,6 +29,10 @@ MARKER = "#!error:"
 # call. The path is matched loosely because it is whatever was passed on the command line.
 REPORT = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:, in [^:]*)?: Error: (?P<msg>.*)$", re.M)
 
+# Parse-time errors (error_at) instead echo the source line and point a caret at the column, so
+# the line number and the message land three lines apart.
+PARSE_REPORT = re.compile(r"^(?P<path>.+?):(?P<line>\d+) \| .*\n.*\nError: (?P<msg>.*)$", re.M)
+
 
 def expectation(path):
     """(line number, expected message substring) from the single marked line."""
@@ -67,7 +71,7 @@ def main():
         r = subprocess.run([binary, path], capture_output=True, text=True)
         out = r.stdout + r.stderr
 
-        m = REPORT.search(out)
+        m = REPORT.search(out) or PARSE_REPORT.search(out)
         if not m:
             print("FAIL %-34s no 'file:line: Error:' report; got: %s" % (name, out.strip()[:90]))
             failures += 1

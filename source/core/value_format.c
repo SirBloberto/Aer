@@ -75,8 +75,14 @@ unsigned int aer_format_int(long long v, char* buf, size_t bufsize) {
 /* Value formatting -- shared by print() and vm_to_str() (interpolation, +, etc.) for one consistent
    recursive rendering, not a terse "<array[3]>" fallback. */
 
-void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
+#define FORMAT_MAX_DEPTH 64
+
+static void format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb, unsigned int depth) {
     char tmp[64];
+    if (depth >= FORMAT_MAX_DEPTH) {
+        strbuf_append(sb, "...");
+        return;
+    }
     switch (aer_type(v)) {
         case TYPE_NULL: strbuf_append(sb, "null"); break;
         case TYPE_INTEGER:
@@ -104,7 +110,7 @@ void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
             for (unsigned int i = 0; i < a->count; i++) {
                 if (i > 0)
                     strbuf_append(sb, ", ");
-                vm_format_value(c, a->items[i], true, sb);
+                format_value(c, a->items[i], true, sb, depth + 1);
             }
             strbuf_append(sb, "]");
             break;
@@ -119,7 +125,7 @@ void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
                     strbuf_append(sb, ", ");
                 strbuf_append(sb, aer_as_string(c->pool[shape->field_names[i]])->data);
                 strbuf_append(sb, ": ");
-                vm_format_value(c, vm_struct_field_read(s, i), true, sb);
+                format_value(c, vm_struct_field_read(s, i), true, sb, depth + 1);
             }
             strbuf_append(sb, "}");
             break;
@@ -157,7 +163,7 @@ void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
                 strbuf_append(sb, "\"");
                 strbuf_append(sb, e->key);
                 strbuf_append(sb, "\": ");
-                vm_format_value(c, e->payload, true, sb);
+                format_value(c, e->payload, true, sb, depth + 1);
             }
             strbuf_append(sb, "}");
             break;
@@ -165,14 +171,18 @@ void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
         case TYPE_RESULT: {
             AerResult* r = aer_as_result(v);
             strbuf_append(sb, "Result(");
-            vm_format_value(c, r->value, true, sb);
+            format_value(c, r->value, true, sb, depth + 1);
             strbuf_append(sb, ", ");
-            vm_format_value(c, r->err, true, sb);
+            format_value(c, r->err, true, sb, depth + 1);
             strbuf_append(sb, ")");
             break;
         }
         case TYPE_ANY: break; /* never a real AerVal's tag -- only Shape.field_types[] uses it */
     }
+}
+
+void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb) {
+    format_value(c, v, in_collection, sb, 0);
 }
 
 void vm_print_value(Chunk* c, AerVal v, bool in_collection) {

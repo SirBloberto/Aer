@@ -6,6 +6,8 @@
 #include "error.h"
 #include "strbuf.h"
 
+#define JSON_MAX_DEPTH 128
+
 /* encode                                                              */
 
 static void json_encode_string(StrBuf* b, const char* s, unsigned int len) {
@@ -36,8 +38,13 @@ static void json_encode_string(StrBuf* b, const char* s, unsigned int len) {
 /* Returns false (error() already called) for a function or packed-array value -- everything else succeeds.
    A struct instance encodes as a JSON object keyed by field names, so they survive a round trip via
    json.decode(). */
-static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
+static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b, unsigned int depth) {
     char tmp[64];
+    if (depth >= JSON_MAX_DEPTH) {
+        error("json.encode() exceeded the maximum nesting depth of %d -- the value may be cyclic",
+              JSON_MAX_DEPTH);
+        return false;
+    }
     switch (aer_type(v)) {
         case TYPE_NULL: strbuf_append(b, "null"); break;
         case TYPE_BOOLEAN: strbuf_append(b, aer_as_bool(v) ? "true" : "false"); break;
@@ -61,7 +68,7 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
             for (unsigned int i = 0; i < a->count; i++) {
                 if (i > 0)
                     strbuf_append_char(b, ',');
-                if (!json_encode_value(c, a->items[i], b))
+                if (!json_encode_value(c, a->items[i], b, depth + 1))
                     return false;
             }
             strbuf_append_char(b, ']');
@@ -77,7 +84,7 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
                 AerString* fname = aer_as_string(c->pool[shape->field_names[i]]);
                 json_encode_string(b, fname->data, fname->length);
                 strbuf_append_char(b, ':');
-                if (!json_encode_value(c, vm_struct_field_read(s, i), b))
+                if (!json_encode_value(c, vm_struct_field_read(s, i), b, depth + 1))
                     return false;
             }
             strbuf_append_char(b, '}');
@@ -94,7 +101,7 @@ static bool json_encode_value(Chunk* c, AerVal v, StrBuf* b) {
                 first = false;
                 json_encode_string(b, e->key, e->length);
                 strbuf_append_char(b, ':');
-                if (!json_encode_value(c, e->payload, b))
+                if (!json_encode_value(c, e->payload, b, depth + 1))
                     return false;
             }
             strbuf_append_char(b, '}');
@@ -115,6 +122,7 @@ typedef struct {
     unsigned int len;
     unsigned int pos;
     char* err; /* xmalloc'd message once set; NULL means "still ok" */
+    unsigned int depth;
 } JsonParser;
 
 static void json_skip_ws(JsonParser* p) {
@@ -391,10 +399,16 @@ static AerVal json_parse_value(JsonParser* p) {
     char ch = p->s[p->pos];
     if (ch == '"')
         return json_parse_string_raw(p);
-    if (ch == '{')
-        return json_parse_object(p);
-    if (ch == '[')
-        return json_parse_array(p);
+    if (ch == '{' || ch == '[') {
+        if (p->depth >= JSON_MAX_DEPTH) {
+            json_set_error(p, "JSON nests too deeply");
+            return aer_null();
+        }
+        p->depth++;
+        AerVal v = (ch == '{') ? json_parse_object(p) : json_parse_array(p);
+        p->depth--;
+        return v;
+    }
     if (ch == 't') {
         if (json_match_literal(p, "true"))
             return aer_bool(true);
@@ -420,7 +434,7 @@ static AerVal json_parse_value(JsonParser* p) {
 }
 
 static AerVal json_decode(AerString* input, char** err_out) {
-    JsonParser p = {input->data, input->length, 0, NULL};
+    JsonParser p = {input->data, input->length, 0, NULL, 0};
     AerVal result = json_parse_value(&p);
     if (!p.err) {
         json_skip_ws(&p);
@@ -438,7 +452,7 @@ bool aer_json_call(VM* vm, Chunk* c, int fn_id, int arg_count) {
         AerVal v = vm_stack_pop(vm);
         StrBuf b;
         strbuf_init(&b);
-        if (!json_encode_value(c, v, &b)) {
+        if (!json_encode_value(c, v, &b, 0)) {
             free(b.buf);
             vm_stack_push(vm, aer_null());
             return true;

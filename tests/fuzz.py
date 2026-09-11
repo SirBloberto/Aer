@@ -107,7 +107,20 @@ def mutate_boundary_number(data, rng):
     return text[:start] + rng.choice(BOUNDARY_NUMBERS) + text[end + 1:]
 
 
-MUTATORS = [mutate_byte_flip, mutate_delete_span, mutate_insert_token, mutate_boundary_number]
+def mutate_nest(data, rng):
+    # Single-token insertion needs hundreds of coincidences to reach a recursion limit, so the
+    # depth caps in the parser and in value rendering went unfuzzed until this ran them directly.
+    opener, closer = rng.choice([(b"(", b")"), (b"[", b"]"), (b"{", b"}")])
+    depth = rng.choice([64, 256, 300, 1000])
+    body = opener * depth + (closer * depth if rng.random() < 0.5 else b"")
+    pos = rng.randrange(len(data) + 1)
+    return data[:pos] + body + data[pos:]
+
+
+# Appended, not inserted: rng.choice() indexes this list, so reordering it renumbers every
+# iteration of an existing --seed run.
+MUTATORS = [mutate_byte_flip, mutate_delete_span, mutate_insert_token, mutate_boundary_number,
+            mutate_nest]
 
 
 # aer's own exit code for --max-instructions being spent (main.c).
