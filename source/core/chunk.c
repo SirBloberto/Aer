@@ -243,6 +243,19 @@ ChunkFunction* chunk_find_function_by_offset(Chunk* c, unsigned int code_offset)
         if (f->code_offset == code_offset)
             return f;
     }
+    /* A specialized body runs at its own offset; SPEC_MAX, since a numeric variant never counts. */
+    for (unsigned int i = c->function_count; i > 0; i--) {
+        ChunkFunction* f = &c->functions[i - 1];
+        if (!f->specializations)
+            continue;
+        for (int s = 0; s < SPEC_MAX; s++) {
+            SpecEntry* e = &f->specializations[s];
+            if (e->shape && e->code_offset == code_offset)
+                return f;
+            if (e->raw_param_count > 0 && e->raw_variant_code_offset == code_offset)
+                return f;
+        }
+    }
     return NULL;
 }
 

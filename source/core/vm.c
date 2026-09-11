@@ -1120,7 +1120,7 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
         return false;
     }
     if (target->call_depth + 1 >= VM_CALL_MAX) {
-        error("v3 call stack overflow");
+        error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
         return false;
     }
     CallFrame* caller = &target->call_stack[target->call_depth];
@@ -1189,7 +1189,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         return;
     }
     if (vm->call_depth + 1 >= VM_CALL_MAX) {
-        return error("v3 call stack overflow");
+        return error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
     }
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
@@ -3455,7 +3455,7 @@ lbl_call: {
     unsigned int func_byte_offset = (unsigned int)READ();
     ChunkFunction* target_f = (ChunkFunction*)((char*)functions + func_byte_offset);
     if (vm->call_depth + 1 >= VM_CALL_MAX) {
-        error("v3 call stack overflow");
+        error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
         DISPATCH();
     }
 
@@ -3612,7 +3612,7 @@ lbl_call_self: {
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
     if (vm->call_depth + 1 >= VM_CALL_MAX) {
-        error("v3 call stack overflow");
+        error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
         DISPATCH();
     }
     CallFrame* caller = &vm->call_stack[vm->call_depth];

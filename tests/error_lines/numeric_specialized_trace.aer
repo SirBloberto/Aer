@@ -1,0 +1,15 @@
+# A numeric function specializes after NUMERIC_SPECIALIZE_AFTER calls and then runs from a variant
+# at its own code offset. chunk_find_function_by_offset knows only the generic offset unless it also
+# scans specializations[], so the function every trace most wants named was the one it could not.
+#!in: accumulate()
+
+function accumulate(total, step):
+    scaled = total * 2 + step
+    return scaled // step   #!error: Division by zero
+
+i = 0
+for i < 40:
+    r = accumulate(i, 3)
+    i += 1
+
+r = accumulate(7, 0)

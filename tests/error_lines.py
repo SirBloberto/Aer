@@ -24,10 +24,13 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 CASES = os.path.join(HERE, "error_lines")
 MARKER = "#!error:"
+# Optional, at most once per case: the function the report must name. A specialized body runs at
+# its own code offset, so getting this wrong renames a hot function to "?" and nothing else notices.
+IN_MARKER = "#!in:"
 
 # "<path>:<line>: Error: msg", or "<path>:<line>, in fn(): Error: msg" when it faulted inside a
 # call. The path is matched loosely because it is whatever was passed on the command line.
-REPORT = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:, in [^:]*)?: Error: (?P<msg>.*)$", re.M)
+REPORT = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:, in (?P<fn>[^:]*))?: Error: (?P<msg>.*)$", re.M)
 
 # Parse-time errors (error_at) instead echo the source line and point a caret at the column, so
 # the line number and the message land three lines apart.
@@ -35,15 +38,18 @@ PARSE_REPORT = re.compile(r"^(?P<path>.+?):(?P<line>\d+) \| .*\n.*\nError: (?P<m
 
 
 def expectation(path):
-    """(line number, expected message substring) from the single marked line."""
+    """(line number, expected message substring, expected function name or None)."""
     found = []
+    want_fn = None
     with open(path, encoding="utf-8") as fh:
         for n, text in enumerate(fh, 1):
-            if MARKER in text:
+            if IN_MARKER in text:
+                want_fn = text.split(IN_MARKER, 1)[1].strip()
+            elif MARKER in text:
                 found.append((n, text.split(MARKER, 1)[1].strip()))
     if len(found) != 1:
         sys.exit("%s: expected exactly one %s marker, found %d" % (path, MARKER, len(found)))
-    return found[0]
+    return found[0][0], found[0][1], want_fn
 
 
 def main():
@@ -67,7 +73,7 @@ def main():
     failures = 0
     for name in cases:
         path = os.path.join(CASES, name)
-        want_line, want_msg = expectation(path)
+        want_line, want_msg, want_fn = expectation(path)
         r = subprocess.run([binary, path], capture_output=True, text=True)
         out = r.stdout + r.stderr
 
@@ -83,6 +89,10 @@ def main():
         elif want_msg.lower() not in got_msg.lower():
             print("FAIL %-34s line %d correct, but message %r lacks %r"
                   % (name, got_line, got_msg, want_msg))
+            failures += 1
+        elif want_fn is not None and m.groupdict().get("fn") != want_fn:
+            print("FAIL %-34s reported function %r, expected %r"
+                  % (name, m.groupdict().get("fn"), want_fn))
             failures += 1
         else:
             print("ok   %-34s line %d: %s" % (name, got_line, got_msg))
