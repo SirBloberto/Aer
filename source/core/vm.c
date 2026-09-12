@@ -4201,231 +4201,417 @@ HANDLER(field_set)
    The aer_type() check is a safety net: the reg_known_shape[] audit is not proven exhaustive, and a
    gap should be loud rather than silent corruption. Storage kind stays in the opcode rather than
    becoming an operand -- see OPTIMIZATION_HISTORY.md for the measurement. */
-#define RAWF_GET_I64(dst, src)                                                                               \
-    do {                                                                                                     \
-        (dst).tag = TYPE_INTEGER;                                                                            \
-        memcpy(&(dst).as.i, (src), 8);                                                                       \
-    } while (0)
-#define RAWF_GET_F64(dst, src)                                                                               \
-    do {                                                                                                     \
-        (dst).tag = TYPE_REAL;                                                                               \
-        memcpy(&(dst).as.d, (src), 8);                                                                       \
-    } while (0)
-#define RAWF_GET_I32(dst, src) ((dst) = aer_int(vm_raw_read_int32(src)))
-#define RAWF_GET_F32(dst, src) ((dst) = aer_real(vm_raw_read_float32(src)))
+/* Which storage a specialized field uses. Every handler below passes a literal, so each switch here
+   folds to the single load or store that field needs -- the kind never reaches a runtime branch. */
+typedef enum { RAWW_INT, RAWW_REAL, RAWW_INT32, RAWW_FLOAT32 } RawWidth;
 
-#define RAWF_SET_I64(dst, src) memcpy((dst), &(src).as.i, 8)
-#define RAWF_SET_F64(dst, src) memcpy((dst), &(src).as.d, 8)
-#define RAWF_SET_I32(dst, src) vm_raw_write_int32((dst), (src).as.i)
-#define RAWF_SET_F32(dst, src) vm_raw_write_float32((dst), (src).as.d)
-
-#define RAWF_LD_I64(lhs, p) memcpy(&(lhs), (p), 8)
-#define RAWF_LD_F64(lhs, p) memcpy(&(lhs), (p), 8)
-#define RAWF_LD_I32(lhs, p) ((lhs) = vm_raw_read_int32(p))
-#define RAWF_LD_F32(lhs, p) ((lhs) = vm_raw_read_float32(p))
-
-#define RAWF_ST_I64(p, v) memcpy((p), &(v), 8)
-#define RAWF_ST_F64(p, v) memcpy((p), &(v), 8)
-#define RAWF_ST_I32(p, v) vm_raw_write_int32((p), (v))
-#define RAWF_ST_F32(p, v) vm_raw_write_float32((p), (v))
-
-#define AER_INDEX_FIELD_GET_RAW(name, GET, resolve)                                                          \
-static VmSliceResult h_##name(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {                     \
-    const uint32_t op_word = pc[-1];                                                                         \
-    (void)op_word;                                                                                           \
-    int dest_slot = (int)UNPACK_A(op_word);                                                                  \
-    int arr_reg = (int)UNPACK_B(op_word);                                                                    \
-    uint32_t field_rk_word = READ();                                                                         \
-    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);                                                    \
-    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));                         \
-    unsigned char* elem = resolve(registers[arr_reg], idx, foffset);                                         \
-    if (!elem)                                                                                               \
-        DISPATCH();                                                                                          \
-    GET(registers[dest_slot], elem);                                                                         \
-    DISPATCH();                                                                                              \
+static inline __attribute__((always_inline)) void raw_field_read(AerVal* dst, unsigned char* src, RawWidth w) {
+    switch (w) {
+        case RAWW_INT:
+            dst->tag = TYPE_INTEGER;
+            memcpy(&dst->as.i, src, 8);
+            break;
+        case RAWW_REAL:
+            dst->tag = TYPE_REAL;
+            memcpy(&dst->as.d, src, 8);
+            break;
+        case RAWW_INT32: *dst = aer_int(vm_raw_read_int32(src)); break;
+        case RAWW_FLOAT32: *dst = aer_real(vm_raw_read_float32(src)); break;
+    }
 }
 
-#define AER_FIELD_GET_RAW(name, GET)                                                                         \
-static VmSliceResult h_##name(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {                     \
-    const uint32_t op_word = pc[-1];                                                                         \
-    (void)op_word;                                                                                           \
-    int dest_slot = (int)UNPACK_A(op_word);                                                                  \
-    int struct_reg = (int)UNPACK_B(op_word);                                                                 \
-    unsigned int foffset = READ();                                                                           \
-    AerVal obj = registers[struct_reg];                                                                      \
-    if (aer_type(obj) != TYPE_STRUCT) {                                                                      \
-        error("internal error: specialized struct field access on a non-struct value");                      \
-        DISPATCH();                                                                                          \
-    }                                                                                                        \
-    GET(registers[dest_slot], aer_as_struct(obj)->fields + foffset);                                         \
-    DISPATCH();                                                                                              \
+static inline __attribute__((always_inline)) void raw_field_write(unsigned char* dst, AerVal src, RawWidth w) {
+    switch (w) {
+        case RAWW_INT: memcpy(dst, &src.as.i, 8); break;
+        case RAWW_REAL: memcpy(dst, &src.as.d, 8); break;
+        case RAWW_INT32: vm_raw_write_int32(dst, src.as.i); break;
+        case RAWW_FLOAT32: vm_raw_write_float32(dst, src.as.d); break;
+    }
 }
 
-#define AER_INDEX_FIELD_SET_RAW(name, SET, resolve)                                                          \
-static VmSliceResult h_##name(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {                     \
-    const uint32_t op_word = pc[-1];                                                                         \
-    (void)op_word;                                                                                           \
-    int obj_reg = (int)UNPACK_A(op_word);                                                                    \
-    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));                                   \
-    uint32_t off_slot_word = READ();                                                                         \
-    unsigned int foffset = UNPACK_2X16_HI(off_slot_word);                                                    \
-    int src_slot = (int)UNPACK_2X16_LO(off_slot_word);                                                       \
-    unsigned char* elem = resolve(registers[obj_reg], idx, foffset);                                         \
-    if (!elem)                                                                                               \
-        DISPATCH();                                                                                          \
-    SET(elem, registers[src_slot]);                                                                          \
-    DISPATCH();                                                                                              \
+/* The struct a specialized access names, or NULL once it has raised -- callers dispatch either way.
+   The check is a safety net rather than a real possibility: a gap in the reg_known_shape[] audit
+   should be loud instead of silently reinterpreting some other value's bits as a field. */
+static inline __attribute__((always_inline)) AerStruct* raw_field_struct(VM* vm, const uint32_t* pc, AerVal obj) {
+    if (aer_type(obj) == TYPE_STRUCT)
+        return aer_as_struct(obj);
+    error("internal error: specialized struct field access on a non-struct value");
+    return NULL;
 }
 
-#define AER_FIELD_SET_RAW(name, SET)                                                                         \
-static VmSliceResult h_##name(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {                     \
-    const uint32_t op_word = pc[-1];                                                                         \
-    (void)op_word;                                                                                           \
-    int struct_reg = (int)UNPACK_A(op_word);                                                                 \
-    unsigned int foffset = READ();                                                                           \
-    int src_slot = (int)READ();                                                                              \
-    AerVal obj = registers[struct_reg];                                                                      \
-    if (aer_type(obj) != TYPE_STRUCT) {                                                                      \
-        error("internal error: specialized struct field access on a non-struct value");                      \
-        DISPATCH();                                                                                          \
-    }                                                                                                        \
-    SET(aer_as_struct(obj)->fields + foffset, registers[src_slot]);                                          \
-    DISPATCH();                                                                                              \
+static inline __attribute__((always_inline)) unsigned char* raw_elem(AerVal arr, AerVal* idx, unsigned int foffset,
+                                                 bool checked) {
+    return checked ? vm_packed_raw_elem(arr, idx, foffset)
+                   : vm_packed_raw_elem_unchecked(arr, idx, foffset);
 }
 
-#define AER_FIELD_COMPOUND_RAW(name, CT, MEMBER, LD, ST)                                                     \
-static VmSliceResult h_##name(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {                     \
-    const uint32_t op_word = pc[-1];                                                                         \
-    (void)op_word;                                                                                           \
-    int struct_reg = (int)UNPACK_A(op_word);                                                                 \
-    Opcode bin_op = (Opcode)UNPACK_B(op_word);                                                               \
-    unsigned int foffset = READ();                                                                           \
-    int rhs_slot = (int)READ();                                                                              \
-    AerVal obj = registers[struct_reg];                                                                      \
-    if (aer_type(obj) != TYPE_STRUCT) {                                                                      \
-        error("internal error: specialized struct field access on a non-struct value");                      \
-        DISPATCH();                                                                                          \
-    }                                                                                                        \
-    AerStruct* oa = aer_as_struct(obj);                                                                      \
-    CT lhs;                                                                                                  \
-    LD(lhs, oa->fields + foffset);                                                                           \
-    CT rhs = registers[rhs_slot].as.MEMBER;                                                                  \
-    CT result;                                                                                               \
-    switch (bin_op) {                                                                                        \
-        case OP_ADD: result = lhs + rhs; break;                                                              \
-        case OP_SUB: result = lhs - rhs; break;                                                              \
-        case OP_MUL: result = lhs * rhs; break;                                                              \
-        default: error("internal error: unsupported raw compound-assign op"); DISPATCH();                    \
-    }                                                                                                        \
-    ST(oa->fields + foffset, result);                                                                        \
-    DISPATCH();                                                                                              \
+/* `+=`, `-=` and `*=` are the whole specialized compound set; anything else raises and leaves the
+   field alone. Int and real never share a field, so the width picks the arithmetic too. */
+static inline __attribute__((always_inline)) bool raw_field_compound(VM* vm, const uint32_t* pc, unsigned char* elem,
+                                                 AerVal rhs, Opcode bin_op, RawWidth w) {
+    if (w == RAWW_INT || w == RAWW_INT32) {
+        int64_t lhs, result;
+        if (w == RAWW_INT)
+            memcpy(&lhs, elem, 8);
+        else
+            lhs = vm_raw_read_int32(elem);
+        switch (bin_op) {
+            case OP_ADD: result = lhs + rhs.as.i; break;
+            case OP_SUB: result = lhs - rhs.as.i; break;
+            case OP_MUL: result = lhs * rhs.as.i; break;
+            default: error("internal error: unsupported raw compound-assign op"); return false;
+        }
+        if (w == RAWW_INT)
+            memcpy(elem, &result, 8);
+        else
+            vm_raw_write_int32(elem, result);
+    } else {
+        double lhs, result;
+        if (w == RAWW_REAL)
+            memcpy(&lhs, elem, 8);
+        else
+            lhs = vm_raw_read_float32(elem);
+        switch (bin_op) {
+            case OP_ADD: result = lhs + rhs.as.d; break;
+            case OP_SUB: result = lhs - rhs.as.d; break;
+            case OP_MUL: result = lhs * rhs.as.d; break;
+            default: error("internal error: unsupported raw compound-assign op"); return false;
+        }
+        if (w == RAWW_REAL)
+            memcpy(elem, &result, 8);
+        else
+            vm_raw_write_float32(elem, result);
+    }
+    return true;
 }
 
-#define AER_INDEX_FIELD_COMPOUND_RAW(name, CT, MEMBER, LD, ST, resolve)                                      \
-static VmSliceResult h_##name(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {                     \
-    const uint32_t op_word = pc[-1];                                                                         \
-    (void)op_word;                                                                                           \
-    int arr_reg = (int)UNPACK_A(op_word);                                                                    \
-    Opcode bin_op = (Opcode)UNPACK_B(op_word);                                                               \
-    uint32_t field_rk_word = READ();                                                                         \
-    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);                                                    \
-    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));                         \
-    int rhs_slot = (int)READ();                                                                              \
-    unsigned char* elem = resolve(registers[arr_reg], idx, foffset);                                         \
-    if (!elem)                                                                                               \
-        DISPATCH();                                                                                          \
-    CT lhs;                                                                                                  \
-    LD(lhs, elem);                                                                                           \
-    CT rhs = registers[rhs_slot].as.MEMBER;                                                                  \
-    CT result;                                                                                               \
-    switch (bin_op) {                                                                                        \
-        case OP_ADD: result = lhs + rhs; break;                                                              \
-        case OP_SUB: result = lhs - rhs; break;                                                              \
-        case OP_MUL: result = lhs * rhs; break;                                                              \
-        default: error("internal error: unsupported raw compound-assign op"); DISPATCH();                    \
-    }                                                                                                        \
-    ST(elem, result);                                                                                        \
-    DISPATCH();                                                                                              \
+static inline __attribute__((always_inline)) void field_get_raw(VM* vm, const uint32_t* pc, AerVal* registers,
+                                            uint32_t op_word, unsigned int foffset, RawWidth w) {
+    AerStruct* s = raw_field_struct(vm, pc, registers[UNPACK_B(op_word)]);
+    if (s)
+        raw_field_read(&registers[UNPACK_A(op_word)], s->fields + foffset, w);
+}
+
+static inline __attribute__((always_inline)) void field_set_raw(VM* vm, const uint32_t* pc, AerVal* registers,
+                                            uint32_t op_word, unsigned int foffset, int src_slot,
+                                            RawWidth w) {
+    AerStruct* s = raw_field_struct(vm, pc, registers[UNPACK_A(op_word)]);
+    if (s)
+        raw_field_write(s->fields + foffset, registers[src_slot], w);
+}
+
+static inline __attribute__((always_inline)) void field_compound_raw(VM* vm, const uint32_t* pc, AerVal* registers,
+                                                 uint32_t op_word, unsigned int foffset,
+                                                 int rhs_slot, RawWidth w) {
+    AerStruct* s = raw_field_struct(vm, pc, registers[UNPACK_A(op_word)]);
+    if (s)
+        raw_field_compound(vm, pc, s->fields + foffset, registers[rhs_slot],
+                           (Opcode)UNPACK_B(op_word), w);
+}
+
+static inline __attribute__((always_inline)) void index_field_get_raw(AerVal* registers, Chunk* c, uint32_t op_word,
+                                                  uint32_t field_rk_word, RawWidth w, bool checked) {
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
+    unsigned char* elem = raw_elem(registers[UNPACK_B(op_word)], idx, foffset, checked);
+    if (elem)
+        raw_field_read(&registers[UNPACK_A(op_word)], elem, w);
+}
+
+static inline __attribute__((always_inline)) void index_field_set_raw(AerVal* registers, Chunk* c, uint32_t op_word,
+                                                  uint32_t off_slot_word, RawWidth w, bool checked) {
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
+    unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
+    unsigned char* elem = raw_elem(registers[UNPACK_A(op_word)], idx, foffset, checked);
+    if (elem)
+        raw_field_write(elem, registers[UNPACK_2X16_LO(off_slot_word)], w);
+}
+
+static inline __attribute__((always_inline)) void index_field_compound_raw(VM* vm, const uint32_t* pc, AerVal* registers,
+                                                       Chunk* c, uint32_t op_word,
+                                                       uint32_t field_rk_word, int rhs_slot,
+                                                       RawWidth w, bool checked) {
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
+    unsigned char* elem = raw_elem(registers[UNPACK_A(op_word)], idx, foffset, checked);
+    if (elem)
+        raw_field_compound(vm, pc, elem, registers[rhs_slot], (Opcode)UNPACK_B(op_word), w);
+}
+
+/* `+=` with bin_op already known at compile time, so it skips the switch the general form runs. */
+static inline __attribute__((always_inline)) void index_field_add_raw(AerVal* registers, Chunk* c, uint32_t op_word,
+                                                  uint32_t field_rk_word, int rhs_slot, RawWidth w,
+                                                  bool checked) {
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
+    unsigned char* elem = raw_elem(registers[UNPACK_A(op_word)], idx, foffset, checked);
+    if (!elem)
+        return;
+    if (w == RAWW_REAL) {
+        double lhs;
+        memcpy(&lhs, elem, 8);
+        lhs += registers[rhs_slot].as.d;
+        memcpy(elem, &lhs, 8);
+    } else {
+        vm_raw_write_float32(elem, vm_raw_read_float32(elem) + registers[rhs_slot].as.d);
+    }
 }
 
 
-#define AER_FIELD_COMPOUND_RAW_OP(name, CT, MEMBER, LD, ST, BINOP)                                           \
-static VmSliceResult h_##name(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {                     \
-    const uint32_t op_word = pc[-1];                                                                         \
-    (void)op_word;                                                                                           \
-    int struct_reg = (int)UNPACK_A(op_word);                                                                 \
-    unsigned int foffset = READ();                                                                           \
-    int rhs_slot = (int)READ();                                                                              \
-    AerVal obj = registers[struct_reg];                                                                      \
-    if (aer_type(obj) != TYPE_STRUCT) {                                                                      \
-        error("internal error: specialized struct field access on a non-struct value");                      \
-        DISPATCH();                                                                                          \
-    }                                                                                                        \
-    AerStruct* oa = aer_as_struct(obj);                                                                      \
-    CT lhs;                                                                                                  \
-    LD(lhs, oa->fields + foffset);                                                                           \
-    CT result = lhs BINOP registers[rhs_slot].as.MEMBER;                                                     \
-    ST(oa->fields + foffset, result);                                                                        \
-    DISPATCH();                                                                                              \
+HANDLER(index_field_get_raw_int)
+    uint32_t field_rk_word = READ();
+    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_INT, true);
+    DISPATCH();
 }
 
-#define AER_INDEX_FIELD_COMPOUND_RAW_OP(name, CT, MEMBER, LD, ST, resolve, BINOP)                            \
-static VmSliceResult h_##name(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {                     \
-    const uint32_t op_word = pc[-1];                                                                         \
-    (void)op_word;                                                                                           \
-    int arr_reg = (int)UNPACK_A(op_word);                                                                    \
-    uint32_t field_rk_word = READ();                                                                         \
-    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);                                                    \
-    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));                         \
-    int rhs_slot = (int)READ();                                                                              \
-    unsigned char* elem = resolve(registers[arr_reg], idx, foffset);                                         \
-    if (!elem)                                                                                               \
-        DISPATCH();                                                                                          \
-    CT lhs;                                                                                                  \
-    LD(lhs, elem);                                                                                           \
-    CT result = lhs BINOP registers[rhs_slot].as.MEMBER;                                                     \
-    ST(elem, result);                                                                                        \
-    DISPATCH();                                                                                              \
+HANDLER(index_field_get_raw_real)
+    uint32_t field_rk_word = READ();
+    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_REAL, true);
+    DISPATCH();
 }
 
-AER_INDEX_FIELD_GET_RAW(index_field_get_raw_int, RAWF_GET_I64, vm_packed_raw_elem)
-AER_INDEX_FIELD_GET_RAW(index_field_get_raw_real, RAWF_GET_F64, vm_packed_raw_elem)
-AER_FIELD_GET_RAW(field_get_raw_int, RAWF_GET_I64)
-AER_FIELD_GET_RAW(field_get_raw_real, RAWF_GET_F64)
-AER_INDEX_FIELD_GET_RAW(index_field_get_raw_int32, RAWF_GET_I32, vm_packed_raw_elem)
-AER_INDEX_FIELD_GET_RAW(index_field_get_raw_float32, RAWF_GET_F32, vm_packed_raw_elem)
-AER_FIELD_GET_RAW(field_get_raw_int32, RAWF_GET_I32)
-AER_FIELD_GET_RAW(field_get_raw_float32, RAWF_GET_F32)
-AER_INDEX_FIELD_SET_RAW(index_field_set_raw_int, RAWF_SET_I64, vm_packed_raw_elem)
-AER_INDEX_FIELD_SET_RAW(index_field_set_raw_real, RAWF_SET_F64, vm_packed_raw_elem)
-AER_FIELD_SET_RAW(field_set_raw_int, RAWF_SET_I64)
-AER_FIELD_SET_RAW(field_set_raw_real, RAWF_SET_F64)
-AER_INDEX_FIELD_SET_RAW(index_field_set_raw_int32, RAWF_SET_I32, vm_packed_raw_elem)
-AER_INDEX_FIELD_SET_RAW(index_field_set_raw_float32, RAWF_SET_F32, vm_packed_raw_elem)
-AER_FIELD_SET_RAW(field_set_raw_int32, RAWF_SET_I32)
-AER_FIELD_SET_RAW(field_set_raw_float32, RAWF_SET_F32)
-AER_FIELD_COMPOUND_RAW(field_compound_raw_int, int64_t, i, RAWF_LD_I64, RAWF_ST_I64)
-AER_FIELD_COMPOUND_RAW(field_compound_raw_real, double, d, RAWF_LD_F64, RAWF_ST_F64)
-AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_int, int64_t, i, RAWF_LD_I64, RAWF_ST_I64, vm_packed_raw_elem)
-AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_real, double, d, RAWF_LD_F64, RAWF_ST_F64, vm_packed_raw_elem)
-AER_INDEX_FIELD_GET_RAW(index_field_get_raw_int_unchecked, RAWF_GET_I64, vm_packed_raw_elem_unchecked)
-AER_INDEX_FIELD_GET_RAW(index_field_get_raw_real_unchecked, RAWF_GET_F64, vm_packed_raw_elem_unchecked)
-AER_INDEX_FIELD_SET_RAW(index_field_set_raw_int_unchecked, RAWF_SET_I64, vm_packed_raw_elem_unchecked)
-AER_INDEX_FIELD_SET_RAW(index_field_set_raw_real_unchecked, RAWF_SET_F64, vm_packed_raw_elem_unchecked)
-AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_int_unchecked, int64_t, i, RAWF_LD_I64, RAWF_ST_I64, vm_packed_raw_elem_unchecked)
-AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_real_unchecked, double, d, RAWF_LD_F64, RAWF_ST_F64, vm_packed_raw_elem_unchecked)
-AER_FIELD_COMPOUND_RAW(field_compound_raw_int32, int64_t, i, RAWF_LD_I32, RAWF_ST_I32)
-AER_FIELD_COMPOUND_RAW(field_compound_raw_float32, double, d, RAWF_LD_F32, RAWF_ST_F32)
-AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_int32, int64_t, i, RAWF_LD_I32, RAWF_ST_I32, vm_packed_raw_elem)
-AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_float32, double, d, RAWF_LD_F32, RAWF_ST_F32, vm_packed_raw_elem)
-AER_INDEX_FIELD_GET_RAW(index_field_get_raw_int32_unchecked, RAWF_GET_I32, vm_packed_raw_elem_unchecked)
-AER_INDEX_FIELD_GET_RAW(index_field_get_raw_float32_unchecked, RAWF_GET_F32, vm_packed_raw_elem_unchecked)
-AER_INDEX_FIELD_SET_RAW(index_field_set_raw_int32_unchecked, RAWF_SET_I32, vm_packed_raw_elem_unchecked)
-AER_INDEX_FIELD_SET_RAW(index_field_set_raw_float32_unchecked, RAWF_SET_F32, vm_packed_raw_elem_unchecked)
-AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_int32_unchecked, int64_t, i, RAWF_LD_I32, RAWF_ST_I32, vm_packed_raw_elem_unchecked)
-AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_float32_unchecked, double, d, RAWF_LD_F32, RAWF_ST_F32, vm_packed_raw_elem_unchecked)
-AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_real_unchecked_add, double, d, RAWF_LD_F64, RAWF_ST_F64, vm_packed_raw_elem_unchecked, +)
-AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_float32_unchecked_add, double, d, RAWF_LD_F32, RAWF_ST_F32, vm_packed_raw_elem_unchecked, +)
+HANDLER(field_get_raw_int)
+    unsigned int foffset = READ();
+    field_get_raw(vm, pc, registers, op_word, foffset, RAWW_INT);
+    DISPATCH();
+}
+
+HANDLER(field_get_raw_real)
+    unsigned int foffset = READ();
+    field_get_raw(vm, pc, registers, op_word, foffset, RAWW_REAL);
+    DISPATCH();
+}
+
+HANDLER(index_field_get_raw_int32)
+    uint32_t field_rk_word = READ();
+    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_INT32, true);
+    DISPATCH();
+}
+
+HANDLER(index_field_get_raw_float32)
+    uint32_t field_rk_word = READ();
+    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_FLOAT32, true);
+    DISPATCH();
+}
+
+HANDLER(field_get_raw_int32)
+    unsigned int foffset = READ();
+    field_get_raw(vm, pc, registers, op_word, foffset, RAWW_INT32);
+    DISPATCH();
+}
+
+HANDLER(field_get_raw_float32)
+    unsigned int foffset = READ();
+    field_get_raw(vm, pc, registers, op_word, foffset, RAWW_FLOAT32);
+    DISPATCH();
+}
+
+HANDLER(index_field_set_raw_int)
+    uint32_t off_slot_word = READ();
+    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_INT, true);
+    DISPATCH();
+}
+
+HANDLER(index_field_set_raw_real)
+    uint32_t off_slot_word = READ();
+    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_REAL, true);
+    DISPATCH();
+}
+
+HANDLER(field_set_raw_int)
+    unsigned int foffset = READ();
+    int src_slot = (int)READ();
+    field_set_raw(vm, pc, registers, op_word, foffset, src_slot, RAWW_INT);
+    DISPATCH();
+}
+
+HANDLER(field_set_raw_real)
+    unsigned int foffset = READ();
+    int src_slot = (int)READ();
+    field_set_raw(vm, pc, registers, op_word, foffset, src_slot, RAWW_REAL);
+    DISPATCH();
+}
+
+HANDLER(index_field_set_raw_int32)
+    uint32_t off_slot_word = READ();
+    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_INT32, true);
+    DISPATCH();
+}
+
+HANDLER(index_field_set_raw_float32)
+    uint32_t off_slot_word = READ();
+    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_FLOAT32, true);
+    DISPATCH();
+}
+
+HANDLER(field_set_raw_int32)
+    unsigned int foffset = READ();
+    int src_slot = (int)READ();
+    field_set_raw(vm, pc, registers, op_word, foffset, src_slot, RAWW_INT32);
+    DISPATCH();
+}
+
+HANDLER(field_set_raw_float32)
+    unsigned int foffset = READ();
+    int src_slot = (int)READ();
+    field_set_raw(vm, pc, registers, op_word, foffset, src_slot, RAWW_FLOAT32);
+    DISPATCH();
+}
+
+HANDLER(field_compound_raw_int)
+    unsigned int foffset = READ();
+    int rhs_slot = (int)READ();
+    field_compound_raw(vm, pc, registers, op_word, foffset, rhs_slot, RAWW_INT);
+    DISPATCH();
+}
+
+HANDLER(field_compound_raw_real)
+    unsigned int foffset = READ();
+    int rhs_slot = (int)READ();
+    field_compound_raw(vm, pc, registers, op_word, foffset, rhs_slot, RAWW_REAL);
+    DISPATCH();
+}
+
+HANDLER(index_field_compound_raw_int)
+    uint32_t field_rk_word = READ();
+    int rhs_slot = (int)READ();
+    index_field_compound_raw(vm, pc, registers, c, op_word, field_rk_word, rhs_slot,
+                            RAWW_INT, true);
+    DISPATCH();
+}
+
+HANDLER(index_field_compound_raw_real)
+    uint32_t field_rk_word = READ();
+    int rhs_slot = (int)READ();
+    index_field_compound_raw(vm, pc, registers, c, op_word, field_rk_word, rhs_slot,
+                            RAWW_REAL, true);
+    DISPATCH();
+}
+
+HANDLER(index_field_get_raw_int_unchecked)
+    uint32_t field_rk_word = READ();
+    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_INT, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_get_raw_real_unchecked)
+    uint32_t field_rk_word = READ();
+    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_REAL, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_set_raw_int_unchecked)
+    uint32_t off_slot_word = READ();
+    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_INT, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_set_raw_real_unchecked)
+    uint32_t off_slot_word = READ();
+    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_REAL, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_compound_raw_int_unchecked)
+    uint32_t field_rk_word = READ();
+    int rhs_slot = (int)READ();
+    index_field_compound_raw(vm, pc, registers, c, op_word, field_rk_word, rhs_slot,
+                            RAWW_INT, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_compound_raw_real_unchecked)
+    uint32_t field_rk_word = READ();
+    int rhs_slot = (int)READ();
+    index_field_compound_raw(vm, pc, registers, c, op_word, field_rk_word, rhs_slot,
+                            RAWW_REAL, false);
+    DISPATCH();
+}
+
+HANDLER(field_compound_raw_int32)
+    unsigned int foffset = READ();
+    int rhs_slot = (int)READ();
+    field_compound_raw(vm, pc, registers, op_word, foffset, rhs_slot, RAWW_INT32);
+    DISPATCH();
+}
+
+HANDLER(field_compound_raw_float32)
+    unsigned int foffset = READ();
+    int rhs_slot = (int)READ();
+    field_compound_raw(vm, pc, registers, op_word, foffset, rhs_slot, RAWW_FLOAT32);
+    DISPATCH();
+}
+
+HANDLER(index_field_compound_raw_int32)
+    uint32_t field_rk_word = READ();
+    int rhs_slot = (int)READ();
+    index_field_compound_raw(vm, pc, registers, c, op_word, field_rk_word, rhs_slot,
+                            RAWW_INT32, true);
+    DISPATCH();
+}
+
+HANDLER(index_field_compound_raw_float32)
+    uint32_t field_rk_word = READ();
+    int rhs_slot = (int)READ();
+    index_field_compound_raw(vm, pc, registers, c, op_word, field_rk_word, rhs_slot,
+                            RAWW_FLOAT32, true);
+    DISPATCH();
+}
+
+HANDLER(index_field_get_raw_int32_unchecked)
+    uint32_t field_rk_word = READ();
+    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_INT32, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_get_raw_float32_unchecked)
+    uint32_t field_rk_word = READ();
+    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_FLOAT32, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_set_raw_int32_unchecked)
+    uint32_t off_slot_word = READ();
+    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_INT32, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_set_raw_float32_unchecked)
+    uint32_t off_slot_word = READ();
+    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_FLOAT32, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_compound_raw_int32_unchecked)
+    uint32_t field_rk_word = READ();
+    int rhs_slot = (int)READ();
+    index_field_compound_raw(vm, pc, registers, c, op_word, field_rk_word, rhs_slot,
+                            RAWW_INT32, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_compound_raw_float32_unchecked)
+    uint32_t field_rk_word = READ();
+    int rhs_slot = (int)READ();
+    index_field_compound_raw(vm, pc, registers, c, op_word, field_rk_word, rhs_slot,
+                            RAWW_FLOAT32, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_compound_raw_real_unchecked_add)
+    uint32_t field_rk_word = READ();
+    int rhs_slot = (int)READ();
+    index_field_add_raw(registers, c, op_word, field_rk_word, rhs_slot, RAWW_REAL, false);
+    DISPATCH();
+}
+
+HANDLER(index_field_compound_raw_float32_unchecked_add)
+    uint32_t field_rk_word = READ();
+    int rhs_slot = (int)READ();
+    index_field_add_raw(registers, c, op_word, field_rk_word, rhs_slot, RAWW_FLOAT32, false);
+    DISPATCH();
+}
+
 
 /* `field += a*b` in one dispatch -- see OP_FIELD_COMPOUND_RAW_FLOAT32_FMA (vm.h). The multiply is
    parenthesised to keep the same rounding the unfused pair had. */
