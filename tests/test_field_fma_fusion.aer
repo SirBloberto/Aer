@@ -1,0 +1,95 @@
+#!/usr/bin/env aer
+import collection
+# AER test suite — `field += a * b` folding its multiply into the compound assignment
+# (OP_FIELD_COMPOUND_RAW_FLOAT32_FMA and OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA, vm.h).
+#
+# The load-bearing claim is that the fused form keeps both roundings, so it produces exactly what
+# the unfused MUL + COMPOUND pair produced. Each case below therefore computes the same thing twice:
+# once as `f.x += a * b` (which fuses) and once through a temporary, `t = a * b; f.x += t` (which
+# cannot -- the fusion only fires when the right-hand side compiled to exactly one raw multiply).
+# Asserting the two agree tests the invariant rather than a hardcoded literal.
+
+struct Narrow:
+    x = 0.0f
+    v = 0.0f
+
+struct Wide:
+    x = 0.0
+    v = 0.0
+
+# ------------------------------------------------------------------ #
+# 1. Bare struct, narrow float32 field — the struct_array_scan shape.  #
+# ------------------------------------------------------------------ #
+
+function acc_fused(p, a, b):
+    p.x += a * b
+
+function acc_unfused(p, a, b):
+    t = a * b
+    p.x += t
+
+fused = Narrow(1.0, 0.0)
+plain = Narrow(1.0, 0.0)
+r = 0
+for r < 12:
+    acc_fused(fused, 0.1, 0.3)
+    acc_unfused(plain, 0.1, 0.3)
+    r += 1
+assert(fused.x == plain.x, "narrow float32 field: fused += a*b matches the unfused pair exactly")
+assert(fused.x > 1.3 and fused.x < 1.4, "and the value is actually accumulating")
+
+# Negative and mixed-magnitude operands, where a single-rounding FMA would diverge first.
+fused2 = Narrow(0.0, 0.0)
+plain2 = Narrow(0.0, 0.0)
+r = 0
+for r < 12:
+    acc_fused(fused2, -7.3, 0.0009)
+    acc_unfused(plain2, -7.3, 0.0009)
+    r += 1
+assert(fused2.x == plain2.x, "narrow float32 field: negative/small operands still match")
+
+# ------------------------------------------------------------------ #
+# 2. Packed array, wide real field, loop-proven index — nbody's shape. #
+# ------------------------------------------------------------------ #
+
+# The field read is hoisted into a local, so the right-hand side is exactly one multiply -- the
+# fusion deliberately does not fire when the operand itself needs a load first (nbody and
+# struct_array_scan both hoist for the same reason).
+function advance_fused(arr, dt):
+    n = length(arr)
+    for i in 0..n:
+        v = arr[i].v
+        arr[i].x += v * dt
+
+function advance_unfused(arr, dt):
+    n = length(arr)
+    for i in 0..n:
+        v = arr[i].v
+        t = v * dt
+        arr[i].x += t
+
+wf = [Wide(0.0, 1.5); 6]
+wp = [Wide(0.0, 1.5); 6]
+r = 0
+for r < 12:
+    advance_fused(wf, 0.017)
+    advance_unfused(wp, 0.017)
+    r += 1
+assert(wf[0].x == wp[0].x, "packed real field: fused += a*b matches the unfused pair exactly")
+assert(wf[5].x == wp[5].x, "last element too -- the whole loop fused, not just the first")
+assert(wf[0].x > 0.3 and wf[0].x < 0.31, "and the value is actually accumulating")
+
+# A field the fusion must leave alone: `-=` has no fused opcode, and `+=` with a non-multiply
+# right-hand side has nothing to fold.
+function mixed(p, a, b):
+    p.x += a
+    p.x -= a * b
+
+mx = Wide(10.0, 0.0)
+r = 0
+for r < 12:
+    mixed(mx, 0.5, 2.0)
+    r += 1
+assert(mx.x == 4.0, "unfused compound forms on the same field are unaffected")
+
+print("test_field_fma_fusion.aer: all assertions passed.")

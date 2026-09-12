@@ -345,6 +345,12 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD",
                   "specialized: field += raw", .trailing_words = 2},
 
+    [OP_FIELD_COMPOUND_RAW_FLOAT32_FMA] = {"OP_FIELD_COMPOUND_RAW_FLOAT32_FMA",
+                                           "specialized: struct.field += rawr * rawr (narrow)",
+                                           .trailing_words = 1},
+    [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA] =
+        {"OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA",
+         "specialized+loop-proven-safe: packed_arr[rk].field += rawr * rawr", .trailing_words = 1},
     [OP_EQ_JUMP_IF_FALSE] = {"OP_EQ_JUMP_IF_FALSE", "jump if !(rk == rk)", .trailing_words = 1},
     [OP_NEQ_JUMP_IF_FALSE] = {"OP_NEQ_JUMP_IF_FALSE", "jump if !(rk != rk)", .trailing_words = 1},
     [OP_LT_JUMP_IF_FALSE] = {"OP_LT_JUMP_IF_FALSE", "jump if !(rk < rk)", .trailing_words = 1},
@@ -884,6 +890,18 @@ static bool disasm_raw(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigne
     } else if (op == OP_RAW_MOVE_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
+    } else if (op == OP_FIELD_COMPOUND_RAW_FLOAT32_FMA) {
+        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
+        print_rawr(out, (int)UNPACK_B(op_word));
+        print_rawr(out, (int)UNPACK_C(op_word));
+        fprintf(out, "  off=%u", c->code[(*pos)++]);
+    } else if (op == OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA) {
+        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
+        print_rawr(out, (int)UNPACK_B(op_word));
+        print_rawr(out, (int)UNPACK_C(op_word));
+        uint32_t w1 = c->code[(*pos)++];
+        fprintf(out, "  off=%u", UNPACK_2X16_HI(w1));
+        print_rk16(out, c, UNPACK_2X16_LO(w1));
     } else if (op == OP_FIELD_COMPOUND_RAW_INT_ADD || op == OP_FIELD_COMPOUND_RAW_REAL_ADD ||
                op == OP_FIELD_COMPOUND_RAW_INT32_ADD || op == OP_FIELD_COMPOUND_RAW_FLOAT32_ADD ||
                op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_REAL ||

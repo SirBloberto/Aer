@@ -134,6 +134,7 @@ TESTS := tests/test_core.aer \
          tests/test_spec_pool_realloc.aer \
          tests/test_recursion_limits.aer \
          tests/test_compound_ops_specialized.aer \
+         tests/test_field_fma_fusion.aer \
          tests/test_net.aer \
          tests/test_regex.aer \
          tests/test_actor.aer \

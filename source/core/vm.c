@@ -3194,6 +3194,9 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD] = &&lbl_index_field_compound_raw_float32_add,
         [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD] = &&lbl_index_field_compound_raw_int32_unchecked_add,
         [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD] = &&lbl_index_field_compound_raw_float32_unchecked_add,
+        [OP_FIELD_COMPOUND_RAW_FLOAT32_FMA] = &&lbl_field_compound_raw_float32_fma,
+        [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA] =
+            &&lbl_index_field_compound_raw_real_unchecked_fma,
 
         [OP_EQ_JUMP_IF_FALSE] = &&lbl_eq_jump_if_false,
         [OP_NEQ_JUMP_IF_FALSE] = &&lbl_neq_jump_if_false,
@@ -4681,6 +4684,40 @@ AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_int32_add, int64_t, i, 
 AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_float32_add, double, d, RAWF_LD_F32, RAWF_ST_F32, vm_packed_raw_elem, +)
 AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_int32_unchecked_add, int64_t, i, RAWF_LD_I32, RAWF_ST_I32, vm_packed_raw_elem_unchecked, +)
 AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_float32_unchecked_add, double, d, RAWF_LD_F32, RAWF_ST_F32, vm_packed_raw_elem_unchecked, +)
+
+/* `field += a*b` in one dispatch -- see OP_FIELD_COMPOUND_RAW_FLOAT32_FMA (vm.h). The multiply is
+   parenthesised to keep the same rounding the unfused pair had. */
+lbl_field_compound_raw_float32_fma: {
+    int struct_reg = (int)UNPACK_A(op_word);
+    int a = (int)UNPACK_B(op_word);
+    unsigned int b = UNPACK_C(op_word);
+    unsigned int foffset = READ();
+    AerVal obj = registers[struct_reg];
+    if (aer_type(obj) != TYPE_STRUCT) {
+        error("internal error: specialized struct field access on a non-struct value");
+        DISPATCH();
+    }
+    unsigned char* slot = aer_as_struct(obj)->fields + foffset;
+    vm_raw_write_float32(slot, vm_raw_read_float32(slot) + (registers[a].as.d * registers[b].as.d));
+    DISPATCH();
+}
+
+lbl_index_field_compound_raw_real_unchecked_fma: {
+    int arr_reg = (int)UNPACK_A(op_word);
+    int a = (int)UNPACK_B(op_word);
+    unsigned int b = UNPACK_C(op_word);
+    uint32_t field_rk_word = READ();
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
+    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
+    if (!elem)
+        DISPATCH();
+    double lhs;
+    memcpy(&lhs, elem, 8);
+    lhs = lhs + (registers[a].as.d * registers[b].as.d);
+    memcpy(elem, &lhs, 8);
+    DISPATCH();
+}
 
 /* `[value; count]` -- fill_reg is already evaluated exactly once by the parser, so this branches on
    its RUNTIME type. Eligibility (every field a fixed primitive) has to be checked here rather than

@@ -320,6 +320,15 @@ typedef enum {
     OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD,
     OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD,
 
+    /* `field += a*b`: the same fusion OP_RAW_FMA_REAL does for raw locals, which excludes field
+       destinations, so the two benchmarks that spend a fifth of their dispatches on exactly this
+       shape paid a separate OP_RAW_MUL_REAL for it. Two roundings, not a hardware FMA, so results
+       match the unfused pair. Only the two storage kinds that carry real traffic; every other
+       field kind keeps the unfused MUL + COMPOUND pair.
+       word0 = PACK3(op, obj_reg, mul_a, mul_b); word1 = foffset, or PACK_2X16(foffset, rk_idx). */
+    OP_FIELD_COMPOUND_RAW_FLOAT32_FMA,
+    OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA,
+
     /* A bare comparison forming an entire if/while condition collapses with its
        OP_JUMP_IF_FALSE_REG into one dispatch -- the boolean was only ever read once, immediately.
        Only the 6 plain boxed comparisons (raw ones have faster opcodes already) and only when

@@ -375,6 +375,7 @@ static void assert_variables_below_floor(const char* where) {
 
 /* Guard for RK16-wire opcodes: 32767 registers-or-constants is far beyond any real program, but
    silent truncation would corrupt the instruction rather than refuse to compile. */
+
 /* `+=` is the overwhelming majority of compound assignment, and bin_op is compile-time known, so
    ADD gets an opcode that skips the dispatch-time switch. SUB/MUL keep the general one. */
 static Opcode compound_add_variant(Opcode op, Opcode bin_op) {
@@ -1069,6 +1070,22 @@ static void ensure_boxed(unsigned int name_idx) {
 
 /* Materializes a constant via OP_LOADK, or boxes a raw value -- OP_JUMP_IF_FALSE_REG needs an
    actual register, no RK/raw form. */
+/* True when the RHS just compiled to exactly one raw real MUL writing the slot rk_rhs names, which
+   is what lets `field += a*b` fold the multiply in. Rewinds the MUL and hands back its operands;
+   the caller emits the fused opcode instead. Mirrors the raw-local fusion in parse_binary_ops. */
+static bool take_fused_mul_real(Chunk* c, unsigned int rhs_start, int rk_rhs, int* mul_a, int* mul_b) {
+    if (c->count - rhs_start != 1)
+        return false;
+    uint32_t mw = c->code[rhs_start];
+    if ((Opcode)(mw & 0xFF) != OP_RAW_MUL_REAL || (int)UNPACK_A(mw) != (rk_rhs & RK_RAW_SLOT_MASK))
+        return false;
+    *mul_a = (int)UNPACK_B(mw);
+    *mul_b = (int)UNPACK_C(mw);
+    c->count = rhs_start;
+    raw_release_if_top((int)UNPACK_A(mw));
+    return true;
+}
+
 static int materialize(Chunk* c, int rk) {
     rk = drop_raw_marks(rk);
     if (!(rk & RK_CONST_FLAG))
@@ -3621,11 +3638,20 @@ static void parse_chain_compound(Chunk* c, ChainTarget t) {
                     field_kind = RAWK_REAL;
             }
 
+            unsigned int rhs_start = c->count;
             int rk_rhs = parse_binary(c, 0);
             if (parse_had_error)
                 return;
 
             Opcode bin_op = compound_assign_ops[i].op;
+            int mul_a, mul_b;
+            if (bin_op == OP_ADD && field_kind == RAWK_REAL && field_narrow_bit &&
+                rk_raw_kind(c, rk_rhs) == RAWK_REAL &&
+                take_fused_mul_real(c, rhs_start, rk_rhs, &mul_a, &mul_b)) {
+                chunk_emit(c, PACK3(OP_FIELD_COMPOUND_RAW_FLOAT32_FMA, obj_reg, mul_a, mul_b));
+                chunk_emit(c, foffset);
+                return; /* obj_is_base is always true here -- see the plain store below */
+            }
             /* Decomposing into raw GET + arithmetic + SET was tried and measured WORSE on
                nbody.aer whenever the rhs needed boxing first -- see the fused index-field-compound
                site's identical reasoning above. But when the rhs is ALREADY raw at this point (a
@@ -3845,10 +3871,24 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 release_if_top(rk_val);
             } else {
                 lex();
+                unsigned int rhs_start = c->count;
                 int rk_rhs = parse_binary(c, 0);
                 if (parse_had_error)
                     return;
                 Opcode bin_op = compound_assign_ops[compound_i].op;
+                int mul_a, mul_b;
+                if (bin_op == OP_ADD && field_kind == RAWK_REAL && !field_narrow_bit &&
+                    obj_reg == P.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx) &&
+                    rk_raw_kind(c, rk_rhs) == RAWK_REAL &&
+                    take_fused_mul_real(c, rhs_start, rk_rhs, &mul_a, &mul_b)) {
+                    chunk_emit(c, PACK3(OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA, obj_reg, mul_a,
+                                        mul_b));
+                    chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(pending_rk_idx)));
+                    release_if_top(pending_rk_idx);
+                    if (!obj_is_base)
+                        reg_free(1);
+                    return;
+                }
                 /* Decomposing into raw GET + arithmetic + SET measured worse whenever the rhs needed
                    boxing -- the generic opcode already does it all in one dispatch. When the rhs is
                    already raw there is no boxing to avoid, so the RAW variant is pure upside. */
