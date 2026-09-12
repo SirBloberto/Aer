@@ -66,6 +66,92 @@ typedef struct {
 
 typedef enum { RAWK_NONE, RAWK_INT, RAWK_REAL } RawKind;
 
+/* What the parser has worked out about each register. invalidate_register clears a register's
+   entry across all of them at once, which is why they live together. */
+typedef struct {
+    VarKind var_kind[FRAME_REGISTERS];
+    /* Which of this function's parameters were used as the base of a struct-field access, directly
+       or through a one-hop alias. See mark_shape_sensitive for how the three work together. */
+    bool shape_sensitive_param[FRAME_REGISTERS];
+    int current_param_count;
+    int alias_source_param[FRAME_REGISTERS]; /* -1 = no known alias */
+    /* Set only during a specialization recompile, and read at field-access sites to skip the
+       generic runtime resolution. */
+    Shape* reg_known_shape[FRAME_REGISTERS];
+    /* Proven >= 0: a non-negative literal, a bounded loop index, a length(), or those combined with
+       + * // %. Wrong in one direction only -- a false positive is caught at runtime by
+       OP_ITER_RANGE_PREP's own guard, so it can never be a safety hole. */
+    bool reg_nonneg[FRAME_REGISTERS];
+    Shape* reg_known_element_shape[FRAME_REGISTERS];
+    /* Element kind of a typed array a register holds, from a `[numeric; count]` literal -- a
+       parse-time fact, so the read can go straight to a raw slot. */
+    RawKind reg_elem_kind[FRAME_REGISTERS];
+} RegFacts;
+
+/* Instructions just emitted that a later one can still fold into or retarget, each valid only
+   while it is the last word in the chunk. peephole_window_reset() clears the whole window; a
+   stale offset here rewrites an instruction some other path can reach. */
+typedef struct {
+    /* The last comparison emitted, so emit_cond_jump_if_false can tell one from a word that merely
+       looks like one -- instruction lengths vary, so it cannot be found by reading backwards. */
+    unsigned int last_cmp_offset;
+    /* The last raw arithmetic emitted, so an assignment can retarget it at the variable's own slot
+       instead of following it with a move. patch_epoch counts backpatches: a jump landing between
+       the two would make the arithmetic conditional when the move was not. */
+    unsigned int raw_write_offset;
+    int raw_write_slot;
+    RawKind raw_write_kind;
+    unsigned int raw_write_epoch;
+    unsigned int patch_epoch;
+    /* Same trick for the last OP_INTERP: emit_index_get folds one into OP_INDEX_GET_INTERP when the
+       interpolation it is indexing with is the instruction immediately before it. */
+    unsigned int last_interp_offset;
+    int last_interp_dest;
+    /* Where the first argument of the call being parsed stopped emitting. Only a call that folds
+       one argument and reads the rest as they are needs it -- collection.group_sum, whose values
+       fuse but whose group column and group count do not. */
+    unsigned int first_arg_end;
+    /* Side channel from the index-get site to parse_assignment, keyed on exact register equality
+       rather than a flag. */
+    int last_plain_index_dest_reg;
+    int last_plain_index_src_param;
+    Shape* last_plain_index_known_elem_shape;
+} PeepholeWindow;
+
+/* Lets a `for i in 0..n:` loop skip an array's index-side runtime checks when n is proven ==
+   length() of the SAME array it indexes. Every fact is tracked per-array-register and re-checked
+   at use, never keyed to one "interesting" parameter, so proving a bound safe for one array can't
+   let a different one borrow the proof. invalidate_register must poison a safe_loop_* entry when
+   EITHER the index or the array half is reassigned -- the array half is the easier one to forget. */
+typedef struct {
+    int hint_param_reg;
+    unsigned int length_tracked_name;
+    bool length_tracked_valid;
+    int length_tracked_source_reg;
+    int last_length_call_result_reg;
+    int last_length_call_arg_reg;
+    int safe_loop_item_regs[LOOP_MAX];
+    int safe_loop_array_regs[LOOP_MAX];
+    int safe_loop_depth;
+} LoopProofs;
+
+/* The function body currently compiling. */
+typedef struct {
+    /* Index of the function whose body is compiling, and whether that body calls itself. A
+       recursive numeric function is the one shape where binding parameters raw loses: its raw values
+       exist only to be re-boxed as the next call's arguments (see SHAPE_MASK_NUMERIC_ONLY, vm.h).
+       -1 outside any function body. */
+    int current_func_idx;
+    bool self_call_seen;
+    /* Set only while a SPECIALIZED body is compiling, so a self-call inside it can skip resolution
+       (OP_CALL_SELF, vm.h). A generic body must not: resolution is what triggers specialization in
+       the first place, so bypassing it there means the variant is never compiled at all. */
+    bool in_variant;
+    /* Raw-vs-boxed opcodes reached for in this body. Nonzero means binding its numeric parameters
+       raw would turn real work raw, which is the trigger for a numeric specialization. */
+    unsigned int raw_boxed_emits;
+} FuncCtx;
+
 /* Every mutable global the compile functions share. P (below) is the live instance;
    parser_save_state/restore_state snapshot it wholesale for a nested compile. */
 typedef struct Parser {
@@ -82,6 +168,10 @@ typedef struct Parser {
        full-size frame. */
     int raw_real_next, raw_real_floor, raw_real_low;
 
+    RegFacts regs;
+    PeepholeWindow peep;
+    LoopProofs proof;
+    FuncCtx fn;
     /* Every register's current variable binding (0 registers is effectively local -- see
        var_kind below for storage-kind tracking). */
     unsigned int var_names[FRAME_REGISTERS];
@@ -89,69 +179,11 @@ typedef struct Parser {
     int var_count;
     VarKind var_kind[FRAME_REGISTERS];
 
-    /* Which of this function's parameters were used as the base of a struct-field access, directly or
-   through a one-hop alias. See mark_shape_sensitive for how the three work together. */
-    bool shape_sensitive_param[FRAME_REGISTERS];
-    int current_param_count;
-    int alias_source_param[FRAME_REGISTERS]; /* -1 = no known alias */
-    /* Set only during a specialization recompile, and read at field-access sites to skip the generic
-   runtime resolution. */
-    Shape* reg_known_shape[FRAME_REGISTERS];
-    /* Proven >= 0: a non-negative literal, a bounded loop index, a length(), or those combined with
-   + * // %. Wrong in one direction only -- a false positive is caught at runtime by
-   OP_ITER_RANGE_PREP's own guard, so it can never be a safety hole. */
-    bool reg_nonneg[FRAME_REGISTERS];
-    Shape* reg_known_element_shape[FRAME_REGISTERS];
-    /* Element kind of a typed array a register holds, from a `[numeric; count]` literal -- a
-   parse-time fact, so the read can go straight to a raw slot. */
-    RawKind reg_elem_kind[FRAME_REGISTERS];
-
-    /* Where the first argument of the call being parsed stopped emitting. Only a call that folds
-       one argument and reads the rest as they are needs it -- collection.group_sum, whose values
-       fuse but whose group column and group count do not. */
-    unsigned int first_arg_end;
-    /* Side channel from the index-get site to parse_assignment, keyed on exact register equality
-   rather than a flag. */
-    int last_plain_index_dest_reg;
-    int last_plain_index_src_param;
-    Shape* last_plain_index_known_elem_shape;
 
     /* Highest temp register reached while compiling the loop condition currently being parsed --
        see parse_for_body for why the body must not be allowed to claim one of these. */
     int loop_cond_peak;
 
-    /* The last comparison emitted, so emit_cond_jump_if_false can tell one from a word that merely
-   looks like one -- instruction lengths vary, so it cannot be found by reading backwards. */
-    unsigned int last_cmp_offset;
-
-    /* The last raw arithmetic emitted, so an assignment can retarget it at the variable's own slot
-   instead of following it with a move. patch_epoch counts backpatches: a jump landing between the
-   two would make the arithmetic conditional when the move was not. */
-    unsigned int raw_write_offset;
-    int raw_write_slot;
-    RawKind raw_write_kind;
-    unsigned int raw_write_epoch;
-    unsigned int patch_epoch;
-
-    /* Raw-vs-boxed opcodes reached for in this body. Nonzero means binding its numeric parameters raw
-   would turn real work raw, which is the trigger for a numeric specialization. */
-    unsigned int raw_boxed_emits;
-
-    /* Index of the function whose body is compiling, and whether that body calls itself. A
-       recursive numeric function is the one shape where binding parameters raw loses: its raw
-       values exist only to be re-boxed as the next call's arguments (see SHAPE_MASK_NUMERIC_ONLY,
-       vm.h). -1 outside any function body. */
-    int current_func_idx;
-    bool self_call_seen;
-    /* Set only while a SPECIALIZED body is compiling, so a self-call inside it can skip resolution
-       (OP_CALL_SELF, vm.h). A generic body must not: resolution is what triggers specialization in
-       the first place, so bypassing it there means the variant is never compiled at all. */
-    bool in_variant;
-
-    /* Same trick for the last OP_INTERP: emit_index_get folds one into OP_INDEX_GET_INTERP when the
-       interpolation it is indexing with is the instruction immediately before it. */
-    unsigned int last_interp_offset;
-    int last_interp_dest;
 
     /* Nonzero while compiling an if/else branch -- disqualifies raw storage (see VarKind). */
     int branch_depth;
@@ -161,21 +193,6 @@ typedef struct Parser {
        indentation cap. */
     int expr_depth;
 
-    /* Loop-bound-hoisting safety tracking -- lets a `for i in 0..n:` loop skip an array's
-       index-side runtime checks when n is proven == length() of the SAME array it indexes. Every
-       fact is tracked per-array-register and re-checked at use, never keyed to one "interesting"
-       parameter, so proving a bound safe for one array can't let a different one borrow the proof.
-       invalidate_register must poison a safe_loop_* entry when EITHER the index or the array half
-       is reassigned -- the array half is the easier one to forget. */
-    int hint_param_reg;
-    unsigned int length_tracked_name;
-    bool length_tracked_valid;
-    int length_tracked_source_reg;
-    int last_length_call_result_reg;
-    int last_length_call_arg_reg;
-    int safe_loop_item_regs[LOOP_MAX];
-    int safe_loop_array_regs[LOOP_MAX];
-    int safe_loop_depth;
 
     /* Range-for loop variables currently in scope, innermost last, with whether the loop's own body
        ever writes one. A body that never does lets OP_ITER_RANGE_LOOP carry its counter IN the loop
@@ -221,6 +238,13 @@ typedef struct Parser {
 } Parser;
 static Parser P;
 
+/* Every tracked instruction stops being the last word emitted at the same moment. */
+static void peephole_window_reset(void) {
+    P.peep.last_cmp_offset = NO_OFFSET;
+    P.peep.raw_write_offset = NO_OFFSET;
+    P.peep.last_interp_offset = NO_OFFSET;
+}
+
 /* Overflow returns -1 and the caller falls back to a dynamically typed value. reg_alloc errors
    instead, because nothing is below it to fall back to. */
 static void track_peak(int v) {
@@ -249,7 +273,7 @@ static int slot_alloc(RawKind kind) {
         return -1;
     int slot = --P.raw_real_next;
     raw_track_low(slot);
-    P.reg_nonneg[slot] = false; /* same as reg_alloc: no proof carries over from the last occupant */
+    P.regs.reg_nonneg[slot] = false; /* same as reg_alloc: no proof carries over from the last occupant */
     return slot;
 }
 
@@ -332,8 +356,8 @@ int reg_alloc(void) {
         return FRAME_REGISTERS - 1;
     }
     int reg = P.slot_next++;
-    P.reg_nonneg[reg] = false; /* a recycled register carries no proof from its last occupant */
-    P.reg_elem_kind[reg] = RAWK_NONE;
+    P.regs.reg_nonneg[reg] = false; /* a recycled register carries no proof from its last occupant */
+    P.regs.reg_elem_kind[reg] = RAWK_NONE;
     track_peak(P.slot_next);
     if (P.slot_next > P.loop_cond_peak)
         P.loop_cond_peak = P.slot_next;
@@ -357,9 +381,9 @@ static void assert_variables_below_floor(const char* where) {
     for (int i = 0; i < P.var_count; i++) {
         /* A real-typed variable is exempt: it lives at the TOP of the frame, deliberately above
            everything the ordinary allocator hands out (see Parser.raw_real_next). */
-        if (P.var_kind[i] == VAR_RAW_REAL && P.var_regs[i] >= P.raw_real_floor)
+        if (P.regs.var_kind[i] == VAR_RAW_REAL && P.var_regs[i] >= P.raw_real_floor)
             continue;
-        if (P.var_kind[i] != VAR_BOXED)
+        if (P.regs.var_kind[i] != VAR_BOXED)
             if (P.var_regs[i] >= P.slot_floor) {
                 fprintf(stderr,
                         "aer: internal error: %s left variable slot %d in register %d, at or above the "
@@ -427,7 +451,7 @@ static bool rk_nonneg(Chunk* c, int rk) {
     }
     /* A statically-typed operand is an ordinary register, so its proof is read the same way. */
     int reg = drop_raw_marks(rk);
-    return reg >= 0 && reg < FRAME_REGISTERS && P.reg_nonneg[reg];
+    return reg >= 0 && reg < FRAME_REGISTERS && P.regs.reg_nonneg[reg];
 }
 
 /* Non-negativity survives + * // and %, and only those: subtraction and left-shift can produce a
@@ -443,7 +467,7 @@ static bool binop_preserves_nonneg(Opcode op) {
 
 /* A plain register below the parameter count -- parameters occupy the frame's first registers. */
 static bool rk_param(int rk) {
-    return !(rk & RK_CONST_FLAG) && drop_raw_marks(rk) < P.current_param_count;
+    return !(rk & RK_CONST_FLAG) && drop_raw_marks(rk) < P.regs.current_param_count;
 }
 
 static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
@@ -462,15 +486,15 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
         spilled++;
     }
     if (dest >= 0 && dest < FRAME_REGISTERS)
-        P.reg_nonneg[dest] = binop_preserves_nonneg(op) && rk_nonneg(c, rk_lhs) && rk_nonneg(c, rk_rhs);
-    P.last_cmp_offset = c->count;
+        P.regs.reg_nonneg[dest] = binop_preserves_nonneg(op) && rk_nonneg(c, rk_lhs) && rk_nonneg(c, rk_rhs);
+    P.peep.last_cmp_offset = c->count;
     chunk_emit(c, PACK3(op, dest, pack_rk8(rk_lhs), pack_rk8(rk_rhs)));
     /* A parameter reaching the fully boxed path is the clearest sign binding it raw would pay --
        and the only sign at all for a body with no raw local for the _BOXED family to catch. Only
        arithmetic and ordering: equality and `in` are defined on every type, so they say nothing
        about whether the operand is a number. */
     if ((op <= OP_FLOOR_DIV || (op >= OP_LT && op <= OP_GTE)) && (rk_param(rk_lhs) || rk_param(rk_rhs)))
-        P.raw_boxed_emits++;
+        P.fn.raw_boxed_emits++;
     if (spilled)
         reg_free(spilled);
 }
@@ -484,9 +508,9 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
     /* The comparison need only be the LAST instruction of the condition, not the whole of it:
        `x * x + y * y > 4.0` computes into raw slots first, and all of that is kept. */
     unsigned int cmp_word_start = cond_start;
-    if (P.last_cmp_offset != NO_OFFSET && P.last_cmp_offset >= cond_start &&
-        P.last_cmp_offset == c->count - 1) {
-        cmp_word_start = P.last_cmp_offset;
+    if (P.peep.last_cmp_offset != NO_OFFSET && P.peep.last_cmp_offset >= cond_start &&
+        P.peep.last_cmp_offset == c->count - 1) {
+        cmp_word_start = P.peep.last_cmp_offset;
     }
     if (c->count - cmp_word_start == 1) {
         uint32_t w = c->code[cmp_word_start];
@@ -561,7 +585,7 @@ unsigned int emit_jump_if_false_reg(Chunk* c, int reg) {
    lets one base serve them all. */
 void patch_jump(Chunk* c, unsigned int patch_offset, unsigned int target) {
     c->code[patch_offset] = (uint32_t)(int32_t)((int64_t)target - (int64_t)patch_offset - 1);
-    P.patch_epoch++;
+    P.peep.patch_epoch++;
 }
 
 /* A call's callee_offset is an absolute function entry, not intra-function control flow. */
@@ -598,8 +622,8 @@ void emit_jump_target(Chunk* c, unsigned int target) {
    real max_registers peak instead of a flat, function-agnostic ceiling. */
 unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count,
                        unsigned int func_index) {
-    if ((int)func_index == P.current_func_idx)
-        P.self_call_seen = true;
+    if ((int)func_index == P.fn.current_func_idx)
+        P.fn.self_call_seen = true;
     chunk_emit(c, PACK3(OP_CALL, dest_reg, arg_reg_base, arg_count));
     unsigned int patch_offset = c->count;
     chunk_emit(c, (uint32_t)callee_offset);
@@ -635,25 +659,25 @@ void emit_array_new(Chunk* c, int dest_reg, int item_reg_base, int item_count) {
    this emitter just produced, fold the two into one opcode that hashes the bytes directly. Detected
    by rollback like emit_cond_jump_if_false, so anything else falls through untouched. */
 static bool try_fuse_index_get_interp(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
-    if (P.last_interp_offset == NO_OFFSET || rk_idx != P.last_interp_dest)
+    if (P.peep.last_interp_offset == NO_OFFSET || rk_idx != P.peep.last_interp_dest)
         return false;
     if (arr_reg == rk_idx)
         return false; /* the receiver is what we are about to stop writing */
-    uint32_t w = c->code[P.last_interp_offset];
+    uint32_t w = c->code[P.peep.last_interp_offset];
     if ((Opcode)(w & 0xFF) != OP_INTERP || (int)UNPACK_A(w) != rk_idx)
         return false;
     unsigned int parts = UNPACK_B(w);
-    if (P.last_interp_offset + 1 + parts != c->count)
+    if (P.peep.last_interp_offset + 1 + parts != c->count)
         return false; /* not the immediately preceding instruction */
 
     uint32_t operands[INTERP_MAX_PARTS];
     for (unsigned int i = 0; i < parts; i++)
-        operands[i] = c->code[P.last_interp_offset + 1 + i];
-    c->count = P.last_interp_offset;
+        operands[i] = c->code[P.peep.last_interp_offset + 1 + i];
+    c->count = P.peep.last_interp_offset;
     chunk_emit(c, PACK3(OP_INDEX_GET_INTERP, dest_reg, arr_reg, (int)parts));
     for (unsigned int i = 0; i < parts; i++)
         chunk_emit(c, operands[i]);
-    P.last_interp_offset = NO_OFFSET;
+    P.peep.last_interp_offset = NO_OFFSET;
     return true;
 }
 
@@ -676,7 +700,7 @@ void emit_index_set(Chunk* c, int arr_reg, int rk_idx, int rk_val) {
     /* Mirror of the raw read: a raw value stores straight from its slot when the array's element
        kind matches, instead of boxing only for vm_index_set_compute to unbox again. Bounds-checked,
        so no loop proof is needed. */
-    RawKind elem = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_elem_kind[arr_reg] : RAWK_NONE;
+    RawKind elem = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_elem_kind[arr_reg] : RAWK_NONE;
     RawKind val_kind = (rk_val & RK_RAW_INT_FLAG)    ? RAWK_INT
                        : (rk_val & RK_RAW_REAL_FLAG) ? RAWK_REAL
                                                      : RAWK_NONE;
@@ -836,27 +860,27 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
                                 const ValueType* raw_param_types, int raw_param_count,
                                 unsigned int* out_max_registers, unsigned short* out_frame_bounds);
 
-/* reg is the parameter's own register (0..P.current_param_count-1) OR a register whose value is
-   known (via P.alias_source_param) to have come from indexing that parameter -- either way, marks
+/* reg is the parameter's own register (0..P.regs.current_param_count-1) OR a register whose value is
+   known (via P.regs.alias_source_param) to have come from indexing that parameter -- either way, marks
    that parameter shape-sensitive. Safe to call with any register (out-of-range/no-alias is a
    silent no-op), matching var_lookup_rk's own "harmless on a miss" convention. See the Parser
    struct's own field comments (top of file) for what each of these tables tracks. */
 static void mark_shape_sensitive(int reg) {
     if (reg < 0 || reg >= FRAME_REGISTERS)
         return;
-    if (reg < P.current_param_count) {
-        P.shape_sensitive_param[reg] = true;
+    if (reg < P.regs.current_param_count) {
+        P.regs.shape_sensitive_param[reg] = true;
         return;
     }
-    int src = P.alias_source_param[reg];
+    int src = P.regs.alias_source_param[reg];
     if (src >= 0)
-        P.shape_sensitive_param[src] = true;
+        P.regs.shape_sensitive_param[src] = true;
 }
 
 /* True iff (arr_reg, idx_rk) matches a pair on the safe_loop_item/array_regs stack. Both halves
    must match: a bound proven for array A must never be trusted for a different array B that
    happens to reuse the same index register. idx_rk must be a plain register.
-   Packed-array field callers additionally require arr_reg == P.hint_param_reg (the field offset
+   Packed-array field callers additionally require arr_reg == P.proof.hint_param_reg (the field offset
    is only valid for that one specialized parameter); typed-array callers do not. */
 static bool index_safe_unchecked(int arr_reg, int idx_rk) {
     if (idx_rk & RK_CONST_FLAG)
@@ -865,8 +889,8 @@ static bool index_safe_unchecked(int arr_reg, int idx_rk) {
        ordinary register and this proof is keyed on register identity. Rejecting it outright left
        sieve's marking loop on the generic OP_INDEX_SET the moment its loop variable became typed. */
     int idx_reg = drop_raw_marks(idx_rk);
-    for (int i = 0; i < P.safe_loop_depth; i++) {
-        if (P.safe_loop_item_regs[i] == idx_reg && P.safe_loop_array_regs[i] == arr_reg)
+    for (int i = 0; i < P.proof.safe_loop_depth; i++) {
+        if (P.proof.safe_loop_item_regs[i] == idx_reg && P.proof.safe_loop_array_regs[i] == arr_reg)
             return true;
     }
     return false;
@@ -879,18 +903,18 @@ static bool index_safe_unchecked(int arr_reg, int idx_rk) {
 static void note_slot_written(int reg) {
     if (reg < 0)
         return;
-    if (P.length_tracked_valid && reg == P.length_tracked_source_reg)
-        P.length_tracked_valid = false;
+    if (P.proof.length_tracked_valid && reg == P.proof.length_tracked_source_reg)
+        P.proof.length_tracked_valid = false;
     if (reg < FRAME_REGISTERS) {
-        P.reg_elem_kind[reg] = RAWK_NONE;
+        P.regs.reg_elem_kind[reg] = RAWK_NONE;
         /* Whatever it held is gone, so it is no longer that array; and a count read from it after
            this is a different value, which must not match one read before. */
     }
-    for (int i = 0; i < P.safe_loop_depth; i++) {
-        if (P.safe_loop_item_regs[i] == reg)
-            P.safe_loop_item_regs[i] = -1;
-        if (P.safe_loop_array_regs[i] == reg)
-            P.safe_loop_array_regs[i] = -1;
+    for (int i = 0; i < P.proof.safe_loop_depth; i++) {
+        if (P.proof.safe_loop_item_regs[i] == reg)
+            P.proof.safe_loop_item_regs[i] = -1;
+        if (P.proof.safe_loop_array_regs[i] == reg)
+            P.proof.safe_loop_array_regs[i] = -1;
     }
     for (int i = 0; i < P.range_loop_depth; i++)
         if (P.range_item_regs[i] == reg)
@@ -902,7 +926,7 @@ static void invalidate_register(int reg) {
     if (reg < 0)
         return;
     if (reg < FRAME_REGISTERS)
-        P.reg_nonneg[reg] = false;
+        P.regs.reg_nonneg[reg] = false;
     note_slot_written(reg);
 }
 
@@ -923,7 +947,7 @@ static bool shape_find_field(Shape* shape, unsigned int field_name_idx, unsigned
     return false;
 }
 
-/* Nonzero while compiling an if/else branch -- disqualifies raw storage (see P.var_kind). A
+/* Nonzero while compiling an if/else branch -- disqualifies raw storage (see P.regs.var_kind). A
    real counter since if/else nests. */
 
 /* True (after reporting the error) if name_idx is a top-level variable and the caller is
@@ -971,10 +995,10 @@ static int var_slot(Chunk* c, unsigned int name_idx) {
     int reg = P.slot_floor;
     P.var_names[P.var_count] = name_idx;
     P.var_regs[P.var_count] = reg;
-    /* P.var_kind[] persists across every function's compilation and save/restore only shrinks
+    /* P.regs.var_kind[] persists across every function's compilation and save/restore only shrinks
        P.var_count, so an earlier function's local leaves a stale kind at this index. Reset here,
        the one place every name is created. */
-    P.var_kind[P.var_count] = VAR_BOXED;
+    P.regs.var_kind[P.var_count] = VAR_BOXED;
     P.var_count++;
     P.slot_floor++; /* permanently protects this register from the temp allocator */
     P.slot_next = P.slot_floor; /* resync -- see this function's own comment for why that's always safe */
@@ -1056,14 +1080,14 @@ static void ensure_boxed(unsigned int name_idx) {
         /* Moving off the real slot is the point: those hold a real for the frame's life, and a
            dynamically typed write would leave a tag the unchecked opcodes keep. Nothing is copied
            out -- every caller overwrites the variable. */
-        if (P.var_kind[i] == VAR_RAW_REAL) {
+        if (P.regs.var_kind[i] == VAR_RAW_REAL) {
             if (P.slot_floor >= P.raw_real_next)
                 return error_at("Too many variables (max %d)", FRAME_REGISTERS);
             P.var_regs[i] = P.slot_floor++;
             P.slot_next = P.slot_floor;
             track_peak(P.slot_floor);
         }
-        P.var_kind[i] = VAR_BOXED;
+        P.regs.var_kind[i] = VAR_BOXED;
         return;
     }
 }
@@ -1104,7 +1128,7 @@ static bool var_lookup_rk(unsigned int name_idx, int* out_rk) {
     for (int i = 0; i < P.var_count; i++) {
         if (P.var_names[i] != name_idx)
             continue;
-        switch (P.var_kind[i]) {
+        switch (P.regs.var_kind[i]) {
             case VAR_RAW_INT: *out_rk = RK_RAW_INT_FLAG | P.var_regs[i]; break;
             case VAR_RAW_REAL: *out_rk = RK_RAW_REAL_FLAG | P.var_regs[i]; break;
             default: *out_rk = P.var_regs[i]; break;
@@ -1285,10 +1309,10 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
 }
 
 static void note_raw_write(Chunk* c, int dest, RawKind kind) {
-    P.raw_write_offset = c->count - 1;
-    P.raw_write_slot = dest;
-    P.raw_write_kind = kind;
-    P.raw_write_epoch = P.patch_epoch;
+    P.peep.raw_write_offset = c->count - 1;
+    P.peep.raw_write_slot = dest;
+    P.peep.raw_write_kind = kind;
+    P.peep.raw_write_epoch = P.peep.patch_epoch;
 }
 
 /* Writes an assignment's value straight into the variable's slot, by re-pointing the arithmetic
@@ -1296,17 +1320,24 @@ static void note_raw_write(Chunk* c, int dest, RawKind kind) {
    still the very last word emitted and no jump has been patched since -- either would mean the
    write is reachable on paths the move was not. The source slot must be a temp: retargeting one
    that belongs to a variable would drop that variable's own value. */
-static bool retarget_raw_write(Chunk* c, int src_slot, int dest_slot, RawKind kind) {
-    if (P.raw_write_offset == NO_OFFSET || P.raw_write_offset != c->count - 1)
+/* Rewrites field A of a tracked instruction to dest, but only while it is still the last word
+   emitted -- anything after it means the write is reachable on paths the move was not. Consumes
+   the tracker, since the instruction it named now writes somewhere else. */
+static bool retarget_tracked(Chunk* c, unsigned int* tracked, int dest) {
+    if (*tracked == NO_OFFSET || *tracked != c->count - 1)
         return false;
-    if (P.raw_write_slot != src_slot || P.raw_write_kind != kind)
-        return false;
-    if (P.raw_write_epoch != P.patch_epoch || !raw_is_temp(src_slot))
-        return false;
-    uint32_t w = c->code[P.raw_write_offset];
-    c->code[P.raw_write_offset] = PACK3((Opcode)(w & 0xFF), dest_slot, UNPACK_B(w), UNPACK_C(w));
-    P.raw_write_offset = NO_OFFSET;
+    uint32_t w = c->code[*tracked];
+    c->code[*tracked] = PACK3((Opcode)(w & 0xFF), dest, UNPACK_B(w), UNPACK_C(w));
+    *tracked = NO_OFFSET;
     return true;
+}
+
+static bool retarget_raw_write(Chunk* c, int src_slot, int dest_slot, RawKind kind) {
+    if (P.peep.raw_write_slot != src_slot || P.peep.raw_write_kind != kind)
+        return false;
+    if (P.peep.raw_write_epoch != P.peep.patch_epoch || !raw_is_temp(src_slot))
+        return false;
+    return retarget_tracked(c, &P.peep.raw_write_offset, dest_slot);
 }
 
 /* Re-points a const-flagged RK at whichever raw constant table `kind` names. An int-kind opcode
@@ -1378,7 +1409,7 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
            float32[]" one opcode early instead. */
         int boxed_reg = drop_raw_marks(boxed_rk);
         bool boxed_is_typed_array = !(boxed_rk & RK_CONST_FLAG) && boxed_reg >= 0 &&
-                                    boxed_reg < FRAME_REGISTERS && P.reg_elem_kind[boxed_reg] != RAWK_NONE;
+                                    boxed_reg < FRAME_REGISTERS && P.regs.reg_elem_kind[boxed_reg] != RAWK_NONE;
         if ((lhs_raw ? kind_lhs : kind_rhs) == RAWK_REAL && !boxed_is_typed_array &&
             !(boxed_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) {
             release_if_top(boxed_rk);
@@ -1528,7 +1559,7 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
 
     if (is_cmp) {
         int dest = reg_alloc();
-        P.last_cmp_offset = c->count;
+        P.peep.last_cmp_offset = c->count;
         chunk_emit(c, PACK3(raw_op, dest, swap_cmp ? slot_rhs : slot_lhs, swap_cmp ? slot_lhs : rhs_field));
         *out_rk = dest;
         return true;
@@ -1550,7 +1581,7 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
        here meant an expression silently lost the proof the moment it became eligible for unchecked
        arithmetic -- `p*p` as a range start being the case that found it. */
     if (dest >= 0 && dest < FRAME_REGISTERS)
-        P.reg_nonneg[dest] = binop_preserves_nonneg(op) && rk_nonneg(c, rk_lhs) && rk_nonneg(c, rk_rhs);
+        P.regs.reg_nonneg[dest] = binop_preserves_nonneg(op) && rk_nonneg(c, rk_lhs) && rk_nonneg(c, rk_rhs);
     note_raw_write(c, dest, int_kind ? RAWK_INT : RAWK_REAL);
     *out_rk = (int_kind ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest;
     return true;
@@ -1717,7 +1748,7 @@ static int arg_materialize(Chunk* c, int rk) {
     } else {
         emit_move(c, target, rk);
         if (rk >= 0 && rk < FRAME_REGISTERS)
-            P.reg_elem_kind[target] = P.reg_elem_kind[rk];
+            P.regs.reg_elem_kind[target] = P.regs.reg_elem_kind[rk];
     }
     return target;
 }
@@ -1731,18 +1762,18 @@ static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base, 
     int base = -1;
     int count = 0;
     *out_base_is_temp = true;
-    P.first_arg_end = 0;
+    P.peep.first_arg_end = 0;
     if (!equal(close_tok)) {
         int rk = parse_binary(c, 0);
         if (!equal(TOKEN_COMMA)) {
             base = materialize(c, rk);
             *out_base_is_temp = is_temp(base);
             *out_base = base;
-            P.first_arg_end = c->count;
+            P.peep.first_arg_end = c->count;
             return 1;
         }
         base = arg_materialize(c, rk);
-        P.first_arg_end = c->count;
+        P.peep.first_arg_end = c->count;
         count = 1;
         while (consume(TOKEN_COMMA)) {
             arg_materialize(c, parse_binary(c, 0));
@@ -1924,8 +1955,8 @@ static int emit_interp(Chunk* c, const int* parts, int part_count) {
     if (temps)
         reg_free(temps);
     int dest = reg_alloc();
-    P.last_interp_offset = c->count;
-    P.last_interp_dest = dest;
+    P.peep.last_interp_offset = c->count;
+    P.peep.last_interp_dest = dest;
     chunk_emit(c, PACK2(OP_INTERP, dest, part_count));
     for (int i = 0; i < part_count; i++)
         chunk_emit(c, pack_rk16(parts[i]));
@@ -2162,7 +2193,7 @@ static int parse_primary_inner(Chunk* c) {
             release_if_top(fill_reg);
             int dest = reg_alloc();
             emit_array_repeat(c, dest, fill_reg, narrow_flag, rk_count);
-            P.reg_elem_kind[dest] = fill_kind;
+            P.regs.reg_elem_kind[dest] = fill_kind;
             return dest;
         }
 
@@ -2327,7 +2358,7 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                        raw local already uses. Falls back to the generic opcode if the field isn't
                        int/real or the raw-slot budget is exhausted. */
                     Shape* known =
-                        (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_known_shape[arr_reg] : NULL;
+                        (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[arr_reg] : NULL;
                     unsigned int foffset;
                     ValueType ftype;
                     bool narrow;
@@ -2336,13 +2367,13 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                         bool is_int = (ftype == TYPE_INTEGER);
                         int slot = slot_alloc(is_int ? RAWK_INT : RAWK_REAL);
                         if (slot >= 0) {
-                            /* arr_reg == P.hint_param_reg checked explicitly here (not inside
+                            /* arr_reg == P.proof.hint_param_reg checked explicitly here (not inside
                                index_safe_unchecked, which typed-array callers also use with no such
                                requirement) -- the field OFFSET this opcode trusts is only valid for
                                this one specialized parameter, never any other array a loop might
                                ALSO have proven a safe index for. */
                             bool unchecked =
-                                arr_reg == P.hint_param_reg && index_safe_unchecked(arr_reg, rk_start);
+                                arr_reg == P.proof.hint_param_reg && index_safe_unchecked(arr_reg, rk_start);
                             Opcode op = narrow
                                             ? (unchecked ? (is_int ? OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED
                                                                    : OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED)
@@ -2372,7 +2403,7 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                 /* Element kind known, so the read lands in a statically-typed slot and everything
                    downstream composes unchecked instead of tag-checking what it just produced. */
                 RawKind elem =
-                    (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_elem_kind[arr_reg] : RAWK_NONE;
+                    (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_elem_kind[arr_reg] : RAWK_NONE;
                 if (elem != RAWK_NONE && rk8_fits(rk_start)) {
                     int slot = slot_alloc(elem);
                     if (slot >= 0) {
@@ -2406,11 +2437,11 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                    last_plain_index_src_param needs only arr_reg's identity, available during the
                    ordinary compile too. last_plain_index_known_elem_shape stays NULL outside a
                    specialization recompile, since reg_known_element_shape is only seeded there. */
-                P.last_plain_index_dest_reg = dest;
-                P.last_plain_index_src_param =
-                    (arr_reg >= 0 && arr_reg < P.current_param_count) ? arr_reg : -1;
-                P.last_plain_index_known_elem_shape =
-                    (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.reg_known_element_shape[arr_reg] : NULL;
+                P.peep.last_plain_index_dest_reg = dest;
+                P.peep.last_plain_index_src_param =
+                    (arr_reg >= 0 && arr_reg < P.regs.current_param_count) ? arr_reg : -1;
+                P.peep.last_plain_index_known_elem_shape =
+                    (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_known_element_shape[arr_reg] : NULL;
                 rk = dest;
                 continue;
             }
@@ -2451,7 +2482,7 @@ static int parse_postfix_chain(Chunk* c, int rk) {
             mark_shape_sensitive(struct_reg);
             {
                 Shape* known =
-                    (struct_reg >= 0 && struct_reg < FRAME_REGISTERS) ? P.reg_known_shape[struct_reg] : NULL;
+                    (struct_reg >= 0 && struct_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[struct_reg] : NULL;
                 unsigned int foffset;
                 ValueType ftype;
                 bool narrow;
@@ -2544,17 +2575,14 @@ static int parse_unary(Chunk* c) {
    only when it is still the last word emitted -- the same test emit_cond_jump_if_false's fusion
    uses, via the offset it already tracks. */
 static bool retarget_last_cmp(Chunk* c, int reg_rhs, int dest) {
-    if (P.last_cmp_offset == NO_OFFSET || P.last_cmp_offset != c->count - 1)
+    if (P.peep.last_cmp_offset == NO_OFFSET || P.peep.last_cmp_offset != c->count - 1)
         return false;
-    uint32_t w = c->code[P.last_cmp_offset];
-    if ((int)UNPACK_A(w) != reg_rhs || !is_temp(reg_rhs))
+    if ((int)UNPACK_A(c->code[P.peep.last_cmp_offset]) != reg_rhs || !is_temp(reg_rhs))
         return false;
-    c->code[P.last_cmp_offset] = PACK3((Opcode)(w & 0xFF), dest, UNPACK_B(w), UNPACK_C(w));
-    /* This comparison is now the last word emitted, which would let an enclosing if/while fuse its
-       branch with it -- but it sits behind the short circuit and only runs when the left operand was
-       truthy, so the fusion would be wrong. */
-    P.last_cmp_offset = NO_OFFSET;
-    return true;
+    /* Clearing the tracker matters here beyond bookkeeping: the retargeted comparison is the last
+       word emitted, so an enclosing if/while would fuse its branch with it -- but it sits behind the
+       short circuit and only runs when the left operand was truthy. */
+    return retarget_tracked(c, &P.peep.last_cmp_offset, dest);
 }
 
 /* Both the lhs-false and rhs-false paths land on the same "result = false" code. `dest`
@@ -2946,9 +2974,9 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
         if (op == OP_ADD || op == OP_SUB || op == OP_MUL) {
             int lr = drop_raw_marks(lhs), rr = drop_raw_marks(rhs);
             if (!(lhs & RK_CONST_FLAG) && lr >= 0 && lr < FRAME_REGISTERS)
-                chain_elem = P.reg_elem_kind[lr];
+                chain_elem = P.regs.reg_elem_kind[lr];
             if (chain_elem == RAWK_NONE && !(rhs & RK_CONST_FLAG) && rr >= 0 && rr < FRAME_REGISTERS)
-                chain_elem = P.reg_elem_kind[rr];
+                chain_elem = P.regs.reg_elem_kind[rr];
         }
 
         /* Free-then-allocate, RHS then LHS, matching compile_node's own discipline exactly. */
@@ -2958,7 +2986,7 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
         int dest = reg_alloc();
         emit_binary(c, dest, op, lhs, rhs);
         if (dest >= 0 && dest < FRAME_REGISTERS)
-            P.reg_elem_kind[dest] = chain_elem;
+            P.regs.reg_elem_kind[dest] = chain_elem;
         lhs = dest;
         lhs_start = c->count;
     }
@@ -3020,10 +3048,10 @@ static void parse_assign_destructuring(Chunk* c, unsigned int name_idx) {
         }
         /* A destructuring target can never re-derive the length_tracked_name invariant (its value
            comes from array-index unpacking, never a fresh length() call) -- invalidate eagerly. */
-        if (P.length_tracked_valid) {
+        if (P.proof.length_tracked_valid) {
             for (unsigned int i = 0; i < count; i++) {
-                if (names[i] == P.length_tracked_name) {
-                    P.length_tracked_valid = false;
+                if (names[i] == P.proof.length_tracked_name) {
+                    P.proof.length_tracked_valid = false;
                     break;
                 }
             }
@@ -3059,10 +3087,10 @@ static void parse_assign_destructuring(Chunk* c, unsigned int name_idx) {
            per-register facts for every target. Timed after the RHS is parsed so a legitimate read
            of a target's old value on the RHS still gets the fast path. */
         for (unsigned int i = 0; i < count; i++) {
-            P.reg_known_shape[target_regs[i]] = NULL;
-            P.reg_known_element_shape[target_regs[i]] = NULL;
-            P.reg_elem_kind[target_regs[i]] = RAWK_NONE;
-            P.alias_source_param[target_regs[i]] = -1;
+            P.regs.reg_known_shape[target_regs[i]] = NULL;
+            P.regs.reg_known_element_shape[target_regs[i]] = NULL;
+            P.regs.reg_elem_kind[target_regs[i]] = RAWK_NONE;
+            P.regs.alias_source_param[target_regs[i]] = -1;
             invalidate_register(target_regs[i]);
         }
 
@@ -3096,18 +3124,18 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
         if (parse_had_error)
             return;
 
-        /* Tracks/invalidates length_tracked_name -- see P.last_length_call_result_reg's own
+        /* Tracks/invalidates length_tracked_name -- see P.proof.last_length_call_result_reg's own
            comment. Equality against rk_val (the FINAL, fully-parsed RHS) rather than clearing this
            at every possible intervening op site: any further operation applied on top of the
            length() call allocates its own new register, so `x = length(p) + 1` naturally fails
            this check (rk_val is the ADD's dest, not length()'s), exactly as `x = length(p)` alone
            naturally passes it -- same self-correcting equality trick as last_plain_index_dest_reg. */
-        if (P.last_length_call_result_reg >= 0 && rk_val == P.last_length_call_result_reg) {
-            P.length_tracked_name = name_idx;
-            P.length_tracked_valid = true;
-            P.length_tracked_source_reg = P.last_length_call_arg_reg;
-        } else if (P.length_tracked_valid && name_idx == P.length_tracked_name) {
-            P.length_tracked_valid = false;
+        if (P.proof.last_length_call_result_reg >= 0 && rk_val == P.proof.last_length_call_result_reg) {
+            P.proof.length_tracked_name = name_idx;
+            P.proof.length_tracked_valid = true;
+            P.proof.length_tracked_source_reg = P.proof.last_length_call_arg_reg;
+        } else if (P.proof.length_tracked_valid && name_idx == P.proof.length_tracked_name) {
+            P.proof.length_tracked_valid = false;
         }
 
         /* Looked up after parsing the RHS -- a self-referential first assignment creates the name as
@@ -3157,7 +3185,7 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
                         }
                         P.var_names[P.var_count] = name_idx;
                         P.var_regs[P.var_count] = slot;
-                        P.var_kind[P.var_count] = (rhs_kind == RAWK_INT) ? VAR_RAW_INT : VAR_RAW_REAL;
+                        P.regs.var_kind[P.var_count] = (rhs_kind == RAWK_INT) ? VAR_RAW_INT : VAR_RAW_REAL;
                         P.var_count++;
                         /* Mirrors var_slot's own registration, which this path bypasses. Without it a
                            top-level int/real is invisible to the shadow ban, so a function could
@@ -3172,13 +3200,13 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
                     }
                 }
             }
-        } else if (P.var_kind[existing_idx] != VAR_BOXED) {
+        } else if (P.regs.var_kind[existing_idx] != VAR_BOXED) {
             /* Stays raw (writes in place, no shadow) whenever the new value is the same raw kind --
                the slot's identity never changes, so there's no phi/merge ambiguity to avoid.
                Otherwise shadows to a fresh boxed register -- var_slot must never be called here,
                since it would return the stale raw slot index as if it were a plain register. */
             RawKind rhs_kind = rk_raw_kind(c, rk_val);
-            VarKind cur = P.var_kind[existing_idx];
+            VarKind cur = P.regs.var_kind[existing_idx];
             bool same_kind = (cur == VAR_RAW_INT && rhs_kind == RAWK_INT) ||
                              (cur == VAR_RAW_REAL && rhs_kind == RAWK_REAL);
             if (same_kind) {
@@ -3221,7 +3249,7 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
             P.slot_floor++;
             P.slot_next = P.slot_floor;
             P.var_regs[existing_idx] = new_reg;
-            P.var_kind[existing_idx] = VAR_BOXED;
+            P.regs.var_kind[existing_idx] = VAR_BOXED;
             /* No P.global_regs update needed -- see ensure_boxed's identical reasoning: this path
                only runs on a currently-raw-tracked name, which can never be in P.global_names. */
             if (rk_val & RK_CONST_FLAG) {
@@ -3243,7 +3271,7 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
            one -- and invalidate_register below would wipe the fact this line is preserving. */
         bool rhs_plain_reg = !(rk_val & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) &&
                              rk_val >= 0 && rk_val < FRAME_REGISTERS;
-        RawKind rhs_elem = rhs_plain_reg ? P.reg_elem_kind[rk_val] : RAWK_NONE;
+        RawKind rhs_elem = rhs_plain_reg ? P.regs.reg_elem_kind[rk_val] : RAWK_NONE;
         /* Preserved across invalidate_register for the same reason rhs_elem is: the literal was
            usually built straight into the register this name is about to be given. */
         /* See invalidate_safe_loop_reg's own comment -- without this, `reg` staying on
@@ -3255,21 +3283,21 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
            deserves a surviving "my elements are this shape" fact. Without this, reassigning a
            specialized array-of-structs parameter and indexing through a fresh alias resolves the
            stale shape's field offset -- reachable type confusion. */
-        P.reg_known_element_shape[reg] = NULL;
+        P.regs.reg_known_element_shape[reg] = NULL;
         /* var_slot returns the same register for an already-declared name, so a reassigned
            shape-sensitive parameter would keep a hint that may no longer hold. Clear it by default
            -- always safe -- unless the RHS was exactly `some_param[idx]`, the one-hop alias pattern
            SPEC_KIND_ARRAY_OF_STRUCTS needs, where the parameter's element shape propagates onto the
            alias instead. Consumed immediately so a freed-and-reused temp can't match later. */
-        if (rk_val == P.last_plain_index_dest_reg && P.last_plain_index_dest_reg >= 0) {
-            P.reg_known_shape[reg] = P.last_plain_index_known_elem_shape;
-            P.alias_source_param[reg] = P.last_plain_index_src_param;
+        if (rk_val == P.peep.last_plain_index_dest_reg && P.peep.last_plain_index_dest_reg >= 0) {
+            P.regs.reg_known_shape[reg] = P.peep.last_plain_index_known_elem_shape;
+            P.regs.alias_source_param[reg] = P.peep.last_plain_index_src_param;
         } else {
-            P.reg_known_shape[reg] = NULL;
-            P.alias_source_param[reg] = -1;
+            P.regs.reg_known_shape[reg] = NULL;
+            P.regs.alias_source_param[reg] = -1;
         }
-        P.last_plain_index_dest_reg = -1;
-        P.reg_elem_kind[reg] = rhs_elem;
+        P.peep.last_plain_index_dest_reg = -1;
+        P.regs.reg_elem_kind[reg] = rhs_elem;
         if (rk_val & RK_CONST_FLAG) {
             emit_loadk(c, reg, (unsigned int)(rk_val & ~RK_CONST_FLAG));
         } else if (reg != rk_val) {
@@ -3291,8 +3319,8 @@ static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
 
         /* A compound assignment can never re-derive length_tracked_name's invariant (the RHS is
            combined with the OLD value, never a fresh length() call alone) -- invalidate eagerly. */
-        if (P.length_tracked_valid && name_idx == P.length_tracked_name)
-            P.length_tracked_valid = false;
+        if (P.proof.length_tracked_valid && name_idx == P.proof.length_tracked_name)
+            P.proof.length_tracked_valid = false;
 
         /* A raw-tracked compound-assignment target needs its own path -- var_lookup would return a
            bare register-shaped int with no distinguishing flag (real bug: silently misread as a
@@ -3305,11 +3333,11 @@ static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
                 break;
             }
 
-        if (existing_idx >= 0 && P.var_kind[existing_idx] != VAR_BOXED) {
+        if (existing_idx >= 0 && P.regs.var_kind[existing_idx] != VAR_BOXED) {
             /* Once for every branch below, all of which write this slot -- same reason as the
                plain assignment path above. */
             note_slot_written(P.var_regs[existing_idx]);
-            RawKind cur_kind = (P.var_kind[existing_idx] == VAR_RAW_INT) ? RAWK_INT : RAWK_REAL;
+            RawKind cur_kind = (P.regs.var_kind[existing_idx] == VAR_RAW_INT) ? RAWK_INT : RAWK_REAL;
             Opcode boxed_op = compound_assign_ops[i].op;
             bool native_op_exists = (boxed_op == OP_ADD || boxed_op == OP_SUB || boxed_op == OP_MUL);
 
@@ -3414,7 +3442,7 @@ static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
                 track_peak(P.slot_floor);
                 P.var_regs[existing_idx] = new_reg;
             }
-            P.var_kind[existing_idx] = VAR_BOXED;
+            P.regs.var_kind[existing_idx] = VAR_BOXED;
             /* No P.global_regs update needed -- see ensure_boxed's identical reasoning. */
             rk_rhs = drop_raw_marks(rk_rhs);
             emit_binary(c, new_reg, boxed_op, old_slot, rk_rhs);
@@ -3441,15 +3469,15 @@ static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
         int rk_rhs = parse_binary(c, 0);
         if (parse_had_error)
             return;
-        /* Same P.reg_known_shape invalidation as the plain-assignment tail above -- `reg`'s value
+        /* Same P.regs.reg_known_shape invalidation as the plain-assignment tail above -- `reg`'s value
            is about to change (e.g. `bodies += extra_bodies`), so any shape hint on it is no longer
            trustworthy. alias_source_param and reg_known_element_shape cleared alongside it now too
            (earlier omissions here -- the plain-assignment tail clears all three); see
            invalidate_register's own comment for why safe_loop_item_regs needs the same treatment. */
-        P.reg_known_shape[reg] = NULL;
-        P.reg_known_element_shape[reg] = NULL;
-        P.reg_elem_kind[reg] = RAWK_NONE;
-        P.alias_source_param[reg] = -1;
+        P.regs.reg_known_shape[reg] = NULL;
+        P.regs.reg_known_element_shape[reg] = NULL;
+        P.regs.reg_elem_kind[reg] = RAWK_NONE;
+        P.regs.alias_source_param[reg] = -1;
         invalidate_register(reg);
         emit_binary(c, reg, compound_assign_ops[i].op, reg, rk_rhs);
         release_if_top(rk_rhs);
@@ -3536,10 +3564,10 @@ static void parse_chain_store(Chunk* c, ChainTarget t) {
         /* Only a direct `param.field = ...` (obj_is_base, no preceding chain step) marks the
            parameter shape-sensitive -- an intermediate chain register (`a.b.c = ...`) isn't a
            parameter itself, and its own provenance isn't tracked (only the one-hop alias case,
-           `local = param[idx]`, is -- see P.alias_source_param). */
+           `local = param[idx]`, is -- see P.regs.alias_source_param). */
         if (pending_is_field && obj_is_base) {
             mark_shape_sensitive(obj_reg);
-            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.reg_known_shape[obj_reg] : NULL;
+            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[obj_reg] : NULL;
             unsigned int foffset;
             ValueType ftype;
             bool field_narrow_bit;
@@ -3623,9 +3651,9 @@ static void parse_chain_compound(Chunk* c, ChainTarget t) {
 
             /* Same compile-time field lookup the plain '=' branch above uses -- only meaningful
                when obj_is_base (this register really is the shape-sensitive parameter/alias, not
-               an intermediate chain link -- P.reg_known_shape is never seeded for those). */
+               an intermediate chain link -- P.regs.reg_known_shape is never seeded for those). */
             Shape* known = (obj_is_base && obj_reg >= 0 && obj_reg < FRAME_REGISTERS)
-                               ? P.reg_known_shape[obj_reg]
+                               ? P.regs.reg_known_shape[obj_reg]
                                : NULL;
             unsigned int foffset = 0;
             ValueType ftype = TYPE_ANY;
@@ -3809,7 +3837,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
             /* obj_reg is still obj's own register here (obj_is_base) -- this is the very first
                postfix step on the name, no chaining happened before it. */
             mark_shape_sensitive(obj_reg);
-            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.reg_known_shape[obj_reg] : NULL;
+            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[obj_reg] : NULL;
             unsigned int foffset = 0;
             ValueType ftype = TYPE_ANY;
             bool field_narrow_bit = false;
@@ -3826,7 +3854,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 if (parse_had_error)
                     return;
                 /* Specialized path: the field's byte offset/type is a compile-time-known fact
-                   here (see P.reg_known_shape's own comment) -- write straight into it from a raw
+                   here (see P.regs.reg_known_shape's own comment) -- write straight into it from a raw
                    slot, no boxing, when rk_val is already the matching raw kind (an already-raw
                    value, or a matching literal -- raw_materialize's own contract). Falls back to
                    the generic (boxing) path otherwise, same graceful-overflow convention raw
@@ -3834,11 +3862,11 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
                     int slot = raw_materialize(c, rk_val, field_kind);
                     if (slot >= 0) {
-                        /* obj_reg == P.hint_param_reg checked explicitly (see the GET site's
+                        /* obj_reg == P.proof.hint_param_reg checked explicitly (see the GET site's
                            identical comment above) -- the field OFFSET these opcodes trust is only
                            valid for this one specialized parameter. */
                         bool unchecked =
-                            obj_reg == P.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
+                            obj_reg == P.proof.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
                         Opcode op =
                             field_narrow_bit
                                 ? (unchecked
@@ -3878,7 +3906,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 Opcode bin_op = compound_assign_ops[compound_i].op;
                 int mul_a, mul_b;
                 if (bin_op == OP_ADD && field_kind == RAWK_REAL && !field_narrow_bit &&
-                    obj_reg == P.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx) &&
+                    obj_reg == P.proof.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx) &&
                     rk_raw_kind(c, rk_rhs) == RAWK_REAL &&
                     take_fused_mul_real(c, rhs_start, rk_rhs, &mul_a, &mul_b)) {
                     chunk_emit(c, PACK3(OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA, obj_reg, mul_a,
@@ -3896,11 +3924,11 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                 if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
                     int slot = raw_materialize(c, rk_rhs, field_kind);
                     if (slot >= 0) {
-                        /* obj_reg == P.hint_param_reg checked explicitly (see the GET site's
+                        /* obj_reg == P.proof.hint_param_reg checked explicitly (see the GET site's
                            identical comment above) -- the field OFFSET these opcodes trust is only
                            valid for this one specialized parameter. */
                         bool unchecked =
-                            obj_reg == P.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
+                            obj_reg == P.proof.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
                         Opcode op =
                             field_narrow_bit
                                 ? (unchecked
@@ -4419,7 +4447,7 @@ static int chain_of_array_ops(Chunk* c, unsigned int start, unsigned int end, in
             return 0;
     /* At least one operand has to be a typed array, or this is scalar arithmetic. */
     for (int i = 0; i < nleaf; i++)
-        if (!(leaf[i] & RK_CONST_FLAG) && P.reg_elem_kind[leaf[i]] == RAWK_REAL)
+        if (!(leaf[i] & RK_CONST_FLAG) && P.regs.reg_elem_kind[leaf[i]] == RAWK_REAL)
             return nleaf;
     return 0;
 }
@@ -4449,13 +4477,13 @@ static void parse_for_range(Chunk* c, unsigned int loop_var_name, int item_reg, 
            non-negative constant. Both fail closed -- an unrecognized shape just compiles as before. */
     bool bound_safe = false;
     int bound_array_reg = -1;
-    if (P.length_tracked_valid && !(rk_end & RK_CONST_FLAG)) {
+    if (P.proof.length_tracked_valid && !(rk_end & RK_CONST_FLAG)) {
         for (int vi = 0; vi < P.var_count; vi++) {
             /* Any kind, not just VAR_BOXED: what matters is that this name still reads the
                    length, which knowing its type does not change. */
-            if (P.var_names[vi] == P.length_tracked_name && P.var_regs[vi] == drop_raw_marks(rk_end)) {
+            if (P.var_names[vi] == P.proof.length_tracked_name && P.var_regs[vi] == drop_raw_marks(rk_end)) {
                 bound_safe = true;
-                bound_array_reg = P.length_tracked_source_reg;
+                bound_array_reg = P.proof.length_tracked_source_reg;
                 break;
             }
         }
@@ -4466,7 +4494,7 @@ static void parse_for_range(Chunk* c, unsigned int loop_var_name, int item_reg, 
            matched by inspecting the emitted OP_ADD word) with one composable predicate. It now also
            covers `p*p`, `i*i+j`, `(p+1)*2` and anything else built from + * // %. */
     bool start_safe = bound_safe && rk_nonneg(c, rk_start);
-    bool this_loop_safe = bound_safe && start_safe && P.safe_loop_depth < LOOP_MAX;
+    bool this_loop_safe = bound_safe && start_safe && P.proof.safe_loop_depth < LOOP_MAX;
 
     /* Snapshotted once, matching Lua/Python's range-for semantics -- a later mutation of the
            source variable has no effect on an already-running loop. Used to reuse a plain register
@@ -4499,13 +4527,13 @@ static void parse_for_range(Chunk* c, unsigned int loop_var_name, int item_reg, 
     /* Pushed/popped exactly around this one loop's own body -- see safe_loop_item_regs's own
            comment (Parser struct) for why this is a small stack, not a whole-frame table. */
     if (this_loop_safe) {
-        P.safe_loop_array_regs[P.safe_loop_depth] = bound_array_reg;
-        P.safe_loop_item_regs[P.safe_loop_depth] = item_reg;
-        P.safe_loop_depth++;
+        P.proof.safe_loop_array_regs[P.proof.safe_loop_depth] = bound_array_reg;
+        P.proof.safe_loop_item_regs[P.proof.safe_loop_depth] = item_reg;
+        P.proof.safe_loop_depth++;
         /* Accepting the loop required a non-negative start, and the step is positive, so
                every value this register takes is >= 0. */
         if (item_reg >= 0 && item_reg < FRAME_REGISTERS)
-            P.reg_nonneg[item_reg] = true;
+            P.regs.reg_nonneg[item_reg] = true;
     }
     /* Same push/pop discipline as safe_loop_* above; invalidate_register does the recording. */
     bool range_tracked = P.range_loop_depth < LOOP_MAX;
@@ -4521,7 +4549,7 @@ static void parse_for_range(Chunk* c, unsigned int loop_var_name, int item_reg, 
            `i = 0; for i < n` did not, which measured 15.9% more instructions for the same work. */
     for (int v = P.var_count - 1; v >= 0; v--)
         if (P.var_names[v] == loop_var_name && P.var_regs[v] == item_reg) {
-            P.var_kind[v] = VAR_RAW_INT;
+            P.regs.var_kind[v] = VAR_RAW_INT;
             break;
         }
     unsigned int body_start = c->count;
@@ -4531,14 +4559,14 @@ static void parse_for_range(Chunk* c, unsigned int loop_var_name, int item_reg, 
         if (range_tracked)
             P.range_loop_depth--;
         if (this_loop_safe)
-            P.safe_loop_depth--;
+            P.proof.safe_loop_depth--;
         P.loop_depth--;
         P.slot_floor = saved_reserved_floor;
         P.slot_next = saved_reserved_floor;
         return;
     }
     if (this_loop_safe)
-        P.safe_loop_depth--;
+        P.proof.safe_loop_depth--;
     bool body_wrote_item = !range_tracked || P.range_item_written[P.range_loop_depth - 1];
     if (range_tracked)
         P.range_loop_depth--;
@@ -4578,17 +4606,17 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
        whatever last used it. This loop's own PREP/LOOP is about to start overwriting it every
        iteration regardless of what THIS loop turns out to prove, so any stale fact must be cleared
        before this loop's own body (or its own bound_safe/start_safe below) can be compiled. */
-    P.reg_known_shape[item_reg] = NULL;
-    P.reg_known_element_shape[item_reg] = NULL;
-    P.reg_elem_kind[item_reg] = RAWK_NONE;
-    P.alias_source_param[item_reg] = -1;
+    P.regs.reg_known_shape[item_reg] = NULL;
+    P.regs.reg_known_element_shape[item_reg] = NULL;
+    P.regs.reg_elem_kind[item_reg] = RAWK_NONE;
+    P.regs.alias_source_param[item_reg] = -1;
     invalidate_register(item_reg);
     /* invalidate_register cannot catch loop_var_name reusing the length_tracked_name NAME itself
        (`for n in 0..1000:` after `n = length(bodies)`) -- var_slot returns a bare register number,
        indistinguishable from a new one. This loop overwrites that register every iteration, so a
        later `for i in 0..n:` would otherwise trust the stale leftover. */
-    if (P.length_tracked_valid && loop_var_name == P.length_tracked_name)
-        P.length_tracked_valid = false;
+    if (P.proof.length_tracked_valid && loop_var_name == P.proof.length_tracked_name)
+        P.proof.length_tracked_valid = false;
 
     int rk_start = parse_binary(c, 0); /* the range's start, or the whole collection if no '..' follows */
 
@@ -4639,19 +4667,19 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
     if (val_reg < 0)
         return;
     /* Same name-shadowing reasoning as parse_for_in's own identical block just above. */
-    P.reg_known_shape[key_reg] = NULL;
-    P.reg_known_element_shape[key_reg] = NULL;
-    P.reg_elem_kind[key_reg] = RAWK_NONE;
-    P.alias_source_param[key_reg] = -1;
+    P.regs.reg_known_shape[key_reg] = NULL;
+    P.regs.reg_known_element_shape[key_reg] = NULL;
+    P.regs.reg_elem_kind[key_reg] = RAWK_NONE;
+    P.regs.alias_source_param[key_reg] = -1;
     invalidate_register(key_reg);
-    P.reg_known_shape[val_reg] = NULL;
-    P.reg_known_element_shape[val_reg] = NULL;
-    P.reg_elem_kind[val_reg] = RAWK_NONE;
-    P.alias_source_param[val_reg] = -1;
+    P.regs.reg_known_shape[val_reg] = NULL;
+    P.regs.reg_known_element_shape[val_reg] = NULL;
+    P.regs.reg_elem_kind[val_reg] = RAWK_NONE;
+    P.regs.alias_source_param[val_reg] = -1;
     invalidate_register(val_reg);
     /* Same length_tracked_name-by-NAME reasoning as parse_for_in's own identical check. */
-    if (P.length_tracked_valid && (key_name == P.length_tracked_name || val_name == P.length_tracked_name)) {
-        P.length_tracked_valid = false;
+    if (P.proof.length_tracked_valid && (key_name == P.proof.length_tracked_name || val_name == P.proof.length_tracked_name)) {
+        P.proof.length_tracked_valid = false;
     }
 
     int rk_col = parse_binary(c, 0);
@@ -4967,7 +4995,7 @@ static int parse_module_call(Chunk* c) {
             chunk_emit(c,
                        PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_GROUP_SUM_CHAIN));
             reg_free(nleaf + 2);
-            P.reg_elem_kind[base] = RAWK_REAL;
+            P.regs.reg_elem_kind[base] = RAWK_REAL;
             return base;
         }
         if (taken)
@@ -5203,12 +5231,12 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
        `length(P)` for any plain-register P, parameter or local -- a locally-built typed array is
        just as eligible for the bound proof, it simply has no shape to specialize on. Widening
        beyond parameters is safe because the field-access sites separately require
-       arr_reg == P.hint_param_reg, so a local can only ever reach the bare-index family. */
-    P.last_length_call_result_reg = -1;
-    P.last_length_call_arg_reg = -1;
+       arr_reg == P.proof.hint_param_reg, so a local can only ever reach the bare-index family. */
+    P.proof.last_length_call_result_reg = -1;
+    P.proof.last_length_call_arg_reg = -1;
     if (call_id == CALL_BUILTIN_LENGTH && arg_count == 1) {
         if (dest >= 0 && dest < FRAME_REGISTERS)
-            P.reg_nonneg[dest] = true; /* a count */
+            P.regs.reg_nonneg[dest] = true; /* a count */
         int arg_orig_reg = base;
         if (arg_code_end - arg_code_begin == 1) {
             uint32_t w = c->code[arg_code_begin];
@@ -5216,8 +5244,8 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
                 arg_orig_reg = (int)UNPACK_B(w);
         }
         if (arg_orig_reg >= 0) {
-            P.last_length_call_result_reg = dest;
-            P.last_length_call_arg_reg = arg_orig_reg;
+            P.proof.last_length_call_result_reg = dest;
+            P.proof.last_length_call_arg_reg = arg_orig_reg;
         }
     }
     return dest;
@@ -5339,9 +5367,9 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         last_bare_call_start = c->count;
         if (needs_call_value)
             emit_call_value(c, dest, base, arg_count, callee_reg);
-        else if (P.in_variant && (int)func_index == P.current_func_idx && arg_count == (int)func_arity &&
+        else if (P.fn.in_variant && (int)func_index == P.fn.current_func_idx && arg_count == (int)func_arity &&
                  func_arity == func_min_arity) {
-            P.self_call_seen = true;
+            P.fn.self_call_seen = true;
             chunk_emit(c, PACK3(OP_CALL_SELF, dest, base, arg_count));
         } else
             emit_call(
@@ -5549,32 +5577,32 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
        it now emits an unbox that fails at runtime -- a function defined between an array's
        construction and its use was enough. */
     RawKind saved_elem_kind[FRAME_REGISTERS];
-    memcpy(saved_elem_kind, P.reg_elem_kind, sizeof(saved_elem_kind));
+    memcpy(saved_elem_kind, P.regs.reg_elem_kind, sizeof(saved_elem_kind));
     memcpy(saved_var_names, P.var_names, sizeof(unsigned int) * (size_t)P.var_count);
     memcpy(saved_var_regs, P.var_regs, sizeof(int) * (size_t)P.var_count);
-    memcpy(saved_var_kind, P.var_kind, sizeof(VarKind) * (size_t)P.var_count);
+    memcpy(saved_var_kind, P.regs.var_kind, sizeof(VarKind) * (size_t)P.var_count);
     P.var_count = 0;
     P.slot_next = P.slot_floor = P.slot_max = 0;
 
-    memset(P.shape_sensitive_param, 0, sizeof(P.shape_sensitive_param));
+    memset(P.regs.shape_sensitive_param, 0, sizeof(P.regs.shape_sensitive_param));
     for (int i = 0; i < FRAME_REGISTERS; i++)
-        P.alias_source_param[i] = -1;
-    memset(P.reg_known_shape, 0, sizeof(P.reg_known_shape));
-    memset(P.reg_known_element_shape, 0, sizeof(P.reg_known_element_shape));
-    P.last_plain_index_dest_reg = -1;
-    P.last_plain_index_src_param = -1;
-    P.last_plain_index_known_elem_shape = NULL;
-    P.current_param_count = param_count;
+        P.regs.alias_source_param[i] = -1;
+    memset(P.regs.reg_known_shape, 0, sizeof(P.regs.reg_known_shape));
+    memset(P.regs.reg_known_element_shape, 0, sizeof(P.regs.reg_known_element_shape));
+    P.peep.last_plain_index_dest_reg = -1;
+    P.peep.last_plain_index_src_param = -1;
+    P.peep.last_plain_index_known_elem_shape = NULL;
+    P.regs.current_param_count = param_count;
     /* hint_param_reg only enables the loop-bound-hoisting optimization for a packed-array
        specialization (kind == SPEC_KIND_PACKED_ARRAY, hint_is_element_shape false) -- an
        array-of-structs specialization has no per-object structural guarantee (see SPEC_KIND_
        ARRAY_OF_STRUCTS's own comment, vm.c) so index_safe_unchecked must never engage for one. */
-    P.hint_param_reg = hint_is_element_shape ? -1 : hint_param_reg;
-    P.length_tracked_valid = false;
-    P.length_tracked_source_reg = -1;
-    P.last_length_call_result_reg = -1;
-    P.last_length_call_arg_reg = -1;
-    P.safe_loop_depth = 0;
+    P.proof.hint_param_reg = hint_is_element_shape ? -1 : hint_param_reg;
+    P.proof.length_tracked_valid = false;
+    P.proof.length_tracked_source_reg = -1;
+    P.proof.last_length_call_result_reg = -1;
+    P.proof.last_length_call_arg_reg = -1;
+    P.proof.safe_loop_depth = 0;
 
     /* Before the parameters, not after: a specialization recompile enters through
        parser_save_state, which zeroes the whole parser, and var_slot reads the region's low end as
@@ -5589,9 +5617,9 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
            "parameter i occupies register i" assumption keeps holding for the others. */
         if (i == hint_param_reg) {
             if (hint_is_element_shape)
-                P.reg_known_element_shape[i] = hint_shape;
+                P.regs.reg_known_element_shape[i] = hint_shape;
             else
-                P.reg_known_shape[i] = hint_shape;
+                P.regs.reg_known_shape[i] = hint_shape;
         }
         for (int k = 0; k < raw_param_count; k++) {
             if (raw_param_regs[k] != i)
@@ -5600,7 +5628,7 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
                its type before choosing this variant -- so recording the type is the whole of the
                binding. No second slot, and no prologue opcode to fill one: the parameter simply
                stops needing its tag checked. */
-            P.var_kind[P.var_count - 1] = (raw_param_types[k] == TYPE_INTEGER) ? VAR_RAW_INT : VAR_RAW_REAL;
+            P.regs.var_kind[P.var_count - 1] = (raw_param_types[k] == TYPE_INTEGER) ? VAR_RAW_INT : VAR_RAW_REAL;
             break;
         }
     }
@@ -5630,14 +5658,14 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     P.var_count = saved_var_count;
     memcpy(P.var_names, saved_var_names, sizeof(unsigned int) * (size_t)saved_var_count);
     memcpy(P.var_regs, saved_var_regs, sizeof(int) * (size_t)saved_var_count);
-    memcpy(P.var_kind, saved_var_kind, sizeof(VarKind) * (size_t)saved_var_count);
+    memcpy(P.regs.var_kind, saved_var_kind, sizeof(VarKind) * (size_t)saved_var_count);
     P.slot_next = saved_next_temp;
     P.slot_floor = saved_reserved_floor;
     P.slot_max = saved_max_slot_used;
     P.raw_real_next = saved_raw_real_next;
     P.raw_real_floor = saved_raw_real_floor;
     P.raw_real_low = saved_raw_real_low;
-    memcpy(P.reg_elem_kind, saved_elem_kind, sizeof(saved_elem_kind));
+    memcpy(P.regs.reg_elem_kind, saved_elem_kind, sizeof(saved_elem_kind));
 }
 
 /* Named functions can't nest. Once one parameter has a default, every parameter after it must
@@ -5689,25 +5717,25 @@ static void parse_function(Chunk* c) {
 
     unsigned int captured_max_registers;
     unsigned short captured_frame_bounds;
-    unsigned int raw_boxed_before = P.raw_boxed_emits;
-    int saved_func_idx = P.current_func_idx;
-    bool saved_self_call = P.self_call_seen;
-    P.current_func_idx = (int)this_func_idx;
-    P.self_call_seen = false;
+    unsigned int raw_boxed_before = P.fn.raw_boxed_emits;
+    int saved_func_idx = P.fn.current_func_idx;
+    bool saved_self_call = P.fn.self_call_seen;
+    P.fn.current_func_idx = (int)this_func_idx;
+    P.fn.self_call_seen = false;
     parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0, &captured_max_registers,
                         &captured_frame_bounds);
-    unsigned int raw_boxed_in_body = P.raw_boxed_emits - raw_boxed_before;
-    P.current_func_idx = saved_func_idx;
-    P.self_call_seen = saved_self_call;
+    unsigned int raw_boxed_in_body = P.fn.raw_boxed_emits - raw_boxed_before;
+    P.fn.current_func_idx = saved_func_idx;
+    P.fn.self_call_seen = saved_self_call;
 
-    /* Fold P.shape_sensitive_param[] into one bitmask; retain the source span (owned copy, see
+    /* Fold P.regs.shape_sensitive_param[] into one bitmask; retain the source span (owned copy, see
        ChunkFunction.source_span's own comment) only when it's actually needed -- the common case
        (not shape-sensitive) pays nothing beyond the mask computation itself. parse_function_body
-       already restored P.shape_sensitive_param/P.current_param_count's OWN inputs, but not the fold-in
+       already restored P.regs.shape_sensitive_param/P.regs.current_param_count's OWN inputs, but not the fold-in
        -- reads them here, right after the call, before anything else can touch them. */
     unsigned int shape_mask = 0;
     for (int i = 0; i < param_count && i < 31; i++)
-        if (P.shape_sensitive_param[i])
+        if (P.regs.shape_sensitive_param[i])
             shape_mask |= (1u << i);
     if (shape_mask == 0 && param_count > 0 && raw_boxed_in_body > 0)
         shape_mask = SHAPE_MASK_NUMERIC_ONLY;
@@ -5764,16 +5792,16 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     unsigned int new_offset = c->count;
     unsigned int max_registers = 0;
     unsigned short frame_bounds = 0;
-    P.current_func_idx = (int)(target_f - c->functions);
+    P.fn.current_func_idx = (int)(target_f - c->functions);
     /* Only a numeric variant may self-call without resolving: a shape-specialized body is chosen by
        the argument's SHAPE, which a recursive call has no guarantee of preserving. */
-    P.in_variant = (raw_param_count > 0);
+    P.fn.in_variant = (raw_param_count > 0);
     if (!parse_had_error) {
         parse_function_body(c, param_names, param_count, param_index, shape,
                             kind == SPEC_KIND_ARRAY_OF_STRUCTS, raw_param_regs, raw_param_types,
                             raw_param_count, &max_registers, &frame_bounds);
     }
-    P.in_variant = false;
+    P.fn.in_variant = false;
     bool ok = !parse_had_error;
 
     lexer_restore_state(saved_lexer);
@@ -6080,10 +6108,8 @@ bool parser_read_variable(VM* vm, Chunk* c, const char* name, AerVal* out) {
 
 void parser_reset(void) {
     reg_reset();
-    P.last_cmp_offset = NO_OFFSET;
-    P.raw_write_offset = NO_OFFSET;
-    P.last_interp_offset = NO_OFFSET;
-    P.current_func_idx = -1; /* 0 is a real function index, so zeroed is not "outside a body" */
+    peephole_window_reset();
+    P.fn.current_func_idx = -1; /* 0 is a real function index, so zeroed is not "outside a body" */
     P.var_count = 0;
     P.global_count = 0;
     P.struct_count = 0;
@@ -6113,7 +6139,7 @@ ParserState* parser_save_state(void) {
     s->p = P;
     P = (Parser){
         0}; /* zeroes everything reg_reset() would, plus every other field -- see this function's own comment above */
-    P.current_func_idx = -1; /* 0 is a real function index, so zeroed is not "outside a body" */
+    P.fn.current_func_idx = -1; /* 0 is a real function index, so zeroed is not "outside a body" */
     /* struct_names is the exception to "reset before its next read": struct definitions are a
        program-wide fact, never re-derived by a nested recompile, and a specialized body may
        construct any of them. With an empty table is_struct_name cannot tell `SomeStruct(...)` from
