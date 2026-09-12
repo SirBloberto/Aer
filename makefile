@@ -96,6 +96,11 @@ profile: $(SOURCE)
 	@mkdir -p binary
 	gcc $(FLAGS) -DAER_PROFILE -o binary/aer-profile$(EXE) $(SOURCE) -lm $(WINLIBS)
 
+# Ranks opcodes by dispatches actually executed, which is a different question from
+# check-opcode-coverage's "is it ever emitted". Reports only; takes minutes, so not part of `check`.
+opcode-traffic: profile
+	python3 tools/opcode_traffic.py --binary binary/aer-profile$(EXE)
+
 TESTS := tests/test_core.aer \
          tests/test_collections.aer \
          tests/test_functions.aer \
