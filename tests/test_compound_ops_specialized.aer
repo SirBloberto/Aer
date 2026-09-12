@@ -1,0 +1,153 @@
+#!/usr/bin/env aer
+import collection
+# AER test suite — `-=` and `*=` on shape-specialized struct and packed-array fields, wide and
+# narrow. `+=` has had coverage since the raw compound family landed; the other two operators reach
+# the same opcodes through the same specialized bodies and had none, so a wrong result on either
+# would have been silent. Every case runs through a function called repeatedly with one shape, which
+# is what makes lbl_call specialize it.
+
+struct Wide:
+    x = 0.0
+    n = 0
+
+struct Narrow:
+    x = 0.0f
+    n = 0i
+
+# ------------------------------------------------------------------ #
+# 1. Bare struct fields — OP_FIELD_COMPOUND_RAW_{REAL,INT,FLOAT32,INT32}
+# ------------------------------------------------------------------ #
+
+function shrink(b, k):
+    b.x -= k
+    b.n -= 2
+    return b.x
+
+function scale(b, k):
+    b.x *= k
+    b.n *= 3
+    return b.x
+
+w = Wide(100.0, 40)
+r = 0
+for r < 5:
+    shrink(w, 1.0)
+    r += 1
+assert(w.x == 95.0, "wide real struct field, -= across specialized calls")
+assert(w.n == 30, "wide int struct field, -= across specialized calls")
+
+r = 0
+for r < 3:
+    scale(w, 2.0)
+    r += 1
+assert(w.x == 760.0, "wide real struct field, *= across specialized calls")
+assert(w.n == 810, "wide int struct field, *= across specialized calls")
+
+nw = Narrow(100.0, 40)
+r = 0
+for r < 5:
+    shrink(nw, 1.0)
+    r += 1
+assert(nw.x == 95.0, "narrow float32 struct field, -=")
+assert(nw.n == 30, "narrow int32 struct field, -=")
+
+r = 0
+for r < 3:
+    scale(nw, 2.0)
+    r += 1
+assert(nw.x == 760.0, "narrow float32 struct field, *=")
+assert(nw.n == 810, "narrow int32 struct field, *=")
+
+# ------------------------------------------------------------------ #
+# 2. Packed-array fields, bounds-checked index —
+#    OP_INDEX_FIELD_COMPOUND_RAW_*
+# ------------------------------------------------------------------ #
+
+function shrink_each(arr, count, k):
+    i = 0
+    for i < count:
+        arr[i].x -= k
+        arr[i].n -= 2
+        i += 1
+
+function scale_each(arr, count, k):
+    i = 0
+    for i < count:
+        arr[i].x *= k
+        arr[i].n *= 3
+        i += 1
+
+wides = [Wide(100.0, 40); 4]
+r = 0
+for r < 5:
+    shrink_each(wides, 4, 1.0)
+    r += 1
+assert(wides[0].x == 95.0 and wides[3].x == 95.0, "wide real packed field, -= checked")
+assert(wides[0].n == 30 and wides[3].n == 30, "wide int packed field, -= checked")
+
+r = 0
+for r < 3:
+    scale_each(wides, 4, 2.0)
+    r += 1
+assert(wides[0].x == 760.0, "wide real packed field, *= checked")
+assert(wides[0].n == 810, "wide int packed field, *= checked")
+
+narrows = [Narrow(100.0, 40); 4]
+r = 0
+for r < 5:
+    shrink_each(narrows, 4, 1.0)
+    r += 1
+assert(narrows[0].x == 95.0 and narrows[2].n == 30, "narrow packed fields, -= checked")
+
+r = 0
+for r < 3:
+    scale_each(narrows, 4, 2.0)
+    r += 1
+assert(narrows[0].x == 760.0 and narrows[2].n == 810, "narrow packed fields, *= checked")
+
+# ------------------------------------------------------------------ #
+# 3. Packed-array fields, loop-proven index —
+#    OP_INDEX_FIELD_COMPOUND_RAW_*_UNCHECKED
+# ------------------------------------------------------------------ #
+
+# length() bound to a local first, then used as the range end -- that is the form the parser can
+# prove safe, and the only one that reaches the _UNCHECKED opcodes (see nbody.aer's own loops).
+function shrink_all(arr, k):
+    count = length(arr)
+    for i in 0..count:
+        arr[i].x -= k
+        arr[i].n -= 2
+
+function scale_all(arr, k):
+    count = length(arr)
+    for i in 0..count:
+        arr[i].x *= k
+        arr[i].n *= 3
+
+wides2 = [Wide(100.0, 40); 4]
+r = 0
+for r < 5:
+    shrink_all(wides2, 1.0)
+    r += 1
+assert(wides2[0].x == 95.0 and wides2[3].n == 30, "wide packed fields, -= unchecked")
+
+r = 0
+for r < 3:
+    scale_all(wides2, 2.0)
+    r += 1
+assert(wides2[0].x == 760.0 and wides2[3].n == 810, "wide packed fields, *= unchecked")
+
+narrows2 = [Narrow(100.0, 40); 4]
+r = 0
+for r < 5:
+    shrink_all(narrows2, 1.0)
+    r += 1
+assert(narrows2[0].x == 95.0 and narrows2[3].n == 30, "narrow packed fields, -= unchecked")
+
+r = 0
+for r < 3:
+    scale_all(narrows2, 2.0)
+    r += 1
+assert(narrows2[0].x == 760.0 and narrows2[3].n == 810, "narrow packed fields, *= unchecked")
+
+print("test_compound_ops_specialized.aer: all assertions passed.")

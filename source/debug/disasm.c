@@ -320,6 +320,30 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED] =
         {"OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED",
          "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr (narrow)", .trailing_words = 2},
+    [OP_FIELD_COMPOUND_RAW_INT_ADD] = {"OP_FIELD_COMPOUND_RAW_INT_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
+    [OP_FIELD_COMPOUND_RAW_REAL_ADD] = {"OP_FIELD_COMPOUND_RAW_REAL_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
+    [OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
+    [OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
+    [OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
+    [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
+    [OP_FIELD_COMPOUND_RAW_INT32_ADD] = {"OP_FIELD_COMPOUND_RAW_INT32_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
+    [OP_FIELD_COMPOUND_RAW_FLOAT32_ADD] = {"OP_FIELD_COMPOUND_RAW_FLOAT32_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
+    [OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
+    [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
+    [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
+    [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD",
+                  "specialized: field += raw", .trailing_words = 2},
 
     [OP_EQ_JUMP_IF_FALSE] = {"OP_EQ_JUMP_IF_FALSE", "jump if !(rk == rk)", .trailing_words = 1},
     [OP_NEQ_JUMP_IF_FALSE] = {"OP_NEQ_JUMP_IF_FALSE", "jump if !(rk != rk)", .trailing_words = 1},
@@ -860,9 +884,12 @@ static bool disasm_raw(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigne
     } else if (op == OP_RAW_MOVE_REAL) {
         print_rawr(out, (int)UNPACK_A(op_word));
         print_rawr(out, (int)UNPACK_B(op_word));
-    } else if (op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_REAL ||
+    } else if (op == OP_FIELD_COMPOUND_RAW_INT_ADD || op == OP_FIELD_COMPOUND_RAW_REAL_ADD ||
+               op == OP_FIELD_COMPOUND_RAW_INT32_ADD || op == OP_FIELD_COMPOUND_RAW_FLOAT32_ADD ||
+               op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_REAL ||
                op == OP_FIELD_COMPOUND_RAW_INT32 || op == OP_FIELD_COMPOUND_RAW_FLOAT32) {
-        bool is_int = (op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_INT32);
+        bool is_int = (op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_INT32 ||
+                       op == OP_FIELD_COMPOUND_RAW_INT_ADD || op == OP_FIELD_COMPOUND_RAW_INT32_ADD);
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
         unsigned int foffset = c->code[(*pos)++];
@@ -872,7 +899,15 @@ static bool disasm_raw(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigne
             print_rawi(out, slot);
         else
             print_rawr(out, slot);
-    } else if (op == OP_INDEX_FIELD_COMPOUND_RAW_INT || op == OP_INDEX_FIELD_COMPOUND_RAW_REAL ||
+    } else if (op == OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD ||
+               op == OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD ||
+               op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD ||
+               op == OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD ||
+               op == OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD ||
+               op == OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD ||
+               op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD ||
+               op == OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD ||
+               op == OP_INDEX_FIELD_COMPOUND_RAW_INT || op == OP_INDEX_FIELD_COMPOUND_RAW_REAL ||
                op == OP_INDEX_FIELD_COMPOUND_RAW_INT32 || op == OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32 ||
                op == OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED ||
                op == OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED ||
@@ -880,7 +915,11 @@ static bool disasm_raw(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigne
                op == OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED) {
         bool is_int = (op == OP_INDEX_FIELD_COMPOUND_RAW_INT || op == OP_INDEX_FIELD_COMPOUND_RAW_INT32 ||
                        op == OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED ||
-                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED);
+                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED ||
+                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD ||
+                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD ||
+                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD ||
+                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD);
         print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
         print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
         uint32_t field_rk_word = c->code[(*pos)++];

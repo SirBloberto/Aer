@@ -3182,6 +3182,18 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED] = &&lbl_index_field_set_raw_float32_unchecked,
         [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED] = &&lbl_index_field_compound_raw_int32_unchecked,
         [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED] = &&lbl_index_field_compound_raw_float32_unchecked,
+        [OP_FIELD_COMPOUND_RAW_INT_ADD] = &&lbl_field_compound_raw_int_add,
+        [OP_FIELD_COMPOUND_RAW_REAL_ADD] = &&lbl_field_compound_raw_real_add,
+        [OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD] = &&lbl_index_field_compound_raw_int_add,
+        [OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD] = &&lbl_index_field_compound_raw_real_add,
+        [OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD] = &&lbl_index_field_compound_raw_int_unchecked_add,
+        [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD] = &&lbl_index_field_compound_raw_real_unchecked_add,
+        [OP_FIELD_COMPOUND_RAW_INT32_ADD] = &&lbl_field_compound_raw_int32_add,
+        [OP_FIELD_COMPOUND_RAW_FLOAT32_ADD] = &&lbl_field_compound_raw_float32_add,
+        [OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD] = &&lbl_index_field_compound_raw_int32_add,
+        [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD] = &&lbl_index_field_compound_raw_float32_add,
+        [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD] = &&lbl_index_field_compound_raw_int32_unchecked_add,
+        [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD] = &&lbl_index_field_compound_raw_float32_unchecked_add,
 
         [OP_EQ_JUMP_IF_FALSE] = &&lbl_eq_jump_if_false,
         [OP_NEQ_JUMP_IF_FALSE] = &&lbl_neq_jump_if_false,
@@ -4586,6 +4598,41 @@ lbl_##name: {                                                                   
 }
 
 
+#define AER_FIELD_COMPOUND_RAW_OP(name, CT, MEMBER, LD, ST, BINOP)                                           \
+lbl_##name: {                                                                                                \
+    int struct_reg = (int)UNPACK_A(op_word);                                                                 \
+    unsigned int foffset = READ();                                                                           \
+    int rhs_slot = (int)READ();                                                                              \
+    AerVal obj = registers[struct_reg];                                                                      \
+    if (aer_type(obj) != TYPE_STRUCT) {                                                                      \
+        error("internal error: specialized struct field access on a non-struct value");                      \
+        DISPATCH();                                                                                          \
+    }                                                                                                        \
+    AerStruct* oa = aer_as_struct(obj);                                                                      \
+    CT lhs;                                                                                                  \
+    LD(lhs, oa->fields + foffset);                                                                           \
+    CT result = lhs BINOP registers[rhs_slot].as.MEMBER;                                                     \
+    ST(oa->fields + foffset, result);                                                                        \
+    DISPATCH();                                                                                              \
+}
+
+#define AER_INDEX_FIELD_COMPOUND_RAW_OP(name, CT, MEMBER, LD, ST, resolve, BINOP)                            \
+lbl_##name: {                                                                                                \
+    int arr_reg = (int)UNPACK_A(op_word);                                                                    \
+    uint32_t field_rk_word = READ();                                                                         \
+    unsigned int foffset = UNPACK_2X16_HI(field_rk_word);                                                    \
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));                         \
+    int rhs_slot = (int)READ();                                                                              \
+    unsigned char* elem = resolve(registers[arr_reg], idx, foffset);                                         \
+    if (!elem)                                                                                               \
+        DISPATCH();                                                                                          \
+    CT lhs;                                                                                                  \
+    LD(lhs, elem);                                                                                           \
+    CT result = lhs BINOP registers[rhs_slot].as.MEMBER;                                                     \
+    ST(elem, result);                                                                                        \
+    DISPATCH();                                                                                              \
+}
+
 AER_INDEX_FIELD_GET_RAW(index_field_get_raw_int, RAWF_GET_I64, vm_packed_raw_elem)
 AER_INDEX_FIELD_GET_RAW(index_field_get_raw_real, RAWF_GET_F64, vm_packed_raw_elem)
 AER_FIELD_GET_RAW(field_get_raw_int, RAWF_GET_I64)
@@ -4622,6 +4669,18 @@ AER_INDEX_FIELD_SET_RAW(index_field_set_raw_int32_unchecked, RAWF_SET_I32, vm_pa
 AER_INDEX_FIELD_SET_RAW(index_field_set_raw_float32_unchecked, RAWF_SET_F32, vm_packed_raw_elem_unchecked)
 AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_int32_unchecked, int64_t, i, RAWF_LD_I32, RAWF_ST_I32, vm_packed_raw_elem_unchecked)
 AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_float32_unchecked, double, d, RAWF_LD_F32, RAWF_ST_F32, vm_packed_raw_elem_unchecked)
+AER_FIELD_COMPOUND_RAW_OP(field_compound_raw_int_add, int64_t, i, RAWF_LD_I64, RAWF_ST_I64, +)
+AER_FIELD_COMPOUND_RAW_OP(field_compound_raw_real_add, double, d, RAWF_LD_F64, RAWF_ST_F64, +)
+AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_int_add, int64_t, i, RAWF_LD_I64, RAWF_ST_I64, vm_packed_raw_elem, +)
+AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_real_add, double, d, RAWF_LD_F64, RAWF_ST_F64, vm_packed_raw_elem, +)
+AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_int_unchecked_add, int64_t, i, RAWF_LD_I64, RAWF_ST_I64, vm_packed_raw_elem_unchecked, +)
+AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_real_unchecked_add, double, d, RAWF_LD_F64, RAWF_ST_F64, vm_packed_raw_elem_unchecked, +)
+AER_FIELD_COMPOUND_RAW_OP(field_compound_raw_int32_add, int64_t, i, RAWF_LD_I32, RAWF_ST_I32, +)
+AER_FIELD_COMPOUND_RAW_OP(field_compound_raw_float32_add, double, d, RAWF_LD_F32, RAWF_ST_F32, +)
+AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_int32_add, int64_t, i, RAWF_LD_I32, RAWF_ST_I32, vm_packed_raw_elem, +)
+AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_float32_add, double, d, RAWF_LD_F32, RAWF_ST_F32, vm_packed_raw_elem, +)
+AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_int32_unchecked_add, int64_t, i, RAWF_LD_I32, RAWF_ST_I32, vm_packed_raw_elem_unchecked, +)
+AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_float32_unchecked_add, double, d, RAWF_LD_F32, RAWF_ST_F32, vm_packed_raw_elem_unchecked, +)
 
 /* `[value; count]` -- fill_reg is already evaluated exactly once by the parser, so this branches on
    its RUNTIME type. Eligibility (every field a fixed primitive) has to be checked here rather than

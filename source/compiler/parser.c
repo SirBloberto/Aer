@@ -375,6 +375,28 @@ static void assert_variables_below_floor(const char* where) {
 
 /* Guard for RK16-wire opcodes: 32767 registers-or-constants is far beyond any real program, but
    silent truncation would corrupt the instruction rather than refuse to compile. */
+/* `+=` is the overwhelming majority of compound assignment, and bin_op is compile-time known, so
+   ADD gets an opcode that skips the dispatch-time switch. SUB/MUL keep the general one. */
+static Opcode compound_add_variant(Opcode op, Opcode bin_op) {
+    if (bin_op != OP_ADD)
+        return op;
+    switch (op) {
+        case OP_FIELD_COMPOUND_RAW_INT: return OP_FIELD_COMPOUND_RAW_INT_ADD;
+        case OP_FIELD_COMPOUND_RAW_REAL: return OP_FIELD_COMPOUND_RAW_REAL_ADD;
+        case OP_INDEX_FIELD_COMPOUND_RAW_INT: return OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD;
+        case OP_INDEX_FIELD_COMPOUND_RAW_REAL: return OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD;
+        case OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED: return OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD;
+        case OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED: return OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD;
+        case OP_FIELD_COMPOUND_RAW_INT32: return OP_FIELD_COMPOUND_RAW_INT32_ADD;
+        case OP_FIELD_COMPOUND_RAW_FLOAT32: return OP_FIELD_COMPOUND_RAW_FLOAT32_ADD;
+        case OP_INDEX_FIELD_COMPOUND_RAW_INT32: return OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD;
+        case OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32: return OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD;
+        case OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED: return OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD;
+        case OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED: return OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD;
+        default: return op;
+    }
+}
+
 static bool rk16_fits(int rk) {
     return (rk & ~RK_CONST_FLAG) <= RK16_MAX_INDEX;
 }
@@ -3601,7 +3623,7 @@ static void parse_chain_compound(Chunk* c, ChainTarget t) {
                                                                              : OP_FIELD_COMPOUND_RAW_FLOAT32)
                                                  : ((field_kind == RAWK_INT) ? OP_FIELD_COMPOUND_RAW_INT
                                                                              : OP_FIELD_COMPOUND_RAW_REAL);
-                    chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
+                    chunk_emit(c, PACK3(compound_add_variant(op, bin_op), obj_reg, bin_op, 0));
                     chunk_emit(c, foffset);
                     chunk_emit(c, (uint32_t)slot);
                     raw_release_if_top(slot);
@@ -3834,7 +3856,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                                                     : OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED)
                                              : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT
                                                                          : OP_INDEX_FIELD_COMPOUND_RAW_REAL));
-                        chunk_emit(c, PACK3(op, obj_reg, bin_op, 0));
+                        chunk_emit(c, PACK3(compound_add_variant(op, bin_op), obj_reg, bin_op, 0));
                         chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(pending_rk_idx)));
                         chunk_emit(c, (uint32_t)slot);
                         raw_release_if_top(slot);

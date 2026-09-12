@@ -305,6 +305,21 @@ typedef enum {
     OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED,
     OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED,
 
+    /* `+=` alone gets its own opcodes: bin_op is always compile-time known, so the switch every
+       opcode above runs is dead work on the hottest compound path. SUB/MUL keep the switch. */
+    OP_FIELD_COMPOUND_RAW_INT_ADD,
+    OP_FIELD_COMPOUND_RAW_REAL_ADD,
+    OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD,
+    OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD,
+    OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD,
+    OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD,
+    OP_FIELD_COMPOUND_RAW_INT32_ADD,
+    OP_FIELD_COMPOUND_RAW_FLOAT32_ADD,
+    OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD,
+    OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD,
+    OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD,
+    OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD,
+
     /* A bare comparison forming an entire if/while condition collapses with its
        OP_JUMP_IF_FALSE_REG into one dispatch -- the boolean was only ever read once, immediately.
        Only the 6 plain boxed comparisons (raw ones have faster opcodes already) and only when
