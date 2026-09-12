@@ -305,19 +305,11 @@ typedef enum {
     OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED,
     OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED,
 
-    /* `+=` alone gets its own opcodes: bin_op is always compile-time known, so the switch every
-       opcode above runs is dead work on the hottest compound path. SUB/MUL keep the switch. */
-    OP_FIELD_COMPOUND_RAW_INT_ADD,
-    OP_FIELD_COMPOUND_RAW_REAL_ADD,
-    OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD,
-    OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD,
-    OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD,
+    /* `+=` on a loop-proven packed element skips the bin_op switch every opcode above runs, since
+       bin_op is compile-time known. Only these two shapes: every other width and checked-ness was
+       measured at under 400 dispatches across the whole benchmark corpus, where the switch costs
+       nothing and the extra opcode costs every other opcode BTB pressure. */
     OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD,
-    OP_FIELD_COMPOUND_RAW_INT32_ADD,
-    OP_FIELD_COMPOUND_RAW_FLOAT32_ADD,
-    OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD,
-    OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD,
-    OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD,
     OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD,
 
     /* `field += a*b`: the same fusion OP_RAW_FMA_REAL does for raw locals, which excludes field

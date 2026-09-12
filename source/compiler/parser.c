@@ -400,23 +400,13 @@ static void assert_variables_below_floor(const char* where) {
 /* Guard for RK16-wire opcodes: 32767 registers-or-constants is far beyond any real program, but
    silent truncation would corrupt the instruction rather than refuse to compile. */
 
-/* `+=` is the overwhelming majority of compound assignment, and bin_op is compile-time known, so
-   ADD gets an opcode that skips the dispatch-time switch. SUB/MUL keep the general one. */
+/* `+=` on a loop-proven packed element gets an opcode that skips the dispatch-time switch; every
+   other compound form keeps the general one (see the ADD opcodes' own comment, vm.h). */
 static Opcode compound_add_variant(Opcode op, Opcode bin_op) {
     if (bin_op != OP_ADD)
         return op;
     switch (op) {
-        case OP_FIELD_COMPOUND_RAW_INT: return OP_FIELD_COMPOUND_RAW_INT_ADD;
-        case OP_FIELD_COMPOUND_RAW_REAL: return OP_FIELD_COMPOUND_RAW_REAL_ADD;
-        case OP_INDEX_FIELD_COMPOUND_RAW_INT: return OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD;
-        case OP_INDEX_FIELD_COMPOUND_RAW_REAL: return OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD;
-        case OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED: return OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD;
         case OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED: return OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD;
-        case OP_FIELD_COMPOUND_RAW_INT32: return OP_FIELD_COMPOUND_RAW_INT32_ADD;
-        case OP_FIELD_COMPOUND_RAW_FLOAT32: return OP_FIELD_COMPOUND_RAW_FLOAT32_ADD;
-        case OP_INDEX_FIELD_COMPOUND_RAW_INT32: return OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD;
-        case OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32: return OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD;
-        case OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED: return OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD;
         case OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED: return OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD;
         default: return op;
     }

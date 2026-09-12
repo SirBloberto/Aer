@@ -3182,17 +3182,7 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
         [OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED] = &&lbl_index_field_set_raw_float32_unchecked,
         [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED] = &&lbl_index_field_compound_raw_int32_unchecked,
         [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED] = &&lbl_index_field_compound_raw_float32_unchecked,
-        [OP_FIELD_COMPOUND_RAW_INT_ADD] = &&lbl_field_compound_raw_int_add,
-        [OP_FIELD_COMPOUND_RAW_REAL_ADD] = &&lbl_field_compound_raw_real_add,
-        [OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD] = &&lbl_index_field_compound_raw_int_add,
-        [OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD] = &&lbl_index_field_compound_raw_real_add,
-        [OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD] = &&lbl_index_field_compound_raw_int_unchecked_add,
         [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD] = &&lbl_index_field_compound_raw_real_unchecked_add,
-        [OP_FIELD_COMPOUND_RAW_INT32_ADD] = &&lbl_field_compound_raw_int32_add,
-        [OP_FIELD_COMPOUND_RAW_FLOAT32_ADD] = &&lbl_field_compound_raw_float32_add,
-        [OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD] = &&lbl_index_field_compound_raw_int32_add,
-        [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD] = &&lbl_index_field_compound_raw_float32_add,
-        [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD] = &&lbl_index_field_compound_raw_int32_unchecked_add,
         [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD] = &&lbl_index_field_compound_raw_float32_unchecked_add,
         [OP_FIELD_COMPOUND_RAW_FLOAT32_FMA] = &&lbl_field_compound_raw_float32_fma,
         [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA] =
@@ -4672,17 +4662,7 @@ AER_INDEX_FIELD_SET_RAW(index_field_set_raw_int32_unchecked, RAWF_SET_I32, vm_pa
 AER_INDEX_FIELD_SET_RAW(index_field_set_raw_float32_unchecked, RAWF_SET_F32, vm_packed_raw_elem_unchecked)
 AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_int32_unchecked, int64_t, i, RAWF_LD_I32, RAWF_ST_I32, vm_packed_raw_elem_unchecked)
 AER_INDEX_FIELD_COMPOUND_RAW(index_field_compound_raw_float32_unchecked, double, d, RAWF_LD_F32, RAWF_ST_F32, vm_packed_raw_elem_unchecked)
-AER_FIELD_COMPOUND_RAW_OP(field_compound_raw_int_add, int64_t, i, RAWF_LD_I64, RAWF_ST_I64, +)
-AER_FIELD_COMPOUND_RAW_OP(field_compound_raw_real_add, double, d, RAWF_LD_F64, RAWF_ST_F64, +)
-AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_int_add, int64_t, i, RAWF_LD_I64, RAWF_ST_I64, vm_packed_raw_elem, +)
-AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_real_add, double, d, RAWF_LD_F64, RAWF_ST_F64, vm_packed_raw_elem, +)
-AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_int_unchecked_add, int64_t, i, RAWF_LD_I64, RAWF_ST_I64, vm_packed_raw_elem_unchecked, +)
 AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_real_unchecked_add, double, d, RAWF_LD_F64, RAWF_ST_F64, vm_packed_raw_elem_unchecked, +)
-AER_FIELD_COMPOUND_RAW_OP(field_compound_raw_int32_add, int64_t, i, RAWF_LD_I32, RAWF_ST_I32, +)
-AER_FIELD_COMPOUND_RAW_OP(field_compound_raw_float32_add, double, d, RAWF_LD_F32, RAWF_ST_F32, +)
-AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_int32_add, int64_t, i, RAWF_LD_I32, RAWF_ST_I32, vm_packed_raw_elem, +)
-AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_float32_add, double, d, RAWF_LD_F32, RAWF_ST_F32, vm_packed_raw_elem, +)
-AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_int32_unchecked_add, int64_t, i, RAWF_LD_I32, RAWF_ST_I32, vm_packed_raw_elem_unchecked, +)
 AER_INDEX_FIELD_COMPOUND_RAW_OP(index_field_compound_raw_float32_unchecked_add, double, d, RAWF_LD_F32, RAWF_ST_F32, vm_packed_raw_elem_unchecked, +)
 
 /* `field += a*b` in one dispatch -- see OP_FIELD_COMPOUND_RAW_FLOAT32_FMA (vm.h). The multiply is
