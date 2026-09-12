@@ -568,6 +568,24 @@ void patch_call_target(Chunk* c, unsigned int patch_offset, unsigned int target)
     c->code[patch_offset] = (uint32_t)target;
 }
 
+/* The two register-to-register primitives. Every site that moves a value into a register goes
+   through one of these, so the word layout is written once rather than at each of twenty. */
+static void emit_loadk(Chunk* c, int reg, unsigned int pool_idx) {
+    chunk_emit(c, PACK_OP_A_W16(OP_LOADK, reg, pool_idx));
+}
+
+static void emit_move(Chunk* c, int dest, int src) {
+    chunk_emit(c, PACK2(OP_MOVE, dest, src));
+}
+
+/* An RK operand lands in a register either way: a constant loads from the pool, a register moves. */
+static void emit_move_rk(Chunk* c, int dest, int rk) {
+    if (rk & RK_CONST_FLAG)
+        emit_loadk(c, dest, (unsigned int)(rk & ~RK_CONST_FLAG));
+    else
+        emit_move(c, dest, rk);
+}
+
 /* Emits an already-known jump target in the same encoding patch_jump writes. */
 void emit_jump_target(Chunk* c, unsigned int target) {
     chunk_emit(c, (uint32_t)(int32_t)((int64_t)target - (int64_t)c->count - 1));
@@ -1057,7 +1075,7 @@ static int materialize(Chunk* c, int rk) {
         return rk;
     int reg = reg_alloc();
     /* dest+pool_idx both fit word0 now (op(8)+dest(8)+pool_idx(16)) -- no trailing word. */
-    chunk_emit(c, PACK_OP_A_W16(OP_LOADK, reg, (unsigned int)(rk & ~RK_CONST_FLAG)));
+    emit_loadk(c, reg, (unsigned int)(rk & ~RK_CONST_FLAG));
     return reg;
 }
 
@@ -1678,9 +1696,9 @@ static int arg_materialize(Chunk* c, int rk) {
     }
     int target = reg_alloc();
     if (rk & RK_CONST_FLAG) {
-        chunk_emit(c, PACK_OP_A_W16(OP_LOADK, target, (unsigned int)(rk & ~RK_CONST_FLAG)));
+        emit_loadk(c, target, (unsigned int)(rk & ~RK_CONST_FLAG));
     } else {
-        chunk_emit(c, PACK2(OP_MOVE, target, rk));
+        emit_move(c, target, rk);
         if (rk >= 0 && rk < FRAME_REGISTERS)
             P.reg_elem_kind[target] = P.reg_elem_kind[rk];
     }
@@ -2534,14 +2552,14 @@ static int compile_and(Chunk* c, int lhs, unsigned int prec) {
         dest = reg_lhs;
     } else {
         dest = reg_alloc();
-        chunk_emit(c, PACK2(OP_MOVE, dest, reg_lhs));
+        emit_move(c, dest, reg_lhs);
     }
     unsigned int patch_skip = emit_jump_if_false_reg(c, dest); /* lhs falsy -- dest already holds it */
 
     int rk_rhs = parse_binary(c, prec);
     int reg_rhs = materialize(c, rk_rhs);
     if (reg_rhs != dest && !retarget_last_cmp(c, reg_rhs, dest))
-        chunk_emit(c, PACK2(OP_MOVE, dest, reg_rhs));
+        emit_move(c, dest, reg_rhs);
     release_if_top(reg_rhs);
 
     patch_jump(c, patch_skip, c->count);
@@ -2558,7 +2576,7 @@ static int compile_or(Chunk* c, int lhs, unsigned int prec) {
         dest = reg_lhs;
     } else {
         dest = reg_alloc();
-        chunk_emit(c, PACK2(OP_MOVE, dest, reg_lhs));
+        emit_move(c, dest, reg_lhs);
     }
     unsigned int patch_use_rhs = emit_jump_if_false_reg(c, dest);
     chunk_emit(c, OP_JUMP);
@@ -2569,7 +2587,7 @@ static int compile_or(Chunk* c, int lhs, unsigned int prec) {
     int rk_rhs = parse_binary(c, prec);
     int reg_rhs = materialize(c, rk_rhs);
     if (reg_rhs != dest && !retarget_last_cmp(c, reg_rhs, dest))
-        chunk_emit(c, PACK2(OP_MOVE, dest, reg_rhs));
+        emit_move(c, dest, reg_rhs);
     release_if_top(reg_rhs);
 
     patch_jump(c, patch_end, c->count);
@@ -3190,9 +3208,9 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
             /* No P.global_regs update needed -- see ensure_boxed's identical reasoning: this path
                only runs on a currently-raw-tracked name, which can never be in P.global_names. */
             if (rk_val & RK_CONST_FLAG) {
-                chunk_emit(c, PACK_OP_A_W16(OP_LOADK, new_reg, (unsigned int)(rk_val & ~RK_CONST_FLAG)));
+                emit_loadk(c, new_reg, (unsigned int)(rk_val & ~RK_CONST_FLAG));
             } else if (new_reg != rk_val) {
-                chunk_emit(c, PACK2(OP_MOVE, new_reg, rk_val));
+                emit_move(c, new_reg, rk_val);
                 release_if_top(rk_val);
             }
             return;
@@ -3236,9 +3254,9 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
         P.last_plain_index_dest_reg = -1;
         P.reg_elem_kind[reg] = rhs_elem;
         if (rk_val & RK_CONST_FLAG) {
-            chunk_emit(c, PACK_OP_A_W16(OP_LOADK, reg, (unsigned int)(rk_val & ~RK_CONST_FLAG)));
+            emit_loadk(c, reg, (unsigned int)(rk_val & ~RK_CONST_FLAG));
         } else if (reg != rk_val) {
-            chunk_emit(c, PACK2(OP_MOVE, reg, rk_val));
+            emit_move(c, reg, rk_val);
             /* Checked after var_slot (which may have just raised the floor), so this correctly recognizes
                rk_val as no-longer-a-temp in the common case. */
             release_if_top(rk_val);
@@ -4366,13 +4384,6 @@ static int chain_of_array_ops(Chunk* c, unsigned int start, unsigned int end, in
     return 0;
 }
 
-/* Leaves arrive as RK operands, so a constant loads from the pool where a register only moves. */
-static void chain_emit_leaf(Chunk* c, int dest, int rk) {
-    if (rk & RK_CONST_FLAG)
-        chunk_emit(c, PACK_OP_A_W16(OP_LOADK, dest, (unsigned int)(rk & ~RK_CONST_FLAG)));
-    else
-        chunk_emit(c, PACK2(OP_MOVE, dest, rk));
-}
 
 /* No exit-time cleanup needed -- col_reg/idx_reg are ordinary registers. Reserves the loop
    variable's register BEFORE compiling the collection expression, so later temps can never
@@ -4554,7 +4565,7 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
 
     int idx_reg = reg_alloc();
     unsigned int pool_zero = chunk_add_pool(c, aer_int(0));
-    chunk_emit(c, PACK_OP_A_W16(OP_LOADK, idx_reg, pool_zero));
+    emit_loadk(c, idx_reg, pool_zero);
 
     /* idx_reg/col_reg must stay valid across the whole body, so they're protected before the body
        compiles, same as the range branch. */
@@ -4612,7 +4623,7 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
 
     int idx_reg = reg_alloc();
     unsigned int pool_zero = chunk_add_pool(c, aer_int(0));
-    chunk_emit(c, PACK_OP_A_W16(OP_LOADK, idx_reg, pool_zero));
+    emit_loadk(c, idx_reg, pool_zero);
 
     int saved_reserved_floor = P.slot_floor;
     P.slot_floor = P.slot_next;
@@ -4905,11 +4916,11 @@ static int parse_module_call(Chunk* c) {
             if (parse_had_error || groups < 0 || ngroups < 0)
                 return 0;
             uint64_t word = prog | ((uint64_t)mask_leaves << CHAIN_SPLIT_SHIFT);
-            chunk_emit(c, PACK_OP_A_W16(OP_LOADK, base, chunk_add_pool(c, aer_int((int64_t)word))));
-            chunk_emit(c, PACK2(OP_MOVE, base + 1, groups));
-            chunk_emit(c, PACK2(OP_MOVE, base + 2, ngroups));
+            emit_loadk(c, base, chunk_add_pool(c, aer_int((int64_t)word)));
+            emit_move(c, base + 1, groups);
+            emit_move(c, base + 2, ngroups);
             for (int i = 0; i < nleaf; i++)
-                chain_emit_leaf(c, base + 3 + i, leaf[i]);
+                emit_move_rk(c, base + 3 + i, leaf[i]);
             chunk_emit(c, PACK3(OP_CALL_MODULE, base, base, nleaf + 3));
             chunk_emit(c, (uint32_t)module_idx);
             chunk_emit(c, (uint32_t)fn_idx);
@@ -4974,9 +4985,9 @@ static int parse_module_call(Chunk* c) {
         if (base >= 0) {
             c->count = arg_code_start; /* the per-operator passes go; the fused call replaces them */
             uint64_t word = packed | ((uint64_t)mask_leaves << CHAIN_SPLIT_SHIFT);
-            chunk_emit(c, PACK_OP_A_W16(OP_LOADK, base, chunk_add_pool(c, aer_int((int64_t)word))));
+            emit_loadk(c, base, chunk_add_pool(c, aer_int((int64_t)word)));
             for (int i = 0; i < nleaf; i++)
-                chain_emit_leaf(c, base + 1 + i, leaf[i]);
+                emit_move_rk(c, base + 1 + i, leaf[i]);
             chunk_emit(c, PACK3(OP_CALL_MODULE, base, base, nleaf + 1));
             chunk_emit(c, (uint32_t)module_idx);
             chunk_emit(c, (uint32_t)fn_idx);
@@ -5275,7 +5286,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
                                          func_max_registers, func_frame_bounds);
         callee_reg = reg_alloc();
-        chunk_emit(c, PACK_OP_A_W16(OP_LOADK, callee_reg, chunk_add_pool(c, fv)));
+        emit_loadk(c, callee_reg, chunk_add_pool(c, fv));
     }
 
     if (is_var) {
