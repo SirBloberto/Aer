@@ -2473,7 +2473,10 @@ measurement, but this data says not to expect it to fix the benchmark that needs
 
 The knob is gone as of the tail-call dispatch conversion (5.62): with each handler ending in its
 own tail call there is no shared site to route through, so the opposite endpoint is no longer
-expressible. The measurement above stands as the reason replication was kept.
+expressible. The measurement above stands as the reason replication was kept, and its central
+finding reappeared after the conversion -- merging eight specialized opcodes into two cost the
+benchmarks that dispatch them 1.5-2.2%, while `mandelbrot`, which does not, got 0.94% faster from
+the smaller table (5.63).
 
 ### 5.48 A use-after-free found by reading the call path, not by a test
 
@@ -3712,3 +3715,26 @@ out of a musttail chain at `-O0`, `-O2` and `-O2 -flto`.
 Requires GCC 15+ / Clang 13+ as the only dispatch mechanism. A computed-goto fallback behind
 `__has_attribute(musttail)` was rejected: maintaining two dispatch mechanisms taxes every future
 handler edit, which is the cost this change exists to remove.
+
+### 5.63 The opcode-shape rule, re-measured after the conversion
+
+5.62 invalidated every earlier opcode-shape measurement: all of them were taken inside the old
+2,400-line function, and both conditions they depended on -- its register allocation and ~150
+dispatch sites sharing a BTB -- are gone.
+
+Re-ran the merge on the eight `OP_INDEX_FIELD_GET_RAW_*` opcodes (four widths x checked/unchecked),
+whose `REAL_UNCHECKED` member is nbody's hottest opcode at 31.3M dispatches. Five layouts, nine runs
+per point, against the split form:
+
+| | nbody | nbody_large_packed |
+|---|---|---|
+| merged 8 -> 2 | **+2.19%** sign-stable | **+1.56%** sign-stable |
+| hybrid 8 -> 3, hot width keeps its opcode | **+1.17%** sign-stable | +0.00% sign-flips |
+
+**The rule holds, at a smaller magnitude** -- 1.5-2.2% rather than the 3.5-5.5% measured before.
+Keeping the hot width specialized recovers only about half of it, so the cost is not purely the
+un-folded switch: part is the layout change, which no amount of selectivity avoids.
+
+The practical form: merging opcodes that carry traffic costs; merging ones that carry none is free
+or better. `make opcode-traffic` separates them, and it currently reports 84 of 157 opcodes sharing
+337,699 dispatches out of 19.9 billion.
