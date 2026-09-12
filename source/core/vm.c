@@ -399,6 +399,9 @@ void vm_init(VM* vm, Chunk* chunk) {
     /* Frame 0's register window only ever needs linking once, for the life of the VM (top-level
        usage is open-ended, so it always gets a flat FRAME_REGISTERS reservation) -- everything
        else a fresh run needs is exactly what aer_vm_reset_for_reuse() already does. */
+    vm->register_stack =
+        xmalloc(sizeof(AerVal) * REGISTER_STACK_INITIAL_FRAMES * FRAME_REGISTERS);
+    vm->call_depth_limit = REGISTER_STACK_INITIAL_FRAMES;
     vm->call_stack[0].registers = &vm->register_stack[0];
     vm->call_stack[0].frame_size = FRAME_REGISTERS;
     /* Top level gets no gap: its real slots come off the top of the same bank the collector has to
@@ -450,6 +453,10 @@ void vm_free(VM* vm) {
     if (vm_current_heap() == heap)
         vm_set_current_heap(NULL);
     *heap = (VmHeap){0};
+
+    free(vm->register_stack);
+    vm->register_stack = NULL;
+    vm->call_depth_limit = 0;
 }
 
 void aer_vm_reset_for_reuse(VM* vm) {
@@ -1110,6 +1117,25 @@ static AerVal vm_default_value(VM* vm, AerVal dflt) {
    in target->call_stack[0].registers[0]. */
 /* Call setup                                                       */
 
+/* False means the depth ceiling itself was reached, which is the caller's overflow error. Offsets
+   are taken before the realloc, not after: every live frame's base points into the block about to
+   move, so reading them back out of freed memory is exactly what the rebase must avoid. */
+static bool vm_grow_registers(VM* vm) {
+    if (vm->call_depth_limit >= VM_CALL_MAX)
+        return false;
+    size_t offsets[VM_CALL_MAX];
+    for (int i = 0; i <= vm->call_depth; i++)
+        offsets[i] = (size_t)(vm->call_stack[i].registers - vm->register_stack);
+    int frames = vm->call_depth_limit * 2;
+    if (frames > VM_CALL_MAX)
+        frames = VM_CALL_MAX;
+    vm->register_stack = xrealloc(vm->register_stack, (size_t)frames * FRAME_REGISTERS * sizeof(AerVal));
+    vm->call_depth_limit = frames;
+    for (int i = 0; i <= vm->call_depth; i++)
+        vm->call_stack[i].registers = vm->register_stack + offsets[i];
+    return true;
+}
+
 bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsigned int return_ip) {
     if (arg_count < (int)fn->min_arity || arg_count > (int)fn->arity) {
         if (fn->min_arity == fn->arity)
@@ -1119,7 +1145,7 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
                   arg_count);
         return false;
     }
-    if (target->call_depth + 1 >= VM_CALL_MAX) {
+    if (target->call_depth + 1 >= target->call_depth_limit && !vm_grow_registers(target)) {
         error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
         return false;
     }
@@ -1188,7 +1214,7 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         reused->tail_calls_collapsed++;
         return;
     }
-    if (vm->call_depth + 1 >= VM_CALL_MAX) {
+    if (vm->call_depth + 1 >= vm->call_depth_limit && !vm_grow_registers(vm)) {
         return error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
     }
     CallFrame* caller = &vm->call_stack[vm->call_depth];
@@ -3454,9 +3480,12 @@ lbl_call: {
        power of two, so indexing cost a multiply on every call. */
     unsigned int func_byte_offset = (unsigned int)READ();
     ChunkFunction* target_f = (ChunkFunction*)((char*)functions + func_byte_offset);
-    if (vm->call_depth + 1 >= VM_CALL_MAX) {
-        error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
-        DISPATCH();
+    if (vm->call_depth + 1 >= vm->call_depth_limit) {
+        if (!vm_grow_registers(vm)) {
+            error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
+            DISPATCH();
+        }
+        registers = vm->call_stack[vm->call_depth].registers; /* the bank moved */
     }
 
     /* Gated on shape_sensitive_mask (zero for most functions, one already-fetched field) rather than
@@ -3611,9 +3640,12 @@ lbl_call_self: {
     int dest_reg = (int)UNPACK_A(op_word);
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
-    if (vm->call_depth + 1 >= VM_CALL_MAX) {
-        error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
-        DISPATCH();
+    if (vm->call_depth + 1 >= vm->call_depth_limit) {
+        if (!vm_grow_registers(vm)) {
+            error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
+            DISPATCH();
+        }
+        registers = vm->call_stack[vm->call_depth].registers; /* the bank moved */
     }
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = caller + 1;

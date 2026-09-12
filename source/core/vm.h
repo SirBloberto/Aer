@@ -870,6 +870,10 @@ typedef struct {
        directly, so a mirror would cost three stores per call and per return to serve no hot
        reader. */
     int call_depth;
+    /* Depth the current bank can seat, at FRAME_REGISTERS each -- always <= VM_CALL_MAX. Every push
+       already had to test call_depth against a ceiling, so growing the bank costs no test of its
+       own: this one stands in for the constant, and the cold side decides grow-or-overflow. */
+    int call_depth_limit;
 
     Chunk* chunk;
     unsigned int ip;
@@ -900,10 +904,15 @@ typedef struct {
        boundary every time. A GC root, and it outlives aer_vm_reset_for_reuse deliberately. */
     AerVal kept;
 
-    /* One shared register bank for the whole chain (calls bump a base pointer). Same worst-case
-       size as a flat design, but the actually-touched working set is far smaller. */
-    AerVal register_stack[VM_CALL_MAX * FRAME_REGISTERS];
+    /* One shared register bank for the whole chain (calls bump a base pointer). Grown on demand
+       rather than reserved: inline at full size this was 93% of sizeof(VM), and every actor and
+       every imported module allocates a VM. */
+    AerVal* register_stack;
 } VM;
+
+/* Frames this bank seats before its first growth. A frame consumes at most FRAME_REGISTERS, so
+   capacity is always call_depth_limit * FRAME_REGISTERS. */
+#define REGISTER_STACK_INITIAL_FRAMES 2
 
 /* Bounds-checked push/pop for native-module files, outside vm_run's PUSH()/POP() macros. */
 static inline bool vm_stack_push(VM* vm, AerVal v) {
