@@ -75,7 +75,7 @@ struct AerArray {
     /* Bumped on every mutation that can change which shapes occupy items[] -- index-assignment
        replacing an element (OP_INDEX_SET), and collection.append/delete/insert (aer_collection.c).
        NOT bumped by collection.sort (reorders, never replaces -- homogeneity is a set property,
-       unaffected by order). Lets lbl_call's SPEC_KIND_ARRAY_OF_STRUCTS per-call-site cache (vm.c)
+       unaffected by order). Lets h_call's SPEC_KIND_ARRAY_OF_STRUCTS per-call-site cache (vm.c)
        skip its O(n) homogeneity re-scan when the same array at the same generation was already
        verified against the same shape on a previous call. */
     unsigned int generation;

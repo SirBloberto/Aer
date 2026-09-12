@@ -9,7 +9,7 @@
 
 /* Its own, not a VM's: a Chunk can outlive any one VM. Per-chunk rather than process-global so two
    actors, which own separate chunks, cannot reach the same pools -- runtime specialization calls
-   chunk_add_pool from inside lbl_call, so a shared set would be written from two threads at once. */
+   chunk_add_pool from inside h_call, so a shared set would be written from two threads at once. */
 void chunk_init(Chunk* c) {
     memset(c, 0, sizeof(*c));
     hashtable_pools_init(&c->name_index_pools);

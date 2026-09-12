@@ -608,7 +608,7 @@ void emit_jump_target(Chunk* c, unsigned int target) {
 
 /* Returns the callee_offset word's offset for a forward-referencing call to patch later
    (pending_call_add); an already-resolved call ignores the return value. func_index is the
-   target's index into chunk->functions[] -- lbl_call reads it to size the callee's frame from its
+   target's index into chunk->functions[] -- h_call reads it to size the callee's frame from its
    real max_registers peak instead of a flat, function-agnostic ceiling. */
 unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count,
                        unsigned int func_index) {
@@ -5463,7 +5463,7 @@ static void parse_raise(Chunk* c) {
 
 /* A function value in expression position -- an anonymous function has no name to self-reference
    by, so parse_function's registration-before-body ordering simply doesn't apply. Not a
-   specialization target either way: lbl_call only specializes named, ChunkFunction-registered
+   specialization target either way: h_call only specializes named, ChunkFunction-registered
    calls (func_index indexes chunk->functions[]), and AerFunction (what this compiles into) has no
    specialization table -- always compiles with no shape hint (-1/NULL). */
 static int parse_function_expr(Chunk* c) {
@@ -5759,7 +5759,7 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     if (!target_f->source_span)
         return false; /* defensive -- shouldn't happen alongside a nonzero shape_sensitive_mask */
 
-    /* Scheduler workers reach this from lbl_call, and the parser is one set of file statics. */
+    /* Scheduler workers reach this from h_call, and the parser is one set of file statics. */
     aer_mutex_lock(&specialize_lock);
     /* error_at would otherwise longjmp to the enclosing vm_run_slice, past every restore below and
        out of a function whose contract is that a failed compile leaves nothing behind. */
@@ -5807,7 +5807,7 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     out_entry->max_registers = max_registers;
     out_entry->frame_bounds = frame_bounds;
     if (raw_param_count == 0) {
-        /* Ordinary shape-only compile -- a freshly-created SpecEntry (see lbl_call, vm.c) needs its
+        /* Ordinary shape-only compile -- a freshly-created SpecEntry (see h_call, vm.c) needs its
            OWN raw-variant bookkeeping starting from a well-defined "never attempted" state (0),
            not whatever garbage sat in the caller's uninitialized stack SpecEntry otherwise. */
         out_entry->shape = shape;

@@ -18,6 +18,20 @@ jobs:
           sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
           make check-style
 
+      # vm.c dispatches with musttail, which needs GCC 15+ or Clang 13+; ubuntu-latest still
+      # defaults to an older GCC. Clang is the fallback because the runner image already ships one
+      # new enough, so this does not depend on the PPA carrying a build for the current release.
+      - name: Install a compiler with musttail
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test || true
+          sudo apt-get update -qq
+          if sudo apt-get install -y -qq gcc-15; then
+            echo "CC=gcc-15" >> "$GITHUB_ENV"
+          else
+            sudo apt-get install -y -qq clang-18
+            echo "CC=clang-18" >> "$GITHUB_ENV"
+          fi
+
       - name: Build
         run: make
 
@@ -102,6 +116,18 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+
+      # Same musttail requirement as the x86 job above.
+      - name: Install a compiler with musttail
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test || true
+          sudo apt-get update -qq
+          if sudo apt-get install -y -qq gcc-15; then
+            echo "CC=gcc-15" >> "$GITHUB_ENV"
+          else
+            sudo apt-get install -y -qq clang-18
+            echo "CC=clang-18" >> "$GITHUB_ENV"
+          fi
 
       - name: Build
         run: make

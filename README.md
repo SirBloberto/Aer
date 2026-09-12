@@ -65,13 +65,16 @@ Runnable examples live in `examples/` (`./binary/aer examples/<name>.aer`):
 
 ### Dependencies
 
-No external libraries — the standard C library is the only dependency, on every platform. The VM's
-computed-goto dispatch loop (`&&label` / `goto *ptr`) is a GCC/Clang extension MSVC doesn't support,
-which is why Windows needs MinGW-w64 rather than `cl.exe`.
+No external libraries — the standard C library is the only dependency, on every platform. The VM
+dispatches each opcode by tail-calling the next (`__attribute__((musttail))`), a GCC/Clang extension
+MSVC doesn't support, which is why Windows needs MinGW-w64 rather than `cl.exe`.
 
-- **Linux / WSL** — GCC + Make, nothing else.
+**That attribute needs GCC 15+ or Clang 13+.** Older compilers do not build AER; set `CC` if the
+default one on a machine is too old (`make CC=gcc-15`).
+
+- **Linux / WSL** — GCC 15+ and Make, nothing else.
 - **macOS** — Xcode Command Line Tools (`xcode-select --install`). `gcc` resolves to Clang, which
-  supports the same computed-goto extension; the Makefile is unmodified for this platform.
+  supports the same extension; the Makefile is unmodified for this platform.
 - **Windows** — [MSYS2](https://www.msys2.org/), then from an MSYS2 shell:
   `pacman -S mingw-w64-x86_64-gcc make`. Build and run from that shell (or the MINGW64 shell it
   installs) — plain `cmd.exe`/PowerShell aren't a supported invocation path (the Makefile's

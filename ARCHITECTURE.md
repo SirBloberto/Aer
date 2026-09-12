@@ -149,7 +149,7 @@ A pool cell is fixed-size (the type's header only); anything variable-length is 
 individually `xmalloc`/`xrealloc`'d allocation the pool system doesn't track at all:
 
 - `AerString.data` — the actual character bytes.
-- `AerArray.items` — the element buffer (grows via `xrealloc`, doubling, in `lbl_array_new`/append
+- `AerArray.items` — the element buffer (grows via `xrealloc`, doubling, in `h_array_new`/append
   paths). Not applicable to a struct instance (see above — inline, no separate buffer).
 - `AerDict`'s hash table (`HashTable`'s sparse and dense arrays, `hashtable.c`).
 - `AerFunction.defaults` — only when the function has default parameters.
@@ -194,7 +194,7 @@ reference-counted, not incremental.
 - Every register of every **live** call frame — bounded to `0..call_depth`, not all `VM_CALL_MAX`
   frames regardless of depth. (A blanket scan over every frame slot was a measured cache-miss
   hotspot: even shallow recursion walked every frame's worth of cold, mostly-zeroed memory on every
-  GC pass. Frames beyond `call_depth` are dead — already returned, unwound by `lbl_return` — so
+  GC pass. Frames beyond `call_depth` are dead — already returned, unwound by `h_return` — so
   bounding the scan can't under-collect.)
 - The chunk's own constant pool (`Chunk.pool[]`) and every registered struct `Shape`'s field
   defaults — permanent roots, since a bytecode constant or a struct's declared default must never
@@ -240,7 +240,7 @@ normal rhythm — if exceeded, an extra major collection is forced before the pr
 reports "Memory ceiling exceeded" via the normal (non-fatal, longjmp-based — see §5.1) error path.
 
 **When cleanup actually happens, concretely**: right after the specific allocation that could have
-crossed the threshold — e.g. `lbl_array_new` calls `pool_alloc(&array_pool)`, fills in the new
+crossed the threshold — e.g. `h_array_new` calls `pool_alloc(&array_pool)`, fills in the new
 array, *then* calls `gc_maybe_collect(vm)` — never before the new value is reachable from a root.
 This ordering is itself load-bearing in a few places: e.g. `setup_call`/`vm_call_value` must
 increment `call_depth` (making the new frame part of `mark_vm_roots`'s scan) *before* calling
@@ -266,7 +266,7 @@ word**: every instruction is one or more 32-bit words, fixed at compile time per
 scheme (dest + both RK operands crammed into one 64-bit word for the hottest opcodes) after
 measurement on the Pi (32-bit ARM) found a real regression: a `uint64_t` is fetched as two 32-bit
 register halves there, and any packed field straddling that boundary needs a shift-and-OR
-reconstruction across both halves before it's usable — direct disassembly of `lbl_add` found
+reconstruction across both halves before it's usable — direct disassembly of `h_add` found
 roughly 30 of its ~71 instructions were exactly this reconstruction tax. Word granularity fixes
 this by construction: the prefetcher only ever sees one of a small, fixed set of strides (4, 8, or
 12 bytes per instruction), the same class of mixed-width stream ARM's own Thumb2 and RISC-V's
@@ -303,7 +303,7 @@ stay a blind overwrite instead of a read-modify-write.
 
 ### 3.3 The dispatch loop
 
-Computed-goto dispatch (`vm_run_slice`, a `static void* dt[] = { [OP_ADD] = &&lbl_add, ... }` table
+Computed-goto dispatch (`vm_run_slice`, a `static void* dt[] = { [OP_ADD] = &&h_add, ... }` table
 + `goto *dt[cur_op]`), the standard technique for beating a `switch`-based bytecode loop (no bounds
 check, no jump-table-then-branch — each opcode handler jumps directly to the next). The opcode
 itself is masked out of the low 8 bits of the word (`& 0xFF`) — matching `PACK3`'s own 8-bit opcode
@@ -338,7 +338,7 @@ Every call — `OP_CALL` (compile-time-resolved offset), `OP_CALL_VALUE`/`OP_CAL
 (runtime function value in a register or a global), and `setup_call` (the cross-file-module
 trampoline, `aer_module.c`) — does the same thing: arity/receiver-type check, bulk-copy argument
 registers from the caller's frame into the callee's frame starting at register 0 (always a
-forward, non-overlapping-hazard copy — see `lbl_call`'s own comment for why increasing-index
+forward, non-overlapping-hazard copy — see `h_call`'s own comment for why increasing-index
 iteration is safe even when caller/callee frames alias registers), fill any omitted trailing
 parameters from the function's own compiled-in defaults, save `return_ip`/`dest_reg` in the
 *callee's own* frame (not a single shared global — this is exactly what makes nested/recursive
@@ -622,7 +622,7 @@ for a change verified codegen-identical rather than assumed to be.
 shape-specialization tracking, forward-reference bookkeeping, loop-context stack, ...) plus a
 hand-mirrored `ParserState` struct and ~75 lines of manual field-by-field save/restore, used around
 a nested compile (a module import, or a lazy shape-specialization recompile triggered mid-execution
-by `lbl_call_spec`, vm.c). Adding new parser state meant declaring it in three places kept in sync
+by `h_call_spec`, vm.c). Adding new parser state meant declaring it in three places kept in sync
 by hand — the exact pattern already responsible for real bugs in this codebase (`var_kind` init,
 `branch_depth`, a `var_slot` bypass, all in the project history).
 
@@ -661,7 +661,7 @@ since this is a compile-time correctness/maintainability change, not a performan
 `aer_host_call` (`aer_host.c`), `aer_actor_module_call` and `aer_scheduler_module_call` (both
 `stdlib/`) each declare a local `AerVal[VM_STACK_MAX]` (4KB on this build: `VM_STACK_MAX` is 256,
 `AerVal` is 16 bytes) to hold a copy of the popped call arguments. Each is called from exactly one
-site in `vm.c`'s `lbl_call_module` — the single-call-site shape GCC's inliner favors regardless of
+site in `vm.c`'s `h_call_module` — the single-call-site shape GCC's inliner favors regardless of
 callee size, since inlining a function called from only one place can't increase code size. Under
 `-flto`, it took the bait on all three at once: disassembling `vm_run_slice` showed a ~30KB stack
 frame (`sub sp, sp, #30336` plus a further `#44`), confirmed via `-fstack-usage` to be ~7KB in a
@@ -856,24 +856,24 @@ keys instead of copying them, has been attempted and reverted twice (see the `bo
 borrowed keys` commits); the second attempt fixed both flaws the first was reverted for and still
 did not land. A third attempt needs a new idea, not a retry.
 
-### 5.18 Why `lbl_call` cannot be micro-optimized (measured, three ways)
+### 5.18 Why `h_call` cannot be micro-optimized (measured, three ways)
 
 `fib_bench` runs 134.4M dispatches for 8.26B instructions -- 61.5 instructions per dispatch, against
 `mandelbrot`'s 22.0 on the same interpreter -- so the call path looks like obvious low-hanging
 fruit. Three attempts, all reverted, and the reasons are worth keeping.
 
-**Reading back what the call just wrote.** `lbl_call` computed the callee's base pointers, stored
+**Reading back what the call just wrote.** `h_call` computed the callee's base pointers, stored
 them into the CallFrame, then loaded them straight back out through `vm->call_stack[vm->call_depth]`
 to refresh `vm->registers` and the hoisted locals. It also loaded `caller->registers`, which is by
 definition the hoisted `registers` local. Removing both round trips regressed **ten** benchmarks --
 `mandelbrot` +6.3%, `nbody` +4.7% -- while helping only `fib_bench`.
 
 `mandelbrot` spends 0.22% of its dispatches on calls (1,036,800 of 468,213,512), so a change
-confined to `lbl_call` cannot cost it 6% through its own work. A control confirmed it is not generic
+confined to `h_call` cannot cost it 6% through its own work. A control confirmed it is not generic
 codegen churn either: swapping two independent decodes in a cold label moves every benchmark 0.00%.
 
 The mechanism is live ranges. `registers` is hoisted for the whole function,
-and `lbl_call` previously did not touch them -- it went through `caller->...` instead, leaving them
+and `h_call` previously did not touch them -- it went through `caller->...` instead, leaving them
 **dead** across the entire call sequence. Referencing them there extends their live ranges over all
 of it, and in a function under this much register pressure that reshapes allocation for every other
 label. The "redundant" load is what keeps the hot arithmetic paths' allocation good. Reloading from
@@ -890,7 +890,7 @@ went **up** 2.44%. The misses were not the binding constraint, which also dispos
 that fib is misprediction-bound: at IPC 1.62 with 8.26B instructions, it is instruction-bound.
 
 The consequence for anyone picking this up: the remaining lever on call-heavy code is **fewer
-dispatches**, not a cheaper `lbl_call`. Seven dispatches per `fib` call (compare-and-branch, two
+dispatches**, not a cheaper `h_call`. Seven dispatches per `fib` call (compare-and-branch, two
 subtracts, two calls, add, return) is the number to attack, and only through fusion.
 
 ### 5.19 Constants as RK operands: where it pays, and where fewer instructions ran slower
@@ -965,7 +965,7 @@ reloading `vm` at 4.73%, 16-byte `ldmia` copies at 4.43% and 2.27%, spills at `[
 and four `str.w [r3, #732..744]` writing the `vm->` mirror. `CallFrame` is 11 fields / 44 bytes, and
 **six of the eleven exist only to maintain the raw int/real side-stacks** -- which `fib` never uses.
 
-**Removing the mirror writes did not work (attempt 4).** `lbl_call` and `lbl_return` each wrote
+**Removing the mirror writes did not work (attempt 4).** `h_call` and `h_return` each wrote
 `vm->registers/raw_ints/raw_reals` and immediately read them back: 6 stores and 12 loads per
 call/return pair. Nothing needs them mid-slice -- the GC walks `call_stack[0..call_depth]`
 (`mark_vm_roots`), not the mirror. Deleting them bought `fib_bench` **0.36%** and cost eight other
@@ -980,8 +980,8 @@ And a portability note: gcc 16.1 **ICEs** (`tree-if-conv.cc`, `factor_out_operat
 the live `CallFrame` instead of taking them as arguments.
 
 **What did work was the address arithmetic, not the instruction count.** Attributing `fib`'s profile
-per handler (segment `perf annotate` on the dispatch `bx`) put **36.3% of cycles in `lbl_call` alone,
-at 129 instructions**, and 19.3% in `lbl_return` at 43. Reading those 129 instructions showed what
+per handler (segment `perf annotate` on the dispatch `bx`) put **36.3% of cycles in `h_call` alone,
+at 129 instructions**, and 19.3% in `h_return` at 43. Reading those 129 instructions showed what
 they were actually spending it on, and it was not the frame writes:
 
 - `CallFrame` was **44 bytes, not a power of two**, so `call_stack[depth]` compiled to a multiply --
@@ -1003,11 +1003,11 @@ they were actually spending it on, and it was not the frame writes:
 
 - `stack[VM_STACK_MAX]`, the 4096-byte stdlib scratch channel **nothing on the call path touches**,
   still sat in front of `call_stack` and pushed every `CallFrame` field back out of the window.
-  Moving it behind: another **-4.62% and -1.46%**, and `lbl_call`'s materialized-constant count goes
+  Moving it behind: another **-4.62% and -1.46%**, and `h_call`'s materialized-constant count goes
   to zero.
 
-Together: **fib_bench -10.5% instructions, `binary_trees` -4.2%**, with `lbl_call` down from 129
-instructions to 107 and `lbl_return` from 43 to 36. Nothing else in the suite moved past 0.12%.
+Together: **fib_bench -10.5% instructions, `binary_trees` -4.2%**, with `h_call` down from 129
+instructions to 107 and `h_return` from 43 to 36. Nothing else in the suite moved past 0.12%.
 
 Note the shape of the displacement budget, because it bites both ways: moving `call_stack` *itself*
 to the front bought `fib_bench` a further 5.79% and cost seven other benchmarks 0.4-3.8%. At 4096
@@ -1015,8 +1015,8 @@ bytes it fills the entire 12-bit window on its own and pushes `heap` -- which ev
 touches -- back out. Reverted. The rule that worked: **small hot scalars first, then the structures
 the dispatch loop indexes, and every big cold array last.**
 
-What remains in `lbl_call` is structural: the 16-byte `AerVal` argument copy (`ldmia`, 2.4%) and `vm`
-reloading from a stack spill in `lbl_return` (4.0%). Both are consequences of a 16-byte value in a
+What remains in `h_call` is structural: the 16-byte `AerVal` argument copy (`ldmia`, 2.4%) and `vm`
+reloading from a stack spill in `h_return` (4.0%). Both are consequences of a 16-byte value in a
 C-compiled dispatch loop, which is the deferred value-representation work. Beyond those, the lever is
 fewer dispatches per call -- fusion, a new opcode, priced at about 3% by 5.20.
 
@@ -1058,7 +1058,7 @@ unconditionally, including slots the callee has not written -- safe only while `
 nothing but valid `AerVal`s. Interleaving raw words let the collector read a `double` as a tagged
 pointer; `tests/test_gc_raw_frames.aer` was written for exactly this and caught it on the first run.
 The fix considered at the time was clearing a frame's raw area on *pop*, which leaves a hole on every
-error unwind and yield, since those skip `lbl_return`. What actually holds now is clearing on
+error unwind and yield, since those skip `h_return`. What actually holds now is clearing on
 **entry**: every frame-entry path zeroes its region's tags, and a frame cannot exist without being
 entered. Nothing needs to happen on the way out.
 
@@ -1149,13 +1149,13 @@ Cycle-weighted inside `vm_run_slice`, loads are 64-86% and stores 7-17%, of whic
 a defect -- an interpreter is a load-dispatch-store machine and LuaJIT's is too -- but the spill
 share is the reducible part, and it is the largest single structural item left.
 
-One bite of it worked. `lbl_call` built four out-params for `vm_call_resolve_specialization` and
+One bite of it worked. `h_call` built four out-params for `vm_call_resolve_specialization` and
 **took their addresses**, which forces all four into memory for the whole handler no matter which
 path runs -- an escaping address cannot live in a register. Scoping those to the branch that uses
-them: `fib_bench` **-4.53%**, `binary_trees` -0.93%, and `lbl_call` went from 103 instructions with
+them: `fib_bench` **-4.53%**, `binary_trees` -0.93%, and `h_call` went from 103 instructions with
 22 spill references to 92 with 17. Worth checking any hot handler for the same shape.
 
-What did **not** work, against expectation: hoisting `lbl_interp`'s `AerVal parts[16]` (256 bytes)
+What did **not** work, against expectation: hoisting `h_interp`'s `AerVal parts[16]` (256 bytes)
 out into a noinline helper, the same fix that was right for `OP_INDEX_GET_INTERP`. It moved nothing
 on the benchmarks that do not interpolate (`mandelbrot`, `fib_bench`, `binary_trees` all 0.00%) and
 cost the ones that do 1.2% (`dict_bench` +1.16%, `small_dict_bench` +1.23%) for the extra call and
@@ -1207,7 +1207,7 @@ already saturated.
 | **hoist `vm->call_stack`** | **`fib_bench` +2.17%, `binary_trees` +0.86%** |
 
 That last row is the ceiling made visible. `vm->call_stack` is a fixed inline array whose address
-never moves, `lbl_call`/`lbl_return` index it repeatedly, and hoisting it is the identical trick that
+never moves, `h_call`/`h_return` index it repeatedly, and hoisting it is the identical trick that
 worked three rows above -- but it made things *worse*, because it became one more value competing for
 the same 14 registers and evicted something hotter. Trading a dereference for a live value only pays
 while a register is free, and there isn't one.
@@ -1325,10 +1325,10 @@ while `sieve` kept its -21.38%. So the cost is codegen shift from touching these
 guard's arithmetic (which would be ~3 instructions against the 10.5 per `PREP` the delta implies).
 Landed anyway: it buys a memory-safety fix and 21% on another benchmark.
 
-### 5.28 Taking lbl_call apart: what its 91 instructions are, and what moved them
+### 5.28 Taking h_call apart: what its 91 instructions are, and what moved them
 
 Attributing the handler instruction-by-instruction against source (`objdump -dS` over the range
-`perf` identifies as `lbl_call`) rather than guessing. What it is actually made of:
+`perf` identifies as `h_call`) rather than guessing. What it is actually made of:
 
 - `add.w r6, r2, ip, lsl #6` -- the `CallFrame` power-of-two shift working as intended (5.21).
 - `mov.w r3, #328` + `mla r5, r3, r5, r2` -- **`sizeof(ChunkFunction)` is 328, not a power of two**,
@@ -1340,7 +1340,7 @@ Attributing the handler instruction-by-instruction against source (`objdump -dS`
   fix holding).
 
 **Splitting `OP_TAIL_CALL` into its own label: neutral.** `OP_CALL` and `OP_TAIL_CALL` shared
-`lbl_call`, so every ordinary call tested `cur_op == OP_TAIL_CALL` and carried the tail body in its
+`h_call`, so every ordinary call tested `cur_op == OP_TAIL_CALL` and carried the tail body in its
 live range -- and the suite runs **35.5M ordinary calls against zero tail calls**. Separating them
 measured `binary_trees` -0.21%, everything else 0.00%. Kept anyway: one label per opcode is simpler,
 and it costs nothing.
@@ -1352,10 +1352,10 @@ the hit test for a struct receiver bought **`binary_trees` -4.63%** and cost **`
 a net **+125M instructions** across the two.
 
 `fib_bench` never executes that code -- its `shape_sensitive_mask` is zero, so the branch is never
-taken. The 3.87% is the cost of roughly ten instructions merely *existing* inside `lbl_call`. That is
+taken. The 3.87% is the cost of roughly ten instructions merely *existing* inside `h_call`. That is
 the sharpest measurement yet of what 5.24 describes: this handler is at its register-allocation
 limit, and anything added to it is paid for by every call in every program, executed or not. Adding
-to `lbl_call` needs a win larger than ~4% on the benchmark it targets before it breaks even.
+to `h_call` needs a win larger than ~4% on the benchmark it targets before it breaks even.
 
 ### 5.29 The module-call path: where nbody's 9.6% goes, and why it stays there
 
@@ -1363,12 +1363,12 @@ to `lbl_call` needs a win larger than ~4% on the benchmark it targets before it 
 `math_pop_double`, over 11.5M `OP_CALL_MODULE` dispatches -- roughly 80 instructions for a
 `double -> double`. Reading the whole path end to end:
 
-1. `lbl_call_module` reads three operand words, then `PUSH`es each argument onto `vm->stack` with a
+1. `h_call_module` reads three operand words, then `PUSH`es each argument onto `vm->stack` with a
    bounds check;
 2. a `noinline` **seven-argument** call into `vm_call_module_dispatch`, which switches on `module_id`;
 3. `aer_math_call` matches `fn_id` down an if-chain, then `math_pop_double` pops (bounds-checked);
 4. `math_unary` switches on **the same `fn_id` a second time**;
-5. the result is pushed (bounds-checked), then `lbl_call_module` pops it back into a register.
+5. the result is pushed (bounds-checked), then `h_call_module` pops it back into a register.
 
 So the value travels **register -> vm->stack -> local double -> vm->stack -> register**: four
 bounds-checked 16-byte transfers where one move would do. Note the if-chain is *not* nbody's problem
@@ -1422,7 +1422,7 @@ it hashes 17 bytes building the dict and 7 more reading it back; over 3.3M itera
 byte-steps of a hash whose answer was already known. `perf annotate` confirms the loop body is
 `eor` + `umull` + `mla`: FNV's 64-bit multiply, which 32-bit ARM has no single instruction for.
 
-There is a second scan on the same bytes. `lbl_dict_new` computes `hashtable_key_true_len(...)` and
+There is a second scan on the same bytes. `h_dict_new` computes `hashtable_key_true_len(...)` and
 passes the result to `hashtable_key_dup`, which calls `hashtable_key_true_len` **again** on the
 already-truncated length -- a walk that by construction can no longer find a NUL.
 
@@ -1488,7 +1488,7 @@ pool's rounded stride stays **32**, and `log_processing`'s peak RSS is identical
 `fib_bench` is kept despite crossing the 0.30% revert line. It contains no dict or string work at
 all -- one `print` -- so the extra instructions cannot be the cache doing work; it is the
 register-allocation shift 5.28 describes, where changing code anywhere in `vm_run_slice`
-re-allocates registers across all 153 label bodies and `fib_bench`'s hot `lbl_call` pays for it.
+re-allocates registers across all 153 label bodies and `fib_bench`'s hot `h_call` pays for it.
 
 **A correction.** This section originally justified keeping it with "cycles are lower in the new
 build (4.278B against 4.308B)". That evidence does not survive 5.32: cycle measurements at
@@ -1538,7 +1538,7 @@ them anyway, because ~10 long-lived pointers compete across 153 label bodies on 
 allocatable registers. The hottest single instruction is the RK8 const-flag test, which GCC compiles
 into a *conditional reload of a base pointer from the stack* on every operand decode.
 
-**Attempt 1: un-hoist `raw_ints`/`raw_reals` to free two registers.** Only the ~18 `lbl_raw_*`
+**Attempt 1: un-hoist `raw_ints`/`raw_reals` to free two registers.** Only the ~18 `h_raw_*`
 labels use them, and `fib` uses none at all (its bytecode has zero raw opcodes -- verified with
 `--debug-path`). The full ablation, in instructions:
 
@@ -1552,8 +1552,8 @@ Freeing *one* register produced a worse allocation than freeing two -- the middl
 the three. Reverted: the best variant still trades `sieve` +1.99% and `nbody` +0.72% for `fib`, which
 is chasing one synthetic call microbenchmark at the suite's expense.
 
-**Attempt 2: stop re-deriving the frame pointer the call path already holds.** `lbl_call`,
-`lbl_return` and `vm_call_value`'s tail-call setup each finished by reading
+**Attempt 2: stop re-deriving the frame pointer the call path already holds.** `h_call`,
+`h_return` and `vm_call_value`'s tail-call setup each finished by reading
 `vm->call_stack[vm->call_depth]` three times to refill the `vm->` mirror, then read the mirror
 straight back into the hoisted locals -- while `callee` already pointed at that exact frame. Removing
 the recompute is strictly less work. It measured `fib_bench` **+0.86%** instructions, and at
@@ -1568,7 +1568,7 @@ the recompute is strictly less work. It measured `fib_bench` **+0.86%** instruct
 | `const_pool` | **all ten benchmarks regress** (nbody +2.35%, sieve +2.00%, fib +1.93%, mandelbrot +1.51%) |
 
 So the hoists are not excess baggage -- every one of them is load-bearing, and the two that look
-most redundant (`functions`, used only by `lbl_call`; `raw_*`, used by 18 of 153 labels) are the only
+most redundant (`functions`, used only by `h_call`; `raw_*`, used by 18 of 153 labels) are the only
 ones where un-hoisting is even arguable. **This closes the "reduce what we pin" line of enquiry.**
 
 Together with 5.21 attempt 4 and 5.24, that is four independent attempts. The pattern is now firm
@@ -2218,7 +2218,7 @@ so the call path is where the remaining structural work is.
 
 Working backwards from the totals: `fib_bench` runs 134.4M dispatches for 6.84B instructions, of
 which ~29.9M are calls and ~29.9M returns. That puts the call/return pair near **96 instructions**,
-about 83% of everything the benchmark executes. Disassembling `lbl_call` shows the first thing it
+about 83% of everything the benchmark executes. Disassembling `h_call` shows the first thing it
 does:
 
 ```
@@ -2228,8 +2228,8 @@ mla    r1, r3, r1, r2    ; &functions[func_index]
 
 `ChunkFunction` is 328 bytes, which is not a power of two, so resolving the callee cost a **multiply
 on every call** -- and it is entirely avoidable, because the parser knows the index at compile time
-and the scale never varies. `emit_call` now emits a byte offset instead, and both `lbl_call` and
-`lbl_tail_call` index with an add.
+and the scale never varies. `emit_call` now emits a byte offset instead, and both `h_call` and
+`h_tail_call` index with an add.
 
 | benchmark | delta | | benchmark | delta |
 |---|---|---|---|---|
@@ -2245,7 +2245,7 @@ changes together improve eight benchmarks and regress none.
 locals -- six stores and six loads per call/return pair. Nothing hot read it: `mark_vm_roots` scans
 `call_stack[f].registers`, and the only other consumers were a test accessor, a REPL variable dump,
 and `vm_call_value`'s tail path, all of which can read the frame directly. The three fields were
-deleted outright and every reader now goes to `call_stack[call_depth]`; `lbl_call` and `lbl_return`
+deleted outright and every reader now goes to `call_stack[call_depth]`; `h_call` and `h_return`
 already hold the relevant `CallFrame*`, so refreshing the locals costs three loads off a pointer
 in hand instead of three loads plus three stores through the VM.
 
@@ -2263,7 +2263,7 @@ existed.
 **The three cold fields are not worth chasing.** `code_offset`, `tail_calls_collapsed` and
 `synthetic_entry` serve only stack traces and tail-call accounting, and two of them are zeroed on
 every ordinary push -- so making them an aligned, same-width, adjacent pair should let one `strd`
-replace two stores. Tried: GCC emitted no `strd` at all (checked by disassembling `lbl_call`), and
+replace two stores. Tried: GCC emitted no `strd` at all (checked by disassembling `h_call`), and
 the measurement agreed at -0.01% / +0.00%. Reverted, since it also cost a `bool` its honest type.
 The eleven frame writes compile to eleven separate `str.w`; coalescing them is not something the
 source can ask for from here.
@@ -2471,13 +2471,14 @@ tail, keep hot opcodes replicated -- targets the wrong end: cold opcodes are not
 `mandelbrot`, its hot ones are. Freeing predictor entries by sharing the tail is still worth a
 measurement, but this data says not to expect it to fix the benchmark that needs it most.
 
-The knob stays as opt-in measurement tooling, never part of a normal build, on the same footing as
-`make pgo` and `make profile`.
+The knob is gone as of the tail-call dispatch conversion (5.62): with each handler ending in its
+own tail call there is no shared site to route through, so the opposite endpoint is no longer
+expressible. The measurement above stands as the reason replication was kept.
 
 ### 5.48 A use-after-free found by reading the call path, not by a test
 
 `vm_run_slice` hoists `c->pool` into `const_pool`, and a shape-specializing recompile runs the
-parser again while that local is live. `lbl_call` already refreshed `code` and `functions` across
+parser again while that local is live. `h_call` already refreshed `code` and `functions` across
 that call, with a comment saying a recompile "can realloc both" -- so the question is why `pool` was
 not in that list.
 
@@ -2512,7 +2513,7 @@ stress. The test stays as a canary: it covers a combination (specialization plus
 same body) that nothing else did, and it will catch a regression whenever the pool does happen to
 grow at that moment.
 
-Worth noting how this surfaced: not from a failing test, but from reading `lbl_call` while looking
+Worth noting how this surfaced: not from a failing test, but from reading `h_call` while looking
 for something else and asking why one hoisted pointer was refreshed and another was not. The
 comment next to the refresh said "can realloc both", and *both* was the bug.
 
@@ -2662,7 +2663,7 @@ it instead of reasoning about it:
 | `pool_alloc` | 3.90% |
 | **`strcmp`** | **1.63%** |
 
-`strcmp` has no business appearing at all. `lbl_struct_new` resolved its type by calling
+`strcmp` has no business appearing at all. `h_struct_new` resolved its type by calling
 `chunk_find_shape(c, name)` -- a newest-first linear scan over every shape, with a `strcmp` per
 shape -- **on every single struct construction**. `binary_trees` allocates millions of nodes, so
 that is millions of string comparisons to answer a question that is constant at each call site.
@@ -2687,14 +2688,14 @@ had profiled -- the work *inside* opcodes rather than the dispatch between them.
 of instructions suite-wide and as little as 2.5% on the allocation-heavy benchmarks; the remaining
 money is in the handlers.
 
-`vm_call_resolve_specialization` at 6.63% is the next thread to pull: it is documented as `lbl_call`'s
+`vm_call_resolve_specialization` at 6.63% is the next thread to pull: it is documented as `h_call`'s
 *cold* path and split out with `noinline` for exactly that reason, so 6.63% means it is not cold at
 all for struct-passing code.
 
 ### 5.53 Struct construction wrote its fields the slow way
 
 Next entry down the same profile: `vm_struct_field_write` at 8.19% of `bench/binary_trees.aer`.
-`lbl_struct_new` called it once per field of every construction, and it is an *externally linked*
+`h_struct_new` called it once per field of every construction, and it is an *externally linked*
 function that re-derives `s->shape` twice per call:
 
 ```c
@@ -2704,7 +2705,7 @@ unsigned int offset = s->shape->field_offsets[slot];
 
 An inline counterpart already existed -- `vm_struct_field_write_at`, taking offset/type/narrow
 precomputed -- used by every field-SET opcode but not by construction, which is the one place that
-writes *every* field. And `lbl_struct_new` already holds `shape`, so the two dependent loads per
+writes *every* field. And `h_struct_new` already holds `shape`, so the two dependent loads per
 field were re-deriving something it had in a register.
 
 | benchmark | instructions |
@@ -3159,9 +3160,9 @@ lever worth pulling is the interpolation/allocation path (§5.13 already took on
   session's other GC work could have moved it. `register_stack`/`raw_int_stack`/`raw_real_stack`
   (`vm.h`) are fixed-size inline `VM` arrays, never reallocated, so caching these three pointers in
   registers across the whole dispatch loop is safe as long as the locals get refreshed at the exact
-  3 sites the fields themselves get reassigned (`lbl_call`, `lbl_call_value` via `vm_call_value`,
-  `lbl_return`) — confirmed by checking each site individually rather than assuming. Caught one real
-  ordering bug of its own while wiring this up: a mechanical find-replace initially left `lbl_return`
+  3 sites the fields themselves get reassigned (`h_call`, `h_call_value` via `vm_call_value`,
+  `h_return`) — confirmed by checking each site individually rather than assuming. Caught one real
+  ordering bug of its own while wiring this up: a mechanical find-replace initially left `h_return`
   writing the callee's result into the *stale* (still-callee-pointing) local instead of the
   just-reassigned caller's, which would have corrupted whichever register of the caller's frame
   happened to share the destination index. Fixed by refreshing the locals before that write, not
@@ -3189,7 +3190,7 @@ lever worth pulling is the interpolation/allocation path (§5.13 already took on
   same primitive `aer_module_load` uses) driven by `vm_run_slice()` — the `vm_run()` dispatch loop,
   refactored to take a bounded instruction count and return `VM_SLICE_YIELDED` instead of running
   to completion, with the budget checked only at the three sites a script can spend unbounded time
-  (`lbl_jump`, `lbl_call`, `lbl_iter_range_loop`'s back-edge — never a blanket per-`DISPATCH()`
+  (`h_jump`, `h_call`, `h_iter_range_loop`'s back-edge — never a blanket per-`DISPATCH()`
   check). This works with no fiber/`ucontext`/stack-copying machinery because AER calls never
   recurse in C — every call pushes a `CallFrame` onto a plain array and jumps, so a "suspended"
   script's entire state already lives on the `VM` struct, not the C stack; `vm_run()` already
@@ -3463,8 +3464,8 @@ lever worth pulling is the interpolation/allocation path (§5.13 already took on
   the one path every ordinary (non-specialized) `.field` opcode uses -- can dispatch correctly.
   Second (the raw-opcode fast path + packed-array support, landed once real interest in measuring
   nbody.aer's narrow-field performance justified the work): every `field_count * 8` packed-array
-  element-size computation (10 call sites across `lbl_index_field_get/set/compound` and
-  `lbl_array_repeat`) became `shape->instance_bytes`, the real per-element stride, so a struct with
+  element-size computation (10 call sites across `h_index_field_get/set/compound` and
+  `h_array_repeat`) became `shape->instance_bytes`, the real per-element stride, so a struct with
   a narrow field packs fine now (`[Point(); n]`); and shape specialization's raw-unboxed-local fast
   path gained 12 narrow counterparts of the whole `OP_FIELD_GET_RAW_INT/REAL` family
   (`OP_FIELD_GET_RAW_INT32/FLOAT32` etc.) -- these widen a field's 4-byte storage into the same
@@ -3658,3 +3659,56 @@ out, don't leave a `// no longer used` marker, don't keep a re-export for compat
 with a real search (callers, computed-goto dispatch tables, macro-generated references) before
 deleting, since this codebase dispatches through function-pointer tables and packed opcodes that a
 plain text search can miss.
+
+### 5.62 Tail-call dispatch: the giant function was costing more than anyone measured
+
+`vm_run_slice` used to be one ~2,400-line function holding ~150 computed-goto labels. Every
+handler's live ranges spanned every other handler, and the allocation that produced was visibly
+bad: `%r12`/`%r13` carried 2 references each while `0x40(%rsp)` was reloaded **607** times and
+`0x50(%rsp)` **537** -- four idle callee-saved registers next to a hot spill slot.
+
+Three register-pressure variants had already been tried against that and all measured inside
++/-1.5%, which read as "the structure is bad but fixing it does not pay on x86". That conclusion
+was wrong, and it was wrong because every variant still lived inside the one function.
+
+Each opcode is now its own `static VmSliceResult h_x(VM*, const uint32_t*, AerVal*, Chunk*)`, and
+`DISPATCH()` is a `musttail` return through `aer_handlers[256]`. Four parameters is exactly the
+Win64 and ARM32 integer-argument budget, and exactly the four values reference-counting showed earn
+a register: `registers` (344 uses), `vm` (117), `c` (81), `pc` (45).
+
+Five-layout wall-clock sweep, five runs per point, median across layouts, against the computed-goto
+build it replaced:
+
+| benchmark | median | sign-stable |
+|---|---|---|
+| `mandelbrot` | **-37.50%** | yes |
+| `fib_bench` | **-17.23%** | yes |
+| `binary_trees` | **-12.00%** | yes |
+| `sieve` | **-9.98%** | yes |
+| `nbody_large_packed` | -6.22% | yes |
+| `struct_array_scan` | -3.26% | yes |
+| `nbody` | -3.21% | yes |
+| `dict_bench` | +0.63% | no -- layout noise |
+
+All 73 corpus programs produce byte-identical output once their self-reported timings are
+normalised. `mandelbrot` gaining the most is consistent with 5.45: it is the benchmark whose time
+is most nearly all dispatch, so it had the most to lose from the allocation and the most to regain.
+
+Two things this required, both easy to get wrong:
+
+**The entry frame must stay alive.** `vm_run_slice` owns `catch_point`, and `error()` unwinds to it
+with `__builtin_longjmp`. So `vm_run_slice` calls the *first* handler with an ordinary call and only
+handler-to-handler edges are tail calls. Written as `SLICE_RETURN(aer_handlers[...](...))` this
+silently breaks: the macro restores the unwind target, the active VM and the current heap *before*
+evaluating its argument, so the whole chain runs with `runtime_error_unwind_target` already NULL and
+`error()` returns instead of unwinding. The call has to be evaluated into a local first.
+
+**Plain `setjmp` would not have worked.** A prototype using libc `setjmp`/`longjmp` crashed with
+`STATUS_BAD_STACK` at every optimisation level, which reads as "musttail destroys the frames Win64
+SEH needs". It is not: the identical program with `musttail` removed crashes the same way. AER uses
+`__builtin_setjmp` (see `error.h`), which saves SP/FP/PC directly and bypasses SEH, and that works
+out of a musttail chain at `-O0`, `-O2` and `-O2 -flto`.
+
+Requires GCC 15+ / Clang 13+ as the only dispatch mechanism. A computed-goto fallback behind
+`__has_attribute(musttail)` was rejected: maintaining two dispatch mechanisms taxes every future
+handler edit, which is the cost this change exists to remove.

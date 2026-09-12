@@ -594,11 +594,11 @@ typedef struct {
        vm_call_resolve_specialization (vm.c). Bit i set = parameter i was seen used as the base of a
        struct-field access (directly, or through a one-hop plain-local alias) during the ordinary
        compile; folded in at function-exit, same moment max_registers is captured. Zero means this
-       function is never specialized, and lbl_call skips the lookup. */
+       function is never specialized, and h_call skips the lookup. */
     unsigned int shape_sensitive_mask;
 /* Set instead of a parameter bit when no parameter is shape-sensitive but the body composed a raw
    local with a boxed value -- work that goes raw once the numeric parameters do. It rides in this
-   mask rather than a field of its own so lbl_call's gate stays the one already-fetched test it is;
+   mask rather than a field of its own so h_call's gate stays the one already-fetched test it is;
    parameter bits are capped at 31 to keep the top one free. */
 #define SHAPE_MASK_NUMERIC_ONLY (1u << 31)
     /* Counted only for a numeric-only function, only until it specializes. A variant re-parses the
@@ -621,7 +621,7 @@ typedef struct {
        generic body via code_offset above for every further call. */
     /* NULL until this function first specializes, which most never do. Inline, the SPEC_MAX
        entries were 83% of this struct (272 of 328 bytes) and spread every ChunkFunction across six
-       cache lines for the handful of fields lbl_call reads per call. Allocated once at full
+       cache lines for the handful of fields h_call reads per call. Allocated once at full
        SPEC_MAX size and never grown, so the SpecEntry* CallSpecCacheEntry caches stays valid. */
     SpecEntry* specializations;
     int specialization_count;
@@ -707,7 +707,7 @@ typedef struct {
     FieldCacheEntry* field_cache;
     unsigned int field_cache_cap;
 
-    /* Per-site inline cache for lbl_call's specialization dispatch, same growth/addressing idiom as
+    /* Per-site inline cache for h_call's specialization dispatch, same growth/addressing idiom as
        field_cache above (sized to c->count, indexed by bytecode word offset). */
     CallSpecCacheEntry* call_spec_cache;
     unsigned int call_spec_cache_cap;
@@ -893,6 +893,11 @@ typedef struct {
 
     Chunk* chunk;
     unsigned int ip;
+    /* The yield budget, read and decremented only at the handful of checkpoints that can yield.
+       Held here rather than in vm_run_slice locals so a handler reaches it through vm alone. */
+    unsigned int slice_budget;
+    unsigned int slice_max; /* 0 disables yielding entirely */
+
     /* For runtime error line lookup only. A pointer, not an offset: vm_run_slice writes it at
        every site that can raise, and an offset would keep `code` live across all of them. `ip`
        stays an offset because it must survive a yield/resume and a REPL reparse in between. */
@@ -909,7 +914,7 @@ typedef struct {
     CallFrame call_stack[VM_CALL_MAX];
     /* Scratch argument channel for bridging out of the register convention (stdlib/module calls).
        Deliberately AFTER call_stack: 4096 bytes in front of it pushed every CallFrame field past the
-       12-bit displacement window, costing lbl_call eight materialized constants per call. Nothing in
+       12-bit displacement window, costing h_call eight materialized constants per call. Nothing in
        the dispatch loop's call path touches this array. */
     AerVal stack[VM_STACK_MAX];
     int stack_top;

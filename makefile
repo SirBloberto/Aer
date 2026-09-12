@@ -8,6 +8,10 @@ else
     WINLIBS :=
 endif
 
+# musttail (vm.c dispatch) needs GCC 15+ or Clang 13+. Override CC to point at one if the
+# default compiler on a machine is older.
+CC ?= gcc
+
 # -flto is load-bearing: pool.c's tiny hot helpers are called constantly from vm.c cross-TU.
 #
 # ARCH_FLAGS is deliberately empty by default -- this build must run on whatever ARM/x86 machine
@@ -75,11 +79,11 @@ LIBOBJECT := $(filter-out object/main.o,$(OBJECT))
 
 all: $(OBJECT)
 	@mkdir -p binary object
-	gcc $(FLAGS) -o binary/aer$(EXE) $^ -lm $(WINLIBS)
+	$(CC) $(FLAGS) -o binary/aer$(EXE) $^ -lm $(WINLIBS)
 
 object/%.o: source/%.c $(HEADERS) $(THREAD_STAMP)
 	@mkdir -p $(dir $@)
-	gcc $(FLAGS) -c $< -o $@
+	$(CC) $(FLAGS) -c $< -o $@
 
 # Below `all` deliberately: the first rule in the file is make's default goal, so a stamp rule
 # above it makes a bare `make` build the stamp and no binary.
@@ -94,7 +98,7 @@ $(THREAD_STAMP):
 # +7.5% on struct_array_scan and +3.5% on nbody (four-layout ensemble), so it gets its own build.
 profile: $(SOURCE)
 	@mkdir -p binary
-	gcc $(FLAGS) -DAER_PROFILE -o binary/aer-profile$(EXE) $(SOURCE) -lm $(WINLIBS)
+	$(CC) $(FLAGS) -DAER_PROFILE -o binary/aer-profile$(EXE) $(SOURCE) -lm $(WINLIBS)
 
 # Ranks opcodes by dispatches actually executed, which is a different question from
 # check-opcode-coverage's "is it ever emitted". Reports only; takes minutes, so not part of `check`.
@@ -159,47 +163,47 @@ test: all
 # Embedding smoke test — links the library directly, no main.c/CLI.
 test-embed: $(LIBOBJECT)
 	@mkdir -p binary object
-	gcc $(FLAGS) -c tests/embed_smoke_test.c -o object/embed_smoke_test.o
-	gcc $(FLAGS) -o binary/embed_smoke_test$(EXE) $(LIBOBJECT) object/embed_smoke_test.o -lm $(WINLIBS)
+	$(CC) $(FLAGS) -c tests/embed_smoke_test.c -o object/embed_smoke_test.o
+	$(CC) $(FLAGS) -o binary/embed_smoke_test$(EXE) $(LIBOBJECT) object/embed_smoke_test.o -lm $(WINLIBS)
 	./binary/embed_smoke_test$(EXE)
 
 # Register-VM unit test — exercises allocator/opcodes below the .aer-file level.
 test-smoke: $(LIBOBJECT)
 	@mkdir -p binary object
-	gcc $(FLAGS) -c tests/smoke_test.c -o object/smoke_test.o
-	gcc $(FLAGS) -o binary/smoke_test$(EXE) $(LIBOBJECT) object/smoke_test.o -lm $(WINLIBS)
+	$(CC) $(FLAGS) -c tests/smoke_test.c -o object/smoke_test.o
+	$(CC) $(FLAGS) -o binary/smoke_test$(EXE) $(LIBOBJECT) object/smoke_test.o -lm $(WINLIBS)
 	./binary/smoke_test$(EXE)
 
 # Exhaustive per-opcode encoding round-trip check — see tests/opcode_roundtrip_test.c's own comment
 # for why this needs direct coverage the ordinary .aer suite doesn't provide.
 test-roundtrip: $(LIBOBJECT)
 	@mkdir -p binary object
-	gcc $(FLAGS) -c tests/opcode_roundtrip_test.c -o object/opcode_roundtrip_test.o
-	gcc $(FLAGS) -o binary/opcode_roundtrip_test$(EXE) $(LIBOBJECT) object/opcode_roundtrip_test.o -lm $(WINLIBS)
+	$(CC) $(FLAGS) -c tests/opcode_roundtrip_test.c -o object/opcode_roundtrip_test.o
+	$(CC) $(FLAGS) -o binary/opcode_roundtrip_test$(EXE) $(LIBOBJECT) object/opcode_roundtrip_test.o -lm $(WINLIBS)
 	./binary/opcode_roundtrip_test$(EXE)
 
 # The short, readable embedding example (examples/embedding_example.c) -- see tests/embed_smoke_test.c
 # for the exhaustive version this project's own test suite actually relies on.
 example-embed: $(LIBOBJECT)
 	@mkdir -p binary object
-	gcc $(FLAGS) -c examples/embedding_example.c -o object/embedding_example.o
-	gcc $(FLAGS) -o binary/embedding_example$(EXE) $(LIBOBJECT) object/embedding_example.o -lm $(WINLIBS)
+	$(CC) $(FLAGS) -c examples/embedding_example.c -o object/embedding_example.o
+	$(CC) $(FLAGS) -o binary/embedding_example$(EXE) $(LIBOBJECT) object/embedding_example.o -lm $(WINLIBS)
 	./binary/embedding_example$(EXE)
 
 # Standalone source formatter -- its own tokenizer (source/tools/aer_fmt.c), not linked against the
 # real compiler at all (see that file's own comment for why).
 fmt-tool:
 	@mkdir -p binary object/tools
-	gcc $(FLAGS) -c source/tools/aer_fmt.c -o object/tools/aer_fmt.o
-	gcc $(FLAGS) -o binary/aer-fmt$(EXE) object/tools/aer_fmt.o
+	$(CC) $(FLAGS) -c source/tools/aer_fmt.c -o object/tools/aer_fmt.o
+	$(CC) $(FLAGS) -o binary/aer-fmt$(EXE) object/tools/aer_fmt.o
 
 # Language server -- links the real compiler directly (LIBOBJECT, same everything-except-main.c
 # set test-embed/example-embed already use), unlike aer-fmt: diagnostics are the real parser's own
 # errors, not a reimplementation.
 lsp-tool: $(LIBOBJECT)
 	@mkdir -p binary object/tools
-	gcc $(FLAGS) -c source/tools/aer_lsp.c -o object/tools/aer_lsp.o
-	gcc $(FLAGS) -o binary/aer-lsp$(EXE) $(LIBOBJECT) object/tools/aer_lsp.o -lm $(WINLIBS)
+	$(CC) $(FLAGS) -c source/tools/aer_lsp.c -o object/tools/aer_lsp.o
+	$(CC) $(FLAGS) -o binary/aer-lsp$(EXE) $(LIBOBJECT) object/tools/aer_lsp.o -lm $(WINLIBS)
 
 # tests/fmt_input.aer (deliberately messy) must format to exactly tests/fmt_expected.aer, and that
 # expected output must be a fixed point (formatting it again changes nothing) -- idempotency is
@@ -245,14 +249,14 @@ pgo:
 		mkdir -p $$(dirname $$o); \
 		gcc $(FLAGS) -fprofile-generate -c $$f -o $$o || exit 1; \
 	done
-	gcc $(FLAGS) -fprofile-generate -o binary/aer-pgo-gen$(EXE) $(patsubst source/%.c,$(PGO_OBJDIR)/%.o,$(SOURCE)) -lm $(WINLIBS)
+	$(CC) $(FLAGS) -fprofile-generate -o binary/aer-pgo-gen$(EXE) $(patsubst source/%.c,$(PGO_OBJDIR)/%.o,$(SOURCE)) -lm $(WINLIBS)
 	@echo "-- training on a representative benchmark mix (numeric loop / dict / struct-allocation heavy) --"
 	@for b in $(PGO_TRAIN); do ./binary/aer-pgo-gen$(EXE) $$b >/dev/null || exit 1; done
 	@for f in $(SOURCE); do \
 		o=$(PGO_OBJDIR)/$$(echo $$f | sed -e 's|^source/||' -e 's|\.c$$|.o|'); \
 		gcc $(FLAGS) -fprofile-use -fprofile-correction -c $$f -o $$o || exit 1; \
 	done
-	gcc $(FLAGS) -fprofile-use -fprofile-correction -o binary/aer-pgo$(EXE) $(patsubst source/%.c,$(PGO_OBJDIR)/%.o,$(SOURCE)) -lm $(WINLIBS)
+	$(CC) $(FLAGS) -fprofile-use -fprofile-correction -o binary/aer-pgo$(EXE) $(patsubst source/%.c,$(PGO_OBJDIR)/%.o,$(SOURCE)) -lm $(WINLIBS)
 	@echo "PGO build complete: binary/aer-pgo$(EXE) (training binary binary/aer-pgo-gen$(EXE) left in place too)"
 
 # AER_CHECKED adds compile-time invariant assertions too expensive for a shipping build -- see
@@ -263,7 +267,7 @@ CHECK_FLAGS := -DAER_CHECKED
 # ASAN build for tests/fuzz.py; may not link on a bare MinGW install (needs libasan).
 asan: $(SOURCE)
 	@mkdir -p binary
-	gcc $(FLAGS) $(CHECK_FLAGS) -fsanitize=address -fno-omit-frame-pointer -o binary/aer-asan$(EXE) $(SOURCE) -lm $(WINLIBS)
+	$(CC) $(FLAGS) $(CHECK_FLAGS) -fsanitize=address -fno-omit-frame-pointer -o binary/aer-asan$(EXE) $(SOURCE) -lm $(WINLIBS)
 
 # UBSan catches what ASAN structurally cannot: misaligned loads (raw struct fields are read out of
 # a byte buffer at computed offsets), and invalid shifts/conversions. Signed overflow is EXCLUDED
@@ -275,7 +279,7 @@ UBSAN_SKIP   := signed-integer-overflow,shift-base
 
 ubsan: $(SOURCE)
 	@mkdir -p binary
-	gcc $(FLAGS) $(CHECK_FLAGS) -fsanitize=$(UBSAN_CHECKS) -fno-sanitize=$(UBSAN_SKIP) \
+	$(CC) $(FLAGS) $(CHECK_FLAGS) -fsanitize=$(UBSAN_CHECKS) -fno-sanitize=$(UBSAN_SKIP) \
 	    -fno-omit-frame-pointer -o binary/aer-ubsan$(EXE) $(SOURCE) -lm $(WINLIBS)
 
 # Runs the whole .aer suite under UBSan; any diagnostic aborts, so a clean run means no finding.
