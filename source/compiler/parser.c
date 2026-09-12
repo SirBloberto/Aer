@@ -2,8 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include "aer_stdlib.h"
+#include "aer_thread.h"
 #include "error.h"
 #include "lexer.h"
+
+static aer_mutex specialize_lock = AER_MUTEX_INIT;
 
 /* VAR_RAW_* is earned by a name whose first assignment is provably int/real outside any branch,
    and is lost on a mismatch; VAR_BOXED never promotes back. */
@@ -5665,6 +5668,13 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     if (!target_f->source_span)
         return false; /* defensive -- shouldn't happen alongside a nonzero shape_sensitive_mask */
 
+    /* Scheduler workers reach this from lbl_call, and the parser is one set of file statics. */
+    aer_mutex_lock(&specialize_lock);
+    /* error_at would otherwise longjmp to the enclosing vm_run_slice, past every restore below and
+       out of a function whose contract is that a failed compile leaves nothing behind. */
+    AerJmpBuf* saved_unwind = runtime_error_unwind_target;
+    runtime_error_unwind_target = NULL;
+
     bool saved_had_error = parse_had_error;
     parse_had_error = false;
 
@@ -5696,6 +5706,8 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     lexer_restore_state(saved_lexer);
     parser_restore_state(saved_parser);
     parse_had_error = saved_had_error;
+    runtime_error_unwind_target = saved_unwind;
+    aer_mutex_unlock(&specialize_lock);
 
     if (!ok)
         return false;

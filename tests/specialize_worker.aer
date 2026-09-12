@@ -1,0 +1,14 @@
+# Numeric enough to earn a raw-parameter variant, and called far past
+# NUMERIC_SPECIALIZE_AFTER so the recompile lands mid-task rather than at startup.
+
+function accumulate(total, step):
+    scaled = total * 3 + step
+    return scaled // step
+
+function churn(n):
+    i = 0
+    total = 0
+    for i < n:
+        total += accumulate(i, 7)
+        i += 1
+    return total

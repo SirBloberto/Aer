@@ -13,7 +13,7 @@ unsigned int (*runtime_line_lookup)(void) = NULL;
 const char* (*runtime_filename_lookup)(void) = NULL;
 const char* (*runtime_function_lookup)(void) = NULL;
 unsigned int (*runtime_stack_trace_lookup)(char* out, unsigned int out_size) = NULL;
-AerJmpBuf* runtime_error_unwind_target = NULL;
+AER_TLS AerJmpBuf* runtime_error_unwind_target = NULL;
 
 #define ERROR_MSG_MAX 2048
 

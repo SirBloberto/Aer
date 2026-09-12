@@ -8,6 +8,7 @@
 #include <pthread.h>
 
 typedef pthread_mutex_t aer_mutex;
+#define AER_MUTEX_INIT PTHREAD_MUTEX_INITIALIZER
 #define aer_mutex_init(m) pthread_mutex_init((m), NULL)
 #define aer_mutex_destroy(m) pthread_mutex_destroy(m)
 #define aer_mutex_lock(m) pthread_mutex_lock(m)
@@ -20,6 +21,7 @@ typedef pthread_t aer_thread;
 #else
 
 typedef char aer_mutex;
+#define AER_MUTEX_INIT 0
 #define aer_mutex_init(m) ((void)(m))
 #define aer_mutex_destroy(m) ((void)(m))
 #define aer_mutex_lock(m) ((void)(m))

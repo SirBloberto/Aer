@@ -1253,21 +1253,23 @@ An embedding host can add its own modules the same way — see [Embedding](#embe
 
 ## Concurrency
 
-**No OS-thread parallelism yet.** AER has no threads, `async`/`await`, or event loop — the VM is a
-single, synchronous dispatch loop. **Multiple independent `VM`+`Chunk` pairs can coexist in one
-process** (file-based `import` already relies on this — each imported file gets its own), and as of
-this heap-independence work, each `VM` genuinely owns its own GC-managed heap (`VmHeap`,
-`source/core/vm.h`/`vm.c`) — allocating, collecting, and freeing entirely on its own, with no shared
-pools between VMs. That was the harder half of what real thread-safety would need, and it's done.
-What's still missing is everything *around* it: the scheduler (`vm_run_slice`) is still cooperative
-and single-threaded, and process-global state elsewhere (the error-unwind target, the currently-
-active-VM-for-errors pointer, the lexer/parser's own file-static state) still assumes only one VM
-ever dispatches at a time. Two VMs running on separate OS threads today would no longer race on the
-*allocator*, but would still race on that remaining shared state — a real, but now much smaller,
-remaining gap than a from-scratch rewrite.
+**`scheduler.run()` uses real OS threads.** There is still no `async`/`await` or event loop, and any
+one AER call stack is a single synchronous dispatch loop — but **multiple independent `VM`+`Chunk`
+pairs can coexist in one process** (file-based `import` already relies on this — each imported file
+gets its own), each owning its own GC-managed heap (`VmHeap`, `source/core/vm.h`/`vm.c`), allocating
+and collecting entirely on its own with no shared pools. That heap independence is what makes
+running two of them at once possible at all, and `scheduler.run()` does exactly that: with more than
+one queued task on a multi-core machine it hands each task to a worker thread.
 
-**Cooperative, single-threaded concurrency exists at the language level** via the `actor` and
-`scheduler` modules:
+Threads are on by default; `make THREADS=0` builds without them (and without any pthread dependency
+— see `source/utilities/aer_thread.h`). The remaining process-wide state a worker can reach is
+handled rather than assumed away: the error-unwind target and the active-VM-for-errors pointer are
+thread-local, and the parser's file statics — which a worker re-enters whenever a hot function
+specializes — are serialized behind a lock, since that recompile is a cold path. What is *not*
+thread-safe is compiling from two threads any other way; `actor.spawn()` is expected on one thread,
+before `scheduler.run()`.
+
+**Concurrency at the language level** comes from the `actor` and `scheduler` modules:
 
 ```
 import actor
@@ -1289,13 +1291,18 @@ never moves a live value. `actor.call` runs a named function on an actor synchro
 completion, right away — no scheduler involved, useful for a one-off request/response.
 
 `scheduler.add(handle, fn, args...)` queues a function call on an already-spawned actor;
-`scheduler.run()` then round-robins every queued task in small instruction-count slices
-(`source/core/vm.c`'s `vm_run_slice`) until each either finishes or errors, so a long-running task
-can't starve a short one — interleaving comes from visiting every unfinished task once per round,
-not from any actor knowing about the others. A task that errors is isolated (removed from the run
-queue) exactly like a normal `actor.call` failure; a task that never finishes (a genuine infinite
-loop) means `scheduler.run()` never returns, the same as any other infinite loop in AER already
-behaves.
+`scheduler.run()` then drives every queued task to completion and returns their results in the order
+they were added. How it drives them depends on the build and the work:
+
+| Condition | Behaviour |
+|-----------|-----------|
+| More than one task, more than one core, threads built in | Each task runs on a worker thread, to completion, genuinely in parallel |
+| One task, one core, or `make THREADS=0` | Round-robin in 1 000-instruction slices (`vm_run_slice`), so a long task can't starve a short one |
+
+Only the sliced path makes the no-starvation guarantee; a worker thread runs its task unbudgeted.
+A task that errors is isolated (removed from the run queue) exactly like a normal `actor.call`
+failure; a task that never finishes (a genuine infinite loop) means `scheduler.run()` never returns,
+the same as any other infinite loop in AER already behaves.
 
 **What this is not:** the scheduler does not preempt a native call. An actor blocked inside
 `net.recv()`/`net.accept()`, a slow `io.read()`, or a pathological regex still runs that call to completion before
@@ -1541,7 +1548,8 @@ it, a match attempt just reports failure early rather than exhaustively searchin
 ### Actors and Scheduling — `actor` / `scheduler`
 
 See [Concurrency](#concurrency) for the full explanation of what these do and don't provide
-(cooperative, single-threaded interleaving — not parallelism, not preemption of a blocking call).
+(worker threads or cooperative slices depending on the build — but never preemption of a blocking
+call).
 
 ```
 import actor
@@ -1739,7 +1747,8 @@ what a real permission system would still need on top of this.
 | `collection.append()`/`delete()`/`sort()`/`shuffle()` mutate in place and also return the container | `arr = collection.append(arr, v)` works but is redundant — the mutation already happened | Call them as statements |
 | Repeated `s += x` in a loop is quadratic | Strings are immutable — every `+=` allocates a fresh buffer and copies the whole thing so far, not just the addition | Build a list with `collection.append()` and join once: `parts = []; for ...: collection.append(parts, x); s = string.join(parts, "")` |
 | No struct-to-struct conversion | There's no built-in way to reshape a hashtable or another struct into a Point | Build the struct explicitly: `Point(some_table["x"], ...)` |
-| Struct instances are still `AerArray` under the hood | `length(p)` works and returns the field count (not blocked) | Harmless but not the intended API — use dot access |
+| Integer arithmetic wraps silently | `9223372036854775807 + 1` → `-9223372036854775808`, with no error | Range-check before the operation, or use floats where the magnitude is unbounded |
+| Strings are bytes, not characters | `length("héllo")` is 6, and `s[1]` yields one byte of a two-byte character | Index only ASCII text; for anything else work on whole strings (`string.split`, `string.replace`) |
 | Pipe rejects nested calls in target args | `x \|> f(g(1))` is a parse error, at any depth | Assign the inner call to a variable first: `t = g(1); x \|> f(t)` |
 
 ### Hard limits
@@ -1779,8 +1788,9 @@ what a real permission system would still need on top of this.
 - No general type annotations on function parameters — struct fields are the only mandatory-typed
   position (see [Structs](#structs)).
 - No struct methods namespaced by type — see [Structs](#structs).
-- No true parallelism — the `actor`/`scheduler` modules give cooperative, single-threaded
-  interleaving only, and can't preempt a blocking native call — see [Concurrency](#concurrency).
+- No preemption — `scheduler.run()` does run tasks on OS threads (see
+  [Concurrency](#concurrency)), but nothing can interrupt a blocking native call, and there is no
+  `async`/`await` or event loop.
 
 ---
 

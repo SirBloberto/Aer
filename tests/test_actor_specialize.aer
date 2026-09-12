@@ -1,0 +1,34 @@
+#!/usr/bin/env aer
+import actor
+import scheduler
+import collection
+# scheduler.run() puts tasks on real OS threads in a threaded build, and a numeric function
+# specializes by re-entering the parser from lbl_call. The parser is one set of file statics and
+# the error-unwind target points into one thread's stack, so every worker here is racing for both.
+# What this pins is that eight actors all specializing at once still each compute the right answer.
+
+WORKERS = 8
+ROUNDS = 400
+
+handles = []
+for i in 0..WORKERS:
+    h, err = actor.spawn("tests/specialize_worker.aer")
+    assert(err == null, "actor {i} spawns")
+    collection.append(handles, h)
+
+for i in 0..WORKERS:
+    scheduler.add(handles[i], "churn", ROUNDS)
+
+results = scheduler.run()
+assert(length(results) == WORKERS, "every task reported back")
+
+# The same arithmetic the workers do, computed here in the generic (unspecialized) path. A variant
+# compiled from corrupted parser state is far likelier to produce a wrong number than to crash.
+expected = 0
+for i in 0..ROUNDS:
+    expected += (i * 3 + 7) // 7
+
+for i in 0..WORKERS:
+    assert(results[i] == expected, "worker {i} agrees with the unspecialized answer")
+
+print("test_actor_specialize.aer: all assertions passed.")

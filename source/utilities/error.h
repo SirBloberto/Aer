@@ -32,8 +32,9 @@ extern AER_TLS bool parse_had_error;
 extern AER_TLS bool runtime_had_error;
 
 /* error() unwinds to this when set; NULL (outside any vm_run) means "set flags, return normally"
-   so parse-time recovery runs unchanged. Nested vm_run calls save/restore it. */
-extern AerJmpBuf* runtime_error_unwind_target;
+   so parse-time recovery runs unchanged. Nested vm_run calls save/restore it. Per-thread: it points
+   into one thread's stack, so a scheduler worker must never see another's. */
+extern AER_TLS AerJmpBuf* runtime_error_unwind_target;
 
 /* Deliberately not runtime_had_error: a failed assertion reports and keeps going. */
 extern AER_TLS unsigned int assert_failure_count;

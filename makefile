@@ -136,7 +136,8 @@ TESTS := tests/test_core.aer \
          tests/test_net.aer \
          tests/test_regex.aer \
          tests/test_actor.aer \
-         tests/test_scheduler.aer
+         tests/test_scheduler.aer \
+         tests/test_actor_specialize.aer
 
 test: all
 	@for t in $(TESTS); do \

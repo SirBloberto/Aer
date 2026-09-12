@@ -5,12 +5,11 @@
 #include "aer_stdlib.h"
 #include "error.h"
 
-/* Cooperative round-robin scheduler over already-spawned actors (aer_actor.h). Single OS thread,
-   never true parallelism -- matches the process-global GC pools' existing constraint (see
-   aer_actor.h's own comment). Each task is one function call on one actor, driven in bounded
-   instruction slices via vm_run_slice (vm.h) instead of to completion, so a long-running task
-   can't starve the others; interleaving comes from visiting every unfinished task once per round,
-   not from anything opcode-level knowing about "other actors." */
+/* Scheduler over already-spawned actors (aer_actor.h). Each task is one function call on one actor.
+   Two shapes, chosen in aer_scheduler_run_collect: worker threads running each task to completion,
+   or -- with one task, one core, or a THREADS=0 build -- one thread visiting every unfinished task
+   per round in bounded vm_run_slice slices. Only the sliced shape keeps a long task from starving
+   the others; a worker thread runs unbudgeted. */
 
 /* Every yield-checkpoint in vm_run_slice (vm.c's lbl_jump/lbl_call/lbl_iter_range_loop) only ever
    fires at a genuine instruction boundary, so resuming a task is always just "call vm_run_slice
