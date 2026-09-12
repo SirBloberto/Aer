@@ -4,389 +4,413 @@
 #include "vm.h"
 #include "error.h"
 
-/* Kinds of operand word this disassembler knows how to decode/print. */
+/* Where an operand sits: a slice of word0, or a whole trailing word or one of its halves. An
+   instruction's word count is derived from the highest trailing word its operands name. */
 typedef enum {
-    FLD_END, /* marks the end of an opcode's operand list */
-    FLD_POOL, /* pool index -- resolve and print the constant's own value */
-    FLD_NAME, /* pool index known to be a TYPE_STRING name -- print just the string, no quotes */
-    FLD_JUMP, /* signed delta to the branch target, from the word after this operand */
-    FLD_COUNT, /* a raw integer (arg count, item count, arity...) */
-    FLD_BINOP, /* an Opcode value used as an operand (bin_op in a fused op) */
-    FLD_CAST, /* CAST_INTEGER/CAST_FLOAT/CAST_BOOLEAN */
-    FLD_REG, /* a plain register index (packed or wide -- a register number either way) */
-    FLD_RK, /* an RK-encoded operand: RK_CONST_FLAG set = a pool constant, else a register */
-} Field;
+    AT_A,
+    AT_B,
+    AT_C,
+    AT_W16, /* word0's upper halfword */
+    AT_W1,
+    AT_W1_HI,
+    AT_W1_LO,
+    AT_W2,
+    AT_W2_HI,
+    AT_W2_LO,
+    AT_W3_HI,
+    AT_W3_LO,
+} At;
 
-#define MAX_FIELDS 6
+/* How an operand's value is rendered. */
+typedef enum {
+    F_END, /* ends an operand list */
+    F_REG,
+    F_RK8,
+    F_RK16,
+    F_RAWI, /* raw int slot */
+    F_RAWR, /* raw real slot */
+    F_RAWK_I, /* raw int slot, or an index into rawk_i[] when the const flag is set */
+    F_RAWK_D,
+    F_RAWK_I_AT, /* always an index into rawk_i[] */
+    F_POOL,
+    F_POOL_RAWI,
+    F_POOL_RAWD,
+    F_NAME,
+    F_JUMP,
+    F_COUNT,
+    F_BINOP,
+    F_CAST,
+    F_OFF, /* a field's byte offset into a struct payload */
+    F_IMM32,
+    F_FN_ID,
+    F_MODULE_ID,
+    F_MODULE_FN,
+    F_BUILTIN_ID,
+} Fld;
+
+typedef struct {
+    unsigned char at;
+    unsigned char fld;
+} Operand;
+
+#define MAX_OPERANDS 7
 
 typedef struct {
     const char* name;
     const char* desc;
-    Field fields[MAX_FIELDS];
-    bool variable; /* true only for OP_DEFINE_STRUCT -- see disassemble_one */
-    /* Total WORD count beyond word0 (i.e. total instruction word count - 1) -- used only by
-       aer_disassemble's per-opcode hit-total pass to skip to the next instruction. Every opcode
-       below is either fully special-cased in disassemble_one (this is its only use) or falls
-       through to the generic display path (which also uses `packed`, see disassemble_one). */
-    int trailing_words;
-    /* How many of fields[] come packed in word0 -- only meaningful for the handful of opcodes
-       that still use the generic display path at the bottom of disassemble_one. */
-    int packed;
+    Operand ops[MAX_OPERANDS];
+    /* Word count comes from the instruction itself rather than from ops[]: OP_DEFINE_STRUCT,
+       OP_INTERP and OP_INDEX_GET_INTERP each carry their operand count in word0. */
+    bool variable;
 } OpInfo;
 
 /* OP_INDEX_GET_INTERP is the last member of the Opcode enum (vm.h). */
 #define OP_INFO_MAX OP_INDEX_GET_INTERP
 
+#define ROW(op, d, ...) [op] = {#op, d, {__VA_ARGS__}}
+
+/* One shape per opcode family, so the kind, width and checked axes read as the matrix they are. */
+#define ROW_BINOP(op, d) ROW(op, d, {AT_A, F_REG}, {AT_B, F_RK8}, {AT_C, F_RK8})
+#define ROW_CMP_JUMP(op, d) ROW(op, d, {AT_B, F_RK8}, {AT_C, F_RK8}, {AT_W1, F_JUMP})
+#define ROW_RAW_CMP_JUMP(op, d, K, KK) ROW(op, d, {AT_B, K}, {AT_C, KK}, {AT_W1, F_JUMP})
+#define ROW_RAW_ARITH(op, d, K, KK) ROW(op, d, {AT_A, K}, {AT_B, K}, {AT_C, KK})
+#define ROW_RAW_CMP(op, d, K, KK) ROW(op, d, {AT_A, F_REG}, {AT_B, K}, {AT_C, KK})
+#define ROW_CALL(op, d)                                                                              \
+    ROW(op, d, {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1, F_JUMP}, {AT_W2, F_COUNT})
+#define ROW_CALL_VALUE(op, d)                                                                        \
+    ROW(op, d, {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1, F_REG})
+#define ROW_ITER(op, d)                                                                              \
+    ROW(op, d, {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_REG}, {AT_W1, F_REG}, {AT_W2, F_JUMP})
+#define ROW_FIELD_GET_RAW(op, d, K) ROW(op, d, {AT_A, K}, {AT_B, F_REG}, {AT_W1, F_OFF})
+#define ROW_FIELD_SET_RAW(op, d, K) ROW(op, d, {AT_A, F_REG}, {AT_W1, F_OFF}, {AT_W2, K})
+#define ROW_FIELD_COMPOUND_RAW(op, d, K)                                                             \
+    ROW(op, d, {AT_A, F_REG}, {AT_B, F_BINOP}, {AT_W1, F_OFF}, {AT_W2, K})
+#define ROW_IDX_FIELD_GET_RAW(op, d, K)                                                              \
+    ROW(op, d, {AT_A, K}, {AT_B, F_REG}, {AT_W1_HI, F_OFF}, {AT_W1_LO, F_RK16})
+#define ROW_IDX_FIELD_SET_RAW(op, d, K)                                                              \
+    ROW(op, d, {AT_A, F_REG}, {AT_W16, F_RK16}, {AT_W1_HI, F_OFF}, {AT_W1_LO, K})
+#define ROW_IDX_FIELD_COMPOUND_RAW(op, d, K)                                                         \
+    ROW(op, d, {AT_A, F_REG}, {AT_B, F_BINOP}, {AT_W1_HI, F_OFF}, {AT_W1_LO, F_RK16}, {AT_W2, K})
+
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
-    /* OP_ADD..OP_IN: one opcode per operator, whole instruction in one word (PACK3 + RK8 pair) --
-       special-cased in disassemble_one via binary_op_dispatched(). */
-    [OP_ADD] = {"OP_ADD", "reg = rk + rk"},
-    [OP_SUB] = {"OP_SUB", "reg = rk - rk"},
-    [OP_MUL] = {"OP_MUL", "reg = rk * rk"},
-    [OP_DIV] = {"OP_DIV", "reg = rk / rk"},
-    [OP_MOD] = {"OP_MOD", "reg = rk % rk"},
-    [OP_FLOOR_DIV] = {"OP_FLOOR_DIV", "reg = rk // rk"},
-    [OP_EQ] = {"OP_EQ", "reg = rk == rk"},
-    [OP_NEQ] = {"OP_NEQ", "reg = rk != rk"},
-    [OP_LT] = {"OP_LT", "reg = rk < rk"},
-    [OP_GT] = {"OP_GT", "reg = rk > rk"},
-    [OP_LTE] = {"OP_LTE", "reg = rk <= rk"},
-    [OP_GTE] = {"OP_GTE", "reg = rk >= rk"},
-    [OP_IN] = {"OP_IN", "reg = rk in rk"},
-    [OP_BITWISE_AND] = {"OP_BITWISE_AND", "reg = rk & rk"},
-    [OP_BITWISE_OR] = {"OP_BITWISE_OR", "reg = rk | rk"},
-    [OP_BITWISE_XOR] = {"OP_BITWISE_XOR", "reg = rk ^ rk"},
-    [OP_LSHIFT] = {"OP_LSHIFT", "reg = rk << rk"},
-    [OP_RSHIFT] = {"OP_RSHIFT", "reg = rk >> rk"},
+    ROW_BINOP(OP_ADD, "reg = rk + rk"),
+    ROW_BINOP(OP_SUB, "reg = rk - rk"),
+    ROW_BINOP(OP_MUL, "reg = rk * rk"),
+    ROW_BINOP(OP_DIV, "reg = rk / rk"),
+    ROW_BINOP(OP_MOD, "reg = rk % rk"),
+    ROW_BINOP(OP_FLOOR_DIV, "reg = rk // rk"),
+    ROW_BINOP(OP_EQ, "reg = rk == rk"),
+    ROW_BINOP(OP_NEQ, "reg = rk != rk"),
+    ROW_BINOP(OP_LT, "reg = rk < rk"),
+    ROW_BINOP(OP_GT, "reg = rk > rk"),
+    ROW_BINOP(OP_LTE, "reg = rk <= rk"),
+    ROW_BINOP(OP_GTE, "reg = rk >= rk"),
+    ROW_BINOP(OP_IN, "reg = rk in rk"),
+    ROW_BINOP(OP_BITWISE_AND, "reg = rk & rk"),
+    ROW_BINOP(OP_BITWISE_OR, "reg = rk | rk"),
+    ROW_BINOP(OP_BITWISE_XOR, "reg = rk ^ rk"),
+    ROW_BINOP(OP_LSHIFT, "reg = rk << rk"),
+    ROW_BINOP(OP_RSHIFT, "reg = rk >> rk"),
 
-    /* Never dispatched standalone (parser tags / OP_UNARY-embedded), but FLD_BINOP rendering
+    /* Never dispatched standalone (parser tags, or embedded in OP_UNARY), but F_BINOP rendering
        still reads their names from this table. */
-    [OP_AND] = {"OP_AND"},
-    [OP_OR] = {"OP_OR"},
-    [OP_PIPE] = {"OP_PIPE"},
-    [OP_NEGATE] = {"OP_NEGATE"},
-    [OP_NOT] = {"OP_NOT"},
-    [OP_BITWISE_NOT] = {"OP_BITWISE_NOT"},
-    [OP_TO_STR] = {"OP_TO_STR"},
+    ROW(OP_AND, ""),
+    ROW(OP_OR, ""),
+    ROW(OP_PIPE, ""),
+    ROW(OP_NEGATE, ""),
+    ROW(OP_NOT, ""),
+    ROW(OP_BITWISE_NOT, ""),
+    ROW(OP_TO_STR, ""),
 
-    /* word0: op only. word1: target (dedicated, blind-overwrite patchable). */
-    [OP_JUMP] = {"OP_JUMP", "unconditional jump", {FLD_JUMP}, false, 1, 0},
+    ROW(OP_JUMP, "unconditional jump", {AT_W1, F_JUMP}),
     [OP_DEFINE_STRUCT] = {"OP_DEFINE_STRUCT",
                           "register a struct type (variable-length: header word, then that many field words)",
-                          {0},
+                          {{0, F_END}},
                           true},
-    [OP_HALT] = {"OP_HALT", "stop execution"},
+    ROW(OP_HALT, "stop execution"),
+    ROW(OP_LOADK, "reg = pool constant", {AT_A, F_REG}, {AT_W16, F_POOL}),
+    ROW(OP_MOVE, "reg = reg", {AT_A, F_REG}, {AT_B, F_REG}),
+    ROW(OP_IS_RESULT, "reg = is-result(reg)", {AT_A, F_REG}, {AT_B, F_REG}),
+    ROW(OP_JUMP_IF_FALSE_REG, "jump if !reg, no pop", {AT_A, F_REG}, {AT_W1, F_JUMP}),
+    ROW_CALL(OP_CALL, "call by compile-time-resolved offset"),
+    ROW_CALL_VALUE(OP_CALL_VALUE, "call a runtime function value held in a register"),
+    ROW_CALL(OP_TAIL_CALL, "tail call by compile-time-resolved offset, reuses this frame"),
+    ROW_CALL_VALUE(OP_TAIL_CALL_VALUE, "tail call through a register value, reuses this frame"),
+    ROW(OP_RETURN, "return reg to caller", {AT_A, F_REG}),
+    ROW(OP_CALL_MODULE, "call a native or file-module function by (module, function) name",
+        {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1, F_NAME}, {AT_W2, F_NAME},
+        {AT_W3_HI, F_MODULE_ID}, {AT_W3_LO, F_MODULE_FN}),
+    ROW(OP_CALL_BUILTIN, "global builtin (length/print/etc.) by name", {AT_A, F_REG}, {AT_B, F_REG},
+        {AT_C, F_COUNT}, {AT_W1, F_NAME}, {AT_W2, F_BUILTIN_ID}),
+    ROW(OP_ARRAY_NEW, "reg = new array from a contiguous reg range", {AT_A, F_REG}, {AT_B, F_REG},
+        {AT_C, F_COUNT}),
+    ROW(OP_INDEX_GET, "reg = reg[rk]", {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_RK8}),
+    ROW(OP_INDEX_SET, "reg[rk] = rk", {AT_A, F_REG}, {AT_B, F_RK8}, {AT_C, F_RK8}),
+    ROW(OP_TYPED_INDEX_GET_UNCHECKED, "loop-proven-safe: reg = typed_arr[rk]", {AT_A, F_REG},
+        {AT_B, F_REG}, {AT_C, F_RK8}),
+    ROW(OP_TYPED_INDEX_SET_UNCHECKED, "loop-proven-safe: typed_arr[rk] = rk", {AT_A, F_REG},
+        {AT_B, F_RK8}, {AT_C, F_RK8}),
+    ROW(OP_DESTRUCTURE, "reg, reg = destructure(reg)", {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_REG}),
+    ROW(OP_SLICE_GET, "reg = reg[rk:rk]", {AT_A, F_REG}, {AT_B, F_REG}, {AT_W1_HI, F_RK16},
+        {AT_W1_LO, F_RK16}),
+    ROW(OP_DICT_NEW, "reg = new dict from contiguous key/value reg pairs", {AT_A, F_REG},
+        {AT_B, F_REG}, {AT_C, F_COUNT}),
+    ROW(OP_ITER_NEXT_ARRAY, "for-each step, array or dict-keys", {AT_A, F_REG}, {AT_B, F_REG},
+        {AT_C, F_REG}, {AT_W1, F_JUMP}),
+    ROW_ITER(OP_ITER_NEXT_PAIR, "for-each step, dict key+value pairs"),
+    ROW_ITER(OP_ITER_RANGE_PREP, "rotated range-for: once-before-loop check"),
+    ROW_ITER(OP_ITER_RANGE_LOOP,
+             "rotated range-for: bottom-of-loop advance+check+branch-back (bounds snapshotted "
+             "once, never re-validated)"),
+    ROW(OP_STRUCT_NEW, "reg = new struct instance from a contiguous reg range", {AT_A, F_REG},
+        {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1, F_NAME}),
+    ROW(OP_FIELD_GET, "reg = struct.field", {AT_A, F_REG}, {AT_B, F_REG}, {AT_W1, F_NAME}),
+    ROW(OP_FIELD_SET, "struct.field = rk", {AT_A, F_REG}, {AT_W16, F_RK16}, {AT_W1, F_NAME}),
+    ROW(OP_ARRAY_REPEAT,
+        "reg = [fill_reg; rk_count] (struct -> packed array, number -> typed array)", {AT_A, F_REG},
+        {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1_LO, F_RK16}),
+    ROW(OP_INDEX_FIELD_GET, "fused: reg = reg[rk].field (packed or struct array)", {AT_A, F_REG},
+        {AT_B, F_REG}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}),
+    ROW(OP_INDEX_FIELD_SET, "fused: reg[rk].field = rk (packed or struct array)", {AT_A, F_REG},
+        {AT_W16, F_RK16}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}),
+    ROW(OP_INDEX_FIELD_COMPOUND,
+        "fused: reg[rk].field OP= rk (resolved once, packed or struct array)", {AT_A, F_REG},
+        {AT_B, F_BINOP}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}, {AT_W2_LO, F_RK16}),
+    ROW(OP_UNARY, "reg = unary_op(rk)", {AT_A, F_REG}, {AT_B, F_BINOP}, {AT_C, F_RK8}),
+    ROW(OP_CAST, "reg = cast(rk)", {AT_A, F_REG}, {AT_B, F_CAST}, {AT_C, F_RK8}),
+    /* Covers both struct.field OP rk AND rk OP struct.field -- the parser canonicalizes the latter
+       into this same opcode wherever that is exact (see vm.h). */
+    ROW(OP_FIELD_BINARY, "fused: reg = struct.field OP rk (field on the left)", {AT_A, F_REG},
+        {AT_B, F_REG}, {AT_C, F_BINOP}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}),
+    ROW(OP_FIELD_COMPOUND, "fused: struct.field OP= rk (resolved once, no dest reg)", {AT_A, F_REG},
+        {AT_B, F_BINOP}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}),
+    ROW(OP_TYPED_ARRAY_CHAIN2,
+        "fused: reg = (reg op1 reg) op2 reg (typed-array chain, runtime-checked)", {AT_A, F_REG},
+        {AT_B, F_REG}, {AT_C, F_REG}, {AT_W1_HI, F_BINOP}, {AT_W1_LO, F_REG}, {AT_W2, F_BINOP}),
+    ROW(OP_PRINT_REPL, "shell mode: print reg unless null", {AT_A, F_REG}),
 
-    /* dest+pool_idx both fit word0 now (op(8)+dest(8)+pool_idx(16)) -- no trailing word. */
-    [OP_LOADK] = {"OP_LOADK", "reg = pool constant", {FLD_REG, FLD_POOL}, false, 0, 2},
-    [OP_MOVE] = {"OP_MOVE", "reg = reg", {FLD_REG, FLD_REG}, false, 0, 2},
-    [OP_IS_RESULT] = {"OP_IS_RESULT", "reg = is-result(reg)", {FLD_REG, FLD_REG}, false, 0, 2},
-    /* word0: op+reg. word1: target (dedicated). */
-    [OP_JUMP_IF_FALSE_REG] =
-        {"OP_JUMP_IF_FALSE_REG", "jump if !reg, no pop", {FLD_REG, FLD_JUMP}, false, 1, 1},
-    /* word0: dest+arg_base+arg_count. word1: callee_offset. */
-    [OP_CALL] = {"OP_CALL",
-                 "call by compile-time-resolved offset",
-                 {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP, FLD_COUNT},
-                 false,
-                 2,
-                 3},
-    /* word0: dest+arg_base+arg_count. word1: callee_reg (never patched). */
-    [OP_CALL_VALUE] = {"OP_CALL_VALUE", "call a runtime function value held in a register",
-                       .trailing_words = 1},
-    [OP_TAIL_CALL] = {"OP_TAIL_CALL",
-                      "tail call by compile-time-resolved offset, reuses this frame",
-                      {FLD_REG, FLD_REG, FLD_COUNT, FLD_JUMP, FLD_COUNT},
-                      false,
-                      2,
-                      3},
-    [OP_TAIL_CALL_VALUE] = {"OP_TAIL_CALL_VALUE", "tail call through a register value, reuses this frame",
-                            .trailing_words = 1},
-    [OP_RETURN] = {"OP_RETURN", "return reg to caller", {FLD_REG}, false, 0, 1},
-    /* word0: dest+arg_base+arg_count. word1: module_idx. word2: fn_idx. word3: module_id+fn_id. */
-    [OP_CALL_MODULE] = {"OP_CALL_MODULE", "call a native or file-module function by (module, function) name",
-                        .trailing_words = 3},
-    /* word0: dest+arg_base+arg_count. word1: name_idx. word2: builtin_id. */
-    [OP_CALL_BUILTIN] = {"OP_CALL_BUILTIN", "global builtin (length/print/etc.) by name",
-                         .trailing_words = 2},
-    [OP_ARRAY_NEW] = {"OP_ARRAY_NEW",
-                      "reg = new array from a contiguous reg range",
-                      {FLD_REG, FLD_REG, FLD_COUNT},
-                      false,
-                      0,
-                      3},
-    /* Single-word RK8-packed family -- special-cased in disassemble_one, like OP_ADD..OP_RSHIFT. */
-    [OP_INDEX_GET] = {"OP_INDEX_GET", "reg = reg[rk]"},
-    [OP_INDEX_SET] = {"OP_INDEX_SET", "reg[rk] = rk"},
-    [OP_TYPED_INDEX_GET_UNCHECKED] = {"OP_TYPED_INDEX_GET_UNCHECKED",
-                                      "loop-proven-safe: reg = typed_arr[rk]"},
-    [OP_TYPED_INDEX_SET_UNCHECKED] = {"OP_TYPED_INDEX_SET_UNCHECKED", "loop-proven-safe: typed_arr[rk] = rk"},
-    [OP_DESTRUCTURE] = {"OP_DESTRUCTURE", "reg, reg = destructure(reg)"},
-    /* word0: dest+arr_reg. word1: rk_start16+rk_end16. */
-    [OP_SLICE_GET] = {"OP_SLICE_GET", "reg = reg[rk:rk]", .trailing_words = 1},
-    [OP_DICT_NEW] = {"OP_DICT_NEW",
-                     "reg = new dict from contiguous key/value reg pairs",
-                     {FLD_REG, FLD_REG, FLD_COUNT},
-                     false,
-                     0,
-                     3},
-    /* word0: col+idx+item_dest. word1: end_target (dedicated). */
-    [OP_ITER_NEXT_ARRAY] = {"OP_ITER_NEXT_ARRAY",
-                            "for-each step, array or dict-keys",
-                            {FLD_REG, FLD_REG, FLD_REG, FLD_JUMP},
-                            false,
-                            1,
-                            3},
-    /* word0: col+idx+key_dest. word1: val_dest. word2: end_target. */
-    [OP_ITER_NEXT_PAIR] = {"OP_ITER_NEXT_PAIR", "for-each step, dict key+value pairs", .trailing_words = 2},
-    [OP_ITER_RANGE_PREP] = {"OP_ITER_RANGE_PREP", "rotated range-for: once-before-loop check",
-                            .trailing_words = 2},
-    [OP_ITER_RANGE_LOOP] = {"OP_ITER_RANGE_LOOP",
-                            "rotated range-for: bottom-of-loop advance+check+branch-back (bounds snapshotted "
-                            "once, never re-validated)",
-                            {0},
-                            false,
-                            2,
-                            0},
-    /* word0: dest+arg_base+arg_count. word1: type_name_idx. */
-    [OP_STRUCT_NEW] = {"OP_STRUCT_NEW", "reg = new struct instance from a contiguous reg range",
-                       .trailing_words = 1},
-    /* word0: dest+struct_reg. word1: field_name_idx. */
-    [OP_FIELD_GET] = {"OP_FIELD_GET", "reg = struct.field", .trailing_words = 1},
-    /* word0: struct_reg+rk_val16. word1: field_name_idx. */
-    [OP_FIELD_SET] = {"OP_FIELD_SET", "struct.field = rk", .trailing_words = 1},
-    /* word0: dest+fill_reg+narrow_flag. word1: rk_count16. */
-    [OP_ARRAY_REPEAT] = {"OP_ARRAY_REPEAT",
-                         "reg = [fill_reg; rk_count] (struct -> packed array, number -> typed array)",
-                         .trailing_words = 1},
-    /* word0: dest+obj_reg. word1: field_idx16+rk_idx16. */
-    [OP_INDEX_FIELD_GET] = {"OP_INDEX_FIELD_GET", "fused: reg = reg[rk].field (packed or struct array)",
-                            .trailing_words = 1},
-    /* word0: obj_reg+rk_idx16. word1: field_idx16+rk_val16. */
-    [OP_INDEX_FIELD_SET] = {"OP_INDEX_FIELD_SET", "fused: reg[rk].field = rk (packed or struct array)",
-                            .trailing_words = 1},
-    /* word0: obj_reg+bin_op. word1: field_idx16+rk_idx16. word2: rk_rhs16. */
-    [OP_INDEX_FIELD_COMPOUND] = {"OP_INDEX_FIELD_COMPOUND",
-                                 "fused: reg[rk].field OP= rk (resolved once, packed or struct array)",
-                                 .trailing_words = 2},
-    /* Single-word RK8-packed -- special-cased. */
-    [OP_UNARY] = {"OP_UNARY", "reg = unary_op(rk)"},
-    [OP_CAST] = {"OP_CAST", "reg = cast(rk)"},
-    /* word0: dest+struct_reg+bin_op. word1: field_idx16+rk16. Covers both `struct.field OP rk`
-       AND `rk OP struct.field` -- the parser canonicalizes the latter into this same opcode
-       wherever that's exact (see OP_FIELD_BINARY's own comment, vm.h). */
-    [OP_FIELD_BINARY] = {"OP_FIELD_BINARY", "fused: reg = struct.field OP rk (field on the left)",
-                         .trailing_words = 1},
-    /* word0: struct_reg+bin_op. word1: field_idx16+rk16. */
-    [OP_FIELD_COMPOUND] = {"OP_FIELD_COMPOUND", "fused: struct.field OP= rk (resolved once, no dest reg)",
-                           .trailing_words = 1},
-    /* word0: dest+a_reg+b_reg. word1: op1(hi16)+c_reg(lo16). word2: op2. */
-    [OP_TYPED_ARRAY_CHAIN2] = {"OP_TYPED_ARRAY_CHAIN2",
-                               "fused: reg = (reg op1 reg) op2 reg (typed-array chain, runtime-checked)",
-                               .trailing_words = 2},
-    [OP_PRINT_REPL] = {"OP_PRINT_REPL", "shell mode: print reg unless null", {FLD_REG}, false, 0, 1},
+    ROW(OP_RAW_LOAD_INT, "rawi = imm (full int32)", {AT_A, F_RAWI}, {AT_W1, F_IMM32}),
+    ROW(OP_RAW_LOAD_REAL, "rawr = pool constant", {AT_A, F_RAWR}, {AT_W1, F_POOL_RAWD}),
+    ROW_RAW_ARITH(OP_RAW_ADD_INT, "rawi = rawi + rawi", F_RAWI, F_RAWK_I),
+    ROW_RAW_ARITH(OP_RAW_SUB_INT, "rawi = rawi - rawi", F_RAWI, F_RAWK_I),
+    ROW_RAW_ARITH(OP_RAW_MUL_INT, "rawi = rawi * rawi", F_RAWI, F_RAWK_I),
+    ROW_RAW_ARITH(OP_RAW_ADD_INT_K, "rawi = rawi + rawk", F_RAWI, F_RAWK_I_AT),
+    ROW_RAW_ARITH(OP_RAW_SUB_INT_K, "rawi = rawi - rawk", F_RAWI, F_RAWK_I_AT),
+    /* int/int division promotes, so this one alone writes a raw real. */
+    ROW(OP_RAW_DIV_INT, "rawr = rawi / rawi (int/int division always promotes to real)",
+        {AT_A, F_RAWR}, {AT_B, F_RAWI}, {AT_C, F_RAWK_I}),
+    ROW_RAW_ARITH(OP_RAW_MOD_INT, "rawi = rawi % rawi", F_RAWI, F_RAWK_I),
+    ROW_RAW_ARITH(OP_RAW_FLOOR_DIV_INT, "rawi = floor(rawi / rawi)", F_RAWI, F_RAWK_I),
+    ROW_RAW_ARITH(OP_RAW_ADD_REAL, "rawr = rawr + rawr", F_RAWR, F_RAWK_D),
+    ROW_RAW_ARITH(OP_RAW_SUB_REAL, "rawr = rawr - rawr", F_RAWR, F_RAWK_D),
+    ROW_RAW_ARITH(OP_RAW_MUL_REAL, "rawr = rawr * rawr", F_RAWR, F_RAWK_D),
+    ROW_RAW_ARITH(OP_RAW_DIV_REAL, "rawr = rawr / rawr", F_RAWR, F_RAWK_D),
+    ROW_RAW_ARITH(OP_RAW_FMA_REAL,
+                  "rawr = rawr + rawr * rawr (fused mul-add dispatch, two roundings)", F_RAWR,
+                  F_RAWK_D),
+    ROW_RAW_ARITH(OP_RAW_FMS_REAL,
+                  "rawr = rawr - rawr * rawr (fused mul-sub dispatch, two roundings)", F_RAWR,
+                  F_RAWK_D),
+    ROW_RAW_CMP(OP_RAW_LT_INT, "reg = rawi < rawi", F_RAWI, F_RAWK_I),
+    ROW_RAW_CMP(OP_RAW_LTE_INT, "reg = rawi <= rawi", F_RAWI, F_RAWK_I),
+    ROW_RAW_CMP(OP_RAW_LT_REAL, "reg = rawr < rawr", F_RAWR, F_RAWK_D),
+    ROW_RAW_CMP(OP_RAW_LTE_REAL, "reg = rawr <= rawr", F_RAWR, F_RAWK_D),
+    ROW_RAW_CMP(OP_RAW_EQ_INT, "reg = rawi == rawi", F_RAWI, F_RAWK_I),
+    ROW_RAW_CMP(OP_RAW_NEQ_INT, "reg = rawi != rawi", F_RAWI, F_RAWK_I),
+    ROW_RAW_CMP(OP_RAW_EQ_REAL, "reg = rawr == rawr", F_RAWR, F_RAWK_D),
+    ROW_RAW_CMP(OP_RAW_NEQ_REAL, "reg = rawr != rawr", F_RAWR, F_RAWK_D),
+    ROW(OP_UNBOX_INT, "rawi = unbox(reg) (tag-checked)", {AT_A, F_RAWI}, {AT_B, F_REG}),
+    ROW(OP_UNBOX_REAL, "rawr = unbox(reg) (tag-checked)", {AT_A, F_RAWR}, {AT_B, F_REG}),
+    ROW(OP_RAW_MOVE_INT, "rawi = rawi", {AT_A, F_RAWI}, {AT_B, F_RAWI}),
+    ROW(OP_RAW_MOVE_REAL, "rawr = rawr", {AT_A, F_RAWR}, {AT_B, F_RAWR}),
+    ROW(OP_RAW_LOAD_INT_POOL, "rawi = pool constant", {AT_A, F_RAWI}, {AT_W1, F_POOL_RAWI}),
 
-    /* Raw-arithmetic family -- special-cased below; fields[]/packed/trailing_words kept for
-       documentation only except where noted (LOAD_INT/LOAD_REAL/LOAD_INT_POOL are 2 words). */
-    [OP_RAW_LOAD_INT] = {"OP_RAW_LOAD_INT", "rawi = imm (full int32)", .trailing_words = 1},
-    [OP_RAW_LOAD_REAL] = {"OP_RAW_LOAD_REAL", "rawr = pool constant", .trailing_words = 1},
-    [OP_RAW_ADD_INT] = {"OP_RAW_ADD_INT", "rawi = rawi + rawi"},
-    [OP_RAW_SUB_INT] = {"OP_RAW_SUB_INT", "rawi = rawi - rawi"},
-    [OP_RAW_MUL_INT] = {"OP_RAW_MUL_INT", "rawi = rawi * rawi"},
-    [OP_RAW_ADD_INT_K] = {"OP_RAW_ADD_INT_K", "rawi = rawi + rawk"},
-    [OP_RAW_SUB_INT_K] = {"OP_RAW_SUB_INT_K", "rawi = rawi - rawk"},
-    [OP_RAW_DIV_INT] = {"OP_RAW_DIV_INT", "rawr = rawi / rawi (int/int division always promotes to real)"},
-    [OP_RAW_MOD_INT] = {"OP_RAW_MOD_INT", "rawi = rawi % rawi"},
-    [OP_RAW_FLOOR_DIV_INT] = {"OP_RAW_FLOOR_DIV_INT", "rawi = floor(rawi / rawi)"},
-    [OP_RAW_ADD_REAL] = {"OP_RAW_ADD_REAL", "rawr = rawr + rawr"},
-    [OP_RAW_SUB_REAL] = {"OP_RAW_SUB_REAL", "rawr = rawr - rawr"},
-    [OP_RAW_MUL_REAL] = {"OP_RAW_MUL_REAL", "rawr = rawr * rawr"},
-    [OP_RAW_DIV_REAL] = {"OP_RAW_DIV_REAL", "rawr = rawr / rawr"},
-    [OP_RAW_FMA_REAL] = {"OP_RAW_FMA_REAL",
-                         "rawr = rawr + rawr * rawr (fused mul-add dispatch, two roundings)"},
-    [OP_RAW_FMS_REAL] = {"OP_RAW_FMS_REAL",
-                         "rawr = rawr - rawr * rawr (fused mul-sub dispatch, two roundings)"},
-    [OP_RAW_LT_INT] = {"OP_RAW_LT_INT", "reg = rawi < rawi"},
-    [OP_RAW_LTE_INT] = {"OP_RAW_LTE_INT", "reg = rawi <= rawi"},
-    [OP_RAW_LT_REAL] = {"OP_RAW_LT_REAL", "reg = rawr < rawr"},
-    [OP_RAW_LTE_REAL] = {"OP_RAW_LTE_REAL", "reg = rawr <= rawr"},
-    [OP_RAW_EQ_INT] = {"OP_RAW_EQ_INT", "reg = rawi == rawi"},
-    [OP_RAW_NEQ_INT] = {"OP_RAW_NEQ_INT", "reg = rawi != rawi"},
-    [OP_RAW_EQ_REAL] = {"OP_RAW_EQ_REAL", "reg = rawr == rawr"},
-    [OP_RAW_NEQ_REAL] = {"OP_RAW_NEQ_REAL", "reg = rawr != rawr"},
-    [OP_UNBOX_INT] = {"OP_UNBOX_INT", "rawi = unbox(reg) (tag-checked)"},
-    [OP_UNBOX_REAL] = {"OP_UNBOX_REAL", "rawr = unbox(reg) (tag-checked)"},
-    [OP_RAW_MOVE_INT] = {"OP_RAW_MOVE_INT", "rawi = rawi"},
-    [OP_RAW_MOVE_REAL] = {"OP_RAW_MOVE_REAL", "rawr = rawr"},
-    [OP_RAW_LOAD_INT_POOL] = {"OP_RAW_LOAD_INT_POOL", "rawi = pool constant", .trailing_words = 1},
+    /* Shape-specialized field access: one row per (storage kind, checked-ness) pair. See vm.h's
+       own comment on this family, and on the compile-time proof behind the _UNCHECKED forms. */
+    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_INT, "specialized: rawi = packed_arr[rk].field",
+                          F_RAWI),
+    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_REAL, "specialized: rawr = packed_arr[rk].field",
+                          F_RAWR),
+    ROW_FIELD_GET_RAW(OP_FIELD_GET_RAW_INT, "specialized: rawi = struct.field", F_RAWI),
+    ROW_FIELD_GET_RAW(OP_FIELD_GET_RAW_REAL, "specialized: rawr = struct.field", F_RAWR),
+    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_INT, "specialized: packed_arr[rk].field = rawi",
+                          F_RAWI),
+    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_REAL, "specialized: packed_arr[rk].field = rawr",
+                          F_RAWR),
+    ROW_FIELD_SET_RAW(OP_FIELD_SET_RAW_INT, "specialized: struct.field = rawi", F_RAWI),
+    ROW_FIELD_SET_RAW(OP_FIELD_SET_RAW_REAL, "specialized: struct.field = rawr", F_RAWR),
+    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_INT, "specialized: struct.field OP= rawi", F_RAWI),
+    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_REAL, "specialized: struct.field OP= rawr", F_RAWR),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT,
+                               "specialized: packed_arr[rk].field OP= rawi", F_RAWI),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_REAL,
+                               "specialized: packed_arr[rk].field OP= rawr", F_RAWR),
 
-    /* Shape-specialized field access -- see vm.h's own comment on this opcode family. All fully
-       special-cased below (custom word layouts), fields[]/packed unused. */
-    [OP_INDEX_FIELD_GET_RAW_INT] = {"OP_INDEX_FIELD_GET_RAW_INT", "specialized: rawi = packed_arr[rk].field",
-                                    .trailing_words = 1},
-    [OP_INDEX_FIELD_GET_RAW_REAL] = {"OP_INDEX_FIELD_GET_RAW_REAL",
-                                     "specialized: rawr = packed_arr[rk].field", .trailing_words = 1},
-    [OP_FIELD_GET_RAW_INT] = {"OP_FIELD_GET_RAW_INT", "specialized: rawi = struct.field",
-                              .trailing_words = 1},
-    [OP_FIELD_GET_RAW_REAL] = {"OP_FIELD_GET_RAW_REAL", "specialized: rawr = struct.field",
-                               .trailing_words = 1},
-    [OP_INDEX_FIELD_SET_RAW_INT] = {"OP_INDEX_FIELD_SET_RAW_INT", "specialized: packed_arr[rk].field = rawi",
-                                    .trailing_words = 1},
-    [OP_INDEX_FIELD_SET_RAW_REAL] = {"OP_INDEX_FIELD_SET_RAW_REAL",
-                                     "specialized: packed_arr[rk].field = rawr", .trailing_words = 1},
-    [OP_FIELD_SET_RAW_INT] = {"OP_FIELD_SET_RAW_INT", "specialized: struct.field = rawi",
-                              .trailing_words = 2},
-    [OP_FIELD_SET_RAW_REAL] = {"OP_FIELD_SET_RAW_REAL", "specialized: struct.field = rawr",
-                               .trailing_words = 2},
-    [OP_FIELD_COMPOUND_RAW_INT] = {"OP_FIELD_COMPOUND_RAW_INT", "specialized: struct.field OP= rawi",
-                                   .trailing_words = 2},
-    [OP_FIELD_COMPOUND_RAW_REAL] = {"OP_FIELD_COMPOUND_RAW_REAL", "specialized: struct.field OP= rawr",
-                                    .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_INT] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT",
-                                         "specialized: packed_arr[rk].field OP= rawi", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_REAL] = {"OP_INDEX_FIELD_COMPOUND_RAW_REAL",
-                                          "specialized: packed_arr[rk].field OP= rawr", .trailing_words = 2},
-
-    /* _UNCHECKED counterparts -- same word layouts as the 3 wide INDEX_FIELD_*_RAW_INT/REAL
-       families above, decoded by the same branches below; see vm.h's own comment on this family
-       for the compile-time proof that makes skipping vm_packed_raw_elem's index checks safe. */
-    [OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED] = {"OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED",
-                                              "specialized+loop-proven-safe: rawi = packed_arr[rk].field",
-                                              .trailing_words = 1},
-    [OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED] = {"OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED",
-                                               "specialized+loop-proven-safe: rawr = packed_arr[rk].field",
-                                               .trailing_words = 1},
-    [OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED] = {"OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED",
-                                              "specialized+loop-proven-safe: packed_arr[rk].field = rawi",
-                                              .trailing_words = 1},
-    [OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED] = {"OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED",
-                                               "specialized+loop-proven-safe: packed_arr[rk].field = rawr",
-                                               .trailing_words = 1},
-    [OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED] =
-        {"OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawi", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED] =
-        {"OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr", .trailing_words = 2},
+    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED,
+                          "specialized+loop-proven-safe: rawi = packed_arr[rk].field", F_RAWI),
+    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED,
+                          "specialized+loop-proven-safe: rawr = packed_arr[rk].field", F_RAWR),
+    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED,
+                          "specialized+loop-proven-safe: packed_arr[rk].field = rawi", F_RAWI),
+    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED,
+                          "specialized+loop-proven-safe: packed_arr[rk].field = rawr", F_RAWR),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED,
+                               "specialized+loop-proven-safe: packed_arr[rk].field OP= rawi", F_RAWI),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED,
+                               "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr", F_RAWR),
 
     /* Narrow (int32/float32) counterparts of the whole family above -- same word layouts, just a
-       4-byte field instead of 8. See vm.h's own comment on this opcode family. */
-    [OP_INDEX_FIELD_GET_RAW_INT32] = {"OP_INDEX_FIELD_GET_RAW_INT32",
-                                      "specialized: rawi = packed_arr[rk].field (narrow)",
-                                      .trailing_words = 1},
-    [OP_INDEX_FIELD_GET_RAW_FLOAT32] = {"OP_INDEX_FIELD_GET_RAW_FLOAT32",
-                                        "specialized: rawr = packed_arr[rk].field (narrow)",
-                                        .trailing_words = 1},
-    [OP_FIELD_GET_RAW_INT32] = {"OP_FIELD_GET_RAW_INT32", "specialized: rawi = struct.field (narrow)",
-                                .trailing_words = 1},
-    [OP_FIELD_GET_RAW_FLOAT32] = {"OP_FIELD_GET_RAW_FLOAT32", "specialized: rawr = struct.field (narrow)",
-                                  .trailing_words = 1},
-    [OP_INDEX_FIELD_SET_RAW_INT32] = {"OP_INDEX_FIELD_SET_RAW_INT32",
-                                      "specialized: packed_arr[rk].field = rawi (narrow)",
-                                      .trailing_words = 1},
-    [OP_INDEX_FIELD_SET_RAW_FLOAT32] = {"OP_INDEX_FIELD_SET_RAW_FLOAT32",
-                                        "specialized: packed_arr[rk].field = rawr (narrow)",
-                                        .trailing_words = 1},
-    [OP_FIELD_SET_RAW_INT32] = {"OP_FIELD_SET_RAW_INT32", "specialized: struct.field = rawi (narrow)",
-                                .trailing_words = 2},
-    [OP_FIELD_SET_RAW_FLOAT32] = {"OP_FIELD_SET_RAW_FLOAT32", "specialized: struct.field = rawr (narrow)",
-                                  .trailing_words = 2},
-    [OP_FIELD_COMPOUND_RAW_INT32] = {"OP_FIELD_COMPOUND_RAW_INT32",
-                                     "specialized: struct.field OP= rawi (narrow)", .trailing_words = 2},
-    [OP_FIELD_COMPOUND_RAW_FLOAT32] = {"OP_FIELD_COMPOUND_RAW_FLOAT32",
-                                       "specialized: struct.field OP= rawr (narrow)", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_INT32] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT32",
-                                           "specialized: packed_arr[rk].field OP= rawi (narrow)",
-                                           .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32] = {"OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32",
-                                             "specialized: packed_arr[rk].field OP= rawr (narrow)",
-                                             .trailing_words = 2},
+       4-byte field instead of 8. */
+    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_INT32,
+                          "specialized: rawi = packed_arr[rk].field (narrow)", F_RAWI),
+    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_FLOAT32,
+                          "specialized: rawr = packed_arr[rk].field (narrow)", F_RAWR),
+    ROW_FIELD_GET_RAW(OP_FIELD_GET_RAW_INT32, "specialized: rawi = struct.field (narrow)", F_RAWI),
+    ROW_FIELD_GET_RAW(OP_FIELD_GET_RAW_FLOAT32, "specialized: rawr = struct.field (narrow)", F_RAWR),
+    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_INT32,
+                          "specialized: packed_arr[rk].field = rawi (narrow)", F_RAWI),
+    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_FLOAT32,
+                          "specialized: packed_arr[rk].field = rawr (narrow)", F_RAWR),
+    ROW_FIELD_SET_RAW(OP_FIELD_SET_RAW_INT32, "specialized: struct.field = rawi (narrow)", F_RAWI),
+    ROW_FIELD_SET_RAW(OP_FIELD_SET_RAW_FLOAT32, "specialized: struct.field = rawr (narrow)", F_RAWR),
+    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_INT32,
+                           "specialized: struct.field OP= rawi (narrow)", F_RAWI),
+    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_FLOAT32,
+                           "specialized: struct.field OP= rawr (narrow)", F_RAWR),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT32,
+                               "specialized: packed_arr[rk].field OP= rawi (narrow)", F_RAWI),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32,
+                               "specialized: packed_arr[rk].field OP= rawr (narrow)", F_RAWR),
 
-    [OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED] =
-        {"OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED",
-         "specialized+loop-proven-safe: rawi = packed_arr[rk].field (narrow)", .trailing_words = 1},
-    [OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED] =
-        {"OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED",
-         "specialized+loop-proven-safe: rawr = packed_arr[rk].field (narrow)", .trailing_words = 1},
-    [OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED] =
-        {"OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field = rawi (narrow)", .trailing_words = 1},
-    [OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED] =
-        {"OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field = rawr (narrow)", .trailing_words = 1},
-    [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED] =
-        {"OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawi (narrow)", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED] =
-        {"OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED",
-         "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr (narrow)", .trailing_words = 2},
-    [OP_FIELD_COMPOUND_RAW_INT_ADD] = {"OP_FIELD_COMPOUND_RAW_INT_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
-    [OP_FIELD_COMPOUND_RAW_REAL_ADD] = {"OP_FIELD_COMPOUND_RAW_REAL_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
-    [OP_FIELD_COMPOUND_RAW_INT32_ADD] = {"OP_FIELD_COMPOUND_RAW_INT32_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
-    [OP_FIELD_COMPOUND_RAW_FLOAT32_ADD] = {"OP_FIELD_COMPOUND_RAW_FLOAT32_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
-    [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD] = {"OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD",
-                  "specialized: field += raw", .trailing_words = 2},
+    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED,
+                          "specialized+loop-proven-safe: rawi = packed_arr[rk].field (narrow)",
+                          F_RAWI),
+    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED,
+                          "specialized+loop-proven-safe: rawr = packed_arr[rk].field (narrow)",
+                          F_RAWR),
+    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED,
+                          "specialized+loop-proven-safe: packed_arr[rk].field = rawi (narrow)",
+                          F_RAWI),
+    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED,
+                          "specialized+loop-proven-safe: packed_arr[rk].field = rawr (narrow)",
+                          F_RAWR),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED,
+                               "specialized+loop-proven-safe: packed_arr[rk].field OP= rawi (narrow)",
+                               F_RAWI),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED,
+                               "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr (narrow)",
+                               F_RAWR),
 
-    [OP_FIELD_COMPOUND_RAW_FLOAT32_FMA] = {"OP_FIELD_COMPOUND_RAW_FLOAT32_FMA",
-                                           "specialized: struct.field += rawr * rawr (narrow)",
-                                           .trailing_words = 1},
-    [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA] =
-        {"OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA",
-         "specialized+loop-proven-safe: packed_arr[rk].field += rawr * rawr", .trailing_words = 1},
-    [OP_EQ_JUMP_IF_FALSE] = {"OP_EQ_JUMP_IF_FALSE", "jump if !(rk == rk)", .trailing_words = 1},
-    [OP_NEQ_JUMP_IF_FALSE] = {"OP_NEQ_JUMP_IF_FALSE", "jump if !(rk != rk)", .trailing_words = 1},
-    [OP_LT_JUMP_IF_FALSE] = {"OP_LT_JUMP_IF_FALSE", "jump if !(rk < rk)", .trailing_words = 1},
-    [OP_GT_JUMP_IF_FALSE] = {"OP_GT_JUMP_IF_FALSE", "jump if !(rk > rk)", .trailing_words = 1},
-    [OP_LTE_JUMP_IF_FALSE] = {"OP_LTE_JUMP_IF_FALSE", "jump if !(rk <= rk)", .trailing_words = 1},
-    [OP_GTE_JUMP_IF_FALSE] = {"OP_GTE_JUMP_IF_FALSE", "jump if !(rk >= rk)", .trailing_words = 1},
-    /* Variable-length, but not OP_DEFINE_STRUCT's shape -- header word then part_count RK16
-       words, one per part. Both walkers below special-case it. */
-    [OP_INTERP] = {"OP_INTERP", "reg = one string built from N parts", .packed = 2},
+    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_INT_ADD, "specialized: field += raw", F_RAWI),
+    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_REAL_ADD, "specialized: field += raw", F_RAWR),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD, "specialized: field += raw",
+                               F_RAWI),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD, "specialized: field += raw",
+                               F_RAWR),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD,
+                               "specialized: field += raw", F_RAWI),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD,
+                               "specialized: field += raw", F_RAWR),
+    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_INT32_ADD, "specialized: field += raw", F_RAWI),
+    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_FLOAT32_ADD, "specialized: field += raw", F_RAWR),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD, "specialized: field += raw",
+                               F_RAWI),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD, "specialized: field += raw",
+                               F_RAWR),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD,
+                               "specialized: field += raw", F_RAWI),
+    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD,
+                               "specialized: field += raw", F_RAWR),
+
+    ROW(OP_FIELD_COMPOUND_RAW_FLOAT32_FMA, "specialized: struct.field += rawr * rawr (narrow)",
+        {AT_A, F_REG}, {AT_B, F_RAWR}, {AT_C, F_RAWR}, {AT_W1, F_OFF}),
+    ROW(OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA,
+        "specialized+loop-proven-safe: packed_arr[rk].field += rawr * rawr", {AT_A, F_REG},
+        {AT_B, F_RAWR}, {AT_C, F_RAWR}, {AT_W1_HI, F_OFF}, {AT_W1_LO, F_RK16}),
+
+    ROW_CMP_JUMP(OP_EQ_JUMP_IF_FALSE, "jump if !(rk == rk)"),
+    ROW_CMP_JUMP(OP_NEQ_JUMP_IF_FALSE, "jump if !(rk != rk)"),
+    ROW_CMP_JUMP(OP_LT_JUMP_IF_FALSE, "jump if !(rk < rk)"),
+    ROW_CMP_JUMP(OP_GT_JUMP_IF_FALSE, "jump if !(rk > rk)"),
+    ROW_CMP_JUMP(OP_LTE_JUMP_IF_FALSE, "jump if !(rk <= rk)"),
+    ROW_CMP_JUMP(OP_GTE_JUMP_IF_FALSE, "jump if !(rk >= rk)"),
+
+    /* Variable-length: a header word, then part_count RK16 words, one per part. */
+    [OP_INTERP] = {"OP_INTERP", "reg = one string built from N parts", {{0, F_END}}, true},
     [OP_INDEX_GET_INTERP] = {"OP_INDEX_GET_INTERP", "reg = dict[N-part key], key never allocated",
-                             .packed = 3},
-    [OP_RAW_LT_INT_JUMP_IF_FALSE] = {"OP_RAW_LT_INT_JUMP_IF_FALSE", "jump if !(rawi < rawi)",
-                                     .trailing_words = 1},
-    [OP_RAW_LTE_INT_JUMP_IF_FALSE] = {"OP_RAW_LTE_INT_JUMP_IF_FALSE", "jump if !(rawi <= rawi)",
-                                      .trailing_words = 1},
-    [OP_RAW_LT_REAL_JUMP_IF_FALSE] = {"OP_RAW_LT_REAL_JUMP_IF_FALSE", "jump if !(rawr < rawr)",
-                                      .trailing_words = 1},
-    [OP_RAW_LTE_REAL_JUMP_IF_FALSE] = {"OP_RAW_LTE_REAL_JUMP_IF_FALSE", "jump if !(rawr <= rawr)",
-                                       .trailing_words = 1},
-    [OP_RAW_EQ_INT_JUMP_IF_FALSE] = {"OP_RAW_EQ_INT_JUMP_IF_FALSE", "jump if !(rawi == rawi)",
-                                     .trailing_words = 1},
-    [OP_RAW_NEQ_INT_JUMP_IF_FALSE] = {"OP_RAW_NEQ_INT_JUMP_IF_FALSE", "jump if !(rawi != rawi)",
-                                      .trailing_words = 1},
-    [OP_RAW_EQ_REAL_JUMP_IF_FALSE] = {"OP_RAW_EQ_REAL_JUMP_IF_FALSE", "jump if !(rawr == rawr)",
-                                      .trailing_words = 1},
-    [OP_RAW_NEQ_REAL_JUMP_IF_FALSE] = {"OP_RAW_NEQ_REAL_JUMP_IF_FALSE", "jump if !(rawr != rawr)",
-                                       .trailing_words = 1},
-    [OP_INDEX_GET_RAW_INT] = {"OP_INDEX_GET_RAW_INT", "rawi = arr[rk] (checked)"},
-    [OP_INDEX_SET_RAW_INT] = {"OP_INDEX_SET_RAW_INT", "arr[rk] = rawi (checked)"},
-    [OP_INDEX_SET_RAW_REAL] = {"OP_INDEX_SET_RAW_REAL", "arr[rk] = rawr (checked)"},
-    [OP_INDEX_GET_RAW_REAL] = {"OP_INDEX_GET_RAW_REAL", "rawr = arr[rk] (checked)"},
-    [OP_CALL_SELF] = {"OP_CALL_SELF", "recursive call into this same specialized body"},
-    [OP_RAW_MATH_REAL] = {"OP_RAW_MATH_REAL", "rawr = math fn(rawr), never boxed"},
-    [OP_RAW_INT_TO_REAL] = {"OP_RAW_INT_TO_REAL", "rawr = (real)rawi"},
-    [OP_RAW_REAL_TO_INT] = {"OP_RAW_REAL_TO_INT", "rawi = (int)rawr, truncating"},
+                             {{0, F_END}}, true},
+
+    ROW_RAW_CMP_JUMP(OP_RAW_LT_INT_JUMP_IF_FALSE, "jump if !(rawi < rawi)", F_RAWI, F_RAWK_I),
+    ROW_RAW_CMP_JUMP(OP_RAW_LTE_INT_JUMP_IF_FALSE, "jump if !(rawi <= rawi)", F_RAWI, F_RAWK_I),
+    ROW_RAW_CMP_JUMP(OP_RAW_LT_REAL_JUMP_IF_FALSE, "jump if !(rawr < rawr)", F_RAWR, F_RAWK_D),
+    ROW_RAW_CMP_JUMP(OP_RAW_LTE_REAL_JUMP_IF_FALSE, "jump if !(rawr <= rawr)", F_RAWR, F_RAWK_D),
+    ROW_RAW_CMP_JUMP(OP_RAW_EQ_INT_JUMP_IF_FALSE, "jump if !(rawi == rawi)", F_RAWI, F_RAWK_I),
+    ROW_RAW_CMP_JUMP(OP_RAW_NEQ_INT_JUMP_IF_FALSE, "jump if !(rawi != rawi)", F_RAWI, F_RAWK_I),
+    ROW_RAW_CMP_JUMP(OP_RAW_EQ_REAL_JUMP_IF_FALSE, "jump if !(rawr == rawr)", F_RAWR, F_RAWK_D),
+    ROW_RAW_CMP_JUMP(OP_RAW_NEQ_REAL_JUMP_IF_FALSE, "jump if !(rawr != rawr)", F_RAWR, F_RAWK_D),
+
+    ROW(OP_INDEX_GET_RAW_INT, "rawi = arr[rk] (checked)", {AT_A, F_RAWI}, {AT_B, F_REG},
+        {AT_C, F_RK8}),
+    ROW(OP_INDEX_SET_RAW_INT, "arr[rk] = rawi (checked)", {AT_A, F_REG}, {AT_B, F_RK8},
+        {AT_C, F_RAWI}),
+    ROW(OP_INDEX_SET_RAW_REAL, "arr[rk] = rawr (checked)", {AT_A, F_REG}, {AT_B, F_RK8},
+        {AT_C, F_RAWR}),
+    ROW(OP_INDEX_GET_RAW_REAL, "rawr = arr[rk] (checked)", {AT_A, F_RAWR}, {AT_B, F_REG},
+        {AT_C, F_RK8}),
+    ROW(OP_CALL_SELF, "recursive call into this same specialized body", {AT_A, F_REG},
+        {AT_B, F_REG}, {AT_C, F_COUNT}),
+    ROW(OP_RAW_MATH_REAL, "rawr = math fn(rawr), never boxed", {AT_A, F_RAWR}, {AT_B, F_RAWR},
+        {AT_C, F_FN_ID}),
+    ROW(OP_RAW_INT_TO_REAL, "rawr = (real)rawi", {AT_A, F_RAWR}, {AT_B, F_RAWI}),
+    ROW(OP_RAW_REAL_TO_INT, "rawi = (int)rawr, truncating", {AT_A, F_RAWI}, {AT_B, F_RAWR}),
 };
+
+static const char* const module_names[] = {"math",  "random",     "string", "time",
+                                           "json",  "collection", "net",    "regex",
+                                           "actor", "scheduler",  "dynamic"};
+static const char* const builtin_names[] = {"length", "print", "type", "assert", "panic", "Result"};
+static const char* const struct_field_type_names[] = {"null",   "boolean",  "integer", "float",
+                                                      "string", "function", "array",   "hashtable"};
+
+/* NULL for a byte that names no opcode -- reachable only from a corrupt chunk or a walk that
+   has lost sync, and in both cases printing beats indexing past the table. */
+static const OpInfo* op_row(int op) {
+    return (op >= 0 && op <= OP_INFO_MAX && op_info[op].name) ? &op_info[op] : NULL;
+}
+
+#define AER_LEN(a) (sizeof(a) / sizeof((a)[0]))
+
+/* A desynchronized walk decodes arbitrary words as operands, so every table-driven read is
+   bounded: the dump has to stay printable long enough to report where it went wrong. */
+static uint32_t code_at(Chunk* c, unsigned int i) {
+    return i < c->count ? c->code[i] : 0;
+}
+
+static AerVal pool_at(Chunk* c, uint32_t i) {
+    return i < c->pool_count ? c->pool[i] : aer_null();
+}
+
+static int64_t rawk_i_at(Chunk* c, uint32_t i) {
+    return i < c->rawk_i_count ? c->rawk_i[i] : 0;
+}
+
+static double rawk_d_at(Chunk* c, uint32_t i) {
+    return i < c->rawk_d_count ? c->rawk_d[i] : 0.0;
+}
+
+static const char* pool_name_at(Chunk* c, uint32_t i) {
+    AerVal v = pool_at(c, i);
+    return aer_type(v) == TYPE_STRING ? aer_as_string(v)->data : "?";
+}
+
+static const char* name_or_q(const char* const* names, size_t n, uint32_t i) {
+    return i < n ? names[i] : "?";
+}
+
+static const char* opcode_name(int op) {
+    const OpInfo* info = op_row(op);
+    return info ? info->name : "?";
+}
 
 static const char* cast_name(int k) {
     switch (k) {
@@ -417,551 +441,175 @@ static void print_pool_value(FILE* out, AerVal v) {
     }
 }
 
-static const char* opcode_name(int op) {
-    return (op >= 0 && op <= OP_INFO_MAX && op_info[op].name) ? op_info[op].name : "?";
+/* Which trailing word an operand reaches into; 0 for word0's own slices. */
+static unsigned int operand_word(unsigned char at) {
+    switch (at) {
+        case AT_W1:
+        case AT_W1_HI:
+        case AT_W1_LO: return 1;
+        case AT_W2:
+        case AT_W2_HI:
+        case AT_W2_LO: return 2;
+        case AT_W3_HI:
+        case AT_W3_LO: return 3;
+        default: return 0;
+    }
 }
 
-/* Jump operands are stored relative (patch_jump, parser.c); print where they land, since a raw
-   delta is unreadable beside the absolute offsets in the left-hand column. */
-static void print_jump(FILE* out, uint32_t delta, unsigned int base) {
-    fprintf(out, "  -> %d", (int)base + (int)(int32_t)delta);
+static uint32_t operand_value(Chunk* c, unsigned int offset, unsigned char at) {
+    uint32_t w = code_at(c, offset + operand_word(at));
+    switch (at) {
+        case AT_A: return UNPACK_A(w);
+        case AT_B: return UNPACK_B(w);
+        case AT_C: return UNPACK_C(w);
+        case AT_W16: return UNPACK_W16(w);
+        case AT_W1_HI:
+        case AT_W2_HI:
+        case AT_W3_HI: return UNPACK_2X16_HI(w);
+        case AT_W1_LO:
+        case AT_W2_LO:
+        case AT_W3_LO: return UNPACK_2X16_LO(w);
+        default: return w;
+    }
 }
 
-/* Prints one already-extracted field value -- the caller has already pulled it out of whichever
-   word/sub-field it lives in. */
-static void print_field(FILE* out, Chunk* c, Field kind, int word) {
-    switch (kind) {
-        case FLD_POOL:
-            fprintf(out, "  val=");
-            print_pool_value(out, c->pool[word]);
-            break;
-        case FLD_NAME: fprintf(out, "  name=%s", aer_as_string(c->pool[word])->data); break;
-        case FLD_JUMP: fprintf(out, "  -> %d", word); break;
-        case FLD_COUNT: fprintf(out, "  n=%d", word); break;
-        case FLD_BINOP: fprintf(out, "  op=%s", opcode_name(word)); break;
-        case FLD_CAST: fprintf(out, "  %s", cast_name(word)); break;
-        case FLD_REG: fprintf(out, "  reg=%d", word); break;
-        case FLD_RK:
-            if (word & RK_CONST_FLAG) {
+/* The one place an instruction's word count is decided. */
+static unsigned int instruction_words(Chunk* c, unsigned int offset) {
+    uint32_t w0 = code_at(c, offset);
+    Opcode op = (Opcode)(w0 & 0xFF);
+    const OpInfo* info = op_row(op);
+    if (!info)
+        return 1;
+    if (info->variable) {
+        if (op == OP_INTERP)
+            return 1 + UNPACK_B(w0);
+        if (op == OP_INDEX_GET_INTERP)
+            return 1 + UNPACK_C(w0);
+        return 1 + (unsigned int)UNPACK_STRUCT_HEADER_COUNT(w0) * 2;
+    }
+    unsigned int words = 1;
+    for (int i = 0; i < MAX_OPERANDS && info->ops[i].fld != F_END; i++) {
+        unsigned int reach = operand_word(info->ops[i].at) + 1;
+        if (reach > words)
+            words = reach;
+    }
+    return words;
+}
+
+static void print_operand(FILE* out, Chunk* c, unsigned int offset, Operand o) {
+    uint32_t v = operand_value(c, offset, o.at);
+    switch (o.fld) {
+        case F_REG: fprintf(out, "  reg=%d", (int)v); break;
+        case F_RK8:
+            if (v & RK8_CONST_FLAG) {
                 fprintf(out, "  rk=const:");
-                print_pool_value(out, c->pool[word & ~RK_CONST_FLAG]);
+                print_pool_value(out, pool_at(c, v & RK8_INDEX_MASK));
             } else
-                fprintf(out, "  rk=reg%d", word);
+                fprintf(out, "  rk=reg%u", v & RK8_INDEX_MASK);
             break;
-        case FLD_END: break;
+        case F_RK16:
+            if (v & RK16_CONST_FLAG) {
+                fprintf(out, "  rk=const:");
+                print_pool_value(out, pool_at(c, v & RK16_INDEX_MASK));
+            } else
+                fprintf(out, "  rk=reg%u", v & RK16_INDEX_MASK);
+            break;
+        case F_RAWI: fprintf(out, "  rawi=%d", (int)v); break;
+        case F_RAWR: fprintf(out, "  rawr=%d", (int)v); break;
+        case F_RAWK_I:
+            if (v & RK8_CONST_FLAG)
+                fprintf(out, "  rawi_const=%lld", (long long)rawk_i_at(c, v & RK8_INDEX_MASK));
+            else
+                fprintf(out, "  rawi=%u", v);
+            break;
+        case F_RAWK_D:
+            if (v & RK8_CONST_FLAG)
+                fprintf(out, "  rawr_const=%g", rawk_d_at(c, v & RK8_INDEX_MASK));
+            else
+                fprintf(out, "  rawr=%u", v);
+            break;
+        case F_RAWK_I_AT: fprintf(out, "  rawk_i=%lld", (long long)rawk_i_at(c, v)); break;
+        case F_POOL:
+            fprintf(out, "  val=");
+            print_pool_value(out, pool_at(c, v));
+            break;
+        case F_POOL_RAWI: fprintf(out, "  val=%lld", (long long)rawk_i_at(c, v)); break;
+        case F_POOL_RAWD: fprintf(out, "  val=%g", rawk_d_at(c, v)); break;
+        case F_NAME: fprintf(out, "  name=%s", pool_name_at(c, v)); break;
+        /* Jump operands are stored relative (patch_jump, parser.c); print where they land, since a
+           raw delta is unreadable beside the absolute offsets in the left-hand column. */
+        case F_JUMP:
+            fprintf(out, "  -> %d",
+                    (int)(offset + operand_word(o.at) + 1) + (int)(int32_t)v);
+            break;
+        case F_COUNT: fprintf(out, "  n=%d", (int)v); break;
+        case F_BINOP: fprintf(out, "  op=%s", opcode_name((int)v)); break;
+        case F_CAST: fprintf(out, "  %s", cast_name((int)v)); break;
+        case F_OFF: fprintf(out, "  off=%u", v); break;
+        case F_IMM32: fprintf(out, "  imm=%d", (int)(int32_t)v); break;
+        case F_FN_ID: fprintf(out, "  fn_id=%u", v); break;
+        case F_MODULE_ID: fprintf(out, "  id=%s", name_or_q(module_names, AER_LEN(module_names), v)); break;
+        case F_MODULE_FN: fprintf(out, " fn_id=%d", (int)(int16_t)v); break;
+        case F_BUILTIN_ID: fprintf(out, "  id=%s", name_or_q(builtin_names, AER_LEN(builtin_names), v)); break;
+        case F_END: break;
     }
 }
 
-/* RK16's own printer (1 flag + 15 index bits) -- the wire form most RK operands use now. */
-static void print_rk16(FILE* out, Chunk* c, uint32_t rk) {
-    if (rk & RK16_CONST_FLAG) {
-        fprintf(out, "  rk=const:");
-        print_pool_value(out, c->pool[rk & RK16_INDEX_MASK]);
-    } else
-        fprintf(out, "  rk=reg%u", rk & RK16_INDEX_MASK);
-}
-
-/* print_rk16's narrower sibling for RK8 (1 flag + 7 index bits) -- the family sharing a packed
-   word with a dest register and another RK operand. */
-static void print_rk8(FILE* out, Chunk* c, uint32_t rk) {
-    if (rk & RK8_CONST_FLAG) {
-        fprintf(out, "  rk=const:");
-        print_pool_value(out, c->pool[rk & RK8_INDEX_MASK]);
-    } else
-        fprintf(out, "  rk=reg%u", rk & RK8_INDEX_MASK);
-}
-
-/* The pure-raw families' right operand: the same const flag, but a non-const one is a raw slot
-   rather than a boxed register. */
-static void print_rawk_i(FILE* out, Chunk* c, uint32_t rk) {
-    if (rk & RK8_CONST_FLAG)
-        fprintf(out, "  rawi_const=%lld", (long long)c->rawk_i[rk & RK8_INDEX_MASK]);
-    else
-        fprintf(out, "  rawi=%u", rk);
-}
-
-static void print_rawk_d(FILE* out, Chunk* c, uint32_t rk) {
-    if (rk & RK8_CONST_FLAG)
-        fprintf(out, "  rawr_const=%g", c->rawk_d[rk & RK8_INDEX_MASK]);
-    else
-        fprintf(out, "  rawr=%u", rk);
-}
-
-/* Raw-slot printers -- kept separate so a dump reader can tell int=/real= from reg=/rk=. */
-static void print_rawi(FILE* out, int slot) {
-    fprintf(out, "  rawi=%d", slot);
-}
-static void print_rawr(FILE* out, int slot) {
-    fprintf(out, "  rawr=%d", slot);
-}
-
-/* The per-operator opcodes sharing the one-word iABC+RK8 shape -- decoded identically. */
-static bool binary_op_dispatched(Opcode op) {
-    switch (op) {
-        case OP_ADD:
-        case OP_SUB:
-        case OP_MUL:
-        case OP_DIV:
-        case OP_MOD:
-        case OP_FLOOR_DIV:
-        case OP_EQ:
-        case OP_NEQ:
-        case OP_LT:
-        case OP_GT:
-        case OP_LTE:
-        case OP_GTE:
-        case OP_IN:
-        case OP_BITWISE_AND:
-        case OP_BITWISE_OR:
-        case OP_BITWISE_XOR:
-        case OP_LSHIFT:
-        case OP_RSHIFT: return true;
-        default: return false;
-    }
-}
-
-/* strings built from parts, and the variable-length forms whose operand count is in the word itself */
-static bool disasm_interp(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
-    const OpInfo* info = &op_info[op];
-    if (op == OP_INTERP) {
-        unsigned int count = UNPACK_B(op_word);
-        fprintf(out, "  reg=%u  parts=%u  [", UNPACK_A(op_word), count);
+/* The three opcodes whose operand count lives in the instruction rather than in op_info. */
+static void print_variable_operands(FILE* out, Chunk* c, unsigned int offset, Opcode op) {
+    uint32_t w0 = c->code[offset];
+    unsigned int pos = offset + 1;
+    if (op == OP_INTERP || op == OP_INDEX_GET_INTERP) {
+        unsigned int count = (op == OP_INTERP) ? UNPACK_B(w0) : UNPACK_C(w0);
+        if (op == OP_INTERP)
+            fprintf(out, "  reg=%u  parts=%u  [", UNPACK_A(w0), count);
+        else
+            fprintf(out, "  reg=%u  obj=r%u  parts=%u  [", UNPACK_A(w0), UNPACK_B(w0), count);
         for (unsigned int i = 0; i < count; i++) {
-            uint32_t rk = c->code[(*pos)++];
+            uint32_t rk = code_at(c, pos++);
             fprintf(out, "%s", i ? ", " : "");
-            if (RK16_IS_CONST(rk))
+            if (!RK16_IS_CONST(rk))
+                fprintf(out, "reg%u", (unsigned int)RK16_INDEX(rk));
+            else if (op == OP_INTERP)
                 fprintf(out, "const:%u", (unsigned int)RK16_INDEX(rk));
             else
-                fprintf(out, "reg%u", (unsigned int)RK16_INDEX(rk));
+                print_pool_value(out, pool_at(c, RK16_INDEX(rk)));
         }
         fprintf(out, "]");
-    } else if (op == OP_INDEX_GET_INTERP) {
-        unsigned int count = UNPACK_C(op_word);
-        fprintf(out, "  reg=%u  obj=r%u  parts=%u  [", UNPACK_A(op_word), UNPACK_B(op_word), count);
-        for (unsigned int i = 0; i < count; i++) {
-            uint32_t rk = c->code[(*pos)++];
-            fprintf(out, "%s", i ? ", " : "");
-            if (RK16_IS_CONST(rk))
-                print_pool_value(out, c->pool[RK16_INDEX(rk)]);
-            else
-                fprintf(out, "reg%u", (unsigned int)RK16_INDEX(rk));
-        }
-        fprintf(out, "]");
-    } else if (info->variable) {
-        /* header word already decoded via op_word; then (name+default, type) pairs -- 2 words per field. */
-        int name_idx = (int)UNPACK_STRUCT_HEADER_NAME(op_word);
-        int field_count = (int)UNPACK_STRUCT_HEADER_COUNT(op_word);
-        fprintf(out, "  name=%s fields=%d [", aer_as_string(c->pool[name_idx])->data, field_count);
-        static const char* const field_type_names[] = {"null",   "boolean",  "integer", "float",
-                                                       "string", "function", "array",   "hashtable"};
-        for (int i = 0; i < field_count; i++) {
-            uint32_t name_default_word = c->code[(*pos)++];
-            int fname_idx = (int)UNPACK_2X16_HI(name_default_word);
-            int fdefault_idx = (int)UNPACK_2X16_LO(name_default_word);
-            /* Low byte is the ValueType tag, bit 0x100 is the narrow (`i`/`f`-suffixed-literal)
-               marker -- see OP_DEFINE_STRUCT's real decode (vm.c) and parse_struct's own emission
-               (parser.c). Masking this out is required, not cosmetic: indexing field_type_names[]
-               with the raw (un-masked) word is an out-of-bounds read the moment a narrow field's
-               0x100 bit is set. */
-            uint32_t ftype_word = (uint32_t)c->code[(*pos)++];
-            int ftype = (int)(ftype_word & 0xFF);
-            bool narrow = (ftype_word & 0x100) != 0;
-            if (i > 0)
-                fprintf(out, ", ");
-            fprintf(out, "%s", aer_as_string(c->pool[fname_idx])->data);
-            if (ftype != TYPE_ANY)
-                fprintf(out, ": %s%s", field_type_names[ftype], narrow ? " (narrow)" : "");
-            fprintf(out, "=");
-            print_pool_value(out, c->pool[fdefault_idx]);
-        }
-        fprintf(out, "]");
-    } else {
-        return false;
+        return;
     }
-    return true;
-}
-/* operators, and the compare-and-branch forms whose constant may live in a raw table */
-static bool disasm_compare(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
-    if (binary_op_dispatched(op)) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rk8(out, c, UNPACK_B(op_word));
-        print_rk8(out, c, UNPACK_C(op_word));
-    } else if (op == OP_EQ_JUMP_IF_FALSE || op == OP_NEQ_JUMP_IF_FALSE || op == OP_LT_JUMP_IF_FALSE ||
-               op == OP_GT_JUMP_IF_FALSE || op == OP_LTE_JUMP_IF_FALSE || op == OP_GTE_JUMP_IF_FALSE) {
-        print_rk8(out, c, UNPACK_B(op_word));
-        print_rk8(out, c, UNPACK_C(op_word));
-        print_jump(out, c->code[(*pos)], (*pos) + 1), (*pos)++;
-    } else if (op == OP_RAW_LT_INT_JUMP_IF_FALSE || op == OP_RAW_LTE_INT_JUMP_IF_FALSE ||
-               op == OP_RAW_EQ_INT_JUMP_IF_FALSE || op == OP_RAW_NEQ_INT_JUMP_IF_FALSE) {
-        print_rawi(out, (int)UNPACK_B(op_word));
-        print_rawk_i(out, c, UNPACK_C(op_word));
-        print_jump(out, c->code[(*pos)], (*pos) + 1), (*pos)++;
-    } else if (op == OP_RAW_LT_REAL_JUMP_IF_FALSE || op == OP_RAW_LTE_REAL_JUMP_IF_FALSE ||
-               op == OP_RAW_EQ_REAL_JUMP_IF_FALSE || op == OP_RAW_NEQ_REAL_JUMP_IF_FALSE) {
-        print_rawr(out, (int)UNPACK_B(op_word));
-        print_rawk_d(out, c, UNPACK_C(op_word));
-        print_jump(out, c->code[(*pos)], (*pos) + 1), (*pos)++;
-    } else {
-        return false;
-    }
-    return true;
-}
-/* indexing an array, in every checked, unchecked and raw combination */
-static bool disasm_indexing(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
-    if (op == OP_INDEX_GET || op == OP_TYPED_INDEX_GET_UNCHECKED) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_rk8(out, c, UNPACK_C(op_word));
-    } else if (op == OP_RAW_INT_TO_REAL) {
-        print_rawr(out, (int)UNPACK_A(op_word));
-        print_rawi(out, (int)UNPACK_B(op_word));
-    } else if (op == OP_RAW_REAL_TO_INT) {
-        print_rawi(out, (int)UNPACK_A(op_word));
-        print_rawr(out, (int)UNPACK_B(op_word));
-    } else if (op == OP_RAW_MATH_REAL) {
-        print_rawr(out, (int)UNPACK_A(op_word));
-        print_rawr(out, (int)UNPACK_B(op_word));
-        fprintf(out, "  fn_id=%u", UNPACK_C(op_word));
-    } else if (op == OP_INDEX_SET_RAW_INT || op == OP_INDEX_SET_RAW_REAL) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rk8(out, c, UNPACK_B(op_word));
-        if (op == OP_INDEX_SET_RAW_INT)
-            print_rawi(out, (int)UNPACK_C(op_word));
-        else
-            print_rawr(out, (int)UNPACK_C(op_word));
-    } else if (op == OP_INDEX_GET_RAW_INT || op == OP_INDEX_GET_RAW_REAL) {
-        if (op == OP_INDEX_GET_RAW_INT)
-            print_rawi(out, (int)UNPACK_A(op_word));
-        else
-            print_rawr(out, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_rk8(out, c, UNPACK_C(op_word));
-    } else if (op == OP_INDEX_SET || op == OP_TYPED_INDEX_SET_UNCHECKED) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rk8(out, c, UNPACK_B(op_word));
-        print_rk8(out, c, UNPACK_C(op_word));
-    } else if (op == OP_DESTRUCTURE) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
-    } else if (op == OP_SLICE_GET) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        uint32_t bounds_word = c->code[(*pos)++];
-        print_rk16(out, c, UNPACK_2X16_HI(bounds_word));
-        print_rk16(out, c, UNPACK_2X16_LO(bounds_word));
-    } else {
-        return false;
-    }
-    return true;
-}
-/* reading and writing a struct field, directly or through an index */
-static bool disasm_field(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
-    if (op == OP_FIELD_GET) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        int field_idx = (int)c->code[(*pos)++];
-        print_field(out, c, FLD_NAME, field_idx);
-    } else if (op == OP_FIELD_SET) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rk16(out, c, UNPACK_W16(op_word));
-        int field_idx = (int)c->code[(*pos)++];
-        print_field(out, c, FLD_NAME, field_idx);
-    } else if (op == OP_ARRAY_REPEAT) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_COUNT, (int)UNPACK_C(op_word));
-        uint32_t count_word = c->code[(*pos)++];
-        print_rk16(out, c, count_word & 0xFFFFU);
-    } else if (op == OP_INDEX_FIELD_GET) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        uint32_t field_rk_word = c->code[(*pos)++];
-        print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_rk_word));
-        print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
-    } else if (op == OP_INDEX_FIELD_SET) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rk16(out, c, UNPACK_W16(op_word));
-        uint32_t field_val_word = c->code[(*pos)++];
-        print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_val_word));
-        print_rk16(out, c, UNPACK_2X16_LO(field_val_word));
-    } else if (op == OP_INDEX_FIELD_GET_RAW_INT || op == OP_INDEX_FIELD_GET_RAW_REAL ||
-               op == OP_INDEX_FIELD_GET_RAW_INT32 || op == OP_INDEX_FIELD_GET_RAW_FLOAT32 ||
-               op == OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED || op == OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED ||
-               op == OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED ||
-               op == OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED) {
-        bool is_int =
-            (op == OP_INDEX_FIELD_GET_RAW_INT || op == OP_INDEX_FIELD_GET_RAW_INT32 ||
-             op == OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED || op == OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED);
-        if (is_int)
-            print_rawi(out, (int)UNPACK_A(op_word));
-        else
-            print_rawr(out, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        uint32_t field_rk_word = c->code[(*pos)++];
-        fprintf(out, "  off=%u", UNPACK_2X16_HI(field_rk_word));
-        print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
-    } else if (op == OP_FIELD_GET_RAW_INT || op == OP_FIELD_GET_RAW_REAL || op == OP_FIELD_GET_RAW_INT32 ||
-               op == OP_FIELD_GET_RAW_FLOAT32) {
-        bool is_int = (op == OP_FIELD_GET_RAW_INT || op == OP_FIELD_GET_RAW_INT32);
-        if (is_int)
-            print_rawi(out, (int)UNPACK_A(op_word));
-        else
-            print_rawr(out, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        unsigned int foffset = c->code[(*pos)++];
-        fprintf(out, "  off=%u", foffset);
-    } else if (op == OP_INDEX_FIELD_SET_RAW_INT || op == OP_INDEX_FIELD_SET_RAW_REAL ||
-               op == OP_INDEX_FIELD_SET_RAW_INT32 || op == OP_INDEX_FIELD_SET_RAW_FLOAT32 ||
-               op == OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED || op == OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED ||
-               op == OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED ||
-               op == OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED) {
-        bool is_int =
-            (op == OP_INDEX_FIELD_SET_RAW_INT || op == OP_INDEX_FIELD_SET_RAW_INT32 ||
-             op == OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED || op == OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED);
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rk16(out, c, UNPACK_W16(op_word));
-        uint32_t off_slot_word = c->code[(*pos)++];
-        fprintf(out, "  off=%u", UNPACK_2X16_HI(off_slot_word));
-        if (is_int)
-            print_rawi(out, (int)UNPACK_2X16_LO(off_slot_word));
-        else
-            print_rawr(out, (int)UNPACK_2X16_LO(off_slot_word));
-    } else if (op == OP_FIELD_SET_RAW_INT || op == OP_FIELD_SET_RAW_REAL || op == OP_FIELD_SET_RAW_INT32 ||
-               op == OP_FIELD_SET_RAW_FLOAT32) {
-        bool is_int = (op == OP_FIELD_SET_RAW_INT || op == OP_FIELD_SET_RAW_INT32);
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        unsigned int foffset = c->code[(*pos)++];
-        fprintf(out, "  off=%u", foffset);
-        int slot = (int)c->code[(*pos)++];
-        if (is_int)
-            print_rawi(out, slot);
-        else
-            print_rawr(out, slot);
-    } else if (op == OP_INDEX_FIELD_COMPOUND) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
-        uint32_t field_idx_word = c->code[(*pos)++];
-        print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_idx_word));
-        print_rk16(out, c, UNPACK_2X16_LO(field_idx_word));
-        uint32_t rhs_word = c->code[(*pos)++];
-        print_rk16(out, c, UNPACK_2X16_LO(rhs_word));
-    } else {
-        return false;
-    }
-    return true;
-}
-/* iterating, calling, and the forms that name something in the pool */
-static bool disasm_call(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
-    if (op == OP_ITER_NEXT_ARRAY) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
-        print_jump(out, c->code[(*pos)], (*pos) + 1);
-        (*pos)++;
-    } else if (op == OP_ITER_NEXT_PAIR || op == OP_ITER_RANGE_PREP || op == OP_ITER_RANGE_LOOP) {
-        /* 3 regs in word0, a 4th register its own trailing word, then a dedicated target word. */
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
-        int fourth_reg = (int)c->code[(*pos)++];
-        print_field(out, c, FLD_REG, fourth_reg);
-        print_jump(out, c->code[(*pos)], (*pos) + 1);
-        (*pos)++;
-    } else if (op == OP_CALL_VALUE || op == OP_TAIL_CALL_VALUE) {
-        /* callee_reg is never a patched target, so nothing else trails. */
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_COUNT, (int)UNPACK_C(op_word));
-        int callee_reg = (int)c->code[(*pos)++];
-        print_field(out, c, FLD_REG, callee_reg);
-    } else if (op == OP_UNARY) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
-        print_rk8(out, c, UNPACK_C(op_word));
-    } else if (op == OP_CAST) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_CAST, (int)UNPACK_B(op_word));
-        print_rk8(out, c, UNPACK_C(op_word));
-    } else if (op == OP_STRUCT_NEW) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_COUNT, (int)UNPACK_C(op_word));
-        int name_idx = (int)c->code[(*pos)++];
-        print_field(out, c, FLD_NAME, name_idx);
-    } else if (op == OP_CALL_MODULE) {
-        static const char* const call_module_id_names[] = {"math",  "random",     "string", "time",
-                                                           "json",  "collection", "net",    "regex",
-                                                           "actor", "scheduler",  "dynamic"};
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_COUNT, (int)UNPACK_C(op_word));
-        int module_idx = (int)c->code[(*pos)++];
-        int fn_idx = (int)c->code[(*pos)++];
-        print_field(out, c, FLD_NAME, module_idx);
-        print_field(out, c, FLD_NAME, fn_idx);
-        uint32_t ids_word = c->code[(*pos)++];
-        int module_id = (int)UNPACK_2X16_HI(ids_word);
-        int fn_id = (int16_t)UNPACK_2X16_LO(ids_word);
-        fprintf(out, "  id=%s fn_id=%d", call_module_id_names[module_id], fn_id);
-    } else if (op == OP_CALL_BUILTIN) {
-        static const char* const call_builtin_id_names[] = {"length", "print", "type",
-                                                            "assert", "panic", "Result"};
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_COUNT, (int)UNPACK_C(op_word));
-        int name_idx = (int)c->code[(*pos)++];
-        print_field(out, c, FLD_NAME, name_idx);
-        int builtin_id = (int)c->code[(*pos)++];
-        fprintf(out, "  id=%s", call_builtin_id_names[builtin_id]);
-    } else if (op == OP_FIELD_BINARY) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_BINOP, (int)UNPACK_C(op_word));
-        uint32_t field_rk_word = c->code[(*pos)++];
-        print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_rk_word));
-        print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
-    } else if (op == OP_FIELD_COMPOUND) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
-        uint32_t field_rk_word = c->code[(*pos)++];
-        print_field(out, c, FLD_NAME, (int)UNPACK_2X16_HI(field_rk_word));
-        print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
-    } else {
-        return false;
-    }
-    return true;
-}
-/* the raw slot arithmetic, where operands are slots rather than registers */
-static bool disasm_raw(FILE* out, Chunk* c, Opcode op, uint32_t op_word, unsigned int* pos) {
-    if (op == OP_TYPED_ARRAY_CHAIN2) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_C(op_word));
-        uint32_t word1 = c->code[(*pos)++];
-        print_field(out, c, FLD_BINOP, (int)UNPACK_2X16_HI(word1));
-        print_field(out, c, FLD_REG, (int)UNPACK_2X16_LO(word1));
-        uint32_t op2 = c->code[(*pos)++];
-        print_field(out, c, FLD_BINOP, (int)op2);
-    } else if (op == OP_RAW_LOAD_INT) {
-        print_rawi(out, (int)UNPACK_A(op_word));
-        int32_t imm = (int32_t)c->code[(*pos)++];
-        fprintf(out, "  imm=%d", imm);
-    } else if (op == OP_RAW_LOAD_REAL) {
-        print_rawr(out, (int)UNPACK_A(op_word));
-        fprintf(out, "  val=%g", c->rawk_d[c->code[(*pos)++]]);
-    } else if (op == OP_RAW_ADD_INT_K || op == OP_RAW_SUB_INT_K) {
-        print_rawi(out, (int)UNPACK_A(op_word));
-        print_rawi(out, (int)UNPACK_B(op_word));
-        fprintf(out, "  rawk_i=%lld", (long long)c->rawk_i[UNPACK_C(op_word)]);
-    } else if (op == OP_RAW_ADD_INT || op == OP_RAW_SUB_INT || op == OP_RAW_MUL_INT || op == OP_RAW_DIV_INT ||
-               op == OP_RAW_MOD_INT || op == OP_RAW_FLOOR_DIV_INT) {
-        /* OP_RAW_DIV_INT alone writes raw_reals[] (int/int division promotes) -- dest printer differs. */
-        if (op == OP_RAW_DIV_INT)
-            print_rawr(out, (int)UNPACK_A(op_word));
-        else
-            print_rawi(out, (int)UNPACK_A(op_word));
-        print_rawi(out, (int)UNPACK_B(op_word));
-        print_rawk_i(out, c, UNPACK_C(op_word));
-    } else if (op == OP_RAW_ADD_REAL || op == OP_RAW_SUB_REAL || op == OP_RAW_MUL_REAL ||
-               op == OP_RAW_DIV_REAL || op == OP_RAW_FMA_REAL || op == OP_RAW_FMS_REAL) {
-        print_rawr(out, (int)UNPACK_A(op_word));
-        print_rawr(out, (int)UNPACK_B(op_word));
-        print_rawk_d(out, c, UNPACK_C(op_word));
-    } else if (op == OP_RAW_LT_INT || op == OP_RAW_LTE_INT || op == OP_RAW_EQ_INT || op == OP_RAW_NEQ_INT) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rawi(out, (int)UNPACK_B(op_word));
-        print_rawk_i(out, c, UNPACK_C(op_word));
-    } else if (op == OP_RAW_LT_REAL || op == OP_RAW_LTE_REAL || op == OP_RAW_EQ_REAL ||
-               op == OP_RAW_NEQ_REAL) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rawr(out, (int)UNPACK_B(op_word));
-        print_rawk_d(out, c, UNPACK_C(op_word));
 
-    } else if (op == OP_UNBOX_INT) {
-        print_rawi(out, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-    } else if (op == OP_UNBOX_REAL) {
-        print_rawr(out, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_REG, (int)UNPACK_B(op_word));
-    } else if (op == OP_RAW_MOVE_INT) {
-        print_rawi(out, (int)UNPACK_A(op_word));
-        print_rawi(out, (int)UNPACK_B(op_word));
-    } else if (op == OP_RAW_MOVE_REAL) {
-        print_rawr(out, (int)UNPACK_A(op_word));
-        print_rawr(out, (int)UNPACK_B(op_word));
-    } else if (op == OP_FIELD_COMPOUND_RAW_FLOAT32_FMA) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rawr(out, (int)UNPACK_B(op_word));
-        print_rawr(out, (int)UNPACK_C(op_word));
-        fprintf(out, "  off=%u", c->code[(*pos)++]);
-    } else if (op == OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA) {
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_rawr(out, (int)UNPACK_B(op_word));
-        print_rawr(out, (int)UNPACK_C(op_word));
-        uint32_t w1 = c->code[(*pos)++];
-        fprintf(out, "  off=%u", UNPACK_2X16_HI(w1));
-        print_rk16(out, c, UNPACK_2X16_LO(w1));
-    } else if (op == OP_FIELD_COMPOUND_RAW_INT_ADD || op == OP_FIELD_COMPOUND_RAW_REAL_ADD ||
-               op == OP_FIELD_COMPOUND_RAW_INT32_ADD || op == OP_FIELD_COMPOUND_RAW_FLOAT32_ADD ||
-               op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_REAL ||
-               op == OP_FIELD_COMPOUND_RAW_INT32 || op == OP_FIELD_COMPOUND_RAW_FLOAT32) {
-        bool is_int = (op == OP_FIELD_COMPOUND_RAW_INT || op == OP_FIELD_COMPOUND_RAW_INT32 ||
-                       op == OP_FIELD_COMPOUND_RAW_INT_ADD || op == OP_FIELD_COMPOUND_RAW_INT32_ADD);
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
-        unsigned int foffset = c->code[(*pos)++];
-        fprintf(out, "  off=%u", foffset);
-        int slot = (int)c->code[(*pos)++];
-        if (is_int)
-            print_rawi(out, slot);
-        else
-            print_rawr(out, slot);
-    } else if (op == OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_REAL_ADD ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_ADD ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_INT || op == OP_INDEX_FIELD_COMPOUND_RAW_REAL ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_INT32 || op == OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32 ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED ||
-               op == OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED) {
-        bool is_int = (op == OP_INDEX_FIELD_COMPOUND_RAW_INT || op == OP_INDEX_FIELD_COMPOUND_RAW_INT32 ||
-                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED ||
-                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED ||
-                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT_ADD ||
-                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_ADD ||
-                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED_ADD ||
-                       op == OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED_ADD);
-        print_field(out, c, FLD_REG, (int)UNPACK_A(op_word));
-        print_field(out, c, FLD_BINOP, (int)UNPACK_B(op_word));
-        uint32_t field_rk_word = c->code[(*pos)++];
-        fprintf(out, "  off=%u", UNPACK_2X16_HI(field_rk_word));
-        print_rk16(out, c, UNPACK_2X16_LO(field_rk_word));
-        int slot = (int)c->code[(*pos)++];
-        if (is_int)
-            print_rawi(out, slot);
-        else
-            print_rawr(out, slot);
-    } else if (op == OP_RAW_LOAD_INT_POOL) {
-        print_rawi(out, (int)UNPACK_A(op_word));
-        fprintf(out, "  val=%lld", (long long)c->rawk_i[c->code[(*pos)++]]);
-    } else {
-        return false;
+    int field_count = (int)UNPACK_STRUCT_HEADER_COUNT(w0);
+    fprintf(out, "  name=%s fields=%d [",
+            pool_name_at(c, UNPACK_STRUCT_HEADER_NAME(w0)), field_count);
+    for (int i = 0; i < field_count; i++) {
+        uint32_t name_default_word = code_at(c, pos++);
+        /* Low byte is the ValueType tag, bit 0x100 the narrow (i/f-suffixed-literal) marker.
+           Masking is required, not cosmetic: indexing struct_field_type_names[] with the unmasked
+           word reads out of bounds the moment a narrow field's 0x100 bit is set. */
+        uint32_t ftype_word = code_at(c, pos++);
+        int ftype = (int)(ftype_word & 0xFF);
+        if (i > 0)
+            fprintf(out, ", ");
+        fprintf(out, "%s", pool_name_at(c, UNPACK_2X16_HI(name_default_word)));
+        if (ftype != TYPE_ANY)
+            fprintf(out, ": %s%s", name_or_q(struct_field_type_names, AER_LEN(struct_field_type_names), (uint32_t)ftype),
+                    (ftype_word & 0x100) ? " (narrow)" : "");
+        fprintf(out, "=");
+        print_pool_value(out, pool_at(c, UNPACK_2X16_LO(name_default_word)));
     }
-    return true;
+    fprintf(out, "]");
 }
 
 static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
-    uint32_t op_word = c->code[offset];
-    /* Full 8-bit mask must match DISPATCH()'s exactly -- opcode is unambiguously its own byte now. */
-    Opcode op = (Opcode)(op_word & 0xFF);
-    const OpInfo* info = &op_info[op];
+    uint32_t w0 = c->code[offset];
+    /* Full 8-bit mask must match DISPATCH()'s exactly -- opcode is unambiguously its own byte. */
+    Opcode op = (Opcode)(w0 & 0xFF);
+    const OpInfo* info = op_row(op);
+    if (!info) {
+        fprintf(out, "%6u  %-47s  unknown opcode byte in word %08x\n", offset, "?", w0);
+        return offset + 1;
+    }
     /* %-47s must stay >= the longest Opcode enum member's name (currently
        OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED, 45 chars) -- a shorter width doesn't truncate,
        it just lets that one line's description column start later than every other line's, since
@@ -969,36 +617,18 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
        exceeds it. */
     fprintf(out, "%6u  %-47s  %s", offset, opcode_name(op), info->desc);
 
-    unsigned int pos = offset + 1;
-    /* Each family prints the operands of the opcodes that share a shape; the last takes what is
-       left, which is every opcode whose operands the field table already describes. */
-    if (!disasm_interp(out, c, op, op_word, &pos) && !disasm_compare(out, c, op, op_word, &pos) &&
-        !disasm_indexing(out, c, op, op_word, &pos) && !disasm_field(out, c, op, op_word, &pos) &&
-        !disasm_call(out, c, op, op_word, &pos) && !disasm_raw(out, c, op, op_word, &pos)) {
-        /* Generic path -- the handful of opcodes whose fields all fit the plain PACK3 shape
-           (op+up to 3 byte fields) with nothing trailing, or nothing at all. */
-        int i = 0;
-        for (; i < info->packed; i++) {
-            int word = (i == 0)   ? (int)UNPACK_A(op_word)
-                       : (i == 1) ? (int)UNPACK_B(op_word)
-                                  : (int)UNPACK_C(op_word);
-            print_field(out, c, info->fields[i], word);
-        }
-        for (; i < MAX_FIELDS && info->fields[i] != FLD_END; i++) {
-            int word = (int)c->code[pos++];
-            if (info->fields[i] == FLD_JUMP)
-                print_jump(out, (uint32_t)word, pos);
-            else
-                print_field(out, c, info->fields[i], word);
-        }
-    }
+    if (info->variable)
+        print_variable_operands(out, c, offset, op);
+    else
+        for (int i = 0; i < MAX_OPERANDS && info->ops[i].fld != F_END; i++)
+            print_operand(out, c, offset, info->ops[i]);
 
     if (c->debug_hits && offset < c->debug_hits_cap && c->debug_hits[offset] > 0) {
         unsigned int line = chunk_line_for_offset(c, offset);
         fprintf(out, "   [hits=%llu, line=%u]", c->debug_hits[offset], line);
     }
     fprintf(out, "\n");
-    return pos;
+    return offset + instruction_words(c, offset);
 }
 
 typedef struct {
@@ -1021,6 +651,41 @@ static int cmp_line_count_desc(const void* a, const void* b) {
     return (ha < hb) - (ha > hb);
 }
 
+/* Line marks and (in a profile build) dispatch counts both name real instruction starts without
+   consulting op_info, so a row claiming too many words shows up as a start the walk stepped
+   over. A row claiming too few often escapes: the walk decodes the trailing word as a one-word
+   instruction and re-aligns on the next one. */
+static void report_encoding_desync(Chunk* c, FILE* out, const unsigned char* visited,
+                                   unsigned int walk_end) {
+    unsigned int bad = 0;
+    for (unsigned int i = 0; i < c->line_mark_count; i++) {
+        unsigned int off = c->line_mark_offsets[i];
+        if (off >= c->count || visited[off])
+            continue;
+        if (bad++ == 0)
+            fprintf(out, "\n--- ENCODING DESYNC ---\n");
+        if (bad <= 8)
+            fprintf(out, "  offset %u begins source line %u but the walk steps over it\n", off,
+                    c->line_mark_lines[i]);
+    }
+    if (c->debug_hits)
+        for (unsigned int i = 0; i < c->debug_hits_cap && i < c->count; i++) {
+            if (c->debug_hits[i] == 0 || visited[i])
+                continue;
+            if (bad++ == 0)
+                fprintf(out, "\n--- ENCODING DESYNC ---\n");
+            if (bad <= 8)
+                fprintf(out, "  offset %u was dispatched but the walk steps over it\n", i);
+        }
+    if (walk_end != c->count) {
+        if (bad++ == 0)
+            fprintf(out, "\n--- ENCODING DESYNC ---\n");
+        fprintf(out, "  the walk ended at word %u, not this chunk's %u\n", walk_end, c->count);
+    }
+    if (bad > 8)
+        fprintf(out, "  ... and %u more\n", bad - 8);
+}
+
 void aer_disassemble(Chunk* c, FILE* out) {
     fprintf(out, "--- disassembly (%u words) ---\n", c->count);
     /* The leading number on each line below is that instruction's own WORD offset into this
@@ -1029,36 +694,25 @@ void aer_disassemble(Chunk* c, FILE* out) {
        instruction it lands on. */
     fprintf(out,
             "(leading number = word offset into code[]; jump targets \"-> N\" refer to this same offset)\n");
-    unsigned int offset = 0;
-    while (offset < c->count)
-        offset = disassemble_one(c, offset, out);
 
-    if (!c->debug_hits)
-        return; /* static-only dump if no run happened yet */
+    uint64_t op_totals[OP_INFO_MAX + 1] = {0};
+    unsigned char* visited = xcalloc(c->count ? c->count : 1, 1);
+    unsigned int offset = 0;
+    while (offset < c->count) {
+        visited[offset] = 1;
+        if (c->debug_hits && offset < c->debug_hits_cap)
+            op_totals[c->code[offset] & 0xFF] += c->debug_hits[offset];
+        offset = disassemble_one(c, offset, out);
+    }
+
+    if (!c->debug_hits) { /* static-only dump if no run happened yet */
+        report_encoding_desync(c, out, visited, offset);
+        free(visited);
+        return;
+    }
 
     NamedCount by_op[OP_INFO_MAX + 1];
     int by_op_count = 0;
-    uint64_t op_totals[OP_INFO_MAX + 1] = {0};
-    offset = 0;
-    while (offset < c->count) {
-        Opcode op = (Opcode)(c->code[offset] & 0xFF);
-        if (offset < c->debug_hits_cap)
-            op_totals[op] += c->debug_hits[offset];
-        const OpInfo* info = &op_info[op];
-        unsigned int next;
-        if (op == OP_INTERP) {
-            next = offset + 1 + UNPACK_B(c->code[offset]);
-        } else if (op == OP_INDEX_GET_INTERP) {
-            next = offset + 1 + UNPACK_C(c->code[offset]);
-        } else if (info->variable) {
-            uint32_t header = c->code[offset];
-            int field_count = (int)UNPACK_STRUCT_HEADER_COUNT(header);
-            next = offset + 1 + (unsigned int)field_count * 2;
-        } else {
-            next = offset + 1 + (unsigned int)info->trailing_words;
-        }
-        offset = next;
-    }
     for (int i = 0; i <= OP_INFO_MAX; i++)
         if (op_totals[i] > 0)
             by_op[by_op_count++] = (NamedCount){opcode_name(i), op_totals[i]};
@@ -1093,6 +747,9 @@ void aer_disassemble(Chunk* c, FILE* out) {
     for (int i = 0; i < by_line_count; i++)
         fprintf(out, "  line %-6u %llu\n", by_line[i].line, by_line[i].hits);
     free(by_line);
+
+    report_encoding_desync(c, out, visited, offset);
+    free(visited);
 }
 
 /* Per-pool memory report                                              */

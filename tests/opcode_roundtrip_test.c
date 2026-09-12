@@ -256,6 +256,29 @@ int main(void) {
         chunk_free(&c);
     }
 
+    /* OP_LOADK's pool index fills word0's whole upper halfword, so it reads back with UNPACK_W16
+       and not UNPACK_B. Disassembling rather than unpacking is the point: a truncated index there
+       names the wrong constant instead of failing, and two gate tools read that dump as the
+       record of what a program emitted. */
+    {
+        Chunk c = new_chunk();
+        for (int i = 0; i < 300; i++)
+            chunk_add_pool(&c, aer_int(i));
+        chunk_emit(&c, PACK_OP_A_W16(OP_LOADK, 5, 299));
+        chunk_emit(&c, PACK1(OP_HALT, 0));
+        char text[4096] = {0};
+        FILE* dump = tmpfile();
+        if (dump) {
+            aer_disassemble(&c, dump);
+            rewind(dump);
+            fread(text, 1, sizeof(text) - 1, dump);
+            fclose(dump);
+        }
+        check(strstr(text, "reg=5") && strstr(text, "val=299"),
+              "OP_LOADK: a pool index past 255 disassembles to its own constant, not a truncated one");
+        chunk_free(&c);
+    }
+
     printf("\n%s\n", failures == 0 ? "All opcode round-trip tests passed." : "SOME OPCODE ROUND-TRIP TESTS FAILED.");
     return failures == 0 ? 0 : 1;
 }
