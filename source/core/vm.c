@@ -403,6 +403,8 @@ void vm_init(VM* vm, Chunk* chunk) {
         xmalloc(sizeof(AerVal) * REGISTER_STACK_INITIAL_FRAMES * FRAME_REGISTERS);
     vm->call_stack = xcalloc(REGISTER_STACK_INITIAL_FRAMES, sizeof(CallFrame));
     vm->call_depth_limit = REGISTER_STACK_INITIAL_FRAMES;
+    vm->register_capacity = (size_t)REGISTER_STACK_INITIAL_FRAMES * FRAME_REGISTERS;
+    vm->push_base_limit = vm->register_stack + (vm->register_capacity - FRAME_REGISTERS);
     vm->call_stack[0].registers = &vm->register_stack[0];
     vm->call_stack[0].frame_size = FRAME_REGISTERS;
     /* Top level gets no gap: its real slots come off the top of the same bank the collector has to
@@ -460,6 +462,8 @@ void vm_free(VM* vm) {
     free(vm->call_stack);
     vm->call_stack = NULL;
     vm->call_depth_limit = 0;
+    vm->register_capacity = 0;
+    vm->push_base_limit = NULL;
 }
 
 void aer_vm_reset_for_reuse(VM* vm) {
@@ -1119,25 +1123,35 @@ static AerVal vm_default_value(VM* vm, AerVal dflt) {
    in target->call_stack[0].registers[0]. */
 /* Call setup                                                       */
 
-/* False means the depth ceiling itself was reached, which is the caller's overflow error. */
-static bool vm_grow_registers(VM* vm) {
-    if (vm->call_depth_limit >= VM_CALL_MAX)
-        return false;
-    int old_frames = vm->call_depth_limit;
-    int frames = old_frames * 2;
-    if (frames > VM_CALL_MAX)
-        frames = VM_CALL_MAX;
-    AerVal* old_bank = vm->register_stack;
-    AerVal* bank = xmalloc((size_t)frames * FRAME_REGISTERS * sizeof(AerVal));
-    memcpy(bank, old_bank, (size_t)old_frames * FRAME_REGISTERS * sizeof(AerVal));
-    vm->call_stack = xrealloc(vm->call_stack, (size_t)frames * sizeof(CallFrame));
-    memset(vm->call_stack + old_frames, 0, (size_t)(frames - old_frames) * sizeof(CallFrame));
-    /* Rebased against the old bank while it is still allocated, so no offset has to be stashed. */
-    for (int i = 0; i <= vm->call_depth; i++)
-        vm->call_stack[i].registers = bank + (vm->call_stack[i].registers - old_bank);
-    free(old_bank);
-    vm->register_stack = bank;
-    vm->call_depth_limit = frames;
+/* Makes room for a frame starting at base: a free call-stack entry, and FRAME_REGISTERS slots of bank
+   from base. False only when the depth ceiling is reached, the caller's overflow error. Growing the
+   bank moves every frame's registers, so the caller recomputes anything it derived from them. */
+static bool vm_grow_for_push(VM* vm, AerVal* base) {
+    if (vm->call_depth + 1 >= vm->call_depth_limit) {
+        if (vm->call_depth_limit >= VM_CALL_MAX)
+            return false;
+        int old_frames = vm->call_depth_limit;
+        int frames = old_frames * 2 > VM_CALL_MAX ? VM_CALL_MAX : old_frames * 2;
+        vm->call_stack = xrealloc(vm->call_stack, (size_t)frames * sizeof(CallFrame));
+        memset(vm->call_stack + old_frames, 0, (size_t)(frames - old_frames) * sizeof(CallFrame));
+        vm->call_depth_limit = frames;
+    }
+    size_t needed = (size_t)(base - vm->register_stack) + FRAME_REGISTERS;
+    if (needed > vm->register_capacity) {
+        size_t capacity = vm->register_capacity * 2;
+        while (capacity < needed)
+            capacity *= 2;
+        AerVal* old_bank = vm->register_stack;
+        AerVal* bank = xmalloc(capacity * sizeof(AerVal));
+        memcpy(bank, old_bank, vm->register_capacity * sizeof(AerVal));
+        /* Rebased against the old bank while it is still allocated, so no offset has to be stashed. */
+        for (int i = 0; i <= vm->call_depth; i++)
+            vm->call_stack[i].registers = bank + (vm->call_stack[i].registers - old_bank);
+        free(old_bank);
+        vm->register_stack = bank;
+        vm->register_capacity = capacity;
+        vm->push_base_limit = bank + (capacity - FRAME_REGISTERS);
+    }
     return true;
 }
 
@@ -1150,13 +1164,17 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
                   arg_count);
         return false;
     }
-    if (target->call_depth + 1 >= target->call_depth_limit && !vm_grow_registers(target)) {
-        error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
-        return false;
-    }
     CallFrame* caller = &target->call_stack[target->call_depth];
-    CallFrame* callee = &target->call_stack[target->call_depth + 1];
     AerVal* callee_regs = caller->registers + caller->frame_size;
+    if (target->call_depth + 1 >= target->call_depth_limit || callee_regs > target->push_base_limit) {
+        if (!vm_grow_for_push(target, callee_regs)) {
+            error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
+            return false;
+        }
+        caller = &target->call_stack[target->call_depth];
+        callee_regs = caller->registers + caller->frame_size;
+    }
+    CallFrame* callee = caller + 1;
     callee->registers = callee_regs;
     callee->frame_size = fn->max_registers;
     for (int i = 0; i < arg_count; i++)
@@ -1219,12 +1237,15 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
         reused->tail_calls_collapsed++;
         return;
     }
-    if (vm->call_depth + 1 >= vm->call_depth_limit && !vm_grow_registers(vm)) {
-        return error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
-    }
     CallFrame* caller = &vm->call_stack[vm->call_depth];
-    CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
     AerVal* callee_regs = caller->registers + caller->frame_size;
+    if (vm->call_depth + 1 >= vm->call_depth_limit || callee_regs > vm->push_base_limit) {
+        if (!vm_grow_for_push(vm, callee_regs))
+            return error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
+        caller = &vm->call_stack[vm->call_depth];
+        callee_regs = caller->registers + caller->frame_size;
+    }
+    CallFrame* callee = caller + 1;
     callee->registers = callee_regs;
     callee->frame_size = f->max_registers;
     for (int i = 0; i < arg_count; i++)
@@ -3238,12 +3259,20 @@ HANDLER(call)
        power of two, so indexing cost a multiply on every call. */
     unsigned int func_byte_offset = (unsigned int)READ();
     ChunkFunction* target_f = (ChunkFunction*)((char*)c->functions + func_byte_offset);
-    if (vm->call_depth + 1 >= vm->call_depth_limit) {
-        if (!vm_grow_registers(vm)) {
+    /* `registers` is the hoisted copy of this same frame's base -- every site that changes frames
+       reassigns it -- so reading it back out of the frame is a redundant dependent load on the
+       hottest path in the interpreter. Resolution below never touches the bank, so the base is
+       final here. */
+    AerVal* callee_regs = registers + vm->call_stack[vm->call_depth].frame_size;
+    if (vm->call_depth + 1 >= vm->call_depth_limit || callee_regs > vm->push_base_limit) {
+        if (!vm_grow_for_push(vm, callee_regs)) {
             error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
             DISPATCH();
         }
-        registers = vm->call_stack[vm->call_depth].registers; /* the bank moved */
+        /* Nothing is written yet, so the call reruns from its first word against the grown bank.
+           Rebasing locals here instead keeps them live through the handler, and every call pays
+           for that in spilled registers. */
+        __attribute__((musttail)) return h_call(vm, pc - 2, vm->call_stack[vm->call_depth].registers, c);
     }
 
     /* Gated on shape_sensitive_mask (zero for most functions, one already-fetched field) rather than
@@ -3273,11 +3302,7 @@ HANDLER(call)
     }
 
     CallFrame* caller = &vm->call_stack[vm->call_depth];
-    CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
-    /* `registers` is the hoisted copy of this same frame's base -- every site that changes frames
-       reassigns it -- so reading it back out of `caller` is a redundant dependent load on the
-       hottest path in the interpreter. */
-    AerVal* callee_regs = registers + caller->frame_size;
+    CallFrame* callee = caller + 1;
     /* Every scalar field first, so pc, c, dest_reg and chosen_offset stop being live across the
        two loops below. The compiler cannot sink them itself: call_stack and the register bank are
        separate allocations, but nothing in the types says so. */
@@ -3384,18 +3409,19 @@ HANDLER(call_self)
     int dest_reg = (int)UNPACK_A(op_word);
     int arg_reg_base = (int)UNPACK_B(op_word);
     int arg_count = (int)UNPACK_C(op_word);
-    if (vm->call_depth + 1 >= vm->call_depth_limit) {
-        if (!vm_grow_registers(vm)) {
-            error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
-            DISPATCH();
-        }
-        registers = vm->call_stack[vm->call_depth].registers; /* the bank moved */
-    }
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = caller + 1;
     unsigned int fsz = caller->frame_size, entry = caller->code_offset;
     unsigned short bounds = caller->frame_bounds;
     AerVal* callee_regs = registers + fsz;
+    if (vm->call_depth + 1 >= vm->call_depth_limit || callee_regs > vm->push_base_limit) {
+        if (!vm_grow_for_push(vm, callee_regs)) {
+            error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
+            DISPATCH();
+        }
+        /* Same rerun as h_call's, and for the same reason. */
+        __attribute__((musttail)) return h_call_self(vm, pc, vm->call_stack[vm->call_depth].registers, c);
+    }
     /* Every scalar field first, so pc, c, dest_reg and entry stop being live across the two loops
        below. The compiler cannot sink them itself: call_stack and the register bank are separate
        allocations, but nothing in the types says so. */

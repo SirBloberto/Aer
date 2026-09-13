@@ -821,7 +821,7 @@ typedef struct {
 
 /* Per-call register frame; each VM owns its own chain, so a nested module VM gets its own. */
 typedef struct {
-    /* The anonymous union pads sizeof(CallFrame) up to 64 without raising its ALIGNMENT. _Alignas(64)
+    /* The anonymous union pads sizeof(CallFrame) up to 32 without raising its ALIGNMENT. _Alignas(32)
        was the obvious way to get that size and is wrong: the requirement propagates to struct VM,
        which aer_module.c -- and any embedder -- allocates with plain malloc, only 8-byte aligned.
        Every module VM was undefined behaviour; UBSan caught it. Only the size matters here. */
@@ -882,11 +882,14 @@ typedef struct {
        active frame's registers here: mark_vm_roots scans call_stack[f].registers directly, so a
        mirror would cost three stores per call and per return to serve no hot reader. */
     int call_depth;
-    /* Depth the call stack and register bank can currently seat -- always <= VM_CALL_MAX. Every
-       push already had to test call_depth against a ceiling, so growing costs no test of its own:
-       this one stands in for the constant, and the cold side decides grow-or-overflow. */
+    /* Frames the call stack can currently seat -- always <= VM_CALL_MAX. It stands in for the constant
+       in the depth test every push already makes, and the cold side decides grow-or-overflow. */
     int call_depth_limit;
     CallFrame* call_stack;
+    /* The highest base a new frame may start at: FRAME_REGISTERS short of the bank's end, the most any
+       frame's tagging touches whatever its bounds say. A tail call reuses a base that already passed
+       this test and the bank only grows, so pushes are the only thing that checks it. */
+    AerVal* push_base_limit;
 
     Chunk* chunk;
     unsigned int ip;
@@ -924,10 +927,10 @@ typedef struct {
        rather than reserved: inline at full size this was 93% of sizeof(VM), and every actor and
        every imported module allocates a VM. */
     AerVal* register_stack;
+    size_t register_capacity; /* slots in register_stack */
 } VM;
 
-/* Frames the call stack and bank seat before their first growth. A frame consumes at most
-   FRAME_REGISTERS, so the bank's capacity is always call_depth_limit * FRAME_REGISTERS. */
+/* Frames the call stack seats, and full-size frames the bank holds, before either first grows. */
 #define REGISTER_STACK_INITIAL_FRAMES 2
 
 /* Bounds-checked push/pop for native-module files, outside vm_run's PUSH()/POP() macros. */

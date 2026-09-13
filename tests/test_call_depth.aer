@@ -1,9 +1,13 @@
 #!/usr/bin/env aer
 # AER test suite — non-tail recursion depth.
 #
-# The call stack and register bank start small and grow as recursion deepens, moving every live
-# frame's registers each time. Each case checks its arithmetic, so a frame rebased to the wrong place
-# shows up as a wrong number, and the allocating cases make the collector walk those frames mid-way.
+# The call stack grows by frames and the register bank by the registers frames actually occupy, and
+# growing the bank moves every live frame. Each case checks its arithmetic, so a frame rebased to the
+# wrong place shows up as a wrong number, and the allocating cases make the collector walk those
+# frames mid-way.
+
+import actor
+import scheduler
 
 marker = 12345
 
@@ -14,6 +18,128 @@ function depth(n):
 
 assert(depth(9000) == 9000, "non-tail recursion 9,000 deep")
 assert(depth(9000) == 9000, "again, with the stack already grown")
+
+function wide(n):
+    if n <= 0:
+        return 0
+    v0 = n + 0
+    v1 = n + 1
+    v2 = n + 2
+    v3 = n + 3
+    v4 = n + 4
+    v5 = n + 5
+    v6 = n + 6
+    v7 = n + 7
+    v8 = n + 8
+    v9 = n + 9
+    v10 = n + 10
+    v11 = n + 11
+    v12 = n + 12
+    v13 = n + 13
+    v14 = n + 14
+    v15 = n + 15
+    v16 = n + 16
+    v17 = n + 17
+    v18 = n + 18
+    v19 = n + 19
+    v20 = n + 20
+    v21 = n + 21
+    v22 = n + 22
+    v23 = n + 23
+    v24 = n + 24
+    v25 = n + 25
+    v26 = n + 26
+    v27 = n + 27
+    v28 = n + 28
+    v29 = n + 29
+    v30 = n + 30
+    v31 = n + 31
+    v32 = n + 32
+    v33 = n + 33
+    v34 = n + 34
+    v35 = n + 35
+    v36 = n + 36
+    v37 = n + 37
+    v38 = n + 38
+    v39 = n + 39
+    return wide(n - 1) + v39 - v0 - 38
+
+assert(wide(4000) == 4000, "frames holding 40 locals each, 4,000 deep")
+
+# A tiny frame deep in the stack tail-calls a function that needs far more registers than it holds.
+# The reused base passed its push test with room for any frame, so the tail call checks nothing.
+function big_leaf(n):
+    a0 = n + 0
+    a1 = n + 1
+    a2 = n + 2
+    a3 = n + 3
+    a4 = n + 4
+    a5 = n + 5
+    a6 = n + 6
+    a7 = n + 7
+    a8 = n + 8
+    a9 = n + 9
+    a10 = n + 10
+    a11 = n + 11
+    a12 = n + 12
+    a13 = n + 13
+    a14 = n + 14
+    a15 = n + 15
+    a16 = n + 16
+    a17 = n + 17
+    a18 = n + 18
+    a19 = n + 19
+    a20 = n + 20
+    a21 = n + 21
+    a22 = n + 22
+    a23 = n + 23
+    a24 = n + 24
+    a25 = n + 25
+    a26 = n + 26
+    a27 = n + 27
+    a28 = n + 28
+    a29 = n + 29
+    a30 = n + 30
+    a31 = n + 31
+    a32 = n + 32
+    a33 = n + 33
+    a34 = n + 34
+    a35 = n + 35
+    a36 = n + 36
+    a37 = n + 37
+    a38 = n + 38
+    a39 = n + 39
+    return a39 - 39
+
+function tiny(n):
+    if n <= 0:
+        return big_leaf(7)
+    return tiny(n - 1) + 1
+
+assert(tiny(5000) == 5007, "a tail call from a tiny frame into a large one, 5,000 deep")
+
+# A real-valued local makes a frame full size; alternate full-size and small frames.
+function real_step(n):
+    if n <= 0:
+        return 0.0
+    half = 0.5
+    return int_step(n - 1) + half
+
+function int_step(n):
+    if n <= 0:
+        return 0.0
+    return real_step(n - 1) + 0.5
+
+assert(real_step(6000) == 3000.0, "full-size and small frames alternating, 6,000 deep")
+
+# Called through a value rather than by name, which pushes through a different path.
+function by_value(n):
+    if n <= 0:
+        return 0
+    f = by_value
+    return f(n - 1) + 1
+
+assert(by_value(4000) == 4000, "recursion through a function value, 4,000 deep")
 
 struct Node:
     value = 0
@@ -44,6 +170,13 @@ function mixed(n, acc):
     return mixed(n - 1, acc) + 0
 
 assert(mixed(5000, 0) == 50, "tail and non-tail calls interleaved")
+
+# An actor's VM has its own call stack and bank, entered through setup_call rather than h_call.
+worker, spawn_err = actor.spawn("tests/call_depth_worker.aer")
+assert(spawn_err == null, "spawn the recursion worker")
+scheduler.add(worker, "deep", 7000)
+answers = scheduler.run()
+assert(answers[0] == 7000, "7,000-deep recursion inside an actor")
 
 assert(marker == 12345, "a top-level variable survives the bank moving underneath it")
 

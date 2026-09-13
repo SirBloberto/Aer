@@ -1,0 +1,5 @@
+# Recursion worker for tests/test_call_depth.aer: its frames grow the actor VM's own call stack.
+function deep(n):
+    if n <= 0:
+        return 0
+    return deep(n - 1) + 1

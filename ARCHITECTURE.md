@@ -320,7 +320,7 @@ of whether that function used any raw locals at all, `CallFrame` growing past a
 `_Static_assert(sizeof(CallFrame) <= 96, ...)` regression guard left specifically to catch this
 coming back), plus `frame_size`/`raw_int_frame_size`/`raw_real_frame_size` (this callee's own
 compile-time peak), `return_ip`/`dest_reg`, `code_offset` (for stack traces), and
-`tail_calls_collapsed`. `VM.call_stack` is a heap array of these, grown on demand up to `VM_CALL_MAX` (10,000) frames;
+`tail_calls_collapsed`. `VM.call_stack` is a heap array of these, grown on demand up to `VM_CALL_MAX` (10,000) frames, and the register bank beside it grows by the registers frames actually occupy (5.67);
 `vm->registers` is a **pointer repointed at the current frame** on every
 call/return (not re-derived from `call_depth` on every access) — a tail call reuses the current
 frame in place, so it's the one case that needs *no* repointing.
@@ -3811,3 +3811,33 @@ h_tail_call would install the generic function's.
 Specializing everything on its first call made 600 once-called functions with short loops cost 47ms
 instead of 0.3ms, while a single 20M-iteration loop gained 17%. Helping a function called once needs
 loop hotness, which means on-stack replacement, not a static "has a loop" test.
+
+### 5.67 Call depth 10,000, and a register bank sized by use
+
+Non-tail recursion was capped at 64 frames, which stops a tree walk or a recursive-descent parser
+on ordinary input. AER-to-AER calls never touch the C stack under tail-call dispatch, so the cap only
+bounds what a runaway recursion can allocate; it is now 10,000.
+
+Raising the constant alone would have grown every VM -- `call_stack` was an inline array, and every
+actor and imported module owns a VM. It moved to the heap and grows on demand, which made `sizeof(VM)`
+~2KB smaller. The register bank then had to stop reserving `FRAME_REGISTERS` per frame: at that rate
+a 9,000-deep recursion peaked at 38MB whatever its frames held, because growth briefly keeps the old
+and new banks together.
+
+**The rule:** a push needs `FRAME_REGISTERS` slots of bank from its base, the most any frame's tagging
+can touch whatever its bounds claim -- hand-built chunks carry placeholder bounds wider than their
+frame. Tail calls reuse a base that already passed that test and the bank only grows, so they check
+nothing. After growing, `h_call` and `h_call_self` rerun the instruction with a tail call to
+themselves rather than rebasing their locals: rebasing kept those locals live through the handler and
+raised `h_call_self` from 3 callee-saved pushes to 8 on every call.
+
+| peak working set | frames x 128 | sized by use |
+|---|---|---|
+| idle VM / 200 actors | 4.8MB / 12.2MB | unchanged |
+| small frames, 4,000 / 9,000 deep | 13.8MB / 38.4MB | 5.7MB / 6.6MB |
+| 40-local frames, 4,000 / 9,000 deep | 13.1MB / 37.8MB | 9.8MB / 13.9MB |
+
+The second capacity test costs fib_bench **+1.96%** sign-stable over five layouts -- one more load,
+compare and branch on each of its 29.8M calls -- with binary_trees, nbody, mandelbrot and sieve within
+noise. Removing it would mean storing frames inside the bank so one test covers both, a larger change.
+The high-water mark is kept until the VM is freed.
