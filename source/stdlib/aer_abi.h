@@ -98,10 +98,8 @@ enum { AER_NATIVE_MODULES(AER_MODULE_ID) CALL_MODULE_DYNAMIC };
 #define FN_COLLECTION_MAX 10
 #define FN_COLLECTION_GROUP_SUM 11
 /* Compiler-emitted only, so absent from the parser's name lookup: a fused array expression under
-   sum() or group_sum(), and the group_sum that ADDS into an array the caller already has (returning
-   a fresh one would rebind the name and change what every other reference to it sees). */
+   sum() or group_sum(). */
 #define FN_COLLECTION_SUM_CHAIN 12
-#define FN_COLLECTION_GROUP_SUM_INTO 13
 #define FN_COLLECTION_GROUP_SUM_CHAIN 14
 
 #define FN_NET_CONNECT 0
