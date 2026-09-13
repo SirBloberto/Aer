@@ -2937,6 +2937,9 @@ static const OpHandler aer_handlers[256];
         const uint32_t op_word = pc[-1];                                                                     \
         (void)op_word;
 
+/* noinline, or the compiler folds it back into its tail caller along with the registers its calls save. */
+#define SEPARATE_HANDLER(name) __attribute__((noinline)) HANDLER(name)
+
 #define READ() (*pc++)
 #define PUSH(v)                                                                                              \
     do {                                                                                                     \
@@ -3083,12 +3086,19 @@ HANDLER(is_result)
 /* `result` points straight at the destination register -- building a local AerVal and copying
    it measured as a 16-byte stack round-trip that was the single hottest instruction in the
    nbody profile. Safe even when dest aliases ra/rb (l/rv already snapshotted by value). */
-/* Only in the vm_binary_cold() branch -- every int/int and real/real fast-path result is a
-   plain tagged-union construction, never an allocation. */
+/* Only the _any_values handlers collect: an int/int or real/real result never allocates. */
+#define BINARY_OP_ANY_VALUES(NAME, OPENUM)                                                                   \
+    SEPARATE_HANDLER(NAME##_any_values)                                                                      \
+        AerVal* ra = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));                                   \
+        AerVal* rb = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));                                   \
+        registers[UNPACK_A(op_word)] = vm_binary_cold(c, *ra, *rb, OPENUM, ra->tag, rb->tag);                \
+        gc_maybe_collect(vm);                                                                                \
+        DISPATCH();                                                                                          \
+    }
 #define BINARY_OP_INT_REAL(NAME, OPENUM, INT_STMT, REAL_STMT)                                                \
+    BINARY_OP_ANY_VALUES(NAME, OPENUM)                                                                       \
     static VmSliceResult h_##NAME(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {                 \
         const uint32_t op_word = pc[-1];                                                                     \
-        (void)op_word;                                                                                       \
         int dest = (int)UNPACK_A(op_word);                                                                   \
         AerVal* ra = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));                                   \
         AerVal* rb = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));                                   \
@@ -3101,26 +3111,23 @@ HANDLER(is_result)
             double l = ra->as.d, rv = rb->as.d;                                                              \
             REAL_STMT                                                                                        \
         } else {                                                                                             \
-            *result = vm_binary_cold(c, *ra, *rb, OPENUM, ta, tb);                                           \
-            gc_maybe_collect(vm);                                                                            \
+            __attribute__((musttail)) return h_##NAME##_any_values(vm, pc, registers, c);                    \
         }                                                                                                    \
         DISPATCH();                                                                                          \
     }
-/* Bitwise family never allocates in any branch, so no gc_maybe_collect at all. */
 #define BINARY_OP_INT_ONLY(NAME, OPENUM, INT_STMT)                                                           \
+    BINARY_OP_ANY_VALUES(NAME, OPENUM)                                                                       \
     static VmSliceResult h_##NAME(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {                 \
         const uint32_t op_word = pc[-1];                                                                     \
-        (void)op_word;                                                                                       \
         int dest = (int)UNPACK_A(op_word);                                                                   \
         AerVal* ra = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));                                   \
         AerVal* rb = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));                                   \
-        ValueType ta = ra->tag, tb = rb->tag;                                                                \
         AerVal* result = &registers[dest];                                                                   \
-        if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) {                                                      \
+        if (ra->tag == TYPE_INTEGER && rb->tag == TYPE_INTEGER) {                                            \
             int64_t l = ra->as.i, rv = rb->as.i;                                                             \
             INT_STMT                                                                                         \
         } else {                                                                                             \
-            *result = vm_binary_cold(c, *ra, *rb, OPENUM, ta, tb);                                           \
+            __attribute__((musttail)) return h_##NAME##_any_values(vm, pc, registers, c);                    \
         }                                                                                                    \
         DISPATCH();                                                                                          \
     }
@@ -3189,6 +3196,7 @@ HANDLER(is_result)
 
 #undef BINARY_OP_INT_REAL
 #undef BINARY_OP_INT_ONLY
+#undef BINARY_OP_ANY_VALUES
 
 /* Fused comparison-and-branch (vm.h's own comment on OP_LT_JUMP_IF_FALSE et al. has the full
    rationale) -- no destination register at all, the truth value is consumed immediately by the
@@ -3197,13 +3205,19 @@ HANDLER(is_result)
    result never allocates, on any operand type, so there is nothing here for a collection to ever
    need to run for. */
 #define CMP_JUMP_IF_FALSE(NAME, OPENUM, INT_CMP, REAL_CMP)                                                   \
+    SEPARATE_HANDLER(NAME##_jump_if_false_any_values)                                                        \
+        AerVal* ra = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));                                   \
+        AerVal* rb = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));                                   \
+        int target = READ();                                                                                 \
+        if (!vm_truthy(vm_binary_cold(c, *ra, *rb, OPENUM, ra->tag, rb->tag)))                               \
+            pc += (int32_t)target;                                                                           \
+        DISPATCH();                                                                                          \
+    }                                                                                                        \
     static VmSliceResult h_##NAME##_jump_if_false(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) { \
         const uint32_t op_word = pc[-1];                                                                     \
-        (void)op_word;                                                                                       \
         AerVal* ra = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));                                   \
         AerVal* rb = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));                                   \
         ValueType ta = ra->tag, tb = rb->tag;                                                                \
-        int target = READ();                                                                                 \
         bool cond;                                                                                           \
         if (ta == TYPE_INTEGER && tb == TYPE_INTEGER) {                                                      \
             int64_t l = ra->as.i, rv = rb->as.i;                                                             \
@@ -3212,8 +3226,9 @@ HANDLER(is_result)
             double l = ra->as.d, rv = rb->as.d;                                                              \
             cond = (REAL_CMP);                                                                               \
         } else {                                                                                             \
-            cond = vm_truthy(vm_binary_cold(c, *ra, *rb, OPENUM, ta, tb));                                   \
+            __attribute__((musttail)) return h_##NAME##_jump_if_false_any_values(vm, pc, registers, c);      \
         }                                                                                                    \
+        int target = READ();                                                                                 \
         if (!cond)                                                                                           \
             pc += (int32_t)target;                                                                           \
         DISPATCH();                                                                                          \
@@ -3597,12 +3612,16 @@ HANDLER(typed_index_get_unchecked)
     int arr_reg = (int)UNPACK_B(op_word);
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     AerVal obj = registers[arr_reg];
-    if (aer_type(obj) != TYPE_TYPED_ARRAY) {
-        vm_index_get_compute(obj, *idx, &registers[dest_reg]);
-        if (aer_type(obj) == TYPE_STRING)
-            gc_maybe_collect(vm); /* matches h_index_get's own post-compute step */
+    if (aer_type(obj) == TYPE_ARRAY) {
+        /* A plain array can shrink inside the loop, so the proof covers only a typed one's index. */
+        AerArray* a = aer_as_array(obj);
+        if (a->shape || idx->tag != TYPE_INTEGER || (uint64_t)idx->as.i >= a->count)
+            __attribute__((musttail)) return h_index_get(vm, pc, registers, c);
+        registers[dest_reg] = a->items[idx->as.i];
         DISPATCH();
     }
+    if (aer_type(obj) != TYPE_TYPED_ARRAY)
+        __attribute__((musttail)) return h_index_get(vm, pc, registers, c);
     AerTypedArray* ta = aer_as_typed_array(obj);
     int64_t i = aer_as_int(*idx);
     unsigned int width = vm_typed_elem_width(ta->elem_kind);
@@ -3615,10 +3634,8 @@ HANDLER(typed_index_set_unchecked)
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
     AerVal* val = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     AerVal obj = registers[arr_reg];
-    if (aer_type(obj) != TYPE_TYPED_ARRAY) {
-        vm_index_set_compute(vm, obj, *idx, *val);
-        DISPATCH();
-    }
+    if (aer_type(obj) != TYPE_TYPED_ARRAY)
+        __attribute__((musttail)) return h_index_set(vm, pc, registers, c);
     AerTypedArray* ta = aer_as_typed_array(obj);
     /* Value-type/range validation is a separate concern from index safety and is NOT skipped --
        see vm_typed_array_check's own contract (vm_typed_elem_write's comment above). */
@@ -3627,6 +3644,50 @@ HANDLER(typed_index_set_unchecked)
     int64_t i = aer_as_int(*idx);
     unsigned int width = vm_typed_elem_width(ta->elem_kind);
     vm_typed_elem_write(ta->data + (size_t)i * width, ta->elem_kind, *val);
+    DISPATCH();
+}
+
+SEPARATE_HANDLER(index_set_any_from_int)
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
+    vm_index_set_compute(vm, registers[(int)UNPACK_A(op_word)], *idx, aer_int(registers[UNPACK_C(op_word)].as.i));
+    DISPATCH();
+}
+
+SEPARATE_HANDLER(index_set_any_from_real)
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
+    vm_index_set_compute(vm, registers[(int)UNPACK_A(op_word)], *idx, aer_real(registers[UNPACK_C(op_word)].as.d));
+    DISPATCH();
+}
+
+SEPARATE_HANDLER(index_get_any_as_int)
+    int dest = (int)UNPACK_A(op_word);
+    AerVal obj = registers[(int)UNPACK_B(op_word)];
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
+    AerVal v;
+    vm_index_get_compute(obj, *idx, &v);
+    if (v.tag == TYPE_INTEGER)
+        registers[dest] = aer_int(v.as.i);
+    else
+        error("Expected an integer from this index, got %s", vm_type_name(c, v));
+    if (aer_type(obj) == TYPE_STRING)
+        gc_maybe_collect(vm);
+    DISPATCH();
+}
+
+SEPARATE_HANDLER(index_get_any_as_real)
+    int dest = (int)UNPACK_A(op_word);
+    AerVal obj = registers[(int)UNPACK_B(op_word)];
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
+    AerVal v;
+    vm_index_get_compute(obj, *idx, &v);
+    if (v.tag == TYPE_REAL)
+        registers[dest] = aer_real(v.as.d);
+    else if (v.tag == TYPE_INTEGER)
+        registers[dest] = aer_real((double)v.as.i);
+    else
+        error("Expected a number from this index, got %s", vm_type_name(c, v));
+    if (aer_type(obj) == TYPE_STRING)
+        gc_maybe_collect(vm);
     DISPATCH();
 }
 
@@ -3652,8 +3713,7 @@ HANDLER(index_set_raw_int)
             }
         }
     }
-    vm_index_set_compute(vm, obj, *idx, aer_int(v));
-    DISPATCH();
+    __attribute__((musttail)) return h_index_set_any_from_int(vm, pc, registers, c);
 }
 
 HANDLER(index_set_raw_real)
@@ -3674,8 +3734,7 @@ HANDLER(index_set_raw_real)
             }
         }
     }
-    vm_index_set_compute(vm, obj, *idx, aer_real(v));
-    DISPATCH();
+    __attribute__((musttail)) return h_index_set_any_from_real(vm, pc, registers, c);
 }
 
 HANDLER(index_get_raw_int)
@@ -3692,15 +3751,7 @@ HANDLER(index_get_raw_int)
             DISPATCH();
         }
     }
-    AerVal v;
-    vm_index_get_compute(obj, *idx, &v);
-    if (v.tag == TYPE_INTEGER)
-        registers[dest] = aer_int(v.as.i);
-    else
-        error("Expected an integer from this index, got %s", vm_type_name(c, v));
-    if (aer_type(obj) == TYPE_STRING)
-        gc_maybe_collect(vm);
-    DISPATCH();
+    __attribute__((musttail)) return h_index_get_any_as_int(vm, pc, registers, c);
 }
 
 HANDLER(index_get_raw_real)
@@ -3717,17 +3768,7 @@ HANDLER(index_get_raw_real)
             DISPATCH();
         }
     }
-    AerVal v;
-    vm_index_get_compute(obj, *idx, &v);
-    if (v.tag == TYPE_REAL)
-        registers[dest] = aer_real(v.as.d);
-    else if (v.tag == TYPE_INTEGER)
-        registers[dest] = aer_real((double)v.as.i);
-    else
-        error("Expected a number from this index, got %s", vm_type_name(c, v));
-    if (aer_type(obj) == TYPE_STRING)
-        gc_maybe_collect(vm);
-    DISPATCH();
+    __attribute__((musttail)) return h_index_get_any_as_real(vm, pc, registers, c);
 }
 
 /* `arr[a:b]` -- vm_slice_bounds() resolves/clamps the bounds; a slice is always a fresh copy. */

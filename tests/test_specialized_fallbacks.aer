@@ -1,0 +1,71 @@
+# A specialized opcode meeting a value it does not specialize for hands the whole instruction to the
+# general operation. Each case here reaches one such hand-off; the answer must match the general form.
+
+function add_values(a, b):
+    return a + b
+
+function below(a, b):
+    if a < b:
+        return true
+    return false
+
+assert(add_values(1, 2.5) == 3.5, "int + real takes the general add")
+assert(add_values("ab", "cd") == "abcd", "string + string takes the general add")
+assert(below("a", "b"), "string compare-and-branch takes the general compare")
+assert(below(1, 2.5), "int vs real compare-and-branch takes the general compare")
+assert(not below(3.5, 2),"real vs int compare-and-branch takes the general compare")
+
+reals = [1.5, 2.5, 3.5]
+n_reals = length(reals)
+real_total = 0.0
+for i in 0..n_reals:
+    real_total = real_total + reals[i]
+assert(real_total == 7.5, "a raw real read from a plain array")
+
+ints = [4, 5, 6]
+n_ints = length(ints)
+int_total = 0
+for i in 0..n_ints:
+    int_total = int_total + ints[i]
+assert(int_total == 15, "a raw int read from a plain array")
+
+names = ["a", "b", "c"]
+n_names = length(names)
+joined = ""
+for i in 0..n_names:
+    joined = joined + names[i]
+assert(joined == "abc", "a loop-proven read from a plain array of strings")
+
+word = "xyz"
+n_word = length(word)
+spelled = ""
+for i in 0..n_word:
+    spelled = spelled + word[i]
+assert(spelled == "xyz", "a loop-proven read from a string")
+
+int_store = [0, 0, 0]
+n_int_store = length(int_store)
+for i in 0..n_int_store:
+    int_store[i] = i * 7
+assert(int_store[2] == 14, "a raw int store into a plain array")
+
+half = 0.5
+real_store = [0.0, 0.0, 0.0]
+n_real_store = length(real_store)
+for i in 0..n_real_store:
+    real_store[i] = half
+assert(real_store[1] == 0.5, "a raw real store into a plain array")
+
+word_store = [0, 0, 0]
+n_word_store = length(word_store)
+for i in 0..n_word_store:
+    word_store[i] = "w"
+assert(word_store[0] == "w", "a loop-proven store of a string into a plain array")
+
+typed_store = [0; 3]
+n_typed_store = length(typed_store)
+for i in 0..n_typed_store:
+    typed_store[i] = i * 3
+assert(typed_store[2] == 6, "the same raw int store into a typed array stays on the fast path")
+
+print("test_specialized_fallbacks: ok")
