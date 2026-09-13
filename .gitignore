@@ -42,3 +42,4 @@ perf.data*
 /CLAUDE.md
 /.claude/
 /OPTIMIZATION_HISTORY.md
+__pycache__/
