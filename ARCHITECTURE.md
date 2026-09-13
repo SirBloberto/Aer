@@ -3762,3 +3762,27 @@ cost struct_array_scan **+9.78%**, nbody_large_packed **+5.98%** and nbody **+4.
 sign-stable over five layouts, because they remove work rather than reshape a dispatch: the ADD
 forms drop a runtime `switch (bin_op)` and the FMA forms drop an entire dispatch per iteration.
 Not cut; see 5.63 for the much smaller cost of merely reshaping an opcode.
+
+### 5.65 fib's gap is frame management, and LTO's cost per dispatch
+
+AER leads Lua 5.3 on all 11 shared benchmarks and LuaJIT `-joff` on 10; `fib_bench` is the
+exception at 0.84x. fib(35) runs 134.4M dispatches over 29.86M calls -- **4.5 dispatches per
+call, two of them the frame push and pop**. Its arithmetic is already at the floor (compare fused
+with branch, subtract reading its constant from the instruction word), so the gap is call
+overhead against a hand-written assembly interpreter, not interpretation speed.
+
+The one avoidable cost inside it is that `OP_ADD` is boxed 14.9M times, because return values
+arrive tagged and `fib(n-1) + fib(n-2)` therefore cannot use `OP_RAW_ADD_INT`. Removing that
+needs return-type inference. It would make 11% of fib's dispatches cheaper, which does not by
+itself close a 19% gap that is mostly frames.
+
+Two findings about the dispatch tail, both from reading emitted code:
+
+- Every frame push indexed `callee->registers` inside the argument-copy loop, and GCC reloaded
+  the field each iteration because an `AerVal` store might alias it. Hoisting it to a local is
+  worth fib_bench -0.37% and binary_trees -0.75%, sign-stable.
+- On Windows each dispatch pays **two** dependent loads, not one: `-flto` reaches
+  `aer_handlers` through a `.refptr` stub (146 sites; zero without `-flto`). This is not the PIE
+  issue 5.x describes -- `-fno-pie -no-pie` does not remove it. Dropping `-flto` does, but costs
+  more than it saves: nbody -0.81% and binary_trees -2.53% for it, dict_bench +1.18% against,
+  because cross-TU inlining of pool.c and hashtable.c is what those benchmarks need.
