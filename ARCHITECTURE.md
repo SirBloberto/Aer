@@ -3793,3 +3793,21 @@ Two findings about the dispatch tail, both from reading emitted code:
   issue 5.x describes -- `-fno-pie -no-pie` does not remove it. Dropping `-flto` does, but costs
   more than it saves: nbody -0.81% and binary_trees -2.53% for it, dict_bench +1.18% against,
   because cross-TU inlining of pool.c and hashtable.c is what those benchmarks need.
+
+### 5.66 Literal loop bounds rotate; tail calls survive specialization
+
+**Literal bounds.** `for i < K:` now rotates like every other loop. The complemented back-edge
+wants K on the left, where the compare-and-branch opcodes take only a slot, so K is loaded once into
+a preheader slot through `hoist_constant`. Worth dict_bench -18.2% dispatches but only -0.81% wall
+clock, since the dispatch removed is an unconditional jump.
+
+**OP_TAIL_CALL_SELF.** A variant emits self-calls as OP_CALL_SELF, which the tail rewrite did not
+know, so a tail-recursive function lost TCO once it had specialized and overflowed the stack on deep
+input. The new opcode completes the set -- OP_CALL/OP_TAIL_CALL, OP_CALL_VALUE/OP_TAIL_CALL_VALUE,
+OP_CALL_SELF/OP_TAIL_CALL_SELF -- and keeps the reused frame's own size, bounds and entry, where
+h_tail_call would install the generic function's.
+
+**Not done: specializing on the first call.** A variant costs about 78us per function to re-parse.
+Specializing everything on its first call made 600 once-called functions with short loops cost 47ms
+instead of 0.3ms, while a single 20M-iteration loop gained 17%. Helping a function called once needs
+loop hotness, which means on-stack replacement, not a static "has a loop" test.
