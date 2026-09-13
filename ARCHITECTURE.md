@@ -3738,3 +3738,27 @@ un-folded switch: part is the layout change, which no amount of selectivity avoi
 The practical form: merging opcodes that carry traffic costs; merging ones that carry none is free
 or better. `make opcode-traffic` separates them, and it currently reports 84 of 157 opcodes sharing
 337,699 dispatches out of 19.9 billion.
+
+### 5.64 Low traffic is not a cut list
+
+`make opcode-traffic` reports 84 of 157 opcodes sharing 337,699 dispatches out of 19.9 billion.
+That is not a list of opcodes to remove, for two reasons measured in turn.
+
+Seven of the zero-traffic entries are not dispatchable: OP_NOT, OP_NEGATE, OP_BITWISE_NOT and
+OP_TO_STR ride in OP_UNARY's B field, and OP_AND/OP_OR/OP_PIPE are parser-internal tokens that
+compile to jumps. They hold no dispatch-table slot. The tool now ranks only the 150 that do.
+
+The rest mostly reflects what the corpus does. The eight non-branching raw comparisons are a
+complete set ({LT, LTE, EQ, NEQ} x {INT, REAL}; GT and GTE fold away by swapping operands), and
+the peephole rewrites one to its `_JUMP_IF_FALSE` form whenever a branch consumes it. A count of 1
+for `OP_RAW_NEQ_REAL` says benchmarks branch on comparisons, not that `flag = a != b` is rare --
+and that shape has no other implementation.
+
+**The test is whether a fallback exists.** A fusion opcode is redundant by construction; the
+unfused sequence still compiles. A semantic opcode is the only implementation of its shape.
+Under it the whole low-traffic tail is untouchable and only the four benchmark-shaped fusions
+qualified -- the two `_UNCHECKED_ADD` and the two `_FMA` compound-raw forms. Cutting those four
+cost struct_array_scan **+9.78%**, nbody_large_packed **+5.98%** and nbody **+4.38%**, all
+sign-stable over five layouts, because they remove work rather than reshape a dispatch: the ADD
+forms drop a runtime `switch (bin_op)` and the FMA forms drop an entire dispatch per iteration.
+Not cut; see 5.63 for the much smaller cost of merely reshaping an opcode.
