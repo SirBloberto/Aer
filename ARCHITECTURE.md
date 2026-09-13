@@ -3841,3 +3841,37 @@ The second capacity test costs fib_bench **+1.96%** sign-stable over five layout
 compare and branch on each of its 29.8M calls -- with binary_trees, nbody, mandelbrot and sieve within
 noise. Removing it would mean storing frames inside the bank so one test covers both, a larger change.
 The high-water mark is kept until the VM is freed.
+
+### 5.68 A specialized handler holds only what it specializes
+
+Several handlers specialized one case and carried the general operation in the same body: boxed
+arithmetic did int/int and real/real and then the full `vm_binary_cold`; the raw index gets read a
+typed array and otherwise indexed anything and converted the result. The general path's calls cost
+the specialized one on every dispatch, because GCC saves the callee-saved registers those calls need
+at entry, before the first type check. GCC's `.cold` partitioning moves the code but not the saves.
+
+**The rule:** the seam is logical, not a guess about frequency. What stays is what the opcode exists
+for; a different operation it can fall back to -- generic indexing, resolving a field by name,
+rejecting a value -- moves to its own handler, reached by a tail call with the instruction unread.
+`SEPARATE_HANDLER` marks those handlers `noinline`: a plain static function reached by `musttail` is
+inlined straight back, saves and all. Growing a resource and retrying the instruction (5.67) is a
+third shape, not a separate operation.
+
+The contract decides the seam. `OP_TYPED_INDEX_GET_UNCHECKED` proves an index, not a container, so a
+plain array is its own case there: sending it to `h_index_get` cost struct_array_scan +0.77%, and
+reading it in place (bounds-checked, since a plain array can shrink in the loop) gained 9%.
+
+| handler | entry saves before | after |
+|---|---|---|
+| add, sub, mul, compares | 3-4 | 2 |
+| compare-and-branch | 3 | 2 |
+| index get raw int/real | 6 | 2 |
+| index set raw int/real | 5 | 2 |
+| typed index get unchecked | 3 | 1 |
+| field get (cached shape) | 5 | 2 |
+| index field get (packed, in range) | 8 | 2 |
+| field set (cached, valid value) | 7 | 5 -- the struct write barrier stays a call, even under LTO |
+
+Handlers with no calls that still save registers (`index_field_set`, the raw compares) are out of
+Win64's seven volatile registers, which the four-value carry set already uses most of; there is
+nothing to separate, and SysV and AArch64 have more.
