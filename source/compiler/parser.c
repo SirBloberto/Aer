@@ -142,12 +142,8 @@ typedef struct {
 
 /* The function body currently compiling. */
 typedef struct {
-    /* Index of the function whose body is compiling, and whether that body calls itself. A
-       recursive numeric function is the one shape where binding parameters raw loses: its raw values
-       exist only to be re-boxed as the next call's arguments (see SHAPE_MASK_NUMERIC_ONLY, vm.h).
-       -1 outside any function body. */
+    /* Index of the function whose body is compiling; -1 outside any function body. */
     int current_func_idx;
-    bool self_call_seen;
     /* Set only while a SPECIALIZED body is compiling, so a self-call inside it can skip resolution
        (OP_CALL_SELF, vm.h). A generic body must not: resolution is what triggers specialization in
        the first place, so bypassing it there means the variant is never compiled at all. */
@@ -617,8 +613,6 @@ void emit_jump_target(Chunk* c, unsigned int target) {
    real max_registers peak instead of a flat, function-agnostic ceiling. */
 unsigned int emit_call(Chunk* c, int dest_reg, unsigned int callee_offset, int arg_reg_base, int arg_count,
                        unsigned int func_index) {
-    if ((int)func_index == P.fn.current_func_idx)
-        P.fn.self_call_seen = true;
     chunk_emit(c, PACK3(OP_CALL, dest_reg, arg_reg_base, arg_count));
     unsigned int patch_offset = c->count;
     chunk_emit(c, (uint32_t)callee_offset);
@@ -5362,10 +5356,9 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         if (needs_call_value)
             emit_call_value(c, dest, base, arg_count, callee_reg);
         else if (P.fn.in_variant && (int)func_index == P.fn.current_func_idx && arg_count == (int)func_arity &&
-                 func_arity == func_min_arity) {
-            P.fn.self_call_seen = true;
+                 func_arity == func_min_arity)
             chunk_emit(c, PACK3(OP_CALL_SELF, dest, base, arg_count));
-        } else
+        else
             emit_call(
                 c, dest, func_offset, base, arg_count,
                 func_index); /* exact arity -- no forward-ref patching needed, is_func means already resolved */
@@ -5713,14 +5706,11 @@ static void parse_function(Chunk* c) {
     unsigned short captured_frame_bounds;
     unsigned int raw_boxed_before = P.fn.raw_boxed_emits;
     int saved_func_idx = P.fn.current_func_idx;
-    bool saved_self_call = P.fn.self_call_seen;
     P.fn.current_func_idx = (int)this_func_idx;
-    P.fn.self_call_seen = false;
     parse_function_body(c, param_names, param_count, -1, NULL, false, NULL, NULL, 0, &captured_max_registers,
                         &captured_frame_bounds);
     unsigned int raw_boxed_in_body = P.fn.raw_boxed_emits - raw_boxed_before;
     P.fn.current_func_idx = saved_func_idx;
-    P.fn.self_call_seen = saved_self_call;
 
     /* Fold P.regs.shape_sensitive_param[] into one bitmask; retain the source span (owned copy, see
        ChunkFunction.source_span's own comment) only when it's actually needed -- the common case
