@@ -1150,14 +1150,15 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
     }
     CallFrame* caller = &target->call_stack[target->call_depth];
     CallFrame* callee = &target->call_stack[target->call_depth + 1];
-    callee->registers = caller->registers + caller->frame_size;
+    AerVal* callee_regs = caller->registers + caller->frame_size;
+    callee->registers = callee_regs;
     callee->frame_size = fn->max_registers;
     for (int i = 0; i < arg_count; i++)
-        callee->registers[i] = args[i];
+        callee_regs[i] = args[i];
     for (int i = arg_count; i < (int)fn->arity; i++)
-        callee->registers[i] = vm_default_value(target, fn->defaults[i - fn->min_arity]);
+        callee_regs[i] = vm_default_value(target, fn->defaults[i - fn->min_arity]);
     /* Same reason as h_call's own -- everything below frame_size gets traced. */
-    frame_init_tags(callee->registers, fn->arity, fn->frame_bounds);
+    frame_init_tags(callee_regs, fn->arity, fn->frame_bounds);
     callee->frame_bounds = fn->frame_bounds;
     callee->return_ip = return_ip;
     callee->dest_reg = 0;
@@ -1217,14 +1218,15 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     }
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = &vm->call_stack[vm->call_depth + 1];
-    callee->registers = caller->registers + caller->frame_size;
+    AerVal* callee_regs = caller->registers + caller->frame_size;
+    callee->registers = callee_regs;
     callee->frame_size = f->max_registers;
     for (int i = 0; i < arg_count; i++)
-        callee->registers[i] = caller->registers[arg_reg_base + i];
+        callee_regs[i] = caller->registers[arg_reg_base + i];
     for (int i = arg_count; i < (int)f->arity; i++)
-        callee->registers[i] = vm_default_value(vm, f->defaults[i - f->min_arity]);
+        callee_regs[i] = vm_default_value(vm, f->defaults[i - f->min_arity]);
     /* Same reason as h_call's own -- everything below frame_size gets traced. */
-    frame_init_tags(callee->registers, f->arity, f->frame_bounds);
+    frame_init_tags(callee_regs, f->arity, f->frame_bounds);
     callee->frame_bounds = f->frame_bounds;
     callee->return_ip = return_ip;
     callee->dest_reg = dest_reg;
@@ -3269,13 +3271,14 @@ HANDLER(call)
     /* `registers` is the hoisted copy of this same frame's base -- every site that changes frames
        reassigns it -- so reading it back out of `caller` is a redundant dependent load on the
        hottest path in the interpreter. */
-    callee->registers = registers + caller->frame_size;
+    AerVal* callee_regs = registers + caller->frame_size;
+    callee->registers = callee_regs;
     callee->frame_size = chosen_max_registers;
     for (int i = 0; i < arg_count; i++)
-        callee->registers[i] = registers[arg_reg_base + i];
+        callee_regs[i] = registers[arg_reg_base + i];
     /* mark_vm_roots traces every register below frame_size, so an unfilled one would still hold a
        popped frame's pointer. Only the tag matters -- value_has_cell reads nothing else. */
-    frame_init_tags(callee->registers, (unsigned int)arg_count, chosen_frame_bounds);
+    frame_init_tags(callee_regs, (unsigned int)arg_count, chosen_frame_bounds);
     callee->frame_bounds = chosen_frame_bounds;
     callee->return_ip =
         (unsigned int)(pc - c->code); /* already past this instruction's operands -- the correct resume point */
@@ -3284,7 +3287,7 @@ HANDLER(call)
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
     vm->call_depth++;
-    registers = callee->registers;
+    registers = callee_regs;
     pc = c->code + chosen_offset;
     if (vm->slice_max && --vm->slice_budget == 0) {
         vm->ip = (unsigned int)(pc - c->code);
@@ -3382,14 +3385,15 @@ HANDLER(call_self)
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = caller + 1;
     unsigned int fsz = caller->frame_size, entry = caller->code_offset;
-    callee->registers = registers + fsz;
+    AerVal* callee_regs = registers + fsz;
+    callee->registers = callee_regs;
     callee->frame_size = fsz;
     for (int i = 0; i < arg_count; i++)
-        callee->registers[i] = registers[arg_reg_base + i];
+        callee_regs[i] = registers[arg_reg_base + i];
     /* mark_vm_roots traces every slot below frame_size, so the ones this call does not fill must not
        keep a popped frame's stale references. Self-call, so the callee's block layout is the
        caller's. */
-    frame_init_tags(callee->registers, (unsigned int)arg_count, caller->frame_bounds);
+    frame_init_tags(callee_regs, (unsigned int)arg_count, caller->frame_bounds);
     callee->frame_bounds = caller->frame_bounds;
     callee->return_ip = (unsigned int)(pc - c->code);
     callee->dest_reg = dest_reg;
@@ -3397,7 +3401,7 @@ HANDLER(call_self)
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
     vm->call_depth++;
-    registers = callee->registers;
+    registers = callee_regs;
     pc = c->code + entry;
     DISPATCH();
 }
