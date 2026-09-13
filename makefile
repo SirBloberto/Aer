@@ -10,7 +10,13 @@ endif
 
 # musttail (vm.c dispatch) needs GCC 15+ or Clang 13+. Override CC to point at one if the
 # default compiler on a machine is older.
-CC ?= gcc
+#
+# `?=` would not do it: make predefines CC as `cc` with origin `default`, and `?=` only assigns
+# when a variable is undefined, so the gcc here would never apply and a machine whose `cc` is an
+# older GCC would fail deep in vm.c instead of here.
+ifeq ($(origin CC),default)
+    CC := gcc
+endif
 
 # -flto is load-bearing: pool.c's tiny hot helpers are called constantly from vm.c cross-TU.
 #

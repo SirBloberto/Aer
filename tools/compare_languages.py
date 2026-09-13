@@ -97,7 +97,13 @@ def time_once(argv, host, remote_dir):
             return None
         return int(parts[1]) / 1000.0, int(parts[2])
     start = time.perf_counter()
-    proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        # A relink in progress leaves a partial PE behind, which Windows reports as
+        # "not a valid Win32 application" rather than as a missing file.
+        print("could not run %s: %s" % (argv[0], e))
+        return None
     proc.wait()
     elapsed = time.perf_counter() - start
     if proc.returncode != 0:
