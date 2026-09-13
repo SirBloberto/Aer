@@ -1,5 +1,5 @@
 #!/usr/bin/env aer
-# columnar_query.aer's query, run four ways:
+# columnar_query.aer's query at a size where the four ways of running it separate clearly:
 #
 #   SELECT region, SUM(price * quantity * (1 - discount))
 #   FROM sales WHERE quantity > 10 AND price < 400 GROUP BY region
@@ -63,20 +63,20 @@ function run_actors(path, q_col, p_col, d_col, r_col, n, groups, workers, passes
         w += 1
     per = n // workers
     start = time.now()
-    p = 0
-    total = 0.0
-    for p < passes:
-        w = 0
-        for w < workers:
-            lo = w * per
-            hi = lo + per
-            if w == workers - 1:
-                hi = n
-            scheduler.add(pool[w], "scan", q_col[lo:hi], p_col[lo:hi], d_col[lo:hi], r_col[lo:hi],
-                          groups)
-            w += 1
-        total = fold(scheduler.run(), groups)
-        p += 1
+    # Each worker is handed its chunk once and runs every pass over it. Sending the chunks per
+    # pass instead copies all four columns twice on each one -- a slice is a fresh copy, and an
+    # actor argument is copied again into the actor's heap -- which on a scan this memory-bound
+    # costs more than the scan and hides whatever the workers are doing.
+    w = 0
+    for w < workers:
+        lo = w * per
+        hi = lo + per
+        if w == workers - 1:
+            hi = n
+        scheduler.add(pool[w], "scan", q_col[lo:hi], p_col[lo:hi], d_col[lo:hi], r_col[lo:hi],
+                      groups, passes)
+        w += 1
+    total = fold(scheduler.run(), groups)
     return [time.now() - start, total]
 
 # ---- 1. base: one row at a time ----
