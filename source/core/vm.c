@@ -3272,13 +3272,11 @@ HANDLER(call)
        reassigns it -- so reading it back out of `caller` is a redundant dependent load on the
        hottest path in the interpreter. */
     AerVal* callee_regs = registers + caller->frame_size;
+    /* Every scalar field first, so pc, c, dest_reg and chosen_offset stop being live across the
+       two loops below. The compiler cannot sink them itself: call_stack and the register bank are
+       separate allocations, but nothing in the types says so. */
     callee->registers = callee_regs;
     callee->frame_size = chosen_max_registers;
-    for (int i = 0; i < arg_count; i++)
-        callee_regs[i] = registers[arg_reg_base + i];
-    /* mark_vm_roots traces every register below frame_size, so an unfilled one would still hold a
-       popped frame's pointer. Only the tag matters -- value_has_cell reads nothing else. */
-    frame_init_tags(callee_regs, (unsigned int)arg_count, chosen_frame_bounds);
     callee->frame_bounds = chosen_frame_bounds;
     callee->return_ip =
         (unsigned int)(pc - c->code); /* already past this instruction's operands -- the correct resume point */
@@ -3286,6 +3284,11 @@ HANDLER(call)
     callee->code_offset = chosen_offset;
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
+    for (int i = 0; i < arg_count; i++)
+        callee_regs[i] = registers[arg_reg_base + i];
+    /* mark_vm_roots traces every register below frame_size, so an unfilled one would still hold a
+       popped frame's pointer. Only the tag matters -- value_has_cell reads nothing else. */
+    frame_init_tags(callee_regs, (unsigned int)arg_count, chosen_frame_bounds);
     vm->call_depth++;
     registers = callee_regs;
     pc = c->code + chosen_offset;
@@ -3385,21 +3388,25 @@ HANDLER(call_self)
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     CallFrame* callee = caller + 1;
     unsigned int fsz = caller->frame_size, entry = caller->code_offset;
+    unsigned short bounds = caller->frame_bounds;
     AerVal* callee_regs = registers + fsz;
+    /* Every scalar field first, so pc, c, dest_reg and entry stop being live across the two loops
+       below. The compiler cannot sink them itself: call_stack and the register bank are separate
+       allocations, but nothing in the types says so. */
     callee->registers = callee_regs;
     callee->frame_size = fsz;
-    for (int i = 0; i < arg_count; i++)
-        callee_regs[i] = registers[arg_reg_base + i];
-    /* mark_vm_roots traces every slot below frame_size, so the ones this call does not fill must not
-       keep a popped frame's stale references. Self-call, so the callee's block layout is the
-       caller's. */
-    frame_init_tags(callee_regs, (unsigned int)arg_count, caller->frame_bounds);
-    callee->frame_bounds = caller->frame_bounds;
+    callee->frame_bounds = bounds;
     callee->return_ip = (unsigned int)(pc - c->code);
     callee->dest_reg = dest_reg;
     callee->code_offset = entry;
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
+    for (int i = 0; i < arg_count; i++)
+        callee_regs[i] = registers[arg_reg_base + i];
+    /* mark_vm_roots traces every slot below frame_size, so the ones this call does not fill must not
+       keep a popped frame's stale references. Self-call, so the callee's block layout is the
+       caller's. */
+    frame_init_tags(callee_regs, (unsigned int)arg_count, bounds);
     vm->call_depth++;
     registers = callee_regs;
     pc = c->code + entry;
