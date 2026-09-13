@@ -111,6 +111,13 @@ def time_once(argv, host, remote_dir):
     return elapsed, (_peak_rss_windows(proc) if os.name == "nt" else 0)
 
 
+def has_source(path, host, remote_dir):
+    """Whether a comparison runtime has this benchmark written for it."""
+    if host:
+        return subprocess.run(["ssh", host, "test -f %s/%s" % (remote_dir, path)]).returncode == 0
+    return os.path.exists(path)
+
+
 def aer_build(aer, host):
     """The commit the aer binary under test was built from. A table that doesn't say which build
     produced it can't be compared against an older one, which is the whole use for these numbers."""
@@ -198,10 +205,18 @@ def main():
 
     ratio_totals = {c: [] for c in cols}
     mem_totals = {c: [] for c in cols}
+    skipped = []
     for name in names:
         # Forward slashes deliberately: valid on Windows too, and --host sends these
         # straight to a POSIX shell where a backslash from os.path.join would not resolve.
         aer_src = "bench/" + name + ".aer"
+        counterparts = {label: has_source("bench/" + name + suffix, args.host, args.remote_dir)
+                        for label, _, _, suffix in available}
+        # Timing AER for a benchmark nothing else implements buys an all-'-' row, and the
+        # scale benchmarks in here are minutes long apiece.
+        if not any(counterparts.values()):
+            skipped.append(name)
+            continue
         a = measure([aer, aer_src], args.runs, args.host, args.remote_dir)
         if a is None:
             print("%-26s %8s  (aer run failed)" % (name, "?"))
@@ -210,9 +225,7 @@ def main():
         cells = []
         for label, exe, prefix, suffix in available:
             src = "bench/" + name + suffix
-            exists = (subprocess.run(["ssh", args.host, "test -f %s/%s" % (args.remote_dir, src)]).returncode == 0
-                      if args.host else os.path.exists(src))
-            if not exists:
+            if not counterparts[label]:
                 cells.append("%15s" % "-")
                 continue
             r = measure([exe] + prefix + [src], args.runs, args.host, args.remote_dir)
@@ -230,6 +243,8 @@ def main():
         print("%-26s %7.2fs %5.1f%% %7s %s%s"
               % (name, t_aer, sp_aer, mem(m_aer), " ".join(cells), noisy))
 
+    if skipped:
+        print("no comparison source, skipped: %s" % ", ".join(skipped))
     print("-" * width)
     print("ratio > 1.00x means AER is faster on that row; the value beside it is that runtime's")
     print("peak memory. runs=%d (mean), '±' is peak-to-peak spread, wall-clock." % args.runs)

@@ -1,5 +1,5 @@
 #!/usr/bin/env aer
-# columnar_query.aer's query at a size where the four ways of running it separate clearly:
+# columnar_query.aer's query, run four ways:
 #
 #   SELECT region, SUM(price * quantity * (1 - discount))
 #   FROM sales WHERE quantity > 10 AND price < 400 GROUP BY region
@@ -22,10 +22,10 @@ import scheduler
 import collection
 import time
 
-N = 32000000
+N = 3000000
 GROUPS = 8
 WORKERS = 6
-PASSES = 45
+PASSES = 4
 
 region = [0.0; N]
 quantity = [0.0; N]
