@@ -4277,10 +4277,6 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
     assert_variables_below_floor("for-loop body");
 }
 
-/* A query's loop body runs longer than a reduction's: two aggregates and a count under one filter
-   is around eighteen instructions, and at sixteen the recogniser gave up before reaching them. */
-#define VEC_MAX_OPS 32
-
 /* Rewrites a range-for into one whole-array reduction -- `for i in 0..length(a): t = t + a[i] * 2`
    becomes `t = t + collection.sum(a * 2)`. Called with the body already compiled, and rewinds over
    it on success; an unrecognised instruction returns false and leaves the loop exactly as it was.
@@ -4781,12 +4777,10 @@ static int module_call_id(AerString* name) {
     return CALL_MODULE_DYNAMIC;
 }
 
-#define NAME_IS(lit) (name->length == sizeof(lit) - 1 && strncmp(name->data, lit, sizeof(lit) - 1) == 0)
-
 /* Every module function's spelling and its wire id. A table rather than a chain of comparisons:
-   the chain WAS this table, written out one branch at a time. NAME_IS cannot be used against an
-   entry -- it takes the length from sizeof, which is the literal's length only for a literal and
-   a pointer's for a pointer -- so the length is a column, filled in where the literal still is. */
+   the chain WAS this table, written out one branch at a time. The length is a column because
+   sizeof gives a literal's length only where the literal still is, not through the table's
+   char pointer. */
 #define MODFN(mod, lit, id) {mod, lit, sizeof(lit) - 1, id}
 static const struct {
     int module_id;
@@ -4884,7 +4878,6 @@ static int module_fn_id(int module_id, AerString* name) {
     return FN_ID_UNKNOWN;
 }
 
-#undef NAME_IS
 
 static int parse_module_call(Chunk* c) {
     int module_id = module_call_id(aer_as_string(token.value));

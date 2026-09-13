@@ -42,8 +42,12 @@ endif
 # than reserving a register to hide it: against the pinned build, mandelbrot -18.51% cycles,
 # binary_trees -1.94%, fib_bench +0.62%, -10.10% over the three.
 #
-# Skipped where PIE is mandatory or the flag is unknown (Android, some hardened toolchains, the
-# MinGW build), which costs those targets the constant base and nothing else.
+# Skipped where PIE is mandatory or the flag is unknown (Android, some hardened toolchains), which
+# costs those targets the constant base and nothing else. Also skipped on MinGW, but for a
+# different reason: the probe links to /dev/null, which a PE linker cannot write, so it reports
+# failure even though the flags are accepted there. Left as is deliberately -- on that target the
+# flags do not buy the constant base anyway, because -flto reaches the table through a
+# .refptr stub and the load stays (one extra dependent load per dispatch, 146 sites).
 PIE_TEST := $(shell printf 'int main(void){return 0;}' > /tmp/aer_pie_$$.c 2>/dev/null && \
   $(CC) -fno-pie -no-pie -o /dev/null /tmp/aer_pie_$$.c >/dev/null 2>&1 && echo ok; \
   rm -f /tmp/aer_pie_$$.c)

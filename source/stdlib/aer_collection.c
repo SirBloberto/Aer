@@ -165,10 +165,6 @@ static bool group_sum_run(AerTypedArray* val, AerTypedArray* grp, AerTypedArray*
    a time keeps every intermediate in L1 and covers any chain. */
 #define CHAIN_TILE 1024u
 #define CHAIN_MAX_OPERANDS 8
-/* A binary tree over k leaves has k-1 operators, so the token count follows from the operand count
-   and needs no separate argument. */
-#define CHAIN_MAX_TOKENS (2 * CHAIN_MAX_OPERANDS - 1)
-
 /* Four bits per token, in postfix order: 0 pushes the next operand, anything else applies an
    operator to the top two. Postfix rather than a straight run of operators because the expressions
    worth fusing are trees -- `price * quantity * (1 - discount) * mask` is four operators and no two
@@ -231,6 +227,7 @@ REDUCE_ATTR static void chain_apply(double* restrict acc, const double* restrict
             for (unsigned int i = 0; i < len; i++)
                 acc[i] = acc[i] > rhs[i] ? 1.0 : 0.0;
             break;
+        case CHAIN_TOK_GTE:
         default:
             for (unsigned int i = 0; i < len; i++)
                 acc[i] = acc[i] >= rhs[i] ? 1.0 : 0.0;
