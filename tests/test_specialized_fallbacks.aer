@@ -68,4 +68,25 @@ for i in 0..n_typed_store:
     typed_store[i] = i * 3
 assert(typed_store[2] == 6, "the same raw int store into a typed array stays on the fast path")
 
+struct Cell:
+    x = 0
+    small = 0i
+
+cells = [Cell(); 4]
+cells[-1].x = 9
+assert(cells[3].x == 9, "a negative index into a packed array")
+assert(cells[-1].x == 9, "a negative index read from a packed array")
+cells[2].small = 7
+assert(cells[2].small == 7, "a narrow field store into a packed array")
+
+loose = [Cell(), Cell()]
+loose[1].x = 5
+assert(loose[1].x == 5, "a field store and read through a plain array of structs")
+
+one = Cell()
+one.x = 3
+assert(one.x == 3, "a struct field store and read")
+one.x = 4
+assert(one.x == 4, "the same site again, from its cache")
+
 print("test_specialized_fallbacks: ok")

@@ -2002,14 +2002,15 @@ static bool vm_typed_array_check(Chunk* c, TypedArrayElemKind kind, AerVal val) 
    `declared != TYPE_ANY && val->tag != declared` check (every OP_FIELD_SET-family handler's own)
    already confirms val really is an integer whenever ftype/declared is TYPE_INTEGER, so this only
    needs to add the extra range check on top of that, not re-verify the type itself. */
+static inline bool vm_fits_narrow_field(ValueType ftype, bool narrow, AerVal val) {
+    return !narrow || ftype != TYPE_INTEGER || (aer_as_int(val) >= INT32_MIN && aer_as_int(val) <= INT32_MAX);
+}
+
 static bool vm_check_narrow_field_write(ValueType ftype, bool narrow, AerVal val) {
-    if (!narrow || ftype != TYPE_INTEGER)
+    if (vm_fits_narrow_field(ftype, narrow, val))
         return true;
-    if (aer_as_int(val) < INT32_MIN || aer_as_int(val) > INT32_MAX) {
-        error("Value %lld out of range for a narrow (int32) field", (long long)aer_as_int(val));
-        return false;
-    }
-    return true;
+    error("Value %lld out of range for a narrow (int32) field", (long long)aer_as_int(val));
+    return false;
 }
 
 /* Narrow (4-byte) counterparts of the raw-slot memcpy's the wide RAW opcode family (vm_run_slice's
@@ -4107,8 +4108,7 @@ HANDLER(struct_new)
     DISPATCH();
 }
 
-/* Reads struct_reg from a register instead of popping the stack. */
-HANDLER(field_get)
+SEPARATE_HANDLER(field_get_by_name)
     unsigned int site = (unsigned int)(pc - c->code) - 1;
     int dest_reg = (int)UNPACK_A(op_word);
     int struct_reg = (int)UNPACK_B(op_word);
@@ -4121,6 +4121,17 @@ HANDLER(field_get)
     if (!vm_resolve_field(registers, c, site, struct_reg, field_idx, &oa, &slot, &foffset, &ftype, &narrow))
         DISPATCH();
     registers[dest_reg] = vm_struct_field_read_at(oa, foffset, ftype, narrow);
+    DISPATCH();
+}
+
+HANDLER(field_get)
+    AerVal* obj = &registers[(int)UNPACK_B(op_word)];
+    FieldCacheEntry* entry = &c->field_cache[(unsigned int)(pc - c->code) - 1];
+    if (obj->tag != TYPE_STRUCT || entry->shape != ((AerStruct*)obj->as.ptr)->shape)
+        __attribute__((musttail)) return h_field_get_by_name(vm, pc, registers, c);
+    (void)READ();
+    registers[(int)UNPACK_A(op_word)] =
+        vm_struct_field_read_at((AerStruct*)obj->as.ptr, entry->offset, entry->ftype, entry->narrow);
     DISPATCH();
 }
 
@@ -4251,7 +4262,7 @@ HANDLER(print_repl)
 }
 
 /* gc_barrier_struct is the write barrier every mutating struct field-set needs. */
-HANDLER(field_set)
+SEPARATE_HANDLER(field_set_by_name)
     unsigned int site = (unsigned int)(pc - c->code) - 1;
     int struct_reg = (int)UNPACK_A(op_word);
     AerVal* val = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
@@ -4275,6 +4286,21 @@ HANDLER(field_set)
         DISPATCH();
     gc_barrier_struct(vm, oa, *val);
     vm_struct_field_write_at(oa, foffset, declared, narrow, *val);
+    DISPATCH();
+}
+
+HANDLER(field_set)
+    AerVal* obj = &registers[(int)UNPACK_A(op_word)];
+    AerVal* val = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
+    FieldCacheEntry* entry = &c->field_cache[(unsigned int)(pc - c->code) - 1];
+    if (obj->tag != TYPE_STRUCT || entry->shape != ((AerStruct*)obj->as.ptr)->shape ||
+        (entry->ftype != TYPE_ANY && val->tag != entry->ftype) ||
+        !vm_fits_narrow_field(entry->ftype, entry->narrow, *val))
+        __attribute__((musttail)) return h_field_set_by_name(vm, pc, registers, c);
+    (void)READ();
+    AerStruct* s = (AerStruct*)obj->as.ptr;
+    gc_barrier_struct(vm, s, *val);
+    vm_struct_field_write_at(s, entry->offset, entry->ftype, entry->narrow, *val);
     DISPATCH();
 }
 
@@ -4843,7 +4869,7 @@ HANDLER(array_repeat)
 /* Handles both a packed array and an ordinary struct array (the parser can't know which --
    functions are untyped). The non-packed branch reproduces the plain index+field path exactly,
    just without needing a scratch register for the intermediate. */
-HANDLER(index_field_get)
+SEPARATE_HANDLER(index_field_get_any_container)
     unsigned int site = (unsigned int)(pc - c->code) - 1;
     int dest_reg = (int)UNPACK_A(op_word);
     int obj_reg = (int)UNPACK_B(op_word);
@@ -4896,8 +4922,26 @@ HANDLER(index_field_get)
     DISPATCH();
 }
 
+HANDLER(index_field_get)
+    AerVal obj = registers[(int)UNPACK_B(op_word)];
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(pc[0]));
+    FieldCacheEntry* entry = &c->field_cache[(unsigned int)(pc - c->code) - 1];
+    if (aer_type(obj) != TYPE_PACKED_ARRAY || idx->tag != TYPE_INTEGER)
+        __attribute__((musttail)) return h_index_field_get_any_container(vm, pc, registers, c);
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    if ((uint64_t)idx->as.i >= pa->count || entry->shape != pa->shape)
+        __attribute__((musttail)) return h_index_field_get_any_container(vm, pc, registers, c);
+    (void)READ();
+    unsigned char* elem = pa->data + (size_t)idx->as.i * pa->shape->instance_bytes + entry->offset;
+    registers[(int)UNPACK_A(op_word)] =
+        entry->narrow
+            ? vm_typed_elem_read(elem, entry->ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32)
+            : vm_packed_slot_read(elem, entry->ftype);
+    DISPATCH();
+}
+
 /* Mirror of h_index_field_get -- same dual dispatch, same reason no scratch register is needed. */
-HANDLER(index_field_set)
+SEPARATE_HANDLER(index_field_set_any_container)
     unsigned int site = (unsigned int)(pc - c->code) - 1;
     int obj_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
@@ -4963,6 +5007,26 @@ HANDLER(index_field_set)
         DISPATCH();
     gc_barrier_struct(vm, oa, *val);
     vm_struct_field_write_at(oa, foffset, declared, narrow, *val);
+    DISPATCH();
+}
+
+HANDLER(index_field_set)
+    AerVal obj = registers[(int)UNPACK_A(op_word)];
+    AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
+    AerVal* val = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(pc[0]));
+    FieldCacheEntry* entry = &c->field_cache[(unsigned int)(pc - c->code) - 1];
+    if (aer_type(obj) != TYPE_PACKED_ARRAY || idx->tag != TYPE_INTEGER)
+        __attribute__((musttail)) return h_index_field_set_any_container(vm, pc, registers, c);
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    if ((uint64_t)idx->as.i >= pa->count || entry->shape != pa->shape || val->tag != entry->ftype ||
+        !vm_fits_narrow_field(entry->ftype, entry->narrow, *val))
+        __attribute__((musttail)) return h_index_field_set_any_container(vm, pc, registers, c);
+    (void)READ();
+    unsigned char* elem = pa->data + (size_t)idx->as.i * pa->shape->instance_bytes + entry->offset;
+    if (entry->narrow)
+        vm_typed_elem_write(elem, entry->ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32, *val);
+    else
+        vm_packed_slot_write(elem, entry->ftype, *val);
     DISPATCH();
 }
 
