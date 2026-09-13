@@ -131,8 +131,8 @@ AerVal register_get(VM* vm, int slot) {
 
 /* RK16: 1 flag + 15 index bits, the wire form most RK operands use. Returns a pointer into the
    hoisted const_pool/registers, not a copy. Takes registers directly rather than re-deriving from
-   a VM*: that re-fetch, through a pointer the compiler cannot prove is unaliased inside this
-   computed-goto function, measured ~4.5% more instructions on fib_bench. */
+   a VM*: that re-fetch, through a pointer the compiler cannot prove is unaliased, measured ~4.5%
+   more instructions on fib_bench. */
 static inline AerVal* vm_rk_ptr16(AerVal* registers, AerVal* pool, uint32_t rk16) {
     if (rk16 & RK16_CONST_FLAG)
         return &pool[rk16 & RK16_INDEX_MASK];
@@ -931,15 +931,14 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
     return aer_make_string(owned, len);
 }
 
-/* OP_INTERP's builder. noinline on purpose: its scratch would otherwise join vm_run_slice's
-   already-3300-byte frame, and §5.18 records what added pressure there costs. A part is rendered
-   into `scratch` only if it isn't already a string; unbounded content defers to vm_to_str. */
+/* OP_INTERP's builder. A part is rendered into `scratch` only if it isn't already a string;
+   unbounded content defers to vm_to_str. */
 /* Formats an interpolated dict key into a stack buffer and probes with the bytes, never building the
    AerString. Returns false (leaving *out alone) when that cannot work, and the caller falls back.
    Must format exactly as vm_interp_build does -- a key written through OP_INTERP and read back
    through here would otherwise silently miss; tests/test_interp_dict_keys.aer guards that.
-   Owns the buffer and the probe so neither lands in vm_run_slice's frame (5.18). */
-static __attribute__((noinline)) bool vm_dict_get_interp(AerDict* d, const uint32_t* rks, unsigned int count,
+   Owns the buffer and the probe rather than handing either back to the caller. */
+static bool vm_dict_get_interp(AerDict* d, const uint32_t* rks, unsigned int count,
                                                          AerVal* registers, AerVal* pool, AerVal* out) {
     char key[INTERP_KEY_MAX];
     unsigned int at = 0;
@@ -984,7 +983,7 @@ static __attribute__((noinline)) bool vm_dict_get_interp(AerDict* d, const uint3
     return true;
 }
 
-static __attribute__((noinline)) AerVal vm_interp_build(VM* vm, const AerVal* parts, unsigned int count) {
+static AerVal vm_interp_build(VM* vm, const AerVal* parts, unsigned int count) {
     const char* piece[INTERP_MAX_PARTS];
     unsigned int piece_len[INTERP_MAX_PARTS];
     char scratch[INTERP_MAX_PARTS][32];
@@ -2299,10 +2298,9 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
     }
 }
 
-/* vm_dict_get_interp's fallback: builds the key string for real, then takes the general index path.
-   Separate and noinline so its parts[] scratch stays out of vm_run_slice's frame. h_interp keeps
-   ITS parts[] inline on purpose -- hoisting that one out the same way measured worse (5.24). */
-static __attribute__((noinline)) AerVal vm_index_get_interp_slow(VM* vm, AerVal obj, const uint32_t* rks,
+/* vm_dict_get_interp's fallback: builds the key string for real, then takes the general index
+   path. */
+static AerVal vm_index_get_interp_slow(VM* vm, AerVal obj, const uint32_t* rks,
                                                                  unsigned int count, AerVal* registers,
                                                                  AerVal* pool) {
     AerVal parts[INTERP_MAX_PARTS];
@@ -2442,7 +2440,7 @@ static AerVal vm_cast(AerVal v, int cast_type) {
     return r;
 }
 
-/* Dispatch loop -- computed goto                                       */
+/* Dispatch loop -- tail calls                                          */
 
 /* GCC direct-threaded dispatch: each instruction jumps straight to the next handler, so the branch
    predictor learns per-instruction patterns instead of funnelling every opcode through one switch.
@@ -2514,10 +2512,9 @@ static void chunk_ensure_call_spec_cache(Chunk* c) {
     memset(c->call_spec_cache + old_cap, 0, sizeof(CallSpecCacheEntry) * (c->call_spec_cache_cap - old_cap));
 }
 
-/* h_call's cold path, split out because inlining it made h_call ~572 machine instructions --
-   by far the largest handler in vm_run_slice, next-largest under 40 -- so every ordinary call paid
-   its icache cost without executing it. noinline is required: a static function with one call site
-   is a prime candidate for LTO to inline right back in. */
+/* h_call's cold path. noinline is required: a static function with one call site is a prime
+   candidate for LTO to inline right back in, which grows h_call from 848 bytes to 3KB
+   for a path an ordinary call never takes. */
 static void __attribute__((noinline))
 vm_call_resolve_specialization_full(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
                                     unsigned int ip, unsigned int* chosen_offset,
@@ -2784,9 +2781,7 @@ static void __attribute__((noinline)) vm_call_resolve_numeric(Chunk* c, ChunkFun
 
 /* The monomorphic case, split off so it does not pay for the full resolver's frame: that one is
    sized for the raw-variant block's candidate arrays and so also carries a stack-protector canary,
-   both on every call regardless of which path runs. Split here rather than at the call site because
-   growing h_call reshuffles register allocation across all 153 label bodies -- measured at +6.93%
-   cycles on nbody, whose h_call is cold, for a call-site version of exactly this test. */
+   both on every call regardless of which path runs. */
 static void __attribute__((noinline))
 vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* registers, int arg_reg_base,
                                unsigned int ip, unsigned int* chosen_offset,
@@ -2813,10 +2808,9 @@ vm_call_resolve_specialization(Chunk* c, ChunkFunction* target_f, AerVal* regist
                                         chosen_max_registers, chosen_frame_bounds);
 }
 
-/* h_call_module's cold path, split for the same reason as vm_call_resolve_specialization: inlined
-   it measured ~1079 instructions, the largest handler in vm_run_slice -- not from complex logic but
-   from spilling vm_run_slice's hoisted locals around each of ~10 external calls. Splitting pays
-   that once at the single call site. POP is safe here (no early-return, unlike PUSH), and the
+/* h_call_module's cold path, split for the same reason as vm_call_resolve_specialization: letting
+   LTO inline it grows h_call_module from 336 bytes to 13KB, all of it the ~10 external calls'
+   argument shuffling. POP is safe here (no early-return, unlike PUSH), and the
    io-disabled error() longjmps before anything after it runs. Always returns true by the time it
    returns; the compiler just cannot prove it. */
 static bool __attribute__((noinline)) vm_call_module_dispatch(VM* vm, Chunk* c, int module_idx, int fn_idx,
@@ -5293,10 +5287,9 @@ HANDLER(raw_load_int_pool)
 
 #undef RAW_CMP_JUMP_IF_FALSE
 
-/* The operand words are read by the helpers straight out of the instruction stream rather than into
-   a local array -- 16 AerVals of scratch here would grow vm_run_slice's frame for every opcode
-   (5.18). Both helpers read every part before dest is written, so dest may alias a part's register,
-   which emit_interp deliberately arranges. */
+/* The operand words are read by the helpers straight out of the instruction stream rather than
+   into a local array. Both helpers read every part before dest is written, so dest may alias a
+   part's register, which emit_interp deliberately arranges. */
 HANDLER(index_get_interp)
     int dest_reg = (int)UNPACK_A(op_word);
     int obj_reg = (int)UNPACK_B(op_word);
