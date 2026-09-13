@@ -516,7 +516,7 @@ static const char* vm_type_name(Chunk* c, AerVal v) {
         return buf;
     }
     if (aer_type(v) == TYPE_TYPED_ARRAY) {
-        static const char* elem_names[] = {"int32", "float32", "integer", "float"};
+        static const char* elem_names[] = {"int32", "float32", "integer", "float", "boolean"};
         static char buf[32];
         snprintf(buf, sizeof(buf), "%s[]", elem_names[aer_as_typed_array(v)->elem_kind]);
         return buf;
@@ -1339,7 +1339,9 @@ static inline void vm_packed_slot_write(unsigned char* slot, ValueType ftype, Ae
    a measured ARM regression from adding exactly this kind of branch to its hot path. Not
    file-static because gc.c needs it; -flto still inlines it at vm.c's own call sites. */
 unsigned int vm_typed_elem_width(TypedArrayElemKind kind) {
-    return (kind == TYPED_ELEM_INT32 || kind == TYPED_ELEM_FLOAT32) ? 4 : 8;
+    if (kind == TYPED_ELEM_INT32 || kind == TYPED_ELEM_FLOAT32)
+        return 4;
+    return kind == TYPED_ELEM_BOOL ? 1 : 8;
 }
 
 static inline AerVal vm_typed_elem_read(unsigned char* slot, TypedArrayElemKind kind) {
@@ -1364,6 +1366,7 @@ static inline AerVal vm_typed_elem_read(unsigned char* slot, TypedArrayElemKind 
             memcpy(&v, slot, 8);
             return aer_real(v);
         }
+        case TYPED_ELEM_BOOL: return aer_bool(*slot != 0);
     }
     return aer_null();
 }
@@ -1391,6 +1394,7 @@ static inline double vm_typed_elem_read_real(unsigned char* slot, TypedArrayElem
             memcpy(&v, slot, 8);
             return v;
         }
+        case TYPED_ELEM_BOOL: break;
     }
     return 0.0;
 }
@@ -1433,7 +1437,30 @@ static inline void vm_typed_elem_write(unsigned char* slot, TypedArrayElemKind k
             memcpy(slot, &dv, 8);
             break;
         }
+        case TYPED_ELEM_BOOL: *slot = aer_as_bool(v) ? 1 : 0; break;
     }
+}
+
+static inline AerVal vm_narrow_field_read(unsigned char* p, ValueType ftype) {
+    if (ftype == TYPE_INTEGER) {
+        int32_t v;
+        memcpy(&v, p, 4);
+        return aer_int(v);
+    }
+    float v;
+    memcpy(&v, p, 4);
+    return aer_real((double)v);
+}
+
+/* The field's declared type is already enforced on v, so a float32 field only ever receives a real. */
+static inline void vm_narrow_field_write(unsigned char* p, ValueType ftype, AerVal v) {
+    if (ftype == TYPE_INTEGER) {
+        int32_t iv = (int32_t)aer_as_int(v);
+        memcpy(p, &iv, 4);
+        return;
+    }
+    float fv = (float)aer_as_real(v);
+    memcpy(p, &fv, 4);
 }
 
 /* Shared by all 12 specialized packed-array raw field opcodes, which differ only in which raw slot
@@ -1572,8 +1599,10 @@ static int typed_div_run(double* out, const AerTypedArray* a, const AerTypedArra
         case TYPED_ELEM_INT32: TYPED_DIV_CALL(i32, int32_t);
         case TYPED_ELEM_INT64: TYPED_DIV_CALL(i64, int64_t);
         case TYPED_ELEM_FLOAT32: TYPED_DIV_CALL(f32, float);
-        default: TYPED_DIV_CALL(f64, double);
+        case TYPED_ELEM_FLOAT64: TYPED_DIV_CALL(f64, double);
+        case TYPED_ELEM_BOOL: break;
     }
+    return 0;
 }
 #undef TYPED_DIV_CALL
 
@@ -1589,7 +1618,8 @@ static void typed_divs_run(double* out, const AerTypedArray* a, double s, bool f
         case TYPED_ELEM_INT32: TYPED_DIVS_CALL(i32, int32_t);
         case TYPED_ELEM_INT64: TYPED_DIVS_CALL(i64, int64_t);
         case TYPED_ELEM_FLOAT32: TYPED_DIVS_CALL(f32, float);
-        default: TYPED_DIVS_CALL(f64, double);
+        case TYPED_ELEM_FLOAT64: TYPED_DIVS_CALL(f64, double);
+        case TYPED_ELEM_BOOL: break;
     }
 }
 #undef TYPED_DIVS_CALL
@@ -1766,7 +1796,14 @@ static AerVal vm_typed_array_chain2(AerTypedArray* a, AerTypedArray* b, AerTyped
 
 /* a and b must already have the same elem_kind and count -- checked by the caller (vm_binary_cold),
    since the error message there names the actual operator, which this function doesn't have. */
+static AerVal vm_reject_boolean_column(Opcode op) {
+    error("'%s' is not defined on a boolean[] -- it holds true and false, not numbers", binop_symbol(op));
+    return aer_bool(false);
+}
+
 static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcode op) {
+    if (a->elem_kind == TYPED_ELEM_BOOL || b->elem_kind == TYPED_ELEM_BOOL)
+        return vm_reject_boolean_column(op);
     if (a->elem_kind != b->elem_kind) {
         error("Cannot combine typed arrays of different element kinds");
         return aer_bool(false);
@@ -1858,6 +1895,7 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
                 typed_mul_f64(rc, ra, rb, a->count);
             break;
         }
+        case TYPED_ELEM_BOOL: break;
     }
 #undef AER_CMP_DISPATCH
     return aer_typed_array_val(r);
@@ -1868,6 +1906,8 @@ static AerVal vm_typed_array_binary_op(AerTypedArray* a, AerTypedArray* b, Opcod
    literal in it has no array-level form to be written as. `flip` is set when the scalar was the
    left operand, which only changes subtraction. */
 static AerVal vm_typed_array_scalar_op(AerTypedArray* a, AerVal scalar, Opcode op, bool flip) {
+    if (a->elem_kind == TYPED_ELEM_BOOL)
+        return vm_reject_boolean_column(op);
     double s = aer_type(scalar) == TYPE_INTEGER ? (double)aer_as_int(scalar) : aer_as_real(scalar);
     if (op == OP_DIV) {
         /* Only the scalar can be a zero divisor here, so it is checked once rather than per row. */
@@ -1937,6 +1977,7 @@ static AerVal vm_typed_array_scalar_op(AerTypedArray* a, AerVal scalar, Opcode o
         AER_SCALAR_CASE(TYPED_ELEM_FLOAT32, f32, float)
         AER_SCALAR_CASE(TYPED_ELEM_FLOAT64, f64, double)
 #undef AER_SCALAR_CASE
+        case TYPED_ELEM_BOOL: break;
     }
     return aer_typed_array_val(r);
 }
@@ -1957,7 +1998,7 @@ AerVal vm_struct_field_read(AerStruct* s, unsigned int slot) {
         return v;
     }
     if (s->shape->field_narrow[slot])
-        return vm_typed_elem_read(p, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32);
+        return vm_narrow_field_read(p, ftype);
     return vm_packed_slot_read(p, ftype);
 }
 
@@ -1967,33 +2008,28 @@ AerVal vm_struct_field_read(AerStruct* s, unsigned int slot) {
    this project's established "fail loudly" convention -- see OP_CAST's own integer-overflow
    handling). float32/float64 accept TYPE_INTEGER or TYPE_REAL, promoted, matching the existing
    promotion convention in the raw-arithmetic `_boxed` handlers. */
-static bool vm_typed_array_check(Chunk* c, TypedArrayElemKind kind, AerVal val) {
+static inline bool vm_typed_array_accepts(TypedArrayElemKind kind, AerVal val) {
     switch (kind) {
-        case TYPED_ELEM_INT64:
-            if (aer_type(val) != TYPE_INTEGER) {
-                error("Cannot assign a %s into an integer[] array", vm_type_name(c, val));
-                return false;
-            }
-            return true;
+        case TYPED_ELEM_INT64: return aer_type(val) == TYPE_INTEGER;
         case TYPED_ELEM_INT32:
-            if (aer_type(val) != TYPE_INTEGER) {
-                error("Cannot assign a %s into an int32[] array", vm_type_name(c, val));
-                return false;
-            }
-            if (aer_as_int(val) < INT32_MIN || aer_as_int(val) > INT32_MAX) {
-                error("Value %lld out of range for an int32[] array", (long long)aer_as_int(val));
-                return false;
-            }
-            return true;
-        case TYPED_ELEM_FLOAT64:
+            return aer_type(val) == TYPE_INTEGER && aer_as_int(val) >= INT32_MIN &&
+                   aer_as_int(val) <= INT32_MAX;
         case TYPED_ELEM_FLOAT32:
-            if (aer_type(val) != TYPE_INTEGER && aer_type(val) != TYPE_REAL) {
-                error("Cannot assign a %s into a %s array", vm_type_name(c, val),
-                      kind == TYPED_ELEM_FLOAT32 ? "float32[]" : "float[]");
-                return false;
-            }
-            return true;
+        case TYPED_ELEM_FLOAT64: return aer_type(val) == TYPE_INTEGER || aer_type(val) == TYPE_REAL;
+        case TYPED_ELEM_BOOL: return aer_type(val) == TYPE_BOOLEAN;
     }
+    return false;
+}
+
+static bool vm_typed_array_check(Chunk* c, TypedArrayElemKind kind, AerVal val) {
+    static const char* array_names[] = {"an int32[]", "a float32[]", "an integer[]", "a float[]",
+                                        "a boolean[]"};
+    if (vm_typed_array_accepts(kind, val))
+        return true;
+    if (kind == TYPED_ELEM_INT32 && aer_type(val) == TYPE_INTEGER)
+        error("Value %lld out of range for an int32[] array", (long long)aer_as_int(val));
+    else
+        error("Cannot assign a %s into %s array", vm_type_name(c, val), array_names[kind]);
     return false;
 }
 
@@ -2049,7 +2085,7 @@ static inline AerVal vm_struct_field_read_at(AerStruct* s, unsigned int offset, 
         return v;
     }
     if (narrow)
-        return vm_typed_elem_read(p, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32);
+        return vm_narrow_field_read(p, ftype);
     return vm_packed_slot_read(p, ftype);
 }
 
@@ -2061,7 +2097,7 @@ static inline void vm_struct_field_write_at(AerStruct* s, unsigned int offset, V
         return;
     }
     if (narrow) {
-        vm_typed_elem_write(p, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32, v);
+        vm_narrow_field_write(p, ftype, v);
         return;
     }
     vm_packed_slot_write(p, ftype, v);
@@ -3630,6 +3666,12 @@ HANDLER(typed_index_get_unchecked)
     DISPATCH();
 }
 
+SEPARATE_HANDLER(typed_index_set_reject_value)
+    AerTypedArray* ta = aer_as_typed_array(registers[(int)UNPACK_A(op_word)]);
+    vm_typed_array_check(c, ta->elem_kind, *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word)));
+    DISPATCH();
+}
+
 HANDLER(typed_index_set_unchecked)
     int arr_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
@@ -3638,10 +3680,9 @@ HANDLER(typed_index_set_unchecked)
     if (aer_type(obj) != TYPE_TYPED_ARRAY)
         __attribute__((musttail)) return h_index_set(vm, pc, registers, c);
     AerTypedArray* ta = aer_as_typed_array(obj);
-    /* Value-type/range validation is a separate concern from index safety and is NOT skipped --
-       see vm_typed_array_check's own contract (vm_typed_elem_write's comment above). */
-    if (!vm_typed_array_check(c, ta->elem_kind, *val))
-        DISPATCH();
+    /* The loop proves the index, not the value. */
+    if (!vm_typed_array_accepts(ta->elem_kind, *val))
+        __attribute__((musttail)) return h_typed_index_set_reject_value(vm, pc, registers, c);
     int64_t i = aer_as_int(*idx);
     unsigned int width = vm_typed_elem_width(ta->elem_kind);
     vm_typed_elem_write(ta->data + (size_t)i * width, ta->elem_kind, *val);
@@ -3650,13 +3691,15 @@ HANDLER(typed_index_set_unchecked)
 
 SEPARATE_HANDLER(index_set_any_from_int)
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
-    vm_index_set_compute(vm, registers[(int)UNPACK_A(op_word)], *idx, aer_int(registers[UNPACK_C(op_word)].as.i));
+    vm_index_set_compute(vm, registers[(int)UNPACK_A(op_word)], *idx,
+                         aer_int(registers[UNPACK_C(op_word)].as.i));
     DISPATCH();
 }
 
 SEPARATE_HANDLER(index_set_any_from_real)
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
-    vm_index_set_compute(vm, registers[(int)UNPACK_A(op_word)], *idx, aer_real(registers[UNPACK_C(op_word)].as.d));
+    vm_index_set_compute(vm, registers[(int)UNPACK_A(op_word)], *idx,
+                         aer_real(registers[UNPACK_C(op_word)].as.d));
     DISPATCH();
 }
 
@@ -4811,7 +4854,8 @@ HANDLER(array_repeat)
         for (int64_t e = 0; e < count; e++)
             memcpy(pa->data + (size_t)e * element_size, src->fields, element_size);
         registers[dest_reg] = aer_packed_array_val(pa);
-    } else if (aer_type(fill) == TYPE_INTEGER || aer_type(fill) == TYPE_REAL) {
+    } else if (aer_type(fill) == TYPE_INTEGER || aer_type(fill) == TYPE_REAL ||
+               aer_type(fill) == TYPE_BOOLEAN) {
         /* narrow_flag is a pure parse-time decision (was the fill expression written as an
            `i`/`f`-suffixed literal directly in this position?) -- by construction, that always
            agrees with fill's own runtime tag (an `i`-suffixed literal is always a TYPE_INTEGER
@@ -4821,6 +4865,8 @@ HANDLER(array_repeat)
             kind = TYPED_ELEM_INT32;
         else if (narrow_flag == 2)
             kind = TYPED_ELEM_FLOAT32;
+        else if (aer_type(fill) == TYPE_BOOLEAN)
+            kind = TYPED_ELEM_BOOL;
         else
             kind = (aer_type(fill) == TYPE_INTEGER) ? TYPED_ELEM_INT64 : TYPED_ELEM_FLOAT64;
         unsigned int width = vm_typed_elem_width(kind);
@@ -4858,7 +4904,7 @@ HANDLER(array_repeat)
         registers[dest_reg] = aer_array_val(rows);
     } else {
         error("Cannot build a repeat-literal array from a %s value -- the fill value must be a "
-              "number, a struct instance, or a typed array",
+              "number, a boolean, a struct instance, or a typed array",
               vm_type_name(c, fill));
         DISPATCH();
     }
@@ -4899,7 +4945,7 @@ SEPARATE_HANDLER(index_field_get_any_container)
         unsigned int element_size = pa->shape->instance_bytes;
         unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
         registers[dest_reg] =
-            narrow ? vm_typed_elem_read(elem, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32)
+            narrow ? vm_narrow_field_read(elem, ftype)
                    : vm_packed_slot_read(elem, ftype);
         DISPATCH();
     }
@@ -4935,7 +4981,7 @@ HANDLER(index_field_get)
     unsigned char* elem = pa->data + (size_t)idx->as.i * pa->shape->instance_bytes + entry->offset;
     registers[(int)UNPACK_A(op_word)] =
         entry->narrow
-            ? vm_typed_elem_read(elem, entry->ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32)
+            ? vm_narrow_field_read(elem, entry->ftype)
             : vm_packed_slot_read(elem, entry->ftype);
     DISPATCH();
 }
@@ -4978,7 +5024,7 @@ SEPARATE_HANDLER(index_field_set_any_container)
         unsigned int element_size = pa->shape->instance_bytes;
         unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
         if (narrow)
-            vm_typed_elem_write(elem, declared == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32, *val);
+            vm_narrow_field_write(elem, declared, *val);
         else
             vm_packed_slot_write(elem, declared, *val);
         DISPATCH();
@@ -5024,7 +5070,7 @@ HANDLER(index_field_set)
     (void)READ();
     unsigned char* elem = pa->data + (size_t)idx->as.i * pa->shape->instance_bytes + entry->offset;
     if (entry->narrow)
-        vm_typed_elem_write(elem, entry->ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32, *val);
+        vm_narrow_field_write(elem, entry->ftype, *val);
     else
         vm_packed_slot_write(elem, entry->ftype, *val);
     DISPATCH();
@@ -5066,7 +5112,7 @@ HANDLER(index_field_compound)
         unsigned int element_size = pa->shape->instance_bytes;
         unsigned char* elem = pa->data + (size_t)i * element_size + foffset;
         AerVal lhs =
-            narrow ? vm_typed_elem_read(elem, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32)
+            narrow ? vm_narrow_field_read(elem, ftype)
                    : vm_packed_slot_read(elem, ftype);
         bool handled;
         AerVal result = vm_binary_fast(lhs, *rhs, bin_op, ftype, aer_type(*rhs), &handled);
@@ -5082,7 +5128,7 @@ HANDLER(index_field_compound)
         if (!vm_check_narrow_field_write(ftype, narrow, result))
             DISPATCH();
         if (narrow)
-            vm_typed_elem_write(elem, ftype == TYPE_INTEGER ? TYPED_ELEM_INT32 : TYPED_ELEM_FLOAT32, result);
+            vm_narrow_field_write(elem, ftype, result);
         else
             vm_packed_slot_write(elem, ftype, result);
         DISPATCH();

@@ -141,8 +141,8 @@ static void format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb, uns
         }
         case TYPE_TYPED_ARRAY: {
             /* Terse summary, matching TYPE_PACKED_ARRAY's own -- vm_type_name (vm.c) already
-               derives "int32[]"/"float32[]"/"integer[]"/"float[]" from elem_kind. */
-            static const char* elem_names[] = {"int32", "float32", "integer", "float"};
+               derives "int32[]"/"float32[]"/"integer[]"/"float[]"/"boolean[]" from elem_kind. */
+            static const char* elem_names[] = {"int32", "float32", "integer", "float", "boolean"};
             AerTypedArray* ta = aer_as_typed_array(v);
             strbuf_append(sb, elem_names[ta->elem_kind]);
             strbuf_append(sb, "[");

@@ -1,0 +1,4 @@
+import collection
+
+flags = [true; 4]
+least = collection.min(flags) #!error: not defined on a boolean[]

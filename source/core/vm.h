@@ -534,8 +534,8 @@ _Static_assert(offsetof(struct AerStruct, gc_state) == 0, "pool.c assumes gc_sta
    -- json.encode serializes structs through it too. */
 AerVal vm_struct_field_read(AerStruct* s, unsigned int slot);
 
-/* 4 for int32/float32, 8 for int64/float64. Not file-static: gc.c's free_typed_array recomputes a
-   dying array's buffer size from it. */
+/* 1 for boolean, 4 for int32/float32, 8 for int64/float64. Not file-static: gc.c's free_typed_array
+   recomputes a dying array's buffer size from it. */
 unsigned int vm_typed_elem_width(TypedArrayElemKind kind);
 
 /* Which runtime shape a shape-sensitive parameter arrived as. STRUCT and PACKED_ARRAY carry a

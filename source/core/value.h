@@ -34,7 +34,7 @@ typedef enum ValueType {
     /* Struct-typed *arrays* packed inline at 8 bytes/field -- fixed-primitive fields only, and no
        standalone `arr[i]` reference value (only `arr[i].field`); see AerPackedArray below. */
     TYPE_PACKED_ARRAY,
-    /* A dense, uniformly-typed numeric array (int32/float32/int64/float64) -- the numeric half of the
+    /* A dense, uniformly-typed array of numbers or booleans -- the scalar half of the
        `[value; count]` repeat-literal (the struct half is TYPE_PACKED_ARRAY above). Unlike
        AerPackedArray this has no Shape at all -- just one fixed element kind for the whole array.
        See AerTypedArray below. */
@@ -101,19 +101,20 @@ struct AerPackedArray {
 };
 _Static_assert(offsetof(struct AerPackedArray, gc_state) == 0, "pool.c assumes gc_state is byte 0");
 
-/* Which numeric width/kind a TYPE_TYPED_ARRAY's elements are stored as. INT64/FLOAT64 are the
-   "wide" (unsuffixed-literal) case, INT32/FLOAT32 the "narrow" (`i`/`f`-suffixed-literal) one --
-   see the repeat-literal construction opcode's own comment (vm.h) for how one is chosen. */
+/* How a TYPE_TYPED_ARRAY's elements are stored. INT64/FLOAT64 are the "wide" (unsuffixed-literal)
+   case, INT32/FLOAT32 the "narrow" (`i`/`f`-suffixed-literal) one, BOOL a true/false fill, one byte
+   each -- see the repeat-literal construction opcode's own comment (vm.h) for how one is chosen. */
 typedef enum {
     TYPED_ELEM_INT32,
     TYPED_ELEM_FLOAT32,
     TYPED_ELEM_INT64,
     TYPED_ELEM_FLOAT64,
+    TYPED_ELEM_BOOL,
 } TypedArrayElemKind;
 
-/* A dense, fixed-width numeric array -- element i's raw bytes are at data + i*elem_width. A GC
-   leaf, same reasoning as AerPackedArray above: every element is a fixed numeric primitive, never a
-   heap reference, so no write barrier and no mark recursion. No Shape -- there are no fields, just
+/* A dense, fixed-width array -- element i's raw bytes are at data + i*elem_width. A GC leaf, same
+   reasoning as AerPackedArray above: every element is a fixed primitive, never a heap reference, so
+   no write barrier and no mark recursion. No Shape -- there are no fields, just
    one uniform element kind for the whole array. */
 struct AerTypedArray {
     unsigned char gc_state;
@@ -198,11 +199,10 @@ static inline AerVal aer_null(void) {
 }
 
 static inline AerVal aer_bool(bool b) {
-    /* as.i = 0 first -- vm_packed_slot_write memcpy's the whole 8-byte union, not just byte 0 */
+    /* All eight bytes, in one store -- vm_packed_slot_write copies the whole union, not just byte 0 */
     AerVal v;
     v.tag = TYPE_BOOLEAN;
-    v.as.i = 0;
-    v.as.b = b;
+    v.as.i = b;
     return v;
 }
 

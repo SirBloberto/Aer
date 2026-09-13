@@ -1,13 +1,12 @@
-# is_composite is an int32 typed array (0/1 standing in for false/true) instead of a boxed
-# array of individually-allocated booleans -- denser storage (4 bytes/flag vs. a full AerVal
-# each) and the repeat-literal builds it in one op instead of `limit+1` incremental appends.
+# is_composite is a boolean[] -- one byte per flag, built in one op by the repeat literal instead of
+# `limit+1` incremental appends.
 function sieve(limit):
-    is_composite = [0i; limit + 1]
+    is_composite = [false; limit + 1]
     n = length(is_composite)
 
     count = 0
     for p in 2..n:
-        if is_composite[p] == 0:
+        if not is_composite[p]:
             count += 1
             # A range-for (not a manual `for multiple <= limit:` while-loop) so the marking pass
             # gets the same loop-rotated single-dispatch condition+advance (OP_ITER_RANGE_LOOP)
@@ -18,7 +17,7 @@ function sieve(limit):
             # being empty on the (common, for p near sqrt(limit)) case where p*p already >= n.
             if p * p < n:
                 for multiple in (p * p)..n..p:
-                    is_composite[multiple] = 1
+                    is_composite[multiple] = true
     return count
 
 LIMIT = 13000000

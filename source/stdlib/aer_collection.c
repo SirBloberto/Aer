@@ -66,6 +66,13 @@ DEFINE_EXTREME(max_f64, double, >)
 
 /* FN_COLLECTION_SUM/MIN/MAX over a typed array. Integer elements answer as an integer and float
    elements as a real, so the result matches what indexing the same array would have given. */
+static int64_t count_true(const uint8_t* d, unsigned int n) {
+    int64_t total = 0;
+    for (unsigned int i = 0; i < n; i++)
+        total += d[i] != 0;
+    return total;
+}
+
 static AerVal typed_reduce(AerTypedArray* ta, int fn_id) {
     const void* d = ta->data;
     unsigned int n = ta->count;
@@ -83,11 +90,12 @@ static AerVal typed_reduce(AerTypedArray* ta, int fn_id) {
                 return aer_real(sum_f32(d, n));
             return aer_real((double)(fn_id == FN_COLLECTION_MIN ? min_f32(d, n) : max_f32(d, n)));
         case TYPED_ELEM_FLOAT64:
-        default:
             if (fn_id == FN_COLLECTION_SUM)
                 return aer_real(sum_f64(d, n));
             return aer_real(fn_id == FN_COLLECTION_MIN ? min_f64(d, n) : max_f64(d, n));
+        case TYPED_ELEM_BOOL: return aer_int(count_true(d, n));
     }
+    return aer_null();
 }
 
 static double typed_elem(const AerTypedArray* t, unsigned int i) {
@@ -95,8 +103,10 @@ static double typed_elem(const AerTypedArray* t, unsigned int i) {
         case TYPED_ELEM_INT32: return (double)((const int32_t*)t->data)[i];
         case TYPED_ELEM_INT64: return (double)((const int64_t*)t->data)[i];
         case TYPED_ELEM_FLOAT32: return (double)((const float*)t->data)[i];
-        default: return ((const double*)t->data)[i];
+        case TYPED_ELEM_FLOAT64: return ((const double*)t->data)[i];
+        case TYPED_ELEM_BOOL: return ((const uint8_t*)t->data)[i] ? 1.0 : 0.0;
     }
+    return 0.0;
 }
 
 /* GROUP BY in one pass. What whole-array arithmetic cannot do is scatter -- send each element to an
@@ -146,17 +156,21 @@ static bool group_sum_run(AerTypedArray* val, AerTypedArray* grp, AerTypedArray*
         case TYPED_ELEM_FLOAT32:                                                                             \
             return gsum_##vsfx##_f32((vt*)out->data, (const vt*)val->data, (const float*)grp->data, keep, n, \
                                      ngroups);                                                               \
-        default:                                                                                             \
+        case TYPED_ELEM_FLOAT64:                                                                             \
             return gsum_##vsfx##_f64((vt*)out->data, (const vt*)val->data, (const double*)grp->data, keep,   \
                                      n, ngroups);                                                            \
+        default:                                                                                             \
+            return false;                                                                                    \
     }
     switch (val->elem_kind) {
         case TYPED_ELEM_INT32: GS_BY_GROUP(i32, int32_t)
         case TYPED_ELEM_INT64: GS_BY_GROUP(i64, int64_t)
         case TYPED_ELEM_FLOAT32: GS_BY_GROUP(f32, float)
-        default: GS_BY_GROUP(f64, double)
+        case TYPED_ELEM_FLOAT64: GS_BY_GROUP(f64, double)
+        case TYPED_ELEM_BOOL: return false;
     }
 #undef GS_BY_GROUP
+    return false;
 }
 
 /* `collection.sum(a * b * c)` in one pass rather than one whole-array pass per operator, each of
@@ -425,7 +439,8 @@ static void typed_sort(AerTypedArray* t) {
                 sort_i64((int64_t*)t->data, t->count);
             break;
         case TYPED_ELEM_FLOAT32: sort_f32((float*)t->data, t->count); break;
-        default: sort_f64((double*)t->data, t->count); break;
+        case TYPED_ELEM_FLOAT64: sort_f64((double*)t->data, t->count); break;
+        case TYPED_ELEM_BOOL: break;
     }
 }
 
@@ -451,15 +466,22 @@ DEFINE_TYPED_FIND(find_f32, float, false)
 DEFINE_TYPED_FIND(find_f64, double, false)
 
 static int64_t typed_index_of(AerTypedArray* t, AerVal want) {
+    if (t->elem_kind == TYPED_ELEM_BOOL) {
+        if (aer_type(want) != TYPE_BOOLEAN || t->count == 0)
+            return -1;
+        const unsigned char* hit = memchr(t->data, aer_as_bool(want) ? 1 : 0, t->count);
+        return hit ? (int64_t)(hit - t->data) : -1;
+    }
     if (aer_type(want) != TYPE_INTEGER && aer_type(want) != TYPE_REAL)
         return -1;
     switch (t->elem_kind) {
         case TYPED_ELEM_INT32: return find_i32(t->data, t->count, want);
         case TYPED_ELEM_INT64: return find_i64(t->data, t->count, want);
         case TYPED_ELEM_FLOAT32: return find_f32(t->data, t->count, want);
-        case TYPED_ELEM_FLOAT64:
-        default: return find_f64(t->data, t->count, want);
+        case TYPED_ELEM_FLOAT64: return find_f64(t->data, t->count, want);
+        case TYPED_ELEM_BOOL: break;
     }
+    return -1;
 }
 
 /* The same three over an ordinary array. It stays integer-exact while every element is an integer,
@@ -733,6 +755,8 @@ static bool collection_group_sum_into(VM* vm, int arg_count) {
     AerTypedArray* val = aer_as_typed_array(val_v);
     AerTypedArray* grp = aer_as_typed_array(grp_v);
     AerTypedArray* keep = arg_count == 4 ? aer_as_typed_array(keep_v) : NULL;
+    if (val->elem_kind == TYPED_ELEM_BOOL || grp->elem_kind == TYPED_ELEM_BOOL)
+        return push_error(vm, "group accumulation needs numbers and group numbers, not a boolean[]");
     if (val->count != grp->count || tgt->elem_kind != val->elem_kind || (keep && keep->count != val->count))
         return push_error(vm, "group accumulation needs matching lengths and element kinds");
     /* The filter arrives as 1/0 in whichever element kind the comparison produced. Flattening it
@@ -785,6 +809,10 @@ static bool collection_group_sum_chain(VM* vm, int arg_count) {
     if (!chain_operands_ok(operand, n, &count))
         return push_null(vm);
     AerTypedArray* grp = aer_as_typed_array(grp_v);
+    if (grp->elem_kind == TYPED_ELEM_BOOL) {
+        error("group_sum() needs group numbers, not a boolean[]");
+        return push_null(vm);
+    }
     if (count != grp->count) {
         error("group_sum() values and groups must be the same length (got %u and %u)", count, grp->count);
         return push_null(vm);
@@ -837,6 +865,11 @@ static bool collection_group_sum(VM* vm) {
     }
     AerTypedArray* val = aer_as_typed_array(val_v);
     AerTypedArray* grp = aer_as_typed_array(grp_v);
+    if (val->elem_kind == TYPED_ELEM_BOOL || grp->elem_kind == TYPED_ELEM_BOOL) {
+        error("group_sum() needs numbers and group numbers, not a boolean[]");
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
     if (val->count != grp->count) {
         error("group_sum() values and groups must be the same length (got %u and %u)", val->count,
               grp->count);
@@ -865,6 +898,12 @@ static bool collection_sum(VM* vm, int fn_id) {
         count = aer_as_array(src)->count;
     else {
         error("%s() requires an array of numbers", fname);
+        vm_stack_push(vm, aer_null());
+        return true;
+    }
+    if (fn_id != FN_COLLECTION_SUM && aer_type(src) == TYPE_TYPED_ARRAY &&
+        aer_as_typed_array(src)->elem_kind == TYPED_ELEM_BOOL) {
+        error("%s() is not defined on a boolean[] -- sum() counts its true elements", fname);
         vm_stack_push(vm, aer_null());
         return true;
     }
@@ -1147,6 +1186,11 @@ static bool collection_sort(VM* vm) {
     AerVal arr = vm_stack_pop(vm);
     if (aer_type(arr) == TYPE_TYPED_ARRAY) {
         AerTypedArray* t = aer_as_typed_array(arr);
+        if (t->elem_kind == TYPED_ELEM_BOOL) {
+            error("sort() is not defined on a boolean[]");
+            vm_stack_push(vm, aer_null());
+            return true;
+        }
         typed_sort(t);
         vm_stack_push(vm, arr);
         return true;

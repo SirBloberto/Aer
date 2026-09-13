@@ -954,6 +954,11 @@ fine as an ordinary, individually-constructed instance (`Type()`).
 This only works for a literal in that exact position — the suffix is parse-time-only information,
 so `x = 0.0f; [x; n]` builds an ordinary (wide) `float[]` array, not a narrow one.
 
+**Boolean arrays**: a `true` or `false` fill (`[false; n]`) builds a `boolean[]`, one byte per
+element. Its elements read back as `true`/`false` and accept only a boolean. `collection.sum()`
+counts the `true` elements and `index_of()` finds one; arithmetic, comparisons, `min`, `max`, `sort`
+and `group_sum` are errors, because a `boolean[]` holds truth values rather than numbers.
+
 **Packed arrays: field access only, no standalone per-element reference.** `arr[i].field` (get and
 set, including compound assignment) is the only supported form; a bare `arr[i]` alone is a compile
 error (`Cannot index type`), and so is `for x in arr:` — a packed array can't be iterated directly
@@ -970,7 +975,8 @@ doesn't yet handle either one on either side of that call.
 
 `type()` reports a distinct name for each: `"Point[]"` for a packed array (not `"Point"`, so packed
 and ordinary instances of the same struct are still distinguishable at runtime), and
-`"integer[]"`/`"float[]"`/`"int32[]"`/`"float32[]"` for a typed array depending on its element kind.
+`"integer[]"`/`"float[]"`/`"int32[]"`/`"float32[]"`/`"boolean[]"` for a typed array depending on its
+element kind.
 
 ## Method Calls and Pipes
 

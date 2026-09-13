@@ -156,6 +156,7 @@ TESTS := tests/test_core.aer \
          tests/test_tail_call_specialized.aer \
          tests/test_call_depth.aer \
          tests/test_specialized_fallbacks.aer \
+         tests/test_boolean_arrays.aer \
          tests/test_compound_ops_specialized.aer \
          tests/test_field_fma_fusion.aer \
          tests/test_net.aer \

@@ -1,0 +1,2 @@
+flags = [false; 4]
+doubled = flags * 2 #!error: not defined on a boolean[]

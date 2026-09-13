@@ -3875,3 +3875,34 @@ reading it in place (bounds-checked, since a plain array can shrink in the loop)
 Handlers with no calls that still save registers (`index_field_set`, the raw compares) are out of
 Win64's seven volatile registers, which the four-value carry set already uses most of; there is
 nothing to separate, and SysV and AArch64 have more.
+
+### 5.69 boolean[], and element-kind switches with no default
+
+`[false; n]` stores one byte per element where the smallest kind before it was a 4-byte `int32[]`.
+It holds truth values, so it takes booleans only and rejects arithmetic, comparison, `min`, `max`,
+`sort` and `group_sum`; `sum` counts the true elements.
+
+**The hazard it exposed:** every switch over `TypedArrayElemKind` that ended in `default:` read an
+unrecognised kind as float64. A new kind would have flowed through sort, `index_of`, the reductions
+and array division as doubles and returned wrong numbers without an error. Those switches name every
+kind now, so `-Wswitch` lists each site a future kind has to handle. The one `default:` left is the
+group-number dispatch, which rejects rather than guesses.
+
+| 13M-flag sieve | peak memory | time |
+|---|---|---|
+| `int32[]`, raw int store and fused compare-and-branch | 54.9MB | 0.354s |
+| `boolean[]` | 17.7MB | 0.365s (+3.1%, one build) |
+| Python `bytearray` | 23.7MB | -- |
+
+A first build ran the boolean sieve 40.6% slower, and nearly all of that was the construction cost
+below, not the storage. What remains is a store of a boxed `true` running the typed store where `= 1`
+gets `OP_INDEX_SET_RAW_INT`, and `if not x` paying an `OP_UNARY` before its jump. The typed store's
+value check was separated first (5.68): it no longer calls out.
+
+**Adding the kind cost handlers that never touch a boolean**, and the cause was construction, not the
+kind. `aer_bool` zeroed the payload and then wrote one byte over it, which GCC built on the stack --
+typed index get went from 1 entry save to 3 and struct_array_scan lost 5.2%. Narrow struct fields
+read and wrote through the typed-array element helpers with a computed kind, which turned into a jump
+table at five kinds. `aer_bool` is now one full-width store (all 14 int/real comparison fast paths
+shrank, `lt` 76 -> 67 instructions; the general `_any_values` ones build theirs in a call and did not) and narrow fields have their own int32/float32 helpers. A table for the element
+width was tried and was worse -- the load needs a register of its own in every handler that inlines it.
