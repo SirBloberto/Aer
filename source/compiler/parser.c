@@ -5427,8 +5427,10 @@ static void parse_return(Chunk* c) {
         if (last_bare_call_end == c->count) {
             int op_slot = (int)last_bare_call_start;
             int orig_op = c->code[op_slot] & 0xFF;
-            if (orig_op == OP_CALL || orig_op == OP_CALL_VALUE) {
-                int tail_op = (orig_op == OP_CALL) ? OP_TAIL_CALL : OP_TAIL_CALL_VALUE;
+            if (orig_op == OP_CALL || orig_op == OP_CALL_VALUE || orig_op == OP_CALL_SELF) {
+                int tail_op = orig_op == OP_CALL         ? OP_TAIL_CALL
+                              : orig_op == OP_CALL_VALUE ? OP_TAIL_CALL_VALUE
+                                                         : OP_TAIL_CALL_SELF;
                 c->code[op_slot] = (c->code[op_slot] & ~0xFFU) | (uint32_t)tail_op;
                 return;
             }

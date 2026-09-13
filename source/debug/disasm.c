@@ -343,6 +343,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
         {AT_C, F_RK8}),
     ROW(OP_CALL_SELF, "recursive call into this same specialized body", {AT_A, F_REG},
         {AT_B, F_REG}, {AT_C, F_COUNT}),
+    ROW(OP_TAIL_CALL_SELF, "tail call into this same specialized body, reuses this frame",
+        {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_COUNT}),
     ROW(OP_RAW_MATH_REAL, "rawr = math fn(rawr), never boxed", {AT_A, F_RAWR}, {AT_B, F_RAWR},
         {AT_C, F_FN_ID}),
     ROW(OP_RAW_INT_TO_REAL, "rawr = (real)rawi", {AT_A, F_RAWR}, {AT_B, F_RAWI}),

@@ -3413,6 +3413,24 @@ HANDLER(call_self)
     DISPATCH();
 }
 
+/* OP_CALL_SELF in tail position. The frame being reused is already this variant's own, so its
+   size, bounds and entry stay as they are -- OP_TAIL_CALL would install the generic function's. */
+HANDLER(tail_call_self)
+    int arg_reg_base = (int)UNPACK_B(op_word);
+    int arg_count = (int)UNPACK_C(op_word);
+    CallFrame* frame = &vm->call_stack[vm->call_depth];
+    for (int i = 0; i < arg_count; i++)
+        registers[i] = registers[arg_reg_base + i];
+    frame_init_tags(registers, (unsigned int)arg_count, frame->frame_bounds);
+    frame->tail_calls_collapsed++;
+    pc = c->code + frame->code_offset;
+    if (vm->slice_max && --vm->slice_budget == 0) {
+        vm->ip = (unsigned int)(pc - c->code);
+        return VM_SLICE_YIELDED;
+    }
+    DISPATCH();
+}
+
 /* On a domain error aer_math_unary_raw has already raised it and longjmped, so the store is only
    reached with a real result. */
 HANDLER(raw_math_real)
@@ -5385,6 +5403,7 @@ static const OpHandler aer_handlers[256] = {
         [OP_INDEX_SET_RAW_REAL] = h_index_set_raw_real,
         [OP_INDEX_GET_RAW_REAL] = h_index_get_raw_real,
         [OP_CALL_SELF] = h_call_self,
+        [OP_TAIL_CALL_SELF] = h_tail_call_self,
         [OP_RAW_MATH_REAL] = h_raw_math_real,
         [OP_RAW_INT_TO_REAL] = h_raw_int_to_real,
         [OP_RAW_REAL_TO_INT] = h_raw_real_to_int,

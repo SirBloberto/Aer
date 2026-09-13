@@ -356,6 +356,7 @@ typedef enum {
        function re-resolves every call, costing more than specializing saved. Emitted only INTO a
        variant: a generic body must keep resolving or it never specializes at all. */
     OP_CALL_SELF, /* dest_reg, arg_reg_base, arg_count */
+    OP_TAIL_CALL_SELF, /* same operands as OP_CALL_SELF; dest_reg is unused */
 
     /* Only the functions aer_math_fn_is_raw_real accepts -- floor/ceil/round return integers. */
     OP_RAW_MATH_REAL, /* dest_slot, src_slot, fn_id */
