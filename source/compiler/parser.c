@@ -44,14 +44,19 @@ typedef struct {
    fill the gap exactly, so a loop using fewer skips the rest with one OP_JUMP. */
 #define HOIST_MAX 4
 #define HOIST_GAP_WORDS (HOIST_MAX * 2)
+
+typedef struct {
+    bool is_int;
+    bool from_pool; /* int too wide for OP_RAW_LOAD_INT's int32 immediate */
+    int64_t value; /* ints: the value itself, so dedup never depends on pool identity */
+    unsigned int rawk_idx;
+    int slot;
+} HoistedConstant;
+
 typedef struct {
     unsigned int gap_offset;
     int count;
-    bool is_int[HOIST_MAX];
-    bool from_pool[HOIST_MAX]; /* int too wide for OP_RAW_LOAD_INT's int32 immediate */
-    int64_t value[HOIST_MAX]; /* ints: the value itself, so dedup never depends on pool identity */
-    unsigned int rawk_idx[HOIST_MAX];
-    int slot[HOIST_MAX];
+    HoistedConstant consts[HOIST_MAX];
     /* Both runs are claimed up front rather than one slot at a time on first use. A first use sits
        part-way through an expression, where an integer claim would raise the floor between two of a
        call's argument registers and break the contiguous run OP_CALL needs, and either kind would
@@ -1187,15 +1192,16 @@ static void hoist_end(Chunk* c, unsigned int after_gap, bool active) {
     LoopHoist* h = &P.hoist_stack[--P.hoist_depth];
     unsigned int w = h->gap_offset;
     for (int i = 0; i < h->count; i++) {
-        if (!h->is_int[i]) {
-            c->code[w++] = PACK1(OP_RAW_LOAD_REAL, h->slot[i]);
-            c->code[w++] = h->rawk_idx[i];
-        } else if (h->from_pool[i]) {
-            c->code[w++] = PACK1(OP_RAW_LOAD_INT_POOL, h->slot[i]);
-            c->code[w++] = h->rawk_idx[i];
+        const HoistedConstant* k = &h->consts[i];
+        if (!k->is_int) {
+            c->code[w++] = PACK1(OP_RAW_LOAD_REAL, k->slot);
+            c->code[w++] = k->rawk_idx;
+        } else if (k->from_pool) {
+            c->code[w++] = PACK1(OP_RAW_LOAD_INT_POOL, k->slot);
+            c->code[w++] = k->rawk_idx;
         } else {
-            c->code[w++] = PACK1(OP_RAW_LOAD_INT, h->slot[i]);
-            c->code[w++] = (uint32_t)(int32_t)h->value[i];
+            c->code[w++] = PACK1(OP_RAW_LOAD_INT, k->slot);
+            c->code[w++] = (uint32_t)(int32_t)k->value;
         }
     }
     if (w < h->gap_offset + HOIST_GAP_WORDS) {
@@ -1224,29 +1230,25 @@ static int hoist_constant(bool is_int, int64_t value, unsigned int rawk_idx, boo
         return -1;
     LoopHoist* h = &P.hoist_stack[P.hoist_depth - 1];
     for (int i = 0; i < h->count; i++) {
-        if (h->is_int[i] != is_int)
+        const HoistedConstant* k = &h->consts[i];
+        if (k->is_int != is_int)
             continue;
-        if (is_int ? (h->value[i] == value) : (h->rawk_idx[i] == rawk_idx))
-            return h->slot[i];
+        if (is_int ? (k->value == value) : (k->rawk_idx == rawk_idx))
+            return k->slot;
     }
     if (h->count >= HOIST_MAX)
         return -1;
     int slot;
     if (is_int) {
-        if (h->slot_base < 0 || h->int_count >= HOIST_MAX)
+        if (h->slot_base < 0)
             return -1;
         slot = h->slot_base + h->int_count++;
     } else {
-        if (h->real_base < 0 || h->real_count >= HOIST_MAX)
+        if (h->real_base < 0)
             return -1;
         slot = h->real_base - h->real_count++;
     }
-    int i = h->count++;
-    h->is_int[i] = is_int;
-    h->from_pool[i] = from_pool;
-    h->value[i] = value;
-    h->rawk_idx[i] = rawk_idx;
-    h->slot[i] = slot;
+    h->consts[h->count++] = (HoistedConstant){is_int, from_pool, value, rawk_idx, slot};
     return slot;
 }
 
