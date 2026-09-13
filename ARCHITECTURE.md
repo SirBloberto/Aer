@@ -3781,6 +3781,13 @@ Two findings about the dispatch tail, both from reading emitted code:
 - Every frame push indexed `callee->registers` inside the argument-copy loop, and GCC reloaded
   the field each iteration because an `AerVal` store might alias it. Hoisting it to a local is
   worth fib_bench -0.37% and binary_trees -0.75%, sign-stable.
+- The same aliasing wall cost far more through store *ordering*. Both pushes wrote the frame's
+  scalar fields after the argument copy and `frame_init_tags`, keeping `pc`, `c`, `dest_reg` and
+  the entry offset live across both loops; `h_call_self` spent six callee-saved registers and 158
+  instructions on it, against a 33-instruction median handler. Writing the scalars first drops it
+  to four and 146, worth **fib_bench -7.69%** and binary_trees -0.86%, sign-stable over five
+  layouts. That moves fib from 0.84x to 0.95x against LuaJIT `-joff`. The gap that remains is
+  still frame management, and still the reason fib is the one benchmark AER loses.
 - On Windows each dispatch pays **two** dependent loads, not one: `-flto` reaches
   `aer_handlers` through a `.refptr` stub (146 sites; zero without `-flto`). This is not the PIE
   issue 5.x describes -- `-fno-pie -no-pie` does not remove it. Dropping `-flto` does, but costs
