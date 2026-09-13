@@ -836,12 +836,6 @@ typedef struct {
 
             unsigned int code_offset; /* this frame's entry point, for stack traces; unset on frame 0 */
             unsigned int tail_calls_collapsed; /* tail calls collapsed since this frame's last real push */
-            /* What the return value must be coerced to before it lands in dest_reg: 0 = whatever the
-               callee produced, 1/2 = integer/real. A call site that goes on to read the result with
-               an unchecked numeric opcode needs the payload to be the width that opcode assumes, and
-               only the site knows which. Every return path honours it, so a body is correct however
-               it was entered. */
-            unsigned char dest_raw_kind;
             bool synthetic_entry; /* set by setup_call() -- return_ip isn't a real caller line */
             unsigned short frame_bounds; /* FRAME_BOUNDS, above; fits the padding CallFrame had */
         };

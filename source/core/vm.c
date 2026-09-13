@@ -1161,7 +1161,6 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
     callee->frame_bounds = fn->frame_bounds;
     callee->return_ip = return_ip;
     callee->dest_reg = 0;
-    callee->dest_raw_kind = 0;
     callee->code_offset = fn->code_offset;
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = true;
@@ -1229,7 +1228,6 @@ static void vm_call_value(VM* vm, AerVal fv, int dest_reg, int arg_reg_base, int
     callee->frame_bounds = f->frame_bounds;
     callee->return_ip = return_ip;
     callee->dest_reg = dest_reg;
-    callee->dest_raw_kind = 0;
     callee->code_offset = f->code_offset;
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
@@ -3282,7 +3280,6 @@ HANDLER(call)
     callee->return_ip =
         (unsigned int)(pc - c->code); /* already past this instruction's operands -- the correct resume point */
     callee->dest_reg = dest_reg;
-    callee->dest_raw_kind = 0;
     callee->code_offset = chosen_offset;
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
@@ -3358,23 +3355,13 @@ HANDLER(return)
     AerVal result = callee->registers[src_reg];
     unsigned int return_ip = callee->return_ip;
     int dest_reg = callee->dest_reg;
-    unsigned char dest_raw_kind = callee->dest_raw_kind;
     vm->call_depth--;
     /* Refreshed BEFORE the write below -- registers still pointed at the callee's (now-popped)
        frame otherwise, corrupting whichever register of the CALLER's frame happens to share
        dest_reg's index instead of writing the return value where the caller expects it. */
     CallFrame* caller = &vm->call_stack[vm->call_depth];
     registers = caller->registers;
-    if (dest_raw_kind == 0)
-        registers[dest_reg] = result;
-    else if (result.tag != TYPE_INTEGER && result.tag != TYPE_REAL)
-        /* Falling off the end of a function a raw call site wanted a number from. Reading the null as 0
-           would turn an error into a wrong answer. */
-        error("Expected a number back from this call, got %s", vm_type_name(c, result));
-    else if (dest_raw_kind == 1)
-        registers[dest_reg] = aer_int((result.tag == TYPE_REAL) ? (int64_t)result.as.d : result.as.i);
-    else
-        registers[dest_reg] = aer_real((result.tag == TYPE_INTEGER) ? (double)result.as.i : result.as.d);
+    registers[dest_reg] = result;
     pc = c->code + return_ip;
     DISPATCH();
 }
@@ -3406,7 +3393,6 @@ HANDLER(call_self)
     callee->frame_bounds = caller->frame_bounds;
     callee->return_ip = (unsigned int)(pc - c->code);
     callee->dest_reg = dest_reg;
-    callee->dest_raw_kind = 0;
     callee->code_offset = entry;
     callee->tail_calls_collapsed = 0;
     callee->synthetic_entry = false;
