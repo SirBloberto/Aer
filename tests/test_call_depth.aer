@@ -1,0 +1,50 @@
+#!/usr/bin/env aer
+# AER test suite — non-tail recursion depth.
+#
+# The call stack and register bank start small and grow as recursion deepens, moving every live
+# frame's registers each time. Each case checks its arithmetic, so a frame rebased to the wrong place
+# shows up as a wrong number, and the allocating cases make the collector walk those frames mid-way.
+
+marker = 12345
+
+function depth(n):
+    if n <= 0:
+        return 0
+    return depth(n - 1) + 1
+
+assert(depth(9000) == 9000, "non-tail recursion 9,000 deep")
+assert(depth(9000) == 9000, "again, with the stack already grown")
+
+struct Node:
+    value = 0
+    next = null
+
+# Allocates an array and a string on every level, so collections run while thousands of frames are
+# live and holding references.
+function build(n):
+    if n <= 0:
+        return null
+    scratch = [n, n + 1, n + 2, n + 3]
+    label = "node {n} of the chain"
+    return Node(scratch[0], build(n - 1))
+
+function total(node):
+    if node == null:
+        return 0
+    return node.value + total(node.next)
+
+chain = build(8000)
+assert(total(chain) == 32004000, "a list built and summed 8,000 deep, with collections along the way")
+
+function mixed(n, acc):
+    if n <= 0:
+        return acc
+    if n % 100 == 0:
+        return mixed(n - 1, acc + 1)
+    return mixed(n - 1, acc) + 0
+
+assert(mixed(5000, 0) == 50, "tail and non-tail calls interleaved")
+
+assert(marker == 12345, "a top-level variable survives the bank moving underneath it")
+
+print("test_call_depth.aer: all assertions passed.")

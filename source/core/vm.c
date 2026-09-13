@@ -401,6 +401,7 @@ void vm_init(VM* vm, Chunk* chunk) {
        else a fresh run needs is exactly what aer_vm_reset_for_reuse() already does. */
     vm->register_stack =
         xmalloc(sizeof(AerVal) * REGISTER_STACK_INITIAL_FRAMES * FRAME_REGISTERS);
+    vm->call_stack = xcalloc(REGISTER_STACK_INITIAL_FRAMES, sizeof(CallFrame));
     vm->call_depth_limit = REGISTER_STACK_INITIAL_FRAMES;
     vm->call_stack[0].registers = &vm->register_stack[0];
     vm->call_stack[0].frame_size = FRAME_REGISTERS;
@@ -456,6 +457,8 @@ void vm_free(VM* vm) {
 
     free(vm->register_stack);
     vm->register_stack = NULL;
+    free(vm->call_stack);
+    vm->call_stack = NULL;
     vm->call_depth_limit = 0;
 }
 
@@ -1116,22 +1119,25 @@ static AerVal vm_default_value(VM* vm, AerVal dflt) {
    in target->call_stack[0].registers[0]. */
 /* Call setup                                                       */
 
-/* False means the depth ceiling itself was reached, which is the caller's overflow error. Offsets
-   are taken before the realloc, not after: every live frame's base points into the block about to
-   move, so reading them back out of freed memory is exactly what the rebase must avoid. */
+/* False means the depth ceiling itself was reached, which is the caller's overflow error. */
 static bool vm_grow_registers(VM* vm) {
     if (vm->call_depth_limit >= VM_CALL_MAX)
         return false;
-    size_t offsets[VM_CALL_MAX];
-    for (int i = 0; i <= vm->call_depth; i++)
-        offsets[i] = (size_t)(vm->call_stack[i].registers - vm->register_stack);
-    int frames = vm->call_depth_limit * 2;
+    int old_frames = vm->call_depth_limit;
+    int frames = old_frames * 2;
     if (frames > VM_CALL_MAX)
         frames = VM_CALL_MAX;
-    vm->register_stack = xrealloc(vm->register_stack, (size_t)frames * FRAME_REGISTERS * sizeof(AerVal));
-    vm->call_depth_limit = frames;
+    AerVal* old_bank = vm->register_stack;
+    AerVal* bank = xmalloc((size_t)frames * FRAME_REGISTERS * sizeof(AerVal));
+    memcpy(bank, old_bank, (size_t)old_frames * FRAME_REGISTERS * sizeof(AerVal));
+    vm->call_stack = xrealloc(vm->call_stack, (size_t)frames * sizeof(CallFrame));
+    memset(vm->call_stack + old_frames, 0, (size_t)(frames - old_frames) * sizeof(CallFrame));
+    /* Rebased against the old bank while it is still allocated, so no offset has to be stashed. */
     for (int i = 0; i <= vm->call_depth; i++)
-        vm->call_stack[i].registers = vm->register_stack + offsets[i];
+        vm->call_stack[i].registers = bank + (vm->call_stack[i].registers - old_bank);
+    free(old_bank);
+    vm->register_stack = bank;
+    vm->call_depth_limit = frames;
     return true;
 }
 

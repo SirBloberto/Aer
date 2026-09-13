@@ -632,7 +632,7 @@ a named call, a function-value call (`f = greet; f("World")`), and a cross-modul
 
 `factorial` above is *not* tail-recursive — `n * factorial(n - 1)` still has work (the
 multiplication) left to do after the recursive call returns, so each call needs its own stack
-frame, capped at 64 deep (`VM_CALL_MAX`). A call in true tail position — `return name(args)` as the
+frame, capped at 10,000 deep (`VM_CALL_MAX`). A call in true tail position — `return name(args)` as the
 **entire** statement, nothing wrapping it — reuses the current frame instead of pushing a new one,
 so recursion in that shape costs no additional stack depth no matter how deep it goes:
 
@@ -1758,7 +1758,7 @@ what a real permission system would still need on top of this.
 
 | Limit | Default cap |
 |-------|-------------|
-| Call stack depth | 64 frames — doesn't apply to true tail calls (see [Functions](#functions)), which reuse the current frame instead of consuming one |
+| Call stack depth | 10,000 frames — doesn't apply to true tail calls (see [Functions](#functions)), which reuse the current frame instead of consuming one |
 | Value stack | 256 slots |
 | Loop nesting | 16 levels |
 | Distinct local names per function (parameters + body locals combined) | 32 |

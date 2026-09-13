@@ -14,7 +14,7 @@ import math
 
 # `return name(args)` as the WHOLE statement reuses the current call frame
 # instead of pushing a new one — completing at a depth far past the
-# 64-frame call-stack limit is the direct, observable proof it fired; the
+# call-stack limit is the direct, observable proof it fired; the
 # unoptimized path would hit "Call stack overflow" long before this.
 function count_down(n, acc):
     if n <= 0:

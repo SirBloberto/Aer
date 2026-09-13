@@ -133,14 +133,17 @@ int main(void) {
     /* Tail-call optimization only reuses the frame for a bare `return
        name(args)` — a call wrapped by another operator, like `+ 0` here,
        is deliberately excluded (see parse_return, parser.c), so deep
-       *non*-tail recursion still correctly exhausts VM_CALL_MAX (64) and
+       *non*-tail recursion still correctly exhausts VM_CALL_MAX and
        aborts with a runtime error. Proves the detection doesn't
        over-apply; tests/test.aer proves the true-tail-call case reuses
-       the frame (completes far past 64 levels) — this is the negative
+       the frame (completes far past the limit) — this is the negative
        case that can't run there, since it deliberately aborts the file. */
+    char deep_non_tail[160];
+    snprintf(deep_non_tail, sizeof(deep_non_tail),
+             "function not_tail(n):\n    if n <= 0:\n        return 0\n    return not_tail(n - 1) + 0\n\nnot_tail(%d)\n", VM_CALL_MAX * 2);
     aer_clear_error();
     ok = aer_run_source(&vm, &chunk,
-        "function not_tail(n):\n    if n <= 0:\n        return 0\n    return not_tail(n - 1) + 0\n\nnot_tail(1000)\n");
+        deep_non_tail);
 
     check(!ok, "deep non-tail recursion still overflows the call stack — tail-call detection did not over-apply");
     check(strstr(aer_last_error(), "overflow") != NULL,

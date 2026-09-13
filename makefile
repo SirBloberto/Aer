@@ -154,6 +154,7 @@ TESTS := tests/test_core.aer \
          tests/test_spec_pool_realloc.aer \
          tests/test_recursion_limits.aer \
          tests/test_tail_call_specialized.aer \
+         tests/test_call_depth.aer \
          tests/test_compound_ops_specialized.aer \
          tests/test_field_fma_fusion.aer \
          tests/test_net.aer \

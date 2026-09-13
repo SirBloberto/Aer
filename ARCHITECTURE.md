@@ -320,7 +320,7 @@ of whether that function used any raw locals at all, `CallFrame` growing past a
 `_Static_assert(sizeof(CallFrame) <= 96, ...)` regression guard left specifically to catch this
 coming back), plus `frame_size`/`raw_int_frame_size`/`raw_real_frame_size` (this callee's own
 compile-time peak), `return_ip`/`dest_reg`, `code_offset` (for stack traces), and
-`tail_calls_collapsed`. `VM.call_stack` is a flat array of these (`VM_CALL_MAX = 64` frames);
+`tail_calls_collapsed`. `VM.call_stack` is a heap array of these, grown on demand up to `VM_CALL_MAX` (10,000) frames;
 `vm->registers` is a **pointer repointed at the current frame** on every
 call/return (not re-derived from `call_depth` on every access) — a tail call reuses the current
 frame in place, so it's the one case that needs *no* repointing.

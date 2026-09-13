@@ -815,9 +815,11 @@ typedef struct {
 /* Virtual machine                                                      */
 
 #define VM_STACK_MAX 256
-#define VM_CALL_MAX 64
+/* Non-tail call depth. The call stack and register bank grow on demand, about 2KB a frame, so this
+   bounds what a runaway recursion can take rather than what every VM reserves. */
+#define VM_CALL_MAX 10000
 
-/* Per-call register frame; lives in the VM struct so a nested module VM gets its own chain. */
+/* Per-call register frame; each VM owns its own chain, so a nested module VM gets its own. */
 typedef struct {
     /* The anonymous union pads sizeof(CallFrame) up to 64 without raising its ALIGNMENT. _Alignas(64)
        was the obvious way to get that size and is wrong: the requirement propagates to struct VM,
@@ -875,16 +877,16 @@ _Static_assert((sizeof(CallFrame) & (sizeof(CallFrame) - 1)) == 0,
                "CallFrame must stay a power of two -- see CALL_FRAME_PAD");
 
 typedef struct {
-    /* First. A Thumb-2 `ldr` reaches a 12-bit displacement, so a field past 4095 bytes needs its
-       offset materialized into a register first, and call_stack itself is 4096 bytes. Nothing
-       mirrors the active frame's registers here: mark_vm_roots scans call_stack[f].registers
-       directly, so a mirror would cost three stores per call and per return to serve no hot
-       reader. */
+    /* First, with call_stack beside it. A Thumb-2 `ldr` reaches a 12-bit displacement, so a field
+       past 4095 bytes needs its offset materialized into a register first. Nothing mirrors the
+       active frame's registers here: mark_vm_roots scans call_stack[f].registers directly, so a
+       mirror would cost three stores per call and per return to serve no hot reader. */
     int call_depth;
-    /* Depth the current bank can seat, at FRAME_REGISTERS each -- always <= VM_CALL_MAX. Every push
-       already had to test call_depth against a ceiling, so growing the bank costs no test of its
-       own: this one stands in for the constant, and the cold side decides grow-or-overflow. */
+    /* Depth the call stack and register bank can currently seat -- always <= VM_CALL_MAX. Every
+       push already had to test call_depth against a ceiling, so growing costs no test of its own:
+       this one stands in for the constant, and the cold side decides grow-or-overflow. */
     int call_depth_limit;
+    CallFrame* call_stack;
 
     Chunk* chunk;
     unsigned int ip;
@@ -906,11 +908,9 @@ typedef struct {
     bool io_enabled;
     bool net_enabled;
 
-    CallFrame call_stack[VM_CALL_MAX];
     /* Scratch argument channel for bridging out of the register convention (stdlib/module calls).
-       Deliberately AFTER call_stack: 4096 bytes in front of it pushed every CallFrame field past the
-       12-bit displacement window, costing h_call eight materialized constants per call. Nothing in
-       the dispatch loop's call path touches this array. */
+       Deliberately after every field the call path reads: its 4096 bytes in front of them would push
+       their offsets past the 12-bit displacement window. Nothing in the call path touches it. */
     AerVal stack[VM_STACK_MAX];
     int stack_top;
 
@@ -926,8 +926,8 @@ typedef struct {
     AerVal* register_stack;
 } VM;
 
-/* Frames this bank seats before its first growth. A frame consumes at most FRAME_REGISTERS, so
-   capacity is always call_depth_limit * FRAME_REGISTERS. */
+/* Frames the call stack and bank seat before their first growth. A frame consumes at most
+   FRAME_REGISTERS, so the bank's capacity is always call_depth_limit * FRAME_REGISTERS. */
 #define REGISTER_STACK_INITIAL_FRAMES 2
 
 /* Bounds-checked push/pop for native-module files, outside vm_run's PUSH()/POP() macros. */
