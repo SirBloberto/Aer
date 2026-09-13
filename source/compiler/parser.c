@@ -4237,10 +4237,19 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
         bool swap;
         if (complement_branch((Opcode)(w & 0xFF), &back_op, &swap)) {
             uint8_t a = (uint8_t)UNPACK_B(w), b = (uint8_t)UNPACK_C(w);
-            /* These opcodes take a constant in the right operand only, so an ordering test against
-               a literal bound (`for i < 5:`) cannot be complemented by swapping -- the complement
-               of `i < K` wants K on the left. Such loops keep the top-tested shape. */
             bool swap_encodable = !RK8_IS_CONST(a) && !RK8_IS_CONST(b);
+            /* The complement of `i < K` wants K on the left, where these opcodes take only a slot, so
+               a literal bound is loaded once into a preheader slot for the back-edge to read. */
+            if (swap && RK8_IS_CONST(a) != RK8_IS_CONST(b)) {
+                uint8_t* k = RK8_IS_CONST(a) ? &a : &b;
+                int64_t v = c->rawk_i[RK8_INDEX(*k)];
+                bool wide = !(v >= INT32_MIN && v <= INT32_MAX);
+                int slot = hoist_constant(true, v, wide ? RK8_INDEX(*k) : 0, wide);
+                if (slot >= 0 && slot <= (int)RK8_INDEX_MASK) {
+                    *k = (uint8_t)slot;
+                    swap_encodable = true;
+                }
+            }
             if (!swap || swap_encodable) {
                 back_lhs = swap ? b : a;
                 back_rhs = swap ? a : b;

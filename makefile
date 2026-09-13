@@ -150,6 +150,7 @@ TESTS := tests/test_core.aer \
          tests/test_loop_bound_hoisting.aer \
          tests/test_range_loop_counter.aer \
          tests/test_loop_constant_hoist.aer \
+         tests/test_loop_literal_bounds.aer \
          tests/test_spec_pool_realloc.aer \
          tests/test_recursion_limits.aer \
          tests/test_compound_ops_specialized.aer \
