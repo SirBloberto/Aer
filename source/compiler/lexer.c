@@ -137,6 +137,9 @@ void read_file(char* filename) {
     /* Normalize Windows line endings: strip \r in-place */
     char* dst = buf;
     char* src = buf;
+    /* A UTF-8 BOM, which most Windows editors write, would otherwise lex as an unknown character. */
+    if ((unsigned char)src[0] == 0xEF && (unsigned char)src[1] == 0xBB && (unsigned char)src[2] == 0xBF)
+        src += 3;
     while (*src) {
         if (*src != '\r')
             *dst++ = *src;
