@@ -109,12 +109,15 @@ typedef struct {
     /* Counts backpatches: a jump landing after the last instruction would make a rewrite of it
        reachable on paths the original was not. */
     unsigned int patch_epoch;
-    /* Side channel from the index-get site to parse_assignment, keyed on exact register equality
-       rather than a flag. */
-    int last_plain_index_dest_reg;
-    int last_plain_index_src_param;
-    Shape* last_plain_index_known_elem_shape;
 } PeepholeWindow;
+
+/* An index read's element facts, handed to the assignment that consumes its result. Keyed on the
+   exact result register and consumed at once, so a freed-and-reused temp cannot pick them up. */
+typedef struct {
+    int dest_reg;
+    int src_param;
+    Shape* elem_shape;
+} IndexAliasHandoff;
 
 /* Lets a `for i in 0..n:` loop skip an array's index-side runtime checks when n is proven ==
    length() of the SAME array it indexes. Every fact is tracked per-array-register and re-checked
@@ -164,6 +167,7 @@ typedef struct Parser {
 
     RegFacts regs;
     PeepholeWindow peep;
+    IndexAliasHandoff index_alias;
     LoopProofs proof;
     FuncCtx fn;
     /* Every register's current variable binding (0 registers is effectively local -- see
@@ -2419,13 +2423,13 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                     emit_index_get(c, dest, arr_reg, rk_start);
                 }
                 /* One-hop alias tracking for SPEC_KIND_ARRAY_OF_STRUCTS. Recorded unconditionally:
-                   last_plain_index_src_param needs only arr_reg's identity, available during the
-                   ordinary compile too. last_plain_index_known_elem_shape stays NULL outside a
+                   index_alias.src_param needs only arr_reg's identity, available during the
+                   ordinary compile too. index_alias.elem_shape stays NULL outside a
                    specialization recompile, since reg_known_element_shape is only seeded there. */
-                P.peep.last_plain_index_dest_reg = dest;
-                P.peep.last_plain_index_src_param =
+                P.index_alias.dest_reg = dest;
+                P.index_alias.src_param =
                     (arr_reg >= 0 && arr_reg < P.regs.current_param_count) ? arr_reg : -1;
-                P.peep.last_plain_index_known_elem_shape =
+                P.index_alias.elem_shape =
                     (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_known_element_shape[arr_reg] : NULL;
                 rk = dest;
                 continue;
@@ -3072,13 +3076,8 @@ static void parse_assign_destructuring(Chunk* c, unsigned int name_idx) {
         /* Destructuring can rebind a shape-tracked or safe-loop-index register, so clear all four
            per-register facts for every target. Timed after the RHS is parsed so a legitimate read
            of a target's old value on the RHS still gets the fast path. */
-        for (unsigned int i = 0; i < count; i++) {
-            P.regs.reg_known_shape[target_regs[i]] = NULL;
-            P.regs.reg_known_element_shape[target_regs[i]] = NULL;
-            P.regs.reg_elem_kind[target_regs[i]] = RAWK_NONE;
-            P.regs.alias_source_param[target_regs[i]] = -1;
-            invalidate_register(target_regs[i]);
-        }
+        for (unsigned int i = 0; i < count; i++)
+            forget_register(target_regs[i]);
 
         int arr_reg = rhs_reg_base;
         if (rhs_count > 1) {
@@ -3115,7 +3114,7 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
            at every possible intervening op site: any further operation applied on top of the
            length() call allocates its own new register, so `x = length(p) + 1` naturally fails
            this check (rk_val is the ADD's dest, not length()'s), exactly as `x = length(p)` alone
-           naturally passes it -- same self-correcting equality trick as last_plain_index_dest_reg. */
+           naturally passes it -- same self-correcting equality trick as index_alias.dest_reg. */
         if (P.proof.last_length_call_result_reg >= 0 && rk_val == P.proof.last_length_call_result_reg) {
             P.proof.length_tracked_name = name_idx;
             P.proof.length_tracked_valid = true;
@@ -3275,14 +3274,14 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
            -- always safe -- unless the RHS was exactly `some_param[idx]`, the one-hop alias pattern
            SPEC_KIND_ARRAY_OF_STRUCTS needs, where the parameter's element shape propagates onto the
            alias instead. Consumed immediately so a freed-and-reused temp can't match later. */
-        if (rk_val == P.peep.last_plain_index_dest_reg && P.peep.last_plain_index_dest_reg >= 0) {
-            P.regs.reg_known_shape[reg] = P.peep.last_plain_index_known_elem_shape;
-            P.regs.alias_source_param[reg] = P.peep.last_plain_index_src_param;
+        if (rk_val == P.index_alias.dest_reg && P.index_alias.dest_reg >= 0) {
+            P.regs.reg_known_shape[reg] = P.index_alias.elem_shape;
+            P.regs.alias_source_param[reg] = P.index_alias.src_param;
         } else {
             P.regs.reg_known_shape[reg] = NULL;
             P.regs.alias_source_param[reg] = -1;
         }
-        P.peep.last_plain_index_dest_reg = -1;
+        P.index_alias.dest_reg = -1;
         P.regs.reg_elem_kind[reg] = rhs_elem;
         if (rk_val & RK_CONST_FLAG) {
             emit_loadk(c, reg, (unsigned int)(rk_val & ~RK_CONST_FLAG));
@@ -5559,9 +5558,9 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
         P.regs.alias_source_param[i] = -1;
     memset(P.regs.reg_known_shape, 0, sizeof(P.regs.reg_known_shape));
     memset(P.regs.reg_known_element_shape, 0, sizeof(P.regs.reg_known_element_shape));
-    P.peep.last_plain_index_dest_reg = -1;
-    P.peep.last_plain_index_src_param = -1;
-    P.peep.last_plain_index_known_elem_shape = NULL;
+    P.index_alias.dest_reg = -1;
+    P.index_alias.src_param = -1;
+    P.index_alias.elem_shape = NULL;
     P.regs.current_param_count = param_count;
     /* hint_param_reg only enables the loop-bound-hoisting optimization for a packed-array
        specialization (kind == SPEC_KIND_PACKED_ARRAY, hint_is_element_shape false) -- an
