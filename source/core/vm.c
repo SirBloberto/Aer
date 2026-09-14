@@ -451,6 +451,7 @@ void vm_free(VM* vm) {
         pool_destroy(&heap->dict_hash_pools.sparse_pools[i]);
     free(heap->remembered_set);
     free(heap->gc_worklist.items);
+    free(heap->gc_worklist.ranges);
     /* If this VM's heap was the active allocation target, it no longer exists -- leaving
        current_heap dangling would be a use-after-free the moment anything allocates next. */
     if (vm_current_heap() == heap)

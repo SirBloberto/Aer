@@ -144,6 +144,50 @@ static void worklist_push(VmHeap* heap, AerVal v, bool minor) {
     wl->items[wl->count++] = v;
 }
 
+/* Wider containers are traced a chunk at a time, so marking one never copies every element onto
+   the worklist at once. */
+#define MARK_CHUNK 256
+
+static unsigned int container_count(void* container, bool is_dict) {
+    return is_dict ? ((AerDict*)container)->map.count : ((AerArray*)container)->count;
+}
+
+static AerVal container_element(void* container, bool is_dict, unsigned int i) {
+    return is_dict ? ((AerDict*)container)->map.dense[i].payload : ((AerArray*)container)->items[i];
+}
+
+static void worklist_push_elements(VmHeap* heap, void* container, bool is_dict, bool minor) {
+    unsigned int count = container_count(container, is_dict);
+    if (count <= MARK_CHUNK) {
+        for (unsigned int i = 0; i < count; i++)
+            worklist_push(heap, container_element(container, is_dict, i), minor);
+        return;
+    }
+    MarkWorklist* wl = &heap->gc_worklist;
+    if (wl->range_count >= wl->range_cap) {
+        wl->range_cap = wl->range_cap ? wl->range_cap * 2 : 16;
+        wl->ranges = xrealloc(wl->ranges, sizeof(MarkRange) * wl->range_cap);
+    }
+    wl->ranges[wl->range_count++] = (MarkRange){container, 0, is_dict};
+}
+
+/* Pushes the next chunk of the most recently started container; false once none is left. */
+static bool worklist_refill(VmHeap* heap, bool minor) {
+    MarkWorklist* wl = &heap->gc_worklist;
+    if (wl->range_count == 0)
+        return false;
+    MarkRange r = wl->ranges[wl->range_count - 1];
+    unsigned int count = container_count(r.container, r.is_dict);
+    unsigned int end = count - r.next > MARK_CHUNK ? r.next + MARK_CHUNK : count;
+    if (end == count)
+        wl->range_count--;
+    else
+        wl->ranges[wl->range_count - 1].next = end;
+    for (unsigned int i = r.next; i < end; i++)
+        worklist_push(heap, container_element(r.container, r.is_dict, i), minor);
+    return true;
+}
+
 /* Shared by TYPE_FUNCTION marking and CallFrame root marking (a frame's executing function is a raw
    AerFunction*, not a wrapped AerVal). */
 static void mark_function(AerFunction* f) {
@@ -157,10 +201,8 @@ static void mark_value(VmHeap* heap, AerVal v, bool minor) {
             break;
         case TYPE_ARRAY: {
             AerArray* a = aer_as_array(v);
-            if (!pool_mark(a)) {
-                for (unsigned int i = 0; i < a->count; i++)
-                    worklist_push(heap, a->items[i], minor);
-            }
+            if (!pool_mark(a))
+                worklist_push_elements(heap, a, false, minor);
             break;
         }
         case TYPE_STRUCT: {
@@ -177,12 +219,9 @@ static void mark_value(VmHeap* heap, AerVal v, bool minor) {
             break;
         }
         case TYPE_DICT:
-            if (!pool_mark(aer_as_dict(v))) {
-                HashTable* map = &aer_as_dict(v)->map;
-                for (unsigned int i = 0; i < map->count; i++)
-                    worklist_push(heap, map->dense[i].payload, minor);
-                /* Keys are plain owned char*, not Values -- nothing to push. */
-            }
+            /* Keys are plain owned char*, not Values -- nothing to push. */
+            if (!pool_mark(aer_as_dict(v)))
+                worklist_push_elements(heap, aer_as_dict(v), true, minor);
             break;
         case TYPE_FUNCTION: mark_function(aer_as_function(v)); break;
         case TYPE_PACKED_ARRAY:
@@ -209,8 +248,10 @@ static void mark_value(VmHeap* heap, AerVal v, bool minor) {
 
 static void mark_drain(VmHeap* heap, bool minor) {
     MarkWorklist* wl = &heap->gc_worklist;
-    while (wl->count > 0)
-        mark_value(heap, wl->items[--wl->count], minor);
+    do {
+        while (wl->count > 0)
+            mark_value(heap, wl->items[--wl->count], minor);
+    } while (worklist_refill(heap, minor));
 }
 
 /* Pushes every live root in vm's own heap -- vm's stack/call-frame registers only, now that each
@@ -370,8 +411,7 @@ static void gc_collect(VM* vm, bool minor, unsigned int* live_out) {
                        every cycle -- without it a build loop still pays O(n^2). */
                     AerArray* a = (AerArray*)e->ptr;
                     if (a->dirty_all || !a->dirty_cards) {
-                        for (unsigned int j = 0; j < a->count; j++)
-                            worklist_push(heap, a->items[j], minor);
+                        worklist_push_elements(heap, a, false, minor);
                     } else {
                         for (unsigned int byte_i = a->dirty_min_byte; byte_i < a->dirty_max_byte; byte_i++) {
                             unsigned char byte = a->dirty_cards[byte_i];
@@ -412,8 +452,7 @@ static void gc_collect(VM* vm, bool minor, unsigned int* live_out) {
                     AerDict* d = (AerDict*)e->ptr;
                     HashTable* map = &d->map;
                     if (d->dirty_all || !d->dirty_cards) {
-                        for (unsigned int j = 0; j < map->count; j++)
-                            worklist_push(heap, map->dense[j].payload, minor);
+                        worklist_push_elements(heap, d, true, minor);
                     } else {
                         for (unsigned int byte_i = d->dirty_min_byte; byte_i < d->dirty_max_byte; byte_i++) {
                             unsigned char byte = d->dirty_cards[byte_i];

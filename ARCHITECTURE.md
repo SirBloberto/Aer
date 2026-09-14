@@ -3906,3 +3906,19 @@ read and wrote through the typed-array element helpers with a computed kind, whi
 table at five kinds. `aer_bool` is now one full-width store (all 14 int/real comparison fast paths
 shrank, `lt` 76 -> 67 instructions; the general `_any_values` ones build theirs in a call and did not) and narrow fields have their own int32/float32 helpers. A table for the element
 width was tried and was worse -- the load needs a register of its own in every handler that inlines it.
+
+### 5.70 Wide containers are marked a chunk at a time
+
+Marking an array or dict pushed every element onto the worklist before tracing any of them. A full
+collection that reached a 2M-element array held a 2M-entry worklist -- 32MB -- whatever the elements
+were, and struct_array_scan's are structs with only raw fields, so every push was wasted.
+
+A container wider than 256 elements now goes on a range stack as (container, next index), and the
+drain refills the worklist 256 elements at a time from the most recently started range. The worklist
+holds a chunk per container being traced rather than every element, and the remembered-set rescan of
+a `dirty_all` container takes the same path.
+
+On the every-10th-minor trigger it barely shows, because those majors ran early, while arrays were
+still small: log_processing 96.8MB -> 92.7MB, nothing else moved. It matters once majors run on a
+large heap. Under the first, cell-counted version of 5.71's growth trigger, struct_array_scan went
+163.8MB -> 153.2MB and log_processing 72.7MB -> 67.1MB.

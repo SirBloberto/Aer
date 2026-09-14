@@ -734,11 +734,20 @@ typedef struct {
     RememberedKind kind;
 } RememberedEntry;
 
+/* A wide array or dict still being traced, from element `next` on. */
+typedef struct {
+    void* container;
+    unsigned int next;
+    bool is_dict;
+} MarkRange;
+
 /* Explicit growable worklist, not C recursion, since user data structures have no depth limit;
    pool_mark's "already marked" return terminates cycles correctly. */
 typedef struct {
     AerVal* items;
     unsigned int count, cap;
+    MarkRange* ranges;
+    unsigned int range_count, range_cap;
 } MarkWorklist;
 
 /* Size-keyed free-list cache for typed-array data buffers -- the payload, not the header, which is
