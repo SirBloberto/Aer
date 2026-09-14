@@ -1376,9 +1376,37 @@ static bool try_rewrite_index_get_raw(Chunk* c, int* rk, unsigned int start, Raw
     return true;
 }
 
-/* Returns false if the operator has no raw-native form or the operand kinds mismatch, and the
-   caller falls back to the boxed path. Only ADD/SUB/MUL/DIV/MOD/FLOOR_DIV and the 4 ordering
-   comparisons are raw-native -- EQ/NEQ/bitwise/AND/OR/IN always stay boxed, deliberately. */
+/* A boxed operator's raw-native forms. `a > b` is `b < a`: emitted as the LT/LTE opcode with the slots
+   swapped, so the raw family needs no GT/GTE members. OP_HALT marks a kind with no raw form. */
+typedef struct {
+    Opcode boxed, raw_int, raw_real;
+    bool is_cmp, swap;
+} RawOpForm;
+
+static const RawOpForm raw_op_forms[] = {
+    {OP_ADD, OP_RAW_ADD_INT, OP_RAW_ADD_REAL, false, false},
+    {OP_SUB, OP_RAW_SUB_INT, OP_RAW_SUB_REAL, false, false},
+    {OP_MUL, OP_RAW_MUL_INT, OP_RAW_MUL_REAL, false, false},
+    {OP_DIV, OP_RAW_DIV_INT, OP_RAW_DIV_REAL, false, false},
+    {OP_MOD, OP_RAW_MOD_INT, OP_HALT, false, false},
+    {OP_FLOOR_DIV, OP_RAW_FLOOR_DIV_INT, OP_HALT, false, false},
+    {OP_LT, OP_RAW_LT_INT, OP_RAW_LT_REAL, true, false},
+    {OP_GT, OP_RAW_LT_INT, OP_RAW_LT_REAL, true, true},
+    {OP_LTE, OP_RAW_LTE_INT, OP_RAW_LTE_REAL, true, false},
+    {OP_GTE, OP_RAW_LTE_INT, OP_RAW_LTE_REAL, true, true},
+    {OP_EQ, OP_RAW_EQ_INT, OP_RAW_EQ_REAL, true, false},
+    {OP_NEQ, OP_RAW_NEQ_INT, OP_RAW_NEQ_REAL, true, false},
+};
+
+static const RawOpForm* raw_op_form(Opcode op) {
+    for (size_t i = 0; i < sizeof(raw_op_forms) / sizeof(raw_op_forms[0]); i++)
+        if (raw_op_forms[i].boxed == op)
+            return &raw_op_forms[i];
+    return NULL;
+}
+
+/* Returns false if the operator has no raw-native form (raw_op_forms) or the operand kinds mismatch,
+   and the caller falls back to the boxed path. Bitwise, AND/OR and IN always stay boxed. */
 static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int* out_rk) {
     RawKind kind_lhs = rk_raw_kind(c, rk_lhs);
     RawKind kind_rhs = rk_raw_kind(c, rk_rhs);
@@ -1422,87 +1450,13 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
         return false;
     bool int_kind = (kind_lhs == RAWK_INT);
 
-    Opcode raw_op;
-    bool is_cmp = false;
-    /* `a > b` is `b < a`: emitted as the LT/LTE opcode with the slots swapped, so the raw-vs-raw
-       family needs no GT/GTE members at all. */
-    bool swap_cmp = false;
-    bool div_int_promotes_to_real =
-        false; /* OP_DIV on two ints still yields a real, matching boxed semantics. */
-    if (int_kind) {
-        switch (op) {
-            case OP_ADD: raw_op = OP_RAW_ADD_INT; break;
-            case OP_SUB: raw_op = OP_RAW_SUB_INT; break;
-            case OP_MUL: raw_op = OP_RAW_MUL_INT; break;
-            case OP_DIV:
-                raw_op = OP_RAW_DIV_INT;
-                div_int_promotes_to_real = true;
-                break;
-            case OP_MOD: raw_op = OP_RAW_MOD_INT; break;
-            case OP_FLOOR_DIV: raw_op = OP_RAW_FLOOR_DIV_INT; break;
-            case OP_LT:
-                raw_op = OP_RAW_LT_INT;
-                is_cmp = true;
-                break;
-            case OP_GT:
-                raw_op = OP_RAW_LT_INT;
-                is_cmp = true;
-                swap_cmp = true;
-                break;
-            case OP_LTE:
-                raw_op = OP_RAW_LTE_INT;
-                is_cmp = true;
-                break;
-            case OP_GTE:
-                raw_op = OP_RAW_LTE_INT;
-                is_cmp = true;
-                swap_cmp = true;
-                break;
-            case OP_EQ:
-                raw_op = OP_RAW_EQ_INT;
-                is_cmp = true;
-                break;
-            case OP_NEQ:
-                raw_op = OP_RAW_NEQ_INT;
-                is_cmp = true;
-                break;
-            default: return false;
-        }
-    } else {
-        switch (op) {
-            case OP_ADD: raw_op = OP_RAW_ADD_REAL; break;
-            case OP_SUB: raw_op = OP_RAW_SUB_REAL; break;
-            case OP_MUL: raw_op = OP_RAW_MUL_REAL; break;
-            case OP_DIV: raw_op = OP_RAW_DIV_REAL; break;
-            case OP_LT:
-                raw_op = OP_RAW_LT_REAL;
-                is_cmp = true;
-                break;
-            case OP_GT:
-                raw_op = OP_RAW_LT_REAL;
-                is_cmp = true;
-                swap_cmp = true;
-                break;
-            case OP_LTE:
-                raw_op = OP_RAW_LTE_REAL;
-                is_cmp = true;
-                break;
-            case OP_GTE:
-                raw_op = OP_RAW_LTE_REAL;
-                is_cmp = true;
-                swap_cmp = true;
-                break;
-            case OP_EQ:
-                raw_op = OP_RAW_EQ_REAL;
-                is_cmp = true;
-                break;
-            case OP_NEQ:
-                raw_op = OP_RAW_NEQ_REAL;
-                is_cmp = true;
-                break;
-            default: return false; /* no raw MOD/FLOOR_DIV for real */
-        }
-    }
+    const RawOpForm* form = raw_op_form(op);
+    Opcode raw_op = form ? (int_kind ? form->raw_int : form->raw_real) : OP_HALT;
+    if (raw_op == OP_HALT)
+        return false;
+    bool is_cmp = form->is_cmp;
+    bool swap_cmp = form->swap;
+    bool div_int_promotes_to_real = int_kind && op == OP_DIV; /* two ints still divide to a real */
 
     int slot_lhs = raw_materialize(c, rk_lhs, kind_lhs);
     if (slot_lhs < 0)
