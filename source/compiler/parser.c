@@ -651,6 +651,16 @@ void emit_call_value(Chunk* c, int dest_reg, int arg_reg_base, int arg_count, in
     chunk_emit(c, (uint32_t)callee_reg);
 }
 
+/* A module function call: OP_CALL_MODULE's word, the module and function name constants, then the
+   resolved ids -- the module's is CALL_MODULE_DYNAMIC when it resolves at runtime. */
+static void emit_module_call(Chunk* c, int dest, int base, int argc, unsigned int module_idx,
+                             unsigned int fn_idx, int module_id, int fn_id) {
+    chunk_emit(c, PACK3(OP_CALL_MODULE, dest, base, argc));
+    chunk_emit(c, (uint32_t)module_idx);
+    chunk_emit(c, (uint32_t)fn_idx);
+    chunk_emit(c, PACK_2X16((uint16_t)module_id, (uint16_t)fn_id));
+}
+
 void emit_print_repl(Chunk* c, int src_reg) {
     chunk_emit(c, PACK1(OP_PRINT_REPL, src_reg));
 }
@@ -2667,10 +2677,7 @@ static int compile_pipe(Chunk* c, int lhs) {
 
         if (arg_count > 1)
             reg_free(arg_count - 1);
-        chunk_emit(c, PACK3(OP_CALL_MODULE, dest, arg_reg_base, arg_count));
-        chunk_emit(c, (uint32_t)module_idx);
-        chunk_emit(c, (uint32_t)fn_idx);
-        chunk_emit(c, PACK_2X16((uint16_t)module_id, (uint16_t)fn_id));
+        emit_module_call(c, dest, arg_reg_base, arg_count, module_idx, fn_idx, module_id, fn_id);
         compile_pipe_guard_end(c, patch_skip_call);
         return dest;
     }
@@ -4769,6 +4776,135 @@ static int module_fn_id(int module_id, AerString* name) {
 }
 
 
+/* count+1 registers as one contiguous run, for a fused call whose arguments the opcode reads by
+   position. The base, or -1 when a register came back out of sequence; *taken counts what the caller
+   must free in that case (the out-of-sequence one is not counted). */
+static int reg_alloc_run(int count, int* taken) {
+    int base = reg_alloc();
+    *taken = base >= 0 ? 1 : 0;
+    for (int i = 0; base >= 0 && i < count; i++) {
+        if (reg_alloc() != base + 1 + i)
+            return -1;
+        (*taken)++;
+    }
+    return base;
+}
+
+/* `math.sqrt(<real>)` on a slot whose type is already known needs neither the module calling
+   convention's tag check nor one on the result. Every function aer_math_fn_is_raw_real names is
+   unary, so the argument is parsed here rather than through the general contiguous-argument path --
+   that path returns registers, having already discarded the kind this needs. */
+static int parse_math_raw_call(Chunk* c, unsigned int module_idx, unsigned int fn_idx, int fn_id) {
+    int rk_arg = parse_binary(c, 0);
+    require(TOKEN_CLOSE_PARENTHESE, "expected ')' after module call arguments");
+    if (parse_had_error)
+        return 0;
+    if (rk_raw_kind(c, rk_arg) == RAWK_REAL) {
+        int src_slot = raw_materialize(c, rk_arg, RAWK_REAL);
+        if (src_slot >= 0) {
+            raw_release_if_top(src_slot);
+            int dest_slot = slot_alloc(RAWK_REAL);
+            if (dest_slot >= 0) {
+                chunk_emit(c, PACK3(OP_RAW_MATH_REAL, dest_slot, src_slot, (unsigned int)fn_id));
+                return RK_RAW_REAL_FLAG | dest_slot;
+            }
+        }
+        rk_arg = src_slot >= 0 ? (RK_RAW_REAL_FLAG | src_slot) : rk_arg;
+    }
+    int dest = arg_materialize(c, rk_arg);
+    emit_module_call(c, dest, dest, 1, module_idx, fn_idx, CALL_MODULE_MATH, fn_id);
+    return dest;
+}
+
+/* `collection.group_sum(price * quantity * (1 - discount) * mask, region, G)` -- the values are the
+   longest expression in a query and the scatter that consumes them is nearly free beside it, so the
+   values fold into the scatter and are never written out. The arguments are parsed one at a time: the
+   values' own code has to be recognised and discarded before the group column is compiled. Only the
+   first argument folds; the other two are read as they are. */
+static int parse_group_sum_call(Chunk* c, unsigned int module_idx, unsigned int fn_idx, int module_id,
+                                int fn_id) {
+    unsigned int values_start = c->count;
+    int values_rk = parse_binary(c, 0);
+    int leaf[CHAIN_MAX_LEAVES];
+    uint64_t prog = 0;
+    int mask_leaves = 0;
+    int nleaf = (parse_had_error || (values_rk & RK_CONST_FLAG))
+                    ? 0
+                    : chain_of_array_ops(c, values_start, c->count, values_rk, leaf, &prog, &mask_leaves);
+    /* The whole run is secured BEFORE anything is discarded -- once the values' code is gone there is
+       no ordinary path left to fall back to. */
+    int taken = 0;
+    int base = nleaf > 0 ? reg_alloc_run(nleaf + 2, &taken) : -1;
+    if (base >= 0) {
+        c->count = values_start; /* the per-operator passes go; every leaf still holds its own */
+        int groups = -1, ngroups = -1;
+        if (consume(TOKEN_COMMA))
+            groups = materialize(c, parse_binary(c, 0));
+        if (consume(TOKEN_COMMA))
+            ngroups = materialize(c, parse_binary(c, 0));
+        require(TOKEN_CLOSE_PARENTHESE, "expected ')' after module call arguments");
+        if (parse_had_error || groups < 0 || ngroups < 0)
+            return 0;
+        uint64_t word = prog | ((uint64_t)mask_leaves << CHAIN_SPLIT_SHIFT);
+        emit_loadk(c, base, chunk_add_pool(c, aer_int((int64_t)word)));
+        emit_move(c, base + 1, groups);
+        emit_move(c, base + 2, ngroups);
+        for (int i = 0; i < nleaf; i++)
+            emit_move_rk(c, base + 3 + i, leaf[i]);
+        emit_module_call(c, base, base, nleaf + 3, module_idx, fn_idx, CALL_MODULE_COLLECTION,
+                         FN_COLLECTION_GROUP_SUM_CHAIN);
+        reg_free(nleaf + 2);
+        P.regs.reg_elem_kind[base] = RAWK_REAL;
+        return base;
+    }
+    if (taken)
+        reg_free(taken);
+    /* Unfused: place the values first in a contiguous run, exactly as the shared path would. */
+    int argbase = arg_materialize(c, values_rk);
+    int argc = 1;
+    while (consume(TOKEN_COMMA)) {
+        arg_materialize(c, parse_binary(c, 0));
+        argc++;
+    }
+    require(TOKEN_CLOSE_PARENTHESE, "expected ')' after module call arguments");
+    if (parse_had_error)
+        return 0;
+    if (argc > 1)
+        reg_free(argc - 1);
+    emit_module_call(c, argbase, argbase, argc, module_idx, fn_idx, module_id, fn_id);
+    return argbase;
+}
+
+/* `collection.sum(a * b * c)` costs one whole-array pass per operator, each writing a full-size
+   intermediate the next reads straight back. Folded into one tiled pass that materialises none of
+   them -- 0.0429s to 0.0098s over 8M elements. True, with *out_rk set, when it fused. */
+static bool try_fuse_sum_chain(Chunk* c, unsigned int arg_code_start, int arg_reg_base,
+                               unsigned int module_idx, unsigned int fn_idx, int* out_rk) {
+    int leaf[CHAIN_MAX_LEAVES];
+    uint64_t packed = 0;
+    int mask_leaves = 0;
+    int nleaf = chain_of_array_ops(c, arg_code_start, c->count, arg_reg_base, leaf, &packed, &mask_leaves);
+    /* The run must be contiguous, and that is settled BEFORE anything is discarded -- once the
+       argument's own code is gone there is no ordinary path left to fall back to. */
+    int taken = 0;
+    int base = nleaf > 0 ? reg_alloc_run(nleaf, &taken) : -1;
+    if (base < 0) {
+        if (taken)
+            reg_free(taken);
+        return false;
+    }
+    c->count = arg_code_start; /* the per-operator passes go; the fused call replaces them */
+    uint64_t word = packed | ((uint64_t)mask_leaves << CHAIN_SPLIT_SHIFT);
+    emit_loadk(c, base, chunk_add_pool(c, aer_int((int64_t)word)));
+    for (int i = 0; i < nleaf; i++)
+        emit_move_rk(c, base + 1 + i, leaf[i]);
+    emit_module_call(c, base, base, nleaf + 1, module_idx, fn_idx, CALL_MODULE_COLLECTION,
+                     FN_COLLECTION_SUM_CHAIN);
+    reg_free(nleaf);
+    *out_rk = base;
+    return true;
+}
+
 static int parse_module_call(Chunk* c) {
     int module_id = module_call_id(aer_as_string(token.value));
     unsigned int module_idx = chunk_add_pool(c, token.value);
@@ -4789,110 +4925,11 @@ static int parse_module_call(Chunk* c) {
     if (parse_had_error)
         return 0;
 
-    /* `math.sqrt(<real>)` on a slot whose type is already known needs neither the module calling
-       convention's tag check nor one on the result. Every function aer_math_fn_is_raw_real names is
-       unary, so the argument is parsed here rather than through the general contiguous-argument path
-       -- that path returns registers, having already discarded the kind this needs. */
-    if (module_id == CALL_MODULE_MATH && aer_math_fn_is_raw_real(fn_id)) {
-        int rk_arg = parse_binary(c, 0);
-        require(TOKEN_CLOSE_PARENTHESE, "expected ')' after module call arguments");
-        if (parse_had_error)
-            return 0;
-        if (rk_raw_kind(c, rk_arg) == RAWK_REAL) {
-            int src_slot = raw_materialize(c, rk_arg, RAWK_REAL);
-            if (src_slot >= 0) {
-                raw_release_if_top(src_slot);
-                int dest_slot = slot_alloc(RAWK_REAL);
-                if (dest_slot >= 0) {
-                    chunk_emit(c, PACK3(OP_RAW_MATH_REAL, dest_slot, src_slot, (unsigned int)fn_id));
-                    return RK_RAW_REAL_FLAG | dest_slot;
-                }
-            }
-            rk_arg = src_slot >= 0 ? (RK_RAW_REAL_FLAG | src_slot) : rk_arg;
-        }
-        int dest = arg_materialize(c, rk_arg);
-        chunk_emit(c, PACK3(OP_CALL_MODULE, dest, dest, 1));
-        chunk_emit(c, (uint32_t)module_idx);
-        chunk_emit(c, (uint32_t)fn_idx);
-        chunk_emit(c, PACK_2X16((uint16_t)module_id, (uint16_t)fn_id));
-        return dest;
-    }
-
-    /* `collection.group_sum(price * quantity * (1 - discount) * mask, region, G)` -- the values are
-       the longest expression in a query and the scatter that consumes them is nearly free beside it,
-       so the values fold into the scatter and are never written out. Its arguments are parsed one at
-       a time rather than as one contiguous run: the values' own code has to be recognised and
-       discarded before the group column is ever compiled, which the shared path gives no point to
-       do. Only the first argument folds; the other two are read as they are. */
+    if (module_id == CALL_MODULE_MATH && aer_math_fn_is_raw_real(fn_id))
+        return parse_math_raw_call(c, module_idx, fn_idx, fn_id);
     if (module_id == CALL_MODULE_COLLECTION && fn_id == FN_COLLECTION_GROUP_SUM &&
-        !equal(TOKEN_CLOSE_PARENTHESE)) {
-        unsigned int values_start = c->count;
-        int values_rk = parse_binary(c, 0);
-        int leaf[CHAIN_MAX_LEAVES];
-        uint64_t prog = 0;
-        int mask_leaves = 0;
-        int nleaf = (parse_had_error || (values_rk & RK_CONST_FLAG))
-                        ? 0
-                        : chain_of_array_ops(c, values_start, c->count, values_rk, leaf, &prog, &mask_leaves);
-        /* The whole run is secured BEFORE anything is discarded -- once the values' code is gone
-           there is no ordinary path left to fall back to. */
-        int base = -1, taken = 0;
-        if (nleaf > 0) {
-            base = reg_alloc();
-            taken = base >= 0 ? 1 : 0;
-            for (int i = 0; base >= 0 && i < nleaf + 2; i++) {
-                if (reg_alloc() != base + 1 + i) {
-                    base = -1;
-                    break;
-                }
-                taken++;
-            }
-        }
-        if (base >= 0) {
-            c->count = values_start; /* the per-operator passes go; every leaf still holds its own */
-            int groups = -1, ngroups = -1;
-            if (consume(TOKEN_COMMA))
-                groups = materialize(c, parse_binary(c, 0));
-            if (consume(TOKEN_COMMA))
-                ngroups = materialize(c, parse_binary(c, 0));
-            require(TOKEN_CLOSE_PARENTHESE, "expected ')' after module call arguments");
-            if (parse_had_error || groups < 0 || ngroups < 0)
-                return 0;
-            uint64_t word = prog | ((uint64_t)mask_leaves << CHAIN_SPLIT_SHIFT);
-            emit_loadk(c, base, chunk_add_pool(c, aer_int((int64_t)word)));
-            emit_move(c, base + 1, groups);
-            emit_move(c, base + 2, ngroups);
-            for (int i = 0; i < nleaf; i++)
-                emit_move_rk(c, base + 3 + i, leaf[i]);
-            chunk_emit(c, PACK3(OP_CALL_MODULE, base, base, nleaf + 3));
-            chunk_emit(c, (uint32_t)module_idx);
-            chunk_emit(c, (uint32_t)fn_idx);
-            chunk_emit(c,
-                       PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_GROUP_SUM_CHAIN));
-            reg_free(nleaf + 2);
-            P.regs.reg_elem_kind[base] = RAWK_REAL;
-            return base;
-        }
-        if (taken)
-            reg_free(taken);
-        /* Unfused: place the values first in a contiguous run, exactly as the shared path would. */
-        int argbase = arg_materialize(c, values_rk);
-        int argc = 1;
-        while (consume(TOKEN_COMMA)) {
-            arg_materialize(c, parse_binary(c, 0));
-            argc++;
-        }
-        require(TOKEN_CLOSE_PARENTHESE, "expected ')' after module call arguments");
-        if (parse_had_error)
-            return 0;
-        if (argc > 1)
-            reg_free(argc - 1);
-        chunk_emit(c, PACK3(OP_CALL_MODULE, argbase, argbase, argc));
-        chunk_emit(c, (uint32_t)module_idx);
-        chunk_emit(c, (uint32_t)fn_idx);
-        chunk_emit(c, PACK_2X16((uint16_t)module_id, (uint16_t)fn_id));
-        return argbase;
-    }
+        !equal(TOKEN_CLOSE_PARENTHESE))
+        return parse_group_sum_call(c, module_idx, fn_idx, module_id, fn_id);
 
     unsigned int arg_code_start = c->count;
     int arg_reg_base;
@@ -4902,56 +4939,18 @@ static int parse_module_call(Chunk* c) {
     if (parse_had_error)
         return 0;
 
-    /* `collection.sum(a * b * c)` costs one whole-array pass per operator, each writing a full-size
-       intermediate the next reads straight back. Recognised here and folded into one tiled pass,
-       which never materialises any of them -- 0.0429s to 0.0098s over 8M elements. */
-    if (module_id == CALL_MODULE_COLLECTION && fn_id == FN_COLLECTION_SUM && arg_count == 1) {
-        int leaf[CHAIN_MAX_LEAVES];
-        uint64_t packed = 0;
-        int mask_leaves = 0;
-        int nleaf =
-            chain_of_array_ops(c, arg_code_start, c->count, arg_reg_base, leaf, &packed, &mask_leaves);
-        /* The run must be contiguous, and that is settled BEFORE anything is discarded -- once the
-           argument's own code is gone there is no ordinary path left to fall back to. */
-        int base = -1, taken = 0;
-        if (nleaf > 0) {
-            base = reg_alloc();
-            taken = base >= 0 ? 1 : 0;
-            for (int i = 0; base >= 0 && i < nleaf; i++) {
-                if (reg_alloc() != base + 1 + i) {
-                    base = -1;
-                    break;
-                }
-                taken++;
-            }
-        }
-        if (base >= 0) {
-            c->count = arg_code_start; /* the per-operator passes go; the fused call replaces them */
-            uint64_t word = packed | ((uint64_t)mask_leaves << CHAIN_SPLIT_SHIFT);
-            emit_loadk(c, base, chunk_add_pool(c, aer_int((int64_t)word)));
-            for (int i = 0; i < nleaf; i++)
-                emit_move_rk(c, base + 1 + i, leaf[i]);
-            chunk_emit(c, PACK3(OP_CALL_MODULE, base, base, nleaf + 1));
-            chunk_emit(c, (uint32_t)module_idx);
-            chunk_emit(c, (uint32_t)fn_idx);
-            chunk_emit(c, PACK_2X16((uint16_t)CALL_MODULE_COLLECTION, (uint16_t)FN_COLLECTION_SUM_CHAIN));
-            reg_free(nleaf);
-            return base;
-        }
-        if (taken)
-            reg_free(taken);
-    }
+    int fused;
+    if (module_id == CALL_MODULE_COLLECTION && fn_id == FN_COLLECTION_SUM && arg_count == 1 &&
+        try_fuse_sum_chain(c, arg_code_start, arg_reg_base, module_idx, fn_idx, &fused))
+        return fused;
 
-    /* Reusing the argument base as the destination is only safe when it is a temp -- a lone
-       argument now stays in its own register, which may be a variable's. */
+    /* Reusing the argument base as the destination is only safe when it is a temp -- a lone argument
+       now stays in its own register, which may be a variable's. */
     int dest = (arg_count > 0 && arg_base_is_temp) ? arg_reg_base : reg_alloc();
     if (arg_count > 1)
         reg_free(arg_count - 1);
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
-    chunk_emit(c, PACK3(OP_CALL_MODULE, dest, base, arg_count));
-    chunk_emit(c, (uint32_t)module_idx);
-    chunk_emit(c, (uint32_t)fn_idx);
-    chunk_emit(c, PACK_2X16((uint16_t)module_id, (uint16_t)fn_id));
+    emit_module_call(c, dest, base, arg_count, module_idx, fn_idx, module_id, fn_id);
     return dest;
 }
 
