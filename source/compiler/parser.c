@@ -5008,18 +5008,22 @@ static unsigned int last_bare_call_end = (unsigned int)-1;
 static unsigned int last_bare_call_start = (unsigned int)-1;
 
 /* False after reporting that a direct call's argument count is outside the function's range. A call with
-   fewer arguments than declared fills the rest from defaults, never from a prior occupant's register. */
+   fewer arguments than declared fills the rest from defaults, never from a prior occupant's register.
+   Reported at call_site: by now the parser has read past the argument list, often onto the next line. */
 static bool check_call_arity(Chunk* c, unsigned int name_idx, int arg_count, unsigned int min_arity,
-                             unsigned int arity) {
+                             unsigned int arity, const char* call_site) {
     if ((unsigned int)arg_count <= arity && (unsigned int)arg_count >= min_arity)
         return true;
     const char* fname = aer_as_string(c->pool[name_idx])->data;
+    const char* real_cursor = current_source_cursor();
+    lexer_set_cursor(call_site);
     if (min_arity == arity)
         error_at("Function '%s' expects %u argument%s, got %d", fname, arity, arity == 1 ? "" : "s",
                  arg_count);
     else
         error_at("Function '%s' expects between %u and %u arguments, got %d", fname, min_arity, arity,
                  arg_count);
+    lexer_set_cursor(real_cursor);
     return false;
 }
 
@@ -5067,13 +5071,9 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
        and reported once parse()'s top-level loop ends if it never actually is. Builtins are already
        handled unconditionally at the top of this function, so reaching here with none of
        is_var/is_struct/is_func true always means an unresolved name, never a builtin. */
-    bool is_forward_ref = false;
-    const char* call_site_cursor = NULL;
-    if (!is_var && !is_struct && !is_func) {
-        is_forward_ref = true;
-        /* Captured now, before the argument list below consumes past it. */
-        call_site_cursor = current_source_cursor();
-    }
+    bool is_forward_ref = !is_var && !is_struct && !is_func;
+    /* Captured now, before the argument list below consumes past it. */
+    const char* call_site_cursor = current_source_cursor();
 
     /* Usually a no-op check, not a copy -- see arg_materialize's own comment. */
     int arg_reg_base;
@@ -5083,7 +5083,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     if (parse_had_error)
         return 0;
 
-    if (is_func && !check_call_arity(c, name_idx, arg_count, func_min_arity, func_arity))
+    if (is_func && !check_call_arity(c, name_idx, arg_count, func_min_arity, func_arity, call_site_cursor))
         return 0;
     bool needs_call_value = is_func && (unsigned int)arg_count < func_arity;
 

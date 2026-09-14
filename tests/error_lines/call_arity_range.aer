@@ -1,0 +1,4 @@
+function scale(n, factor = 2):
+    return n * factor
+
+big = scale(1, 2, 3) #!error: Function 'scale' expects between 1 and 2 arguments, got 3
