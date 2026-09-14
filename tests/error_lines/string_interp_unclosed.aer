@@ -1,0 +1,2 @@
+name = "world"
+greeting = """hello {name""" #!error: Unclosed '{' in string

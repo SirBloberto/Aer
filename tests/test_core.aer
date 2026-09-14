@@ -94,6 +94,10 @@ assert("{1}{2}{3}" == "123", "adjacent expression parts with no literal between 
 many = "{1}{2}{3}{4}{5}{6}{7}{8}{9}{10}{11}{12}{13}{14}{15}{16}{17}{18}{19}{20}"
 assert(many == "1234567891011121314151617181920", "an interpolation past the fold limit still builds one correct string")
 assert(length(many) == 31, "and has the right length")
+# A computed part landing exactly on the fold, after 16 literal and constant parts.
+fold_x = 7
+assert("a{fold_x}b{fold_x}c{fold_x}d{fold_x}e{fold_x}f{fold_x}g{fold_x}h{fold_x}{fold_x * 1000}" ==
+       "a7b7c7d7e7f7g7h77000", "a computed part at the fold boundary keeps its place")
 
 # A part long enough to push the result past the 15-byte inline-string threshold, so the builder
 # takes its heap-payload path instead of the inline one.

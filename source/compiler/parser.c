@@ -1916,87 +1916,77 @@ static int emit_interp(Chunk* c, const int* parts, int part_count) {
     return dest;
 }
 
+/* Index of the first '{' in s[i..len) not behind a backslash, or len. */
+static unsigned int next_interp_open(const char* s, unsigned int len, unsigned int i) {
+    while (i < len) {
+        if (s[i] == '\\' && i + 1 < len) {
+            i += 2;
+            continue;
+        }
+        if (s[i] == '{')
+            return i;
+        i++;
+    }
+    return len;
+}
+
+/* Index of the '}' closing an interpolation whose body starts at i, or len when it never closes.
+   Depth-aware, so a dict literal's own braces inside it do not end the scan early. */
+static unsigned int interp_close(const char* s, unsigned int len, unsigned int i) {
+    int depth = 1;
+    while (i < len) {
+        if (s[i] == '\\' && i + 1 < len) {
+            i += 2;
+            continue;
+        }
+        if (s[i] == '{')
+            depth++;
+        else if (s[i] == '}' && --depth == 0)
+            return i;
+        i++;
+    }
+    return len;
+}
+
+/* Folds a full OP_INTERP part list into one part, so a string has no limit on how many it has. */
+static void interp_make_room(Chunk* c, int* parts, int* part_count) {
+    if (*part_count == INTERP_MAX_PARTS) {
+        parts[0] = emit_interp(c, parts, *part_count);
+        *part_count = 1;
+    }
+}
+
 static int parse_string_literal(Chunk* c) {
     AerString* ts = aer_as_string(token.value);
     char* s = ts->data;
     unsigned int len = ts->length;
 
-    bool has_interp = false;
-    for (unsigned int k = 0; k < len; k++) {
-        if (s[k] == '\\' && k + 1 < len) {
-            k++;
-            continue;
-        }
-        if (s[k] == '{') {
-            has_interp = true;
-            break;
-        }
-    }
-
-    if (!has_interp) {
+    if (next_interp_open(s, len, 0) == len) {
         unsigned int pool_idx = pool_escaped_string(c, s, len);
         lex();
         return (int)pool_idx | RK_CONST_FLAG;
     }
 
     /* Collected as RK values and emitted as one OP_INTERP: one dispatch and one allocation, not a
-       concatenate per part. Past INTERP_MAX_PARTS a left-fold chain takes over, so there is no
-       limit on length. */
+       concatenate per part. */
     int parts[INTERP_MAX_PARTS];
     int part_count = 0;
-
-    int result = -1; /* -1: no parts concatenated yet (a valid RK/register value is always >= 0) */
     unsigned int i = 0;
     while (i <= len) {
-        /* Literal segment up to the next unescaped '{' or end. */
         unsigned int seg_start = i;
-        while (i < len) {
-            if (s[i] == '\\' && i + 1 < len) {
-                i += 2;
-                continue;
-            }
-            if (s[i] == '{')
-                break;
-            i++;
-        }
+        i = next_interp_open(s, len, i);
         if (i > seg_start) {
+            /* A constant segment stays an RK constant -- OP_INTERP reads it straight from the pool. */
             int rk_seg = (int)pool_escaped_string(c, s + seg_start, i - seg_start) | RK_CONST_FLAG;
-            /* A constant segment stays an RK constant -- OP_INTERP reads it straight from the pool,
-               so unlike the concatenate chain it never needs materializing into a register. */
-            if (part_count == INTERP_MAX_PARTS) {
-                int folded = emit_interp(c, parts, part_count);
-                part_count = 0;
-                parts[part_count++] = folded;
-            }
+            interp_make_room(c, parts, &part_count);
             parts[part_count++] = rk_seg;
         }
         if (i >= len)
             break;
 
-        /* Depth-aware so a nested '{'/'}'  (a dict literal) doesn't end the scan early. */
-        i++; /* skip '{' */
-        unsigned int expr_start = i;
-        int depth = 1;
-        while (i < len && depth > 0) {
-            if (s[i] == '\\' && i + 1 < len) {
-                i += 2;
-                continue;
-            }
-            if (s[i] == '{') {
-                depth++;
-                i++;
-                continue;
-            }
-            if (s[i] == '}') {
-                depth--;
-                if (depth == 0)
-                    break;
-                i++;
-                continue;
-            }
-            i++;
-        }
-        if (depth != 0) {
+        unsigned int expr_start = i + 1;
+        i = interp_close(s, len, expr_start);
+        if (i == len) {
             error_at("Unclosed '{' in string");
             break;
         }
@@ -2005,32 +1995,22 @@ static int parse_string_literal(Chunk* c) {
             i++;
             continue;
         }
-
-        unsigned int expr_len = i - expr_start;
-        int rk_expr = parse_interpolated_expr(c, s + expr_start, expr_len);
-        if (parse_had_error) {
-            i++;
-            continue;
+        int rk_expr = parse_interpolated_expr(c, s + expr_start, i - expr_start);
+        if (!parse_had_error) {
+            /* No OP_TO_STR: OP_INTERP formats an int/real/bool/null part directly into the result. */
+            interp_make_room(c, parts, &part_count);
+            parts[part_count++] = rk16_fits(rk_expr) ? rk_expr : materialize(c, rk_expr);
         }
-        /* No OP_TO_STR: OP_INTERP formats an int/real/bool/null part directly into the result,
-           allocating no throwaway string. */
-        if (part_count == INTERP_MAX_PARTS) {
-            int folded = emit_interp(c, parts, part_count);
-            part_count = 0;
-            parts[part_count++] = folded;
-        }
-        parts[part_count++] = rk16_fits(rk_expr) ? rk_expr : materialize(c, rk_expr);
-        i++; /* skip '}' */
+        i++; /* past '}' */
     }
 
-    /* A string with no interpolation at all already returned above, so a single part here is a
-       single interpolated expression -- which still has to be converted, whatever its type. */
-    if (part_count > 0) {
+    /* A string with no interpolation at all already returned above, so a single part here is a single
+       interpolated expression -- which still has to be converted, whatever its type. */
+    int result;
+    if (part_count > 0)
         result = emit_interp(c, parts, part_count);
-    } else {
+    else
         result = (int)chunk_add_pool(c, aer_make_string_copy("", 0)) | RK_CONST_FLAG;
-    }
-
     lex();
     return result;
 }
@@ -5027,6 +5007,22 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
 static unsigned int last_bare_call_end = (unsigned int)-1;
 static unsigned int last_bare_call_start = (unsigned int)-1;
 
+/* False after reporting that a direct call's argument count is outside the function's range. A call with
+   fewer arguments than declared fills the rest from defaults, never from a prior occupant's register. */
+static bool check_call_arity(Chunk* c, unsigned int name_idx, int arg_count, unsigned int min_arity,
+                             unsigned int arity) {
+    if ((unsigned int)arg_count <= arity && (unsigned int)arg_count >= min_arity)
+        return true;
+    const char* fname = aer_as_string(c->pool[name_idx])->data;
+    if (min_arity == arity)
+        error_at("Function '%s' expects %u argument%s, got %d", fname, arity, arity == 1 ? "" : "s",
+                 arg_count);
+    else
+        error_at("Function '%s' expects between %u and %u arguments, got %d", fname, min_arity, arity,
+                 arg_count);
+    return false;
+}
+
 static int parse_call(Chunk* c, unsigned int name_idx) {
     /* The four casts, checked before anything else. Exactly one argument, enforced by the grammar
        itself: parse_binary parses one expression, so a second argument or none falls through to a
@@ -5048,8 +5044,8 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
        name resolution. A top-level variable of this name is never callable from inside a
        function -- reported immediately so it isn't mistaken for a forward reference. */
     int var_reg = -1;
-    bool is_local_var = var_lookup(name_idx, &var_reg);
-    if (!is_local_var && P.function_depth > 0) {
+    bool is_var = var_lookup(name_idx, &var_reg);
+    if (!is_var && P.function_depth > 0) {
         int dummy_reg;
         if (global_lookup(name_idx, &dummy_reg)) {
             error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a "
@@ -5058,7 +5054,6 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
             return 0;
         }
     }
-    bool is_var = is_local_var;
 
     bool is_struct = !is_var && is_struct_name(name_idx);
     unsigned int func_offset = 0, func_arity = 0, func_min_arity = 0, func_max_registers = 0;
@@ -5076,8 +5071,8 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     const char* call_site_cursor = NULL;
     if (!is_var && !is_struct && !is_func) {
         is_forward_ref = true;
-        call_site_cursor =
-            current_source_cursor(); /* captured NOW -- before the arg list below consumes past it */
+        /* Captured now, before the argument list below consumes past it. */
+        call_site_cursor = current_source_cursor();
     }
 
     /* Usually a no-op check, not a copy -- see arg_materialize's own comment. */
@@ -5088,32 +5083,16 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     if (parse_had_error)
         return 0;
 
-    /* A direct call must check arity -- fewer args than declared means some fall back to
-       defaults, not garbage from a prior occupant of that frame slot. */
-    bool arity_error =
-        is_func && ((unsigned int)arg_count > func_arity || (unsigned int)arg_count < func_min_arity);
-    if (arity_error) {
-        const char* fname = aer_as_string(c->pool[name_idx])->data;
-        if (func_min_arity == func_arity)
-            error_at("Function '%s' expects %u argument%s, got %d", fname, func_arity,
-                     func_arity == 1 ? "" : "s", arg_count);
-        else
-            error_at("Function '%s' expects between %u and %u arguments, got %d", fname, func_min_arity,
-                     func_arity, arg_count);
+    if (is_func && !check_call_arity(c, name_idx, arg_count, func_min_arity, func_arity))
         return 0;
-    }
     bool needs_call_value = is_func && (unsigned int)arg_count < func_arity;
 
-    /* Matches Lua's own convention of reusing the base register for the result. Determined before
-       any callee_reg is allocated, so an extra register (a freshly built function value) always
-       lands above dest/the args -- allocating after compaction (the original order) could
-       silently hand out a register an omitted-defaults call's argument was still sitting in. */
-    /* Reusing the argument base as the destination is only safe when it is a temp -- a lone argument
-       now stays in its own register, which may be a variable's. */
+    /* The result reuses the argument base, as Lua does, when that base is a temp -- a lone argument may
+       be a variable's own register. Chosen before any callee_reg is allocated, so a freshly built
+       function value always lands above dest and the arguments. */
     int dest = (arg_count > 0 && arg_base_is_temp) ? arg_reg_base : reg_alloc();
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
 
-    bool needs_callee_reg = needs_call_value;
     int callee_reg = -1;
     if (needs_call_value) {
         AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
@@ -5135,10 +5114,8 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         else if (P.fn.in_variant && (int)func_index == P.fn.current_func_idx && arg_count == (int)func_arity &&
                  func_arity == func_min_arity)
             chunk_emit(c, PACK3(OP_CALL_SELF, dest, base, arg_count));
-        else
-            emit_call(
-                c, dest, func_offset, base, arg_count,
-                func_index); /* exact arity -- no forward-ref patching needed, is_func means already resolved */
+        else /* already resolved, so no forward-reference patch */
+            emit_call(c, dest, func_offset, base, arg_count, func_index);
         last_bare_call_end = c->count;
     } else {
         last_bare_call_start = c->count;
@@ -5150,7 +5127,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
 
     /* One combined compaction for both the extra argument registers and callee_reg, not two
        separately-timed frees -- nothing allocates between them. */
-    int extra = (arg_count > 1 ? arg_count - 1 : 0) + (needs_callee_reg ? 1 : 0);
+    int extra = (arg_count > 1 ? arg_count - 1 : 0) + (needs_call_value ? 1 : 0);
     if (extra > 0)
         reg_free(extra);
 
