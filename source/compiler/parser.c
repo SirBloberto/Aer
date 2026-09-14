@@ -2237,10 +2237,32 @@ static int parse_primary_inner(Chunk* c) {
 /* `[index]`/slice/`.field` reads plus a trailing call-THROUGH-value (not call-by-name) --
    covers functions stored in a container and called via index/key, and currying as a side
    effect. `rk` is reused in place as the call's own dest_reg. */
-typedef enum { INDEX_FIELD_GET, INDEX_FIELD_SET, INDEX_FIELD_COMPOUND } IndexFieldAccess;
+typedef enum { FIELD_GET, FIELD_SET, FIELD_COMPOUND } FieldAccess;
+
+/* The raw kind of field_idx on reg's compile-time-known shape, with its offset and narrowness: RAWK_NONE
+   when the register has no known shape, the shape lacks the field, or the field is not an integer or
+   real. reg may be -1 for a register whose shape is never tracked. */
+static RawKind known_field_kind(int reg, unsigned int field_idx, unsigned int* offset, bool* narrow) {
+    Shape* known = (reg >= 0 && reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[reg] : NULL;
+    ValueType type;
+    if (!known || !shape_find_field(known, field_idx, offset, &type, narrow))
+        return RAWK_NONE;
+    return type == TYPE_INTEGER ? RAWK_INT : type == TYPE_REAL ? RAWK_REAL : RAWK_NONE;
+}
+
+/* The raw opcode for a `struct.field` read, store or compound: [access][narrow][real]. */
+static Opcode field_raw_op(FieldAccess access, bool narrow, RawKind kind) {
+    static const Opcode ops[3][2][2] = {
+        {{OP_FIELD_GET_RAW_INT, OP_FIELD_GET_RAW_REAL}, {OP_FIELD_GET_RAW_INT32, OP_FIELD_GET_RAW_FLOAT32}},
+        {{OP_FIELD_SET_RAW_INT, OP_FIELD_SET_RAW_REAL}, {OP_FIELD_SET_RAW_INT32, OP_FIELD_SET_RAW_FLOAT32}},
+        {{OP_FIELD_COMPOUND_RAW_INT, OP_FIELD_COMPOUND_RAW_REAL},
+         {OP_FIELD_COMPOUND_RAW_INT32, OP_FIELD_COMPOUND_RAW_FLOAT32}},
+    };
+    return ops[access][narrow][kind == RAWK_REAL];
+}
 
 /* The raw fused opcode for a `name[i].field` read, store or compound: [access][narrow][unchecked][real]. */
-static Opcode index_field_raw_op(IndexFieldAccess access, bool narrow, bool unchecked, RawKind kind) {
+static Opcode index_field_raw_op(FieldAccess access, bool narrow, bool unchecked, RawKind kind) {
     static const Opcode ops[3][2][2][2] = {
         {{{OP_INDEX_FIELD_GET_RAW_INT, OP_INDEX_FIELD_GET_RAW_REAL},
           {OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED, OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED}},
@@ -2270,20 +2292,17 @@ static bool emit_index_field_get(Chunk* c, int arr_reg, int rk_start, unsigned i
         return false;
     }
     mark_shape_sensitive(arr_reg);
-    Shape* known = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[arr_reg] : NULL;
-    unsigned int foffset;
-    ValueType ftype;
-    bool narrow;
-    if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
-        (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
-        RawKind kind = (ftype == TYPE_INTEGER) ? RAWK_INT : RAWK_REAL;
+    unsigned int foffset = 0;
+    bool narrow = false;
+    RawKind kind = known_field_kind(arr_reg, field_idx, &foffset, &narrow);
+    if (kind != RAWK_NONE) {
         int slot = slot_alloc(kind);
         if (slot >= 0) {
             /* Checked here, not in index_safe_unchecked, which typed-array reads share: the field
                offset is valid only for the one specialized parameter, never another array a loop
                also proved an index safe for. */
             bool unchecked = arr_reg == P.proof.hint_param_reg && index_safe_unchecked(arr_reg, rk_start);
-            Opcode op = index_field_raw_op(INDEX_FIELD_GET, narrow, unchecked, kind);
+            Opcode op = index_field_raw_op(FIELD_GET, narrow, unchecked, kind);
             chunk_emit(c, PACK3(op, slot, arr_reg, 0));
             chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(rk_start)));
             *out_rk = (kind == RAWK_INT ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | slot;
@@ -2341,21 +2360,15 @@ static int emit_index_read(Chunk* c, int arr_reg, int rk_start) {
 static int emit_field_read(Chunk* c, int struct_reg, unsigned int field_idx) {
     release_if_top(struct_reg);
     mark_shape_sensitive(struct_reg);
-    Shape* known =
-        (struct_reg >= 0 && struct_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[struct_reg] : NULL;
-    unsigned int foffset;
-    ValueType ftype;
-    bool narrow;
-    if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
-        (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
-        bool is_int = (ftype == TYPE_INTEGER);
-        int slot = slot_alloc(is_int ? RAWK_INT : RAWK_REAL);
+    unsigned int foffset = 0;
+    bool narrow = false;
+    RawKind kind = known_field_kind(struct_reg, field_idx, &foffset, &narrow);
+    if (kind != RAWK_NONE) {
+        int slot = slot_alloc(kind);
         if (slot >= 0) {
-            Opcode op = narrow ? (is_int ? OP_FIELD_GET_RAW_INT32 : OP_FIELD_GET_RAW_FLOAT32)
-                               : (is_int ? OP_FIELD_GET_RAW_INT : OP_FIELD_GET_RAW_REAL);
-            chunk_emit(c, PACK3(op, slot, struct_reg, 0));
+            chunk_emit(c, PACK3(field_raw_op(FIELD_GET, narrow, kind), slot, struct_reg, 0));
             chunk_emit(c, foffset);
-            return is_int ? (RK_RAW_INT_FLAG | slot) : (RK_RAW_REAL_FLAG | slot);
+            return (kind == RAWK_INT ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | slot;
         }
     }
     int dest = reg_alloc();
@@ -3470,27 +3483,18 @@ static void parse_chain_store(Chunk* c, ChainTarget t) {
            `local = param[idx]`, is -- see P.regs.alias_source_param). */
         if (pending_is_field && obj_is_base) {
             mark_shape_sensitive(obj_reg);
-            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[obj_reg] : NULL;
-            unsigned int foffset;
-            ValueType ftype;
-            bool field_narrow_bit;
-            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit)) {
-                RawKind field_kind = (ftype == TYPE_INTEGER) ? RAWK_INT
-                                     : (ftype == TYPE_REAL)  ? RAWK_REAL
-                                                             : RAWK_NONE;
-                if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
-                    int slot = raw_materialize(c, rk_val, field_kind);
-                    if (slot >= 0) {
-                        Opcode op = field_narrow_bit ? ((field_kind == RAWK_INT) ? OP_FIELD_SET_RAW_INT32
-                                                                                 : OP_FIELD_SET_RAW_FLOAT32)
-                                                     : ((field_kind == RAWK_INT) ? OP_FIELD_SET_RAW_INT
-                                                                                 : OP_FIELD_SET_RAW_REAL);
-                        chunk_emit(c, PACK3(op, obj_reg, 0, 0));
-                        chunk_emit(c, foffset);
-                        chunk_emit(c, (uint32_t)slot);
-                        raw_release_if_top(slot);
-                        return; /* obj_is_base is always true here, so no reg_free(1) for it needed */
-                    }
+            unsigned int foffset = 0;
+            bool field_narrow_bit = false;
+            RawKind field_kind = known_field_kind(obj_reg, pending_field_idx, &foffset, &field_narrow_bit);
+            if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
+                int slot = raw_materialize(c, rk_val, field_kind);
+                if (slot >= 0) {
+                    Opcode op = field_raw_op(FIELD_SET, field_narrow_bit, field_kind);
+                    chunk_emit(c, PACK3(op, obj_reg, 0, 0));
+                    chunk_emit(c, foffset);
+                    chunk_emit(c, (uint32_t)slot);
+                    raw_release_if_top(slot);
+                    return; /* obj_is_base is always true here, so no reg_free(1) for it needed */
                 }
             }
         }
@@ -3552,22 +3556,12 @@ static void parse_chain_compound(Chunk* c, ChainTarget t) {
             if (obj_is_base)
                 mark_shape_sensitive(obj_reg);
 
-            /* Same compile-time field lookup the plain '=' branch above uses -- only meaningful
-               when obj_is_base (this register really is the shape-sensitive parameter/alias, not
-               an intermediate chain link -- P.regs.reg_known_shape is never seeded for those). */
-            Shape* known = (obj_is_base && obj_reg >= 0 && obj_reg < FRAME_REGISTERS)
-                               ? P.regs.reg_known_shape[obj_reg]
-                               : NULL;
+            /* Only a base register -- the shape-sensitive parameter or its alias -- has a tracked shape;
+               an intermediate chain link never does. */
             unsigned int foffset = 0;
-            ValueType ftype = TYPE_ANY;
             bool field_narrow_bit = false;
-            RawKind field_kind = RAWK_NONE;
-            if (known && shape_find_field(known, pending_field_idx, &foffset, &ftype, &field_narrow_bit)) {
-                if (ftype == TYPE_INTEGER)
-                    field_kind = RAWK_INT;
-                else if (ftype == TYPE_REAL)
-                    field_kind = RAWK_REAL;
-            }
+            RawKind field_kind =
+                known_field_kind(obj_is_base ? obj_reg : -1, pending_field_idx, &foffset, &field_narrow_bit);
 
             unsigned int rhs_start = c->count;
             int rk_rhs = parse_binary(c, 0);
@@ -3594,10 +3588,7 @@ static void parse_chain_compound(Chunk* c, ChainTarget t) {
             if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
                 int slot = raw_materialize(c, rk_rhs, field_kind);
                 if (slot >= 0) {
-                    Opcode op = field_narrow_bit ? ((field_kind == RAWK_INT) ? OP_FIELD_COMPOUND_RAW_INT32
-                                                                             : OP_FIELD_COMPOUND_RAW_FLOAT32)
-                                                 : ((field_kind == RAWK_INT) ? OP_FIELD_COMPOUND_RAW_INT
-                                                                             : OP_FIELD_COMPOUND_RAW_REAL);
+                    Opcode op = field_raw_op(FIELD_COMPOUND, field_narrow_bit, field_kind);
                     chunk_emit(c, PACK3(compound_add_variant(op, bin_op), obj_reg, bin_op, 0));
                     chunk_emit(c, foffset);
                     chunk_emit(c, (uint32_t)slot);
@@ -3682,17 +3673,9 @@ static bool emit_index_field_assign(Chunk* c, int obj_reg, int rk_idx, unsigned 
         return false;
     }
     mark_shape_sensitive(obj_reg);
-    Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[obj_reg] : NULL;
     unsigned int foffset = 0;
-    ValueType ftype = TYPE_ANY;
     bool narrow = false;
-    RawKind field_kind = RAWK_NONE;
-    if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow)) {
-        if (ftype == TYPE_INTEGER)
-            field_kind = RAWK_INT;
-        else if (ftype == TYPE_REAL)
-            field_kind = RAWK_REAL;
-    }
+    RawKind field_kind = known_field_kind(obj_reg, field_idx, &foffset, &narrow);
 
     lex();
     unsigned int rhs_start = c->count;
@@ -3706,7 +3689,7 @@ static bool emit_index_field_assign(Chunk* c, int obj_reg, int rk_idx, unsigned 
         if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
             int slot = raw_materialize(c, rk_rhs, field_kind);
             if (slot >= 0) {
-                Opcode op = index_field_raw_op(INDEX_FIELD_SET, narrow, unchecked, field_kind);
+                Opcode op = index_field_raw_op(FIELD_SET, narrow, unchecked, field_kind);
                 chunk_emit(c, PACK_OP_A_W16(op, obj_reg, pack_rk16(rk_idx)));
                 chunk_emit(c, PACK_2X16((uint16_t)foffset, (uint16_t)slot));
                 raw_release_if_top(slot);
@@ -3739,7 +3722,7 @@ static bool emit_index_field_assign(Chunk* c, int obj_reg, int rk_idx, unsigned 
     if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
         int slot = raw_materialize(c, rk_rhs, field_kind);
         if (slot >= 0) {
-            Opcode op = index_field_raw_op(INDEX_FIELD_COMPOUND, narrow, unchecked, field_kind);
+            Opcode op = index_field_raw_op(FIELD_COMPOUND, narrow, unchecked, field_kind);
             chunk_emit(c, PACK3(compound_add_variant(op, bin_op), obj_reg, bin_op, 0));
             chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(rk_idx)));
             chunk_emit(c, (uint32_t)slot);
