@@ -3542,78 +3542,70 @@ static void parse_chain_store(Chunk* c, ChainTarget t) {
 }
 /* `a[i].f += value` -- read-modify-write through the same fusion opcodes the plain
    store uses, so there is no dedicated compound opcode per shape. */
+/* `obj.field op= rhs`. True when parse_chain_compound's shared tail should run -- false after an error
+   or the FMA fuse, which both skip it. */
+static bool compound_assign_field(Chunk* c, ChainTarget t, Opcode bin_op) {
+    if (t.obj_is_base)
+        mark_shape_sensitive(t.obj_reg);
+
+    /* Only a base register -- the shape-sensitive parameter or its alias -- has a tracked shape; an
+       intermediate chain link never does. */
+    unsigned int foffset = 0;
+    bool field_narrow_bit = false;
+    RawKind field_kind =
+        known_field_kind(t.obj_is_base ? t.obj_reg : -1, t.pending_field_idx, &foffset, &field_narrow_bit);
+
+    unsigned int rhs_start = c->count;
+    int rk_rhs = parse_binary(c, 0);
+    if (parse_had_error)
+        return false;
+
+    int mul_a, mul_b;
+    if (bin_op == OP_ADD && field_kind == RAWK_REAL && field_narrow_bit &&
+        rk_raw_kind(c, rk_rhs) == RAWK_REAL && take_fused_mul_real(c, rhs_start, rk_rhs, &mul_a, &mul_b)) {
+        chunk_emit(c, PACK3(OP_FIELD_COMPOUND_RAW_FLOAT32_FMA, t.obj_reg, mul_a, mul_b));
+        chunk_emit(c, foffset);
+        return false; /* obj_is_base is always true here, so the tail has nothing to release */
+    }
+    /* Decomposing into raw GET + arithmetic + SET measured worse whenever the rhs needed boxing -- the
+       fused opcode below does it all in one dispatch. An rhs that is already raw has nothing to box. */
+    bool native_op_exists = (bin_op == OP_ADD || bin_op == OP_SUB || bin_op == OP_MUL);
+    if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
+        int slot = raw_materialize(c, rk_rhs, field_kind);
+        if (slot >= 0) {
+            Opcode op = field_raw_op(FIELD_COMPOUND, field_narrow_bit, field_kind);
+            chunk_emit(c, PACK3(compound_add_variant(op, bin_op), t.obj_reg, bin_op, 0));
+            chunk_emit(c, foffset);
+            chunk_emit(c, (uint32_t)slot);
+            raw_release_if_top(slot);
+            return true;
+        }
+    }
+    /* One fused OP_FIELD_COMPOUND -- read, compute and write back in a single dispatch and a single
+       vm_resolve_field call, with no temp register: the result goes straight back into the field. */
+    rk_rhs = drop_raw_marks(rk_rhs);
+    if (!rk16_fits(rk_rhs)) {
+        error_at("Expression too large to compile (register/constant index exceeds the fused field-op "
+                 "encoding's range)");
+        return false;
+    }
+    chunk_emit(c, PACK3(OP_FIELD_COMPOUND, t.obj_reg, bin_op, 0));
+    chunk_emit(c, PACK_2X16(t.pending_field_idx, pack_rk16(rk_rhs)));
+    release_if_top(rk_rhs);
+    return true;
+}
+
 static void parse_chain_compound(Chunk* c, ChainTarget t) {
-    int obj_reg = t.obj_reg;
-    bool obj_is_base = t.obj_is_base;
-    bool pending_is_field = t.pending_is_field;
-    unsigned int pending_field_idx = t.pending_field_idx;
-    int pending_rk_idx = t.pending_rk_idx;
     for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
         if (!consume(compound_assign_ops[i].tok))
             continue;
 
-        if (pending_is_field) {
-            if (obj_is_base)
-                mark_shape_sensitive(obj_reg);
-
-            /* Only a base register -- the shape-sensitive parameter or its alias -- has a tracked shape;
-               an intermediate chain link never does. */
-            unsigned int foffset = 0;
-            bool field_narrow_bit = false;
-            RawKind field_kind =
-                known_field_kind(obj_is_base ? obj_reg : -1, pending_field_idx, &foffset, &field_narrow_bit);
-
-            unsigned int rhs_start = c->count;
-            int rk_rhs = parse_binary(c, 0);
-            if (parse_had_error)
+        if (t.pending_is_field) {
+            if (!compound_assign_field(c, t, compound_assign_ops[i].op))
                 return;
-
-            Opcode bin_op = compound_assign_ops[i].op;
-            int mul_a, mul_b;
-            if (bin_op == OP_ADD && field_kind == RAWK_REAL && field_narrow_bit &&
-                rk_raw_kind(c, rk_rhs) == RAWK_REAL &&
-                take_fused_mul_real(c, rhs_start, rk_rhs, &mul_a, &mul_b)) {
-                chunk_emit(c, PACK3(OP_FIELD_COMPOUND_RAW_FLOAT32_FMA, obj_reg, mul_a, mul_b));
-                chunk_emit(c, foffset);
-                return; /* obj_is_base is always true here -- see the plain store below */
-            }
-            /* Decomposing into raw GET + arithmetic + SET was tried and measured WORSE on
-               nbody.aer whenever the rhs needed boxing first -- see the fused index-field-compound
-               site's identical reasoning above. But when the rhs is ALREADY raw at this point (a
-               raw local, or try_emit_arith_raw_boxed's fusion result), OP_FIELD_COMPOUND_RAW_INT/
-               REAL reads/computes/writes the field raw AND takes rk_rhs raw directly -- no boxing
-               to avoid paying for, only upside. */
-            bool native_op_exists = (bin_op == OP_ADD || bin_op == OP_SUB || bin_op == OP_MUL);
-            bool specialized = false;
-            if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
-                int slot = raw_materialize(c, rk_rhs, field_kind);
-                if (slot >= 0) {
-                    Opcode op = field_raw_op(FIELD_COMPOUND, field_narrow_bit, field_kind);
-                    chunk_emit(c, PACK3(compound_add_variant(op, bin_op), obj_reg, bin_op, 0));
-                    chunk_emit(c, foffset);
-                    chunk_emit(c, (uint32_t)slot);
-                    raw_release_if_top(slot);
-                    specialized = true;
-                }
-            }
-            if (!specialized) {
-                /* One fused OP_FIELD_COMPOUND -- read, compute, and write back in a single
-                   dispatch, a single vm_resolve_field call. No temp register needed: the result
-                   writes straight back into the same field, never through a register at all. */
-                rk_rhs = drop_raw_marks(rk_rhs);
-
-                if (!rk16_fits(rk_rhs)) {
-                    return error_at(
-                        "Expression too large to compile (register/constant index exceeds the fused "
-                        "field-op encoding's range)");
-                }
-                chunk_emit(c, PACK3(OP_FIELD_COMPOUND, obj_reg, bin_op, 0));
-                chunk_emit(c, PACK_2X16(pending_field_idx, pack_rk16(rk_rhs)));
-                release_if_top(rk_rhs);
-            }
         } else {
             int item_reg = reg_alloc();
-            emit_index_get(c, item_reg, obj_reg, pending_rk_idx);
+            emit_index_get(c, item_reg, t.obj_reg, t.pending_rk_idx);
 
             int rk_rhs = parse_binary(c, 0);
             if (parse_had_error)
@@ -3622,12 +3614,12 @@ static void parse_chain_compound(Chunk* c, ChainTarget t) {
             emit_binary(c, item_reg, compound_assign_ops[i].op, item_reg, rk_rhs);
             release_if_top(rk_rhs);
 
-            emit_index_set(c, obj_reg, pending_rk_idx, item_reg);
+            emit_index_set(c, t.obj_reg, t.pending_rk_idx, item_reg);
             reg_free(1); /* item_reg */
         }
 
-        release_if_top(pending_rk_idx);
-        if (!obj_is_base)
+        release_if_top(t.pending_rk_idx);
+        if (!t.obj_is_base)
             reg_free(1);
         return;
     }
