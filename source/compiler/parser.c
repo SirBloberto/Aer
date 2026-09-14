@@ -2731,6 +2731,75 @@ static int compile_pipe(Chunk* c, int lhs) {
 
 /* Split from parse_binary so a for-while condition starting with an identifier can resolve it
    once and climb from there. */
+typedef enum { FUSE_NONE, FUSE_DONE, FUSE_ERROR } FuseResult;
+
+/* `t + a*b` / `t - a*b` where t is a fresh raw-real temporary and the rhs is exactly one raw MUL: one
+   FMA/FMS writing t in place. Safe only for a temporary -- a named variable's slot must not be
+   overwritten, since a plain expression's lhs may still be read with its original value. */
+static bool try_fuse_fma_temp(Chunk* c, Opcode op, int* lhs, int rhs, unsigned int rhs_start) {
+    if ((op != OP_ADD && op != OP_SUB) || rk_raw_kind(c, *lhs) != RAWK_REAL ||
+        !raw_is_temp(*lhs & RK_RAW_SLOT_MASK) || c->count - rhs_start != 1)
+        return false;
+    uint32_t mw = c->code[rhs_start];
+    if ((Opcode)(mw & 0xFF) != OP_RAW_MUL_REAL || rk_raw_kind(c, rhs) != RAWK_REAL ||
+        (int)UNPACK_A(mw) != (rhs & RK_RAW_SLOT_MASK))
+        return false;
+    int lhs_slot = *lhs & RK_RAW_SLOT_MASK;
+    int mul_a = (int)UNPACK_B(mw), mul_b = (int)UNPACK_C(mw);
+    c->count = rhs_start; /* discard the MUL -- fused below instead */
+    raw_release_if_top((int)UNPACK_A(mw));
+    chunk_emit(c, PACK3(op == OP_ADD ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL, lhs_slot, mul_a, mul_b));
+    *lhs = RK_RAW_REAL_FLAG | lhs_slot;
+    return true;
+}
+
+/* The operator that gives `field OP' x` the value of `x OP field`: itself when commutative, the mirror
+   comparison for an ordering. False for SUB/DIV/MOD/FLOOR_DIV/shifts/IN, which have no equivalent. */
+static bool commuted_op(Opcode op, Opcode* out) {
+    switch (op) {
+        case OP_ADD:
+        case OP_MUL:
+        case OP_EQ:
+        case OP_NEQ:
+        case OP_BITWISE_AND:
+        case OP_BITWISE_OR:
+        case OP_BITWISE_XOR: *out = op; return true;
+        case OP_LT: *out = OP_GT; return true;
+        case OP_GT: *out = OP_LT; return true;
+        case OP_LTE: *out = OP_GTE; return true;
+        case OP_GTE: *out = OP_LTE; return true;
+        default: return false;
+    }
+}
+
+/* `x OP y.field`, when the rhs is exactly one bare field read: reuses OP_FIELD_BINARY (`field OP' x`)
+   rather than a mirror opcode. */
+static FuseResult try_fuse_field_rhs(Chunk* c, Opcode op, int* lhs, int rhs, unsigned int rhs_start) {
+    Opcode field_op;
+    if (c->count - rhs_start != 2 || (c->code[rhs_start] & 0xFF) != OP_FIELD_GET ||
+        !commuted_op(op, &field_op))
+        return FUSE_NONE;
+    int struct_reg = (int)UNPACK_B(c->code[rhs_start]);
+    unsigned int field_idx = c->code[rhs_start + 1];
+    c->count = rhs_start; /* discard the OP_FIELD_GET just emitted, never executed */
+
+    /* rhs is always the OP_FIELD_GET result (never raw); lhs could be raw -- box it. */
+    *lhs = drop_raw_marks(*lhs);
+    release_if_top(rhs);
+    release_if_top(*lhs);
+
+    int dest = reg_alloc();
+    if (!rk16_fits(*lhs)) {
+        error_at("Expression too large to compile (register/constant index exceeds the fused "
+                 "field-op encoding's range)");
+        return FUSE_ERROR;
+    }
+    chunk_emit(c, PACK3(OP_FIELD_BINARY, dest, struct_reg, field_op));
+    chunk_emit(c, PACK_2X16(field_idx, pack_rk16(*lhs)));
+    *lhs = dest;
+    return FUSE_DONE;
+}
+
 static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned int lhs_start) {
     for (;;) {
         unsigned int prec;
@@ -2826,75 +2895,16 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             continue;
         }
 
-        /* Generalizes the compound-assignment FMA/FMS fusion to any plain expression whose running
-           sum is a fresh raw-real temporary. Safe only for a temporary: a named variable's slot must
-           not be overwritten in place, since unlike `x += a*b` a plain expression's lhs may still be
-           read with its original value. Requires the RHS to be exactly one raw MUL; anything else
-           falls through. Real only. */
-        if (!lhs_is_field && !lhs_is_chain2 && (op == OP_ADD || op == OP_SUB) &&
-            rk_raw_kind(c, lhs) == RAWK_REAL && raw_is_temp(lhs & RK_RAW_SLOT_MASK) &&
-            c->count - rhs_start == 1) {
-            uint32_t mw = c->code[rhs_start];
-            if ((Opcode)(mw & 0xFF) == OP_RAW_MUL_REAL && rk_raw_kind(c, rhs) == RAWK_REAL &&
-                (int)UNPACK_A(mw) == (rhs & RK_RAW_SLOT_MASK)) {
-                int lhs_slot = lhs & RK_RAW_SLOT_MASK;
-                int mul_a = (int)UNPACK_B(mw), mul_b = (int)UNPACK_C(mw);
-                c->count = rhs_start; /* discard the MUL -- fused below instead */
-                raw_release_if_top((int)UNPACK_A(mw));
-                Opcode fused = (op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
-                chunk_emit(c, PACK3(fused, lhs_slot, mul_a, mul_b));
-                lhs = RK_RAW_REAL_FLAG | lhs_slot;
-                lhs_start = c->count;
-                continue;
-            }
+        if (try_fuse_fma_temp(c, op, &lhs, rhs, rhs_start)) {
+            lhs_start = c->count;
+            continue;
         }
-
-        /* Fuses `x OP y.field`, recognized by the RHS being exactly one bare field read. Reuses
-           OP_FIELD_BINARY (`field OP' x`) rather than a mirror opcode: the two agree whenever op is
-           commutative or is a comparison whose operands can be swapped (`x < f` == `f > x`).
-           SUB/DIV/MOD/shifts/IN have no such equivalent and fall through unfused. */
-        if (c->count - rhs_start == 2 && (c->code[rhs_start] & 0xFF) == OP_FIELD_GET) {
-            Opcode commuted_op;
-            bool commutable = true;
-            switch (op) {
-                case OP_ADD:
-                case OP_MUL:
-                case OP_EQ:
-                case OP_NEQ:
-                case OP_BITWISE_AND:
-                case OP_BITWISE_OR:
-                case OP_BITWISE_XOR: commuted_op = op; break;
-                case OP_LT: commuted_op = OP_GT; break;
-                case OP_GT: commuted_op = OP_LT; break;
-                case OP_LTE: commuted_op = OP_GTE; break;
-                case OP_GTE: commuted_op = OP_LTE; break;
-                default:
-                    commutable = false;
-                    commuted_op = op;
-                    break; /* SUB/DIV/MOD/FLOOR_DIV/LSHIFT/RSHIFT/IN -- order-sensitive, no fusion */
-            }
-            if (commutable) {
-                int struct_reg = (int)UNPACK_B(c->code[rhs_start]);
-                unsigned int field_idx = c->code[rhs_start + 1];
-                c->count = rhs_start; /* discard the OP_FIELD_GET just emitted, never executed */
-
-                /* rhs is always the OP_FIELD_GET result (never raw); lhs could be raw -- box it. */
-                lhs = drop_raw_marks(lhs);
-                release_if_top(rhs);
-                release_if_top(lhs);
-
-                int dest = reg_alloc();
-                if (!rk16_fits(lhs)) {
-                    error_at("Expression too large to compile (register/constant index exceeds the fused "
-                             "field-op encoding's range)");
-                    return lhs;
-                }
-                chunk_emit(c, PACK3(OP_FIELD_BINARY, dest, struct_reg, commuted_op));
-                chunk_emit(c, PACK_2X16(field_idx, pack_rk16(lhs)));
-                lhs = dest;
-                lhs_start = c->count;
-                continue;
-            }
+        FuseResult field_rhs = try_fuse_field_rhs(c, op, &lhs, rhs, rhs_start);
+        if (field_rhs == FUSE_ERROR)
+            return lhs;
+        if (field_rhs == FUSE_DONE) {
+            lhs_start = c->count;
+            continue;
         }
 
         /* One operand already raw makes the other's wanted kind known, which is the only thing a
