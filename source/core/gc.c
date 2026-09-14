@@ -342,6 +342,28 @@ static void free_result(void* cell) {
     (void)cell;
 } /* both fields are plain AerVals -- nothing separately owned */
 
+/* Each owning pool's payload, sized from the same fields its finalizer above frees. */
+static size_t payload_bytes_string(void* cell) {
+    AerString* s = (AerString*)cell;
+    return s->data != s->inline_buf ? (size_t)s->length + 1 : 0;
+}
+static size_t payload_bytes_array(void* cell) {
+    return (size_t)((AerArray*)cell)->capacity * sizeof(AerVal);
+}
+static size_t payload_bytes_dict(void* cell) {
+    HashTable* map = &((AerDict*)cell)->map;
+    return (size_t)map->dense_capacity * sizeof(HashTableEntry) +
+           (size_t)map->capacity * sizeof(unsigned int);
+}
+static size_t payload_bytes_packed_array(void* cell) {
+    AerPackedArray* pa = (AerPackedArray*)cell;
+    return (size_t)pa->count * pa->shape->instance_bytes;
+}
+static size_t payload_bytes_typed_array(void* cell) {
+    AerTypedArray* ta = (AerTypedArray*)cell;
+    return (size_t)ta->count * vm_typed_elem_width(ta->elem_kind);
+}
+
 /* Every pool a VmHeap owns, by field offset rather than raw pointer, paired with its finalizer.
    The single place all pools are listed; gc_finalize_all_pools, pool_sweep and gc_count_live_cells
    all walk this instead of hand-written lists -- which is how gc_count_live_cells once silently
@@ -349,20 +371,21 @@ static void free_result(void* cell) {
 typedef struct {
     size_t offset;
     void (*on_free)(void* cell);
+    size_t (*payload_bytes)(void* cell); /* NULL when the cell owns nothing separately */
 } PoolEntry;
 static const PoolEntry pool_table[] = {
-    {offsetof(VmHeap, string_pool), free_string},
-    {offsetof(VmHeap, array_pool), free_array},
-    {offsetof(VmHeap, dict_pool), free_dict},
-    {offsetof(VmHeap, function_pool), free_function},
-    {offsetof(VmHeap, struct_pools[0]), free_struct},
-    {offsetof(VmHeap, struct_pools[1]), free_struct},
-    {offsetof(VmHeap, struct_pools[2]), free_struct},
-    {offsetof(VmHeap, struct_pools[3]), free_struct},
-    {offsetof(VmHeap, struct_pools[4]), free_struct},
-    {offsetof(VmHeap, packed_array_pool), free_packed_array},
-    {offsetof(VmHeap, typed_array_pool), free_typed_array},
-    {offsetof(VmHeap, result_pool), free_result},
+    {offsetof(VmHeap, string_pool), free_string, payload_bytes_string},
+    {offsetof(VmHeap, array_pool), free_array, payload_bytes_array},
+    {offsetof(VmHeap, dict_pool), free_dict, payload_bytes_dict},
+    {offsetof(VmHeap, function_pool), free_function, NULL},
+    {offsetof(VmHeap, struct_pools[0]), free_struct, NULL},
+    {offsetof(VmHeap, struct_pools[1]), free_struct, NULL},
+    {offsetof(VmHeap, struct_pools[2]), free_struct, NULL},
+    {offsetof(VmHeap, struct_pools[3]), free_struct, NULL},
+    {offsetof(VmHeap, struct_pools[4]), free_struct, NULL},
+    {offsetof(VmHeap, packed_array_pool), free_packed_array, payload_bytes_packed_array},
+    {offsetof(VmHeap, typed_array_pool), free_typed_array, payload_bytes_typed_array},
+    {offsetof(VmHeap, result_pool), free_result, NULL},
 };
 #define POOL_TABLE_COUNT (sizeof(pool_table) / sizeof(pool_table[0]))
 _Static_assert(STRUCT_PAYLOAD_TIER_COUNT == 5,
@@ -385,7 +408,7 @@ void gc_finalize_all_pools(VmHeap* heap) {
 /* Collects only vm's own heap, against only vm's own roots -- each VM owns an independent heap, so
    there is no other VM's state to fan out into. File-modules and actors each collect themselves the
    same way, whenever THEIR OWN gc_maybe_collect fires. */
-static void gc_collect(VM* vm, bool minor, unsigned int* live_out) {
+static void gc_collect(VM* vm, bool minor, PoolSweepTally* tally) {
     VmHeap* heap = &vm->heap;
 
     mark_vm_roots(heap, vm, minor);
@@ -483,18 +506,13 @@ static void gc_collect(VM* vm, bool minor, unsigned int* live_out) {
     mark_drain(heap, minor);
 
     for (size_t i = 0; i < POOL_TABLE_COUNT; i++)
-        pool_sweep(pool_at(heap, pool_table[i].offset), minor, pool_table[i].on_free, live_out);
+        pool_sweep(pool_at(heap, pool_table[i].offset), minor, pool_table[i].on_free,
+                   pool_table[i].payload_bytes, tally);
 }
 
 /* Generational GC -- trigger                                           */
 
-/* Tuning defaults (DEFAULT_MINOR_GC_THRESHOLD/DEFAULT_MAJOR_GC_EVERY_N_MINOR, overridable per-heap
-   via aer_gc_configure()) are applied in vm_heap_init (vm.c) -- VmHeap's zero-init obviously can't
-   carry these non-zero defaults itself. */
-
-static void gc_reset_alloc_counts(VmHeap* heap) {
-    heap->pool_alloc_count = 0;
-}
+/* Tuning defaults, overridable via aer_gc_configure(), are applied in vm_heap_init (vm.c). */
 
 /* A full walk of every pool. A major sweep reports its own live count as it goes, so this is only
    for callers with no collection to piggyback on: aer_gc_stats, and the ceiling check after a minor. */
@@ -514,16 +532,21 @@ unsigned int gc_count_live_cells(VmHeap* heap) {
     return total;
 }
 
-#define AER_MINOR_THRESHOLD_CAP (4u * 1024 * 1024)
+/* Returns the live cell count, for the ceiling; the old generation is sized in bytes. */
+static unsigned int gc_major(VM* vm) {
+    VmHeap* heap = &vm->heap;
+    PoolSweepTally live = {0, 0};
+    gc_collect(vm, false, &live);
+    heap->major_collections_run++;
+    heap->old_bytes = heap->old_bytes_after_major = live.bytes;
+    return live.cells;
+}
 
-/* Rescales minor_gc_threshold to the live set, capped, floored at minor_gc_threshold_floor. A small
-   live heap keeps the small configured default, since bounded peak memory is the point there; a
-   large, largely-static one gets a proportionally bigger nursery instead of re-tracing that data
-   nearly as often. Recomputed from the floor each time so it can shrink again. */
-static void gc_rescale_minor_threshold(VmHeap* heap, unsigned int live) {
-    unsigned int scaled = live > AER_MINOR_THRESHOLD_CAP ? AER_MINOR_THRESHOLD_CAP : live;
-    heap->minor_gc_threshold =
-        scaled > heap->minor_gc_threshold_floor ? scaled : heap->minor_gc_threshold_floor;
+/* Floored at the nursery, or a nearly empty heap would run a major after every minor. */
+static bool gc_old_generation_grown(VmHeap* heap) {
+    size_t base = heap->old_bytes_after_major > heap->nursery_bytes ? heap->old_bytes_after_major
+                                                                    : heap->nursery_bytes;
+    return (uint64_t)heap->old_bytes >= (uint64_t)base * heap->growth_factor;
 }
 
 /* Runs only between complete opcodes, where stack/scope/frame invariants are consistent. Called
@@ -532,35 +555,28 @@ static void gc_rescale_minor_threshold(VmHeap* heap, unsigned int live) {
 void gc_run_collection_cycle(VM* vm) {
     VmHeap* heap = &vm->heap;
     heap->gc_ever_collected = true;
-    gc_collect(vm, true, NULL);
+    PoolSweepTally promoted = {0, 0};
+    gc_collect(vm, true, &promoted);
     heap->minor_collections_run++;
-    gc_reset_alloc_counts(heap);
+    heap->young_bytes = 0;
+    heap->old_bytes += promoted.bytes;
 
     bool major_ran = false;
     unsigned int live = 0;
-    bool live_known = false;
-    if (++heap->minor_since_major >= heap->major_gc_every_n_minor) {
-        gc_collect(vm, false, &live);
-        heap->major_collections_run++;
-        heap->minor_since_major = 0;
+    if (gc_old_generation_grown(heap)) {
+        live = gc_major(vm);
         major_ran = true;
-        live_known = true;
-        gc_rescale_minor_threshold(heap, live);
     }
 
     /* Checked once per opcode, not per allocation -- a ceiling'd host can slip slightly past it. */
     if (heap->gc_live_cell_ceiling == 0)
         return;
-    if (!live_known)
+    if (!major_ran)
         live = gc_count_live_cells(heap); /* a minor did not visit the old cells, so it owes a full walk */
     if (live <= heap->gc_live_cell_ceiling)
         return;
     if (!major_ran) {
-        live = 0;
-        gc_collect(vm, false, &live);
-        heap->major_collections_run++;
-        heap->minor_since_major = 0;
-        gc_rescale_minor_threshold(heap, live);
+        live = gc_major(vm);
         if (live <= heap->gc_live_cell_ceiling)
             return;
     }

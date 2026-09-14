@@ -190,10 +190,19 @@ void pool_mark_remembered(void* cell) {
     *(unsigned char*)cell |= POOL_REMEMBERED;
 }
 
+static inline void pool_tally_survivor(PoolSweepTally* tally, const Pool* p,
+                                       size_t (*payload_bytes)(void* cell), void* cell) {
+    if (!tally)
+        return;
+    tally->cells++;
+    tally->bytes += p->stride + (payload_bytes ? payload_bytes(cell) : 0);
+}
+
 /* Leaves every surviving cell mark-free (the promote branch clears it), and pool_alloc zeroes the
    state byte of every cell it hands out -- together that is what makes a separate pre-mark clearing
    pass unnecessary. Don't add one back: it would be a pure no-op scan of the whole heap. */
-void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell), unsigned int* live_out) {
+void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell), size_t (*payload_bytes)(void* cell),
+                PoolSweepTally* tally) {
     if (young_only) {
         /* Walk ONLY the slabs the young thread says still have >=1 young cell -- O(live young
            slabs), not O(slab_count). slab_young_count[i] alone only let the per-CELL scan skip a
@@ -213,6 +222,7 @@ void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell), unsigned 
                     continue; /* old cells are presumed live during a minor pass */
                 if (*state & POOL_MARKED) {
                     *state = (unsigned char)((*state & ~POOL_MARKED) | POOL_OLD); /* survived -> promote */
+                    pool_tally_survivor(tally, p, payload_bytes, cell);
                 } else {
                     on_free(cell);
                     pool_free_at(
@@ -240,8 +250,7 @@ void pool_sweep(Pool* p, bool young_only, void (*on_free)(void* cell), unsigned 
             bool was_young = (*state & POOL_OLD) == 0;
             if (*state & POOL_MARKED) {
                 *state = (unsigned char)((*state & ~POOL_MARKED) | POOL_OLD); /* survived -> promote */
-                if (live_out)
-                    (*live_out)++;
+                pool_tally_survivor(tally, p, payload_bytes, cell);
             } else {
                 on_free(cell);
                 pool_free_at(p, cell, i);

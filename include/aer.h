@@ -58,9 +58,11 @@ unsigned int aer_assert_failure_count(void);
    counts garbage not yet swept. Reports on the most recently run VM, not the process. */
 void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections, unsigned int* major_collections);
 
-/* Defaults are a 2048-cell minor threshold and a major every 10th minor. 0 leaves one unchanged.
-   Safe before any VM exists: later VMs inherit it, and the current one updates immediately. */
-void aer_gc_configure(unsigned int minor_threshold, unsigned int major_every_n_minor);
+/* A minor collection runs every nursery_bytes of allocation (default 1MB), and a full one once the
+   surviving memory has grown growth_factor times since the last (default 2). 0 leaves one
+   unchanged. Safe before any VM exists: later VMs inherit it, and the current one updates
+   immediately. */
+void aer_gc_configure(unsigned int nursery_bytes, unsigned int growth_factor);
 
 /* A -Xmx-style ceiling on one VM's live cells; 0 means unlimited. Still over it after a forced
    collection is a recoverable runtime error, not a process exit. */

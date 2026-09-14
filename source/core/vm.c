@@ -18,8 +18,8 @@
    before any VM exists yet (configure once, then create VMs that pick it up). aer_gc_configure/
    set_ceiling update these AND current_heap's own live fields, so both "configure ahead of time"
    and "reconfigure an already-running VM" work. */
-static unsigned int default_minor_gc_threshold = 2048;
-static unsigned int default_major_gc_every_n_minor = 10;
+static unsigned int default_nursery_bytes = 1024u * 1024;
+static unsigned int default_growth_factor = 2;
 static unsigned int default_gc_live_cell_ceiling = 0; /* 0 = unlimited */
 
 /* Tier sizes for the size-classed struct pools (VmHeap.struct_pools, vm.h's own comment on why).
@@ -104,20 +104,16 @@ static void vm_heap_init(VmHeap* heap) {
         heap->typed_array_free_cache[i].ptr = NULL;
     }
     heap->typed_array_free_cache_bytes = 0;
-    heap->minor_gc_threshold = default_minor_gc_threshold;
-    heap->minor_gc_threshold_floor = default_minor_gc_threshold;
-    heap->major_gc_every_n_minor = default_major_gc_every_n_minor;
+    heap->nursery_bytes = default_nursery_bytes;
+    heap->growth_factor = default_growth_factor;
     heap->gc_live_cell_ceiling = default_gc_live_cell_ceiling;
     heap->pools_initialized = true;
 }
 
-/* Every allocation from one of a heap's 8 GC-managed pools goes through here instead of calling
-   pool_alloc directly, so heap->pool_alloc_count (gc_maybe_collect's trigger) stays accurate --
-   per-VM, not a single process-global counter, since each VM owns an independent heap. Centralized
-   here rather than at each of the ~10 call sites so there's exactly one place that can get this
-   wrong, not ten. */
+/* Every allocation from a heap's GC-managed pools goes through here, so young_bytes (the minor
+   collection's trigger) counts each cell exactly once. */
 static void* heap_alloc(VmHeap* heap, Pool* p) {
-    heap->pool_alloc_count++;
+    heap->young_bytes += p->stride;
     return pool_alloc(p);
 }
 
@@ -165,20 +161,18 @@ void vm_gc_unsuppress(void) {
         h->gc_suppress_depth--;
 }
 
-void aer_gc_configure(unsigned int minor_threshold, unsigned int major_every_n_minor) {
-    if (minor_threshold)
-        default_minor_gc_threshold = minor_threshold;
-    if (major_every_n_minor)
-        default_major_gc_every_n_minor = major_every_n_minor;
+void aer_gc_configure(unsigned int nursery_bytes, unsigned int growth_factor) {
+    if (nursery_bytes)
+        default_nursery_bytes = nursery_bytes;
+    if (growth_factor)
+        default_growth_factor = growth_factor;
     /* Also apply immediately to whichever heap is already current, if one exists -- so
        reconfiguring an already-running VM takes effect right away, not just for the next one. */
     VmHeap* heap = vm_require_current_heap();
-    if (minor_threshold) {
-        heap->minor_gc_threshold = minor_threshold;
-        heap->minor_gc_threshold_floor = minor_threshold;
-    }
-    if (major_every_n_minor)
-        heap->major_gc_every_n_minor = major_every_n_minor;
+    if (nursery_bytes)
+        heap->nursery_bytes = nursery_bytes;
+    if (growth_factor)
+        heap->growth_factor = growth_factor;
 }
 
 void aer_gc_set_ceiling(unsigned int max_live_cells) {
@@ -193,7 +187,7 @@ static inline __attribute__((always_inline)) bool gc_should_collect(VM* vm) {
     VmHeap* heap = &vm->heap;
     if (heap->gc_suppress_depth > 0)
         return false;
-    return heap->pool_alloc_count >= heap->minor_gc_threshold;
+    return heap->young_bytes >= heap->nursery_bytes;
 }
 
 /* Tiny and always_inline, so the common case costs nothing. gc.c holds the collection itself. */
@@ -1686,10 +1680,8 @@ static unsigned char* typed_array_data_alloc(VmHeap* heap, size_t size) {
             return p;
         }
     }
-    /* The collector's trigger counts cells, and a typed array is one cell however many megabytes
-       hang off it -- so charging a miss by size is what pulls the next cycle in soon enough for the
-       cache above to be populated. A hit allocated nothing, so it is charged nothing. */
-    heap->pool_alloc_count += (unsigned int)(size / TYPED_ARRAY_ALLOC_CHARGE_BYTES);
+    /* A hit above allocated nothing, so only a miss counts toward the next collection. */
+    heap->young_bytes += size;
     return xmalloc(size);
 }
 
@@ -4846,6 +4838,7 @@ HANDLER(array_repeat)
         /* malloc(0) is implementation-defined -- skip it for a zero-count array; bounds checks
            reject every later access anyway. */
         pa->data = count > 0 ? xmalloc((size_t)count * (size_t)element_size) : NULL;
+        vm->heap.young_bytes += (size_t)count * (size_t)element_size;
         /* Every eligible field is raw -- 8 bytes, or 4 if narrow (TYPE_ANY, the only field kind
            needing a full boxed AerVal, was already rejected above) -- so src->fields IS one
            element's worth of bytes at exactly instance_bytes, laid out identically to a packed

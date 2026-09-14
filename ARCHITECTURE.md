@@ -233,8 +233,11 @@ payload, e.g. `AerString.data`) and pushed onto the free-list.
 **Trigger** (`gc_maybe_collect`, `vm.c`): checked from inside individual allocating opcode
 handlers, **not** from `DISPATCH()` on every single instruction (see §5.1 for why this placement
 itself was a real, measured win). A minor collection runs once `pool_total_alloc_count` (a single
-shared counter across all 8 pools) crosses `minor_gc_threshold` (default 2048, `aer_gc_configure`);
-a major collection runs after every `major_gc_every_n_minor` (default 10) minor ones. An optional
+shared counter across all 8 pools) crosses `nursery_bytes` (default 1MB, `aer_gc_configure`). A major
+collection runs once the old generation has grown `growth_factor` (default 2) times past what the
+last major left live, never measured against less than the nursery. Both count bytes. The nursery
+counts each new cell plus each new typed- or packed-array buffer; the old generation counts every
+surviving cell plus the payload it owns, so a few large arrays weigh what they occupy. An optional
 live-cell **ceiling** (`aer_gc_set_ceiling`, 0 = unlimited) is checked once per opcode after the
 normal rhythm — if exceeded, an extra major collection is forced before the process gives up and
 reports "Memory ceiling exceeded" via the normal (non-fatal, longjmp-based — see §5.1) error path.
@@ -3210,9 +3213,9 @@ lever worth pulling is the interpolation/allocation path (§5.13 already took on
     current contents on every subsequent minor GC, for as long as it stayed remembered (entries are
     never proactively removed) — `for (j = 0; j < a->count; j++) worklist_push(...)` regardless of
     which indices actually changed. For a container built via many incremental insertions
-    (`append()`, or repeated `dict[key] = value` with new keys), each of the ~(N / minor_gc_threshold)
+    (`append()`, or repeated `dict[key] = value` with new keys), each of the ~(N / nursery size)
     minor GCs across construction rescanned everything built so far, not just what's new — total cost
-    degraded to roughly O(n²/threshold). Fixed with a JVM/.NET-style write barrier: `AerArray`/
+    degraded to roughly O(n²/nursery). Fixed with a JVM/.NET-style write barrier: `AerArray`/
     `AerDict` gained a lazily-allocated per-index dirty-bit array (`dirty_cards`), set only for the
     exact index written; the remembered-set replay walks only dirty bits, then clears them.
     `collection.insert`/`delete`/`sort` (which shift element-to-index correspondence) fall back to a
@@ -3922,3 +3925,48 @@ On the every-10th-minor trigger it barely shows, because those majors ran early,
 still small: log_processing 96.8MB -> 92.7MB, nothing else moved. It matters once majors run on a
 large heap. Under the first, cell-counted version of 5.71's growth trigger, struct_array_scan went
 163.8MB -> 153.2MB and log_processing 72.7MB -> 67.1MB.
+
+### 5.71 The collector counts bytes
+
+The trigger it replaced counted cells: a minor every 2048 allocations, a major every 10th minor, and
+a nursery rescaled to the live cell count after each major. A program holding a large live set got a
+large nursery for it -- log_processing peaked at 97MB against Python's 54MB -- and a program holding
+almost nothing still ran a full collection every tenth minor (small_dict_bench ran 322 of them).
+
+**The first attempt kept cells and added rules, and each rule rescued the last.** Measuring the old
+generation in cells let columnar_scale reach 4GB: a typed array is one cell however many megabytes
+hang off it. Charging a payload one cell per 4KB fixed that; a nursery sized from the old generation
+brought back binary_trees; an adaptive growth factor brought back struct_array_scan and cost
+columnar_scale 200MB. A fixed 16K-cell nursery showed the actual flaw -- typed_elementwise went from
+15MB to 67MB, because 16K cells of typed arrays is 64MB. A cell meant 48 bytes or 4KB, so no cell
+count could be right for both.
+
+Everything is bytes now, and the rules are gone:
+
+| field | meaning |
+|---|---|
+| `young_bytes` | allocated since the last minor collection |
+| `nursery_bytes` | a minor runs when `young_bytes` reaches it -- 1MB by default |
+| `old_bytes` | what the last major left live, plus everything promoted since |
+| `old_bytes_after_major` | `old_bytes` right after the last major |
+| `growth_factor` | a major runs when `old_bytes` reaches this many times `old_bytes_after_major`, measured against no less than the nursery -- 2 by default |
+
+The old generation is measured at each sweep from the cells that survive, each cell plus the payload
+it owns. The nursery counts each new cell plus each new typed- or packed-array buffer; an array's item
+buffer, a string's payload and a dict's storage are counted once they survive, not as they grow.
+
+| benchmark | time, 5 layouts | peak memory |
+|---|---|---|
+| typed_elementwise | **-27.6%** | 14.6MB -> 8.5MB |
+| dict_bench | **-15.2%** | 51.3MB -> 53.0MB |
+| log_processing | **-12.3%** | 96.8MB -> 57.2MB |
+| binary_trees | **-2.6%** | 7.8MB -> 8.6MB |
+| columnar_scale | **-1.4%** | 991MB -> 836MB |
+| fib_bench | -1.3% | unchanged |
+| struct_array_scan | +4.1%, sign flips | 151MB -> 149MB |
+| small_dict_bench | +2.5%, sign flips | 5.8MB -> 9.3MB |
+
+A small program now carries up to one nursery of garbage it did not before: small_dict_bench's
++3.5MB and binary_trees' +0.8MB are that megabyte. The same garbage shows in `aer_gc_stats`, whose
+live count includes unswept cells -- about 12,500 small arrays after any allocation loop, however long.
+A memory ceiling is still checked when a collection runs, so a host can pass it by up to a nursery.

@@ -198,9 +198,9 @@ assert(mut_pts[0].x == 101 and mut_pts[1].x == 102 and mut_pts[2].x == 103,
        "arr[idx].field compound-assignment fusion correct with inline struct storage")
 
 # A TYPE_ANY field holding a real reference (an array, not just a string this
-# time) must survive not only a minor collection but a MAJOR one too — the
-# default major_gc_every_n_minor is 10, so this needs enough allocation
-# pressure to actually cross that, not just the ~3 minor cycles the write-
+# time) must survive not only a minor collection but a MAJOR one too — a
+# major runs once the old generation doubles, so this needs enough surviving
+# allocation to cross that, not just the ~3 minor cycles the write-
 # barrier test above triggers. mark_value's TYPE_STRUCT case must keep
 # pushing this field's content every cycle for as long as it's reachable.
 struct RefHolder:

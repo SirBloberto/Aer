@@ -758,10 +758,6 @@ typedef struct {
    each time, while still admitting eight buffers sitting just under it. */
 #define TYPED_ARRAY_FREE_CACHE_SLOTS 8
 #define TYPED_ARRAY_FREE_CACHE_MAX_TOTAL_BYTES (32u * 1024 * 1024)
-/* Bytes of freshly-malloc'd typed-array payload that count as one cell against the collector's
-   trigger -- see typed_array_data_alloc. Roughly a page, so a buffer costs about what faulting it
-   in costs. */
-#define TYPED_ARRAY_ALLOC_CHARGE_BYTES 4096u
 
 typedef struct {
     size_t size; /* 0 = empty slot */
@@ -799,21 +795,15 @@ typedef struct {
 
     MarkWorklist gc_worklist;
 
-    /* Tuning (overridable via aer_gc_configure()): minor_gc_threshold is total cells allocated
-       across all pools since the last minor GC; major_gc_every_n_minor runs a major pass after
-       that many minor ones. 0 for gc_live_cell_ceiling means unlimited (aer_gc_set_ceiling). */
-    unsigned int minor_gc_threshold, major_gc_every_n_minor, gc_live_cell_ceiling;
-    /* Floor for minor_gc_threshold, which gc_rescale_minor_threshold recomputes after every major
-       collection as max(floor, live cell count) -- so a large mostly-static live heap gets a bigger
-       nursery instead of re-tracing itself nearly as often. Never mutated by that rescale, only by
-       aer_gc_configure, which is what lets the threshold shrink again rather than ratchet upward. */
-    unsigned int minor_gc_threshold_floor;
-    unsigned int minor_collections_run, major_collections_run, minor_since_major;
+    /* All in bytes. A minor runs once young_bytes, allocated since the last one, reaches
+       nursery_bytes. old_bytes is what the last major left live plus everything promoted since, so
+       old garbage keeps counting until a major reclaims it; a major runs once it reaches
+       growth_factor times old_bytes_after_major. nursery_bytes and growth_factor come from
+       aer_gc_configure; 0 for gc_live_cell_ceiling means unlimited. */
+    size_t young_bytes, nursery_bytes, old_bytes, old_bytes_after_major;
+    unsigned int growth_factor, gc_live_cell_ceiling;
+    unsigned int minor_collections_run, major_collections_run;
     int gc_suppress_depth;
-
-    /* Cells allocated since gc_reset_alloc_counts -- gc_maybe_collect checks this against
-       minor_gc_threshold. One per heap. */
-    unsigned int pool_alloc_count;
 
     /* Every AerDict this heap owns gets its key/sparse-array storage from here, one per heap like
        the 7 GC pools above. Chunk.name_index has no owning VM, so it uses its own process-global

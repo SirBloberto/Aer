@@ -479,7 +479,7 @@ int main(void) {
 
         unsigned int minors_after;
         aer_gc_stats(NULL, &minors_after, NULL);
-        aer_gc_configure(2048, 10);   /* restore defaults */
+        aer_gc_configure(1024 * 1024, 2);   /* restore defaults */
 
         check(minors_after > minors_before,
               "the throwaway-array loop actually triggered real minor collections, not just ran without crashing");

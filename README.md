@@ -2190,9 +2190,10 @@ reclaimed around them.
 Introspect a running VM via `aer_gc_stats()` (`include/aer.h`) — live cell count, minor collections
 run, major collections run.
 
-**Two knobs, both optional.** `aer_gc_configure(minor_threshold, major_every_n_minor)` overrides the
-tuning constants above (2048 and 10 by default) — pass `0` for either argument to leave that one
-alone. `aer_gc_set_ceiling(max_live_cells)` caps total live cells across all seven pools — a
+**Two knobs, both optional.** `aer_gc_configure(nursery_bytes, growth_factor)` sets how much is
+allocated between minor collections (1MB by default) and how many times surviving memory must grow
+before a full collection (2 by default: once it doubles) — pass `0` for either argument to leave
+that one alone. `aer_gc_set_ceiling(max_live_cells)` caps total live cells across all seven pools — a
 `-Xmx`-style limit, `0` (the default) meaning unlimited. Hitting the ceiling doesn't crash the host:
 the collector forces one extra major pass first (in case a cheap collection alone would've freed
 enough), and only if the script is *still* over the limit does it abort with a normal, recoverable

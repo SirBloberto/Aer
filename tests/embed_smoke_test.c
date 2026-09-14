@@ -207,15 +207,15 @@ int main(void) {
     check(ok && !aer_had_error(), "a module function using raw int locals runs without error through setup_call");
     check(aer_assert_failure_count() == 0, "raw_calc(5) == 10 (0+1+2+3+4), proving setup_call's raw_ints/raw_reals bump-pointer sizing is correct");
 
-    /* Generational GC — aer_gc_stats() introspection. Allocates far more
-       short-lived arrays than MINOR_GC_THRESHOLD (2048, vm.c) — each loop
+    /* Generational GC — aer_gc_stats() introspection. Allocates several
+       times the default 1MB nursery in short-lived arrays — each loop
        iteration overwrites `temp`, so only the last one stays reachable,
        and everything before it is immediately collectible garbage.
        Asserting a collection actually ran and that the live-cell count
        stayed far below the iteration count is the only real proof
        reclamation happened, not just that nothing crashed. */
     aer_clear_error();
-    ok = aer_run_source(&vm, &chunk, "for i in 0..5000:\n    temp = [i, i * 2, i * 3]\n");
+    ok = aer_run_source(&vm, &chunk, "for i in 0..200000:\n    temp = [i, i * 2, i * 3]\n");
 
     unsigned int live_cells, minor_collections, major_collections;
     aer_gc_stats(&live_cells, &minor_collections, &major_collections);
@@ -225,23 +225,23 @@ int main(void) {
     /* live_cells counts every currently-live pool cell in the whole shared VM, not just this
        loop's own allocations — it also includes every object still held by earlier tests in this
        same file (module registrations, function registries, etc.), so this bound isn't "this
-       loop's own leftovers," it's "still far below the 5000 iterations that ran," with headroom for
-       the file's own accumulated baseline growing over time as more tests get added. */
-    check(live_cells < 2000,
-          "live cell count stayed far below the 5000 iterations that ran — reclamation, not just non-crashing");
+       loop's own leftovers," it's "still far below the 200000 iterations that ran." Garbage from the
+       last nursery not yet swept counts too -- about 12,500 cells at 1MB, the same at any loop length. */
+    check(live_cells < 20000,
+          "live cell count stayed far below the 200000 iterations that ran — reclamation, not just non-crashing");
 
     /* aer_gc_configure — a much smaller minor threshold should trigger far
        more collections than the default for the same workload. Restored
        to the defaults immediately after, so it doesn't affect the ceiling
        tests below. */
     aer_clear_error();
-    aer_gc_configure(20, 0);   /* tiny minor threshold; 0 leaves the major cadence alone */
+    aer_gc_configure(20, 0);   /* tiny nursery; 0 leaves the growth factor alone */
     unsigned int minors_before;
     aer_gc_stats(NULL, &minors_before, NULL);
     ok = aer_run_source(&vm, &chunk, "for i in 0..2000:\n    temp = [i, i * 2, i * 3]\n");
     unsigned int minors_after;
     aer_gc_stats(NULL, &minors_after, NULL);
-    aer_gc_configure(2048, 10);   /* restore defaults before the ceiling tests below */
+    aer_gc_configure(1024 * 1024, 2);   /* restore defaults before the ceiling tests below */
 
     check(ok, "a script still runs correctly with an aggressively small GC threshold configured");
     check(minors_after - minors_before > 10,
@@ -253,7 +253,7 @@ int main(void) {
        forever. */
     aer_clear_error();
     aer_gc_set_ceiling(50);
-    ok = aer_run_source(&vm, &chunk, "import collection\npermanent = []\nfor i in 0..5000:\n    collection.append(permanent, [i, i * 2, i * 3])\n");
+    ok = aer_run_source(&vm, &chunk, "import collection\npermanent = []\nfor i in 0..50000:\n    collection.append(permanent, [i, i * 2, i * 3])\n");
 
     check(!ok, "a script whose live memory keeps growing hits the ceiling and aborts");
     check(aer_had_error(), "aer_had_error() is true after the ceiling is exceeded");
@@ -472,7 +472,7 @@ int main(void) {
         aer_gc_stats(&live_b_before, NULL, NULL);
 
         aer_clear_error();
-        bool iso_ok = aer_run_source(&vm_a, &chunk_a, "for i in 0..5000:\n    temp = [i, i * 2, i * 3]\n");
+        bool iso_ok = aer_run_source(&vm_a, &chunk_a, "for i in 0..200000:\n    temp = [i, i * 2, i * 3]\n");
 
         vm_set_current_heap(&vm_a.heap);
         unsigned int live_a;
@@ -485,7 +485,7 @@ int main(void) {
         check(iso_ok, "the heavy-allocation script on vm_a ran to completion without error");
         /* vm_a's own heap actually did the work (a real collection ran, keeping this bounded --
            same assertion shape as the earlier single-VM GC test). */
-        check(live_a < 2000, "vm_a's own live cell count reflects its allocation, collected down same as any single VM");
+        check(live_a < 20000, "vm_a's own live cell count reflects its allocation, collected down same as any single VM");
         check(live_b_before == live_b_after,
               "vm_b's live cell count is completely unchanged by vm_a's allocation — the two heaps never touched each other");
 
