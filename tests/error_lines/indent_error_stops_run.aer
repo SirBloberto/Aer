@@ -1,0 +1,6 @@
+if true:
+    if true:
+        x = 1
+      y = 2 #!error: Indentation does not match any outer level
+items = []
+missing = items[3]

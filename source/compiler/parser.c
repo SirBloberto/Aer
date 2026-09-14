@@ -3915,6 +3915,8 @@ static void parse_block(Chunk* c) {
     while (!equal(TOKEN_END_OF_FILE) && !equal(TOKEN_ELSE) && !equal(TOKEN_DEDENT)) {
         if (consume(TOKEN_NEW_LINE))
             continue;
+        /* A lexer error while reading the boundary belongs to no statement, so no rollback records it. */
+        P.any_compile_error |= parse_had_error;
         parse_had_error = false;
         P.expr_depth = 0;
         P.recovered_at_boundary = false;
@@ -3942,7 +3944,9 @@ static void parse_block(Chunk* c) {
        caller checks it right after to decide if ITS OWN construct failed. For a function
        definition this is serious: func_register already ran, so a stale flag would roll back the
        function's real bytecode while its name stays registered (can manifest as an infinite loop
-       when called). Reset here so only a genuine top-level failure propagates. */
+       when called). Reset here so only a genuine top-level failure propagates -- after recording it,
+       since an error the lexer raised on the block's last boundary was seen by no statement. */
+    P.any_compile_error |= parse_had_error;
     parse_had_error = false;
 }
 
@@ -5925,12 +5929,15 @@ void parser_restore_state(ParserState* s) {
    OP_HALT -- patching only the jump target would still run the call's side effects. */
 void parse(Chunk* c) {
     P.any_compile_error = false;
+    parse_had_error = false;
     aer_reset_parse_error_count();
     while (!equal(TOKEN_END_OF_FILE)) {
         if (consume(TOKEN_NEW_LINE))
             continue;
         if (consume(TOKEN_DEDENT))
             continue;
+        /* A lexer error while reading the boundary belongs to no statement, so no rollback records it. */
+        P.any_compile_error |= parse_had_error;
         parse_had_error = false;
         P.expr_depth = 0;
         P.recovered_at_boundary = false;
