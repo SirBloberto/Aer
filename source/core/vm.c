@@ -897,52 +897,27 @@ static AerVal vm_to_str(VM* vm, AerVal v) {
     if (aer_type(v) == TYPE_STRING)
         return v;
 
-    char* owned;
+    char buf[64];
+    const char* text;
     unsigned int len;
-
-    if (aer_type(v) == TYPE_ARRAY || aer_type(v) == TYPE_DICT || aer_type(v) == TYPE_STRUCT ||
-        aer_type(v) == TYPE_PACKED_ARRAY || aer_type(v) == TYPE_TYPED_ARRAY || aer_type(v) == TYPE_RESULT) {
-        /* Recursive content has no bounded size, so this reuses print()'s formatter and hands over
-           its buffer as-is. */
-        StrBuf sb;
-        strbuf_init(&sb);
-        vm_format_value(vm->chunk, v, false, &sb);
-        owned = sb.buf;
-        len = (unsigned int)sb.len;
-    } else {
-        /* Formatted onto the stack, then copied straight into the new AerString cell (inline when
-           short) via aer_make_string_copy -- buf itself is never heap-allocated. */
-        char buf[64];
-        switch (aer_type(v)) {
-            case TYPE_NULL: snprintf(buf, sizeof(buf), "null"); break;
-            case TYPE_INTEGER: aer_format_int((long long)aer_as_int(v), buf, sizeof(buf)); break;
-            case TYPE_REAL: aer_format_real(aer_as_real(v), buf, sizeof(buf)); break;
-            case TYPE_BOOLEAN: snprintf(buf, sizeof(buf), "%s", aer_as_bool(v) ? "true" : "false"); break;
-            case TYPE_FUNCTION: snprintf(buf, sizeof(buf), "<function>"); break;
-            case TYPE_ARRAY:
-            case TYPE_DICT:
-            case TYPE_STRUCT:
-            case TYPE_STRING:
-            case TYPE_PACKED_ARRAY:
-            case TYPE_TYPED_ARRAY:
-            case TYPE_RESULT: break; /* handled above */
-            case TYPE_ANY: break; /* never a real AerVal's tag -- only Shape.field_types[] uses it */
-        }
-        /* Not interned: a runtime string is used once, and interning would grow the pool forever --
-           7x slower for 100k unique casts than for 10 distinct ones. */
-        return aer_make_string_copy(buf, (unsigned int)strlen(buf));
-    }
-    /* No chunk_add_pool interning -- same reasoning as above. */
-    return aer_make_string(owned, len);
+    /* Not interned: a runtime string is used once, and interning would grow the pool forever -- 7x
+       slower for 100k unique casts than for 10 distinct ones. */
+    if (aer_format_scalar(v, buf, sizeof(buf), &text, &len))
+        return aer_make_string_copy(text, len);
+    /* Recursive content has no bounded size, so this reuses print()'s formatter and hands over its
+       buffer as-is. */
+    StrBuf sb;
+    strbuf_init(&sb);
+    vm_format_value(vm->chunk, v, false, &sb);
+    return aer_make_string(sb.buf, (unsigned int)sb.len);
 }
 
 /* OP_INTERP's builder. A part is rendered into `scratch` only if it isn't already a string;
    unbounded content defers to vm_to_str. */
 /* Formats an interpolated dict key into a stack buffer and probes with the bytes, never building the
    AerString. Returns false (leaving *out alone) when that cannot work, and the caller falls back.
-   Must format exactly as vm_interp_build does -- a key written through OP_INTERP and read back
-   through here would otherwise silently miss; tests/test_interp_dict_keys.aer guards that.
-   Owns the buffer and the probe rather than handing either back to the caller. */
+   Scalars render through aer_format_scalar, as in vm_interp_build, so a key written through OP_INTERP
+   is found here; tests/test_interp_dict_keys.aer guards that. */
 static bool vm_dict_get_interp(AerDict* d, const uint32_t* rks, unsigned int count,
                                                          AerVal* registers, AerVal* pool, AerVal* out) {
     char key[INTERP_KEY_MAX];
@@ -952,30 +927,11 @@ static bool vm_dict_get_interp(AerDict* d, const uint32_t* rks, unsigned int cou
         const char* piece;
         unsigned int piece_len;
         char scratch[32];
-        switch (aer_type(v)) {
-            case TYPE_STRING: {
-                AerString* s = aer_as_string(v);
-                piece = s->data;
-                piece_len = s->length;
-                break;
-            }
-            case TYPE_INTEGER:
-                piece_len = aer_format_int((long long)aer_as_int(v), scratch, sizeof(scratch));
-                piece = scratch;
-                break;
-            case TYPE_REAL:
-                piece_len = aer_format_real(aer_as_real(v), scratch, sizeof(scratch));
-                piece = scratch;
-                break;
-            case TYPE_BOOLEAN:
-                piece = aer_as_bool(v) ? "true" : "false";
-                piece_len = aer_as_bool(v) ? 4u : 5u;
-                break;
-            case TYPE_NULL:
-                piece = "null";
-                piece_len = 4;
-                break;
-            default: return false; /* a collection part needs vm_to_str, which allocates */
+        if (aer_type(v) == TYPE_STRING) {
+            piece = aer_as_string(v)->data;
+            piece_len = aer_as_string(v)->length;
+        } else if (!aer_format_scalar(v, scratch, sizeof(scratch), &piece, &piece_len)) {
+            return false; /* a collection part needs vm_to_str, which allocates */
         }
         if (at + piece_len > INTERP_KEY_MAX)
             return false;
@@ -999,38 +955,16 @@ static AerVal vm_interp_build(VM* vm, const AerVal* parts, unsigned int count) {
 
     for (unsigned int i = 0; i < count; i++) {
         AerVal v = parts[i];
-        switch (aer_type(v)) {
-            case TYPE_STRING: {
-                AerString* s = aer_as_string(v);
-                piece[i] = s->data;
-                piece_len[i] = s->length;
-                break;
-            }
-            case TYPE_INTEGER:
-                piece_len[i] = aer_format_int((long long)aer_as_int(v), scratch[i], sizeof(scratch[i]));
-                piece[i] = scratch[i];
-                break;
-            case TYPE_REAL:
-                piece_len[i] = aer_format_real(aer_as_real(v), scratch[i], sizeof(scratch[i]));
-                piece[i] = scratch[i];
-                break;
-            case TYPE_BOOLEAN:
-                piece[i] = aer_as_bool(v) ? "true" : "false";
-                piece_len[i] = aer_as_bool(v) ? 4u : 5u;
-                break;
-            case TYPE_NULL:
-                piece[i] = "null";
-                piece_len[i] = 4;
-                break;
-            default: {
-                /* vm_to_str allocates; hold the result so a collection triggered by a later part
-                   cannot reclaim bytes this one still points at. */
-                AerVal s = vm_to_str(vm, v);
-                spilled[spill_count++] = s;
-                piece[i] = aer_as_string(s)->data;
-                piece_len[i] = aer_as_string(s)->length;
-                break;
-            }
+        if (aer_type(v) == TYPE_STRING) {
+            piece[i] = aer_as_string(v)->data;
+            piece_len[i] = aer_as_string(v)->length;
+        } else if (!aer_format_scalar(v, scratch[i], sizeof(scratch[i]), &piece[i], &piece_len[i])) {
+            /* vm_to_str allocates; hold the result so a collection triggered by a later part cannot
+               reclaim bytes this one still points at. */
+            AerVal s = vm_to_str(vm, v);
+            spilled[spill_count++] = s;
+            piece[i] = aer_as_string(s)->data;
+            piece_len[i] = aer_as_string(s)->length;
         }
         total += piece_len[i];
     }

@@ -969,6 +969,11 @@ unsigned int aer_format_real(double d, char* buf, size_t bufsize);
 /* Fast snprintf("%lld", ...) replacement -- see its own comment, value_format.c. */
 unsigned int aer_format_int(long long v, char* buf, size_t bufsize);
 
+/* The text of a value that renders without allocating -- null, integer, real, boolean, function -- using
+   scratch for numbers; false for strings and collections. print(), interpolation and interpolated dict
+   keys all render scalars through it, so a key cannot read back differently from how it was written. */
+bool aer_format_scalar(AerVal v, char* scratch, size_t size, const char** text, unsigned int* len);
+
 /* Shared recursive rendering (value_format.c) behind print() and vm_to_str() (interpolation, +,
    etc.) -- one consistent representation, not a terse "<array[3]>" fallback. */
 void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb);

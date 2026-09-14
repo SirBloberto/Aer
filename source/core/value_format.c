@@ -72,6 +72,32 @@ unsigned int aer_format_int(long long v, char* buf, size_t bufsize) {
     return (unsigned int)len;
 }
 
+bool aer_format_scalar(AerVal v, char* scratch, size_t size, const char** text, unsigned int* len) {
+    switch (aer_type(v)) {
+        case TYPE_NULL:
+            *text = "null";
+            *len = 4;
+            return true;
+        case TYPE_INTEGER:
+            *len = aer_format_int((long long)aer_as_int(v), scratch, size);
+            *text = scratch;
+            return true;
+        case TYPE_REAL:
+            *len = aer_format_real(aer_as_real(v), scratch, size);
+            *text = scratch;
+            return true;
+        case TYPE_BOOLEAN:
+            *text = aer_as_bool(v) ? "true" : "false";
+            *len = aer_as_bool(v) ? 4u : 5u;
+            return true;
+        case TYPE_FUNCTION:
+            *text = "<function>";
+            *len = 10;
+            return true;
+        default: return false;
+    }
+}
+
 /* Value formatting -- shared by print() and vm_to_str() (interpolation, +, etc.) for one consistent
    recursive rendering, not a terse "<array[3]>" fallback. */
 
@@ -83,18 +109,13 @@ static void format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb, uns
         strbuf_append(sb, "...");
         return;
     }
+    const char* text;
+    unsigned int len;
+    if (aer_format_scalar(v, tmp, sizeof(tmp), &text, &len)) {
+        strbuf_append_n(sb, text, len);
+        return;
+    }
     switch (aer_type(v)) {
-        case TYPE_NULL: strbuf_append(sb, "null"); break;
-        case TYPE_INTEGER:
-            aer_format_int((long long)aer_as_int(v), tmp, sizeof(tmp));
-            strbuf_append(sb, tmp);
-            break;
-        case TYPE_REAL:
-            aer_format_real(aer_as_real(v), tmp, sizeof(tmp));
-            strbuf_append(sb, tmp);
-            break;
-        case TYPE_BOOLEAN: strbuf_append(sb, aer_as_bool(v) ? "true" : "false"); break;
-        case TYPE_FUNCTION: strbuf_append(sb, "<function>"); break;
         case TYPE_STRING: {
             AerString* s = aer_as_string(v);
             if (in_collection)
@@ -177,7 +198,12 @@ static void format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb, uns
             strbuf_append(sb, ")");
             break;
         }
-        case TYPE_ANY: break; /* never a real AerVal's tag -- only Shape.field_types[] uses it */
+        case TYPE_NULL:
+        case TYPE_INTEGER:
+        case TYPE_REAL:
+        case TYPE_BOOLEAN:
+        case TYPE_FUNCTION:
+        case TYPE_ANY: break; /* scalars returned above; TYPE_ANY is never a real AerVal's tag */
     }
 }
 
