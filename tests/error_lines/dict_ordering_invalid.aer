@@ -1,0 +1,5 @@
+a = {"k": 1}
+b = a
+assert(a == b, "a dict equals itself")
+assert({"k": 1} != a, "two dicts with the same entries are different dicts")
+bigger = a < b #!error: Operator not valid for dicts

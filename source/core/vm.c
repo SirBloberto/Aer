@@ -814,12 +814,14 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
         return aer_bool(false);
     }
 
-    if (aer_type(a) == TYPE_ARRAY && aer_type(b) == TYPE_ARRAY) {
-        if (op == OP_EQ)
-            return aer_bool(aer_as_array(a) == aer_as_array(b));
-        if (op == OP_NEQ)
-            return aer_bool(aer_as_array(a) != aer_as_array(b));
-        error("Operator not valid for arrays");
+    /* Compared by identity only. Tested on the values' own tags: a struct-field caller passes the
+       field's declared type as ta, which is TYPE_ANY for an untyped field. */
+    if (aer_type(a) == aer_type(b) &&
+        (aer_type(a) == TYPE_ARRAY || aer_type(a) == TYPE_DICT || aer_type(a) == TYPE_RESULT)) {
+        if (op == OP_EQ || op == OP_NEQ)
+            return aer_bool((a.as.ptr == b.as.ptr) == (op == OP_EQ));
+        error("Operator not valid for %s",
+              aer_type(a) == TYPE_ARRAY ? "arrays" : aer_type(a) == TYPE_DICT ? "dicts" : "Results");
         return aer_bool(false);
     }
 
@@ -848,24 +850,6 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
             return vm_typed_array_scalar_op(aer_as_typed_array(a), b, op, false);
         if (b_arr && a_num)
             return vm_typed_array_scalar_op(aer_as_typed_array(b), a, op, true);
-    }
-
-    if (aer_type(a) == TYPE_DICT && aer_type(b) == TYPE_DICT) {
-        if (op == OP_EQ)
-            return aer_bool(aer_as_dict(a) == aer_as_dict(b));
-        if (op == OP_NEQ)
-            return aer_bool(aer_as_dict(a) != aer_as_dict(b));
-        error("Operator not valid for dicts");
-        return aer_bool(false);
-    }
-
-    if (aer_type(a) == TYPE_RESULT && aer_type(b) == TYPE_RESULT) {
-        if (op == OP_EQ)
-            return aer_bool(aer_as_result(a) == aer_as_result(b));
-        if (op == OP_NEQ)
-            return aer_bool(aer_as_result(a) != aer_as_result(b));
-        error("Operator not valid for Results");
-        return aer_bool(false);
     }
 
     /* A column reaching here failed for a reason the generic message hides: either the operator is

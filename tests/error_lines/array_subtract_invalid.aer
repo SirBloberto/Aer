@@ -1,0 +1,5 @@
+xs = [1, 2]
+ys = xs
+assert(xs == ys, "an array equals itself")
+assert([1, 2] != xs, "two arrays with the same items are different arrays")
+diff = xs - ys #!error: Operator not valid for arrays

@@ -1,0 +1,6 @@
+struct Holder:
+    seen = null
+
+h = Holder()
+h.seen = {"k": 1}
+h.seen *= {"k": 2} #!error: Operator not valid for dicts

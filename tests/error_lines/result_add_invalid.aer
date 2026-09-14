@@ -1,0 +1,5 @@
+r = Result(1, null)
+s = r
+assert(r == s, "a Result equals itself")
+assert(Result(1, null) != r, "two Results with the same contents are different Results")
+total = r + s #!error: Operator not valid for Results
