@@ -434,67 +434,73 @@ static void lex_identifier() {
 
 /* Main lex function                                                    */
 
+/* At the start of a line: skips blank and comment-only lines, then measures the indentation. True when
+   that produced the token (INDENT, DEDENT, or an error); false when the line stays at the same level. */
+static bool lex_line_start(void) {
+    for (;;) {
+        char* p = current->buffer;
+        while (*p == ' ')
+            p++;
+        if (*p == '#')
+            while (*p != '\n' && *p != '\0')
+                p++;
+        if (*p != '\n')
+            break;
+        current->buffer = p + 1;
+    }
+
+    char* p = current->buffer;
+    unsigned int spaces = 0;
+    while (*p == ' ') {
+        spaces++;
+        p++;
+    }
+    if (*p == '\t') {
+        error_at("Tabs not allowed for indentation");
+        return true;
+    }
+
+    unsigned int top = indent_stack[indent_depth - 1];
+    if (*p != '\0' && spaces > top) {
+        if (indent_depth >= 64) {
+            error_at("Indentation too deep");
+            return true;
+        }
+        indent_stack[indent_depth++] = spaces;
+        current->buffer = p;
+        token.type = TOKEN_INDENT;
+        return true;
+    }
+    current->buffer = p;
+    if (spaces < top || (*p == '\0' && indent_depth > 1)) {
+        int pops = 0;
+        while (indent_depth > 1 && indent_stack[indent_depth - 1] > spaces) {
+            indent_depth--;
+            pops++;
+        }
+        if (*p != '\0' && indent_stack[indent_depth - 1] != spaces) {
+            error_at("Indentation does not match any outer level");
+            return true;
+        }
+        if (*p == '\0')
+            indent_depth = 1;
+        pending_dedents = pops - 1;
+        token.type = TOKEN_DEDENT;
+        return true;
+    }
+    return false;
+}
+
 void lex() {
-    /* Emit queued DEDENTs before anything else */
     if (pending_dedents > 0) {
         pending_dedents--;
         token.type = TOKEN_DEDENT;
         return;
     }
-
-    /* At the start of a line: measure indentation */
     if (at_line_start) {
         at_line_start = false;
-
-        /* Skip blank and comment-only lines */
-        for (;;) {
-            char* p = current->buffer;
-            while (*p == ' ')
-                p++;
-            if (*p == '#')
-                while (*p != '\n' && *p != '\0')
-                    p++;
-            if (*p != '\n')
-                break;
-            current->buffer = p + 1;
-        }
-
-        /* Count leading spaces; error on tabs */
-        char* p = current->buffer;
-        unsigned int spaces = 0;
-        while (*p == ' ') {
-            spaces++;
-            p++;
-        }
-        if (*p == '\t')
-            return error_at("Tabs not allowed for indentation");
-
-        unsigned int top = indent_stack[indent_depth - 1];
-
-        if (*p != '\0' && spaces > top) {
-            if (indent_depth >= 64)
-                return error_at("Indentation too deep");
-            indent_stack[indent_depth++] = spaces;
-            current->buffer = p;
-            token.type = TOKEN_INDENT;
+        if (lex_line_start())
             return;
-        } else if (spaces < top || (*p == '\0' && indent_depth > 1)) {
-            current->buffer = p;
-            int pops = 0;
-            while (indent_depth > 1 && indent_stack[indent_depth - 1] > spaces) {
-                indent_depth--;
-                pops++;
-            }
-            if (*p != '\0' && indent_stack[indent_depth - 1] != spaces)
-                return error_at("Indentation does not match any outer level");
-            if (*p == '\0')
-                indent_depth = 1;
-            pending_dedents = pops - 1;
-            token.type = TOKEN_DEDENT;
-            return;
-        } else {
-            current->buffer = p; /* same level: skip leading spaces */
-        }
     }
 
     skip_whitespace_and_comments();
