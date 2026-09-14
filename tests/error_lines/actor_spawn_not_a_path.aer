@@ -1,0 +1,2 @@
+import actor
+actor.spawn(42) #!error: actor.spawn() requires a path string

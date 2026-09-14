@@ -296,6 +296,143 @@ void aer_actor_free_all(void) {
 /* noinline -- see aer_host_call's own comment (aer_host.c): this function's 4KB `AerVal
    popped[VM_STACK_MAX]` local was one of three such arrays LTO was folding into vm_run_slice's own
    frame, since each of the three has exactly one call site. */
+static bool push_null(VM* vm) {
+    vm_stack_push(vm, aer_null());
+    return true;
+}
+
+/* The actor a handle names, or NULL after reporting that none does. */
+static Actor* resolve_actor(AerVal handle_v, const char* verb) {
+    Actor* a = aer_actor_resolve(handle_v);
+    if (!a)
+        error("%s: no actor with that handle", verb);
+    return a;
+}
+
+/* Hands a typed array's payload to another actor instead of copying it. Safe only because the sender
+   gives up its own reference in the same breath -- the array is left empty here, so the buffer has
+   exactly one owner throughout and neither collector can free what the other holds. That single-owner
+   rule is why this is a separate verb rather than a flag on send(). */
+static bool actor_give(VM* vm) {
+    AerVal value_v = vm_stack_pop(vm);
+    AerVal handle_v = vm_stack_pop(vm);
+    if (aer_type(value_v) != TYPE_TYPED_ARRAY) {
+        error("actor.give() moves a typed array; use actor.send() for anything else");
+        return push_null(vm);
+    }
+    Actor* a = resolve_actor(handle_v, "actor.give()");
+    if (!a)
+        return push_null(vm);
+    AerTypedArray* ta = aer_as_typed_array(value_v);
+    unsigned int width = vm_typed_elem_width(ta->elem_kind);
+    aer_actor_send_owned(a, (char*)ta->data, NULL, ta->count * width, true, ta->elem_kind, ta->count);
+    ta->data = NULL; /* given away: this array is now empty, and frees nothing */
+    ta->count = 0;
+    return push_null(vm);
+}
+
+static bool actor_spawn(VM* vm) {
+    AerVal path_v = vm_stack_pop(vm);
+    if (aer_type(path_v) != TYPE_STRING) {
+        error("actor.spawn() requires a path string");
+        return push_null(vm);
+    }
+    Actor* a = aer_actor_spawn(aer_as_string(path_v)->data);
+    if (!a) {
+        vm_stack_push(vm, aer_make_result(aer_null(),
+                                          aer_make_error("actor.spawn(): failed to load or run the script")));
+        return true;
+    }
+    vm_stack_push(vm, aer_make_result(aer_int((int64_t)aer_actor_id(a)), aer_null()));
+    return true;
+}
+
+static bool actor_send(VM* vm) {
+    AerVal message_v = vm_stack_pop(vm);
+    AerVal handle_v = vm_stack_pop(vm);
+    bool typed = aer_type(message_v) == TYPE_TYPED_ARRAY;
+    if (aer_type(message_v) != TYPE_STRING && !typed) {
+        error("actor.send() requires an actor handle and a string or typed array");
+        return push_null(vm);
+    }
+    Actor* a = resolve_actor(handle_v, "actor.send()");
+    if (!a)
+        return push_null(vm);
+    /* A typed array crosses as its raw bytes, not as text. Its elements are numbers with no pointers
+       among them, so the receiver rebuilds it with a memcpy rather than a parse -- the whole reason
+       chunking work across actors is affordable. */
+    if (typed) {
+        AerTypedArray* ta = aer_as_typed_array(message_v);
+        unsigned int width = vm_typed_elem_width(ta->elem_kind);
+        aer_actor_send_bytes(a, (const char*)ta->data, ta->count * width, true, ta->elem_kind, ta->count);
+    } else {
+        AerString* str = aer_as_string(message_v);
+        aer_actor_send(a, str->data, str->length);
+    }
+    return push_null(vm);
+}
+
+static bool actor_receive(VM* vm) {
+    Actor* a = resolve_actor(vm_stack_pop(vm), "actor.receive()");
+    if (!a)
+        return push_null(vm);
+    char* message;
+    unsigned int len;
+    bool typed;
+    TypedArrayElemKind kind;
+    unsigned int count;
+    /* No message ready is a normal, non-error outcome -- plain null, matching this language's existing
+       "missing dict key returns null" idiom, not a Result. */
+    if (!aer_actor_try_receive(a, &message, &len, &typed, &kind, &count))
+        return push_null(vm);
+    if (typed && count) {
+        /* try_receive hands this buffer over, so the array adopts the allocation rather than copying
+           it -- one copy fewer on every typed-array receive, and the point of actor.give. */
+        AerVal arr = vm_new_typed_array_val(kind, 0);
+        AerTypedArray* ta = aer_as_typed_array(arr);
+        free(ta->data);
+        ta->data = (unsigned char*)message;
+        ta->count = count;
+        vm_stack_push(vm, arr);
+        return true;
+    }
+    if (typed) {
+        AerVal arr = vm_new_typed_array_val(kind, count);
+        if (count)
+            memcpy(aer_as_typed_array(arr)->data, message, len);
+        free(message);
+        vm_stack_push(vm, arr);
+        return true;
+    }
+    vm_stack_push(vm, aer_make_string(message, len));
+    return true;
+}
+
+static bool actor_call(VM* vm, int arg_count) {
+    /* Popped in reverse (LIFO) order, same shape as aer_host_call's own arg-copy -- popped[0] ends up
+       as the first-pushed (handle), popped[arg_count-1] as the last extra argument. */
+    AerVal popped[VM_STACK_MAX];
+    for (int i = arg_count - 1; i >= 0; i--)
+        popped[i] = vm_stack_pop(vm);
+
+    if (aer_type(popped[1]) != TYPE_STRING) {
+        error("actor.call() requires an actor handle and a function-name string");
+        return push_null(vm);
+    }
+    Actor* a = resolve_actor(popped[0], "actor.call()");
+    if (!a)
+        return push_null(vm);
+
+    AerVal result;
+    if (!aer_actor_call(a, aer_as_string(popped[1])->data, arg_count - 2, &popped[2], &result)) {
+        AerVal err = aer_make_error("actor.call(): function not found or the call failed");
+        vm_stack_push(vm, aer_make_result(aer_null(), err));
+        return true;
+    }
+    vm_stack_push(vm, aer_make_result(result, aer_null()));
+    return true;
+}
+
 __attribute__((noinline)) bool aer_actor_module_call(VM* vm, int fn_id, int arg_count) {
     /* Hold one value across calls, in THIS vm's own heap. An actor's functions cannot reach a
        top-level variable, so without somewhere to put it, work that reuses the same data had to be
@@ -310,154 +447,15 @@ __attribute__((noinline)) bool aer_actor_module_call(VM* vm, int fn_id, int arg_
         vm_stack_push(vm, vm->kept);
         return true;
     }
-    /* Hands a typed array's payload to another actor instead of copying it. Safe only because the
-       sender gives up its own reference in the same breath -- the array is left empty here, so the
-       buffer has exactly one owner throughout and neither collector can free what the other holds.
-       That single-owner rule is why this is a separate verb rather than a flag on send(). */
-    if (fn_id == FN_ACTOR_GIVE && arg_count == 2) {
-        AerVal value_v = vm_stack_pop(vm);
-        AerVal handle_v = vm_stack_pop(vm);
-        if (aer_type(value_v) != TYPE_TYPED_ARRAY) {
-            error("actor.give() moves a typed array; use actor.send() for anything else");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        Actor* a = aer_actor_resolve(handle_v);
-        if (!a) {
-            error("actor.give(): no actor with that handle");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        AerTypedArray* ta = aer_as_typed_array(value_v);
-        unsigned int width = vm_typed_elem_width(ta->elem_kind);
-        aer_actor_send_owned(a, (char*)ta->data, NULL, ta->count * width, true, ta->elem_kind, ta->count);
-        ta->data = NULL; /* given away: this array is now empty, and frees nothing */
-        ta->count = 0;
-        vm_stack_push(vm, aer_null());
-        return true;
-    }
-    if (fn_id == FN_ACTOR_SPAWN && arg_count == 1) {
-        AerVal path_v = vm_stack_pop(vm);
-        if (aer_type(path_v) != TYPE_STRING) {
-            error("actor.spawn() requires a path string");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        Actor* a = aer_actor_spawn(aer_as_string(path_v)->data);
-        if (!a) {
-            vm_stack_push(vm,
-                          aer_make_result(aer_null(),
-                                          aer_make_error("actor.spawn(): failed to load or run the script")));
-            return true;
-        }
-        vm_stack_push(vm, aer_make_result(aer_int((int64_t)aer_actor_id(a)), aer_null()));
-        return true;
-    }
-
-    if (fn_id == FN_ACTOR_SEND && arg_count == 2) {
-        AerVal message_v = vm_stack_pop(vm);
-        AerVal handle_v = vm_stack_pop(vm);
-        bool typed = aer_type(message_v) == TYPE_TYPED_ARRAY;
-        if (aer_type(message_v) != TYPE_STRING && !typed) {
-            error("actor.send() requires an actor handle and a string or typed array");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        Actor* a = aer_actor_resolve(handle_v);
-        if (!a) {
-            error("actor.send(): no actor with that handle");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        /* A typed array crosses as its raw bytes, not as text. Its elements are numbers with no
-           pointers among them, so the receiver rebuilds it with a memcpy rather than a parse -- the
-           whole reason chunking work across actors is affordable. */
-        if (typed) {
-            AerTypedArray* ta = aer_as_typed_array(message_v);
-            unsigned int width = vm_typed_elem_width(ta->elem_kind);
-            aer_actor_send_bytes(a, (const char*)ta->data, ta->count * width, true, ta->elem_kind, ta->count);
-        } else {
-            AerString* str = aer_as_string(message_v);
-            aer_actor_send(a, str->data, str->length);
-        }
-        vm_stack_push(vm, aer_null());
-        return true;
-    }
-
-    if (fn_id == FN_ACTOR_RECEIVE && arg_count == 1) {
-        AerVal handle_v = vm_stack_pop(vm);
-        Actor* a = aer_actor_resolve(handle_v);
-        if (!a) {
-            error("actor.receive(): no actor with that handle");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        char* message;
-        unsigned int len;
-        bool typed;
-        TypedArrayElemKind kind;
-        unsigned int count;
-        /* No message ready is a normal, non-error outcome -- plain null, matching this language's
-           existing "missing dict key returns null" idiom, not a Result. */
-        if (!aer_actor_try_receive(a, &message, &len, &typed, &kind, &count)) {
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        if (typed && count) {
-            /* try_receive hands this buffer over -- the caller frees it -- so the array adopts the
-               allocation rather than copying it and freeing the original. One copy fewer on every
-               typed-array receive, and the whole point of actor.give, which does not copy on the
-               way in either. */
-            AerVal arr = vm_new_typed_array_val(kind, 0);
-            AerTypedArray* ta = aer_as_typed_array(arr);
-            free(ta->data);
-            ta->data = (unsigned char*)message;
-            ta->count = count;
-            vm_stack_push(vm, arr);
-            return true;
-        }
-        if (typed) {
-            AerVal arr = vm_new_typed_array_val(kind, count);
-            if (count)
-                memcpy(aer_as_typed_array(arr)->data, message, len);
-            free(message);
-            vm_stack_push(vm, arr);
-            return true;
-        }
-        vm_stack_push(vm, aer_make_string(message, len));
-        return true;
-    }
-
-    if (fn_id == FN_ACTOR_CALL && arg_count >= 2) {
-        /* Popped in reverse (LIFO) order, same shape as aer_host_call's own arg-copy -- popped[0]
-           ends up as the first-pushed (handle), popped[arg_count-1] as the last extra argument. */
-        AerVal popped[VM_STACK_MAX];
-        for (int i = arg_count - 1; i >= 0; i--)
-            popped[i] = vm_stack_pop(vm);
-
-        if (aer_type(popped[1]) != TYPE_STRING) {
-            error("actor.call() requires an actor handle and a function-name string");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-        Actor* a = aer_actor_resolve(popped[0]);
-        if (!a) {
-            error("actor.call(): no actor with that handle");
-            vm_stack_push(vm, aer_null());
-            return true;
-        }
-
-        AerVal result;
-        bool ok = aer_actor_call(a, aer_as_string(popped[1])->data, arg_count - 2, &popped[2], &result);
-        if (!ok) {
-            vm_stack_push(
-                vm, aer_make_result(aer_null(),
-                                    aer_make_error("actor.call(): function not found or the call failed")));
-            return true;
-        }
-        vm_stack_push(vm, aer_make_result(result, aer_null()));
-        return true;
-    }
-
+    if (fn_id == FN_ACTOR_GIVE && arg_count == 2)
+        return actor_give(vm);
+    if (fn_id == FN_ACTOR_SPAWN && arg_count == 1)
+        return actor_spawn(vm);
+    if (fn_id == FN_ACTOR_SEND && arg_count == 2)
+        return actor_send(vm);
+    if (fn_id == FN_ACTOR_RECEIVE && arg_count == 1)
+        return actor_receive(vm);
+    if (fn_id == FN_ACTOR_CALL && arg_count >= 2)
+        return actor_call(vm, arg_count);
     return false;
 }

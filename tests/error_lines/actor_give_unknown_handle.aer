@@ -1,0 +1,3 @@
+import actor
+column = [0; 4]
+actor.give(987654, column) #!error: actor.give(): no actor with that handle

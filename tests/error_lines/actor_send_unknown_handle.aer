@@ -1,0 +1,2 @@
+import actor
+actor.send(987654, "hello") #!error: actor.send(): no actor with that handle
