@@ -2793,6 +2793,55 @@ static FuseResult try_fuse_field_rhs(Chunk* c, Opcode op, int* lhs, int rhs, uns
     return FUSE_DONE;
 }
 
+/* The two LHS peepholes below read the LHS's just-emitted bytecode and, on a match, drop it so the
+   operator can fuse it in. They run before the RHS is parsed, while that code is still the chunk's tail --
+   excising bytecode from the middle could invalidate an RHS jump target. */
+
+/* An LHS that is exactly one OP_FIELD_GET: its struct register and field, with the read discarded. */
+static bool take_lhs_field_get(Chunk* c, unsigned int lhs_start, int* struct_reg, unsigned int* field_idx) {
+    if (c->count - lhs_start != 2 || (c->code[lhs_start] & 0xFF) != OP_FIELD_GET)
+        return false;
+    *struct_reg = (int)UNPACK_B(c->code[lhs_start]);
+    *field_idx = c->code[lhs_start + 1];
+    c->count = lhs_start;
+    return true;
+}
+
+/* An LHS that is exactly one `A op1 B` over plain registers, with op1 and the outer op both + - *: A, B and
+   op1, with the inner op discarded, for one OP_TYPED_ARRAY_CHAIN2 pass (see vm.c's op_chain2_index). */
+static bool take_lhs_chain2(Chunk* c, unsigned int lhs_start, int lhs, Opcode op, int* a, int* b,
+                            Opcode* op1) {
+    if (c->count - lhs_start != 1 || !(op == OP_ADD || op == OP_SUB || op == OP_MUL))
+        return false;
+    uint32_t w = c->code[lhs_start];
+    Opcode wop = (Opcode)(w & 0xFF);
+    if (!(wop == OP_ADD || wop == OP_SUB || wop == OP_MUL) || (int)UNPACK_A(w) != lhs)
+        return false;
+    uint8_t a8 = (uint8_t)UNPACK_B(w), b8 = (uint8_t)UNPACK_C(w);
+    if (RK8_IS_CONST(a8) || RK8_IS_CONST(b8))
+        return false;
+    *op1 = wop;
+    *a = RK8_INDEX(a8);
+    *b = RK8_INDEX(b8);
+    c->count = lhs_start;
+    return true;
+}
+
+/* Elementwise + - * on a typed array yields a typed array of the same kind, and the result has to say so
+   or the next operator in the chain sees an unproven register and unboxes it -- `(a - 1.0) * 2.0` failed
+   on exactly that. Read before the operands' registers are freed, since dest may be handed one of them. */
+static RawKind elementwise_result_kind(Opcode op, int lhs, int rhs) {
+    if (!(op == OP_ADD || op == OP_SUB || op == OP_MUL))
+        return RAWK_NONE;
+    int lr = drop_raw_marks(lhs), rr = drop_raw_marks(rhs);
+    RawKind kind = RAWK_NONE;
+    if (!(lhs & RK_CONST_FLAG) && lr >= 0 && lr < FRAME_REGISTERS)
+        kind = P.regs.reg_elem_kind[lr];
+    if (kind == RAWK_NONE && !(rhs & RK_CONST_FLAG) && rr >= 0 && rr < FRAME_REGISTERS)
+        kind = P.regs.reg_elem_kind[rr];
+    return kind;
+}
+
 static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned int lhs_start) {
     for (;;) {
         unsigned int prec;
@@ -2817,40 +2866,13 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             continue;
         }
 
-        /* Checked before parsing the RHS, while lhs's bytecode is still the tail of the chunk --
-           excising bytecode from the middle would risk invalidating an RHS jump target.
-           OP_FIELD_GET is now a fixed 2-word shape (word0: op+dest+struct_reg, word1: field_idx). */
-        bool lhs_is_field = (c->count - lhs_start == 2 && (c->code[lhs_start] & 0xFF) == OP_FIELD_GET);
         int lhs_struct_reg = 0;
         unsigned int lhs_field_idx = 0;
-        if (lhs_is_field) {
-            lhs_struct_reg = (int)UNPACK_B(c->code[lhs_start]);
-            lhs_field_idx = c->code[lhs_start + 1];
-            c->count = lhs_start; /* discard lhs's OP_FIELD_GET, never executed */
-        }
-
-        /* Fuses `(A op1 B) op2 C` into one typed-array pass, checked like lhs_is_field above --
-           against just-emitted code, before the outer RHS is parsed. Both operators must be
-           fusable (see vm.c's op_chain2_index) and the inner operands plain registers; anything
-           else takes the ordinary unfused path. */
-        bool lhs_is_chain2 = false;
+        bool lhs_is_field = take_lhs_field_get(c, lhs_start, &lhs_struct_reg, &lhs_field_idx);
         int lhs_chain2_a = 0, lhs_chain2_b = 0;
         Opcode lhs_chain2_op1 = OP_ADD;
-        if (!lhs_is_field && c->count - lhs_start == 1) {
-            uint32_t w = c->code[lhs_start];
-            Opcode wop = (Opcode)(w & 0xFF);
-            if ((wop == OP_ADD || wop == OP_SUB || wop == OP_MUL) && (int)UNPACK_A(w) == lhs &&
-                (op == OP_ADD || op == OP_SUB || op == OP_MUL)) {
-                uint8_t a8 = (uint8_t)UNPACK_B(w), b8 = (uint8_t)UNPACK_C(w);
-                if (!RK8_IS_CONST(a8) && !RK8_IS_CONST(b8)) {
-                    lhs_is_chain2 = true;
-                    lhs_chain2_op1 = wop;
-                    lhs_chain2_a = RK8_INDEX(a8);
-                    lhs_chain2_b = RK8_INDEX(b8);
-                    c->count = lhs_start; /* discard the inner op, never executed as its own instruction */
-                }
-            }
-        }
+        bool lhs_is_chain2 = !lhs_is_field && take_lhs_chain2(c, lhs_start, lhs, op, &lhs_chain2_a,
+                                                              &lhs_chain2_b, &lhs_chain2_op1);
 
         unsigned int rhs_start = c->count;
         int rhs = parse_binary(c, prec); /* same precedence as floor -> left-associative */
@@ -2917,18 +2939,7 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             continue;
         }
 
-        /* Elementwise arithmetic on a typed array yields a typed array of the same kind, and the
-           result has to say so or the next operator in the chain sees an unproven register and
-           unboxes it -- `(a - 1.0) * 2.0` failed on exactly that. Read before the registers are
-           freed, since dest may be handed one of them. */
-        RawKind chain_elem = RAWK_NONE;
-        if (op == OP_ADD || op == OP_SUB || op == OP_MUL) {
-            int lr = drop_raw_marks(lhs), rr = drop_raw_marks(rhs);
-            if (!(lhs & RK_CONST_FLAG) && lr >= 0 && lr < FRAME_REGISTERS)
-                chain_elem = P.regs.reg_elem_kind[lr];
-            if (chain_elem == RAWK_NONE && !(rhs & RK_CONST_FLAG) && rr >= 0 && rr < FRAME_REGISTERS)
-                chain_elem = P.regs.reg_elem_kind[rr];
-        }
+        RawKind chain_elem = elementwise_result_kind(op, lhs, rhs);
 
         /* Free-then-allocate, RHS then LHS, matching compile_node's own discipline exactly. */
         release_if_top(rhs);
