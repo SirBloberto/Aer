@@ -1,0 +1,2 @@
+﻿items = [1, 2, 3]
+missing = items[7] #!error: out of bounds

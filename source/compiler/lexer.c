@@ -99,6 +99,15 @@ void lexer_restore_state(LexerState* s) {
 
 /* File loading                                                         */
 
+/* Copies src to dst without its '\r' bytes, so Windows line endings lex like Unix ones. dst may be src,
+   or earlier in the same buffer. */
+static void copy_without_carriage_returns(char* dst, const char* src) {
+    for (; *src; src++)
+        if (*src != '\r')
+            *dst++ = *src;
+    *dst = '\0';
+}
+
 void read_file(char* filename) {
     FILE* fp = fopen(filename, "rb");
     if (!fp)
@@ -134,18 +143,10 @@ void read_file(char* filename) {
             filename, at);
     }
 
-    /* Normalize Windows line endings: strip \r in-place */
-    char* dst = buf;
-    char* src = buf;
     /* A UTF-8 BOM, which most Windows editors write, would otherwise lex as an unknown character. */
-    if ((unsigned char)src[0] == 0xEF && (unsigned char)src[1] == 0xBB && (unsigned char)src[2] == 0xBF)
-        src += 3;
-    while (*src) {
-        if (*src != '\r')
-            *dst++ = *src;
-        src++;
-    }
-    *dst = '\0';
+    bool bom =
+        (unsigned char)buf[0] == 0xEF && (unsigned char)buf[1] == 0xBB && (unsigned char)buf[2] == 0xBF;
+    copy_without_carriage_returns(buf, bom ? buf + 3 : buf);
 
     if (file_index >= file_capacity) {
         file_capacity = file_capacity ? file_capacity * 2 : 8;
@@ -170,15 +171,7 @@ void shell(char* line) {
     previous = strdup(line);
     if (!previous)
         error("Out of memory in shell");
-    /* Strip \r from pasted Windows-style input */
-    char* r = previous;
-    char* w = previous;
-    while (*r) {
-        if (*r != '\r')
-            *w++ = *r;
-        r++;
-    }
-    *w = '\0';
+    copy_without_carriage_returns(previous, previous);
     shell_file.name = "shell";
     shell_file.start = previous;
     shell_file.buffer = previous;
