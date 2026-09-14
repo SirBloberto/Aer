@@ -55,21 +55,24 @@ static void mark_card_dirty(unsigned char** dirty_cards, unsigned int* dirty_car
         *dirty_max_byte = byte_i + 1;
 }
 
-/* Array write barrier (index-assign, append, insert) -- `index` is the exact slot new_value lands
-   in, so the next minor GC's REMEMBERED_ARRAY rescan (gc_collect below) only has to revisit that
-   one slot instead of the whole array. See AerArray.dirty_cards's own comment (value.h) for the
-   dirty_all fallback collection.delete/insert/sort use instead, when a write also shifts OTHER
-   elements' indices. */
-void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value) {
+/* An old container gaining a young value at `index`: mark that index's card and remember the
+   container, so the next minor re-traces only what changed. Nothing can be old before the first
+   collection, and a young container is re-traced anyway. */
+static void barrier_with_cards(VM* vm, void* cell, RememberedKind kind, unsigned char** cards,
+                               unsigned int* cards_bytes, unsigned int* min_byte, unsigned int* max_byte,
+                               unsigned int index, AerVal new_value) {
     VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected)
-        return; /* nothing can be old yet -- see gc_ever_collected's own comment */
-    if (pool_is_young(a))
-        return; /* young containers are re-traced normally next cycle */
-    if (!value_is_young(new_value))
+    if (!heap->gc_ever_collected || pool_is_young(cell) || !value_is_young(new_value))
         return;
-    mark_card_dirty(&a->dirty_cards, &a->dirty_cards_bytes, &a->dirty_min_byte, &a->dirty_max_byte, index);
-    gc_remember(heap, a, REMEMBERED_ARRAY);
+    mark_card_dirty(cards, cards_bytes, min_byte, max_byte, index);
+    gc_remember(heap, cell, kind);
+}
+
+/* Array write barrier (index-assign, append, insert) -- `index` is the exact slot new_value lands
+   in. collection.delete/insert/sort set dirty_all instead when a write also shifts other elements. */
+void gc_barrier_array(VM* vm, AerArray* a, unsigned int index, AerVal new_value) {
+    barrier_with_cards(vm, a, REMEMBERED_ARRAY, &a->dirty_cards, &a->dirty_cards_bytes, &a->dirty_min_byte,
+                       &a->dirty_max_byte, index, new_value);
 }
 
 /* Struct field-set write barrier -- AerStruct has its own pool, so it needs its own barrier. No
@@ -86,22 +89,12 @@ void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value) {
     gc_remember(heap, s, REMEMBERED_STRUCT);
 }
 
-/* Dict entry write barrier (update-in-place and new-entry paths) -- `index` is the entry's DENSE
-   index (map.dense[index]), which the caller must resolve BEFORE the actual hashtable_get_hashed/
-   hashtable_put_hashed call: an update reuses an existing entry's stable dense index, while a fresh
-   key always lands at the table's current count (hashtable_get_index_hashed, hashtable.c). Stable
-   across ordinary insert/update; hashtable_remove's swap-compaction invalidates it, which is why
-   collection.delete sets dirty_all instead (see AerDict.dirty_cards's own comment, vm.h). */
+/* Dict entry write barrier -- `index` is the entry's DENSE index, which the caller resolves before the
+   put: an update reuses the entry's stable index, a new key lands at the current count.
+   hashtable_remove's swap-compaction invalidates it, which is why collection.delete sets dirty_all. */
 void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value) {
-    VmHeap* heap = &vm->heap;
-    if (!heap->gc_ever_collected)
-        return; /* nothing can be old yet -- see gc_ever_collected's own comment */
-    if (pool_is_young(d))
-        return;
-    if (!value_is_young(new_value))
-        return;
-    mark_card_dirty(&d->dirty_cards, &d->dirty_cards_bytes, &d->dirty_min_byte, &d->dirty_max_byte, index);
-    gc_remember(heap, d, REMEMBERED_DICT);
+    barrier_with_cards(vm, d, REMEMBERED_DICT, &d->dirty_cards, &d->dirty_cards_bytes, &d->dirty_min_byte,
+                       &d->dirty_max_byte, index, new_value);
 }
 
 /* Generational GC -- mark phase                                        */
@@ -169,6 +162,39 @@ static void worklist_push_elements(VmHeap* heap, void* container, bool is_dict, 
         wl->ranges = xrealloc(wl->ranges, sizeof(MarkRange) * wl->range_cap);
     }
     wl->ranges[wl->range_count++] = (MarkRange){container, 0, is_dict};
+}
+
+/* Re-traces a remembered container's elements whose cards were marked since the last minor -- or all of
+   them after an operation that shifted indices -- then clears the marks. Bounding the scan and the clear
+   to [min_byte, max_byte) is what keeps a pure-growth append loop O(n) rather than O(n^2).
+   always_inline: as its own function it moves the code after gc_collect, costing small_dict_bench ~6%. */
+static inline __attribute__((always_inline)) void rescan_dirty_cards(VmHeap* heap, void* container,
+                                                                     bool is_dict, unsigned char* cards,
+                                                                     unsigned int* min_byte,
+                                                                     unsigned int* max_byte, bool* all,
+                                                                     bool minor) {
+    if (*all || !cards) {
+        worklist_push_elements(heap, container, is_dict, minor);
+    } else {
+        unsigned int count = container_count(container, is_dict);
+        for (unsigned int byte_i = *min_byte; byte_i < *max_byte; byte_i++) {
+            unsigned char byte = cards[byte_i];
+            if (!byte)
+                continue;
+            for (unsigned int bit = 0; bit < 8; bit++) {
+                if (!(byte & (1u << bit)))
+                    continue;
+                unsigned int idx = byte_i * 8 + bit;
+                if (idx < count)
+                    worklist_push(heap, container_element(container, is_dict, idx), minor);
+            }
+        }
+    }
+    if (*max_byte > *min_byte)
+        memset(cards + *min_byte, 0, *max_byte - *min_byte);
+    *min_byte = (unsigned int)-1;
+    *max_byte = 0;
+    *all = false;
 }
 
 /* Pushes the next chunk of the most recently started container; false once none is left. */
@@ -426,34 +452,9 @@ static void gc_collect(VM* vm, bool minor, PoolSweepTally* tally) {
 
             switch (e->kind) {
                 case REMEMBERED_ARRAY: {
-                    /* Only indices dirtied since the last rescan get revisited, turning a
-                       pure-growth append pattern into true O(n) total. dirty_all is the fallback
-                       for operations that shift index correspondence; !dirty_cards is defensive and
-                       should never trigger. Bounding the scan and the clear to
-                       [dirty_min_byte, dirty_max_byte) is what avoids walking the whole card array
-                       every cycle -- without it a build loop still pays O(n^2). */
                     AerArray* a = (AerArray*)e->ptr;
-                    if (a->dirty_all || !a->dirty_cards) {
-                        worklist_push_elements(heap, a, false, minor);
-                    } else {
-                        for (unsigned int byte_i = a->dirty_min_byte; byte_i < a->dirty_max_byte; byte_i++) {
-                            unsigned char byte = a->dirty_cards[byte_i];
-                            if (!byte)
-                                continue;
-                            for (unsigned int bit = 0; bit < 8; bit++) {
-                                if (!(byte & (1u << bit)))
-                                    continue;
-                                unsigned int idx = byte_i * 8 + bit;
-                                if (idx < a->count)
-                                    worklist_push(heap, a->items[idx], minor);
-                            }
-                        }
-                    }
-                    if (a->dirty_max_byte > a->dirty_min_byte)
-                        memset(a->dirty_cards + a->dirty_min_byte, 0, a->dirty_max_byte - a->dirty_min_byte);
-                    a->dirty_min_byte = (unsigned int)-1;
-                    a->dirty_max_byte = 0;
-                    a->dirty_all = false;
+                    rescan_dirty_cards(heap, a, false, a->dirty_cards, &a->dirty_min_byte, &a->dirty_max_byte,
+                                       &a->dirty_all, minor);
                     break;
                 }
                 case REMEMBERED_STRUCT: {
@@ -468,33 +469,9 @@ static void gc_collect(VM* vm, bool minor, PoolSweepTally* tally) {
                     break;
                 }
                 case REMEMBERED_DICT: {
-                    /* Same card-marked scan as REMEMBERED_ARRAY above, indexed by dense slot, with
-                       the same [dirty_min_byte, dirty_max_byte) bound on the scan and the clear --
-                       see REMEMBERED_ARRAY's own comment for why that bound is load-bearing, not
-                       cosmetic. */
                     AerDict* d = (AerDict*)e->ptr;
-                    HashTable* map = &d->map;
-                    if (d->dirty_all || !d->dirty_cards) {
-                        worklist_push_elements(heap, d, true, minor);
-                    } else {
-                        for (unsigned int byte_i = d->dirty_min_byte; byte_i < d->dirty_max_byte; byte_i++) {
-                            unsigned char byte = d->dirty_cards[byte_i];
-                            if (!byte)
-                                continue;
-                            for (unsigned int bit = 0; bit < 8; bit++) {
-                                if (!(byte & (1u << bit)))
-                                    continue;
-                                unsigned int idx = byte_i * 8 + bit;
-                                if (idx < map->count)
-                                    worklist_push(heap, map->dense[idx].payload, minor);
-                            }
-                        }
-                    }
-                    if (d->dirty_max_byte > d->dirty_min_byte)
-                        memset(d->dirty_cards + d->dirty_min_byte, 0, d->dirty_max_byte - d->dirty_min_byte);
-                    d->dirty_min_byte = (unsigned int)-1;
-                    d->dirty_max_byte = 0;
-                    d->dirty_all = false;
+                    rescan_dirty_cards(heap, d, true, d->dirty_cards, &d->dirty_min_byte, &d->dirty_max_byte,
+                                       &d->dirty_all, minor);
                     break;
                 }
             }
