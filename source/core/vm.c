@@ -301,10 +301,13 @@ static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size)
    current_heap, guarded via vm_require_current_heap() because the lexer can call this
    (emit_string_token) before any VM/pool exists -- without the guard, an uninitialized heap's
    zero elem_size makes pool_alloc hand back a ~1-byte allocation (ASAN heap-buffer-overflow). */
-static AerString* aer_string_alloc(unsigned int length) {
+/* always_inline: counting the text made LTO stop inlining it, putting a call on every string built. */
+static inline __attribute__((always_inline)) AerString* aer_string_alloc(unsigned int length) {
     VmHeap* heap = vm_require_current_heap();
     vm_heap_init(heap);
     AerString* s = heap_alloc(heap, &heap->string_pool);
+    if (length > AER_STRING_INLINE_MAX)
+        heap->young_bytes += (size_t)length + 1; /* the text, which a cell's own size says nothing about */
     s->length = length;
     s->hash = 0;
     return s;
@@ -2112,6 +2115,18 @@ static bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
 
 /* Value constructors                                               */
 
+void vm_array_alloc_items(AerArray* a, unsigned int capacity) {
+    vm_require_current_heap()->young_bytes += (size_t)capacity * sizeof(AerVal);
+    a->items = xmalloc(sizeof(AerVal) * capacity);
+    a->capacity = capacity;
+}
+
+void vm_array_grow_items(AerArray* a, unsigned int capacity) {
+    vm_require_current_heap()->young_bytes += (size_t)(capacity - a->capacity) * sizeof(AerVal);
+    a->items = xrealloc(a->items, sizeof(AerVal) * capacity);
+    a->capacity = capacity;
+}
+
 AerArray* vm_new_array(void) {
     VmHeap* heap = vm_require_current_heap();
     AerArray* a = heap_alloc(heap, &heap->array_pool);
@@ -3582,9 +3597,8 @@ HANDLER(array_new)
     int item_reg_base = (int)UNPACK_B(op_word);
     int item_count = (int)UNPACK_C(op_word);
     AerArray* a = heap_alloc(&vm->heap, &vm->heap.array_pool);
-    a->capacity = item_count > 0 ? (unsigned int)item_count : 4;
+    vm_array_alloc_items(a, item_count > 0 ? (unsigned int)item_count : 4);
     a->count = (unsigned int)item_count;
-    a->items = xmalloc(sizeof(AerVal) * a->capacity);
     a->shape = NULL;
     a->generation = 0;
     a->dirty_cards = NULL;
@@ -3831,8 +3845,7 @@ HANDLER(slice_get)
         unsigned int n = (unsigned int)(end - start);
         AerArray* r = heap_alloc(&vm->heap, &vm->heap.array_pool);
         r->count = n;
-        r->capacity = n > 0 ? n : 4;
-        r->items = xmalloc(sizeof(AerVal) * r->capacity);
+        vm_array_alloc_items(r, n > 0 ? n : 4);
         r->shape = NULL; /* a slice is always a plain array, even of a struct */
         r->generation = 0;
         r->dirty_cards = NULL;
@@ -4880,8 +4893,7 @@ HANDLER(array_repeat)
         unsigned int width = vm_typed_elem_width(src->elem_kind);
         AerArray* rows = heap_alloc(&vm->heap, &vm->heap.array_pool);
         rows->count = (unsigned int)count;
-        rows->capacity = count > 0 ? (unsigned int)count : 4;
-        rows->items = xmalloc(sizeof(AerVal) * rows->capacity);
+        vm_array_alloc_items(rows, count > 0 ? (unsigned int)count : 4);
         rows->shape = NULL;
         rows->generation = 0;
         rows->dirty_cards = NULL;

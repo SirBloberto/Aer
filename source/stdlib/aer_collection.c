@@ -896,10 +896,8 @@ static bool collection_append(VM* vm) {
         vm_stack_push(vm, aer_null());
         return true;
     }
-    if (a->count >= a->capacity) {
-        a->capacity = a->capacity ? a->capacity * 2 : 4;
-        a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
-    }
+    if (a->count >= a->capacity)
+        vm_array_grow_items(a, a->capacity ? a->capacity * 2 : 4);
     gc_barrier_array(vm, a, a->count, val);
     a->items[a->count++] = val;
     a->generation++; /* see AerArray.generation's own comment, value.h */
@@ -938,10 +936,8 @@ static bool collection_reserve(VM* vm) {
            hashtable_reserve's own contract (hashtable.c): never shrinks, a no-op if already big
            enough. Doesn't touch count -- unlike a packed array's fixed-size construction, this is
            purely a capacity hint; elements still only exist once actually appended/assigned. */
-    if ((unsigned int)n > a->capacity) {
-        a->capacity = (unsigned int)n;
-        a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
-    }
+    if ((unsigned int)n > a->capacity)
+        vm_array_grow_items(a, (unsigned int)n);
     vm_stack_push(vm, arr);
     return true;
 }
@@ -1007,8 +1003,7 @@ static bool collection_copy(VM* vm) {
         AerArray* a = aer_as_array(src);
         AerArray* r = vm_new_array();
         r->count = a->count;
-        r->capacity = a->count ? a->count : 4;
-        r->items = xmalloc(sizeof(AerVal) * r->capacity);
+        vm_array_alloc_items(r, a->count ? a->count : 4);
         r->shape = NULL;
         r->generation = 0;
         memcpy(r->items, a->items, sizeof(AerVal) * a->count);
@@ -1073,10 +1068,8 @@ static bool collection_insert(VM* vm) {
         vm_stack_push(vm, aer_null());
         return true;
     }
-    if (a->count >= a->capacity) {
-        a->capacity = a->capacity ? a->capacity * 2 : 4;
-        a->items = xrealloc(a->items, sizeof(AerVal) * a->capacity);
-    }
+    if (a->count >= a->capacity)
+        vm_array_grow_items(a, a->capacity ? a->capacity * 2 : 4);
     /* Shifts every element from i onward up by one -- same dirty_all reasoning as delete's own
            (see AerArray.dirty_cards's own comment, value.h); gc_barrier_array's own per-index card
            for the new value at i is harmless but redundant once dirty_all forces a full rescan. */
@@ -1121,8 +1114,7 @@ static bool collection_keys(VM* vm) {
     AerDict* d = aer_as_dict(src);
     AerArray* r = vm_new_array();
     r->count = 0;
-    r->capacity = d->map.count ? d->map.count : 4;
-    r->items = xmalloc(sizeof(AerVal) * r->capacity);
+    vm_array_alloc_items(r, d->map.count ? d->map.count : 4);
     r->shape = NULL;
     r->generation = 0;
     for (unsigned int i = 0; i < d->map.count; i++) {

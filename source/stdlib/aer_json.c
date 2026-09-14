@@ -294,8 +294,7 @@ static AerVal json_parse_array(JsonParser* p) {
     p->pos++; /* '[' */
     AerArray* r = vm_new_array();
     r->count = 0;
-    r->capacity = 4;
-    r->items = xmalloc(sizeof(AerVal) * r->capacity);
+    vm_array_alloc_items(r, 4);
     r->shape = NULL;
     r->generation = 0;
 
@@ -309,10 +308,8 @@ static AerVal json_parse_array(JsonParser* p) {
         AerVal v = json_parse_value(p);
         if (p->err)
             return aer_null();
-        if (r->count >= r->capacity) {
-            r->capacity *= 2;
-            r->items = xrealloc(r->items, sizeof(AerVal) * r->capacity);
-        }
+        if (r->count >= r->capacity)
+            vm_array_grow_items(r, r->capacity * 2);
         r->items[r->count++] = v;
         json_skip_ws(p);
         if (p->pos >= p->len) {

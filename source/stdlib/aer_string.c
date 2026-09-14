@@ -157,8 +157,7 @@ static bool string_split(VM* vm) {
 
     AerArray* r = vm_new_array();
     r->count = 0;
-    r->capacity = 4;
-    r->items = xmalloc(sizeof(AerVal) * r->capacity);
+    vm_array_alloc_items(r, 4);
     r->shape = NULL;
     r->generation = 0;
 
@@ -167,10 +166,8 @@ static bool string_split(VM* vm) {
     unsigned int seg_start = 0;
     for (;;) {
         unsigned int at = aer_bytes_find(s, slen, sep, seplen, seg_start);
-        if (r->count >= r->capacity) {
-            r->capacity *= 2;
-            r->items = xrealloc(r->items, sizeof(AerVal) * r->capacity);
-        }
+        if (r->count >= r->capacity)
+            vm_array_grow_items(r, r->capacity * 2);
         r->items[r->count++] = aer_make_string_copy(s + seg_start, at - seg_start);
         if (at == slen)
             break;

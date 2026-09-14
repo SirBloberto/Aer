@@ -527,8 +527,7 @@ static bool regex_find_all(VM* vm) {
     AerString* subject = aer_as_string(str_v);
     AerArray* r = vm_new_array();
     r->count = 0;
-    r->capacity = 4;
-    r->items = xmalloc(sizeof(AerVal) * r->capacity);
+    vm_array_alloc_items(r, 4);
     r->shape = NULL;
     r->generation = 0;
 
@@ -541,10 +540,8 @@ static bool regex_find_all(VM* vm) {
         char* buf = xmalloc((size_t)mlen + 1);
         memcpy(buf, at, (size_t)mlen);
         buf[mlen] = '\0';
-        if (r->count >= r->capacity) {
-            r->capacity *= 2;
-            r->items = xrealloc(r->items, sizeof(AerVal) * r->capacity);
-        }
+        if (r->count >= r->capacity)
+            vm_array_grow_items(r, r->capacity * 2);
         r->items[r->count++] = aer_make_string(buf, (unsigned int)mlen);
         /* A zero-width match (e.g. pattern "a*" against "bbb") must still advance past one
                real character, or this loop never terminates -- same guard replace() uses. */

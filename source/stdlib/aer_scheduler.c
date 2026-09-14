@@ -137,8 +137,7 @@ static AerVal aer_scheduler_run_collect(void) {
         n++;
     AerArray* out = vm_new_array();
     out->count = n;
-    out->capacity = n ? n : 4;
-    out->items = xmalloc(sizeof(AerVal) * out->capacity);
+    vm_array_alloc_items(out, n ? n : 4);
     out->shape = NULL;
     out->generation = 0;
     out->dirty_cards = NULL;

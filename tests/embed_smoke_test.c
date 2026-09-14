@@ -247,6 +247,17 @@ int main(void) {
     check(minors_after - minors_before > 10,
           "aer_gc_configure's smaller minor threshold triggers many more collections for the same workload");
 
+    /* 2000 discarded 131KB strings are 262MB of garbage in only 2000 cells -- a nursery that counted
+       cells and not the text they hold never collected, and the process grew to 2.5GB. */
+    aer_clear_error();
+    aer_gc_stats(NULL, &minors_before, NULL);
+    ok = aer_run_source(&vm, &chunk,
+        "gc_text = \"x\"\nfor i in 0..17:\n    gc_text = gc_text + gc_text\nfor i in 0..2000:\n    gc_text_copy = gc_text + \"y\"\n");
+    aer_gc_stats(NULL, &minors_after, NULL);
+    check(ok, "a loop discarding large strings runs to completion");
+    check(minors_after - minors_before > 100,
+          "discarded strings trigger collections by the size of their text, not by how many there are");
+
     /* aer_gc_set_ceiling — a deliberately tiny cap forces a script that
        keeps genuinely-live memory growing (not throwaway garbage) to
        abort with a normal, recoverable runtime error instead of growing

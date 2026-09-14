@@ -151,8 +151,7 @@ static AerVal io_args(VM* vm, int arg_count, AerVal* args, void* userdata) {
     }
     AerArray* r = vm_new_array();
     r->count = 0;
-    r->capacity = io_argc > 0 ? (unsigned int)io_argc : 4;
-    r->items = xmalloc(sizeof(AerVal) * r->capacity);
+    vm_array_alloc_items(r, io_argc > 0 ? (unsigned int)io_argc : 4);
     r->shape = NULL;
     r->generation = 0;
     for (int i = 0; i < io_argc; i++) {

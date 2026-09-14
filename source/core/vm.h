@@ -1058,6 +1058,12 @@ bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsi
 /* Uninitialized AerArray header from vm.c's slab pool -- exposed for string.split(). */
 AerArray* vm_new_array(void);
 
+/* An array's item buffer at `capacity`, which both set as a->capacity and count toward the next
+   collection -- the array's one cell says nothing about them. alloc is for a new array, whose items
+   field is still garbage; grow is for an existing one. */
+void vm_array_alloc_items(AerArray* a, unsigned int capacity);
+void vm_array_grow_items(AerArray* a, unsigned int capacity);
+
 /* A zeroed typed array as a value -- exposed for actor.receive(). */
 AerVal vm_new_typed_array_val(TypedArrayElemKind kind, unsigned int count);
 

@@ -236,8 +236,9 @@ itself was a real, measured win). A minor collection runs once `pool_total_alloc
 shared counter across all 8 pools) crosses `nursery_bytes` (default 1MB, `aer_gc_configure`). A major
 collection runs once the old generation has grown `growth_factor` (default 2) times past what the
 last major left live, never measured against less than the nursery. Both count bytes. The nursery
-counts each new cell plus each new typed- or packed-array buffer; the old generation counts every
-surviving cell plus the payload it owns, so a few large arrays weigh what they occupy. An optional
+counts each new cell plus the text, item buffer or typed/packed data it allocates (a dict's storage
+is the exception, counted once it survives); the old generation counts every surviving cell plus the
+payload it owns, so a few large objects weigh what they occupy. An optional
 live-cell **ceiling** (`aer_gc_set_ceiling`, 0 = unlimited) is checked once per opcode after the
 normal rhythm — if exceeded, an extra major collection is forced before the process gives up and
 reports "Memory ceiling exceeded" via the normal (non-fatal, longjmp-based — see §5.1) error path.
@@ -3952,8 +3953,14 @@ Everything is bytes now, and the rules are gone:
 | `growth_factor` | a major runs when `old_bytes` reaches this many times `old_bytes_after_major`, measured against no less than the nursery -- 2 by default |
 
 The old generation is measured at each sweep from the cells that survive, each cell plus the payload
-it owns. The nursery counts each new cell plus each new typed- or packed-array buffer; an array's item
-buffer, a string's payload and a dict's storage are counted once they survive, not as they grow.
+it owns. The nursery counts each new cell plus what it allocates: a string's text (in
+`aer_string_alloc`), an array's item buffer (`vm_array_alloc_items`/`vm_array_grow_items`), a typed or
+packed array's data. A dict's storage is counted only once it survives.
+
+**Counting only cells and typed data missed text.** The first byte version left strings' text out, and
+a loop discarding 2000 strings of 131KB each -- 262MB of garbage in 2000 cells, about 100KB of cell
+bytes -- never reached a 1MB nursery: it grew to 2.5GB where the cell-counted collector peaked at 263MB.
+An embedding test now requires that loop to collect.
 
 | benchmark | time, 5 layouts | peak memory |
 |---|---|---|
