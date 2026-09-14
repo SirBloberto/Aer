@@ -2091,6 +2091,127 @@ static int emit_primitive_cast(Chunk* c, int cast_type, int lhs) {
     return dest;
 }
 
+/* The rest of `[value; count]` once the fill value is parsed. narrow_flag is 1 or 2 when the fill was a
+   lone i- or f-suffixed literal. */
+static int parse_array_repeat(Chunk* c, int rk_first, int narrow_flag) {
+    RawKind fill_kind = rk_raw_kind(c, rk_first);
+    int fill_reg = arg_materialize(c, rk_first);
+    int rk_count = parse_binary(c, 0);
+    require(TOKEN_CLOSE_BRACKET, "expected ']' after repeat-literal count");
+    if (parse_had_error)
+        return 0;
+    rk_count = drop_raw_marks(rk_count);
+    if (!rk16_fits(rk_count)) {
+        error_at("Expression too large to compile (register/constant exceeds the repeat-literal "
+                 "count encoding's range)");
+        return 0;
+    }
+    /* Strict LIFO free order -- rk_count was allocated (if a temp at all) after fill_reg. */
+    release_if_top(rk_count);
+    release_if_top(fill_reg);
+    int dest = reg_alloc();
+    emit_array_repeat(c, dest, fill_reg, narrow_flag, rk_count);
+    P.regs.reg_elem_kind[dest] = fill_kind;
+    return dest;
+}
+
+/* `[a, b, c]` or `[value; count]`, after the '['. Nothing before the first element tells them apart, so
+   it is parsed as an ordinary expression and the next token decides. */
+static int parse_array_literal(Chunk* c) {
+    if (consume(TOKEN_CLOSE_BRACKET)) {
+        int dest = reg_alloc();
+        emit_array_new(c, dest, dest, 0);
+        return dest;
+    }
+    /* A suffix is parse-time-only information, so narrow storage must be decided from the token before
+       parse_binary consumes it. "Not wrapped in anything else" is confirmed by the first element
+       emitting zero opcodes -- a lone literal folds into a constant operand. */
+    bool narrow_int_candidate = (token.type == TOKEN_INTEGER && token.narrow);
+    bool narrow_float_candidate = (token.type == TOKEN_REAL && token.narrow);
+    unsigned int emit_count_before = c->count;
+    int rk_first = parse_binary(c, 0);
+    if (parse_had_error)
+        return 0;
+
+    if (consume(TOKEN_SEMICOLON)) {
+        int narrow_flag = 0;
+        if (c->count == emit_count_before)
+            narrow_flag = narrow_int_candidate ? 1 : narrow_float_candidate ? 2 : 0;
+        return parse_array_repeat(c, rk_first, narrow_flag);
+    }
+
+    int item_reg_base = arg_materialize(c, rk_first);
+    int item_count = 1;
+    while (consume(TOKEN_COMMA)) {
+        int rk = parse_binary(c, 0);
+        arg_materialize(c, rk);
+        item_count++;
+    }
+    require(TOKEN_CLOSE_BRACKET, "expected ']' after array literal");
+    if (parse_had_error)
+        return 0;
+    if (item_count > 1)
+        reg_free(item_count - 1);
+    emit_array_new(c, item_reg_base, item_reg_base, item_count);
+    return item_reg_base;
+}
+
+/* `{k: v, ...}` after the '{'. Key and value materialize back to back, landing at pair_reg_base+2i and
+   +2i+1 to match OP_DICT_NEW's layout. */
+static int parse_dict_literal(Chunk* c) {
+    int pair_reg_base = -1;
+    int pair_count = 0;
+    if (!equal(TOKEN_CLOSE_BRACE)) {
+        do {
+            int rk_key = parse_binary(c, 0);
+            int reg_key = arg_materialize(c, rk_key);
+            if (pair_count == 0)
+                pair_reg_base = reg_key;
+            require(TOKEN_COLON, "expected ':' after dict key");
+            if (parse_had_error)
+                return 0;
+            int rk_val = parse_binary(c, 0);
+            arg_materialize(c, rk_val);
+            pair_count++;
+        } while (consume(TOKEN_COMMA));
+    }
+    require(TOKEN_CLOSE_BRACE, "expected '}' after dict literal");
+    if (parse_had_error)
+        return 0;
+    int dest = (pair_count > 0) ? pair_reg_base : reg_alloc();
+    if (pair_count > 1)
+        reg_free(2 * pair_count - 1);
+    emit_dict_new(c, dest, pair_reg_base < 0 ? dest : pair_reg_base, pair_count);
+    return dest;
+}
+
+/* A bare name, already consumed and not followed by '(': a variable, or a known function as a value. */
+static int parse_name_reference(Chunk* c, unsigned int name_idx) {
+    /* A raw-tracked name returns an RK_RAW_*_FLAG-tagged operand, letting a bare reference compose
+       through further arithmetic without boxing. */
+    int reg;
+    if (var_lookup_rk(name_idx, &reg))
+        return reg;
+
+    /* Built once per reference as a deduped pool constant. AerFunction carries its own register peaks,
+       so the function index is not needed. */
+    unsigned int func_offset, func_arity, func_min_arity, func_max_registers, func_index_unused;
+    unsigned short func_frame_bounds;
+    AerVal* func_defaults;
+    if (func_full_lookup(c, name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
+                         &func_max_registers, &func_frame_bounds, &func_index_unused)) {
+        AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
+                                         func_max_registers, func_frame_bounds);
+        return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
+    }
+
+    /* Must not fall through to var_slot -- that would read an uninitialized register. */
+    if (report_if_shadowed_global(c, name_idx))
+        return 0;
+    error_at("'%s' is not defined", aer_as_string(c->pool[name_idx])->data);
+    return 0;
+}
+
 static int parse_primary_inner(Chunk* c) {
     if (consume(TOKEN_FUNCTION))
         return parse_function_expr(c);
@@ -2099,100 +2220,10 @@ static int parse_primary_inner(Chunk* c) {
         require(TOKEN_CLOSE_PARENTHESE, "expected ')' after expression");
         return rk;
     }
-    /* `[]`/`[a, b, c]` (ordinary array literal, sharing call arguments' contiguous-materialization
-       helper, then OP_ARRAY_NEW) vs. `[value; count]` (the repeat-literal -- replaces the old
-       `Type[count]` entirely, see OP_ARRAY_REPEAT's own comment, vm.h). The two can't be told apart
-       until the first element is already parsed (nothing before it distinguishes them), so the
-       first element is always parsed as an ordinary expression first, then the next token decides
-       which construct this actually is. */
-    if (consume(TOKEN_OPEN_BRACKET)) {
-        if (consume(TOKEN_CLOSE_BRACKET)) {
-            int dest = reg_alloc();
-            emit_array_new(c, dest, dest, 0);
-            return dest;
-        }
-        /* A suffix is parse-time-only information, so narrow storage must be decided from the token
-           before parse_binary consumes it. "Not wrapped in anything else" is confirmed by the first
-           element emitting zero opcodes -- a lone literal folds into a constant operand. */
-        bool narrow_int_candidate = (token.type == TOKEN_INTEGER && token.narrow);
-        bool narrow_float_candidate = (token.type == TOKEN_REAL && token.narrow);
-        unsigned int emit_count_before = c->count;
-        int rk_first = parse_binary(c, 0);
-        if (parse_had_error)
-            return 0;
-
-        if (consume(TOKEN_SEMICOLON)) {
-            int narrow_flag = 0;
-            if (c->count == emit_count_before) {
-                if (narrow_int_candidate)
-                    narrow_flag = 1;
-                else if (narrow_float_candidate)
-                    narrow_flag = 2;
-            }
-            RawKind fill_kind = rk_raw_kind(c, rk_first);
-            int fill_reg = arg_materialize(c, rk_first);
-            int rk_count = parse_binary(c, 0);
-            require(TOKEN_CLOSE_BRACKET, "expected ']' after repeat-literal count");
-            if (parse_had_error)
-                return 0;
-            rk_count = drop_raw_marks(rk_count);
-            if (!rk16_fits(rk_count)) {
-                error_at("Expression too large to compile (register/constant exceeds the repeat-literal "
-                         "count encoding's range)");
-                return 0;
-            }
-            /* Strict LIFO free order -- rk_count was allocated (if a temp at all) after fill_reg. */
-            release_if_top(rk_count);
-            release_if_top(fill_reg);
-            int dest = reg_alloc();
-            emit_array_repeat(c, dest, fill_reg, narrow_flag, rk_count);
-            P.regs.reg_elem_kind[dest] = fill_kind;
-            return dest;
-        }
-
-        int item_reg_base = arg_materialize(c, rk_first);
-        int item_count = 1;
-        while (consume(TOKEN_COMMA)) {
-            int rk = parse_binary(c, 0);
-            arg_materialize(c, rk);
-            item_count++;
-        }
-        require(TOKEN_CLOSE_BRACKET, "expected ']' after array literal");
-        if (parse_had_error)
-            return 0;
-        if (item_count > 1)
-            reg_free(item_count - 1);
-        emit_array_new(c, item_reg_base, item_reg_base, item_count);
-        return item_reg_base;
-    }
-    /* Each item is a key:value pair, so key/value materialize back to back, landing at
-       pair_reg_base+2i/+2i+1 to match OP_DICT_NEW's layout. */
-    if (consume(TOKEN_OPEN_BRACE)) {
-        int pair_reg_base = -1;
-        int pair_count = 0;
-        if (!equal(TOKEN_CLOSE_BRACE)) {
-            do {
-                int rk_key = parse_binary(c, 0);
-                int reg_key = arg_materialize(c, rk_key);
-                if (pair_count == 0)
-                    pair_reg_base = reg_key;
-                require(TOKEN_COLON, "expected ':' after dict key");
-                if (parse_had_error)
-                    return 0;
-                int rk_val = parse_binary(c, 0);
-                arg_materialize(c, rk_val);
-                pair_count++;
-            } while (consume(TOKEN_COMMA));
-        }
-        require(TOKEN_CLOSE_BRACE, "expected '}' after dict literal");
-        if (parse_had_error)
-            return 0;
-        int dest = (pair_count > 0) ? pair_reg_base : reg_alloc();
-        if (pair_count > 1)
-            reg_free(2 * pair_count - 1);
-        emit_dict_new(c, dest, pair_reg_base < 0 ? dest : pair_reg_base, pair_count);
-        return dest;
-    }
+    if (consume(TOKEN_OPEN_BRACKET))
+        return parse_array_literal(c);
+    if (consume(TOKEN_OPEN_BRACE))
+        return parse_dict_literal(c);
     if (token.type == TOKEN_INTEGER || token.type == TOKEN_REAL || token.type == TOKEN_TRUE ||
         token.type == TOKEN_FALSE || token.type == TOKEN_NULL) {
         AerVal v;
@@ -2216,32 +2247,7 @@ static int parse_primary_inner(Chunk* c) {
         lex();
         if (consume(TOKEN_OPEN_PARENTHESE))
             return parse_call(c, name_idx);
-
-        /* A raw-tracked name returns an RK_RAW_*_FLAG-tagged operand, letting a bare reference compose
-           through further arithmetic without boxing. */
-        int reg;
-        if (var_lookup_rk(name_idx, &reg))
-            return reg;
-
-        /* A known function referenced without a following '(' is a reference to the function itself
-           as a value -- built once per reference as a deduped pool constant. */
-        unsigned int func_offset, func_arity, func_min_arity, func_max_registers;
-        unsigned short func_frame_bounds;
-        unsigned int
-            func_index_unused; /* AerFunction carries its own peaks directly -- no func_index needed for OP_CALL_VALUE */
-        AerVal* func_defaults;
-        if (func_full_lookup(c, name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
-                             &func_max_registers, &func_frame_bounds, &func_index_unused)) {
-            AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
-                                             func_max_registers, func_frame_bounds);
-            return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
-        }
-
-        /* Must not fall through to var_slot -- that would read an uninitialized register. */
-        if (report_if_shadowed_global(c, name_idx))
-            return 0;
-        error_at("'%s' is not defined", aer_as_string(c->pool[name_idx])->data);
-        return 0;
+        return parse_name_reference(c, name_idx);
     }
     error_at("Expected an expression (only literals, variables, calls, array/dict literals, "
              "arithmetic/comparisons, and parentheses are supported)");
