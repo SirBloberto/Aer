@@ -166,14 +166,16 @@ TESTS := tests/test_core.aer \
          tests/test_actor_specialize.aer
 
 test: all
-	@for t in $(TESTS); do \
+	@failed=""; \
+	for t in $(TESTS); do \
 		echo "=== $$t ==="; \
-		./binary/aer$(EXE) $$t || exit 1; \
-	done
-	@echo "=== tests/test_stdin.aer (piped input) ==="
-	@echo "expected stdin content" | ./binary/aer$(EXE) tests/test_stdin.aer
-	@echo "=== tests/error_lines (reported line numbers) ==="
-	python3 tests/error_lines.py --binary binary/aer$(EXE)
+		./binary/aer$(EXE) $$t || failed="$$failed $$t"; \
+	done; \
+	echo "=== tests/test_stdin.aer (piped input) ==="; \
+	echo "expected stdin content" | ./binary/aer$(EXE) tests/test_stdin.aer || failed="$$failed tests/test_stdin.aer"; \
+	echo "=== tests/error_lines (reported line numbers) ==="; \
+	python3 tests/error_lines.py --binary binary/aer$(EXE) || failed="$$failed tests/error_lines"; \
+	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; exit 1; fi
 
 # Embedding smoke test — links the library directly, no main.c/CLI.
 test-embed: $(LIBOBJECT)
@@ -299,10 +301,12 @@ ubsan: $(SOURCE)
 
 # Runs the whole .aer suite under UBSan; any diagnostic aborts, so a clean run means no finding.
 test-ubsan: ubsan
-	@for t in $(TESTS); do \
+	@failed=""; \
+	for t in $(TESTS); do \
 		echo "=== $$t ==="; \
-		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./binary/aer-ubsan$(EXE) $$t || exit 1; \
-	done
+		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./binary/aer-ubsan$(EXE) $$t || failed="$$failed $$t"; \
+	done; \
+	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; exit 1; fi
 
 # A fixed seed plus the interpreter-enforced instruction budget makes a run reproduce exactly,
 # on any machine; override for exploratory runs (FUZZ_SEED= FUZZ_ITERATIONS=5000).
