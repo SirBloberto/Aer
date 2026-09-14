@@ -525,11 +525,7 @@ static bool regex_find_all(VM* vm) {
     }
 
     AerString* subject = aer_as_string(str_v);
-    AerArray* r = vm_new_array();
-    r->count = 0;
-    vm_array_alloc_items(r, 4);
-    r->shape = NULL;
-    r->generation = 0;
+    AerArray* r = vm_new_array(4);
 
     const char* cursor = subject->data;
     for (;;) {

@@ -292,11 +292,7 @@ static AerVal json_parse_number(JsonParser* p) {
 
 static AerVal json_parse_array(JsonParser* p) {
     p->pos++; /* '[' */
-    AerArray* r = vm_new_array();
-    r->count = 0;
-    vm_array_alloc_items(r, 4);
-    r->shape = NULL;
-    r->generation = 0;
+    AerArray* r = vm_new_array(4);
 
     json_skip_ws(p);
     if (p->pos < p->len && p->s[p->pos] == ']') {

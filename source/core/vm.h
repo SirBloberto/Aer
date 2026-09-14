@@ -1064,8 +1064,8 @@ void vm_gc_unsuppress(void);
    0 -- after the trampoline drains, the result is in call_stack[0].registers[0]. */
 bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsigned int return_ip);
 
-/* Uninitialized AerArray header from vm.c's slab pool -- exposed for string.split(). */
-AerArray* vm_new_array(void);
+/* An empty plain array with room for `capacity` items; 0 leaves items NULL. */
+AerArray* vm_new_array(unsigned int capacity);
 
 /* An array's item buffer at `capacity`, which both set as a->capacity and count toward the next
    collection -- the array's one cell says nothing about them. alloc is for a new array, whose items

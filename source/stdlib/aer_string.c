@@ -155,11 +155,7 @@ static bool string_split(VM* vm) {
     const char* s = ss->data;
     const char* sep = seps->data;
 
-    AerArray* r = vm_new_array();
-    r->count = 0;
-    vm_array_alloc_items(r, 4);
-    r->shape = NULL;
-    r->generation = 0;
+    AerArray* r = vm_new_array(4);
 
     /* aer_bytes_find returns slen when no separator remains, which is exactly where the final
            segment ends -- so the trailing segment needs no special case. */

@@ -1013,24 +1013,34 @@ static bool vm_slice_bounds(AerVal start_v, AerVal end_v, int64_t len, int64_t* 
     return true;
 }
 
+/* An empty plain array with room for `capacity` items; 0 leaves items NULL. Every field is set, since
+   pool_alloc zeroes only gc_state and a reused cell's stale dirty_cards pointer would be unsafe. */
+static AerArray* heap_new_array(VmHeap* heap, unsigned int capacity) {
+    AerArray* a = heap_alloc(heap, &heap->array_pool);
+    a->count = 0;
+    a->shape = NULL;
+    a->generation = 0;
+    a->dirty_cards = NULL;
+    a->dirty_cards_bytes = 0;
+    a->dirty_min_byte = (unsigned int)-1;
+    a->dirty_max_byte = 0;
+    a->dirty_all = false;
+    if (capacity > 0) {
+        vm_array_alloc_items(a, capacity);
+    } else {
+        a->items = NULL;
+        a->capacity = 0;
+    }
+    return a;
+}
+
 /* A baked default (struct field or function parameter): primitives copy as-is; an array/dict
    default must become a FRESH empty container, or every omitted call/instance would alias the
    same one (Python's mutable-default bug). parser.c only ever bakes an empty '[]'/'{}' as such
    a default, so a fresh empty one is always correct -- no deep copy needed. */
 static AerVal vm_default_value(VM* vm, AerVal dflt) {
-    if (aer_type(dflt) == TYPE_ARRAY && !aer_as_array(dflt)->shape) {
-        AerArray* a = heap_alloc(&vm->heap, &vm->heap.array_pool);
-        a->count = a->capacity = 0;
-        a->items = NULL;
-        a->shape = NULL;
-        a->generation = 0;
-        a->dirty_cards = NULL;
-        a->dirty_cards_bytes = 0;
-        a->dirty_min_byte = (unsigned int)-1;
-        a->dirty_max_byte = 0;
-        a->dirty_all = false;
-        return aer_array_val(a);
-    }
+    if (aer_type(dflt) == TYPE_ARRAY && !aer_as_array(dflt)->shape)
+        return aer_array_val(heap_new_array(&vm->heap, 0));
     if (aer_type(dflt) == TYPE_DICT) {
         AerDict* d = heap_alloc(&vm->heap, &vm->heap.dict_pool);
         memset(&d->map, 0, sizeof(d->map));
@@ -2057,21 +2067,8 @@ void vm_array_grow_items(AerArray* a, unsigned int capacity) {
     a->capacity = capacity;
 }
 
-AerArray* vm_new_array(void) {
-    VmHeap* heap = vm_require_current_heap();
-    AerArray* a = heap_alloc(heap, &heap->array_pool);
-    /* pool_alloc only zeroes gc_state (byte 0) -- a reused cell's previous occupant's dirty_cards
-       pointer would otherwise survive as garbage. Every OTHER field (count/capacity/items/shape/
-       generation) is still the individual caller's own responsibility, unchanged -- these three are
-       centralized here since vm_new_array is the one common entry point almost every caller already
-       goes through, and getting a stale dirty_cards pointer wrong is a real memory-safety bug, not
-       just a correctness nit. */
-    a->dirty_cards = NULL;
-    a->dirty_cards_bytes = 0;
-    a->dirty_min_byte = (unsigned int)-1;
-    a->dirty_max_byte = 0;
-    a->dirty_all = false;
-    return a;
+AerArray* vm_new_array(unsigned int capacity) {
+    return heap_new_array(vm_require_current_heap(), capacity);
 }
 
 AerDict* vm_new_dict(void) {
@@ -3526,16 +3523,8 @@ HANDLER(array_new)
     int dest_reg = (int)UNPACK_A(op_word);
     int item_reg_base = (int)UNPACK_B(op_word);
     int item_count = (int)UNPACK_C(op_word);
-    AerArray* a = heap_alloc(&vm->heap, &vm->heap.array_pool);
-    vm_array_alloc_items(a, item_count > 0 ? (unsigned int)item_count : 4);
+    AerArray* a = heap_new_array(&vm->heap, item_count > 0 ? (unsigned int)item_count : 4);
     a->count = (unsigned int)item_count;
-    a->shape = NULL;
-    a->generation = 0;
-    a->dirty_cards = NULL;
-    a->dirty_cards_bytes = 0;
-    a->dirty_min_byte = (unsigned int)-1;
-    a->dirty_max_byte = 0;
-    a->dirty_all = false;
     for (int i = 0; i < item_count; i++)
         a->items[i] = registers[item_reg_base + i];
     registers[dest_reg] = aer_array_val(a);
@@ -3773,16 +3762,9 @@ HANDLER(slice_get)
             DISPATCH();
         }
         unsigned int n = (unsigned int)(end - start);
-        AerArray* r = heap_alloc(&vm->heap, &vm->heap.array_pool);
+        /* a slice is always a plain array, even of a struct */
+        AerArray* r = heap_new_array(&vm->heap, n > 0 ? n : 4);
         r->count = n;
-        vm_array_alloc_items(r, n > 0 ? n : 4);
-        r->shape = NULL; /* a slice is always a plain array, even of a struct */
-        r->generation = 0;
-        r->dirty_cards = NULL;
-        r->dirty_cards_bytes = 0;
-        r->dirty_min_byte = (unsigned int)-1;
-        r->dirty_max_byte = 0;
-        r->dirty_all = false;
         for (unsigned int i = 0; i < n; i++)
             r->items[i] = a->items[start + i];
         registers[dest_reg] = aer_array_val(r);
@@ -4818,16 +4800,8 @@ HANDLER(array_repeat)
            to build before the outer array roots them (gc_maybe_collect runs after). */
         AerTypedArray* src = aer_as_typed_array(fill);
         unsigned int width = vm_typed_elem_width(src->elem_kind);
-        AerArray* rows = heap_alloc(&vm->heap, &vm->heap.array_pool);
+        AerArray* rows = heap_new_array(&vm->heap, count > 0 ? (unsigned int)count : 4);
         rows->count = (unsigned int)count;
-        vm_array_alloc_items(rows, count > 0 ? (unsigned int)count : 4);
-        rows->shape = NULL;
-        rows->generation = 0;
-        rows->dirty_cards = NULL;
-        rows->dirty_cards_bytes = 0;
-        rows->dirty_min_byte = (unsigned int)-1;
-        rows->dirty_max_byte = 0;
-        rows->dirty_all = false;
         for (int64_t e = 0; e < count; e++) {
             AerTypedArray* row = vm_new_typed_array(src->elem_kind, src->count);
             if (src->count > 0)

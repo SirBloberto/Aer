@@ -5614,12 +5614,7 @@ static bool parse_literal_default(Chunk* c, AerVal* out, bool* out_narrow) {
         lex();
         if (token.type != TOKEN_CLOSE_BRACKET)
             return false;
-        AerArray* a = vm_new_array();
-        a->count = a->capacity = 0;
-        a->items = NULL;
-        a->shape = NULL;
-        a->generation = 0;
-        *out = aer_array_val(a);
+        *out = aer_array_val(vm_new_array(0));
     } else if (token.type == TOKEN_OPEN_BRACE) {
         lex();
         if (token.type != TOKEN_CLOSE_BRACE)

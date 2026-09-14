@@ -149,11 +149,7 @@ static AerVal io_args(VM* vm, int arg_count, AerVal* args, void* userdata) {
         error("io.args() takes no arguments");
         return aer_null();
     }
-    AerArray* r = vm_new_array();
-    r->count = 0;
-    vm_array_alloc_items(r, io_argc > 0 ? (unsigned int)io_argc : 4);
-    r->shape = NULL;
-    r->generation = 0;
+    AerArray* r = vm_new_array(io_argc > 0 ? (unsigned int)io_argc : 4);
     for (int i = 0; i < io_argc; i++) {
         size_t n = strlen(io_argv[i]);
         char* buf = xmalloc(n + 1);

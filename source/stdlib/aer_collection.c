@@ -1001,11 +1001,8 @@ static bool collection_copy(VM* vm) {
     AerVal src = vm_stack_pop(vm);
     if (aer_type(src) == TYPE_ARRAY && !aer_as_array(src)->shape) {
         AerArray* a = aer_as_array(src);
-        AerArray* r = vm_new_array();
+        AerArray* r = vm_new_array(a->count ? a->count : 4);
         r->count = a->count;
-        vm_array_alloc_items(r, a->count ? a->count : 4);
-        r->shape = NULL;
-        r->generation = 0;
         memcpy(r->items, a->items, sizeof(AerVal) * a->count);
         vm_stack_push(vm, aer_array_val(r));
         return true;
@@ -1112,11 +1109,7 @@ static bool collection_keys(VM* vm) {
         return true;
     }
     AerDict* d = aer_as_dict(src);
-    AerArray* r = vm_new_array();
-    r->count = 0;
-    vm_array_alloc_items(r, d->map.count ? d->map.count : 4);
-    r->shape = NULL;
-    r->generation = 0;
+    AerArray* r = vm_new_array(d->map.count ? d->map.count : 4);
     for (unsigned int i = 0; i < d->map.count; i++) {
         unsigned int n = d->map.dense[i].length;
         r->items[r->count++] = aer_make_string_copy(d->map.dense[i].key, n);

@@ -135,16 +135,8 @@ static AerVal aer_scheduler_run_collect(void) {
     unsigned int n = 0;
     for (Task* t = tasks; t; t = t->next)
         n++;
-    AerArray* out = vm_new_array();
+    AerArray* out = vm_new_array(n ? n : 4);
     out->count = n;
-    vm_array_alloc_items(out, n ? n : 4);
-    out->shape = NULL;
-    out->generation = 0;
-    out->dirty_cards = NULL;
-    out->dirty_cards_bytes = 0;
-    out->dirty_min_byte = (unsigned int)-1;
-    out->dirty_max_byte = 0;
-    out->dirty_all = false;
 
     unsigned int i = 0;
     while (tasks) {
