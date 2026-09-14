@@ -12,7 +12,7 @@ static aer_mutex specialize_lock = AER_MUTEX_INIT;
    and is lost on a mismatch; VAR_BOXED never promotes back. */
 typedef enum { VAR_BOXED, VAR_RAW_INT, VAR_RAW_REAL } VarKind;
 
-/* Nothing emitted yet at a tracked offset -- see Parser.last_cmp_offset / last_interp_offset. */
+/* No instruction to fold into or retarget -- see LastInstruction. */
 #define NO_OFFSET ((unsigned int)-1)
 
 /* A call to a name not yet registered, patched once parse() has seen the whole file. */
@@ -93,29 +93,22 @@ typedef struct {
     RawKind reg_elem_kind[FRAME_REGISTERS];
 } RegFacts;
 
-/* Instructions just emitted that a later one can still fold into or retarget, each valid only
-   while it is the last word in the chunk. peephole_window_reset() clears the whole window; a
-   stale offset here rewrites an instruction some other path can reach. */
+/* The last foldable instruction emitted: a comparison or boxed binary op, raw arithmetic (raw_kind
+   names its destination slot's kind), or an OP_INTERP. A later instruction may fold into it or
+   retarget it only while last_instruction() still returns it -- instruction lengths vary, so it
+   cannot be found by reading backwards, and a stale offset rewrites code another path can reach. */
 typedef struct {
-    /* The last comparison emitted, so emit_cond_jump_if_false can tell one from a word that merely
-       looks like one -- instruction lengths vary, so it cannot be found by reading backwards. */
-    unsigned int last_cmp_offset;
-    /* The last raw arithmetic emitted, so an assignment can retarget it at the variable's own slot
-       instead of following it with a move. patch_epoch counts backpatches: a jump landing between
-       the two would make the arithmetic conditional when the move was not. */
-    unsigned int raw_write_offset;
-    int raw_write_slot;
-    RawKind raw_write_kind;
-    unsigned int raw_write_epoch;
+    unsigned int offset;
+    unsigned int length;
+    unsigned int epoch;
+    RawKind raw_kind;
+} LastInstruction;
+
+typedef struct {
+    LastInstruction last;
+    /* Counts backpatches: a jump landing after the last instruction would make a rewrite of it
+       reachable on paths the original was not. */
     unsigned int patch_epoch;
-    /* Same trick for the last OP_INTERP: emit_index_get folds one into OP_INDEX_GET_INTERP when the
-       interpolation it is indexing with is the instruction immediately before it. */
-    unsigned int last_interp_offset;
-    int last_interp_dest;
-    /* Where the first argument of the call being parsed stopped emitting. Only a call that folds
-       one argument and reads the rest as they are needs it -- collection.group_sum, whose values
-       fuse but whose group column and group count do not. */
-    unsigned int first_arg_end;
     /* Side channel from the index-get site to parse_assignment, keyed on exact register equality
        rather than a flag. */
     int last_plain_index_dest_reg;
@@ -239,11 +232,30 @@ typedef struct Parser {
 } Parser;
 static Parser P;
 
-/* Every tracked instruction stops being the last word emitted at the same moment. */
 static void peephole_window_reset(void) {
-    P.peep.last_cmp_offset = NO_OFFSET;
-    P.peep.raw_write_offset = NO_OFFSET;
-    P.peep.last_interp_offset = NO_OFFSET;
+    P.peep.last.offset = NO_OFFSET;
+}
+
+/* Records the instruction from `offset` to the end of the chunk as the one a later emit may fold. */
+static void note_last_instruction(Chunk* c, unsigned int offset, RawKind raw_kind) {
+    P.peep.last = (LastInstruction){offset, c->count - offset, P.peep.patch_epoch, raw_kind};
+}
+
+/* Where the recorded instruction starts, or NO_OFFSET once anything was written after it or a jump
+   was pointed past it. */
+static unsigned int last_instruction(Chunk* c) {
+    const LastInstruction* last = &P.peep.last;
+    if (last->offset == NO_OFFSET || last->offset + last->length != c->count ||
+        last->epoch != P.peep.patch_epoch)
+        return NO_OFFSET;
+    return last->offset;
+}
+
+/* Rewrites field A of the last instruction to dest, and forgets it: it now writes somewhere else. */
+static void retarget_last(Chunk* c, unsigned int at, int dest) {
+    uint32_t w = c->code[at];
+    c->code[at] = PACK3((Opcode)(w & 0xFF), dest, UNPACK_B(w), UNPACK_C(w));
+    P.peep.last.offset = NO_OFFSET;
 }
 
 /* Overflow returns -1 and the caller falls back to a dynamically typed value. reg_alloc errors
@@ -478,8 +490,8 @@ static void emit_binary(Chunk* c, int dest, Opcode op, int rk_lhs, int rk_rhs) {
     }
     if (dest >= 0 && dest < FRAME_REGISTERS)
         P.regs.reg_nonneg[dest] = binop_preserves_nonneg(op) && rk_nonneg(c, rk_lhs) && rk_nonneg(c, rk_rhs);
-    P.peep.last_cmp_offset = c->count;
     chunk_emit(c, PACK3(op, dest, pack_rk8(rk_lhs), pack_rk8(rk_rhs)));
+    note_last_instruction(c, c->count - 1, RAWK_NONE);
     /* A parameter reaching the fully boxed path is the clearest sign binding it raw would pay --
        and the only sign at all for a body with no raw local for the _BOXED family to catch. Only
        arithmetic and ordering: equality and `in` are defined on every type, so they say nothing
@@ -499,10 +511,9 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
     /* The comparison need only be the LAST instruction of the condition, not the whole of it:
        `x * x + y * y > 4.0` computes into raw slots first, and all of that is kept. */
     unsigned int cmp_word_start = cond_start;
-    if (P.peep.last_cmp_offset != NO_OFFSET && P.peep.last_cmp_offset >= cond_start &&
-        P.peep.last_cmp_offset == c->count - 1) {
-        cmp_word_start = P.peep.last_cmp_offset;
-    }
+    unsigned int last = last_instruction(c);
+    if (last != NO_OFFSET && last >= cond_start)
+        cmp_word_start = last;
     if (c->count - cmp_word_start == 1) {
         uint32_t w = c->code[cmp_word_start];
         bool matched = true;
@@ -648,25 +659,24 @@ void emit_array_new(Chunk* c, int dest_reg, int item_reg_base, int item_count) {
    this emitter just produced, fold the two into one opcode that hashes the bytes directly. Detected
    by rollback like emit_cond_jump_if_false, so anything else falls through untouched. */
 static bool try_fuse_index_get_interp(Chunk* c, int dest_reg, int arr_reg, int rk_idx) {
-    if (P.peep.last_interp_offset == NO_OFFSET || rk_idx != P.peep.last_interp_dest)
+    unsigned int at = last_instruction(c);
+    if (at == NO_OFFSET)
         return false;
     if (arr_reg == rk_idx)
         return false; /* the receiver is what we are about to stop writing */
-    uint32_t w = c->code[P.peep.last_interp_offset];
+    uint32_t w = c->code[at];
     if ((Opcode)(w & 0xFF) != OP_INTERP || (int)UNPACK_A(w) != rk_idx)
         return false;
-    unsigned int parts = UNPACK_B(w);
-    if (P.peep.last_interp_offset + 1 + parts != c->count)
-        return false; /* not the immediately preceding instruction */
 
+    unsigned int parts = UNPACK_B(w);
     uint32_t operands[INTERP_MAX_PARTS];
     for (unsigned int i = 0; i < parts; i++)
-        operands[i] = c->code[P.peep.last_interp_offset + 1 + i];
-    c->count = P.peep.last_interp_offset;
+        operands[i] = c->code[at + 1 + i];
+    c->count = at;
     chunk_emit(c, PACK3(OP_INDEX_GET_INTERP, dest_reg, arr_reg, (int)parts));
     for (unsigned int i = 0; i < parts; i++)
         chunk_emit(c, operands[i]);
-    P.peep.last_interp_offset = NO_OFFSET;
+    P.peep.last.offset = NO_OFFSET;
     return true;
 }
 
@@ -1294,36 +1304,17 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
     }
 }
 
-static void note_raw_write(Chunk* c, int dest, RawKind kind) {
-    P.peep.raw_write_offset = c->count - 1;
-    P.peep.raw_write_slot = dest;
-    P.peep.raw_write_kind = kind;
-    P.peep.raw_write_epoch = P.peep.patch_epoch;
-}
-
 /* Writes an assignment's value straight into the variable's slot, by re-pointing the arithmetic
-   that produced it, so `x = a * b + c` needs no move afterwards. Declines unless that arithmetic is
-   still the very last word emitted and no jump has been patched since -- either would mean the
-   write is reachable on paths the move was not. The source slot must be a temp: retargeting one
-   that belongs to a variable would drop that variable's own value. */
-/* Rewrites field A of a tracked instruction to dest, but only while it is still the last word
-   emitted -- anything after it means the write is reachable on paths the move was not. Consumes
-   the tracker, since the instruction it named now writes somewhere else. */
-static bool retarget_tracked(Chunk* c, unsigned int* tracked, int dest) {
-    if (*tracked == NO_OFFSET || *tracked != c->count - 1)
-        return false;
-    uint32_t w = c->code[*tracked];
-    c->code[*tracked] = PACK3((Opcode)(w & 0xFF), dest, UNPACK_B(w), UNPACK_C(w));
-    *tracked = NO_OFFSET;
-    return true;
-}
-
+   that produced it, so `x = a * b + c` needs no move afterwards. The source slot must be a temp:
+   retargeting one that belongs to a variable would drop that variable's own value. */
 static bool retarget_raw_write(Chunk* c, int src_slot, int dest_slot, RawKind kind) {
-    if (P.peep.raw_write_slot != src_slot || P.peep.raw_write_kind != kind)
+    unsigned int at = last_instruction(c);
+    if (at == NO_OFFSET || P.peep.last.raw_kind != kind || (int)UNPACK_A(c->code[at]) != src_slot)
         return false;
-    if (P.peep.raw_write_epoch != P.peep.patch_epoch || !raw_is_temp(src_slot))
+    if (!raw_is_temp(src_slot))
         return false;
-    return retarget_tracked(c, &P.peep.raw_write_offset, dest_slot);
+    retarget_last(c, at, dest_slot);
+    return true;
 }
 
 /* Re-points a const-flagged RK at whichever raw constant table `kind` names. An int-kind opcode
@@ -1545,8 +1536,8 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
 
     if (is_cmp) {
         int dest = reg_alloc();
-        P.peep.last_cmp_offset = c->count;
         chunk_emit(c, PACK3(raw_op, dest, swap_cmp ? slot_rhs : slot_lhs, swap_cmp ? slot_lhs : rhs_field));
+        note_last_instruction(c, c->count - 1, RAWK_NONE);
         *out_rk = dest;
         return true;
     }
@@ -1555,7 +1546,7 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
         if (dest < 0)
             return false; /* extremely unlikely right after freeing 2 int slots, but stay safe */
         chunk_emit(c, PACK3(raw_op, dest, slot_lhs, rhs_field));
-        note_raw_write(c, dest, RAWK_REAL);
+        note_last_instruction(c, c->count - 1, RAWK_REAL);
         *out_rk = RK_RAW_REAL_FLAG | dest;
         return true;
     }
@@ -1568,7 +1559,7 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
        arithmetic -- `p*p` as a range start being the case that found it. */
     if (dest >= 0 && dest < FRAME_REGISTERS)
         P.regs.reg_nonneg[dest] = binop_preserves_nonneg(op) && rk_nonneg(c, rk_lhs) && rk_nonneg(c, rk_rhs);
-    note_raw_write(c, dest, int_kind ? RAWK_INT : RAWK_REAL);
+    note_last_instruction(c, c->count - 1, int_kind ? RAWK_INT : RAWK_REAL);
     *out_rk = (int_kind ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | dest;
     return true;
 }
@@ -1748,18 +1739,15 @@ static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base, 
     int base = -1;
     int count = 0;
     *out_base_is_temp = true;
-    P.peep.first_arg_end = 0;
     if (!equal(close_tok)) {
         int rk = parse_binary(c, 0);
         if (!equal(TOKEN_COMMA)) {
             base = materialize(c, rk);
             *out_base_is_temp = is_temp(base);
             *out_base = base;
-            P.peep.first_arg_end = c->count;
             return 1;
         }
         base = arg_materialize(c, rk);
-        P.peep.first_arg_end = c->count;
         count = 1;
         while (consume(TOKEN_COMMA)) {
             arg_materialize(c, parse_binary(c, 0));
@@ -1941,11 +1929,11 @@ static int emit_interp(Chunk* c, const int* parts, int part_count) {
     if (temps)
         reg_free(temps);
     int dest = reg_alloc();
-    P.peep.last_interp_offset = c->count;
-    P.peep.last_interp_dest = dest;
+    unsigned int at = c->count;
     chunk_emit(c, PACK2(OP_INTERP, dest, part_count));
     for (int i = 0; i < part_count; i++)
         chunk_emit(c, pack_rk16(parts[i]));
+    note_last_instruction(c, at, RAWK_NONE);
     return dest;
 }
 
@@ -2557,18 +2545,19 @@ static int parse_unary(Chunk* c) {
 }
 
 /* Re-points a just-emitted comparison at `dest` so && / || need no move to collect their result.
-   Only a comparison, whose destination is always field A and whose only effect is that write, and
-   only when it is still the last word emitted -- the same test emit_cond_jump_if_false's fusion
-   uses, via the offset it already tracks. */
+   Only a comparison or boxed binary op, whose destination is always field A and whose only effect
+   is that write, and only while last_instruction() still returns it. */
 static bool retarget_last_cmp(Chunk* c, int reg_rhs, int dest) {
-    if (P.peep.last_cmp_offset == NO_OFFSET || P.peep.last_cmp_offset != c->count - 1)
+    unsigned int at = last_instruction(c);
+    if (at == NO_OFFSET || P.peep.last.raw_kind != RAWK_NONE || (Opcode)(c->code[at] & 0xFF) == OP_INTERP)
         return false;
-    if ((int)UNPACK_A(c->code[P.peep.last_cmp_offset]) != reg_rhs || !is_temp(reg_rhs))
+    if ((int)UNPACK_A(c->code[at]) != reg_rhs || !is_temp(reg_rhs))
         return false;
-    /* Clearing the tracker matters here beyond bookkeeping: the retargeted comparison is the last
-       word emitted, so an enclosing if/while would fuse its branch with it -- but it sits behind the
+    /* Forgetting it matters here beyond bookkeeping: the retargeted comparison is the last word
+       emitted, so an enclosing if/while would fuse its branch with it -- but it sits behind the
        short circuit and only runs when the left operand was truthy. */
-    return retarget_tracked(c, &P.peep.last_cmp_offset, dest);
+    retarget_last(c, at, dest);
+    return true;
 }
 
 /* Both the lhs-false and rhs-false paths land on the same "result = false" code. `dest`
@@ -4042,6 +4031,7 @@ static void parse_block(Chunk* c) {
             P.any_compile_error = true;
             c->count = saved;
             c->line_mark_count = saved_marks;
+            peephole_window_reset();
             if (!P.recovered_at_boundary) {
                 while (!equal(TOKEN_END_OF_FILE) && !equal(TOKEN_ELSE) && !equal(TOKEN_DEDENT) &&
                        !equal(TOKEN_NEW_LINE))
@@ -6174,6 +6164,7 @@ void parse(Chunk* c) {
             P.any_compile_error = true;
             c->count = saved;
             c->line_mark_count = saved_marks;
+            peephole_window_reset();
             if (!P.recovered_at_boundary) {
                 while (!equal(TOKEN_END_OF_FILE) && !equal(TOKEN_NEW_LINE) && !equal(TOKEN_DEDENT))
                     lex();
