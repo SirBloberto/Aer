@@ -1,0 +1,3 @@
+import math
+
+root = math.sqrt(-1) #!error: sqrt() requires a non-negative number

@@ -1,0 +1,3 @@
+import math
+
+angle = math.asin(2) #!error: asin() requires a number between -1 and 1

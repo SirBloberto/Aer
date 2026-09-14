@@ -1,0 +1,4 @@
+import math
+
+x = 0.0
+y = math.log(x) #!error: log() requires a positive number

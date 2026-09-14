@@ -14,154 +14,98 @@ static bool math_pop_double(VM* vm, const char* name, double* out) {
     return false;
 }
 
-/* Computation and domain check for every single-argument real-in math function. One place knows
-   what each computes and what its domain allows, rather than eleven near-identical blocks that can
-   drift apart. Raises its own error and returns false on a domain violation; *out is meaningful
-   only on true. abs and the 0-/2-arg functions aren't this shape and stay inline below. */
-/* The real-returning half of math_unary, without the AerVal. Only these: floor/ceil/round yield an
-   integer, so they have no place to land in a real slot. Same domain errors, same results. */
-bool aer_math_unary_raw(int fn_id, double x, double* out) {
-    switch (fn_id) {
-        case FN_MATH_SQRT:
-            if (x < 0) {
-                error("sqrt() requires a non-negative number");
-                return false;
-            }
-            *out = sqrt(x);
-            return true;
-        case FN_MATH_SIN: *out = sin(x); return true;
-        case FN_MATH_COS: *out = cos(x); return true;
-        case FN_MATH_TAN: *out = tan(x); return true;
-        case FN_MATH_ATAN: *out = atan(x); return true;
-        case FN_MATH_ASIN:
-            if (x < -1 || x > 1) {
-                error("asin() requires a number between -1 and 1");
-                return false;
-            }
-            *out = asin(x);
-            return true;
-        case FN_MATH_ACOS:
-            if (x < -1 || x > 1) {
-                error("acos() requires a number between -1 and 1");
-                return false;
-            }
-            *out = acos(x);
-            return true;
-        case FN_MATH_EXP: *out = exp(x); return true;
-        case FN_MATH_LOG:
-            if (x <= 0) {
-                error("log() requires a positive number");
-                return false;
-            }
-            *out = log(x);
-            return true;
-        case FN_MATH_LOG2:
-            if (x <= 0) {
-                error("log2() requires a positive number");
-                return false;
-            }
-            *out = log2(x);
-            return true;
-        case FN_MATH_LOG10:
-            if (x <= 0) {
-                error("log10() requires a positive number");
-                return false;
-            }
-            *out = log10(x);
-            return true;
-        default: return false;
-    }
+/* What a real-in, real-out function accepts; the error text names the rule. */
+typedef enum { DOMAIN_ANY, DOMAIN_NON_NEGATIVE, DOMAIN_POSITIVE, DOMAIN_UNIT } MathDomain;
+
+/* Every single-argument math function that takes a real and gives a real -- OP_RAW_MATH_REAL's set. */
+static const struct {
+    int fn_id;
+    const char* name;
+    double (*fn)(double);
+    MathDomain domain;
+} real_unary[] = {
+    {FN_MATH_SQRT, "sqrt", sqrt, DOMAIN_NON_NEGATIVE},
+    {FN_MATH_SIN, "sin", sin, DOMAIN_ANY},
+    {FN_MATH_COS, "cos", cos, DOMAIN_ANY},
+    {FN_MATH_TAN, "tan", tan, DOMAIN_ANY},
+    {FN_MATH_ASIN, "asin", asin, DOMAIN_UNIT},
+    {FN_MATH_ACOS, "acos", acos, DOMAIN_UNIT},
+    {FN_MATH_ATAN, "atan", atan, DOMAIN_ANY},
+    {FN_MATH_EXP, "exp", exp, DOMAIN_ANY},
+    {FN_MATH_LOG, "log", log, DOMAIN_POSITIVE},
+    {FN_MATH_LOG2, "log2", log2, DOMAIN_POSITIVE},
+    {FN_MATH_LOG10, "log10", log10, DOMAIN_POSITIVE},
+};
+
+static int real_unary_index(int fn_id) {
+    for (int i = 0; i < (int)(sizeof(real_unary) / sizeof(real_unary[0])); i++)
+        if (real_unary[i].fn_id == fn_id)
+            return i;
+    return -1;
 }
 
-/* Which fn_ids aer_math_unary_raw handles -- the parser's test before it may emit OP_RAW_MATH_REAL. */
 bool aer_math_fn_is_raw_real(int fn_id) {
-    return fn_id == FN_MATH_SQRT || fn_id == FN_MATH_SIN || fn_id == FN_MATH_COS || fn_id == FN_MATH_TAN ||
-           fn_id == FN_MATH_EXP || fn_id == FN_MATH_LOG || fn_id == FN_MATH_LOG2 || fn_id == FN_MATH_LOG10 ||
-           fn_id == FN_MATH_ASIN || fn_id == FN_MATH_ACOS || fn_id == FN_MATH_ATAN;
+    return real_unary_index(fn_id) >= 0;
 }
 
-static bool math_unary(int fn_id, double x, AerVal* out) {
-    switch (fn_id) {
-        case FN_MATH_SQRT:
+bool aer_math_unary_raw(int fn_id, double x, double* out) {
+    int i = real_unary_index(fn_id);
+    if (i < 0)
+        return false;
+    const char* name = real_unary[i].name;
+    switch (real_unary[i].domain) {
+        case DOMAIN_ANY: break;
+        case DOMAIN_NON_NEGATIVE:
             if (x < 0) {
-                error("sqrt() requires a non-negative number");
+                error("%s() requires a non-negative number", name);
                 return false;
             }
-            *out = aer_real(sqrt(x));
-            return true;
-        case FN_MATH_FLOOR: *out = aer_int((int64_t)floor(x)); return true;
-        case FN_MATH_CEIL: *out = aer_int((int64_t)ceil(x)); return true;
-        /* llround, not (int64_t)(x + 0.5) -- the latter mis-rounds negatives (-2.5 -> -1). */
-        case FN_MATH_ROUND: *out = aer_int((int64_t)llround(x)); return true;
-        case FN_MATH_SIN: *out = aer_real(sin(x)); return true;
-        case FN_MATH_COS: *out = aer_real(cos(x)); return true;
-        case FN_MATH_TAN: *out = aer_real(tan(x)); return true;
-        case FN_MATH_ATAN: *out = aer_real(atan(x)); return true;
-        case FN_MATH_ASIN:
-        case FN_MATH_ACOS: {
-            double raw;
-            if (!aer_math_unary_raw(fn_id, x, &raw))
-                return false;
-            *out = aer_real(raw);
-            return true;
-        }
-        case FN_MATH_EXP: *out = aer_real(exp(x)); return true;
-        case FN_MATH_LOG:
+            break;
+        case DOMAIN_POSITIVE:
             if (x <= 0) {
-                error("log() requires a positive number");
+                error("%s() requires a positive number", name);
                 return false;
             }
-            *out = aer_real(log(x));
-            return true;
-        case FN_MATH_LOG2:
-            if (x <= 0) {
-                error("log2() requires a positive number");
+            break;
+        case DOMAIN_UNIT:
+            if (x < -1 || x > 1) {
+                error("%s() requires a number between -1 and 1", name);
                 return false;
             }
-            *out = aer_real(log2(x));
-            return true;
-        case FN_MATH_LOG10:
-            if (x <= 0) {
-                error("log10() requires a positive number");
-                return false;
-            }
-            *out = aer_real(log10(x));
-            return true;
-        default: return false; /* not one of this shape's functions -- not reached today */
+            break;
     }
+    *out = real_unary[i].fn(x);
+    return true;
 }
 
-/* Pop+coerce (NAME supplies the "requires a number" error text), compute via math_unary, push the
-   result. A domain violation inside math_unary has already raised its own error and unwound. */
-#define MATH_UNARY_CASE(FN_ID, NAME)                                                                         \
-    if (fn_id == (FN_ID) && arg_count == 1) {                                                                \
-        double x;                                                                                            \
-        AerVal result;                                                                                       \
-        if (!math_pop_double(vm, (NAME), &x))                                                                \
-            return true;                                                                                     \
-        if (!math_unary(fn_id, x, &result)) {                                                                \
-            vm_stack_push(vm, aer_null());                                                                   \
-            return true;                                                                                     \
-        }                                                                                                    \
-        vm_stack_push(vm, result);                                                                           \
-        return true;                                                                                         \
+/* A single-argument function on a number: one of real_unary, or floor/ceil/round, which give an
+   integer and so have no raw-real form. False, with the stack untouched, for any other fn_id. */
+static bool math_unary_call(VM* vm, int fn_id) {
+    int ri = real_unary_index(fn_id);
+    const char* name = ri >= 0                  ? real_unary[ri].name
+                       : fn_id == FN_MATH_FLOOR ? "floor"
+                       : fn_id == FN_MATH_CEIL  ? "ceil"
+                       : fn_id == FN_MATH_ROUND ? "round"
+                                                : NULL;
+    if (!name)
+        return false;
+    double x;
+    if (!math_pop_double(vm, name, &x))
+        return true;
+    double real;
+    switch (fn_id) {
+        case FN_MATH_FLOOR: vm_stack_push(vm, aer_int((int64_t)floor(x))); break;
+        case FN_MATH_CEIL: vm_stack_push(vm, aer_int((int64_t)ceil(x))); break;
+        /* llround, not (int64_t)(x + 0.5) -- the latter mis-rounds negatives (-2.5 -> -1). */
+        case FN_MATH_ROUND: vm_stack_push(vm, aer_int((int64_t)llround(x))); break;
+        default: vm_stack_push(vm, aer_math_unary_raw(fn_id, x, &real) ? aer_real(real) : aer_null()); break;
     }
+    return true;
+}
 
 bool aer_math_call(VM* vm, int fn_id, int arg_count) {
-    MATH_UNARY_CASE(FN_MATH_SQRT, "sqrt")
-    MATH_UNARY_CASE(FN_MATH_FLOOR, "floor")
-    MATH_UNARY_CASE(FN_MATH_CEIL, "ceil")
-    MATH_UNARY_CASE(FN_MATH_ROUND, "round")
-    MATH_UNARY_CASE(FN_MATH_SIN, "sin")
-    MATH_UNARY_CASE(FN_MATH_COS, "cos")
-    MATH_UNARY_CASE(FN_MATH_TAN, "tan")
-    MATH_UNARY_CASE(FN_MATH_EXP, "exp")
-    MATH_UNARY_CASE(FN_MATH_ASIN, "asin")
-    MATH_UNARY_CASE(FN_MATH_ACOS, "acos")
-    MATH_UNARY_CASE(FN_MATH_ATAN, "atan")
-    MATH_UNARY_CASE(FN_MATH_LOG, "log")
-    MATH_UNARY_CASE(FN_MATH_LOG2, "log2")
-    MATH_UNARY_CASE(FN_MATH_LOG10, "log10")
+    if (arg_count == 1 && math_unary_call(vm, fn_id))
+        return true;
     /* Two arguments, so it gets the quadrant right where atan(y / x) cannot -- and unlike the
        unary functions it has no raw-slot form, since OP_RAW_MATH_REAL carries one operand. */
     if (fn_id == FN_MATH_ATAN2 && arg_count == 2) {
@@ -242,4 +186,3 @@ bool aer_math_call(VM* vm, int fn_id, int arg_count) {
 
     return false;
 }
-#undef MATH_UNARY_CASE
