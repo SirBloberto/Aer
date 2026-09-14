@@ -5688,10 +5688,6 @@ static void parse_struct(Chunk* c) {
     }
     consume(TOKEN_DEDENT);
 
-    if (field_count == 0) {
-        return error_at("Struct must have at least one field");
-    }
-
     chunk_emit(c, PACK_STRUCT_HEADER(name_idx, field_count));
     for (unsigned int i = 0; i < field_count; i++) {
         unsigned int default_idx = chunk_add_pool(c, field_defaults[i]);
