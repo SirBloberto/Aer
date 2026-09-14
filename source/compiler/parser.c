@@ -3745,6 +3745,110 @@ static void chain_advance(Chunk* c, int* obj_reg, bool* obj_is_base, bool pendin
     *obj_is_base = false;
 }
 
+/* The raw fused opcode for a `name[i].field` store or compound: [compound][narrow][unchecked][real]. */
+static Opcode index_field_raw_op(bool compound, bool narrow, bool unchecked, RawKind kind) {
+    static const Opcode ops[2][2][2][2] = {
+        {{{OP_INDEX_FIELD_SET_RAW_INT, OP_INDEX_FIELD_SET_RAW_REAL},
+          {OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED, OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED}},
+         {{OP_INDEX_FIELD_SET_RAW_INT32, OP_INDEX_FIELD_SET_RAW_FLOAT32},
+          {OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED, OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED}}},
+        {{{OP_INDEX_FIELD_COMPOUND_RAW_INT, OP_INDEX_FIELD_COMPOUND_RAW_REAL},
+          {OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED, OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED}},
+         {{OP_INDEX_FIELD_COMPOUND_RAW_INT32, OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32},
+          {OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED, OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED}}},
+    };
+    return ops[compound][narrow][unchecked][kind == RAWK_REAL];
+}
+
+/* `name[index].field = value` or `name[index].field op= value` as one fused opcode, when nothing
+   chains after the field. obj_reg is still the name's own register. False once an error is
+   reported; the caller releases the index and object only on success. */
+static bool emit_index_field_assign(Chunk* c, int obj_reg, int rk_idx, unsigned int field_idx,
+                                    int compound_i) {
+    if (!rk16_fits(rk_idx)) {
+        error_at("Expression too large to compile (register/constant index exceeds the fused "
+                 "index-field-op encoding's range)");
+        return false;
+    }
+    mark_shape_sensitive(obj_reg);
+    Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[obj_reg] : NULL;
+    unsigned int foffset = 0;
+    ValueType ftype = TYPE_ANY;
+    bool narrow = false;
+    RawKind field_kind = RAWK_NONE;
+    if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow)) {
+        if (ftype == TYPE_INTEGER)
+            field_kind = RAWK_INT;
+        else if (ftype == TYPE_REAL)
+            field_kind = RAWK_REAL;
+    }
+
+    lex();
+    unsigned int rhs_start = c->count;
+    int rk_rhs = parse_binary(c, 0);
+    if (parse_had_error)
+        return false;
+    /* The field offset these raw opcodes trust is valid only for the one specialized parameter. */
+    bool unchecked = obj_reg == P.proof.hint_param_reg && index_safe_unchecked(obj_reg, rk_idx);
+
+    if (compound_i < 0) {
+        if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
+            int slot = raw_materialize(c, rk_rhs, field_kind);
+            if (slot >= 0) {
+                chunk_emit(c, PACK_OP_A_W16(index_field_raw_op(false, narrow, unchecked, field_kind), obj_reg,
+                                            pack_rk16(rk_idx)));
+                chunk_emit(c, PACK_2X16((uint16_t)foffset, (uint16_t)slot));
+                raw_release_if_top(slot);
+                return true;
+            }
+        }
+        rk_rhs = drop_raw_marks(rk_rhs);
+        if (!rk16_fits(rk_rhs)) {
+            error_at("Expression too large to compile (value exceeds the fused index-field-set "
+                     "encoding's range)");
+            return false;
+        }
+        chunk_emit(c, PACK_OP_A_W16(OP_INDEX_FIELD_SET, obj_reg, pack_rk16(rk_idx)));
+        chunk_emit(c, PACK_2X16(field_idx, pack_rk16(rk_rhs)));
+        release_if_top(rk_rhs);
+        return true;
+    }
+
+    Opcode bin_op = compound_assign_ops[compound_i].op;
+    int mul_a, mul_b;
+    if (bin_op == OP_ADD && field_kind == RAWK_REAL && !narrow && unchecked &&
+        rk_raw_kind(c, rk_rhs) == RAWK_REAL && take_fused_mul_real(c, rhs_start, rk_rhs, &mul_a, &mul_b)) {
+        chunk_emit(c, PACK3(OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA, obj_reg, mul_a, mul_b));
+        chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(rk_idx)));
+        return true;
+    }
+    /* Decomposing into raw GET + arithmetic + SET measured worse whenever the rhs needed boxing -- the
+       generic opcode already does it all in one dispatch. An rhs that is already raw has nothing to box. */
+    bool native_op_exists = (bin_op == OP_ADD || bin_op == OP_SUB || bin_op == OP_MUL);
+    if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
+        int slot = raw_materialize(c, rk_rhs, field_kind);
+        if (slot >= 0) {
+            Opcode op = index_field_raw_op(true, narrow, unchecked, field_kind);
+            chunk_emit(c, PACK3(compound_add_variant(op, bin_op), obj_reg, bin_op, 0));
+            chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(rk_idx)));
+            chunk_emit(c, (uint32_t)slot);
+            raw_release_if_top(slot);
+            return true;
+        }
+    }
+    rk_rhs = drop_raw_marks(rk_rhs);
+    if (!rk16_fits(rk_rhs)) {
+        error_at("Expression too large to compile (value exceeds the fused index-field-compound "
+                 "encoding's range)");
+        return false;
+    }
+    chunk_emit(c, PACK3(OP_INDEX_FIELD_COMPOUND, obj_reg, bin_op, 0));
+    chunk_emit(c, PACK_2X16(field_idx, pack_rk16(rk_idx)));
+    chunk_emit(c, PACK_2X16(0, pack_rk16(rk_rhs)));
+    release_if_top(rk_rhs);
+    return true;
+}
+
 static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_is_index) {
     int obj_reg;
     bool obj_is_base; /* true while obj_reg is still name_idx's own permanent register */
@@ -3807,142 +3911,11 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
         }
 
         if (no_more_chaining && (is_plain_assign || compound_i >= 0)) {
-            if (!rk16_fits(pending_rk_idx)) {
-                return error_at("Expression too large to compile (register/constant index exceeds the fused "
-                                "index-field-op encoding's range)");
+            if (emit_index_field_assign(c, obj_reg, pending_rk_idx, fused_field_idx, compound_i)) {
+                release_if_top(pending_rk_idx);
+                if (!obj_is_base)
+                    reg_free(1);
             }
-            /* obj_reg is still obj's own register here (obj_is_base) -- this is the very first
-               postfix step on the name, no chaining happened before it. */
-            mark_shape_sensitive(obj_reg);
-            Shape* known = (obj_reg >= 0 && obj_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[obj_reg] : NULL;
-            unsigned int foffset = 0;
-            ValueType ftype = TYPE_ANY;
-            bool field_narrow_bit = false;
-            RawKind field_kind = RAWK_NONE;
-            if (known && shape_find_field(known, fused_field_idx, &foffset, &ftype, &field_narrow_bit)) {
-                if (ftype == TYPE_INTEGER)
-                    field_kind = RAWK_INT;
-                else if (ftype == TYPE_REAL)
-                    field_kind = RAWK_REAL;
-            }
-            if (is_plain_assign) {
-                lex();
-                int rk_val = parse_binary(c, 0);
-                if (parse_had_error)
-                    return;
-                /* Specialized path: the field's byte offset/type is a compile-time-known fact
-                   here (see P.regs.reg_known_shape's own comment) -- write straight into it from a raw
-                   slot, no boxing, when rk_val is already the matching raw kind (an already-raw
-                   value, or a matching literal -- raw_materialize's own contract). Falls back to
-                   the generic (boxing) path otherwise, same graceful-overflow convention raw
-                   locals already use. */
-                if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_val) == field_kind) {
-                    int slot = raw_materialize(c, rk_val, field_kind);
-                    if (slot >= 0) {
-                        /* obj_reg == P.proof.hint_param_reg checked explicitly (see the GET site's
-                           identical comment above) -- the field OFFSET these opcodes trust is only
-                           valid for this one specialized parameter. */
-                        bool unchecked =
-                            obj_reg == P.proof.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
-                        Opcode op =
-                            field_narrow_bit
-                                ? (unchecked
-                                       ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED
-                                                                   : OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED)
-                                       : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT32
-                                                                   : OP_INDEX_FIELD_SET_RAW_FLOAT32))
-                                : (unchecked
-                                       ? ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED
-                                                                   : OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED)
-                                       : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_SET_RAW_INT
-                                                                   : OP_INDEX_FIELD_SET_RAW_REAL));
-                        chunk_emit(c, PACK_OP_A_W16(op, obj_reg, pack_rk16(pending_rk_idx)));
-                        chunk_emit(c, PACK_2X16((uint16_t)foffset, (uint16_t)slot));
-                        raw_release_if_top(slot);
-                        release_if_top(pending_rk_idx);
-                        if (!obj_is_base)
-                            reg_free(1);
-                        return;
-                    }
-                }
-                rk_val = drop_raw_marks(rk_val);
-                if (!rk16_fits(rk_val)) {
-                    return error_at(
-                        "Expression too large to compile (value exceeds the fused index-field-set "
-                        "encoding's range)");
-                }
-                chunk_emit(c, PACK_OP_A_W16(OP_INDEX_FIELD_SET, obj_reg, pack_rk16(pending_rk_idx)));
-                chunk_emit(c, PACK_2X16(fused_field_idx, pack_rk16(rk_val)));
-                release_if_top(rk_val);
-            } else {
-                lex();
-                unsigned int rhs_start = c->count;
-                int rk_rhs = parse_binary(c, 0);
-                if (parse_had_error)
-                    return;
-                Opcode bin_op = compound_assign_ops[compound_i].op;
-                int mul_a, mul_b;
-                if (bin_op == OP_ADD && field_kind == RAWK_REAL && !field_narrow_bit &&
-                    obj_reg == P.proof.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx) &&
-                    rk_raw_kind(c, rk_rhs) == RAWK_REAL &&
-                    take_fused_mul_real(c, rhs_start, rk_rhs, &mul_a, &mul_b)) {
-                    chunk_emit(c, PACK3(OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA, obj_reg, mul_a,
-                                        mul_b));
-                    chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(pending_rk_idx)));
-                    release_if_top(pending_rk_idx);
-                    if (!obj_is_base)
-                        reg_free(1);
-                    return;
-                }
-                /* Decomposing into raw GET + arithmetic + SET measured worse whenever the rhs needed
-                   boxing -- the generic opcode already does it all in one dispatch. When the rhs is
-                   already raw there is no boxing to avoid, so the RAW variant is pure upside. */
-                bool native_op_exists = (bin_op == OP_ADD || bin_op == OP_SUB || bin_op == OP_MUL);
-                if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
-                    int slot = raw_materialize(c, rk_rhs, field_kind);
-                    if (slot >= 0) {
-                        /* obj_reg == P.proof.hint_param_reg checked explicitly (see the GET site's
-                           identical comment above) -- the field OFFSET these opcodes trust is only
-                           valid for this one specialized parameter. */
-                        bool unchecked =
-                            obj_reg == P.proof.hint_param_reg && index_safe_unchecked(obj_reg, pending_rk_idx);
-                        Opcode op =
-                            field_narrow_bit
-                                ? (unchecked
-                                       ? ((field_kind == RAWK_INT)
-                                              ? OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED
-                                              : OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED)
-                                       : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT32
-                                                                   : OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32))
-                                : (unchecked ? ((field_kind == RAWK_INT)
-                                                    ? OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED
-                                                    : OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED)
-                                             : ((field_kind == RAWK_INT) ? OP_INDEX_FIELD_COMPOUND_RAW_INT
-                                                                         : OP_INDEX_FIELD_COMPOUND_RAW_REAL));
-                        chunk_emit(c, PACK3(compound_add_variant(op, bin_op), obj_reg, bin_op, 0));
-                        chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(pending_rk_idx)));
-                        chunk_emit(c, (uint32_t)slot);
-                        raw_release_if_top(slot);
-                        release_if_top(pending_rk_idx);
-                        if (!obj_is_base)
-                            reg_free(1);
-                        return;
-                    }
-                }
-                rk_rhs = drop_raw_marks(rk_rhs);
-                if (!rk16_fits(rk_rhs)) {
-                    return error_at(
-                        "Expression too large to compile (value exceeds the fused index-field-compound "
-                        "encoding's range)");
-                }
-                chunk_emit(c, PACK3(OP_INDEX_FIELD_COMPOUND, obj_reg, bin_op, 0));
-                chunk_emit(c, PACK_2X16(fused_field_idx, pack_rk16(pending_rk_idx)));
-                chunk_emit(c, PACK_2X16(0, pack_rk16(rk_rhs)));
-                release_if_top(rk_rhs);
-            }
-            release_if_top(pending_rk_idx);
-            if (!obj_is_base)
-                reg_free(1);
             return;
         }
 
