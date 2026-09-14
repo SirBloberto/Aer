@@ -206,6 +206,81 @@ static char* handle_terminal_piped(void) {
     return buffer;
 }
 
+/* Replaces the edit buffer with the history entry at [entry_start, entry_start + entry_len), clamped to
+   the buffer, and makes it the current history position. */
+static void load_history_entry(unsigned long entry_start, unsigned long entry_len) {
+    if (entry_len > (unsigned long)(buffer_length - 1))
+        entry_len = (unsigned long)(buffer_length - 1);
+    for (unsigned long i = 0; i < entry_len; i++)
+        buffer[i] = history_buffer[(entry_start + i) % COMMAND_SIZE];
+    position = length = (int)entry_len;
+    history_position = entry_start;
+}
+
+/* Loads the entry before the current one; false when there is none. */
+static bool history_previous(void) {
+    if (history_position < 2)
+        return false;
+    reset();
+    clear();
+    /* Bytes before this floor were overwritten by ring wraparound -- scanning past it aliases. */
+    unsigned long floor_pos = (history_length > COMMAND_SIZE) ? (history_length - COMMAND_SIZE) : 0;
+    /* Step back past the trailing newline of the previous entry */
+    unsigned long pos = history_position - 2;
+    unsigned long start = pos;
+    while (pos > floor_pos && history_buffer[pos % COMMAND_SIZE] != '\n')
+        pos--;
+    /* If we stopped on a newline, move past it */
+    unsigned long entry_start =
+        (pos > floor_pos && history_buffer[pos % COMMAND_SIZE] == '\n') ? pos + 1 : pos;
+    load_history_entry(entry_start, start - entry_start + 1);
+    return true;
+}
+
+/* Loads the entry after the current one; false when there is none. */
+static bool history_next(void) {
+    if (history_position >= history_length)
+        return false;
+    reset();
+    clear();
+    /* Skip to after the current newline */
+    unsigned long pos = history_position;
+    while (pos < history_length && history_buffer[pos % COMMAND_SIZE] != '\n')
+        pos++;
+    pos++; /* step past the newline */
+    unsigned long entry_start = pos;
+    while (pos < history_length && history_buffer[pos % COMMAND_SIZE] != '\n')
+        pos++;
+    load_history_entry(entry_start, pos - entry_start);
+    return true;
+}
+
+/* Terminates the line, records it in the history file and ring, and moves the cursor below the input. */
+static char* submit_line(void) {
+    /* length can equal buffer_length exactly -- reserve room for newline AND NUL before writing. */
+    if (length + 2 > buffer_length) {
+        buffer_length *= 2;
+        buffer = xrealloc(buffer, buffer_length);
+    }
+    buffer[length] = '\n';
+    /* Backspace leaves stale bytes past `length` -- NUL-terminate or strlen reads a longer edit's tail. */
+    buffer[length + 1] = '\0';
+    if (length != 0) {
+        fwrite(buffer, 1, length + 1, history);
+        fflush(history);
+        for (int i = 0; i <= length; i++)
+            history_buffer[history_position++ % COMMAND_SIZE] = buffer[i];
+        history_length += (unsigned long)(length + 1);
+    }
+    /* Move cursor to last row of input then advance to next line */
+    if (screen_rows > screen_row)
+        printf("\x1b[%dB", screen_rows - screen_row);
+    printf("\r\n");
+    fflush(stdout);
+    screen_row = 0;
+    return buffer;
+}
+
 char* handle_terminal() {
     if (piped_stdin)
         return handle_terminal_piped();
@@ -230,49 +305,11 @@ char* handle_terminal() {
         int key = read_key(); /* int: preserves high-bit chars, EOF, and KEY_* sentinels */
 
         if (key == KEY_ARROW_UP) {
-            if (history_position < 2)
-                continue; /* underflow guard */
-            reset();
-            clear();
-            /* Bytes before this floor were overwritten by ring wraparound -- scanning past it aliases. */
-            unsigned long floor_pos = (history_length > COMMAND_SIZE) ? (history_length - COMMAND_SIZE) : 0;
-            /* Step back past the trailing newline of the previous entry */
-            unsigned long pos = history_position - 2;
-            unsigned long start = pos;
-            while (pos > floor_pos && history_buffer[pos % COMMAND_SIZE] != '\n')
-                pos--;
-            /* If we stopped on a newline, move past it */
-            unsigned long entry_start =
-                (pos > floor_pos && history_buffer[pos % COMMAND_SIZE] == '\n') ? pos + 1 : pos;
-            unsigned long entry_len = start - entry_start + 1;
-            if (entry_len > (unsigned long)(buffer_length - 1))
-                entry_len = (unsigned long)(buffer_length - 1);
-            for (unsigned long i = 0; i < entry_len; i++)
-                buffer[i] = history_buffer[(entry_start + i) % COMMAND_SIZE];
-            position = length = (int)entry_len;
-            history_position = entry_start;
-
-        } else if (key == KEY_ARROW_DOWN) {
-            if (history_position >= history_length)
+            if (!history_previous())
                 continue;
-            reset();
-            clear();
-            /* Skip to after the current newline */
-            unsigned long pos = history_position;
-            while (pos < history_length && history_buffer[pos % COMMAND_SIZE] != '\n')
-                pos++;
-            pos++; /* step past the newline */
-            unsigned long entry_start = pos;
-            while (pos < history_length && history_buffer[pos % COMMAND_SIZE] != '\n')
-                pos++;
-            unsigned long entry_len = pos - entry_start;
-            if (entry_len > (unsigned long)(buffer_length - 1))
-                entry_len = (unsigned long)(buffer_length - 1);
-            for (unsigned long i = 0; i < entry_len; i++)
-                buffer[i] = history_buffer[(entry_start + i) % COMMAND_SIZE];
-            position = length = (int)entry_len;
-            history_position = entry_start;
-
+        } else if (key == KEY_ARROW_DOWN) {
+            if (!history_next())
+                continue;
         } else if (key == KEY_ARROW_RIGHT) {
             position = MIN(position + 1, length);
         } else if (key == KEY_ARROW_LEFT) {
@@ -295,32 +332,7 @@ char* handle_terminal() {
             length--;
 
         } else if (key == NEW_LINE) {
-            /* length can equal buffer_length exactly -- reserve room for newline AND NUL before writing. */
-            if (length + 2 > buffer_length) {
-                buffer_length *= 2;
-                buffer = xrealloc(buffer, buffer_length);
-            }
-            buffer[length] = '\n';
-            /* Backspace leaves stale bytes past `length` -- NUL-terminate or strlen reads a longer edit's
-               tail. */
-            buffer[length + 1] = '\0';
-            if (length != 0) {
-                /* Persist to history file */
-                fwrite(buffer, 1, length + 1, history);
-                fflush(history);
-                /* Append to ring buffer */
-                for (int i = 0; i <= length; i++)
-                    history_buffer[history_position++ % COMMAND_SIZE] = buffer[i];
-                history_length += (unsigned long)(length + 1);
-            }
-            /* Move cursor to last row of input then advance to next line */
-            if (screen_rows > screen_row)
-                printf("\x1b[%dB", screen_rows - screen_row);
-            printf("\r\n");
-            fflush(stdout);
-            screen_row = 0;
-            return buffer;
-
+            return submit_line();
         } else if (key == END_OF_TEXT) { /* Ctrl-C */
             /* Ctrl-C cancels the whole in-progress input (including a multi-line block), not the shell;
                Ctrl-D exits -- say so, there's no other way to discover it. */
@@ -331,17 +343,11 @@ char* handle_terminal() {
             screen_row = 0;
             return NULL;
 
-        } else if (key == END_OF_TRANS) { /* Ctrl-D */
+        } else if (key == END_OF_TRANS || key == EOF) {
+            /* Ctrl-D, or stdin closed -- without the EOF case, EOF loops forever in the insert branch. */
             printf("\n");
             end_terminal();
             exit(0);
-
-        } else if (key == EOF) {
-            /* stdin closed/exhausted -- without this, EOF loops forever in the insert branch. */
-            printf("\n");
-            end_terminal();
-            exit(0);
-
         } else if (key >= 0 && key < 256 && !iscntrl(key)) {
             if (length >= buffer_length) {
                 buffer_length *= 2;
