@@ -3253,146 +3253,121 @@ static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
 }
 /* `x += ...` and friends. Answers whether it matched an operator, since a bare name followed
    by something else is still a legal statement. */
+/* `x op= rhs` on a raw variable: raw arithmetic in place when the RHS is the same kind or can be
+   unboxed into it; otherwise -- /= always, since int/int division promotes to real -- the variable
+   becomes boxed. */
+static void compound_assign_raw_variable(Chunk* c, unsigned int name_idx, int existing_idx,
+                                         Opcode boxed_op) {
+    /* Once for every branch below, all of which write this slot. */
+    note_slot_written(P.var_regs[existing_idx]);
+    RawKind cur_kind = (P.regs.var_kind[existing_idx] == VAR_RAW_INT) ? RAWK_INT : RAWK_REAL;
+    bool native_op_exists = (boxed_op == OP_ADD || boxed_op == OP_SUB || boxed_op == OP_MUL);
+
+    unsigned int rhs_start = c->count;
+    int rk_rhs = parse_binary(c, 0);
+    if (parse_had_error)
+        return;
+    RawKind rhs_kind = rk_raw_kind(c, rk_rhs);
+    /* The target's kind is the wanted kind, so `total += nums[i]` reads the element raw rather than
+       boxing it for a tag check one opcode later. */
+    if (rhs_kind == RAWK_NONE && try_rewrite_index_get_raw(c, &rk_rhs, rhs_start, cur_kind))
+        rhs_kind = cur_kind;
+    int slot = P.var_regs[existing_idx];
+
+    /* The RHS's just-emitted raw MUL and this ADD/SUB become one FMA/FMS writing the variable. */
+    if (cur_kind == RAWK_REAL && (boxed_op == OP_ADD || boxed_op == OP_SUB) && rhs_kind == RAWK_REAL &&
+        c->count - rhs_start == 1) {
+        uint32_t mw = c->code[rhs_start];
+        if ((Opcode)(mw & 0xFF) == OP_RAW_MUL_REAL && (int)UNPACK_A(mw) == (rk_rhs & RK_RAW_SLOT_MASK)) {
+            c->count = rhs_start; /* discard the MUL -- fused below instead */
+            raw_release_if_top((int)UNPACK_A(mw));
+            Opcode fused = (boxed_op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
+            chunk_emit(c, PACK3(fused, slot, (int)UNPACK_B(mw), (int)UNPACK_C(mw)));
+            return;
+        }
+    }
+
+    if (native_op_exists) {
+        const RawOpForm* form = raw_op_form(boxed_op);
+        Opcode raw_op = (cur_kind == RAWK_INT) ? form->raw_int : form->raw_real;
+        if (rhs_kind == cur_kind) {
+            int rhs_slot = raw_materialize(c, rk_rhs, rhs_kind);
+            if (rhs_slot >= 0) {
+                chunk_emit(c, PACK3(raw_op, slot, slot, rhs_slot));
+                raw_release_if_top(rhs_slot);
+                return;
+            }
+            /* Budget exhausted materializing the RHS: box below rather than leave it half-updated. */
+        } else if (rhs_kind == RAWK_NONE) {
+            /* An ordinary boxed RHS (nbody's `e += 0.5 * bim * (...)`) is checked once into a raw
+               slot and accumulated with raw arithmetic -- no shadow, safe every loop iteration. */
+            int boxed_reg = materialize(c, rk_rhs);
+            int tmp = slot_alloc(cur_kind);
+            if (tmp >= 0) {
+                Opcode unbox = (cur_kind == RAWK_INT) ? OP_UNBOX_INT : OP_UNBOX_REAL;
+                chunk_emit(c, PACK3(unbox, tmp, boxed_reg, 0));
+                chunk_emit(c, PACK3(raw_op, slot, slot, tmp));
+                raw_release_if_top(tmp);
+                release_if_top(boxed_reg);
+                return;
+            }
+            release_if_top(boxed_reg);
+        }
+    }
+
+    /* Boxing the variable here depends on its old value, so a loop re-executing it would re-read a
+       stale slot every iteration. No single-pass fix exists: refuse to compile rather than corrupt. */
+    if (P.loop_depth > 0) {
+        error_at("This compound assignment would change '%s' from a fixed numeric type to a "
+                 "different type, but it's inside a loop — not supported (restructure so the type "
+                 "change happens outside any loop)",
+                 aer_as_string(c->pool[name_idx])->data);
+        return;
+    }
+    /* A real reads its old slot but writes a fresh register -- a real-block slot must never take a
+       dynamically typed write (see ensure_boxed). The old slot is correctly tagged either way. */
+    int new_reg = slot;
+    if (cur_kind == RAWK_REAL) {
+        if (P.slot_floor >= P.raw_real_next) {
+            error_at("Too many variables (max %d)", FRAME_REGISTERS);
+            return;
+        }
+        new_reg = P.slot_floor++;
+        P.slot_next = P.slot_floor;
+        track_peak(P.slot_floor);
+        P.var_regs[existing_idx] = new_reg;
+    }
+    P.regs.var_kind[existing_idx] = VAR_BOXED;
+    /* No global_regs update: a raw-tracked name is never in global_names (see ensure_boxed). */
+    rk_rhs = drop_raw_marks(rk_rhs);
+    emit_binary(c, new_reg, boxed_op, slot, rk_rhs);
+    release_if_top(rk_rhs);
+}
+
 static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
     for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
         if (!consume(compound_assign_ops[i].tok))
             continue;
 
-        /* A compound assignment can never re-derive length_tracked_name's invariant (the RHS is
-           combined with the OLD value, never a fresh length() call alone) -- invalidate eagerly. */
+        /* The RHS combines with the old value, never a fresh length() alone, so a tracked length ends. */
         if (P.proof.length_tracked_valid && name_idx == P.proof.length_tracked_name)
             P.proof.length_tracked_valid = false;
 
-        /* A raw-tracked compound-assignment target needs its own path -- var_lookup would return a
-           bare register-shaped int with no distinguishing flag (real bug: silently misread as a
-           plain register). Stays raw for +=/-=/x= with a same-kind RHS; /= always shadows (int/int
-           division promotes to real). */
+        /* A raw target needs its own path: var_lookup would return its slot as a bare register number,
+           silently misread as a plain register. */
         int existing_idx = -1;
         for (int j = 0; j < P.var_count; j++)
             if (P.var_names[j] == name_idx) {
                 existing_idx = j;
                 break;
             }
-
         if (existing_idx >= 0 && P.regs.var_kind[existing_idx] != VAR_BOXED) {
-            /* Once for every branch below, all of which write this slot -- same reason as the
-               plain assignment path above. */
-            note_slot_written(P.var_regs[existing_idx]);
-            RawKind cur_kind = (P.regs.var_kind[existing_idx] == VAR_RAW_INT) ? RAWK_INT : RAWK_REAL;
-            Opcode boxed_op = compound_assign_ops[i].op;
-            bool native_op_exists = (boxed_op == OP_ADD || boxed_op == OP_SUB || boxed_op == OP_MUL);
-
-            unsigned int rhs_start = c->count;
-            int rk_rhs = parse_binary(c, 0);
-            if (parse_had_error)
-                return;
-            RawKind rhs_kind = rk_raw_kind(c, rk_rhs);
-            /* The target's kind is the wanted kind, so `total += nums[i]` reads the element raw
-               rather than boxing it for a tag check one opcode later. */
-            if (rhs_kind == RAWK_NONE && try_rewrite_index_get_raw(c, &rk_rhs, rhs_start, cur_kind))
-                rhs_kind = cur_kind;
-
-            /* Fuses the RHS's just-emitted OP_RAW_MUL_REAL with this ADD/SUB into one FMA/FMS
-               dispatch. Only when the RHS was exactly one raw MUL writing the slot rk_rhs points
-               at; anything else falls through unfused. Real only. */
-            if (cur_kind == RAWK_REAL && (boxed_op == OP_ADD || boxed_op == OP_SUB) &&
-                rhs_kind == RAWK_REAL && c->count - rhs_start == 1) {
-                uint32_t mw = c->code[rhs_start];
-                if ((Opcode)(mw & 0xFF) == OP_RAW_MUL_REAL &&
-                    (int)UNPACK_A(mw) == (rk_rhs & RK_RAW_SLOT_MASK)) {
-                    int dest_slot = P.var_regs[existing_idx];
-                    int mul_a = (int)UNPACK_B(mw), mul_b = (int)UNPACK_C(mw);
-                    c->count = rhs_start; /* discard the MUL -- fused below instead */
-                    raw_release_if_top((int)UNPACK_A(mw));
-                    Opcode fused = (boxed_op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
-                    chunk_emit(c, PACK3(fused, dest_slot, mul_a, mul_b));
-                    return;
-                }
-            }
-
-            if (native_op_exists && rhs_kind == cur_kind) {
-                int dest_slot = P.var_regs[existing_idx];
-                int rhs_slot = raw_materialize(c, rk_rhs, rhs_kind);
-                if (rhs_slot >= 0) {
-                    Opcode raw_op;
-                    if (cur_kind == RAWK_INT)
-                        raw_op = (boxed_op == OP_ADD)   ? OP_RAW_ADD_INT
-                                 : (boxed_op == OP_SUB) ? OP_RAW_SUB_INT
-                                                        : OP_RAW_MUL_INT;
-                    else
-                        raw_op = (boxed_op == OP_ADD)   ? OP_RAW_ADD_REAL
-                                 : (boxed_op == OP_SUB) ? OP_RAW_SUB_REAL
-                                                        : OP_RAW_MUL_REAL;
-                    chunk_emit(c, PACK3(raw_op, dest_slot, dest_slot, rhs_slot));
-                    raw_release_if_top(rhs_slot);
-                    return;
-                }
-                /* raw-slot budget exhausted materializing the RHS: fall through to the shadow
-                   path below instead of leaving the variable half-updated. */
-            }
-
-            /* An ordinary boxed RHS (e.g. nbody.aer's `e += 0.5 * bim * (...)`) is checked once into
-               a raw slot and then accumulated with ordinary raw arithmetic -- no shadow, no
-               allocation, safe every loop iteration. A provably-mismatched kind still shadows. */
-            if (native_op_exists && rhs_kind == RAWK_NONE) {
-                bool int_kind = (cur_kind == RAWK_INT);
-                int dest_slot = P.var_regs[existing_idx];
-                int boxed_reg = materialize(c, rk_rhs);
-                int tmp = slot_alloc(cur_kind);
-                if (tmp >= 0) {
-                    chunk_emit(c, PACK3(int_kind ? OP_UNBOX_INT : OP_UNBOX_REAL, tmp, boxed_reg, 0));
-                    Opcode raw_op;
-                    if (int_kind)
-                        raw_op = (boxed_op == OP_ADD)   ? OP_RAW_ADD_INT
-                                 : (boxed_op == OP_SUB) ? OP_RAW_SUB_INT
-                                                        : OP_RAW_MUL_INT;
-                    else
-                        raw_op = (boxed_op == OP_ADD)   ? OP_RAW_ADD_REAL
-                                 : (boxed_op == OP_SUB) ? OP_RAW_SUB_REAL
-                                                        : OP_RAW_MUL_REAL;
-                    chunk_emit(c, PACK3(raw_op, dest_slot, dest_slot, tmp));
-                    raw_release_if_top(tmp);
-                    release_if_top(boxed_reg);
-                    return;
-                }
-                release_if_top(boxed_reg);
-            }
-
-            /* Boxes the current raw value, then performs the compound op -- unlike plain assignment's
-               shadow, this genuinely depends on old_slot's value, so a loop re-executing it would
-               re-read the stale value every iteration (real bug found this way). No single-pass
-               fix exists, so refuse to compile rather than silently corrupt. */
-            if (P.loop_depth > 0) {
-                return error_at(
-                    "This compound assignment would change '%s' from a fixed numeric type to a "
-                    "different type, but it's inside a loop — not supported (restructure so the type "
-                    "change happens outside any loop)",
-                    aer_as_string(c->pool[name_idx])->data);
-            }
-            /* A real reads its old slot but writes a fresh one -- see ensure_boxed for why a
-               real-block slot must never take a dynamically typed write. Either way the old slot
-               holds a correctly tagged value, so it needs no boxing on the way out. */
-            int old_slot = P.var_regs[existing_idx];
-            int new_reg = old_slot;
-            if (cur_kind == RAWK_REAL) {
-                if (P.slot_floor >= P.raw_real_next) {
-                    return error_at("Too many variables (max %d)", FRAME_REGISTERS);
-                }
-                new_reg = P.slot_floor++;
-                P.slot_next = P.slot_floor;
-                track_peak(P.slot_floor);
-                P.var_regs[existing_idx] = new_reg;
-            }
-            P.regs.var_kind[existing_idx] = VAR_BOXED;
-            /* No P.global_regs update needed -- see ensure_boxed's identical reasoning. */
-            rk_rhs = drop_raw_marks(rk_rhs);
-            emit_binary(c, new_reg, boxed_op, old_slot, rk_rhs);
-            release_if_top(rk_rhs);
+            compound_assign_raw_variable(c, name_idx, existing_idx, compound_assign_ops[i].op);
             return;
         }
 
-        /* Compound assignment to an undefined name is a compile error -- same shadow-ban as a bare
-           reference for an existing top-level global. */
+        /* An undefined name is a compile error -- the same shadow ban as a bare reference to a
+           top-level global. */
         int reg;
         if (!var_lookup(name_idx, &reg)) {
             int dummy_reg;
@@ -3402,9 +3377,9 @@ static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
                          aer_as_string(c->pool[name_idx])->data);
                 return;
             }
-            return error_at(
-                "Compound assignment target must already have a value (no assigning to an undefined "
-                "name this way)");
+            error_at("Compound assignment target must already have a value (no assigning to an undefined "
+                     "name this way)");
+            return;
         }
 
         int rk_rhs = parse_binary(c, 0);
@@ -3416,8 +3391,6 @@ static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
         release_if_top(rk_rhs);
         return;
     }
-
-    /* A pipe chain from a bare name used as a statement -- non-creating lookup. */
 }
 /* A pipe chain from a bare name used as a statement -- a lookup that never creates. */
 static void parse_assign_pipe(Chunk* c, unsigned int name_idx) {
