@@ -473,7 +473,7 @@ void lex() {
 
         if (*p != '\0' && spaces > top) {
             if (indent_depth >= 64)
-                return error("Indentation too deep");
+                return error_at("Indentation too deep");
             indent_stack[indent_depth++] = spaces;
             current->buffer = p;
             token.type = TOKEN_INDENT;
@@ -485,7 +485,7 @@ void lex() {
                 indent_depth--;
                 pops++;
             }
-            if (*p != '\0' && indent_depth > 1 && indent_stack[indent_depth - 1] != spaces)
+            if (*p != '\0' && indent_stack[indent_depth - 1] != spaces)
                 return error_at("Indentation does not match any outer level");
             if (*p == '\0')
                 indent_depth = 1;
