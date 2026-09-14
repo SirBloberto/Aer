@@ -2241,6 +2241,132 @@ static int parse_primary_inner(Chunk* c) {
 /* `[index]`/slice/`.field` reads plus a trailing call-THROUGH-value (not call-by-name) --
    covers functions stored in a container and called via index/key, and currying as a side
    effect. `rk` is reused in place as the call's own dest_reg. */
+typedef enum { INDEX_FIELD_GET, INDEX_FIELD_SET, INDEX_FIELD_COMPOUND } IndexFieldAccess;
+
+/* The raw fused opcode for a `name[i].field` read, store or compound: [access][narrow][unchecked][real]. */
+static Opcode index_field_raw_op(IndexFieldAccess access, bool narrow, bool unchecked, RawKind kind) {
+    static const Opcode ops[3][2][2][2] = {
+        {{{OP_INDEX_FIELD_GET_RAW_INT, OP_INDEX_FIELD_GET_RAW_REAL},
+          {OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED, OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED}},
+         {{OP_INDEX_FIELD_GET_RAW_INT32, OP_INDEX_FIELD_GET_RAW_FLOAT32},
+          {OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED, OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED}}},
+        {{{OP_INDEX_FIELD_SET_RAW_INT, OP_INDEX_FIELD_SET_RAW_REAL},
+          {OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED, OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED}},
+         {{OP_INDEX_FIELD_SET_RAW_INT32, OP_INDEX_FIELD_SET_RAW_FLOAT32},
+          {OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED, OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED}}},
+        {{{OP_INDEX_FIELD_COMPOUND_RAW_INT, OP_INDEX_FIELD_COMPOUND_RAW_REAL},
+          {OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED, OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED}},
+         {{OP_INDEX_FIELD_COMPOUND_RAW_INT32, OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32},
+          {OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED, OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED}}},
+    };
+    return ops[access][narrow][unchecked][kind == RAWK_REAL];
+}
+
+/* `expr[index].field` as one fused read -- a packed array has no standalone `expr[index]` value. A
+   field the array's known shape types as int/real reads straight into a raw slot. False once an
+   error is reported, leaving *out_rk untouched. */
+static bool emit_index_field_get(Chunk* c, int arr_reg, int rk_start, unsigned int field_idx, int* out_rk) {
+    release_if_top(rk_start);
+    release_if_top(arr_reg);
+    if (!rk16_fits(rk_start)) {
+        error_at("Expression too large to compile (register/constant index exceeds the fused "
+                 "index-field-op encoding's range)");
+        return false;
+    }
+    mark_shape_sensitive(arr_reg);
+    Shape* known = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[arr_reg] : NULL;
+    unsigned int foffset;
+    ValueType ftype;
+    bool narrow;
+    if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
+        (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
+        RawKind kind = (ftype == TYPE_INTEGER) ? RAWK_INT : RAWK_REAL;
+        int slot = slot_alloc(kind);
+        if (slot >= 0) {
+            /* Checked here, not in index_safe_unchecked, which typed-array reads share: the field
+               offset is valid only for the one specialized parameter, never another array a loop
+               also proved an index safe for. */
+            bool unchecked = arr_reg == P.proof.hint_param_reg && index_safe_unchecked(arr_reg, rk_start);
+            Opcode op = index_field_raw_op(INDEX_FIELD_GET, narrow, unchecked, kind);
+            chunk_emit(c, PACK3(op, slot, arr_reg, 0));
+            chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(rk_start)));
+            *out_rk = (kind == RAWK_INT ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | slot;
+            return true;
+        }
+    }
+    int dest = reg_alloc();
+    chunk_emit(c, PACK3(OP_INDEX_FIELD_GET, dest, arr_reg, 0));
+    chunk_emit(c, PACK_2X16(field_idx, pack_rk16(rk_start)));
+    *out_rk = dest;
+    return true;
+}
+
+/* `expr[index]`: into a raw slot when the array's element kind is known, unchecked once a loop proved
+   the index. */
+static int emit_index_read(Chunk* c, int arr_reg, int rk_start) {
+    /* Free-then-allocate, matching parse_binary_ops's own discipline. */
+    release_if_top(rk_start);
+    release_if_top(arr_reg);
+
+    RawKind elem = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_elem_kind[arr_reg] : RAWK_NONE;
+    if (elem != RAWK_NONE && rk8_fits(rk_start)) {
+        int slot = slot_alloc(elem);
+        if (slot >= 0) {
+            /* The kind here is not an inference: reg_elem_kind is set from watching the array get built
+               and cleared by any write to that register, unlike try_rewrite_index_get_raw's guess from
+               the consumer, which is what the checked opcode's fallback exists to catch (15 in 22.1M,
+               all from there). */
+            if (index_safe_unchecked(arr_reg, rk_start))
+                chunk_emit(c, PACK3(OP_TYPED_INDEX_GET_UNCHECKED, slot, arr_reg, pack_rk8(rk_start)));
+            else
+                chunk_emit(c, PACK3(elem == RAWK_INT ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL, slot,
+                                    arr_reg, pack_rk8(rk_start)));
+            return (elem == RAWK_INT ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | slot;
+        }
+    }
+
+    int dest = reg_alloc();
+    /* rk_start is plain and non-raw here, so it fits RK8 directly. A loop-safety proof only, not a
+       container-type one -- the opcode still checks TYPE_TYPED_ARRAY itself. */
+    if (index_safe_unchecked(arr_reg, rk_start))
+        chunk_emit(c, PACK3(OP_TYPED_INDEX_GET_UNCHECKED, dest, arr_reg, pack_rk8(rk_start)));
+    else
+        emit_index_get(c, dest, arr_reg, rk_start);
+    /* One-hop alias tracking for SPEC_KIND_ARRAY_OF_STRUCTS. src_param needs only arr_reg's identity;
+       elem_shape stays NULL outside a specialization recompile, the only place it is seeded. */
+    P.index_alias.dest_reg = dest;
+    P.index_alias.src_param = (arr_reg >= 0 && arr_reg < P.regs.current_param_count) ? arr_reg : -1;
+    P.index_alias.elem_shape =
+        (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_known_element_shape[arr_reg] : NULL;
+    return dest;
+}
+
+/* `expr.field`: into a raw slot when the struct's known shape types the field as int/real. */
+static int emit_field_read(Chunk* c, int struct_reg, unsigned int field_idx) {
+    release_if_top(struct_reg);
+    mark_shape_sensitive(struct_reg);
+    Shape* known =
+        (struct_reg >= 0 && struct_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[struct_reg] : NULL;
+    unsigned int foffset;
+    ValueType ftype;
+    bool narrow;
+    if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
+        (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
+        bool is_int = (ftype == TYPE_INTEGER);
+        int slot = slot_alloc(is_int ? RAWK_INT : RAWK_REAL);
+        if (slot >= 0) {
+            Opcode op = narrow ? (is_int ? OP_FIELD_GET_RAW_INT32 : OP_FIELD_GET_RAW_FLOAT32)
+                               : (is_int ? OP_FIELD_GET_RAW_INT : OP_FIELD_GET_RAW_REAL);
+            chunk_emit(c, PACK3(op, slot, struct_reg, 0));
+            chunk_emit(c, foffset);
+            return is_int ? (RK_RAW_INT_FLAG | slot) : (RK_RAW_REAL_FLAG | slot);
+        }
+    }
+    int dest = reg_alloc();
+    emit_field_get(c, dest, struct_reg, field_idx);
+    return dest;
+}
+
 static int parse_postfix_chain(Chunk* c, int rk) {
     for (;;) {
         if (consume(TOKEN_OPEN_PARENTHESE)) {
@@ -2286,106 +2412,11 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                     }
                     unsigned int field_idx = chunk_add_pool(c, token.value);
                     lex();
-
-                    release_if_top(rk_start);
-                    release_if_top(arr_reg);
-
-                    if (!rk16_fits(rk_start)) {
-                        error_at("Expression too large to compile (register/constant index exceeds the fused "
-                                 "index-field-op encoding's range)");
+                    if (!emit_index_field_get(c, arr_reg, rk_start, field_idx, &rk))
                         return rk;
-                    }
-                    mark_shape_sensitive(arr_reg);
-                    /* arr_reg's shape is a compile-time fact here, so resolve the field directly and
-                       route the result through a raw slot, composing via the same raw machinery a
-                       raw local already uses. Falls back to the generic opcode if the field isn't
-                       int/real or the raw-slot budget is exhausted. */
-                    Shape* known =
-                        (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[arr_reg] : NULL;
-                    unsigned int foffset;
-                    ValueType ftype;
-                    bool narrow;
-                    if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
-                        (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
-                        bool is_int = (ftype == TYPE_INTEGER);
-                        int slot = slot_alloc(is_int ? RAWK_INT : RAWK_REAL);
-                        if (slot >= 0) {
-                            /* arr_reg == P.proof.hint_param_reg checked explicitly here (not inside
-                               index_safe_unchecked, which typed-array callers also use with no such
-                               requirement) -- the field OFFSET this opcode trusts is only valid for
-                               this one specialized parameter, never any other array a loop might
-                               ALSO have proven a safe index for. */
-                            bool unchecked =
-                                arr_reg == P.proof.hint_param_reg && index_safe_unchecked(arr_reg, rk_start);
-                            Opcode op = narrow
-                                            ? (unchecked ? (is_int ? OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED
-                                                                   : OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED)
-                                                         : (is_int ? OP_INDEX_FIELD_GET_RAW_INT32
-                                                                   : OP_INDEX_FIELD_GET_RAW_FLOAT32))
-                                            : (unchecked ? (is_int ? OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED
-                                                                   : OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED)
-                                                         : (is_int ? OP_INDEX_FIELD_GET_RAW_INT
-                                                                   : OP_INDEX_FIELD_GET_RAW_REAL));
-                            chunk_emit(c, PACK3(op, slot, arr_reg, 0));
-                            chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(rk_start)));
-                            rk = is_int ? (RK_RAW_INT_FLAG | slot) : (RK_RAW_REAL_FLAG | slot);
-                            continue;
-                        }
-                    }
-                    int dest = reg_alloc();
-                    chunk_emit(c, PACK3(OP_INDEX_FIELD_GET, dest, arr_reg, 0));
-                    chunk_emit(c, PACK_2X16(field_idx, pack_rk16(rk_start)));
-                    rk = dest;
                     continue;
                 }
-
-                /* Free-then-allocate, matching parse_binary_ops's own discipline. */
-                release_if_top(rk_start);
-                release_if_top(arr_reg);
-
-                /* Element kind known, so the read lands in a statically-typed slot and everything
-                   downstream composes unchecked instead of tag-checking what it just produced. */
-                RawKind elem =
-                    (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_elem_kind[arr_reg] : RAWK_NONE;
-                if (elem != RAWK_NONE && rk8_fits(rk_start)) {
-                    int slot = slot_alloc(elem);
-                    if (slot >= 0) {
-                        /* With the loop proof in hand the index needs no bounds check either. The
-                           kind here is not an inference: reg_elem_kind is set from watching the
-                           array get built and cleared by any write to that register, unlike
-                           try_rewrite_index_get_raw's guess from the consumer, which is what the
-                           checked opcode's fallback exists to catch (15 in 22.1M, all from there). */
-                        if (index_safe_unchecked(arr_reg, rk_start))
-                            chunk_emit(
-                                c, PACK3(OP_TYPED_INDEX_GET_UNCHECKED, slot, arr_reg, pack_rk8(rk_start)));
-                        else
-                            chunk_emit(c,
-                                       PACK3(elem == RAWK_INT ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL,
-                                             slot, arr_reg, pack_rk8(rk_start)));
-                        rk = (elem == RAWK_INT ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | slot;
-                        continue;
-                    }
-                }
-
-                int dest = reg_alloc();
-                /* rk_start is guaranteed plain and non-raw here, so it always fits RK8 directly.
-                   This is a loop-safety proof only, not a container-type one -- the opcode still
-                   checks TYPE_TYPED_ARRAY itself. */
-                if (index_safe_unchecked(arr_reg, rk_start)) {
-                    chunk_emit(c, PACK3(OP_TYPED_INDEX_GET_UNCHECKED, dest, arr_reg, pack_rk8(rk_start)));
-                } else {
-                    emit_index_get(c, dest, arr_reg, rk_start);
-                }
-                /* One-hop alias tracking for SPEC_KIND_ARRAY_OF_STRUCTS. Recorded unconditionally:
-                   index_alias.src_param needs only arr_reg's identity, available during the
-                   ordinary compile too. index_alias.elem_shape stays NULL outside a
-                   specialization recompile, since reg_known_element_shape is only seeded there. */
-                P.index_alias.dest_reg = dest;
-                P.index_alias.src_param =
-                    (arr_reg >= 0 && arr_reg < P.regs.current_param_count) ? arr_reg : -1;
-                P.index_alias.elem_shape =
-                    (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_known_element_shape[arr_reg] : NULL;
-                rk = dest;
+                rk = emit_index_read(c, arr_reg, rk_start);
                 continue;
             }
 
@@ -2418,34 +2449,7 @@ static int parse_postfix_chain(Chunk* c, int rk) {
             }
             unsigned int field_idx = chunk_add_pool(c, token.value);
             lex();
-
-            int struct_reg = materialize(c, rk);
-            release_if_top(struct_reg);
-
-            mark_shape_sensitive(struct_reg);
-            {
-                Shape* known =
-                    (struct_reg >= 0 && struct_reg < FRAME_REGISTERS) ? P.regs.reg_known_shape[struct_reg] : NULL;
-                unsigned int foffset;
-                ValueType ftype;
-                bool narrow;
-                if (known && shape_find_field(known, field_idx, &foffset, &ftype, &narrow) &&
-                    (ftype == TYPE_INTEGER || ftype == TYPE_REAL)) {
-                    bool is_int = (ftype == TYPE_INTEGER);
-                    int slot = slot_alloc(is_int ? RAWK_INT : RAWK_REAL);
-                    if (slot >= 0) {
-                        Opcode op = narrow ? (is_int ? OP_FIELD_GET_RAW_INT32 : OP_FIELD_GET_RAW_FLOAT32)
-                                           : (is_int ? OP_FIELD_GET_RAW_INT : OP_FIELD_GET_RAW_REAL);
-                        chunk_emit(c, PACK3(op, slot, struct_reg, 0));
-                        chunk_emit(c, foffset);
-                        rk = is_int ? (RK_RAW_INT_FLAG | slot) : (RK_RAW_REAL_FLAG | slot);
-                        continue;
-                    }
-                }
-            }
-            int dest = reg_alloc();
-            emit_field_get(c, dest, struct_reg, field_idx);
-            rk = dest;
+            rk = emit_field_read(c, materialize(c, rk), field_idx);
             continue;
         }
         break;
@@ -3699,21 +3703,6 @@ static void chain_advance(Chunk* c, int* obj_reg, bool* obj_is_base, bool pendin
     *obj_is_base = false;
 }
 
-/* The raw fused opcode for a `name[i].field` store or compound: [compound][narrow][unchecked][real]. */
-static Opcode index_field_raw_op(bool compound, bool narrow, bool unchecked, RawKind kind) {
-    static const Opcode ops[2][2][2][2] = {
-        {{{OP_INDEX_FIELD_SET_RAW_INT, OP_INDEX_FIELD_SET_RAW_REAL},
-          {OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED, OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED}},
-         {{OP_INDEX_FIELD_SET_RAW_INT32, OP_INDEX_FIELD_SET_RAW_FLOAT32},
-          {OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED, OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED}}},
-        {{{OP_INDEX_FIELD_COMPOUND_RAW_INT, OP_INDEX_FIELD_COMPOUND_RAW_REAL},
-          {OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED, OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED}},
-         {{OP_INDEX_FIELD_COMPOUND_RAW_INT32, OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32},
-          {OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED, OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED}}},
-    };
-    return ops[compound][narrow][unchecked][kind == RAWK_REAL];
-}
-
 /* `name[index].field = value` or `name[index].field op= value` as one fused opcode, when nothing
    chains after the field. obj_reg is still the name's own register. False once an error is
    reported; the caller releases the index and object only on success. */
@@ -3749,8 +3738,8 @@ static bool emit_index_field_assign(Chunk* c, int obj_reg, int rk_idx, unsigned 
         if (field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
             int slot = raw_materialize(c, rk_rhs, field_kind);
             if (slot >= 0) {
-                chunk_emit(c, PACK_OP_A_W16(index_field_raw_op(false, narrow, unchecked, field_kind), obj_reg,
-                                            pack_rk16(rk_idx)));
+                Opcode op = index_field_raw_op(INDEX_FIELD_SET, narrow, unchecked, field_kind);
+                chunk_emit(c, PACK_OP_A_W16(op, obj_reg, pack_rk16(rk_idx)));
                 chunk_emit(c, PACK_2X16((uint16_t)foffset, (uint16_t)slot));
                 raw_release_if_top(slot);
                 return true;
@@ -3782,7 +3771,7 @@ static bool emit_index_field_assign(Chunk* c, int obj_reg, int rk_idx, unsigned 
     if (native_op_exists && field_kind != RAWK_NONE && rk_raw_kind(c, rk_rhs) == field_kind) {
         int slot = raw_materialize(c, rk_rhs, field_kind);
         if (slot >= 0) {
-            Opcode op = index_field_raw_op(true, narrow, unchecked, field_kind);
+            Opcode op = index_field_raw_op(INDEX_FIELD_COMPOUND, narrow, unchecked, field_kind);
             chunk_emit(c, PACK3(compound_add_variant(op, bin_op), obj_reg, bin_op, 0));
             chunk_emit(c, PACK_2X16((uint16_t)foffset, pack_rk16(rk_idx)));
             chunk_emit(c, (uint32_t)slot);
