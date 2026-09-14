@@ -407,6 +407,11 @@ void vm_init(VM* vm, Chunk* chunk) {
     /* Top level gets no gap: its real slots come off the top of the same bank the collector has to
        trace for top-level variables, and there is no per-call cost here to save by narrowing it. */
     vm->call_stack[0].frame_bounds = FRAME_BOUNDS(FRAME_REGISTERS, FRAME_REGISTERS);
+    /* Top level has no caller to tag its frame, so it is done once here. Its real slots come off the top
+       and the parser never places one on a register it has used for anything else, so the tags stay
+       right for the VM's life -- retagging on a later run would overwrite live top-level variables. */
+    for (unsigned int i = 0; i < FRAME_REGISTERS; i++)
+        vm->call_stack[0].registers[i].tag = TYPE_REAL;
     aer_vm_reset_for_reuse(vm);
 }
 
@@ -467,11 +472,6 @@ void vm_free(VM* vm) {
 void aer_vm_reset_for_reuse(VM* vm) {
     vm->stack_top = 0;
     vm->call_depth = 0;
-    /* Top level has no caller to tag its frame, so it is done here -- every run, not once at
-       vm_init: a REPL line's real slots come off the top of the frame, where an earlier line may
-       have left a heap reference in a register it used as an ordinary one. */
-    for (unsigned int i = 0; i < FRAME_REGISTERS; i++)
-        vm->call_stack[0].registers[i].tag = TYPE_REAL;
 }
 
 bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {

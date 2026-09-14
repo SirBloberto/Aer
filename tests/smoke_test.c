@@ -74,36 +74,13 @@ static bool run_source(Chunk* c, VM* vm, const char* src) {
     return vm_run(vm);
 }
 
-/* M6 slice 1 — mirrors main.c's own run() exactly (down to resuming vm->ip at the chunk's
-   PRE-parse length, not 0, reusing the SAME VM instance across calls instead of a fresh vm_init,
-   and — critically — always emitting OP_HALT and running regardless of parse_had_error) but
-   targeting parse() instead of parse() — a real REPL session compiling and running one
-   line/block at a time against persistent state, not a single one-shot compile.
-     Always running (not gating on parse_had_error the way run_source above does) is
-   deliberate, not an oversight: parse()'s own per-statement rollback already excludes a failed
-   statement's bytecode from the chunk entirely (c->count is restored to exactly where it was
-   before that statement started), so whatever ended up between `start` and c->count is always a
-   run of fully-compiled, safe-to-execute statements — identical reasoning to why main.c's own
-   run() never checks parse_had_error before calling vm_run either. Returns false if EITHER this
-   call's compilation reported any error OR the run itself failed — but the run still happens
-   either way, so a later, successfully-compiled statement on the SAME "line" still executes even
-   after an earlier one on it failed.
-     Callers create ONE Chunk + call parser_reset() + vm_init() ONCE before the first call, then
-   call this repeatedly; NO parser_reset() between calls, or every earlier "line"'s
-   names/registers would vanish — the entire point being tested. */
+/* One REPL line through aer_run_source, the entry point the REPL itself uses, against persistent
+   state. It always runs: a failed statement was already rolled back out of the chunk. False if the
+   line reported a compile error or the run failed. Callers do parser_reset() + vm_init() once, and
+   never parser_reset() between lines, or earlier lines' names would vanish. */
 static bool run_repl_line(Chunk* c, VM* vm, const char* src) {
-    unsigned int start = c->count;
-    vm->ip            = start;
-    vm->stack_top     = 0;
-    vm->call_depth = 0;
-    shell((char*)src);
-    lex();
-    parse(c);
-    bool compiled_ok = !parse_had_error;
-    chunk_emit(c, OP_HALT);
-    runtime_had_error = false;
-    bool ran_ok = vm_run(vm);
-    return compiled_ok && ran_ok;
+    bool ran_ok = aer_run_source(vm, c, src);
+    return !parse_had_error && ran_ok;
 }
 
 int main(void) {
@@ -1619,6 +1596,8 @@ int main(void) {
         bool ok2 = run_repl_line(&c, &vm, "y = x + 5\n");
         check(ok2, "REPL line 2 ('y = x + 5') ran without error, reading x from an earlier line");
         check(aer_as_int(var_of(&vm, &c, "y")) == 15, "y == 15 — x's value from line 1 correctly persisted across parse() calls");
+        check(aer_type(var_of(&vm, &c, "x")) == TYPE_INTEGER,
+              "x still carries its integer tag after line 2 ran -- a run must not retag live top-level registers");
 
         /* An incomplete expression ('z = 1 +' with nothing after it) is an IMMEDIATE parse-time
            error (caught mid-statement, well before any name-resolution ambiguity) — deliberately
@@ -1639,6 +1618,9 @@ int main(void) {
         bool ok5 = run_repl_line(&c, &vm, "arr = [1, 2, 3]\n");
         check(ok5, "REPL line 5 ('arr = [1, 2, 3]') ran without error");
 
+        bool ok6 = run_repl_line(&c, &vm, "label = \"kept\"\n");
+        check(ok6, "REPL line 6 ('label = \"kept\"') ran without error");
+
         mode = MODE_SHELL;
         bool no_leak = true;
         for (int i = 0; i < 50; i++) {
@@ -1646,6 +1628,8 @@ int main(void) {
         }
         mode = MODE_RUN;
         check(no_leak, "50 sequential bare 'length(arr)' statements (auto-printed in shell mode) all ran without error — proves each one's temp register is actually freed, not leaked; FRAME_REGISTERS is only 128, so a real leak would have failed well before the 50th");
+        check(string_eq(var_of(&vm, &c, "label"), "kept"),
+              "label is still the string \"kept\" after 50 later lines ran -- a run must not retag live top-level registers");
 
         chunk_free(&c);
     }
