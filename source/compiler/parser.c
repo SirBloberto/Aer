@@ -929,6 +929,17 @@ static void invalidate_register(int reg) {
     note_slot_written(reg);
 }
 
+/* invalidate_register plus what the register's value was known to be -- its shape and the parameter
+   it was indexed from -- for a register about to take a value nothing is known about. */
+static void forget_register(int reg) {
+    if (reg >= 0 && reg < FRAME_REGISTERS) {
+        P.regs.reg_known_shape[reg] = NULL;
+        P.regs.reg_known_element_shape[reg] = NULL;
+        P.regs.alias_source_param[reg] = -1;
+    }
+    invalidate_register(reg);
+}
+
 /* Compile-time field lookup against a known Shape, resolving offset and type from the Shape's own
    arrays instead of vm_resolve_field_by_shape's runtime lookup. False means the field is absent;
    callers fall back to the generic opcode, which reports the source-level mistake correctly.
@@ -3444,16 +3455,8 @@ static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
         int rk_rhs = parse_binary(c, 0);
         if (parse_had_error)
             return;
-        /* Same P.regs.reg_known_shape invalidation as the plain-assignment tail above -- `reg`'s value
-           is about to change (e.g. `bodies += extra_bodies`), so any shape hint on it is no longer
-           trustworthy. alias_source_param and reg_known_element_shape cleared alongside it now too
-           (earlier omissions here -- the plain-assignment tail clears all three); see
-           invalidate_register's own comment for why safe_loop_item_regs needs the same treatment. */
-        P.regs.reg_known_shape[reg] = NULL;
-        P.regs.reg_known_element_shape[reg] = NULL;
-        P.regs.reg_elem_kind[reg] = RAWK_NONE;
-        P.regs.alias_source_param[reg] = -1;
-        invalidate_register(reg);
+        /* `bodies += extra_bodies` changes what reg holds, so nothing known about it survives. */
+        forget_register(reg);
         emit_binary(c, reg, compound_assign_ops[i].op, reg, rk_rhs);
         release_if_top(rk_rhs);
         return;
@@ -4587,11 +4590,7 @@ static void parse_for_in(Chunk* c, unsigned int loop_var_name) {
        whatever last used it. This loop's own PREP/LOOP is about to start overwriting it every
        iteration regardless of what THIS loop turns out to prove, so any stale fact must be cleared
        before this loop's own body (or its own bound_safe/start_safe below) can be compiled. */
-    P.regs.reg_known_shape[item_reg] = NULL;
-    P.regs.reg_known_element_shape[item_reg] = NULL;
-    P.regs.reg_elem_kind[item_reg] = RAWK_NONE;
-    P.regs.alias_source_param[item_reg] = -1;
-    invalidate_register(item_reg);
+    forget_register(item_reg);
     /* invalidate_register cannot catch loop_var_name reusing the length_tracked_name NAME itself
        (`for n in 0..1000:` after `n = length(bodies)`) -- var_slot returns a bare register number,
        indistinguishable from a new one. This loop overwrites that register every iteration, so a
@@ -4648,16 +4647,8 @@ static void parse_for_in_pair(Chunk* c, unsigned int key_name, unsigned int val_
     if (val_reg < 0)
         return;
     /* Same name-shadowing reasoning as parse_for_in's own identical block just above. */
-    P.regs.reg_known_shape[key_reg] = NULL;
-    P.regs.reg_known_element_shape[key_reg] = NULL;
-    P.regs.reg_elem_kind[key_reg] = RAWK_NONE;
-    P.regs.alias_source_param[key_reg] = -1;
-    invalidate_register(key_reg);
-    P.regs.reg_known_shape[val_reg] = NULL;
-    P.regs.reg_known_element_shape[val_reg] = NULL;
-    P.regs.reg_elem_kind[val_reg] = RAWK_NONE;
-    P.regs.alias_source_param[val_reg] = -1;
-    invalidate_register(val_reg);
+    forget_register(key_reg);
+    forget_register(val_reg);
     /* Same length_tracked_name-by-NAME reasoning as parse_for_in's own identical check. */
     if (P.proof.length_tracked_valid && (key_name == P.proof.length_tracked_name || val_name == P.proof.length_tracked_name)) {
         P.proof.length_tracked_valid = false;
