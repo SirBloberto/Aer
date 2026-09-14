@@ -302,29 +302,15 @@ static void scan_symbols(const char* text) {
     }
 }
 
-/* Mirrors parser.c's own module_call_id/module_fn_id tables (kept in sync by hand -- a small,
-   rarely-changing list, not the kind of thing worth a shared header for). */
-typedef struct {
-    const char* module;
-    const char* fns[16];
-} ModuleFns;
-static const ModuleFns MODULE_FNS[] = {
-    {"math",
-     {"sqrt", "pow", "floor", "ceil", "abs", "min", "max", "sin", "cos", "log", "log2", "log10", "pi",
-      "round", "tan", "exp"}},
-    {"random", {"random", "randint", "seed", "choice", "shuffle", NULL}},
-    {"string",
-     {"upper", "lower", "trim", "contains", "split", "starts_with", "ends_with", "repeat", "replace", "join",
-      "index_of", NULL}},
-    {"time", {"now", "strftime", "sleep", "parse", NULL}},
-    {"json", {"encode", "decode", NULL}},
-    {"collection", {"append", "delete", "copy", "insert", "index_of", "keys", "sort", NULL}},
-    {"net", {"connect", "send", "recv", "close", NULL}},
-    {"regex", {"match", "find", "replace", NULL}},
-    {"actor", {"spawn", "send", "receive", "call", NULL}},
-    {"scheduler", {"add", "run", NULL}},
-    {"io", {"read", "write", "append", "exists", "remove", "stdin", "args", NULL}},
-    {NULL, {NULL}}};
+/* Completion labels: every function the compiler resolves by module name, from the same lists it uses. */
+static const char* const MODULE_FUNCTION_NAMES[] = {
+#define AER_FN_NAME(module, name, fn_id) name,
+    AER_MODULE_FUNCTIONS(AER_FN_NAME)
+#undef AER_FN_NAME
+#define AER_IO_NAME(name, handler) name,
+    AER_IO_FUNCTIONS(AER_IO_NAME)
+#undef AER_IO_NAME
+};
 
 /* Method handlers                                                      */
 
@@ -461,13 +447,11 @@ static void handle_completion(const char* msg) {
 
     APPEND("{\"jsonrpc\":\"2.0\",\"id\":%ld,\"result\":[", id);
     bool first = true;
-    for (int m = 0; MODULE_FNS[m].module; m++) {
-        for (int f = 0; MODULE_FNS[m].fns[f]; f++) {
-            if (!first)
-                APPEND(",");
-            first = false;
-            APPEND("{\"label\":\"%s\",\"kind\":3}", MODULE_FNS[m].fns[f]);
-        }
+    for (size_t f = 0; f < sizeof(MODULE_FUNCTION_NAMES) / sizeof(*MODULE_FUNCTION_NAMES); f++) {
+        if (!first)
+            APPEND(",");
+        first = false;
+        APPEND("{\"label\":\"%s\",\"kind\":3}", MODULE_FUNCTION_NAMES[f]);
     }
     if (text) {
         for (int i = 0; i < symbol_count; i++) {

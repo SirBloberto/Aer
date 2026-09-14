@@ -252,14 +252,7 @@ void aer_io_set_args(int argc, char** argv) {
 }
 
 void aer_io_register(void) {
-    aer_register_function("io", "read", io_read, NULL);
-    aer_register_function("io", "write", io_write, NULL);
-    aer_register_function("io", "append", io_append, NULL);
-    aer_register_function("io", "exists", io_exists, NULL);
-    aer_register_function("io", "remove", io_remove, NULL);
-    aer_register_function("io", "stdin", io_stdin, NULL);
-    aer_register_function("io", "args", io_args, NULL);
-    aer_register_function("io", "basename", io_basename, NULL);
-    aer_register_function("io", "dirname", io_dirname, NULL);
-    aer_register_function("io", "join", io_join, NULL);
+#define AER_IO_REGISTER(name, handler) aer_register_function("io", name, handler, NULL);
+    AER_IO_FUNCTIONS(AER_IO_REGISTER)
+#undef AER_IO_REGISTER
 }

@@ -30,6 +30,21 @@ bool aer_scheduler_module_call(VM* vm, int fn_id, int arg_count);
 /* Takes Chunk* unlike the others -- encoding a struct instance needs its field names. */
 bool aer_json_call(VM* vm, Chunk* c, int fn_id, int arg_count);
 
+/* io's functions, as (spelling, handler). io registers as a host module rather than a native one,
+   so it is outside AER_MODULE_FUNCTIONS; aer_io_register and the language server's completions both
+   expand this list. */
+#define AER_IO_FUNCTIONS(X)                                                                                  \
+    X("read", io_read)                                                                                       \
+    X("write", io_write)                                                                                     \
+    X("append", io_append)                                                                                   \
+    X("exists", io_exists)                                                                                   \
+    X("remove", io_remove)                                                                                   \
+    X("stdin", io_stdin)                                                                                     \
+    X("args", io_args)                                                                                       \
+    X("basename", io_basename)                                                                               \
+    X("dirname", io_dirname)                                                                                 \
+    X("join", io_join)
+
 /* Registers the "io" module via aer_register_function -- called once per process by vm_init()
    (vm.c's ensure_io_registered), the same always-on status every other stdlib module already has.
    Declared here rather than called directly so aer_register_function's generic mechanism stays

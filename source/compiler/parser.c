@@ -4647,95 +4647,16 @@ static int module_call_id(AerString* name) {
     return CALL_MODULE_DYNAMIC;
 }
 
-/* Every module function's spelling and its wire id. A table rather than a chain of comparisons:
-   the chain WAS this table, written out one branch at a time. The length is a column because
-   sizeof gives a literal's length only where the literal still is, not through the table's
-   char pointer. */
-#define MODFN(mod, lit, id) {mod, lit, sizeof(lit) - 1, id}
+/* Every module function's spelling and wire id, expanded from aer_abi.h's AER_MODULE_FUNCTIONS. The
+   length is a column because sizeof gives a literal's length only where the literal still is, not
+   through the table's char pointer. */
+#define MODFN(mod, lit, id) {CALL_MODULE_##mod, lit, sizeof(lit) - 1, id},
 static const struct {
     int module_id;
     const char* name;
     unsigned int length;
     int fn_id;
-} module_functions[] = {
-    MODFN(CALL_MODULE_MATH, "sqrt", FN_MATH_SQRT),
-    MODFN(CALL_MODULE_MATH, "pow", FN_MATH_POW),
-    MODFN(CALL_MODULE_MATH, "floor", FN_MATH_FLOOR),
-    MODFN(CALL_MODULE_MATH, "ceil", FN_MATH_CEIL),
-    MODFN(CALL_MODULE_MATH, "abs", FN_MATH_ABS),
-    MODFN(CALL_MODULE_MATH, "min", FN_MATH_MIN),
-    MODFN(CALL_MODULE_MATH, "max", FN_MATH_MAX),
-    MODFN(CALL_MODULE_MATH, "sin", FN_MATH_SIN),
-    MODFN(CALL_MODULE_MATH, "cos", FN_MATH_COS),
-    MODFN(CALL_MODULE_MATH, "log", FN_MATH_LOG),
-    MODFN(CALL_MODULE_MATH, "log2", FN_MATH_LOG2),
-    MODFN(CALL_MODULE_MATH, "log10", FN_MATH_LOG10),
-    MODFN(CALL_MODULE_MATH, "pi", FN_MATH_PI),
-    MODFN(CALL_MODULE_MATH, "round", FN_MATH_ROUND),
-    MODFN(CALL_MODULE_MATH, "tan", FN_MATH_TAN),
-    MODFN(CALL_MODULE_MATH, "exp", FN_MATH_EXP),
-    MODFN(CALL_MODULE_MATH, "asin", FN_MATH_ASIN),
-    MODFN(CALL_MODULE_MATH, "acos", FN_MATH_ACOS),
-    MODFN(CALL_MODULE_MATH, "atan", FN_MATH_ATAN),
-    MODFN(CALL_MODULE_MATH, "atan2", FN_MATH_ATAN2),
-    MODFN(CALL_MODULE_RANDOM, "random", FN_RANDOM_RANDOM),
-    MODFN(CALL_MODULE_RANDOM, "randint", FN_RANDOM_RANDINT),
-    MODFN(CALL_MODULE_RANDOM, "seed", FN_RANDOM_SEED),
-    MODFN(CALL_MODULE_RANDOM, "choice", FN_RANDOM_CHOICE),
-    MODFN(CALL_MODULE_RANDOM, "shuffle", FN_RANDOM_SHUFFLE),
-    MODFN(CALL_MODULE_STRING, "upper", FN_STRING_UPPER),
-    MODFN(CALL_MODULE_STRING, "lower", FN_STRING_LOWER),
-    MODFN(CALL_MODULE_STRING, "trim", FN_STRING_TRIM),
-    MODFN(CALL_MODULE_STRING, "contains", FN_STRING_CONTAINS),
-    MODFN(CALL_MODULE_STRING, "split", FN_STRING_SPLIT),
-    MODFN(CALL_MODULE_STRING, "starts_with", FN_STRING_STARTS_WITH),
-    MODFN(CALL_MODULE_STRING, "ends_with", FN_STRING_ENDS_WITH),
-    MODFN(CALL_MODULE_STRING, "repeat", FN_STRING_REPEAT),
-    MODFN(CALL_MODULE_STRING, "replace", FN_STRING_REPLACE),
-    MODFN(CALL_MODULE_STRING, "join", FN_STRING_JOIN),
-    MODFN(CALL_MODULE_STRING, "to_integer", FN_STRING_TO_INTEGER),
-    MODFN(CALL_MODULE_STRING, "to_float", FN_STRING_TO_FLOAT),
-    MODFN(CALL_MODULE_STRING, "index_of", FN_STRING_INDEX_OF),
-    MODFN(CALL_MODULE_TIME, "now", FN_TIME_NOW),
-    MODFN(CALL_MODULE_TIME, "strftime", FN_TIME_STRFTIME),
-    MODFN(CALL_MODULE_TIME, "sleep", FN_TIME_SLEEP),
-    MODFN(CALL_MODULE_TIME, "parse", FN_TIME_PARSE),
-    MODFN(CALL_MODULE_TIME, "to_parts", FN_TIME_TO_PARTS),
-    MODFN(CALL_MODULE_TIME, "from_parts", FN_TIME_FROM_PARTS),
-    MODFN(CALL_MODULE_JSON, "encode", FN_JSON_ENCODE),
-    MODFN(CALL_MODULE_JSON, "decode", FN_JSON_DECODE),
-    MODFN(CALL_MODULE_COLLECTION, "append", FN_COLLECTION_APPEND),
-    MODFN(CALL_MODULE_COLLECTION, "delete", FN_COLLECTION_DELETE),
-    MODFN(CALL_MODULE_COLLECTION, "copy", FN_COLLECTION_COPY),
-    MODFN(CALL_MODULE_COLLECTION, "insert", FN_COLLECTION_INSERT),
-    MODFN(CALL_MODULE_COLLECTION, "index_of", FN_COLLECTION_INDEX_OF),
-    MODFN(CALL_MODULE_COLLECTION, "keys", FN_COLLECTION_KEYS),
-    MODFN(CALL_MODULE_COLLECTION, "sort", FN_COLLECTION_SORT),
-    MODFN(CALL_MODULE_COLLECTION, "reserve", FN_COLLECTION_RESERVE),
-    MODFN(CALL_MODULE_COLLECTION, "sum", FN_COLLECTION_SUM),
-    MODFN(CALL_MODULE_COLLECTION, "min", FN_COLLECTION_MIN),
-    MODFN(CALL_MODULE_COLLECTION, "max", FN_COLLECTION_MAX),
-    MODFN(CALL_MODULE_COLLECTION, "group_sum", FN_COLLECTION_GROUP_SUM),
-    MODFN(CALL_MODULE_NET, "connect", FN_NET_CONNECT),
-    MODFN(CALL_MODULE_NET, "send", FN_NET_SEND),
-    MODFN(CALL_MODULE_NET, "recv", FN_NET_RECV),
-    MODFN(CALL_MODULE_NET, "close", FN_NET_CLOSE),
-    MODFN(CALL_MODULE_NET, "listen", FN_NET_LISTEN),
-    MODFN(CALL_MODULE_NET, "accept", FN_NET_ACCEPT),
-    MODFN(CALL_MODULE_REGEX, "match", FN_REGEX_MATCH),
-    MODFN(CALL_MODULE_REGEX, "find", FN_REGEX_FIND),
-    MODFN(CALL_MODULE_REGEX, "replace", FN_REGEX_REPLACE),
-    MODFN(CALL_MODULE_REGEX, "find_all", FN_REGEX_FIND_ALL),
-    MODFN(CALL_MODULE_ACTOR, "spawn", FN_ACTOR_SPAWN),
-    MODFN(CALL_MODULE_ACTOR, "send", FN_ACTOR_SEND),
-    MODFN(CALL_MODULE_ACTOR, "receive", FN_ACTOR_RECEIVE),
-    MODFN(CALL_MODULE_ACTOR, "call", FN_ACTOR_CALL),
-    MODFN(CALL_MODULE_ACTOR, "keep", FN_ACTOR_KEEP),
-    MODFN(CALL_MODULE_ACTOR, "kept", FN_ACTOR_KEPT),
-    MODFN(CALL_MODULE_ACTOR, "give", FN_ACTOR_GIVE),
-    MODFN(CALL_MODULE_SCHEDULER, "add", FN_SCHEDULER_ADD),
-    MODFN(CALL_MODULE_SCHEDULER, "run", FN_SCHEDULER_RUN),
-};
+} module_functions[] = {AER_MODULE_FUNCTIONS(MODFN)};
 #undef MODFN
 
 /* A literal identifier, never ambiguous, so resolvable once here. FN_ID_UNKNOWN for anything

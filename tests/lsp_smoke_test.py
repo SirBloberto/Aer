@@ -80,6 +80,8 @@ comp = recv()
 labels = [item["label"] for item in comp.get("result", [])]
 check("sqrt" in labels, "completion includes math.sqrt")
 check("connect" in labels, "completion includes other modules' functions too (net.connect)")
+check("group_sum" in labels, "completion includes every compiler-known function (collection.group_sum)")
+check("basename" in labels, "completion includes io's host-registered functions (io.basename)")
 
 # 5. go-to-definition on a user-defined function call
 send("textDocument/didOpen", {"textDocument": {"uri": "file:///def.aer", "text": GOOD_SOURCE}})
