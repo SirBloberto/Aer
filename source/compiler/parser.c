@@ -3067,201 +3067,182 @@ static void parse_assign_destructuring(Chunk* c, unsigned int name_idx) {
     }
 }
 /* `x = ...`, including the raw-slot promotion a numeric value earns. */
-static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
-    if (consume(TOKEN_ASSIGN)) {
-        /* Watches for a self-reference during the RHS parse -- see self_ref_watch_name's own
-           comment (top of file) for why and what consumes self_ref_watch_seen just below. */
-        P.self_ref_watch_name = name_idx;
-        P.self_ref_watch_seen = false;
-        int rk_val = parse_binary(c, 0);
-        if (parse_had_error)
-            return;
+/* Puts a raw value into dest_slot: re-points the arithmetic that produced it when that is still the
+   last instruction, else a raw move. Frees src_slot if it was a temp. */
+static void emit_raw_move(Chunk* c, int src_slot, int dest_slot, RawKind kind) {
+    if (src_slot == dest_slot)
+        return;
+    if (!retarget_raw_write(c, src_slot, dest_slot, kind))
+        chunk_emit(c, PACK3(kind == RAWK_INT ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL, dest_slot, src_slot, 0));
+    raw_release_if_top(src_slot);
+}
 
-        /* Tracks/invalidates length_tracked_name -- see P.proof.last_length_call_result_reg's own
-           comment. Equality against rk_val (the FINAL, fully-parsed RHS) rather than clearing this
-           at every possible intervening op site: any further operation applied on top of the
-           length() call allocates its own new register, so `x = length(p) + 1` naturally fails
-           this check (rk_val is the ADD's dest, not length()'s), exactly as `x = length(p)` alone
-           naturally passes it -- same self-correcting equality trick as index_alias.dest_reg. */
-        if (P.proof.last_length_call_result_reg >= 0 && rk_val == P.proof.last_length_call_result_reg) {
-            P.proof.length_tracked_name = name_idx;
-            P.proof.length_tracked_valid = true;
-            P.proof.length_tracked_source_reg = P.proof.last_length_call_arg_reg;
-        } else if (P.proof.length_tracked_valid && name_idx == P.proof.length_tracked_name) {
-            P.proof.length_tracked_valid = false;
+/* `x = length(arr)` starts tracking x as arr's length; any other assignment to a tracked x stops it.
+   Keyed on the final RHS register -- `x = length(p) + 1` lands in the ADD's register, not length()'s --
+   the same self-correcting equality index_alias.dest_reg uses. */
+static void note_length_assignment(unsigned int name_idx, int rk_val) {
+    if (P.proof.last_length_call_result_reg >= 0 && rk_val == P.proof.last_length_call_result_reg) {
+        P.proof.length_tracked_name = name_idx;
+        P.proof.length_tracked_valid = true;
+        P.proof.length_tracked_source_reg = P.proof.last_length_call_arg_reg;
+    } else if (P.proof.length_tracked_valid && name_idx == P.proof.length_tracked_name) {
+        P.proof.length_tracked_valid = false;
+    }
+}
+
+/* A new name's first assignment: a raw slot when outside any if/else branch and the RHS is provably
+   int/real. True once the assignment is done or an error reported; false leaves it to be boxed. */
+static bool try_declare_raw_variable(Chunk* c, unsigned int name_idx, int rk_val) {
+    /* Checked before this path registers the name directly, bypassing var_slot's identical check. */
+    if (P.function_depth > 0) {
+        for (int i = 0; i < P.global_count; i++) {
+            if (P.global_names[i] == name_idx) {
+                error_at("'%s' is a top-level variable — not accessible inside a function; pass it "
+                         "as a parameter (or rename)",
+                         aer_as_string(c->pool[name_idx])->data);
+                return true;
+            }
         }
+    }
+    /* Not gated on function_depth, so top-level qualifies: frame 0's registers are linked at full
+       capacity for the VM's life and aer_vm_reset_for_reuse never touches them. */
+    RawKind rhs_kind = rk_raw_kind(c, rk_val);
+    if (P.branch_depth != 0 || rhs_kind == RAWK_NONE)
+        return false;
+    int slot = slot_reserve_one(rhs_kind);
+    if (slot < 0)
+        return false;
+    int src_slot = raw_materialize(c, rk_val, rhs_kind);
+    if (src_slot < 0) {
+        raw_unreserve_one(rhs_kind); /* budget exhausted mid-materialize: fall through to boxed */
+        return false;
+    }
+    emit_raw_move(c, src_slot, slot, rhs_kind);
+    P.var_names[P.var_count] = name_idx;
+    P.var_regs[P.var_count] = slot;
+    P.regs.var_kind[P.var_count] = (rhs_kind == RAWK_INT) ? VAR_RAW_INT : VAR_RAW_REAL;
+    P.var_count++;
+    /* Mirrors var_slot's own registration, which this path bypasses: without it a top-level int/real is
+       invisible to the shadow ban. */
+    if (P.function_depth == 0 && P.global_count < FRAME_REGISTERS) {
+        P.global_names[P.global_count] = name_idx;
+        P.global_regs[P.global_count] = slot;
+        P.global_count++;
+    }
+    return true;
+}
 
-        /* Looked up after parsing the RHS -- a self-referential first assignment creates the name as
-           a side effect of parsing it, always boxed, so checking existence now naturally folds
-           that case into the ordinary path. */
-        int existing_idx = -1;
-        for (int i = 0; i < P.var_count; i++)
-            if (P.var_names[i] == name_idx) {
-                existing_idx = i;
-                break;
-            }
-
-        if (existing_idx < 0) {
-            /* Checked before the raw-eligible fast path could register the name directly, bypassing
-               var_slot's own identical check. */
-            if (P.function_depth > 0) {
-                for (int i = 0; i < P.global_count; i++) {
-                    if (P.global_names[i] == name_idx) {
-                        error_at("'%s' is a top-level variable — not accessible inside a function; pass it "
-                                 "as a parameter (or rename)",
-                                 aer_as_string(c->pool[name_idx])->data);
-                        return;
-                    }
-                }
-            }
-            /* Raw storage iff outside any if/else branch and the RHS is provably int/real -- not
-               gated on function_depth, so top-level qualifies. Safe there because frame 0's
-               registers are linked at full capacity for the VM's life and aer_vm_reset_for_reuse
-               never touches them. global_regs[] only compares register numbers, never dereferences. */
-            RawKind rhs_kind = rk_raw_kind(c, rk_val);
-            if (P.branch_depth == 0 && rhs_kind != RAWK_NONE) {
-                int slot = slot_reserve_one(rhs_kind);
-                if (slot >= 0) {
-                    int src_slot = raw_materialize(c, rk_val, rhs_kind);
-                    if (src_slot < 0) {
-                        /* Budget exhausted mid-materialize -- release the reservation, fall through to
-                           boxed. */
-                        raw_unreserve_one(rhs_kind);
-                    } else {
-                        if (src_slot != slot) {
-                            /* Direct analog of the boxed path's "reg != rk_val -> MOVE" case. */
-                            if (!retarget_raw_write(c, src_slot, slot, rhs_kind)) {
-                                Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
-                                chunk_emit(c, PACK3(move_op, slot, src_slot, 0));
-                            }
-                            raw_release_if_top(src_slot);
-                        }
-                        P.var_names[P.var_count] = name_idx;
-                        P.var_regs[P.var_count] = slot;
-                        P.regs.var_kind[P.var_count] = (rhs_kind == RAWK_INT) ? VAR_RAW_INT : VAR_RAW_REAL;
-                        P.var_count++;
-                        /* Mirrors var_slot's own registration, which this path bypasses. Without it a
-                           top-level int/real is invisible to the shadow ban, so a function could
-                           silently declare a local of the same name -- the exact behaviour the ban
-                           exists to reject, and which still errored for a top-level string or array. */
-                        if (P.function_depth == 0 && P.global_count < FRAME_REGISTERS) {
-                            P.global_names[P.global_count] = name_idx;
-                            P.global_regs[P.global_count] = slot;
-                            P.global_count++;
-                        }
-                        return;
-                    }
-                }
-            }
-        } else if (P.regs.var_kind[existing_idx] != VAR_BOXED) {
-            /* Stays raw (writes in place, no shadow) whenever the new value is the same raw kind --
-               the slot's identity never changes, so there's no phi/merge ambiguity to avoid.
-               Otherwise shadows to a fresh boxed register -- var_slot must never be called here,
-               since it would return the stale raw slot index as if it were a plain register. */
-            RawKind rhs_kind = rk_raw_kind(c, rk_val);
-            VarKind cur = P.regs.var_kind[existing_idx];
-            bool same_kind = (cur == VAR_RAW_INT && rhs_kind == RAWK_INT) ||
-                             (cur == VAR_RAW_REAL && rhs_kind == RAWK_REAL);
-            if (same_kind) {
-                int dest_slot = P.var_regs[existing_idx];
-                /* A statically-typed write is still a write: a loop-safety proof keyed on this
-                   register, or a tracked length, stops holding. Its non-negativity does not --
-                   see note_slot_written. */
-                note_slot_written(dest_slot);
-                int src_slot = raw_materialize(c, rk_val, rhs_kind);
-                if (src_slot >= 0) {
-                    if (src_slot != dest_slot) {
-                        if (!retarget_raw_write(c, src_slot, dest_slot, rhs_kind)) {
-                            Opcode move_op = (rhs_kind == RAWK_INT) ? OP_RAW_MOVE_INT : OP_RAW_MOVE_REAL;
-                            chunk_emit(c, PACK3(move_op, dest_slot, src_slot, 0));
-                        }
-                        raw_release_if_top(src_slot);
-                    }
-                    return;
-                }
-                /* Budget exhausted materializing the RHS -- fall through to the shadow path. */
-            }
-            /* Mirrors var_slot's register-claiming but rebinds in place. A looped self-referential
-               shadow (`total = total + x`) must refuse to compile: the RHS reading the old raw value
-               was already emitted and would re-read a slot nothing writes anymore. Gated on
-               self_ref_watch_seen rather than loop_depth, since a reassignment that doesn't read the
-               old value has nothing stale to re-read. */
-            if (P.loop_depth > 0 && P.self_ref_watch_seen) {
-                return error_at(
-                    "This assignment would change '%s' from a fixed numeric type to a different type, "
-                    "but it's inside a loop — not supported. If you're accumulating with +, -, or *, "
-                    "use the compound form ('%s += ...' etc.) instead — it doesn't have this "
-                    "restriction. Otherwise, restructure so the type change happens outside any loop.",
-                    aer_as_string(c->pool[name_idx])->data, aer_as_string(c->pool[name_idx])->data);
-            }
-            rk_val = drop_raw_marks(rk_val);
-            if (P.slot_floor >= P.raw_real_next) {
-                return error_at("Too many variables (max %d)", FRAME_REGISTERS);
-            }
-            int new_reg = P.slot_floor;
-            P.slot_floor++;
-            P.slot_next = P.slot_floor;
-            P.var_regs[existing_idx] = new_reg;
-            P.regs.var_kind[existing_idx] = VAR_BOXED;
-            /* No P.global_regs update needed -- see ensure_boxed's identical reasoning: this path
-               only runs on a currently-raw-tracked name, which can never be in P.global_names. */
-            if (rk_val & RK_CONST_FLAG) {
-                emit_loadk(c, new_reg, (unsigned int)(rk_val & ~RK_CONST_FLAG));
-            } else if (new_reg != rk_val) {
-                emit_move(c, new_reg, rk_val);
-                release_if_top(rk_val);
-            }
+/* Reassigning a raw variable: in place when the new value is the same raw kind, else shadowed by a
+   fresh boxed register. var_slot must never be called here -- it would return the raw slot as if it
+   were a plain register. */
+static void assign_raw_variable(Chunk* c, unsigned int name_idx, int existing_idx, int rk_val) {
+    RawKind rhs_kind = rk_raw_kind(c, rk_val);
+    VarKind cur = P.regs.var_kind[existing_idx];
+    if ((cur == VAR_RAW_INT && rhs_kind == RAWK_INT) || (cur == VAR_RAW_REAL && rhs_kind == RAWK_REAL)) {
+        int dest_slot = P.var_regs[existing_idx];
+        /* A typed write still ends any loop proof or tracked length keyed on this register. */
+        note_slot_written(dest_slot);
+        int src_slot = raw_materialize(c, rk_val, rhs_kind);
+        if (src_slot >= 0) {
+            emit_raw_move(c, src_slot, dest_slot, rhs_kind);
             return;
         }
-
-        /* Unchanged existing behavior. rk_val is boxed first in case it's raw-flagged. */
-        rk_val = drop_raw_marks(rk_val);
-        int reg = var_slot(c, name_idx);
-        if (reg < 0)
-            return; /* error_at already called */
-        /* Read before anything clears it. A `[numeric; count]` literal is built straight into the
-           register var_slot then hands this name, so source and destination are usually the SAME
-           one -- and invalidate_register below would wipe the fact this line is preserving. */
-        bool rhs_plain_reg = !(rk_val & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) &&
-                             rk_val >= 0 && rk_val < FRAME_REGISTERS;
-        RawKind rhs_elem = rhs_plain_reg ? P.regs.reg_elem_kind[rk_val] : RAWK_NONE;
-        /* Preserved across invalidate_register for the same reason rhs_elem is: the literal was
-           usually built straight into the register this name is about to be given. */
-        /* See invalidate_safe_loop_reg's own comment -- without this, `reg` staying on
-           safe_loop_item_regs after this reassignment would let a later arr[reg].field inside the
-           same loop body keep trusting an index register that may no longer hold what the loop's
-           own PREP/LOOP put there. */
-        invalidate_register(reg);
-        /* Cleared unconditionally before either branch: only parse_function_body's initial seed
-           deserves a surviving "my elements are this shape" fact. Without this, reassigning a
-           specialized array-of-structs parameter and indexing through a fresh alias resolves the
-           stale shape's field offset -- reachable type confusion. */
-        P.regs.reg_known_element_shape[reg] = NULL;
-        /* var_slot returns the same register for an already-declared name, so a reassigned
-           shape-sensitive parameter would keep a hint that may no longer hold. Clear it by default
-           -- always safe -- unless the RHS was exactly `some_param[idx]`, the one-hop alias pattern
-           SPEC_KIND_ARRAY_OF_STRUCTS needs, where the parameter's element shape propagates onto the
-           alias instead. Consumed immediately so a freed-and-reused temp can't match later. */
-        if (rk_val == P.index_alias.dest_reg && P.index_alias.dest_reg >= 0) {
-            P.regs.reg_known_shape[reg] = P.index_alias.elem_shape;
-            P.regs.alias_source_param[reg] = P.index_alias.src_param;
-        } else {
-            P.regs.reg_known_shape[reg] = NULL;
-            P.regs.alias_source_param[reg] = -1;
-        }
-        P.index_alias.dest_reg = -1;
-        P.regs.reg_elem_kind[reg] = rhs_elem;
-        if (rk_val & RK_CONST_FLAG) {
-            emit_loadk(c, reg, (unsigned int)(rk_val & ~RK_CONST_FLAG));
-        } else if (reg != rk_val) {
-            emit_move(c, reg, rk_val);
-            /* Checked after var_slot (which may have just raised the floor), so this correctly recognizes
-               rk_val as no-longer-a-temp in the common case. */
-            release_if_top(rk_val);
-        }
-        /* reg == rk_val: the RHS already landed where var_slot reserved -- skip the no-op MOVE. */
+        /* Budget exhausted materializing the RHS -- fall through to the shadow path. */
+    }
+    /* A looped self-referential shadow (`total = total + x`) must refuse to compile: the RHS already
+       emitted reads the old raw slot, which nothing writes anymore. Gated on self_ref_watch_seen,
+       since a reassignment that does not read the old value has nothing stale to re-read. */
+    if (P.loop_depth > 0 && P.self_ref_watch_seen) {
+        error_at("This assignment would change '%s' from a fixed numeric type to a different type, "
+                 "but it's inside a loop — not supported. If you're accumulating with +, -, or *, "
+                 "use the compound form ('%s += ...' etc.) instead — it doesn't have this "
+                 "restriction. Otherwise, restructure so the type change happens outside any loop.",
+                 aer_as_string(c->pool[name_idx])->data, aer_as_string(c->pool[name_idx])->data);
         return;
     }
+    rk_val = drop_raw_marks(rk_val);
+    if (P.slot_floor >= P.raw_real_next) {
+        error_at("Too many variables (max %d)", FRAME_REGISTERS);
+        return;
+    }
+    int new_reg = P.slot_floor;
+    P.slot_floor++;
+    P.slot_next = P.slot_floor;
+    P.var_regs[existing_idx] = new_reg;
+    P.regs.var_kind[existing_idx] = VAR_BOXED;
+    /* No global_regs update: a raw-tracked name is never in global_names (see ensure_boxed). */
+    if (rk_val & RK_CONST_FLAG) {
+        emit_loadk(c, new_reg, (unsigned int)(rk_val & ~RK_CONST_FLAG));
+    } else if (new_reg != rk_val) {
+        emit_move(c, new_reg, rk_val);
+        release_if_top(rk_val);
+    }
+}
+
+/* An ordinary boxed assignment, through var_slot. */
+static void assign_boxed_variable(Chunk* c, unsigned int name_idx, int rk_val) {
+    rk_val = drop_raw_marks(rk_val);
+    int reg = var_slot(c, name_idx);
+    if (reg < 0)
+        return; /* error_at already called */
+    /* Read before invalidate_register wipes it: a `[numeric; count]` literal is usually built straight
+       into the register var_slot hands this name, so source and destination are the same one. */
+    bool rhs_plain_reg = !(rk_val & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)) && rk_val >= 0 &&
+                         rk_val < FRAME_REGISTERS;
+    RawKind rhs_elem = rhs_plain_reg ? P.regs.reg_elem_kind[rk_val] : RAWK_NONE;
+    /* Without this, `reg` staying on safe_loop_item_regs would let a later arr[reg].field in the same
+       loop body trust an index register that may no longer hold what the loop put there. */
+    invalidate_register(reg);
+    /* Only parse_function_body's initial seed deserves a surviving element-shape fact; keeping one here
+       lets a reassigned array-of-structs parameter resolve a stale field offset -- type confusion. */
+    P.regs.reg_known_element_shape[reg] = NULL;
+    /* A reassigned shape-sensitive name keeps no shape hint, unless the RHS was exactly
+       `some_param[idx]` -- the one-hop alias SPEC_KIND_ARRAY_OF_STRUCTS needs -- whose element shape
+       propagates onto it. Consumed at once, so a freed-and-reused temp cannot match later. */
+    if (rk_val == P.index_alias.dest_reg && P.index_alias.dest_reg >= 0) {
+        P.regs.reg_known_shape[reg] = P.index_alias.elem_shape;
+        P.regs.alias_source_param[reg] = P.index_alias.src_param;
+    } else {
+        P.regs.reg_known_shape[reg] = NULL;
+        P.regs.alias_source_param[reg] = -1;
+    }
+    P.index_alias.dest_reg = -1;
+    P.regs.reg_elem_kind[reg] = rhs_elem;
+    if (rk_val & RK_CONST_FLAG) {
+        emit_loadk(c, reg, (unsigned int)(rk_val & ~RK_CONST_FLAG));
+    } else if (reg != rk_val) {
+        emit_move(c, reg, rk_val);
+        /* After var_slot, which may have raised the floor, so rk_val is correctly no longer a temp. */
+        release_if_top(rk_val);
+    }
+}
+
+static void parse_assign_plain(Chunk* c, unsigned int name_idx) {
+    if (!consume(TOKEN_ASSIGN))
+        return;
+    /* Watches for a self-reference during the RHS parse -- see self_ref_watch_name (top of file). */
+    P.self_ref_watch_name = name_idx;
+    P.self_ref_watch_seen = false;
+    int rk_val = parse_binary(c, 0);
+    if (parse_had_error)
+        return;
+    note_length_assignment(name_idx, rk_val);
+
+    /* Looked up after the RHS: a self-referential first assignment creates the name while parsing it,
+       always boxed, which folds that case into the ordinary path. */
+    int existing_idx = -1;
+    for (int i = 0; i < P.var_count; i++)
+        if (P.var_names[i] == name_idx) {
+            existing_idx = i;
+            break;
+        }
+    if (existing_idx < 0 && try_declare_raw_variable(c, name_idx, rk_val))
+        return;
+    if (existing_idx >= 0 && P.regs.var_kind[existing_idx] != VAR_BOXED) {
+        assign_raw_variable(c, name_idx, existing_idx, rk_val);
+        return;
+    }
+    assign_boxed_variable(c, name_idx, rk_val);
 }
 /* `x += ...` and friends. Answers whether it matched an operator, since a bare name followed
    by something else is still a legal statement. */
