@@ -499,11 +499,8 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
 
 /* Type helpers                                                         */
 
-/* A struct reports its declared name, a packed array that name plus "[]". type_names[] is indexed
-   by ValueType, so it must stay as long as the entries not handled specially above. */
+/* A struct reports its declared name, a packed array that name plus "[]". */
 static const char* vm_type_name(Chunk* c, AerVal v) {
-    static const char* type_names[] = {"null",   "boolean",  "integer", "float",
-                                       "string", "function", "array",   "hashtable"};
     if (aer_type(v) == TYPE_STRUCT)
         return aer_as_string(c->pool[aer_as_struct(v)->shape->name])->data;
     if (aer_type(v) == TYPE_PACKED_ARRAY) {
@@ -514,14 +511,13 @@ static const char* vm_type_name(Chunk* c, AerVal v) {
         return buf;
     }
     if (aer_type(v) == TYPE_TYPED_ARRAY) {
-        static const char* elem_names[] = {"int32", "float32", "integer", "float", "boolean"};
         static char buf[32];
-        snprintf(buf, sizeof(buf), "%s[]", elem_names[aer_as_typed_array(v)->elem_kind]);
+        snprintf(buf, sizeof(buf), "%s[]", aer_typed_elem_names[aer_as_typed_array(v)->elem_kind]);
         return buf;
     }
     if (aer_type(v) == TYPE_RESULT)
         return "Result";
-    return type_names[aer_type(v)];
+    return aer_value_type_names[aer_type(v)];
 }
 
 static inline __attribute__((always_inline)) bool vm_truthy(AerVal v) {
@@ -1952,14 +1948,14 @@ static inline bool vm_typed_array_accepts(TypedArrayElemKind kind, AerVal val) {
 }
 
 static bool vm_typed_array_check(Chunk* c, TypedArrayElemKind kind, AerVal val) {
-    static const char* array_names[] = {"an int32[]", "a float32[]", "an integer[]", "a float[]",
-                                        "a boolean[]"};
     if (vm_typed_array_accepts(kind, val))
         return true;
+    const char* elem = aer_typed_elem_names[kind];
     if (kind == TYPED_ELEM_INT32 && aer_type(val) == TYPE_INTEGER)
         error("Value %lld out of range for an int32[] array", (long long)aer_as_int(val));
     else
-        error("Cannot assign a %s into %s array", vm_type_name(c, val), array_names[kind]);
+        error("Cannot assign a %s into %s %s[] array", vm_type_name(c, val), elem[0] == 'i' ? "an" : "a",
+              elem);
     return false;
 }
 
@@ -4764,10 +4760,7 @@ HANDLER(array_repeat)
         for (unsigned int i = 0; i < shape->field_count; i++) {
             ValueType ft = shape->field_types[i];
             if (ft != TYPE_INTEGER && ft != TYPE_REAL && ft != TYPE_BOOLEAN) {
-                const char* got = ft == TYPE_ANY     ? "untyped (no annotation)"
-                                  : ft == TYPE_ARRAY ? "array"
-                                  : ft == TYPE_DICT  ? "hashtable"
-                                                     : "string";
+                const char* got = ft == TYPE_ANY ? "untyped (no annotation)" : aer_value_type_names[ft];
                 error("'%s' cannot be packed into an array: field '%s' must be integer/float/boolean, not %s",
                       aer_as_string(c->pool[shape->name])->data,
                       aer_as_string(c->pool[shape->field_names[i]])->data, got);

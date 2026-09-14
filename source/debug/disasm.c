@@ -351,12 +351,12 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
     ROW(OP_RAW_REAL_TO_INT, "rawi = (int)rawr, truncating", {AT_A, F_RAWI}, {AT_B, F_RAWR}),
 };
 
-static const char* const module_names[] = {"math",  "random",     "string", "time",
-                                           "json",  "collection", "net",    "regex",
-                                           "actor", "scheduler",  "dynamic"};
-static const char* const builtin_names[] = {"length", "print", "type", "assert", "panic", "Result"};
-static const char* const struct_field_type_names[] = {"null",   "boolean",  "integer", "float",
-                                                      "string", "function", "array",   "hashtable"};
+#define AER_NAME_OF_MODULE(id, str, call) str,
+static const char* const module_names[] = {AER_NATIVE_MODULES(AER_NAME_OF_MODULE) "dynamic"};
+#undef AER_NAME_OF_MODULE
+#define AER_NAME_OF_BUILTIN(id, str) str,
+static const char* const builtin_names[] = {AER_BUILTINS(AER_NAME_OF_BUILTIN)};
+#undef AER_NAME_OF_BUILTIN
 
 /* NULL for a byte that names no opcode -- reachable only from a corrupt chunk or a walk that
    has lost sync, and in both cases printing beats indexing past the table. */
@@ -571,7 +571,7 @@ static void print_variable_operands(FILE* out, Chunk* c, unsigned int offset, Op
     for (int i = 0; i < field_count; i++) {
         uint32_t name_default_word = code_at(c, pos++);
         /* Low byte is the ValueType tag, bit 0x100 the narrow (i/f-suffixed-literal) marker.
-           Masking is required, not cosmetic: indexing struct_field_type_names[] with the unmasked
+           Masking is required, not cosmetic: indexing aer_value_type_names[] with the unmasked
            word reads out of bounds the moment a narrow field's 0x100 bit is set. */
         uint32_t ftype_word = code_at(c, pos++);
         int ftype = (int)(ftype_word & 0xFF);
@@ -579,7 +579,7 @@ static void print_variable_operands(FILE* out, Chunk* c, unsigned int offset, Op
             fprintf(out, ", ");
         fprintf(out, "%s", pool_name_at(c, UNPACK_2X16_HI(name_default_word)));
         if (ftype != TYPE_ANY)
-            fprintf(out, ": %s%s", name_or_q(struct_field_type_names, AER_LEN(struct_field_type_names), (uint32_t)ftype),
+            fprintf(out, ": %s%s", name_or_q(aer_value_type_names, TYPE_STRUCT, (uint32_t)ftype),
                     (ftype_word & 0x100) ? " (narrow)" : "");
         fprintf(out, "=");
         print_pool_value(out, pool_at(c, UNPACK_2X16_LO(name_default_word)));

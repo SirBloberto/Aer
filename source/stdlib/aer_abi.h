@@ -207,13 +207,18 @@ enum { AER_NATIVE_MODULES(AER_MODULE_ID) CALL_MODULE_DYNAMIC };
     X(SCHEDULER, "add", FN_SCHEDULER_ADD)                                                                    \
     X(SCHEDULER, "run", FN_SCHEDULER_RUN)
 
-/* OP_CALL_BUILTIN's trailing builtin_id -- no DYNAMIC case; is_builtin_name gates every site. */
-#define CALL_BUILTIN_LENGTH 0
-#define CALL_BUILTIN_PRINT 1
-#define CALL_BUILTIN_TYPE 2
-#define CALL_BUILTIN_ASSERT 3
-#define CALL_BUILTIN_PANIC 4
-/* The only way AER source constructs a Result -- lets user functions join |>'s short-circuit. */
-#define CALL_BUILTIN_RESULT 5
+/* OP_CALL_BUILTIN's trailing builtin_id, in wire order. Result is the only way AER source constructs a
+   Result, which lets user functions join |>'s short-circuit. */
+#define AER_BUILTINS(X)                                                                                      \
+    X(LENGTH, "length")                                                                                      \
+    X(PRINT, "print")                                                                                        \
+    X(TYPE, "type")                                                                                          \
+    X(ASSERT, "assert")                                                                                      \
+    X(PANIC, "panic")                                                                                        \
+    X(RESULT, "Result")
+
+#define AER_BUILTIN_ID(name, str) CALL_BUILTIN_##name,
+enum { AER_BUILTINS(AER_BUILTIN_ID) };
+#undef AER_BUILTIN_ID
 
 #endif /* AER_ABI_H */

@@ -1,0 +1,5 @@
+struct Holder:
+    count = 0
+    seen = {}
+
+holders = [Holder(); 3] #!error: field 'seen' must be integer/float/boolean, not hashtable

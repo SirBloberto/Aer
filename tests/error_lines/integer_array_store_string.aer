@@ -1,0 +1,2 @@
+ints = [0; 4]
+ints[1] = "x" #!error: Cannot assign a string into an integer[] array

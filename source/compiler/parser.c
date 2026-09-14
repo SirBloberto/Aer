@@ -4940,36 +4940,25 @@ static void parse_import(Chunk* c) {
     chunk_add_import(c, path_buf + bind_start, bind_len, path_buf, path_len);
 }
 
-/* Checked against a fixed list, consistent with every other call target resolving at compile
-   time. Struct construction is deliberately excluded -- already resolved via is_struct_name. */
-/* Reserved global function names: they always resolve to the builtin, so they cannot be variables
-   either (var_slot rejects them). integer/float/boolean/string are here rather than being reserved
-   lexer tokens -- one mechanism, and three fewer keywords in the language. */
-static bool is_builtin_name(Chunk* c, unsigned int name_idx) {
-    AerString* s = aer_as_string(c->pool[name_idx]);
-    static const char* const names[] = {"length", "print",  "type",    "assert", "panic",
-                                        "Result", "string", "integer", "float",  "boolean"};
-    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+/* The builtin a name resolves to, or -1. */
+static int builtin_call_id(AerString* name) {
+#define AER_NAME_OF_BUILTIN(id, str) str,
+    static const char* const names[] = {AER_BUILTINS(AER_NAME_OF_BUILTIN)};
+#undef AER_NAME_OF_BUILTIN
+    for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) {
         size_t len = strlen(names[i]);
-        if (s->length == len && strncmp(s->data, names[i], len) == 0)
-            return true;
+        if (name->length == len && strncmp(name->data, names[i], len) == 0)
+            return i;
     }
-    return false;
+    return -1;
 }
 
-/* Mirrors module_call_id below -- only called after is_builtin_name confirms a match. */
-static int builtin_call_id(AerString* name) {
-    if (name->length == 6 && strncmp(name->data, "length", 6) == 0)
-        return CALL_BUILTIN_LENGTH;
-    if (name->length == 5 && strncmp(name->data, "print", 5) == 0)
-        return CALL_BUILTIN_PRINT;
-    if (name->length == 4 && strncmp(name->data, "type", 4) == 0)
-        return CALL_BUILTIN_TYPE;
-    if (name->length == 6 && strncmp(name->data, "assert", 6) == 0)
-        return CALL_BUILTIN_ASSERT;
-    if (name->length == 6 && strncmp(name->data, "Result", 6) == 0)
-        return CALL_BUILTIN_RESULT;
-    return CALL_BUILTIN_PANIC;
+/* Reserved global function names: a builtin or a cast, resolved at compile time, so they cannot be
+   variables either (var_slot rejects them). The casts are names rather than lexer tokens -- one
+   mechanism, and three fewer keywords in the language. Struct construction is resolved separately, via is_struct_name. */
+static bool is_builtin_name(Chunk* c, unsigned int name_idx) {
+    AerString* name = aer_as_string(c->pool[name_idx]);
+    return builtin_call_id(name) >= 0 || cast_type_for_name(name) != CAST_NONE;
 }
 
 /* Same contiguous-register materialization and result-register reuse as parse_call, emitting
