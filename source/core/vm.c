@@ -210,6 +210,13 @@ void aer_gc_stats(unsigned int* live_cells, unsigned int* minor_collections,
 
 /* Runtime error context -- the callbacks error.c installs              */
 
+/* The line of the instruction that ends just before `offset`. A handler's recorded pc and a frame's return
+   address both sit past the instruction they belong to -- the next statement's first word when that
+   instruction ends its own -- so one word back is always inside it. */
+static unsigned int line_before(Chunk* c, unsigned int offset) {
+    return chunk_line_for_offset(c, offset > 0 ? offset - 1 : 0);
+}
+
 static unsigned int lookup_runtime_line(void) {
     VM* vm = vm_active_error_vm();
     if (!vm)
@@ -219,10 +226,7 @@ static unsigned int lookup_runtime_line(void) {
        has not entered vm_run_slice yet. */
     if (!vm->error_pc || !vm->chunk)
         return chunk_line_for_offset(vm->chunk, vm->ip);
-    /* error_pc is past the words the handler already read, which is the next statement's first word when
-       the faulting instruction ends its own; one word back is always inside that instruction. */
-    unsigned int offset = (unsigned int)(vm->error_pc - vm->chunk->code);
-    return chunk_line_for_offset(vm->chunk, offset > 0 ? offset - 1 : 0);
+    return line_before(vm->chunk, (unsigned int)(vm->error_pc - vm->chunk->code));
 }
 
 static const char* lookup_runtime_filename(void) {
@@ -273,7 +277,7 @@ static unsigned int lookup_runtime_stack_trace(char* out, unsigned int out_size)
             hit_synthetic_boundary = true;
             break;
         }
-        unsigned int line = chunk_line_for_offset(c, vm->call_stack[depth].return_ip);
+        unsigned int line = line_before(c, vm->call_stack[depth].return_ip);
         const char* note =
             tail_call_note(vm->call_stack[depth - 1].tail_calls_collapsed, note_buf, sizeof(note_buf));
         int n;

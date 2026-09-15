@@ -1,0 +1,5 @@
+function boom(n):
+    x = 10 // n #!error: Division by zero
+
+boom(0) #!called-from
+w = 1

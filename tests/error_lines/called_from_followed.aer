@@ -1,0 +1,5 @@
+function halve(n):
+    return 10 // n #!error: Division by zero
+
+v = halve(0) #!called-from
+w = 1

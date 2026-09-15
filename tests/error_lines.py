@@ -27,6 +27,9 @@ MARKER = "#!error:"
 # Optional, at most once per case: the function the report must name. A specialized body runs at
 # its own code offset, so getting this wrong renames a hot function to "?" and nothing else notices.
 IN_MARKER = "#!in:"
+# Optional, at most once per case, on the call itself: the line the first "called from line N" must name.
+CALLED_MARKER = "#!called-from"
+CALLER = re.compile(r"called from line (\d+)")
 
 # "<path>:<line>: Error: msg", or "<path>:<line>, in fn(): Error: msg" when it faulted inside a
 # call. The path is matched loosely because it is whatever was passed on the command line.
@@ -38,18 +41,26 @@ PARSE_REPORT = re.compile(r"^(?P<path>.+?):(?P<line>\d+) \| .*\n.*\nError: (?P<m
 
 
 def expectation(path):
-    """(line number, expected message substring, expected function name or None)."""
+    """(line number, expected message substring, expected function name or None, caller line or None)."""
     found = []
     want_fn = None
+    want_caller = None
     with open(path, encoding="utf-8") as fh:
         for n, text in enumerate(fh, 1):
             if IN_MARKER in text:
                 want_fn = text.split(IN_MARKER, 1)[1].strip()
+            elif CALLED_MARKER in text:
+                want_caller = n
             elif MARKER in text:
                 found.append((n, text.split(MARKER, 1)[1].strip()))
     if len(found) != 1:
         sys.exit("%s: expected exactly one %s marker, found %d" % (path, MARKER, len(found)))
-    return found[0][0], found[0][1], want_fn
+    return found[0][0], found[0][1], want_fn, want_caller
+
+
+def caller_line(out):
+    mc = CALLER.search(out)
+    return int(mc.group(1)) if mc else None
 
 
 def main():
@@ -73,7 +84,7 @@ def main():
     failures = 0
     for name in cases:
         path = os.path.join(CASES, name)
-        want_line, want_msg, want_fn = expectation(path)
+        want_line, want_msg, want_fn, want_caller = expectation(path)
         r = subprocess.run([binary, path], capture_output=True, text=True)
         out = r.stdout + r.stderr
 
@@ -93,6 +104,9 @@ def main():
         elif want_fn is not None and m.groupdict().get("fn") != want_fn:
             print("FAIL %-34s reported function %r, expected %r"
                   % (name, m.groupdict().get("fn"), want_fn))
+            failures += 1
+        elif want_caller is not None and caller_line(out) != want_caller:
+            print("FAIL %-34s called from line %s, expected %d" % (name, caller_line(out), want_caller))
             failures += 1
         else:
             print("ok   %-34s line %d: %s" % (name, got_line, got_msg))
