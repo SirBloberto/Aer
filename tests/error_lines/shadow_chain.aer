@@ -1,0 +1,5 @@
+grid = [0; 3]
+
+function mark():
+    grid[0] = 1 #!error: 'grid' is a top-level variable
+    return 0

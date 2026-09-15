@@ -1,0 +1,5 @@
+total = 0
+
+function bump():
+    total += 1 #!error: 'total' is a top-level variable
+    return 0

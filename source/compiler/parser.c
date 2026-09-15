@@ -974,12 +974,9 @@ static bool shape_find_field(Shape* shape, unsigned int field_name_idx, unsigned
 /* Nonzero while compiling an if/else branch -- disqualifies raw storage (see P.regs.var_kind). A
    real counter since if/else nests. */
 
-/* True (after reporting the error) if name_idx is a top-level variable and the caller is
-   inside a function body -- see the Parser struct's own field comments (top of file) for how
-   global_names/function_depth track this. */
-static bool report_if_shadowed_global(Chunk* c, unsigned int name_idx) {
-    if (P.function_depth == 0)
-        return false;
+/* True (after reporting the error) if name_idx is a top-level variable. Report it while the offending
+   name is still the current token, or the error names a later line. */
+static bool report_top_level_name(Chunk* c, unsigned int name_idx) {
     for (int i = 0; i < P.global_count; i++) {
         if (P.global_names[i] == name_idx) {
             error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a "
@@ -989,6 +986,12 @@ static bool report_if_shadowed_global(Chunk* c, unsigned int name_idx) {
         }
     }
     return false;
+}
+
+/* report_top_level_name, when the caller is inside a function body -- see the Parser struct's own
+   field comments (top of file) for how global_names/function_depth track this. */
+static bool report_if_shadowed_global(Chunk* c, unsigned int name_idx) {
+    return P.function_depth > 0 && report_top_level_name(c, name_idx);
 }
 
 /* P.slot_floor, not P.var_count: a for-loop promotes the floor for its own iteration registers
@@ -1033,17 +1036,6 @@ static int var_slot(Chunk* c, unsigned int name_idx) {
         P.global_count++;
     }
     return reg;
-}
-
-/* Non-creating -- a match here is a top-level variable, grounds for the shadow-ban error, not
-   a read/write. */
-static bool global_lookup(unsigned int name_idx, int* out_reg) {
-    for (int i = 0; i < P.global_count; i++)
-        if (P.global_names[i] == name_idx) {
-            *out_reg = P.global_regs[i];
-            return true;
-        }
-    return false;
 }
 
 /* Non-creating counterpart to var_slot -- `name += expr` needs an existing value, so it must
@@ -3110,17 +3102,6 @@ static void note_length_assignment(unsigned int name_idx, int rk_val) {
 /* A new name's first assignment: a raw slot when outside any if/else branch and the RHS is provably
    int/real. True once the assignment is done or an error reported; false leaves it to be boxed. */
 static bool try_declare_raw_variable(Chunk* c, unsigned int name_idx, int rk_val) {
-    /* Checked before this path registers the name directly, bypassing var_slot's identical check. */
-    if (P.function_depth > 0) {
-        for (int i = 0; i < P.global_count; i++) {
-            if (P.global_names[i] == name_idx) {
-                error_at("'%s' is a top-level variable — not accessible inside a function; pass it "
-                         "as a parameter (or rename)",
-                         aer_as_string(c->pool[name_idx])->data);
-                return true;
-            }
-        }
-    }
     /* Not gated on function_depth, so top-level qualifies: frame 0's registers are linked at full
        capacity for the VM's life and aer_vm_reset_for_reuse never touches them. */
     RawKind rhs_kind = rk_raw_kind(c, rk_val);
@@ -3376,17 +3357,9 @@ static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
             return;
         }
 
-        /* An undefined name is a compile error -- the same shadow ban as a bare reference to a
-           top-level global. */
+        /* An undefined name is a compile error; parse_assignment has already reported a top-level one. */
         int reg;
         if (!var_lookup(name_idx, &reg)) {
-            int dummy_reg;
-            if (P.function_depth > 0 && global_lookup(name_idx, &dummy_reg)) {
-                error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a "
-                         "parameter (or rename)",
-                         aer_as_string(c->pool[name_idx])->data);
-                return;
-            }
             error_at("Compound assignment target must already have a value (no assigning to an undefined "
                      "name this way)");
             return;
@@ -3404,26 +3377,13 @@ static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
 }
 /* A pipe chain from a bare name used as a statement -- a lookup that never creates. */
 static void parse_assign_pipe(Chunk* c, unsigned int name_idx) {
-    if (equal(TOKEN_PIPE)) {
-        int reg;
-        unsigned int lhs_start = c->count;
-        if (!var_lookup_rk(name_idx, &reg)) {
-            int dummy_reg;
-            if (P.function_depth > 0 && global_lookup(name_idx, &dummy_reg)) {
-                error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a "
-                         "parameter (or rename)",
-                         aer_as_string(c->pool[name_idx])->data);
-                return;
-            }
-            return error_at("'%s' is not defined (a pipe chain's source must already have a value)",
-                            aer_as_string(c->pool[name_idx])->data);
-        }
-        int rk_result = parse_binary_ops(c, 0, reg, lhs_start);
-        discard_statement_result(c, rk_result);
-        return;
-    }
-
-    error_at("Only plain 'name = expr' or compound assignment is supported here (no field access)");
+    int reg;
+    unsigned int lhs_start = c->count;
+    if (!var_lookup_rk(name_idx, &reg))
+        return error_at("'%s' is not defined (a pipe chain's source must already have a value)",
+                        aer_as_string(c->pool[name_idx])->data);
+    int rk_result = parse_binary_ops(c, 0, reg, lhs_start);
+    discard_statement_result(c, rk_result);
 }
 
 static void parse_assignment(Chunk* c, unsigned int name_idx) {
@@ -3434,6 +3394,10 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         return error_at("'%s' is a reserved function name and can't be used as a variable",
                         aer_as_string(c->pool[name_idx])->data);
     }
+    /* Before the right-hand side is read, while the name is still on this line. */
+    int existing_reg;
+    if (!var_lookup(name_idx, &existing_reg) && report_if_shadowed_global(c, name_idx))
+        return;
     /* Multiple RHS values pack into a real array (OP_ARRAY_NEW); each target reads its own index
        back via OP_INDEX_GET. Targets resolve via var_slot BEFORE the RHS is parsed -- creating a
        variable after a temp is live could hand out that temp's own register. */
@@ -3740,12 +3704,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
     bool obj_is_base; /* true while obj_reg is still name_idx's own permanent register */
     if (var_lookup(name_idx, &obj_reg)) {
         obj_is_base = true;
-    } else if (P.function_depth > 0 && global_lookup(name_idx, &obj_reg)) {
-        /* `name` isn't a local of the current function but IS an existing top-level global --
-           same shadow-ban error var_slot enforces for a bare reference. */
-        error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a parameter "
-                 "(or rename)",
-                 aer_as_string(c->pool[name_idx])->data);
+    } else if (report_if_shadowed_global(c, name_idx)) {
         return;
     } else {
         return error_at("'%s' is not defined (an indexed/field write target must already have a value)",
@@ -5035,15 +4994,8 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
        function -- reported immediately so it isn't mistaken for a forward reference. */
     int var_reg = -1;
     bool is_var = var_lookup(name_idx, &var_reg);
-    if (!is_var && P.function_depth > 0) {
-        int dummy_reg;
-        if (global_lookup(name_idx, &dummy_reg)) {
-            error_at("'%s' is a top-level variable — not accessible inside a function; pass it as a "
-                     "parameter (or rename)",
-                     aer_as_string(c->pool[name_idx])->data);
-            return 0;
-        }
-    }
+    if (!is_var && report_if_shadowed_global(c, name_idx))
+        return 0;
 
     bool is_struct = !is_var && is_struct_name(name_idx);
     unsigned int func_offset = 0, func_arity = 0, func_min_arity = 0, func_max_registers = 0;
@@ -5259,6 +5211,8 @@ static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal
                 return error_at("Too many parameters (max %d)", FRAME_REGISTERS);
             }
             param_names[param_count] = chunk_add_pool(c, token.value);
+            if (report_top_level_name(c, param_names[param_count]))
+                return;
             lex();
             if (consume(TOKEN_ASSIGN)) {
                 bool unused_narrow;

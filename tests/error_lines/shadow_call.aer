@@ -1,0 +1,4 @@
+helper = 5
+
+function run():
+    return helper(1) #!error: 'helper' is a top-level variable

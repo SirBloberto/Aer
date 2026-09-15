@@ -1,0 +1,5 @@
+label = "top"
+
+function rename():
+    label = "inner" #!error: 'label' is a top-level variable
+    return 0

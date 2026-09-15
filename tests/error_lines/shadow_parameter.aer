@@ -1,0 +1,4 @@
+limit = 1
+
+function clamp(limit): #!error: 'limit' is a top-level variable
+    return limit
