@@ -1407,47 +1407,52 @@ static const RawOpForm* raw_op_form(Opcode op) {
     return NULL;
 }
 
+/* With one raw real operand, unboxes the other into a raw slot so the result stays raw. Arithmetic only
+   (these reject a non-number anyway; `5 == "5"` must stay false), real only (OP_UNBOX_REAL widens an int,
+   an int slot cannot hold a real), and never a typed array, which `a * 2.0` broadcasts across. */
+static void unbox_other_side_real(Chunk* c, Opcode op, int* rk_lhs, RawKind* kind_lhs, int* rk_rhs,
+                                  RawKind* kind_rhs) {
+    if ((*kind_lhs == RAWK_NONE) == (*kind_rhs == RAWK_NONE) ||
+        !(op == OP_ADD || op == OP_SUB || op == OP_MUL))
+        return;
+    bool lhs_raw = (*kind_lhs != RAWK_NONE);
+    int boxed_rk = lhs_raw ? *rk_rhs : *rk_lhs;
+    int boxed_reg = drop_raw_marks(boxed_rk);
+    bool boxed_is_typed_array = !(boxed_rk & RK_CONST_FLAG) && boxed_reg >= 0 &&
+                                boxed_reg < FRAME_REGISTERS && P.regs.reg_elem_kind[boxed_reg] != RAWK_NONE;
+    if ((lhs_raw ? *kind_lhs : *kind_rhs) != RAWK_REAL || boxed_is_typed_array ||
+        (boxed_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG)))
+        return;
+    release_if_top(boxed_rk);
+    int tmp = slot_alloc(RAWK_REAL);
+    if (tmp < 0)
+        return;
+    chunk_emit(c, PACK3(OP_UNBOX_REAL, tmp, boxed_rk, 0));
+    if (lhs_raw) {
+        *rk_rhs = RK_RAW_REAL_FLAG | tmp;
+        *kind_rhs = RAWK_REAL;
+    } else {
+        *rk_lhs = RK_RAW_REAL_FLAG | tmp;
+        *kind_lhs = RAWK_REAL;
+    }
+}
+
+/* The raw-constant index a literal right operand folds to, when it fits `limit`; -1 otherwise. */
+static int rhs_constant_index(Chunk* c, int rk_rhs, RawKind kind, unsigned int limit) {
+    int const_rk;
+    if (!(rk_rhs & RK_CONST_FLAG) || !rawk_const_rk(c, rk_rhs, kind, &const_rk))
+        return -1;
+    unsigned int idx = (unsigned int)(const_rk & ~RK_CONST_FLAG);
+    return idx <= limit ? (int)idx : -1;
+}
+
 /* Returns false if the operator has no raw-native form (raw_op_forms) or the operand kinds mismatch,
    and the caller falls back to the boxed path. Bitwise, AND/OR and IN always stay boxed. */
 static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int* out_rk) {
     RawKind kind_lhs = rk_raw_kind(c, rk_lhs);
     RawKind kind_rhs = rk_raw_kind(c, rk_rhs);
 
-    /* One raw operand and one whose type nothing has proven: check the boxed side once into a raw
-       slot and let the rest be ordinary raw arithmetic, so the result stays raw and a local built
-       this way never has to shadow. Arithmetic only -- these operators reject a non-number on
-       either side anyway, so erroring at the unbox says the same thing one opcode earlier, which is
-       not true of equality (`5 == "5"` is false, not an error). */
-    if ((kind_lhs == RAWK_NONE) != (kind_rhs == RAWK_NONE) &&
-        (op == OP_ADD || op == OP_SUB || op == OP_MUL)) {
-        bool lhs_raw = (kind_lhs != RAWK_NONE);
-        int boxed_rk = lhs_raw ? rk_rhs : rk_lhs;
-        /* Real only. An integer raw side composed with a boxed real must promote the whole result
-           to real, which an int slot cannot hold -- OP_UNBOX_REAL widens an integer the same way
-           the boxed arithmetic does, so only that direction is safe here. */
-        /* A register known to hold a typed array is not a number awaiting an unbox: `a * 2.0`
-           broadcasts the scalar across it, so it has to stay on the boxed path that reaches
-           vm_typed_array_scalar_op. Unboxing it raised "Cannot apply this operator to float and
-           float32[]" one opcode early instead. */
-        int boxed_reg = drop_raw_marks(boxed_rk);
-        bool boxed_is_typed_array = !(boxed_rk & RK_CONST_FLAG) && boxed_reg >= 0 &&
-                                    boxed_reg < FRAME_REGISTERS && P.regs.reg_elem_kind[boxed_reg] != RAWK_NONE;
-        if ((lhs_raw ? kind_lhs : kind_rhs) == RAWK_REAL && !boxed_is_typed_array &&
-            !(boxed_rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))) {
-            release_if_top(boxed_rk);
-            int tmp = slot_alloc(RAWK_REAL);
-            if (tmp >= 0) {
-                chunk_emit(c, PACK3(OP_UNBOX_REAL, tmp, boxed_rk, 0));
-                if (lhs_raw) {
-                    rk_rhs = RK_RAW_REAL_FLAG | tmp;
-                    kind_rhs = RAWK_REAL;
-                } else {
-                    rk_lhs = RK_RAW_REAL_FLAG | tmp;
-                    kind_lhs = RAWK_REAL;
-                }
-            }
-        }
-    }
+    unbox_other_side_real(c, op, &rk_lhs, &kind_lhs, &rk_rhs, &kind_rhs);
     if (kind_lhs == RAWK_NONE || kind_rhs == RAWK_NONE || kind_lhs != kind_rhs)
         return false;
     bool int_kind = (kind_lhs == RAWK_INT);
@@ -1471,26 +1476,19 @@ static bool try_emit_binary_raw(Chunk* c, Opcode op, int rk_lhs, int rk_rhs, int
        preheader hoists anyway. A comparison is one per iteration, where the trade goes the other
        way. Only the right one: the swap form moves it left, where the field is a bare slot index. */
     int rhs_field = -1;
-    if (is_cmp && !swap_cmp && (rk_rhs & RK_CONST_FLAG)) {
-        int const_rk;
-        if (rawk_const_rk(c, rk_rhs, kind_lhs, &const_rk)) {
-            unsigned int idx = (unsigned int)(const_rk & ~RK_CONST_FLAG);
-            if (idx <= RK8_INDEX_MASK)
-                rhs_field = (int)(RK8_CONST_FLAG | idx);
-        }
+    if (is_cmp && !swap_cmp) {
+        int idx = rhs_constant_index(c, rk_rhs, kind_lhs, RK8_INDEX_MASK);
+        if (idx >= 0)
+            rhs_field = (int)(RK8_CONST_FLAG | (unsigned int)idx);
     }
     /* Same idea for integer +/-, but via a dedicated opcode whose C field is a bare index (see
        OP_RAW_ADD_INT_K). Worth it only because a recursive body re-runs the load it replaces on
        every call, where a loop's would have been hoisted once into the preheader. */
-    if (!is_cmp && int_kind && (raw_op == OP_RAW_ADD_INT || raw_op == OP_RAW_SUB_INT) &&
-        (rk_rhs & RK_CONST_FLAG)) {
-        int const_rk;
-        if (rawk_const_rk(c, rk_rhs, RAWK_INT, &const_rk)) {
-            unsigned int idx = (unsigned int)(const_rk & ~RK_CONST_FLAG);
-            if (idx <= 0xFFu) {
-                rhs_field = (int)idx;
-                raw_op = (raw_op == OP_RAW_ADD_INT) ? OP_RAW_ADD_INT_K : OP_RAW_SUB_INT_K;
-            }
+    if (!is_cmp && int_kind && (raw_op == OP_RAW_ADD_INT || raw_op == OP_RAW_SUB_INT)) {
+        int idx = rhs_constant_index(c, rk_rhs, RAWK_INT, 0xFFu);
+        if (idx >= 0) {
+            rhs_field = idx;
+            raw_op = (raw_op == OP_RAW_ADD_INT) ? OP_RAW_ADD_INT_K : OP_RAW_SUB_INT_K;
         }
     }
     int slot_rhs = -1;
