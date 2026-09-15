@@ -1,2 +1,2 @@
 flags = [false; 4]
-flags[1] = 1 #!error: into a boolean[] array
+flags[1] = 1 #!error: Cannot assign an integer into a boolean[] array

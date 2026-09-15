@@ -1919,15 +1919,20 @@ static inline bool vm_typed_array_accepts(TypedArrayElemKind kind, AerVal val) {
     return false;
 }
 
+/* The indefinite article for a type or element name: "an integer", "an int32", "a float", "a Point". */
+static const char* article_for(const char* name) {
+    return name[0] != '\0' && strchr("aeiouAEIOU", name[0]) ? "an" : "a";
+}
+
 static bool vm_typed_array_check(Chunk* c, TypedArrayElemKind kind, AerVal val) {
     if (vm_typed_array_accepts(kind, val))
         return true;
     const char* elem = aer_typed_elem_names[kind];
+    const char* got = vm_type_name(c, val);
     if (kind == TYPED_ELEM_INT32 && aer_type(val) == TYPE_INTEGER)
         error("Value %lld out of range for an int32[] array", (long long)aer_as_int(val));
     else
-        error("Cannot assign a %s into %s %s[] array", vm_type_name(c, val), elem[0] == 'i' ? "an" : "a",
-              elem);
+        error("Cannot assign %s %s into %s %s[] array", article_for(got), got, article_for(elem), elem);
     return false;
 }
 
