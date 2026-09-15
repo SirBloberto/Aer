@@ -2621,6 +2621,30 @@ static void compile_pipe_guard_end(Chunk* c, unsigned int patch_skip_call) {
     patch_jump(c, patch_over_skip, end);
 }
 
+/* The piped value as argument zero, then the parenthesized arguments after it, contiguous. Returns the
+   argument base, which is also the call's destination, or -1 once an error is reported. When `guarded`,
+   *guard_patch is the short-circuit guard compile_pipe_guard_end closes. */
+static int parse_pipe_args(Chunk* c, int lhs, bool guarded, int* arg_count, unsigned int* guard_patch) {
+    release_if_top(lhs);
+    int arg_reg_base = arg_materialize(c, lhs);
+    *guard_patch = guarded ? compile_pipe_guard_begin(c, arg_reg_base) : 0;
+
+    *arg_count = 1;
+    if (!equal(TOKEN_CLOSE_PARENTHESE)) {
+        do {
+            int rk = parse_binary(c, 0);
+            arg_materialize(c, rk);
+            (*arg_count)++;
+        } while (consume(TOKEN_COMMA));
+    }
+    require(TOKEN_CLOSE_PARENTHESE, "expected ')' after pipe call arguments");
+    if (parse_had_error)
+        return -1;
+    if (*arg_count > 1)
+        reg_free(*arg_count - 1);
+    return arg_reg_base;
+}
+
 /* Reuses parse_call's own resolution and arg_materialize directly -- the only new part is
    materializing `lhs` into argument zero first. */
 static int compile_pipe(Chunk* c, int lhs) {
@@ -2649,26 +2673,12 @@ static int compile_pipe(Chunk* c, int lhs) {
         if (parse_had_error)
             return lhs;
 
-        release_if_top(lhs);
-        int arg_reg_base = arg_materialize(c, lhs);
-        int dest = arg_reg_base;
-        unsigned int patch_skip_call = compile_pipe_guard_begin(c, dest);
-
-        int arg_count = 1;
-        if (!equal(TOKEN_CLOSE_PARENTHESE)) {
-            do {
-                int rk = parse_binary(c, 0);
-                arg_materialize(c, rk);
-                arg_count++;
-            } while (consume(TOKEN_COMMA));
-        }
-        require(TOKEN_CLOSE_PARENTHESE, "expected ')' after pipe call arguments");
-        if (parse_had_error)
+        int arg_count;
+        unsigned int patch_skip_call;
+        int dest = parse_pipe_args(c, lhs, true, &arg_count, &patch_skip_call);
+        if (dest < 0)
             return lhs;
-
-        if (arg_count > 1)
-            reg_free(arg_count - 1);
-        emit_module_call(c, dest, arg_reg_base, arg_count, module_idx, fn_idx, module_id, fn_id);
+        emit_module_call(c, dest, dest, arg_count, module_idx, fn_idx, module_id, fn_id);
         compile_pipe_guard_end(c, patch_skip_call);
         return dest;
     }
@@ -2696,30 +2706,16 @@ static int compile_pipe(Chunk* c, int lhs) {
     if (parse_had_error)
         return lhs;
 
-    release_if_top(lhs);
-    int arg_reg_base = arg_materialize(c, lhs);
-    int dest = arg_reg_base;
+    int arg_count;
+    unsigned int patch_skip_call;
     /* No reasonable meaning for short-circuiting a struct construction, so the guard is skipped. */
-    unsigned int patch_skip_call = is_struct ? 0 : compile_pipe_guard_begin(c, dest);
-
-    int arg_count = 1;
-    if (!equal(TOKEN_CLOSE_PARENTHESE)) {
-        do {
-            int rk = parse_binary(c, 0);
-            arg_materialize(c, rk);
-            arg_count++;
-        } while (consume(TOKEN_COMMA));
-    }
-    require(TOKEN_CLOSE_PARENTHESE, "expected ')' after pipe call arguments");
-    if (parse_had_error)
+    int dest = parse_pipe_args(c, lhs, !is_struct, &arg_count, &patch_skip_call);
+    if (dest < 0)
         return lhs;
-
-    if (arg_count > 1)
-        reg_free(arg_count - 1);
     if (is_struct) {
-        emit_struct_new(c, dest, name_idx, arg_reg_base, arg_count);
+        emit_struct_new(c, dest, name_idx, dest, arg_count);
     } else {
-        unsigned int patch_offset = emit_call(c, dest, func_offset, arg_reg_base, arg_count, func_index);
+        unsigned int patch_offset = emit_call(c, dest, func_offset, dest, arg_count, func_index);
         if (is_forward_ref)
             pending_call_add(name_idx, patch_offset, call_site_cursor);
         compile_pipe_guard_end(c, patch_skip_call);
