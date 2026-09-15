@@ -2157,6 +2157,26 @@ static bool vm_call_builtin(Chunk* c, int builtin_id, AerVal* args, int arg_coun
     return false;
 }
 
+/* Where an array index lands in [0, count), counting from the end when negative. */
+static inline bool vm_array_position(AerVal idx, unsigned int count, uint64_t* out) {
+    if (aer_type(idx) != TYPE_INTEGER)
+        return false;
+    int64_t i = aer_as_int(idx);
+    if (i < 0)
+        i += (int64_t)count;
+    if (i < 0 || (uint64_t)i >= count)
+        return false;
+    *out = (uint64_t)i;
+    return true;
+}
+
+static void vm_array_index_error(AerVal idx, unsigned int count) {
+    if (aer_type(idx) != TYPE_INTEGER)
+        error("Array index must be an integer");
+    else
+        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), count);
+}
+
 /* Shared by h_index_get and the fused index-get handlers -- same dispatch, bounds, and
    errors as the original inline body, returning the value instead of pushing it. */
 /* Writes through `out` (avoids a 16-byte stack round-trip returning by value -- see
@@ -2169,16 +2189,9 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
             *out = aer_null();
             return;
         }
-        if (aer_type(idx) != TYPE_INTEGER) {
-            error("Array index must be an integer");
-            *out = aer_null();
-            return;
-        }
-        int64_t i = aer_as_int(idx);
-        if (i < 0)
-            i += (int64_t)a->count;
-        if (i < 0 || (uint64_t)i >= a->count) {
-            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count);
+        uint64_t i;
+        if (!vm_array_position(idx, a->count, &i)) {
+            vm_array_index_error(idx, a->count);
             *out = aer_null();
             return;
         }
@@ -2242,16 +2255,9 @@ static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
         *out = aer_null();
     } else if (aer_type(obj) == TYPE_TYPED_ARRAY) {
         AerTypedArray* ta = aer_as_typed_array(obj);
-        if (aer_type(idx) != TYPE_INTEGER) {
-            error("Array index must be an integer");
-            *out = aer_null();
-            return;
-        }
-        int64_t i = aer_as_int(idx);
-        if (i < 0)
-            i += (int64_t)ta->count;
-        if (i < 0 || (uint64_t)i >= ta->count) {
-            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), ta->count);
+        uint64_t i;
+        if (!vm_array_position(idx, ta->count, &i)) {
+            vm_array_index_error(idx, ta->count);
             *out = aer_null();
             return;
         }
@@ -2309,15 +2315,9 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         if (a->shape) {
             return error("Struct fields are assigned with '.', not '[]'");
         }
-        if (aer_type(idx) != TYPE_INTEGER) {
-            return error("Array index must be an integer");
-        }
-        int64_t i = aer_as_int(idx);
-        if (i < 0)
-            i += (int64_t)a->count;
-        if (i < 0 || (uint64_t)i >= a->count) {
-            return error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), a->count);
-        }
+        uint64_t i;
+        if (!vm_array_position(idx, a->count, &i))
+            return vm_array_index_error(idx, a->count);
         gc_barrier_array(vm, a, (unsigned int)i, val);
         a->items[i] = val;
         /* Replacing an element can change whether this array is uniformly one struct shape --
@@ -2347,15 +2347,9 @@ static inline void vm_index_set_compute(VM* vm, AerVal obj, AerVal idx, AerVal v
         error("Strings are immutable — cannot assign to an index");
     } else if (aer_type(obj) == TYPE_TYPED_ARRAY) {
         AerTypedArray* ta = aer_as_typed_array(obj);
-        if (aer_type(idx) != TYPE_INTEGER) {
-            return error("Array index must be an integer");
-        }
-        int64_t i = aer_as_int(idx);
-        if (i < 0)
-            i += (int64_t)ta->count;
-        if (i < 0 || (uint64_t)i >= ta->count) {
-            return error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(idx), ta->count);
-        }
+        uint64_t i;
+        if (!vm_array_position(idx, ta->count, &i))
+            return vm_array_index_error(idx, ta->count);
         if (!vm_typed_array_check(vm->chunk, ta->elem_kind, val))
             return;
         unsigned int width = vm_typed_elem_width(ta->elem_kind);
@@ -2920,6 +2914,7 @@ static const OpHandler aer_handlers[256];
 #define vm_binary_cold(...) (SYNC_IP(), (vm_binary_cold)(__VA_ARGS__))
 #define vm_index_get_compute(...) (SYNC_IP(), (vm_index_get_compute)(__VA_ARGS__))
 #define vm_index_set_compute(...) (SYNC_IP(), (vm_index_set_compute)(__VA_ARGS__))
+#define vm_array_index_error(...) (SYNC_IP(), (vm_array_index_error)(__VA_ARGS__))
 #define vm_in(...) (SYNC_IP(), (vm_in)(__VA_ARGS__))
 #define vm_cast(...) (SYNC_IP(), (vm_cast)(__VA_ARGS__))
 #define vm_to_str(...) (SYNC_IP(), (vm_to_str)(__VA_ARGS__))
@@ -4299,15 +4294,9 @@ static inline __attribute__((always_inline)) unsigned char* vm_packed_raw_elem(V
         return NULL;
     }
     AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) {
-        error("Array index must be an integer");
-        return NULL;
-    }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0)
-        i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+    uint64_t i;
+    if (!vm_array_position(*idx, pa->count, &i)) {
+        vm_array_index_error(*idx, pa->count);
         return NULL;
     }
     return pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
@@ -4863,15 +4852,9 @@ SEPARATE_HANDLER(index_field_get_any_container)
     AerVal obj = registers[obj_reg];
     if (aer_type(obj) == TYPE_PACKED_ARRAY) {
         AerPackedArray* pa = aer_as_packed_array(obj);
-        if (aer_type(*idx) != TYPE_INTEGER) {
-            error("Array index must be an integer");
-            DISPATCH();
-        }
-        int64_t i = aer_as_int(*idx);
-        if (i < 0)
-            i += (int64_t)pa->count;
-        if (i < 0 || (uint64_t)i >= pa->count) {
-            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+        uint64_t i;
+        if (!vm_array_position(*idx, pa->count, &i)) {
+            vm_array_index_error(*idx, pa->count);
             DISPATCH();
         }
         int slot;
@@ -4935,15 +4918,9 @@ SEPARATE_HANDLER(index_field_set_any_container)
     AerVal obj = registers[obj_reg];
     if (aer_type(obj) == TYPE_PACKED_ARRAY) {
         AerPackedArray* pa = aer_as_packed_array(obj);
-        if (aer_type(*idx) != TYPE_INTEGER) {
-            error("Array index must be an integer");
-            DISPATCH();
-        }
-        int64_t i = aer_as_int(*idx);
-        if (i < 0)
-            i += (int64_t)pa->count;
-        if (i < 0 || (uint64_t)i >= pa->count) {
-            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+        uint64_t i;
+        if (!vm_array_position(*idx, pa->count, &i)) {
+            vm_array_index_error(*idx, pa->count);
             DISPATCH();
         }
         int slot;
@@ -5030,15 +5007,9 @@ HANDLER(index_field_compound)
     AerVal obj = registers[obj_reg];
     if (aer_type(obj) == TYPE_PACKED_ARRAY) {
         AerPackedArray* pa = aer_as_packed_array(obj);
-        if (aer_type(*idx) != TYPE_INTEGER) {
-            error("Array index must be an integer");
-            DISPATCH();
-        }
-        int64_t i = aer_as_int(*idx);
-        if (i < 0)
-            i += (int64_t)pa->count;
-        if (i < 0 || (uint64_t)i >= pa->count) {
-            error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+        uint64_t i;
+        if (!vm_array_position(*idx, pa->count, &i)) {
+            vm_array_index_error(*idx, pa->count);
             DISPATCH();
         }
         int slot;
@@ -5456,6 +5427,7 @@ static VmSliceResult h_halt(VM* vm, const uint32_t* pc, AerVal* registers, Chunk
 #undef vm_binary_cold
 #undef vm_index_get_compute
 #undef vm_index_set_compute
+#undef vm_array_index_error
 #undef vm_in
 #undef vm_cast
 #undef vm_to_str
