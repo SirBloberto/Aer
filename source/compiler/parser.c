@@ -2985,15 +2985,13 @@ static const struct {
 };
 #define COMPOUND_ASSIGN_OP_COUNT (int)(sizeof(compound_assign_ops) / sizeof(*compound_assign_ops))
 
-/* No indexed/field targets (out of scope). `name` is already consumed by the caller, which
-   decided between this, a bare call, and an indexed write via one token of lookahead. */
-/* Whether the next token opens a compound assignment. The handler consumes it; this only looks,
-   so the dispatcher can choose without the handler having to report back. */
-static bool at_compound_assign(void) {
+/* The compound_assign_ops index the next token opens, or -1. It only looks, so a dispatcher can
+   choose a handler and the handler consumes the token. */
+static int compound_assign_at(void) {
     for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++)
         if (equal(compound_assign_ops[i].tok))
-            return true;
-    return false;
+            return i;
+    return -1;
 }
 
 /* `a, b = ...`. Targets resolve BEFORE the right-hand side is parsed -- creating a variable
@@ -3336,44 +3334,41 @@ static void compound_assign_raw_variable(Chunk* c, unsigned int name_idx, int ex
 }
 
 static void parse_assign_compound(Chunk* c, unsigned int name_idx) {
-    for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
-        if (!consume(compound_assign_ops[i].tok))
-            continue;
+    Opcode op = compound_assign_ops[compound_assign_at()].op;
+    lex();
 
-        /* The RHS combines with the old value, never a fresh length() alone, so a tracked length ends. */
-        if (P.proof.length_tracked_valid && name_idx == P.proof.length_tracked_name)
-            P.proof.length_tracked_valid = false;
+    /* The RHS combines with the old value, never a fresh length() alone, so a tracked length ends. */
+    if (P.proof.length_tracked_valid && name_idx == P.proof.length_tracked_name)
+        P.proof.length_tracked_valid = false;
 
-        /* A raw target needs its own path: var_lookup would return its slot as a bare register number,
-           silently misread as a plain register. */
-        int existing_idx = -1;
-        for (int j = 0; j < P.var_count; j++)
-            if (P.var_names[j] == name_idx) {
-                existing_idx = j;
-                break;
-            }
-        if (existing_idx >= 0 && P.regs.var_kind[existing_idx] != VAR_BOXED) {
-            compound_assign_raw_variable(c, name_idx, existing_idx, compound_assign_ops[i].op);
-            return;
+    /* A raw target needs its own path: var_lookup would return its slot as a bare register number,
+       silently misread as a plain register. */
+    int existing_idx = -1;
+    for (int j = 0; j < P.var_count; j++)
+        if (P.var_names[j] == name_idx) {
+            existing_idx = j;
+            break;
         }
-
-        /* An undefined name is a compile error; parse_assignment has already reported a top-level one. */
-        int reg;
-        if (!var_lookup(name_idx, &reg)) {
-            error_at("Compound assignment target must already have a value (no assigning to an undefined "
-                     "name this way)");
-            return;
-        }
-
-        int rk_rhs = parse_binary(c, 0);
-        if (parse_had_error)
-            return;
-        /* `bodies += extra_bodies` changes what reg holds, so nothing known about it survives. */
-        forget_register(reg);
-        emit_binary(c, reg, compound_assign_ops[i].op, reg, rk_rhs);
-        release_if_top(rk_rhs);
+    if (existing_idx >= 0 && P.regs.var_kind[existing_idx] != VAR_BOXED) {
+        compound_assign_raw_variable(c, name_idx, existing_idx, op);
         return;
     }
+
+    /* An undefined name is a compile error; parse_assignment has already reported a top-level one. */
+    int reg;
+    if (!var_lookup(name_idx, &reg)) {
+        error_at("Compound assignment target must already have a value (no assigning to an undefined "
+                 "name this way)");
+        return;
+    }
+
+    int rk_rhs = parse_binary(c, 0);
+    if (parse_had_error)
+        return;
+    /* `bodies += extra_bodies` changes what reg holds, so nothing known about it survives. */
+    forget_register(reg);
+    emit_binary(c, reg, op, reg, rk_rhs);
+    release_if_top(rk_rhs);
 }
 /* A pipe chain from a bare name used as a statement -- a lookup that never creates. */
 static void parse_assign_pipe(Chunk* c, unsigned int name_idx) {
@@ -3386,6 +3381,8 @@ static void parse_assign_pipe(Chunk* c, unsigned int name_idx) {
     discard_statement_result(c, rk_result);
 }
 
+/* A statement starting with a bare name, already consumed; the caller chose this over a call or an
+   indexed/field write by one token of lookahead. */
 static void parse_assignment(Chunk* c, unsigned int name_idx) {
     /* Checked here rather than in var_slot: the raw-promotion path below registers a name itself and
        never calls var_slot, so `integer = 5` would slip through. A reserved name always resolves to
@@ -3405,7 +3402,7 @@ static void parse_assignment(Chunk* c, unsigned int name_idx) {
         return parse_assign_destructuring(c, name_idx);
     if (equal(TOKEN_ASSIGN))
         return parse_assign_plain(c, name_idx);
-    if (at_compound_assign())
+    if (compound_assign_at() >= 0)
         return parse_assign_compound(c, name_idx);
     if (equal(TOKEN_PIPE))
         return parse_assign_pipe(c, name_idx);
@@ -3560,33 +3557,30 @@ static bool compound_assign_field(Chunk* c, ChainTarget t, Opcode bin_op) {
 }
 
 static void parse_chain_compound(Chunk* c, ChainTarget t) {
-    for (int i = 0; i < COMPOUND_ASSIGN_OP_COUNT; i++) {
-        if (!consume(compound_assign_ops[i].tok))
-            continue;
+    Opcode op = compound_assign_ops[compound_assign_at()].op;
+    lex();
 
-        if (t.pending_is_field) {
-            if (!compound_assign_field(c, t, compound_assign_ops[i].op))
-                return;
-        } else {
-            int item_reg = reg_alloc();
-            emit_index_get(c, item_reg, t.obj_reg, t.pending_rk_idx);
+    if (t.pending_is_field) {
+        if (!compound_assign_field(c, t, op))
+            return;
+    } else {
+        int item_reg = reg_alloc();
+        emit_index_get(c, item_reg, t.obj_reg, t.pending_rk_idx);
 
-            int rk_rhs = parse_binary(c, 0);
-            if (parse_had_error)
-                return;
+        int rk_rhs = parse_binary(c, 0);
+        if (parse_had_error)
+            return;
 
-            emit_binary(c, item_reg, compound_assign_ops[i].op, item_reg, rk_rhs);
-            release_if_top(rk_rhs);
+        emit_binary(c, item_reg, op, item_reg, rk_rhs);
+        release_if_top(rk_rhs);
 
-            emit_index_set(c, t.obj_reg, t.pending_rk_idx, item_reg);
-            reg_free(1); /* item_reg */
-        }
-
-        release_if_top(t.pending_rk_idx);
-        if (!t.obj_is_base)
-            reg_free(1);
-        return;
+        emit_index_set(c, t.obj_reg, t.pending_rk_idx, item_reg);
+        reg_free(1); /* item_reg */
     }
+
+    release_if_top(t.pending_rk_idx);
+    if (!t.obj_is_base)
+        reg_free(1);
 }
 
 /* One hop along an assignment target's chain: reads the pending index/field step into a register,
@@ -3745,15 +3739,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
 
         bool no_more_chaining = !equal(TOKEN_OPEN_BRACKET) && !equal(TOKEN_DOT);
         bool is_plain_assign = equal(TOKEN_ASSIGN);
-        int compound_i = -1;
-        if (!is_plain_assign) {
-            for (int ci = 0; ci < COMPOUND_ASSIGN_OP_COUNT; ci++) {
-                if (equal(compound_assign_ops[ci].tok)) {
-                    compound_i = ci;
-                    break;
-                }
-            }
-        }
+        int compound_i = is_plain_assign ? -1 : compound_assign_at();
 
         if (no_more_chaining && (is_plain_assign || compound_i >= 0)) {
             if (emit_index_field_assign(c, obj_reg, pending_rk_idx, fused_field_idx, compound_i)) {
@@ -3796,7 +3782,7 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
     ChainTarget target = {obj_reg, obj_is_base, pending_is_field, pending_field_idx, pending_rk_idx};
     if (equal(TOKEN_ASSIGN))
         return parse_chain_store(c, target);
-    if (at_compound_assign())
+    if (compound_assign_at() >= 0)
         return parse_chain_compound(c, target);
 
     /* Finish the pending step as a GET, falling through to a general expression statement. */
