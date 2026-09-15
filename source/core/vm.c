@@ -4263,11 +4263,18 @@ static inline __attribute__((always_inline)) void raw_field_read(AerVal* dst, un
     }
 }
 
-static inline __attribute__((always_inline)) void raw_field_write(unsigned char* dst, AerVal src, RawWidth w) {
+static inline __attribute__((always_inline)) void raw_field_write(VM* vm, const uint32_t* pc,
+                                                                  unsigned char* dst, AerVal src,
+                                                                  RawWidth w) {
     switch (w) {
         case RAWW_INT: memcpy(dst, &src.as.i, 8); break;
         case RAWW_REAL: memcpy(dst, &src.as.d, 8); break;
-        case RAWW_INT32: vm_raw_write_int32(dst, src.as.i); break;
+        case RAWW_INT32:
+            if (vm_fits_narrow_field(TYPE_INTEGER, true, src))
+                vm_raw_write_int32(dst, src.as.i);
+            else
+                vm_check_narrow_field_write(TYPE_INTEGER, true, src); /* reports */
+            break;
         case RAWW_FLOAT32: vm_raw_write_float32(dst, src.as.d); break;
     }
 }
@@ -4342,10 +4349,14 @@ static inline __attribute__((always_inline)) bool raw_field_compound(VM* vm, con
             case OP_MUL: result = lhs * rhs.as.i; break;
             default: error("internal error: unsupported raw compound-assign op"); return false;
         }
-        if (w == RAWW_INT)
+        if (w == RAWW_INT) {
             memcpy(elem, &result, 8);
-        else
+        } else if (vm_fits_narrow_field(TYPE_INTEGER, true, aer_int(result))) {
             vm_raw_write_int32(elem, result);
+        } else {
+            vm_check_narrow_field_write(TYPE_INTEGER, true, aer_int(result));
+            return false;
+        }
     } else {
         double lhs, result;
         if (w == RAWW_REAL)
@@ -4378,7 +4389,7 @@ static inline __attribute__((always_inline)) void field_set_raw(VM* vm, const ui
                                             RawWidth w) {
     AerStruct* s = raw_field_struct(vm, pc, registers[UNPACK_A(op_word)]);
     if (s)
-        raw_field_write(s->fields + foffset, registers[src_slot], w);
+        raw_field_write(vm, pc, s->fields + foffset, registers[src_slot], w);
 }
 
 static inline __attribute__((always_inline)) void field_compound_raw(VM* vm, const uint32_t* pc, AerVal* registers,
@@ -4411,7 +4422,7 @@ static inline __attribute__((always_inline)) void index_field_set_raw(VM* vm, co
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
     unsigned char* elem = raw_elem(vm, pc, registers[UNPACK_A(op_word)], idx, foffset, checked);
     if (elem)
-        raw_field_write(elem, registers[UNPACK_2X16_LO(off_slot_word)], w);
+        raw_field_write(vm, pc, elem, registers[UNPACK_2X16_LO(off_slot_word)], w);
 }
 
 static inline __attribute__((always_inline)) void index_field_compound_raw(VM* vm, const uint32_t* pc, AerVal* registers,

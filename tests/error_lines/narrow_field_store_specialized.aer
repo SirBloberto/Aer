@@ -1,0 +1,8 @@
+struct Small:
+    n = 0i
+
+function widen(s):
+    s.n = 3000000000 #!error: out of range for a narrow (int32) field
+    return 0
+
+v = widen(Small())

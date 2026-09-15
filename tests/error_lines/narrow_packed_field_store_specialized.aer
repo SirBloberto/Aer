@@ -1,0 +1,9 @@
+struct Small:
+    n = 0i
+
+function widen_first(items):
+    items[0].n = 3000000000 #!error: out of range for a narrow (int32) field
+    return 0
+
+smalls = [Small(); 3]
+v = widen_first(smalls)
