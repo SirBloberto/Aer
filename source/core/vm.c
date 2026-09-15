@@ -1385,45 +1385,6 @@ static inline void vm_narrow_field_write(unsigned char* p, ValueType ftype, AerV
     memcpy(p, &fv, 4);
 }
 
-/* Shared by all 12 specialized packed-array raw field opcodes, which differ only in which raw slot
-   array they touch and at what width. always_inline: dispatch-loop code, not a real call boundary.
-   Returns NULL having already reported the error, matching each call site's `if (!elem) DISPATCH()`. */
-static inline __attribute__((always_inline)) unsigned char* vm_packed_raw_elem(AerVal obj, AerVal* idx,
-                                                                               unsigned int foffset) {
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) {
-        error("internal error: specialized packed-array field access on a non-packed-array value");
-        return NULL;
-    }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    if (aer_type(*idx) != TYPE_INTEGER) {
-        error("Array index must be an integer");
-        return NULL;
-    }
-    int64_t i = aer_as_int(*idx);
-    if (i < 0)
-        i += (int64_t)pa->count;
-    if (i < 0 || (uint64_t)i >= pa->count) {
-        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
-        return NULL;
-    }
-    return pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
-}
-
-/* _UNCHECKED counterpart of vm_packed_raw_elem: the index is proven in range for the whole loop
-   (parser.c's index_safe_unchecked), so the type check, negative adjust, bounds check and
-   NULL-return contract are all unreachable and dropped. The array's own type check stays -- see
-   vm_packed_raw_elem above for why that one remains a defensive net. */
-static inline __attribute__((always_inline)) unsigned char*
-vm_packed_raw_elem_unchecked(AerVal obj, AerVal* idx, unsigned int foffset) {
-    if (aer_type(obj) != TYPE_PACKED_ARRAY) {
-        error("internal error: specialized packed-array field access on a non-packed-array value");
-        return NULL;
-    }
-    AerPackedArray* pa = aer_as_packed_array(obj);
-    int64_t i = aer_as_int(*idx);
-    return pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
-}
-
 /* -O2 vectorizes none of these and -O3 alone skips the float kinds, hence the per-function
    attribute; fast-math is on the float32 pair only, so every other float op keeps strict IEEE 754.
    Worth ~2.2-2.4x while cache-resident, nothing past it -- the loop is bandwidth-bound there. */
@@ -4292,10 +4253,48 @@ static inline __attribute__((always_inline)) AerStruct* raw_field_struct(VM* vm,
     return NULL;
 }
 
-static inline __attribute__((always_inline)) unsigned char* raw_elem(AerVal arr, AerVal* idx, unsigned int foffset,
-                                                 bool checked) {
-    return checked ? vm_packed_raw_elem(arr, idx, foffset)
-                   : vm_packed_raw_elem_unchecked(arr, idx, foffset);
+/* The raw field bytes a specialized packed-array access names, or NULL once it has raised. Below the
+   `error` macro, so a raised error records this instruction rather than the caller's. */
+static inline __attribute__((always_inline)) unsigned char* vm_packed_raw_elem(VM* vm, const uint32_t* pc,
+                                                                               AerVal obj, AerVal* idx,
+                                                                               unsigned int foffset) {
+    if (aer_type(obj) != TYPE_PACKED_ARRAY) {
+        error("internal error: specialized packed-array field access on a non-packed-array value");
+        return NULL;
+    }
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    if (aer_type(*idx) != TYPE_INTEGER) {
+        error("Array index must be an integer");
+        return NULL;
+    }
+    int64_t i = aer_as_int(*idx);
+    if (i < 0)
+        i += (int64_t)pa->count;
+    if (i < 0 || (uint64_t)i >= pa->count) {
+        error("Array index %lld out of bounds (len %u)", (long long)aer_as_int(*idx), pa->count);
+        return NULL;
+    }
+    return pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+}
+
+/* vm_packed_raw_elem for an index a loop proved in range (parser.c's index_safe_unchecked): only the array's
+   own type check remains, as a defensive net. */
+static inline __attribute__((always_inline)) unsigned char*
+vm_packed_raw_elem_unchecked(VM* vm, const uint32_t* pc, AerVal obj, AerVal* idx, unsigned int foffset) {
+    if (aer_type(obj) != TYPE_PACKED_ARRAY) {
+        error("internal error: specialized packed-array field access on a non-packed-array value");
+        return NULL;
+    }
+    AerPackedArray* pa = aer_as_packed_array(obj);
+    int64_t i = aer_as_int(*idx);
+    return pa->data + (size_t)i * pa->shape->instance_bytes + foffset;
+}
+
+static inline __attribute__((always_inline)) unsigned char* raw_elem(VM* vm, const uint32_t* pc, AerVal arr,
+                                                                     AerVal* idx, unsigned int foffset,
+                                                                     bool checked) {
+    return checked ? vm_packed_raw_elem(vm, pc, arr, idx, foffset)
+                   : vm_packed_raw_elem_unchecked(vm, pc, arr, idx, foffset);
 }
 
 /* `+=`, `-=` and `*=` are the whole specialized compound set; anything else raises and leaves the
@@ -4362,20 +4361,26 @@ static inline __attribute__((always_inline)) void field_compound_raw(VM* vm, con
                            (Opcode)UNPACK_B(op_word), w);
 }
 
-static inline __attribute__((always_inline)) void index_field_get_raw(AerVal* registers, Chunk* c, uint32_t op_word,
-                                                  uint32_t field_rk_word, RawWidth w, bool checked) {
+static inline __attribute__((always_inline)) void index_field_get_raw(VM* vm, const uint32_t* pc,
+                                                                      AerVal* registers, Chunk* c,
+                                                                      uint32_t op_word,
+                                                                      uint32_t field_rk_word, RawWidth w,
+                                                                      bool checked) {
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
-    unsigned char* elem = raw_elem(registers[UNPACK_B(op_word)], idx, foffset, checked);
+    unsigned char* elem = raw_elem(vm, pc, registers[UNPACK_B(op_word)], idx, foffset, checked);
     if (elem)
         raw_field_read(&registers[UNPACK_A(op_word)], elem, w);
 }
 
-static inline __attribute__((always_inline)) void index_field_set_raw(AerVal* registers, Chunk* c, uint32_t op_word,
-                                                  uint32_t off_slot_word, RawWidth w, bool checked) {
+static inline __attribute__((always_inline)) void index_field_set_raw(VM* vm, const uint32_t* pc,
+                                                                      AerVal* registers, Chunk* c,
+                                                                      uint32_t op_word,
+                                                                      uint32_t off_slot_word, RawWidth w,
+                                                                      bool checked) {
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_W16(op_word));
     unsigned int foffset = UNPACK_2X16_HI(off_slot_word);
-    unsigned char* elem = raw_elem(registers[UNPACK_A(op_word)], idx, foffset, checked);
+    unsigned char* elem = raw_elem(vm, pc, registers[UNPACK_A(op_word)], idx, foffset, checked);
     if (elem)
         raw_field_write(elem, registers[UNPACK_2X16_LO(off_slot_word)], w);
 }
@@ -4386,18 +4391,20 @@ static inline __attribute__((always_inline)) void index_field_compound_raw(VM* v
                                                        RawWidth w, bool checked) {
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
-    unsigned char* elem = raw_elem(registers[UNPACK_A(op_word)], idx, foffset, checked);
+    unsigned char* elem = raw_elem(vm, pc, registers[UNPACK_A(op_word)], idx, foffset, checked);
     if (elem)
         raw_field_compound(vm, pc, elem, registers[rhs_slot], (Opcode)UNPACK_B(op_word), w);
 }
 
 /* `+=` with bin_op already known at compile time, so it skips the switch the general form runs. */
-static inline __attribute__((always_inline)) void index_field_add_raw(AerVal* registers, Chunk* c, uint32_t op_word,
-                                                  uint32_t field_rk_word, int rhs_slot, RawWidth w,
-                                                  bool checked) {
+static inline __attribute__((always_inline)) void index_field_add_raw(VM* vm, const uint32_t* pc,
+                                                                      AerVal* registers, Chunk* c,
+                                                                      uint32_t op_word,
+                                                                      uint32_t field_rk_word, int rhs_slot,
+                                                                      RawWidth w, bool checked) {
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
-    unsigned char* elem = raw_elem(registers[UNPACK_A(op_word)], idx, foffset, checked);
+    unsigned char* elem = raw_elem(vm, pc, registers[UNPACK_A(op_word)], idx, foffset, checked);
     if (!elem)
         return;
     if (w == RAWW_REAL) {
@@ -4413,13 +4420,13 @@ static inline __attribute__((always_inline)) void index_field_add_raw(AerVal* re
 
 HANDLER(index_field_get_raw_int)
     uint32_t field_rk_word = READ();
-    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_INT, true);
+    index_field_get_raw(vm, pc, registers, c, op_word, field_rk_word, RAWW_INT, true);
     DISPATCH();
 }
 
 HANDLER(index_field_get_raw_real)
     uint32_t field_rk_word = READ();
-    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_REAL, true);
+    index_field_get_raw(vm, pc, registers, c, op_word, field_rk_word, RAWW_REAL, true);
     DISPATCH();
 }
 
@@ -4437,13 +4444,13 @@ HANDLER(field_get_raw_real)
 
 HANDLER(index_field_get_raw_int32)
     uint32_t field_rk_word = READ();
-    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_INT32, true);
+    index_field_get_raw(vm, pc, registers, c, op_word, field_rk_word, RAWW_INT32, true);
     DISPATCH();
 }
 
 HANDLER(index_field_get_raw_float32)
     uint32_t field_rk_word = READ();
-    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_FLOAT32, true);
+    index_field_get_raw(vm, pc, registers, c, op_word, field_rk_word, RAWW_FLOAT32, true);
     DISPATCH();
 }
 
@@ -4461,13 +4468,13 @@ HANDLER(field_get_raw_float32)
 
 HANDLER(index_field_set_raw_int)
     uint32_t off_slot_word = READ();
-    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_INT, true);
+    index_field_set_raw(vm, pc, registers, c, op_word, off_slot_word, RAWW_INT, true);
     DISPATCH();
 }
 
 HANDLER(index_field_set_raw_real)
     uint32_t off_slot_word = READ();
-    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_REAL, true);
+    index_field_set_raw(vm, pc, registers, c, op_word, off_slot_word, RAWW_REAL, true);
     DISPATCH();
 }
 
@@ -4487,13 +4494,13 @@ HANDLER(field_set_raw_real)
 
 HANDLER(index_field_set_raw_int32)
     uint32_t off_slot_word = READ();
-    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_INT32, true);
+    index_field_set_raw(vm, pc, registers, c, op_word, off_slot_word, RAWW_INT32, true);
     DISPATCH();
 }
 
 HANDLER(index_field_set_raw_float32)
     uint32_t off_slot_word = READ();
-    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_FLOAT32, true);
+    index_field_set_raw(vm, pc, registers, c, op_word, off_slot_word, RAWW_FLOAT32, true);
     DISPATCH();
 }
 
@@ -4543,25 +4550,25 @@ HANDLER(index_field_compound_raw_real)
 
 HANDLER(index_field_get_raw_int_unchecked)
     uint32_t field_rk_word = READ();
-    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_INT, false);
+    index_field_get_raw(vm, pc, registers, c, op_word, field_rk_word, RAWW_INT, false);
     DISPATCH();
 }
 
 HANDLER(index_field_get_raw_real_unchecked)
     uint32_t field_rk_word = READ();
-    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_REAL, false);
+    index_field_get_raw(vm, pc, registers, c, op_word, field_rk_word, RAWW_REAL, false);
     DISPATCH();
 }
 
 HANDLER(index_field_set_raw_int_unchecked)
     uint32_t off_slot_word = READ();
-    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_INT, false);
+    index_field_set_raw(vm, pc, registers, c, op_word, off_slot_word, RAWW_INT, false);
     DISPATCH();
 }
 
 HANDLER(index_field_set_raw_real_unchecked)
     uint32_t off_slot_word = READ();
-    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_REAL, false);
+    index_field_set_raw(vm, pc, registers, c, op_word, off_slot_word, RAWW_REAL, false);
     DISPATCH();
 }
 
@@ -4613,25 +4620,25 @@ HANDLER(index_field_compound_raw_float32)
 
 HANDLER(index_field_get_raw_int32_unchecked)
     uint32_t field_rk_word = READ();
-    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_INT32, false);
+    index_field_get_raw(vm, pc, registers, c, op_word, field_rk_word, RAWW_INT32, false);
     DISPATCH();
 }
 
 HANDLER(index_field_get_raw_float32_unchecked)
     uint32_t field_rk_word = READ();
-    index_field_get_raw(registers, c, op_word, field_rk_word, RAWW_FLOAT32, false);
+    index_field_get_raw(vm, pc, registers, c, op_word, field_rk_word, RAWW_FLOAT32, false);
     DISPATCH();
 }
 
 HANDLER(index_field_set_raw_int32_unchecked)
     uint32_t off_slot_word = READ();
-    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_INT32, false);
+    index_field_set_raw(vm, pc, registers, c, op_word, off_slot_word, RAWW_INT32, false);
     DISPATCH();
 }
 
 HANDLER(index_field_set_raw_float32_unchecked)
     uint32_t off_slot_word = READ();
-    index_field_set_raw(registers, c, op_word, off_slot_word, RAWW_FLOAT32, false);
+    index_field_set_raw(vm, pc, registers, c, op_word, off_slot_word, RAWW_FLOAT32, false);
     DISPATCH();
 }
 
@@ -4654,14 +4661,14 @@ HANDLER(index_field_compound_raw_float32_unchecked)
 HANDLER(index_field_compound_raw_real_unchecked_add)
     uint32_t field_rk_word = READ();
     int rhs_slot = (int)READ();
-    index_field_add_raw(registers, c, op_word, field_rk_word, rhs_slot, RAWW_REAL, false);
+    index_field_add_raw(vm, pc, registers, c, op_word, field_rk_word, rhs_slot, RAWW_REAL, false);
     DISPATCH();
 }
 
 HANDLER(index_field_compound_raw_float32_unchecked_add)
     uint32_t field_rk_word = READ();
     int rhs_slot = (int)READ();
-    index_field_add_raw(registers, c, op_word, field_rk_word, rhs_slot, RAWW_FLOAT32, false);
+    index_field_add_raw(vm, pc, registers, c, op_word, field_rk_word, rhs_slot, RAWW_FLOAT32, false);
     DISPATCH();
 }
 
@@ -4690,7 +4697,7 @@ HANDLER(index_field_compound_raw_real_unchecked_fma)
     uint32_t field_rk_word = READ();
     unsigned int foffset = UNPACK_2X16_HI(field_rk_word);
     AerVal* idx = vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(field_rk_word));
-    unsigned char* elem = vm_packed_raw_elem_unchecked(registers[arr_reg], idx, foffset);
+    unsigned char* elem = vm_packed_raw_elem_unchecked(vm, pc, registers[arr_reg], idx, foffset);
     if (!elem)
         DISPATCH();
     double lhs;

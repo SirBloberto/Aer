@@ -1,0 +1,9 @@
+struct Point:
+    x = 0
+    y = 0
+
+function tenth_x(points):
+    return points[9].x #!error: Array index 9 out of bounds (len 3)
+
+pts = [Point(); 3]
+v = tenth_x(pts)

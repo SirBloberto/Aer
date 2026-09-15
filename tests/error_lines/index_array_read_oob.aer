@@ -1,0 +1,2 @@
+xs = [1, 2]
+v = xs[5] #!error: Array index 5 out of bounds (len 2)

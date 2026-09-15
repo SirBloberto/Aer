@@ -1,0 +1,2 @@
+ints = [0; 3]
+ints[9] = 1 #!error: Array index 9 out of bounds (len 3)
