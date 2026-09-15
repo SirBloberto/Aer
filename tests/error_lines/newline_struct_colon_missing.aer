@@ -1,0 +1,2 @@
+struct Point #!error: expected ':'
+    x = 0

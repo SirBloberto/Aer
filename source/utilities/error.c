@@ -180,7 +180,7 @@ void error_at(const char* format, ...) {
     }
 
     const char* start = current_source_start();
-    const char* cursor = current_source_cursor();
+    const char* cursor = current_token_start();
 
     unsigned int line_number = 1;
     const char* line_start = start;

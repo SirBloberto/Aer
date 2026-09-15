@@ -10,6 +10,7 @@ typedef struct File {
     char* name;
     char* start; /* immutable pointer to beginning of buffer */
     char* buffer; /* advances as we lex */
+    char* token_start; /* where the current token begins -- what a compile error points at */
     /* Absolute source line where this File's buffer begins -- 0 for a real file or REPL line
        (current_source_line's own newline-count already gives the right absolute number there). A
        span (lexer_begin_span) starts its OWN buffer at line 1 relative to itself, so this is the
@@ -53,9 +54,13 @@ const char* current_source_name() {
     return current->name;
 }
 
-/* Narrow escape hatch for reporting a deferred error at a saved position, not a general seek. */
-void lexer_set_cursor(const char* pos) {
-    current->buffer = (char*)pos;
+const char* current_token_start() {
+    return current->token_start;
+}
+
+/* Narrow escape hatch for reporting a deferred error at a saved position, not a seek. */
+void lexer_set_token_start(const char* pos) {
+    current->token_start = (char*)pos;
 }
 
 /* The line number, for tagging bytecode. Same scan as error_at(). */
@@ -156,6 +161,7 @@ void read_file(char* filename) {
     file->name = filename;
     file->start = buf;
     file->buffer = buf;
+    file->token_start = buf;
     file->line_base = 0;
     files_storage[file_index++] = file;
     current = file;
@@ -175,6 +181,7 @@ void shell(char* line) {
     shell_file.name = "shell";
     shell_file.start = previous;
     shell_file.buffer = previous;
+    shell_file.token_start = previous;
     current = &shell_file;
     indent_reset();
 }
@@ -197,6 +204,7 @@ void lexer_begin_span(const char* text, unsigned int len, unsigned int start_lin
     file->name = "<interpolation>";
     file->start = buf;
     file->buffer = buf;
+    file->token_start = buf;
     file->line_base = start_line - 1;
     files_storage[file_index++] = file;
     current = file;
@@ -448,6 +456,7 @@ static bool lex_line_start(void) {
         spaces++;
         p++;
     }
+    current->token_start = p;
     if (*p == '\t') {
         error_at("Tabs not allowed for indentation");
         return true;
@@ -497,6 +506,7 @@ void lex() {
     }
 
     skip_whitespace_and_comments();
+    current->token_start = current->buffer;
 
     char* b = current->buffer;
 

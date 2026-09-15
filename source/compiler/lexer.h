@@ -112,8 +112,10 @@ extern Token token;
 const char* current_source_start();
 const char* current_source_cursor();
 
-/* Reports at a saved cursor: save current_source_cursor(), override, restore. */
-void lexer_set_cursor(const char* pos);
+/* Where the current token begins; compile errors report there, so a statement-ending newline names its
+   own line. To report at a saved position: save current_token_start(), override, restore. */
+const char* current_token_start();
+void lexer_set_token_start(const char* pos);
 
 /* For tagging each statement's bytecode with its source line. */
 unsigned int current_source_line();

@@ -4940,15 +4940,15 @@ static bool check_call_arity(Chunk* c, unsigned int name_idx, int arg_count, uns
     if ((unsigned int)arg_count <= arity && (unsigned int)arg_count >= min_arity)
         return true;
     const char* fname = aer_as_string(c->pool[name_idx])->data;
-    const char* real_cursor = current_source_cursor();
-    lexer_set_cursor(call_site);
+    const char* real_start = current_token_start();
+    lexer_set_token_start(call_site);
     if (min_arity == arity)
         error_at("Function '%s' expects %u argument%s, got %d", fname, arity, arity == 1 ? "" : "s",
                  arg_count);
     else
         error_at("Function '%s' expects between %u and %u arguments, got %d", fname, min_arity, arity,
                  arg_count);
-    lexer_set_cursor(real_cursor);
+    lexer_set_token_start(real_start);
     return false;
 }
 
@@ -5851,18 +5851,18 @@ void parse(Chunk* c) {
         }
     }
     if (P.pending_count > 0) {
-        const char* real_cursor = current_source_cursor();
+        const char* real_start = current_token_start();
         bool any_pending_error = false;
         for (int i = 0; i < P.pending_count; i++) {
             unsigned int patch_offset = P.pending_calls[i].patch_offset;
             c->code[patch_offset - 1] = OP_HALT;
-            lexer_set_cursor(P.pending_calls[i].call_site_cursor);
+            lexer_set_token_start(P.pending_calls[i].call_site_cursor);
             error_at("Unknown function or struct type '%s' (never defined anywhere in this compile — not a "
                      "valid forward reference, module call, or struct construction target)",
                      aer_as_string(c->pool[P.pending_calls[i].name_idx])->data);
             any_pending_error = true;
         }
-        lexer_set_cursor(real_cursor);
+        lexer_set_token_start(real_start);
         P.pending_count = 0;
         if (any_pending_error)
             P.any_compile_error = true;
