@@ -640,7 +640,12 @@ static inline AerVal vm_binary_fast(AerVal a, AerVal b, Opcode op, ValueType ta,
                     return aer_real(0.0);
                 }
                 return aer_real(floor(l / rv));
-            case OP_MOD: return aer_real(aer_mod_double(l, rv));
+            case OP_MOD:
+                if (rv == 0.0) {
+                    error("Modulo by zero");
+                    return aer_real(0.0);
+                }
+                return aer_real(aer_mod_double(l, rv));
             case OP_EQ: return aer_bool(l == rv);
             case OP_NEQ: return aer_bool(l != rv);
             case OP_LT: return aer_bool(l < rv);
@@ -755,7 +760,12 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
                     return aer_real(0.0);
                 }
                 return aer_real(floor(l / rv));
-            case OP_MOD: return aer_real(aer_mod_double(l, rv));
+            case OP_MOD:
+                if (rv == 0.0) {
+                    error("Modulo by zero");
+                    return aer_real(0.0);
+                }
+                return aer_real(aer_mod_double(l, rv));
             case OP_EQ: return aer_bool(l == rv);
             case OP_NEQ: return aer_bool(l != rv);
             case OP_LT: return aer_bool(l < rv);
@@ -3098,7 +3108,14 @@ HANDLER(is_result)
                 *result = aer_int(aer_mod_int64(l, rv));
             }
         },
-        { *result = aer_real(aer_mod_double(l, rv)); })
+        {
+            if (rv == 0.0) {
+                error("Modulo by zero");
+                *result = aer_real(0.0);
+            } else {
+                *result = aer_real(aer_mod_double(l, rv));
+            }
+        })
     BINARY_OP_INT_REAL(eq, OP_EQ, { *result = aer_bool(l == rv); }, { *result = aer_bool(l == rv); })
     BINARY_OP_INT_REAL(neq, OP_NEQ, { *result = aer_bool(l != rv); }, { *result = aer_bool(l != rv); })
     BINARY_OP_INT_REAL(lt, OP_LT, { *result = aer_bool(l < rv); }, { *result = aer_bool(l < rv); })
