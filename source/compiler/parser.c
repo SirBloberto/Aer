@@ -3612,6 +3612,27 @@ static void chain_advance(Chunk* c, int* obj_reg, bool* obj_is_base, bool pendin
     *obj_is_base = false;
 }
 
+/* Reads one `[index]` or `.name` step of an assignment target after its opening token, into the pending
+   fields. False once an error is reported. The index is boxed unconditionally: the fused opcodes pack it
+   into a 16-bit RK slot with no raw state, and rk16_fits/rk8_fits mask only RK_CONST_FLAG, so a
+   raw-flagged index would corrupt the encoding (surfacing as a bogus "expression too large"). */
+static bool parse_chain_step(Chunk* c, bool is_index, bool* pending_is_field,
+                             unsigned int* pending_field_idx, int* pending_rk_idx) {
+    *pending_is_field = !is_index;
+    if (is_index) {
+        *pending_rk_idx = drop_raw_marks(parse_binary(c, 0));
+        require(TOKEN_CLOSE_BRACKET, "expected ']' after index");
+    } else {
+        if (!equal(TOKEN_IDENTIFIER)) {
+            error_at("Expected field name after '.'");
+            return false;
+        }
+        *pending_field_idx = chunk_add_pool(c, token.value);
+        lex();
+    }
+    return !parse_had_error;
+}
+
 /* `name[index].field = value` or `name[index].field op= value` as one fused opcode, when nothing
    chains after the field. obj_reg is still the name's own register. False once an error is
    reported; the caller releases the index and object only on success. */
@@ -3705,25 +3726,10 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
                         aer_as_string(c->pool[name_idx])->data);
     }
 
-    bool pending_is_field = !first_is_index;
+    bool pending_is_field;
     unsigned int pending_field_idx = 0;
     int pending_rk_idx = 0;
-
-    if (first_is_index) {
-        pending_rk_idx = parse_binary(c, 0);
-        /* Boxed unconditionally: the fused opcodes pack the index into a 16-bit RK slot with no raw
-           state, and rk16_fits/rk8_fits mask only RK_CONST_FLAG, so a raw-flagged index corrupts the
-           encoding (surfacing as a bogus "expression too large"). No-op for the general path. */
-        pending_rk_idx = drop_raw_marks(pending_rk_idx);
-        require(TOKEN_CLOSE_BRACKET, "expected ']' after index");
-    } else {
-        if (!equal(TOKEN_IDENTIFIER)) {
-            return error_at("Expected field name after '.'");
-        }
-        pending_field_idx = chunk_add_pool(c, token.value);
-        lex();
-    }
-    if (parse_had_error)
+    if (!parse_chain_step(c, first_is_index, &pending_is_field, &pending_field_idx, &pending_rk_idx))
         return;
 
     /* Fuses into OP_INDEX_FIELD_GET/SET for the same reason the read side does -- a packed array
@@ -3760,22 +3766,10 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
     while (equal(TOKEN_OPEN_BRACKET) || equal(TOKEN_DOT)) {
         chain_advance(c, &obj_reg, &obj_is_base, pending_is_field, pending_field_idx, pending_rk_idx);
 
-        if (consume(TOKEN_OPEN_BRACKET)) {
-            pending_is_field = false;
-            pending_rk_idx = parse_binary(c, 0);
-            /* Same fix as the first index step's own -- see that site's comment. */
-            pending_rk_idx = drop_raw_marks(pending_rk_idx);
-            require(TOKEN_CLOSE_BRACKET, "expected ']' after index");
-        } else {
+        bool is_index = consume(TOKEN_OPEN_BRACKET);
+        if (!is_index)
             consume(TOKEN_DOT);
-            if (!equal(TOKEN_IDENTIFIER)) {
-                return error_at("Expected field name after '.'");
-            }
-            pending_field_idx = chunk_add_pool(c, token.value);
-            pending_is_field = true;
-            lex();
-        }
-        if (parse_had_error)
+        if (!parse_chain_step(c, is_index, &pending_is_field, &pending_field_idx, &pending_rk_idx))
             return;
     }
 
