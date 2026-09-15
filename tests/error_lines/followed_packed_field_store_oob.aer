@@ -1,0 +1,7 @@
+struct Point:
+    x = 0
+    y = 0
+
+pts = [Point(); 3]
+pts[9].x = 1 #!error: Array index 9 out of bounds (len 3)
+z = 2

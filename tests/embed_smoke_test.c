@@ -551,10 +551,9 @@ int main(void) {
             "\n"
             "compute(Divisor(10), 0)\n");
         check(!spec_ok, "division by zero inside a specialized function body still fails");
-        check(strstr(aer_last_error(), "Line 7:") != NULL,
-              "the error names the TRUE source line (a pre-existing, separate off-by-one attributes "
-              "it to the trailing return statement's line rather than the division's own line 6 -- "
-              "see this test's own follow-up comment), not one relative to the retained span");
+        check(strstr(aer_last_error(), "Line 6:") != NULL,
+              "the error names the division's own source line, not one relative to the retained span "
+              "or the statement after it");
         check(strstr(aer_last_error(), "Line 3:") == NULL,
               "the error does NOT report the old, buggy span-relative line number");
         vm_free(&spec_vm);

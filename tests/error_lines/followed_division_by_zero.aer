@@ -1,0 +1,3 @@
+n = 0
+q = 10 // n #!error: Division by zero
+z = 2

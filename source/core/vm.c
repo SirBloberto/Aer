@@ -219,7 +219,10 @@ static unsigned int lookup_runtime_line(void) {
        has not entered vm_run_slice yet. */
     if (!vm->error_pc || !vm->chunk)
         return chunk_line_for_offset(vm->chunk, vm->ip);
-    return chunk_line_for_offset(vm->chunk, (unsigned int)(vm->error_pc - vm->chunk->code));
+    /* error_pc is past the words the handler already read, which is the next statement's first word when
+       the faulting instruction ends its own; one word back is always inside that instruction. */
+    unsigned int offset = (unsigned int)(vm->error_pc - vm->chunk->code);
+    return chunk_line_for_offset(vm->chunk, offset > 0 ? offset - 1 : 0);
 }
 
 static const char* lookup_runtime_filename(void) {
