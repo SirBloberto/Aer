@@ -5325,14 +5325,13 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
     parse_block(c);
     P.function_depth--;
 
-    if (!parse_had_error) {
-        if (!P.fn.last_stmt_was_return)
-            P.fn.returns_all_int = false; /* the implicit return below is reachable */
-        /* Implicit 'return null' if control falls off the end. Given a slot above everything the
-           body used rather than one recycled from the temp allocator: this instruction usually
-           never executes, and recycling ties a tagged write to a register the hot loop writes
-           unchecked, which forfeits that register's tag elision for the whole function. Costs one
-           register in a frame whose peak was set elsewhere. */
+    /* Implicit 'return null' if control falls off the end -- skipped when the body's last statement
+       already returned, since nothing reaches it and the slot it claims is one more the frame tags
+       on every call. Otherwise given a slot above everything the body used rather than one recycled
+       from the temp allocator: recycling ties a tagged write to a register the hot loop writes
+       unchecked, which forfeits that register's tag elision for the whole function. */
+    if (!parse_had_error && !P.fn.last_stmt_was_return) {
+        P.fn.returns_all_int = false;
         if (P.slot_next < P.slot_max)
             P.slot_next = P.slot_max;
         int rk_null = (int)chunk_add_pool(c, aer_null()) | RK_CONST_FLAG;
