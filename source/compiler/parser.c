@@ -147,6 +147,16 @@ typedef struct {
     /* Raw-vs-boxed opcodes reached for in this body. Nonzero means binding its numeric parameters
        raw would turn real work raw, which is the trigger for a numeric specialization. */
     unsigned int raw_boxed_emits;
+    /* A variant compiles its self-calls as if the function returns an integer, which is what lets
+       `f(a) + f(b)` compose raw. returns_all_int records whether every return agreed; when one did
+       not AND marked_self_int says a call actually took the assumption, parser_specialize_function
+       compiles the body again with it off. */
+    bool assume_self_int;
+    bool returns_all_int;
+    bool marked_self_int;
+    /* Whether the statement that closed the innermost block was a return -- read right after the
+       body's own block, where it says whether the implicit trailing return can be reached. */
+    bool last_stmt_was_return;
 } FuncCtx;
 
 /* Every mutable global the compile functions share. P (below) is the live instance;
@@ -3821,8 +3831,12 @@ static void parse_block(Chunk* c) {
         P.recovered_at_boundary = false;
         unsigned int saved = c->count;
         unsigned int saved_marks = c->line_mark_count;
+        bool was_return = equal(TOKEN_RETURN);
         chunk_mark_line(c, saved, current_source_line());
         parse_statement(c);
+        /* Written after the statement, so a nested block's own last one is overwritten by whichever
+           statement actually closes this block. */
+        P.fn.last_stmt_was_return = was_return && !parse_had_error;
         if (parse_had_error) {
             P.any_compile_error = true;
             c->count = saved;
@@ -5006,6 +5020,7 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
 
     int callee_reg = -1;
+    bool self_call = false;
     if (needs_call_value) {
         AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
                                          func_max_registers, func_frame_bounds);
@@ -5024,8 +5039,10 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         if (needs_call_value)
             emit_call_value(c, dest, base, arg_count, callee_reg);
         else if (P.fn.in_variant && (int)func_index == P.fn.current_func_idx && arg_count == (int)func_arity &&
-                 func_arity == func_min_arity)
+                 func_arity == func_min_arity) {
             chunk_emit(c, PACK3(OP_CALL_SELF, dest, base, arg_count));
+            self_call = true;
+        }
         else /* already resolved, so no forward-reference patch */
             emit_call(c, dest, func_offset, base, arg_count, func_index);
         last_bare_call_end = c->count;
@@ -5043,6 +5060,12 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     if (extra > 0)
         reg_free(extra);
 
+    /* Under the variant's assumption this result is an integer, so the arithmetic consuming it
+       composes raw instead of going through the boxed add. */
+    if (self_call && P.fn.assume_self_int) {
+        P.fn.marked_self_int = true;
+        return (int)(RK_RAW_INT_FLAG | (unsigned int)dest);
+    }
     return dest;
 }
 
@@ -5075,6 +5098,7 @@ static void parse_return(Chunk* c) {
             return;
 
         if (equal(TOKEN_COMMA)) {
+            P.fn.returns_all_int = false; /* packs into an array */
             int reg_base = arg_materialize(c, rk_first);
             unsigned int count = 1;
             while (consume(TOKEN_COMMA)) {
@@ -5094,6 +5118,10 @@ static void parse_return(Chunk* c) {
             int op_slot = (int)last_bare_call_start;
             int orig_op = c->code[op_slot] & 0xFF;
             if (orig_op == OP_CALL || orig_op == OP_CALL_VALUE || orig_op == OP_CALL_SELF) {
+                /* A self tail call returns whatever this same function does, so it agrees with the
+                   assumption by construction; any other callee's type is unknown here. */
+                if (orig_op != OP_CALL_SELF)
+                    P.fn.returns_all_int = false;
                 int tail_op = orig_op == OP_CALL         ? OP_TAIL_CALL
                               : orig_op == OP_CALL_VALUE ? OP_TAIL_CALL_VALUE
                                                          : OP_TAIL_CALL_SELF;
@@ -5102,11 +5130,14 @@ static void parse_return(Chunk* c) {
             }
         }
 
+        if (rk_raw_kind(c, rk_first) != RAWK_INT)
+            P.fn.returns_all_int = false;
         int reg = materialize(c, rk_first);
         emit_return(c, reg);
         return;
     }
 
+    P.fn.returns_all_int = false; /* a bare `return` yields null */
     int rk = (int)chunk_add_pool(c, aer_null()) | RK_CONST_FLAG;
     int reg = materialize(c, rk);
     emit_return(c, reg);
@@ -5290,10 +5321,13 @@ static void parse_function_body(Chunk* c, unsigned int* param_names, int param_c
         }
     }
 
+    P.fn.last_stmt_was_return = false;
     parse_block(c);
     P.function_depth--;
 
     if (!parse_had_error) {
+        if (!P.fn.last_stmt_was_return)
+            P.fn.returns_all_int = false; /* the implicit return below is reachable */
         /* Implicit 'return null' if control falls off the end. Given a slot above everything the
            body used rather than one recycled from the temp allocator: this instruction usually
            never executes, and recycling ties a tagged write to a register the hot loop writes
@@ -5444,18 +5478,39 @@ bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape,
     parse_function_signature(c, param_names, param_defaults, &param_count, &min_param_count);
 
     unsigned int new_offset = c->count;
+    unsigned int saved_marks = c->line_mark_count;
     unsigned int max_registers = 0;
     unsigned short frame_bounds = 0;
     P.fn.current_func_idx = (int)(target_f - c->functions);
     /* Only a numeric variant may self-call without resolving: a shape-specialized body is chosen by
        the argument's SHAPE, which a recursive call has no guarantee of preserving. */
     P.fn.in_variant = (raw_param_count > 0);
+    P.fn.assume_self_int = P.fn.in_variant;
+    P.fn.returns_all_int = true;
+    P.fn.marked_self_int = false;
     if (!parse_had_error) {
         parse_function_body(c, param_names, param_count, param_index, shape,
                             kind == SPEC_KIND_ARRAY_OF_STRUCTS, raw_param_regs, raw_param_types,
                             raw_param_count, &max_registers, &frame_bounds);
     }
+    /* The assumption only ever made a self-call's result raw, so a body that disagreed just
+       compiles again without it rather than losing its variant. A body no call took it in already
+       compiled to what the second pass would emit. */
+    if (!parse_had_error && P.fn.marked_self_int && !P.fn.returns_all_int) {
+        c->count = new_offset;
+        c->line_mark_count = saved_marks;
+        peephole_window_reset();
+        P.fn.assume_self_int = false;
+        lexer_begin_span(target_f->source_span, target_f->source_span_len, target_f->source_span_line);
+        lex();
+        parse_function_signature(c, param_names, param_defaults, &param_count, &min_param_count);
+        if (!parse_had_error)
+            parse_function_body(c, param_names, param_count, param_index, shape,
+                                kind == SPEC_KIND_ARRAY_OF_STRUCTS, raw_param_regs, raw_param_types,
+                                raw_param_count, &max_registers, &frame_bounds);
+    }
     P.fn.in_variant = false;
+    P.fn.assume_self_int = false;
     bool ok = !parse_had_error;
 
     lexer_restore_state(saved_lexer);

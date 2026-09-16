@@ -359,7 +359,7 @@ function id(x):
 function helper_small(x):
     return x * 2
 
-# a..h2 are call RESULTS (never raw -- rk_raw_kind excludes call results), so each is a genuine,
+# a..h2 are results of calls to ANOTHER function, whose return type is unknown here, so each is a genuine,
 # permanent boxed register -- 8 of them, registers 1-8 (register 0 is n). helper_small(5)'s own
 # call needs a temp register beyond those 8 -- if the reused frame's own reservation were still
 # sized for tiny_footprint's tiny footprint below (2 registers), helper_small's own frame would
@@ -380,5 +380,50 @@ function tiny_footprint(n):
     return big_footprint(n)   # tail call: tiny_footprint's own (small) frame is reused for big_footprint
 
 assert(tiny_footprint(1) == 18, "tail-calling from a small-footprint function into a much larger one refreshes the reused frame's own register/raw-slot reservation, so the larger function's later real call doesn't corrupt its own still-live locals (1*8 + helper_small(5)=10 == 18; confirmed this exact scenario returns 31 -- silent corruption, no crash -- if the reused frame's reservation is left stale)")
+
+# ------------------------------------------------------------------ #
+# 23. Recursive results feeding arithmetic                             #
+# ------------------------------------------------------------------ #
+
+# A numeric variant compiles its self-calls as if the function returns an integer, which is what lets
+# `f(a) + f(b)` compose raw. The first case below agrees; the other three return a real, a string and
+# null, so their variants are recompiled without it. Each is called often enough to specialize.
+
+function fibi_of(n):
+    if n < 2:
+        return n
+    return fibi_of(n - 1) + fibi_of(n - 2)
+
+fibi_total = 0
+for i in 0..20:
+    fibi_total += fibi_of(i)
+assert(fibi_of(20) == 6765, "an int-returning recursive function is correct once it specializes")
+assert(fibi_total == 10945, "and so is every call leading up to that")
+
+function recr_of(n):
+    if n < 2:
+        return 1.5
+    return recr_of(n - 1) + 0.5
+
+for i in 0..20:
+    recr_check = recr_of(i)
+assert(recr_of(20) == 11.0, "a real-returning recursive function still returns a real")
+
+function recs_of(n):
+    if n < 1:
+        return "x"
+    return recs_of(n - 1) + "y"
+
+for i in 0..20:
+    recs_check = recs_of(3)
+assert(recs_of(3) == "xyyy", "a string-returning recursive function is untouched by the assumption")
+
+function recm_of(n):
+    if n > 0:
+        return recm_of(n - 1)
+
+for i in 0..20:
+    recm_check = recm_of(3)
+assert(recm_of(3) == null, "a recursive function that falls off the end still returns null")
 
 print("test_functions.aer: all assertions passed.")
