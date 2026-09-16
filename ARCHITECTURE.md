@@ -2650,6 +2650,15 @@ five. The measurable levers there are ordinary compiler flags: `-O3` is worth a 
 `-march=native` another 1-5% at the cost of a binary that no longer runs anywhere. `-O3` is NOT a
 universal default: on ARM it is mixed (`nbody` -2.44% but `fib_bench` +0.47%, `sieve` +0.29%).
 
+**Re-measured on x86-64 at `d958a4c`, after the tail-call dispatch conversion: the "consistent 2.7%"
+above no longer holds, and `fib_bench` has changed sign.** Five layouts per side, `-O2` against the
+same build plus `-O3`: `struct_array_scan` **-6.96%**, `dict_bench` **-5.53%**, `columnar_query`
+-1.93%, `mandelbrot` -1.86% (all sign-stable) against `fib_bench` **+2.95%** and `binary_trees`
+**+2.99%** (both sign-stable); `nbody` -1.80% and `sieve` -0.04% flip. So `-O3` now splits by
+benchmark class on x86-64 too -- data-heavy work gains, call-heavy work loses -- which makes it a
+trade rather than a free default on every platform, not just ARM. Quote these numbers, not the ones
+above, for any build-flag decision taken after the conversion.
+
 One incidental finding worth more than either flag: **the layout lottery is an ARM problem.** The same
 sweep that moves `mandelbrot` 25.58% on ARM moves it 1.1% on x86-64 (0.609-0.616s across three
 offsets). A larger BTB and better indirect prediction absorb what ARM's cannot -- which is why
