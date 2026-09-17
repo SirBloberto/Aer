@@ -186,6 +186,12 @@ typedef enum {
        logical operation. Same operand shape as OP_FIELD_BINARY (dest slot unused). */
     OP_FIELD_COMPOUND, /* struct_reg, field_name_pool_idx, bin_op, rk_rhs */
 
+    /* `arr[rk] OP= rhs` for every receiver the raw forms do not cover -- a dict, a plain array, a
+       narrow element. One dispatch and, for a dict, one hash instead of the two a separate read and
+       write pay. The element counterpart of OP_FIELD_COMPOUND above, which a tally (`counts[k] += 1`)
+       needs as often as a struct field does. */
+    OP_INDEX_COMPOUND, /* word0: arr_reg, bin_op -- word1: rk_idx(hi16)/rk_rhs(lo16) */
+
     /* Fuses `(A op1 B) op2 C` written as one expression: parse_binary_ops truncates the inner op and
        re-encodes it alongside op2/C. Fuses only when A/B/C turn out to be matching typed arrays at
        runtime; anything else computes the same value unfused. */

@@ -1,0 +1,2 @@
+counts = {}
+counts["absent"] += 1 #!error: Operator not valid for null

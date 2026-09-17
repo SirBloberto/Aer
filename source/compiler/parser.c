@@ -3560,40 +3560,42 @@ static bool compound_assign_field(Chunk* c, ChainTarget t, Opcode bin_op) {
     return true;
 }
 
-/* `arr[rk] op= rhs` -- the array-element counterpart of compound_assign_field, and like it the rhs
-   is parsed before the element is read. Whether to try this is decided BEFORE parsing, from the
-   element kind, the operator and the index width alone, so declining never has to un-parse. True
-   when it emitted the whole statement. */
-static bool compound_assign_index_raw(Chunk* c, ChainTarget t, Opcode bin_op) {
-    if (bin_op != OP_ADD && bin_op != OP_SUB && bin_op != OP_MUL)
-        return false;
+/* `arr[rk] op= rhs` -- the element counterpart of compound_assign_field, and like it the rhs is
+   parsed before the element is read. A typed array whose element kind matches takes the raw form;
+   every other receiver takes the generic one, which still reads, computes and writes in a single
+   dispatch rather than the three a separate get/op/set costs. Always emits the whole statement. */
+static void compound_assign_index(Chunk* c, ChainTarget t, Opcode bin_op) {
     RawKind elem =
         (t.obj_reg >= 0 && t.obj_reg < FRAME_REGISTERS) ? P.regs.reg_elem_kind[t.obj_reg] : RAWK_NONE;
-    if (elem == RAWK_NONE || !rk8_fits(t.pending_rk_idx))
-        return false;
+    bool raw_op_exists = (bin_op == OP_ADD || bin_op == OP_SUB || bin_op == OP_MUL);
 
     int rk_rhs = parse_binary(c, 0);
     if (parse_had_error)
-        return true;
+        return;
 
-    if (rk_raw_kind(c, rk_rhs) == elem) {
+    /* The raw opcodes pack the index into 8 bits; the generic one below carries RK16 and has no
+       such limit, so a wide index only rules out the fast path. */
+    if (raw_op_exists && elem != RAWK_NONE && rk8_fits(t.pending_rk_idx) &&
+        rk_raw_kind(c, rk_rhs) == elem) {
         int slot = raw_materialize(c, rk_rhs, elem);
         if (slot >= 0) {
             chunk_emit(c, PACK3(elem == RAWK_INT ? OP_INDEX_COMPOUND_RAW_INT : OP_INDEX_COMPOUND_RAW_REAL,
                                 t.obj_reg, bin_op, pack_rk8(t.pending_rk_idx)));
             chunk_emit(c, (uint32_t)slot);
             raw_release_if_top(slot);
-            return true;
+            return;
         }
     }
 
-    int item_reg = reg_alloc();
-    emit_index_get(c, item_reg, t.obj_reg, t.pending_rk_idx);
-    emit_binary(c, item_reg, bin_op, item_reg, rk_rhs);
+    int rk_idx = drop_raw_marks(t.pending_rk_idx);
+    rk_rhs = drop_raw_marks(rk_rhs);
+    if (!rk16_fits(rk_idx) || !rk16_fits(rk_rhs)) {
+        return error_at("Expression too large to compile (register/constant index exceeds the fused "
+                        "index-op encoding's range)");
+    }
+    chunk_emit(c, PACK3(OP_INDEX_COMPOUND, t.obj_reg, bin_op, 0));
+    chunk_emit(c, PACK_2X16(pack_rk16(rk_idx), pack_rk16(rk_rhs)));
     release_if_top(rk_rhs);
-    emit_index_set(c, t.obj_reg, t.pending_rk_idx, item_reg);
-    reg_free(1);
-    return true;
 }
 
 static void parse_chain_compound(Chunk* c, ChainTarget t) {
@@ -3603,19 +3605,10 @@ static void parse_chain_compound(Chunk* c, ChainTarget t) {
     if (t.pending_is_field) {
         if (!compound_assign_field(c, t, op))
             return;
-    } else if (!compound_assign_index_raw(c, t, op)) {
-        int item_reg = reg_alloc();
-        emit_index_get(c, item_reg, t.obj_reg, t.pending_rk_idx);
-
-        int rk_rhs = parse_binary(c, 0);
+    } else {
+        compound_assign_index(c, t, op);
         if (parse_had_error)
             return;
-
-        emit_binary(c, item_reg, op, item_reg, rk_rhs);
-        release_if_top(rk_rhs);
-
-        emit_index_set(c, t.obj_reg, t.pending_rk_idx, item_reg);
-        reg_free(1); /* item_reg */
     }
 
     release_if_top(t.pending_rk_idx);

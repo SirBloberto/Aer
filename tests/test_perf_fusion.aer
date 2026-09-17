@@ -207,7 +207,23 @@ assert(ic_narrow[0] == 21, "a narrow int32 element falls back and still computes
 # Receivers the fused form never covers.
 ic_dict = {"k": 5}
 ic_dict["k"] += 3
-assert(ic_dict["k"] == 8, "a dict value += falls back to the general path")
+assert(ic_dict["k"] == 8, "a dict value += on an existing key")
+
+# The update writes through the entry the lookup already found, so it must not add a key, disturb a
+# neighbour, or read the value back after storing it.
+ic_tally = {"a": 1, "b": 10}
+ic_tally["a"] += 1
+ic_tally["a"] += 1
+assert(ic_tally["a"] == 3 and ic_tally["b"] == 10, "repeated updates leave the neighbour alone")
+assert(length(ic_tally) == 2, "updating a key in place does not grow the map")
+
+ic_self_dict = {"n": 6}
+ic_self_dict["n"] += ic_self_dict["n"]
+assert(ic_self_dict["n"] == 12, "dict[k] += itself reads the entry before writing it back")
+
+ic_real_dict = {"r": 9.0}
+ic_real_dict["r"] /= 2.0
+assert(ic_real_dict["r"] == 4.5, "/= on a dict value has no fused form and still divides")
 
 ic_mixed = ["a", 2]
 ic_mixed[1] += 3

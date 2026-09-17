@@ -3714,6 +3714,26 @@ HANDLER(index_get_raw_real)
    as the ordinary boxed read-modify-write its three-opcode expansion would have done. */
 static void vm_index_compound_slow(VM* vm, const uint32_t* pc, Chunk* c, AerVal obj, AerVal idx,
                                    AerVal rhs, Opcode bin) {
+    /* An existing dict entry is read and written through ONE resolution -- the whole reason the read
+       and the write are in the same handler. A missing key falls through so its error is the one the
+       separate read and write would have raised. */
+    if (aer_type(obj) == TYPE_DICT && aer_type(idx) == TYPE_STRING) {
+        AerDict* d = aer_as_dict(obj);
+        AerString* is = aer_as_string(idx);
+        unsigned int klen = hashtable_key_true_len(is->data, is->length);
+        HashValue khash = hashtable_string_hash(is, klen);
+        int at = hashtable_get_index_hashed(&d->map, is->data, klen, khash);
+        if (at >= 0) {
+            AerVal held = d->map.dense[at].payload;
+            bool done;
+            AerVal updated = vm_binary_fast(held, rhs, bin, aer_type(held), aer_type(rhs), &done);
+            if (!done)
+                updated = vm_binary_cold(c, held, rhs, bin, aer_type(held), aer_type(rhs));
+            gc_barrier_dict(vm, d, (unsigned int)at, updated);
+            d->map.dense[at].payload = updated;
+            return;
+        }
+    }
     AerVal cur;
     vm_index_get_compute(obj, idx, &cur);
     bool handled;
@@ -3721,6 +3741,20 @@ static void vm_index_compound_slow(VM* vm, const uint32_t* pc, Chunk* c, AerVal 
     if (!handled)
         res = vm_binary_cold(c, cur, rhs, bin, aer_type(cur), aer_type(rhs));
     vm_index_set_compute(vm, obj, idx, res);
+}
+
+/* `arr[rk] OP= rhs` on any receiver: the same read-modify-write the three-opcode expansion did, in
+   one dispatch, and without boxing the element into a temp register in between. The read and the
+   write still resolve separately, so a dict still hashes its key twice. */
+HANDLER(index_compound)
+    AerVal obj = registers[(int)UNPACK_A(op_word)];
+    Opcode bin = (Opcode)UNPACK_B(op_word);
+    uint32_t idx_rhs_word = READ();
+    AerVal idx = *vm_rk_ptr16(registers, const_pool, UNPACK_2X16_HI(idx_rhs_word));
+    AerVal rhs = *vm_rk_ptr16(registers, const_pool, UNPACK_2X16_LO(idx_rhs_word));
+    vm_index_compound_slow(vm, pc, c, obj, idx, rhs, bin);
+    gc_maybe_collect(vm);
+    DISPATCH();
 }
 
 /* Only ADD/SUB/MUL reach here (parser.c), so the three-way choice is exhaustive. */
@@ -5574,6 +5608,7 @@ static const OpHandler aer_handlers[256] = {
         [OP_CAST] = h_cast,
         [OP_FIELD_BINARY] = h_field_binary,
         [OP_FIELD_COMPOUND] = h_field_compound,
+        [OP_INDEX_COMPOUND] = h_index_compound,
         [OP_TYPED_ARRAY_CHAIN2] = h_typed_array_chain2,
         [OP_PRINT_REPL] = h_print_repl,
 

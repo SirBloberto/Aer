@@ -184,6 +184,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
         {AT_B, F_REG}, {AT_C, F_BINOP}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}),
     ROW(OP_FIELD_COMPOUND, "fused: struct.field OP= rk (resolved once, no dest reg)", {AT_A, F_REG},
         {AT_B, F_BINOP}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}),
+    ROW(OP_INDEX_COMPOUND, "fused: arr[rk] OP= rk (any receiver, no dest reg)", {AT_A, F_REG},
+        {AT_B, F_BINOP}, {AT_W1_HI, F_RK16}, {AT_W1_LO, F_RK16}),
     ROW(OP_TYPED_ARRAY_CHAIN2,
         "fused: reg = (reg op1 reg) op2 reg (typed-array chain, runtime-checked)", {AT_A, F_REG},
         {AT_B, F_REG}, {AT_C, F_REG}, {AT_W1_HI, F_BINOP}, {AT_W1_LO, F_REG}, {AT_W2, F_BINOP}),
