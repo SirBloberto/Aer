@@ -365,4 +365,44 @@ function get_int(x):
 ai = accumulate_int_into_real(4)
 assert(ai == 0.0 + 1.0 + 2.0 + 3.0, "a raw real local's own compound assignment ('+=') also promotes a boxed integer rhs correctly")
 
+# ------------------------------------------------------------------ #
+# A chained element read may take its raw kind from the consumer only  #
+# on the hop that ENDS the chain. Every earlier hop yields the next    #
+# receiver -- a row -- and reading a row as a number raises. Two-deep  #
+# cannot distinguish "past the first hop" from "the last hop", so the  #
+# three-deep cases below are the ones that hold the rule in place.     #
+# ------------------------------------------------------------------ #
+
+function nested_two_deep():
+    m = [[2.0; 3]; 2]
+    nd_sum = 0.0
+    for i in 0..2:
+        for k in 0..3:
+            nd_sum += m[i][k]
+    return nd_sum
+
+assert(nested_two_deep() == 12.0, "a two-deep element read into a raw real accumulator sums correctly")
+
+function nested_three_deep():
+    cube = [[[1.5, 1.5], [1.5, 1.5]], [[1.5, 1.5], [1.5, 1.5]]]
+    nd_sum = 0.0
+    for i in 0..2:
+        for j in 0..2:
+            for k in 0..2:
+                nd_sum += cube[i][j][k]
+    return nd_sum
+
+assert(nested_three_deep() == 12.0, "a three-deep element read into a raw real accumulator sums correctly -- the middle hop yields a row and must stay generic")
+
+function nested_three_deep_int():
+    cube = [[[3, 3], [3, 3]], [[3, 3], [3, 3]]]
+    t = 0
+    for i in 0..2:
+        for j in 0..2:
+            for k in 0..2:
+                t += cube[i][j][k]
+    return t
+
+assert(nested_three_deep_int() == 24, "the same three-deep shape with an integer accumulator and integer elements")
+
 print("test_primitive_pass.aer: all assertions passed.")

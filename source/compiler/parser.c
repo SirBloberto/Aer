@@ -2330,16 +2330,15 @@ static bool emit_index_field_get(Chunk* c, int arr_reg, int rk_start, unsigned i
 
 /* `expr[index]`: into a raw slot when the array's element kind is known, unchecked once a loop proved
    the index. */
-static int emit_index_read(Chunk* c, int arr_reg, int rk_start, bool receiver_is_chain_step) {
+static int emit_index_read(Chunk* c, int arr_reg, int rk_start, bool may_take_want_kind) {
     /* Free-then-allocate, matching parse_binary_ops's own discipline. */
     release_if_top(rk_start);
     release_if_top(arr_reg);
 
     RawKind elem = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_elem_kind[arr_reg] : RAWK_NONE;
-    /* Nothing was watched being built, so take the consumer's kind -- but only past the first hop of a
-       chain. `a[i]` yields the ROW, and reading a row as a number raises; `a[i][k]` yields the element
-       the consumer actually reads. */
-    if (elem == RAWK_NONE && receiver_is_chain_step)
+    /* Nothing was watched being built, so take the consumer's kind -- but only where the chain ENDS.
+       Every earlier hop yields a receiver, and reading a row as a number raises. */
+    if (elem == RAWK_NONE && may_take_want_kind)
         elem = P.want_kind;
     if (elem != RAWK_NONE && rk8_fits(rk_start)) {
         int slot = slot_alloc(elem);
@@ -2394,8 +2393,8 @@ static int emit_field_read(Chunk* c, int struct_reg, unsigned int field_idx) {
 }
 
 static int parse_postfix_chain(Chunk* c, int rk) {
-    /* False until an index step has produced a value, so the FIRST hop never reads a row as a number:
-       only a later hop's receiver is itself an element of something. */
+    /* False until an index step has produced a value: the first hop's receiver is the array itself, so
+       what it yields is a row rather than an element. */
     bool took_a_step = false;
     for (;;) {
         if (consume(TOKEN_OPEN_PARENTHESE)) {
@@ -2445,7 +2444,10 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                         return rk;
                     continue;
                 }
-                rk = emit_index_read(c, arr_reg, rk_start, took_a_step);
+                /* Only a hop that ENDS the chain may take the consumer's kind: an intermediate hop
+                   yields the next receiver (a row, or a callee), and reading that as a number raises. */
+                bool ends_chain = !equal(TOKEN_OPEN_BRACKET) && !equal(TOKEN_OPEN_PARENTHESE);
+                rk = emit_index_read(c, arr_reg, rk_start, took_a_step && ends_chain);
                 took_a_step = true;
                 continue;
             }
