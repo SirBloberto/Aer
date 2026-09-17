@@ -2145,6 +2145,9 @@ static int parse_array_literal(Chunk* c) {
     if (item_count > 1)
         reg_free(item_count - 1);
     emit_array_new(c, item_reg_base, item_reg_base, item_count);
+    /* The array lands in its FIRST element's register, so that element's own element kind -- a typed
+       array row carries one -- must not survive as this array's. */
+    note_slot_written(item_reg_base);
     return item_reg_base;
 }
 

@@ -405,4 +405,35 @@ function nested_three_deep_int():
 
 assert(nested_three_deep_int() == 24, "the same three-deep shape with an integer accumulator and integer elements")
 
+# ------------------------------------------------------------------ #
+# An array literal is built into its first element's register, so that #
+# element's element-kind must not survive as the new array's own. A    #
+# typed array row (`[v; n]`) carries one, so a literal whose FIRST     #
+# element is typed would otherwise be read as an array of bare numbers #
+# -- unreadable at any depth, with or without a raw consumer.          #
+# ------------------------------------------------------------------ #
+
+function typed_first_row_single_hop():
+    m = [[2.5; 3], [2.5; 3]]
+    row = m[0]
+    return length(row)
+
+assert(typed_first_row_single_hop() == 3, "a single-hop read of a literal whose first element is a typed array yields the row")
+
+function typed_first_row_nested():
+    m = [[1.5; 2], [1.5; 2]]
+    nd_acc = 0.0
+    for i in 0..2:
+        for k in 0..2:
+            nd_acc += m[i][k]
+    return nd_acc
+
+assert(typed_first_row_nested() == 6.0, "the same literal reads correctly through a two-deep chain into a raw accumulator")
+
+function typed_second_row_only():
+    m = [[1.5, 1.5], [2.5; 2]]
+    return m[1][0]
+
+assert(typed_second_row_only() == 2.5, "a typed row in a later position was always fine and stays fine")
+
 print("test_primitive_pass.aer: all assertions passed.")
