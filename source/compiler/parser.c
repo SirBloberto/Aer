@@ -201,6 +201,12 @@ typedef struct Parser {
        indentation cap. */
     int expr_depth;
 
+    /* The kind the consumer of the expression being parsed will read it as, or RAWK_NONE. Set only
+       where a consumer genuinely knows (a raw variable's `op=`) and never guessed from the data: the
+       checked index opcodes coerce int to real on their fallback, so an invented kind would silently
+       turn integer arithmetic into floating-point. */
+    RawKind want_kind;
+
 
     /* Range-for loop variables currently in scope, innermost last, with whether the loop's own body
        ever writes one. A body that never does lets OP_ITER_RANGE_LOOP carry its counter IN the loop
@@ -1717,6 +1723,10 @@ static int arg_materialize(Chunk* c, int rk) {
 static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base, bool* out_base_is_temp) {
     int base = -1;
     int count = 0;
+    /* An argument is read by the callee, never by whatever consumes this call's result, so the
+       enclosing want must not reach it. Restored on every exit. */
+    RawKind saved_want = P.want_kind;
+    P.want_kind = RAWK_NONE;
     *out_base_is_temp = true;
     if (!equal(close_tok)) {
         int rk = parse_binary(c, 0);
@@ -1724,6 +1734,7 @@ static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base, 
             base = materialize(c, rk);
             *out_base_is_temp = is_temp(base);
             *out_base = base;
+            P.want_kind = saved_want;
             return 1;
         }
         base = arg_materialize(c, rk);
@@ -1734,6 +1745,7 @@ static int parse_contiguous_exprs(Chunk* c, TokenType close_tok, int* out_base, 
         }
     }
     *out_base = base;
+    P.want_kind = saved_want;
     return count;
 }
 
@@ -2318,19 +2330,24 @@ static bool emit_index_field_get(Chunk* c, int arr_reg, int rk_start, unsigned i
 
 /* `expr[index]`: into a raw slot when the array's element kind is known, unchecked once a loop proved
    the index. */
-static int emit_index_read(Chunk* c, int arr_reg, int rk_start) {
+static int emit_index_read(Chunk* c, int arr_reg, int rk_start, bool receiver_is_chain_step) {
     /* Free-then-allocate, matching parse_binary_ops's own discipline. */
     release_if_top(rk_start);
     release_if_top(arr_reg);
 
     RawKind elem = (arr_reg >= 0 && arr_reg < FRAME_REGISTERS) ? P.regs.reg_elem_kind[arr_reg] : RAWK_NONE;
+    /* Nothing was watched being built, so take the consumer's kind -- but only past the first hop of a
+       chain. `a[i]` yields the ROW, and reading a row as a number raises; `a[i][k]` yields the element
+       the consumer actually reads. */
+    if (elem == RAWK_NONE && receiver_is_chain_step)
+        elem = P.want_kind;
     if (elem != RAWK_NONE && rk8_fits(rk_start)) {
         int slot = slot_alloc(elem);
         if (slot >= 0) {
-            /* The kind here is not an inference: reg_elem_kind is set from watching the array get built
-               and cleared by any write to that register, unlike try_rewrite_index_get_raw's guess from
-               the consumer, which is what the checked opcode's fallback exists to catch (15 in 22.1M,
-               all from there). */
+            /* Two kinds reach here. reg_elem_kind is not an inference -- set from watching the array get
+               built, cleared by any write to that register. P.want_kind is a guess from the consumer,
+               like try_rewrite_index_get_raw's, and the checked opcode's fallback is what catches a
+               wrong one (15 in 22.1M before this path existed). */
             if (index_safe_unchecked(arr_reg, rk_start))
                 chunk_emit(c, PACK3(OP_TYPED_INDEX_GET_UNCHECKED, slot, arr_reg, pack_rk8(rk_start)));
             else
@@ -2377,6 +2394,9 @@ static int emit_field_read(Chunk* c, int struct_reg, unsigned int field_idx) {
 }
 
 static int parse_postfix_chain(Chunk* c, int rk) {
+    /* False until an index step has produced a value, so the FIRST hop never reads a row as a number:
+       only a later hop's receiver is itself an element of something. */
+    bool took_a_step = false;
     for (;;) {
         if (consume(TOKEN_OPEN_PARENTHESE)) {
             int callee_reg = materialize(c, rk);
@@ -2425,7 +2445,8 @@ static int parse_postfix_chain(Chunk* c, int rk) {
                         return rk;
                     continue;
                 }
-                rk = emit_index_read(c, arr_reg, rk_start);
+                rk = emit_index_read(c, arr_reg, rk_start, took_a_step);
+                took_a_step = true;
                 continue;
             }
 
@@ -3257,7 +3278,10 @@ static void compound_assign_raw_variable(Chunk* c, unsigned int name_idx, int ex
     bool native_op_exists = (boxed_op == OP_ADD || boxed_op == OP_SUB || boxed_op == OP_MUL);
 
     unsigned int rhs_start = c->count;
+    RawKind saved_want = P.want_kind;
+    P.want_kind = cur_kind; /* whatever the rhs computes is ultimately read as the target's kind */
     int rk_rhs = parse_binary(c, 0);
+    P.want_kind = saved_want;
     if (parse_had_error)
         return;
     RawKind rhs_kind = rk_raw_kind(c, rk_rhs);
