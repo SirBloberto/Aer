@@ -1,0 +1,30 @@
+# Naive dense matrix multiply -- the shape real matrix code has: two nested index reads per inner
+# iteration, a scalar accumulator, and a row-major walk. `[[0.0; n]; n]` builds a plain outer array
+# of INDEPENDENT typed rows (the repeat literal copies each row), so the outer dimension is a plain
+# array and only the innermost one is dense -- a typed array holds primitives, never other arrays.
+function matmul(a, b, n):
+    c = [[0.0; n]; n]
+    for i in 0..n:
+        for j in 0..n:
+            s = 0.0
+            for k in 0..n:
+                s += a[i][k] * b[k][j]
+            c[i][j] = s
+    return c
+
+N = 256
+
+a = [[0.0; N]; N]
+b = [[0.0; N]; N]
+for i in 0..N:
+    for j in 0..N:
+        a[i][j] = float((i + j) % 7) * 0.5
+        b[i][j] = float((i * j) % 5) * 0.25
+
+c = matmul(a, b, N)
+
+# The trace, so the result is consumed and nothing above can be discarded as dead.
+trace = 0.0
+for d in 0..N:
+    trace += c[d][d]
+print("matmul {N}x{N}: trace={trace}")
