@@ -3507,6 +3507,17 @@ HANDLER(index_get)
     int arr_reg = (int)UNPACK_B(op_word);
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     AerVal obj = registers[arr_reg];
+    /* A negative index wraps to a huge unsigned value and falls through to vm_array_position, which
+       counts it from the end -- so one compare covers both bounds and this skips nothing a plain
+       in-range read needs. */
+    if (aer_type(obj) == TYPE_ARRAY && aer_type(*idx) == TYPE_INTEGER) {
+        AerArray* a = aer_as_array(obj);
+        uint64_t at = (uint64_t)aer_as_int(*idx);
+        if (!a->shape && at < (uint64_t)a->count) {
+            registers[dest_reg] = a->items[at];
+            DISPATCH();
+        }
+    }
     vm_index_get_compute(obj, *idx, &registers[dest_reg]);
     /* Only single-char string indexing allocates -- array/dict indexing never touches the heap, so
        skip the check for the dominant common case. */
