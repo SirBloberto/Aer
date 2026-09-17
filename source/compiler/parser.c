@@ -3296,16 +3296,33 @@ static void compound_assign_raw_variable(Chunk* c, unsigned int name_idx, int ex
         rhs_kind = cur_kind;
     int slot = P.var_regs[existing_idx];
 
-    /* The RHS's just-emitted raw MUL and this ADD/SUB become one FMA/FMS writing the variable. */
-    if (cur_kind == RAWK_REAL && (boxed_op == OP_ADD || boxed_op == OP_SUB) && rhs_kind == RAWK_REAL &&
-        c->count - rhs_start == 1) {
-        uint32_t mw = c->code[rhs_start];
-        if ((Opcode)(mw & 0xFF) == OP_RAW_MUL_REAL && (int)UNPACK_A(mw) == (rk_rhs & RK_RAW_SLOT_MASK)) {
-            c->count = rhs_start; /* discard the MUL -- fused below instead */
-            raw_release_if_top((int)UNPACK_A(mw));
-            Opcode fused = (boxed_op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
-            chunk_emit(c, PACK3(fused, slot, (int)UNPACK_B(mw), (int)UNPACK_C(mw)));
-            return;
+    /* The RHS's just-emitted raw MUL and this ADD/SUB become one FMA/FMS writing the variable. The
+       MUL only has to be the LAST instruction, not the whole RHS: `s += a[i][k] * b[k][j]` emits the
+       element reads first. last_instruction is what proves it is still the tail -- lengths vary, so
+       it cannot be found by reading backwards. */
+    if (cur_kind == RAWK_REAL && (boxed_op == OP_ADD || boxed_op == OP_SUB) && rhs_kind == RAWK_REAL) {
+        unsigned int at = last_instruction(c);
+        /* An RHS that emitted nothing leaves the window pointing before it, at code this statement
+           does not own. */
+        if (at != NO_OFFSET && at < rhs_start)
+            at = NO_OFFSET;
+        /* Still reachable: a backpatch inside the RHS bumps the epoch and closes the window, but a
+           lone MUL is findable without it. */
+        if (at == NO_OFFSET && c->count - rhs_start == 1)
+            at = rhs_start;
+        if (at != NO_OFFSET) {
+            uint32_t mw = c->code[at];
+            if ((Opcode)(mw & 0xFF) == OP_RAW_MUL_REAL &&
+                (int)UNPACK_A(mw) == (rk_rhs & RK_RAW_SLOT_MASK)) {
+                c->count = at; /* discard the MUL -- fused below instead */
+                /* The FMA lands where the MUL was, so the window would otherwise hand it back as a
+                   foldable MUL. */
+                P.peep.last.offset = NO_OFFSET;
+                raw_release_if_top((int)UNPACK_A(mw));
+                Opcode fused = (boxed_op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
+                chunk_emit(c, PACK3(fused, slot, (int)UNPACK_B(mw), (int)UNPACK_C(mw)));
+                return;
+            }
         }
     }
 
