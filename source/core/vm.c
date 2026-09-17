@@ -3710,6 +3710,60 @@ HANDLER(index_get_raw_real)
     __attribute__((musttail)) return h_index_get_any_as_real(vm, pc, registers, c);
 }
 
+/* Any receiver the fused compound below does not cover -- a dict, a plain array, a narrow element --
+   as the ordinary boxed read-modify-write its three-opcode expansion would have done. */
+static void vm_index_compound_slow(VM* vm, const uint32_t* pc, Chunk* c, AerVal obj, AerVal idx,
+                                   AerVal rhs, Opcode bin) {
+    AerVal cur;
+    vm_index_get_compute(obj, idx, &cur);
+    bool handled;
+    AerVal res = vm_binary_fast(cur, rhs, bin, aer_type(cur), aer_type(rhs), &handled);
+    if (!handled)
+        res = vm_binary_cold(c, cur, rhs, bin, aer_type(cur), aer_type(rhs));
+    vm_index_set_compute(vm, obj, idx, res);
+}
+
+/* Only ADD/SUB/MUL reach here (parser.c), so the three-way choice is exhaustive. */
+HANDLER(index_compound_raw_int)
+    AerVal obj = registers[(int)UNPACK_A(op_word)];
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
+    Opcode bin = (Opcode)UNPACK_B(op_word);
+    int64_t rhs = registers[READ()].as.i;
+    if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        if ((uint64_t)idx->as.i < (uint64_t)ta->count && ta->elem_kind == TYPED_ELEM_INT64) {
+            unsigned char* at = ta->data + (size_t)idx->as.i * 8;
+            int64_t cur;
+            memcpy(&cur, at, 8);
+            cur = bin == OP_ADD ? cur + rhs : bin == OP_SUB ? cur - rhs : cur * rhs;
+            memcpy(at, &cur, 8);
+            DISPATCH();
+        }
+    }
+    vm_index_compound_slow(vm, pc, c, obj, *idx, aer_int(rhs), bin);
+    DISPATCH();
+}
+
+HANDLER(index_compound_raw_real)
+    AerVal obj = registers[(int)UNPACK_A(op_word)];
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
+    Opcode bin = (Opcode)UNPACK_B(op_word);
+    double rhs = registers[READ()].as.d;
+    if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
+        AerTypedArray* ta = aer_as_typed_array(obj);
+        if ((uint64_t)idx->as.i < (uint64_t)ta->count && ta->elem_kind == TYPED_ELEM_FLOAT64) {
+            unsigned char* at = ta->data + (size_t)idx->as.i * 8;
+            double cur;
+            memcpy(&cur, at, 8);
+            cur = bin == OP_ADD ? cur + rhs : bin == OP_SUB ? cur - rhs : cur * rhs;
+            memcpy(at, &cur, 8);
+            DISPATCH();
+        }
+    }
+    vm_index_compound_slow(vm, pc, c, obj, *idx, aer_real(rhs), bin);
+    DISPATCH();
+}
+
 /* `arr[a:b]` -- vm_slice_bounds() resolves/clamps the bounds; a slice is always a fresh copy. */
 HANDLER(slice_get)
     int dest_reg = (int)UNPACK_A(op_word);
@@ -5495,6 +5549,8 @@ static const OpHandler aer_handlers[256] = {
         [OP_INDEX_SET_RAW_INT] = h_index_set_raw_int,
         [OP_INDEX_SET_RAW_REAL] = h_index_set_raw_real,
         [OP_INDEX_GET_RAW_REAL] = h_index_get_raw_real,
+        [OP_INDEX_COMPOUND_RAW_INT] = h_index_compound_raw_int,
+        [OP_INDEX_COMPOUND_RAW_REAL] = h_index_compound_raw_real,
         [OP_CALL_SELF] = h_call_self,
         [OP_TAIL_CALL_SELF] = h_tail_call_self,
         [OP_RAW_MATH_REAL] = h_raw_math_real,

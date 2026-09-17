@@ -352,6 +352,13 @@ typedef enum {
     OP_INDEX_SET_RAW_REAL, /* arr_reg, rk_idx, raw_real_slot */
     OP_INDEX_GET_RAW_REAL, /* raw_real_slot, arr_reg, rk_idx */
 
+    /* `arr[rk] OP= raw` in one dispatch, where a separate get, arithmetic and set cost three and
+       box the element in between -- the trade OP_FIELD_COMPOUND already makes for a struct field,
+       which an accumulator into an array element (a histogram bucket, a group-by total) needs just
+       as often. ADD/SUB/MUL and the wide element kinds only; anything else takes the slow path. */
+    OP_INDEX_COMPOUND_RAW_INT, /* word0: arr_reg, bin_op, rk_idx -- word1: raw_int_slot */
+    OP_INDEX_COMPOUND_RAW_REAL, /* word0: arr_reg, bin_op, rk_idx -- word1: raw_real_slot */
+
     /* Same variant, so the frame is the caller's own and no resolver runs -- without it a recursive
        function re-resolves every call, costing more than specializing saved. Emitted only INTO a
        variant: a generic body must keep resolving or it never specializes at all. */
