@@ -1766,8 +1766,8 @@ what a real permission system would still need on top of this.
 |-------|-------------|
 | Call stack depth | 10,000 frames — doesn't apply to true tail calls (see [Functions](#functions)), which reuse the current frame instead of consuming one |
 | Value stack | 256 slots |
-| Loop nesting | 16 levels |
-| Distinct local names per function (parameters + body locals combined) | 32 |
+| Loop nesting | 16 levels — but each `for` claims registers, so the 128-register frame usually binds first, at roughly 11 nested range-fors |
+| Distinct local names per function (parameters + body locals combined) | 127 — one short of the 128-register frame |
 | Destructuring targets | 16 |
 | Struct fields | 16 |
 | Interpolation buffer | 4 096 chars |
