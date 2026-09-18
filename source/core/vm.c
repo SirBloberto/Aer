@@ -1310,47 +1310,6 @@ static inline AerVal vm_typed_elem_read(unsigned char* slot, TypedArrayElemKind 
     return aer_null();
 }
 
-/* vm_typed_elem_read's unboxed counterparts -- same widening rules, no AerVal built. */
-static inline double vm_typed_elem_read_real(unsigned char* slot, TypedArrayElemKind kind) {
-    switch (kind) {
-        case TYPED_ELEM_INT32: {
-            int32_t v;
-            memcpy(&v, slot, 4);
-            return (double)v;
-        }
-        case TYPED_ELEM_FLOAT32: {
-            float v;
-            memcpy(&v, slot, 4);
-            return (double)v;
-        }
-        case TYPED_ELEM_INT64: {
-            int64_t v;
-            memcpy(&v, slot, 8);
-            return (double)v;
-        }
-        case TYPED_ELEM_FLOAT64: {
-            double v;
-            memcpy(&v, slot, 8);
-            return v;
-        }
-        case TYPED_ELEM_BOOL: break;
-    }
-    return 0.0;
-}
-
-/* Only the integer kinds -- a float element read into an int slot would silently truncate, so the
-   caller falls back to the boxed path instead (see h_typed_index_get_raw_int). */
-static inline int64_t vm_typed_elem_read_int(unsigned char* slot, TypedArrayElemKind kind) {
-    if (kind == TYPED_ELEM_INT32) {
-        int32_t v;
-        memcpy(&v, slot, 4);
-        return v;
-    }
-    int64_t v;
-    memcpy(&v, slot, 8);
-    return v;
-}
-
 /* Caller must already have validated v against kind -- see vm_typed_array_check. int32 in
    particular is never silently wrapped: an out-of-range value is rejected there, not truncated
    here. */
@@ -3693,12 +3652,21 @@ HANDLER(index_get_raw_int)
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
         AerTypedArray* ta = aer_as_typed_array(obj);
-        if ((uint64_t)idx->as.i < (uint64_t)ta->count &&
-            (ta->elem_kind == TYPED_ELEM_INT32 || ta->elem_kind == TYPED_ELEM_INT64)) {
-            unsigned int width = vm_typed_elem_width(ta->elem_kind);
-            registers[dest] =
-                aer_int(vm_typed_elem_read_int(ta->data + (size_t)idx->as.i * width, ta->elem_kind));
-            DISPATCH();
+        if ((uint64_t)idx->as.i < (uint64_t)ta->count) {
+            /* Only two kinds can reach the read, so decode it here rather than through the shared
+               helpers, which each re-decide among five on an element read. */
+            if (ta->elem_kind == TYPED_ELEM_INT64) {
+                int64_t v;
+                memcpy(&v, ta->data + (size_t)idx->as.i * 8, 8);
+                registers[dest] = aer_int(v);
+                DISPATCH();
+            }
+            if (ta->elem_kind == TYPED_ELEM_INT32) {
+                int32_t v;
+                memcpy(&v, ta->data + (size_t)idx->as.i * 4, 4);
+                registers[dest] = aer_int(v);
+                DISPATCH();
+            }
         }
     }
     __attribute__((musttail)) return h_index_get_any_as_int(vm, pc, registers, c);
@@ -3710,12 +3678,20 @@ HANDLER(index_get_raw_real)
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
         AerTypedArray* ta = aer_as_typed_array(obj);
-        if ((uint64_t)idx->as.i < (uint64_t)ta->count &&
-            (ta->elem_kind == TYPED_ELEM_FLOAT32 || ta->elem_kind == TYPED_ELEM_FLOAT64)) {
-            unsigned int width = vm_typed_elem_width(ta->elem_kind);
-            registers[dest] =
-                aer_real(vm_typed_elem_read_real(ta->data + (size_t)idx->as.i * width, ta->elem_kind));
-            DISPATCH();
+        if ((uint64_t)idx->as.i < (uint64_t)ta->count) {
+            /* Same two-kind decode as index_get_raw_int above. */
+            if (ta->elem_kind == TYPED_ELEM_FLOAT64) {
+                double v;
+                memcpy(&v, ta->data + (size_t)idx->as.i * 8, 8);
+                registers[dest] = aer_real(v);
+                DISPATCH();
+            }
+            if (ta->elem_kind == TYPED_ELEM_FLOAT32) {
+                float v;
+                memcpy(&v, ta->data + (size_t)idx->as.i * 4, 4);
+                registers[dest] = aer_real((double)v);
+                DISPATCH();
+            }
         }
     }
     __attribute__((musttail)) return h_index_get_any_as_real(vm, pc, registers, c);
