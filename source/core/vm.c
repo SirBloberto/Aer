@@ -3318,6 +3318,21 @@ HANDLER(return)
     DISPATCH();
 }
 
+static VmSliceResult h_call_self(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c);
+
+/* The push that does not fit. Separate because vm_grow_for_push and error() are the only calls
+   h_call_self makes, and one call is what gives the whole handler a stack frame -- a recursive body
+   runs the push path millions of times and this path almost never. */
+SEPARATE_HANDLER(call_self_grow)
+    AerVal* callee_regs = registers + vm->call_stack[vm->call_depth].frame_size;
+    if (!vm_grow_for_push(vm, callee_regs)) {
+        error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
+        DISPATCH();
+    }
+    /* Same rerun as h_call's, and for the same reason. */
+    __attribute__((musttail)) return h_call_self(vm, pc, vm->call_stack[vm->call_depth].registers, c);
+}
+
 /* See OP_CALL_SELF (vm.h). The frame is the caller's own size and entry point, both read from the
    caller frame rather than resolved, so this is a push and nothing else. */
 HANDLER(call_self)
@@ -3329,14 +3344,8 @@ HANDLER(call_self)
     unsigned int fsz = caller->frame_size, entry = caller->code_offset;
     unsigned short bounds = caller->frame_bounds;
     AerVal* callee_regs = registers + fsz;
-    if (vm->call_depth + 1 >= vm->call_depth_limit || callee_regs > vm->push_base_limit) {
-        if (!vm_grow_for_push(vm, callee_regs)) {
-            error("Call stack overflow (max %d frames); tail calls do not consume one", VM_CALL_MAX);
-            DISPATCH();
-        }
-        /* Same rerun as h_call's, and for the same reason. */
-        __attribute__((musttail)) return h_call_self(vm, pc, vm->call_stack[vm->call_depth].registers, c);
-    }
+    if (vm->call_depth + 1 >= vm->call_depth_limit || callee_regs > vm->push_base_limit)
+        __attribute__((musttail)) return h_call_self_grow(vm, pc, registers, c);
     /* Every scalar field first, so pc, c, dest_reg and entry stop being live across the two loops
        below. The compiler cannot sink them itself: call_stack and the register bank are separate
        allocations, but nothing in the types says so. */
