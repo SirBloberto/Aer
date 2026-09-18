@@ -3472,7 +3472,7 @@ HANDLER(array_new)
 /* Every receiver and index form the plain-array read below does not cover -- a dict, a string, a
    shaped array, a negative or out-of-range index. Separate because the call is what makes the
    compiler give this opcode a stack frame, and the plain read needs none. */
-SEPARATE_HANDLER(index_get_compute)
+__attribute__((cold)) SEPARATE_HANDLER(index_get_compute)
     int dest_reg = (int)UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     AerVal obj = registers[(int)UNPACK_B(op_word)];
