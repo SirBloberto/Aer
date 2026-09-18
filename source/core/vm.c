@@ -3460,6 +3460,21 @@ HANDLER(array_new)
     DISPATCH();
 }
 
+/* Every receiver and index form the plain-array read below does not cover -- a dict, a string, a
+   shaped array, a negative or out-of-range index. Separate because the call is what makes the
+   compiler give this opcode a stack frame, and the plain read needs none. */
+SEPARATE_HANDLER(index_get_compute)
+    int dest_reg = (int)UNPACK_A(op_word);
+    AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
+    AerVal obj = registers[(int)UNPACK_B(op_word)];
+    vm_index_get_compute(obj, *idx, &registers[dest_reg]);
+    /* Only single-char string indexing allocates -- array/dict indexing never touches the heap, so
+       skip the check for the dominant common case. */
+    if (aer_type(obj) == TYPE_STRING)
+        gc_maybe_collect(vm);
+    DISPATCH();
+}
+
 /* Already type-generic (array/dict/string) with all bounds/negative-index logic. */
 HANDLER(index_get)
     int dest_reg = (int)UNPACK_A(op_word);
@@ -3477,12 +3492,7 @@ HANDLER(index_get)
             DISPATCH();
         }
     }
-    vm_index_get_compute(obj, *idx, &registers[dest_reg]);
-    /* Only single-char string indexing allocates -- array/dict indexing never touches the heap, so
-       skip the check for the dominant common case. */
-    if (aer_type(obj) == TYPE_STRING)
-        gc_maybe_collect(vm);
-    DISPATCH();
+    __attribute__((musttail)) return h_index_get_compute(vm, pc, registers, c);
 }
 
 /* a, b = expr -- see vm_destructure_compute. Never allocates, unlike h_index_get, so no
