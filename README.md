@@ -1758,7 +1758,6 @@ what a real permission system would still need on top of this.
 | No struct-to-struct conversion | There's no built-in way to reshape a hashtable or another struct into a Point | Build the struct explicitly: `Point(some_table["x"], ...)` |
 | Integer arithmetic wraps silently | `9223372036854775807 + 1` → `-9223372036854775808`, with no error | Range-check before the operation, or use floats where the magnitude is unbounded |
 | Strings are bytes, not characters | `length("héllo")` is 6, and `s[1]` yields one byte of a two-byte character | Index only ASCII text; for anything else work on whole strings (`string.split`, `string.replace`) |
-| Pipe rejects nested calls in target args | `x \|> f(g(1))` is a parse error, at any depth | Assign the inner call to a variable first: `t = g(1); x \|> f(t)` |
 
 ### Hard limits
 
@@ -1781,8 +1780,8 @@ what a real permission system would still need on top of this.
   function/struct persistence work. The file-module registry grows the same way during normal
   execution, but an embedding host can explicitly reclaim it via `aer_module_free_all()` (see
   [Embedding](#embedding)) when tearing the process down.
-- `net` is a minimal blocking TCP client only — no listen/accept (no way to *be* a server), no
-  HTTP/TLS layer. `regex` covers a practical common subset (see [Regular
+- `net` is a minimal blocking TCP layer — connect, plus `listen`/`accept` — with no HTTP or TLS
+  layer of its own. `regex` covers a practical common subset (see [Regular
   Expressions](#regular-expressions--regex)), not the full PCRE feature set.
 - No try/catch **at the AER language level** — runtime errors are still not catchable AER
   values; user-level fallibility still uses the multi-return `(value, null)` / `(null, message)`
