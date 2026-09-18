@@ -5317,6 +5317,17 @@ HANDLER(raw_load_real)
     RAW_ARITH_INT_K(add, +)
     RAW_ARITH_INT_K(sub, -)
 
+/* The zero divisor for all three integer division forms. Separate because error() is variadic and
+   one call frames the whole handler, which the arithmetic path should not pay for; the store after
+   it stays because error() only longjmps when an unwind target is set, and returns otherwise. */
+SEPARATE_HANDLER(raw_int_div_zero)
+    Opcode op = (Opcode)(op_word & 0xFF);
+    int dest = (int)UNPACK_A(op_word);
+    error(op == OP_RAW_MOD_INT ? "Modulo by zero" : "Division by zero");
+    registers[dest] = (op == OP_RAW_DIV_INT) ? aer_real(0.0) : aer_int(0);
+    DISPATCH();
+}
+
 /* Matches OP_DIV's own semantics: int/int division always promotes to float, so this is the one
    OP_RAW_*_INT opcode whose dest is registers[].as.d, not registers[].as.i. */
 HANDLER(raw_div_int)
@@ -5324,11 +5335,9 @@ HANDLER(raw_div_int)
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
     int64_t rv = registers[b].as.i;
-    if (rv == 0) {
-        error("Division by zero");
-        registers[dest] = aer_real(0.0);
-    } else
-        registers[dest] = aer_real((double)registers[a].as.i / (double)rv);
+    if (rv == 0)
+        __attribute__((musttail)) return h_raw_int_div_zero(vm, pc, registers, c);
+    registers[dest] = aer_real((double)registers[a].as.i / (double)rv);
     DISPATCH();
 }
 
@@ -5337,11 +5346,9 @@ HANDLER(raw_mod_int)
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
     int64_t rv = registers[b].as.i;
-    if (rv == 0) {
-        error("Modulo by zero");
-        registers[dest] = aer_int(0);
-    } else
-        registers[dest] = aer_int(aer_mod_int64(registers[a].as.i, rv));
+    if (rv == 0)
+        __attribute__((musttail)) return h_raw_int_div_zero(vm, pc, registers, c);
+    registers[dest] = aer_int(aer_mod_int64(registers[a].as.i, rv));
     DISPATCH();
 }
 
@@ -5350,11 +5357,9 @@ HANDLER(raw_floor_div_int)
     int a = (int)UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
     int64_t rv = registers[b].as.i;
-    if (rv == 0) {
-        error("Division by zero");
-        registers[dest] = aer_int(0);
-    } else
-        registers[dest] = aer_int((int64_t)floor((double)registers[a].as.i / (double)rv));
+    if (rv == 0)
+        __attribute__((musttail)) return h_raw_int_div_zero(vm, pc, registers, c);
+    registers[dest] = aer_int((int64_t)floor((double)registers[a].as.i / (double)rv));
     DISPATCH();
 }
 
