@@ -5493,6 +5493,21 @@ HANDLER(raw_load_int_pool)
 
 #undef RAW_CMP_JUMP_IF_FALSE
 
+/* See OP_RAW_INC_LTE_INT_JUMP_IF_FALSE (vm.h). The increment writes the tag for the same reason
+   RAW_ARITH_INT does -- a raw int slot doubles as a boxed integer. The limit is a plain slot, not
+   an RK: the form this fuses always had it in one. */
+HANDLER(raw_inc_lte_int_jump_if_false)
+    int counter = (int)UNPACK_A(op_word);
+    int step = (int)UNPACK_B(op_word);
+    int limit = (int)UNPACK_C(op_word);
+    int64_t next = registers[counter].as.i + registers[step].as.i;
+    registers[counter] = aer_int(next);
+    int target = READ();
+    if (!(registers[limit].as.i <= next))
+        pc += (int32_t)target;
+    DISPATCH();
+}
+
 /* The operand words are read by the helpers straight out of the instruction stream rather than
    into a local array. Both helpers read every part before dest is written, so dest may alias a
    part's register, which emit_interp deliberately arranges. */
@@ -5711,6 +5726,7 @@ static const OpHandler aer_handlers[256] = {
         [OP_RAW_LTE_INT_JUMP_IF_FALSE] = h_raw_lte_int_jump_if_false,
         [OP_RAW_LT_REAL_JUMP_IF_FALSE] = h_raw_lt_real_jump_if_false,
         [OP_RAW_LTE_REAL_JUMP_IF_FALSE] = h_raw_lte_real_jump_if_false,
+        [OP_RAW_INC_LTE_INT_JUMP_IF_FALSE] = h_raw_inc_lte_int_jump_if_false,
         [OP_RAW_EQ_INT_JUMP_IF_FALSE] = h_raw_eq_int_jump_if_false,
         [OP_RAW_NEQ_INT_JUMP_IF_FALSE] = h_raw_neq_int_jump_if_false,
         [OP_RAW_EQ_REAL_JUMP_IF_FALSE] = h_raw_eq_real_jump_if_false,

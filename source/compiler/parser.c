@@ -4077,6 +4077,29 @@ static void parse_loop_body_rotated(Chunk* c, unsigned int body_top, unsigned in
     }
 
     unsigned int cond_pos = c->count;
+    /* `counter += step` as the body's last act, tested by this very back-edge, is the while form of
+       what a range-for gets from OP_ITER_RANGE_LOOP. Only without a `continue`: that jumps here, and
+       a fused bump would then run on a path the separate increment never reached. Read off the tail
+       rather than through last_instruction, which a compound `i += 1` never records. */
+    unsigned int inc_at = c->count - 1;
+    if (back_op == OP_RAW_LTE_INT_JUMP_IF_FALSE && c->count > 0 &&
+        P.loop_stack[P.loop_depth - 1].continue_patch_count == 0 && !(rhs & RK8_CONST_FLAG)) {
+        uint32_t w = c->code[inc_at];
+        if ((Opcode)(w & 0xFF) == OP_RAW_ADD_INT && UNPACK_A(w) == UNPACK_B(w) &&
+            (uint8_t)UNPACK_A(w) == rhs) {
+            c->count = inc_at; /* discard the increment -- folded into the back-edge below */
+            P.peep.last.offset = NO_OFFSET;
+            cond_pos = c->count;
+            chunk_emit(c, PACK3(OP_RAW_INC_LTE_INT_JUMP_IF_FALSE, (uint8_t)UNPACK_A(w),
+                                (uint8_t)UNPACK_C(w), lhs));
+            unsigned int patch_fused = c->count;
+            chunk_emit(c, 0);
+            patch_jump(c, patch_fused, body_top);
+            patch_jump(c, patch_exit, c->count);
+            loop_pop_and_patch_rotated(c, c->count, cond_pos);
+            return;
+        }
+    }
     chunk_emit(c, PACK3(back_op, 0, lhs, rhs));
     unsigned int patch_back = c->count;
     chunk_emit(c, 0);

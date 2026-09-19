@@ -345,6 +345,12 @@ typedef enum {
     OP_RAW_LTE_INT_JUMP_IF_FALSE,
     OP_RAW_EQ_INT_JUMP_IF_FALSE,
     OP_RAW_NEQ_INT_JUMP_IF_FALSE,
+
+    /* A while loop's counter bump folded into its own back-edge: `counter += step` immediately
+       followed by the rotated test of that same counter. A range-for already gets this from
+       OP_ITER_RANGE_LOOP; the `for i < n:` form paid two dispatches for it.
+       word0 = PACK3(op, counter, step, limit); word1 = jump target. */
+    OP_RAW_INC_LTE_INT_JUMP_IF_FALSE,
     OP_RAW_LT_REAL_JUMP_IF_FALSE,
     OP_RAW_LTE_REAL_JUMP_IF_FALSE,
     OP_RAW_EQ_REAL_JUMP_IF_FALSE,

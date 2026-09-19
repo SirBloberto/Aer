@@ -328,6 +328,8 @@ static const OpInfo op_info[OP_INFO_MAX + 1] = {
 
     ROW_RAW_CMP_JUMP(OP_RAW_LT_INT_JUMP_IF_FALSE, "jump if !(rawi < rawi)", F_RAWI, F_RAWK_I),
     ROW_RAW_CMP_JUMP(OP_RAW_LTE_INT_JUMP_IF_FALSE, "jump if !(rawi <= rawi)", F_RAWI, F_RAWK_I),
+    ROW(OP_RAW_INC_LTE_INT_JUMP_IF_FALSE, "rawi += rawi, then jump if !(rawi <= it)", {AT_A, F_RAWI},
+        {AT_B, F_RAWI}, {AT_C, F_RAWI}, {AT_W1, F_JUMP}),
     ROW_RAW_CMP_JUMP(OP_RAW_LT_REAL_JUMP_IF_FALSE, "jump if !(rawr < rawr)", F_RAWR, F_RAWK_D),
     ROW_RAW_CMP_JUMP(OP_RAW_LTE_REAL_JUMP_IF_FALSE, "jump if !(rawr <= rawr)", F_RAWR, F_RAWK_D),
     ROW_RAW_CMP_JUMP(OP_RAW_EQ_INT_JUMP_IF_FALSE, "jump if !(rawi == rawi)", F_RAWI, F_RAWK_I),
