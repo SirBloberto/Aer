@@ -115,55 +115,8 @@ profile: $(SOURCE)
 opcode-traffic: profile
 	python3 tools/opcode_traffic.py --binary binary/aer-profile$(EXE)
 
-TESTS := tests/test_core.aer \
-         tests/test_collections.aer \
-         tests/test_functions.aer \
-         tests/test_structs.aer \
-         tests/test_errors_scope.aer \
-         tests/test_stdlib_modules.aer \
-         tests/test_memory_gc.aer \
-         tests/test_card_marking.aer \
-         tests/test_pool_churn.aer \
-         tests/test_perf_fusion.aer \
-         tests/test_raw_fma_fusion.aer \
-         tests/test_fma_plain_expr_fusion.aer \
-         tests/test_toplevel_raw_promotion.aer \
-         tests/test_raw_const_cmp_fusion.aer \
-         tests/test_interp_dict_keys.aer \
-         tests/test_gc_raw_frames.aer \
-         tests/test_nonneg_range_start.aer \
-         tests/test_dict_key_hash_cache.aer \
-         tests/test_struct_pool_tiers.aer \
-         tests/test_primitive_pass.aer \
-         tests/test_dict_pool_stress.aer \
-         tests/test_packed_arrays.aer \
-         tests/test_typed_arrays.aer \
-         tests/test_typed_array_chain2.aer \
-         tests/test_radix_sort.aer \
-         tests/test_pipe_forward_ref.aer \
-         tests/test_array_loops.aer \
-         tests/test_narrow_fields.aer \
-         tests/test_shape_specialization.aer \
-         tests/test_int_fields_specialized.aer \
-         tests/test_loop_cond_registers.aer \
-         tests/test_raw_comparisons.aer \
-         tests/test_loop_bound_hoisting.aer \
-         tests/test_range_loop_counter.aer \
-         tests/test_loop_constant_hoist.aer \
-         tests/test_loop_literal_bounds.aer \
-         tests/test_spec_pool_realloc.aer \
-         tests/test_recursion_limits.aer \
-         tests/test_tail_call_specialized.aer \
-         tests/test_call_depth.aer \
-         tests/test_specialized_fallbacks.aer \
-         tests/test_boolean_arrays.aer \
-         tests/test_compound_ops_specialized.aer \
-         tests/test_field_fma_fusion.aer \
-         tests/test_net.aer \
-         tests/test_regex.aer \
-         tests/test_actor.aer \
-         tests/test_scheduler.aer \
-         tests/test_actor_specialize.aer
+# test_stdin.aer needs piped input, so `test` runs it separately below.
+TESTS := $(filter-out tests/test_stdin.aer,$(wildcard tests/test_*.aer))
 
 test: all
 	@failed=""; \
