@@ -129,8 +129,6 @@ static inline uint16_t pack_rk16(int rk) {
 /* Module, function and builtin ids -- the stdlib's wire identity. */
 #include "aer_abi.h"
 
-/* Parts in one OP_INTERP. Bounds the builder's stack scratch; a longer interpolation compiles to
-   the ordinary concatenate chain instead, which has no limit. */
 /* OP_ITER_RANGE_PREP's item_dest operand is a whole 32-bit word for what is an 8-bit register
    index, so the spare high bits carry a flag. GUARD_NONNEG means this loop's body was compiled
    with UNCHECKED indexing on the strength of a compile-time proof that the start is >= 0
@@ -139,6 +137,8 @@ static inline uint16_t pack_rk16(int rk) {
 #define RANGE_PREP_GUARD_NONNEG 0x80000000u
 #define RANGE_PREP_ITEM_REG(w) ((int)((w) & 0xFFu))
 
+/* Parts in one OP_INTERP. Bounds the builder's stack scratch; a longer interpolation compiles to
+   the ordinary concatenate chain instead, which has no limit. */
 #define INTERP_MAX_PARTS 16
 
 /* Longest interpolated dict key OP_INDEX_GET_INTERP will build without allocating. Anything longer
@@ -200,7 +200,7 @@ typedef struct {
     unsigned short frame_bounds;
 
     /* Shape-specializing compilation (lazy, per-call-observed-shape recompiles) -- see
-       vm_call_resolve_specialization (vm.c). Bit i set = parameter i was seen used as the base of a
+       vm_call_resolve_specialization (call.c). Bit i set = parameter i was seen used as the base of a
        struct-field access (directly, or through a one-hop plain-local alias) during the ordinary
        compile; folded in at function-exit, same moment max_registers is captured. Zero means this
        function is never specialized, and h_call skips the lookup. */
@@ -240,7 +240,7 @@ typedef struct {
 /* Bytecode chunk                                                       */
 /* Flat 32-bit word array: one descriptor word (opcode + narrow packed fields) plus, per opcode's
    own fixed shape, zero or more trailing wide-field words -- see the fixed-width encoding comment
-   above chunk_emit_word/read_word (vm.c). */
+   above PACK3. */
 
 /* offset/ftype/narrow are pure functions of (shape, slot), cached here so a hit reads them from the
    entry it already touched for the shape check rather than indirecting through Shape again. */
@@ -557,7 +557,7 @@ void gc_barrier_struct(VM* vm, AerStruct* s, AerVal new_value);
 /* Same, for a dict entry. `index` is the DENSE index, which the caller resolves before the write. */
 void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value);
 
-/* Called from vm.c's gc_maybe_collect once the threshold is actually crossed. gc_maybe_collect runs
+/* Called from gc_maybe_collect (vm_internal.h) once the threshold is actually crossed. gc_maybe_collect runs
    at hand-placed points in the allocating opcodes, not on every dispatch. */
 void gc_run_collection_cycle(VM* vm);
 

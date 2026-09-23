@@ -17,7 +17,7 @@ static int sort_cmp(const void* pa, const void* pb) {
     return da < db ? -1 : (da > db ? 1 : 0);
 }
 
-/* Same treatment vm.c's typed-array kernels get: -O3 with vectorization on these loops only, rather
+/* Same treatment typed_array.c's kernels get: -O3 with vectorization on these loops only, rather
    than raising it for the whole file. */
 #define REDUCE_ATTR __attribute__((optimize("O3", "tree-vectorize")))
 

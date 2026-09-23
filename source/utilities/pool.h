@@ -86,7 +86,7 @@ bool pool_mark(void* cell);
 bool pool_is_young(void* cell);
 
 /* True if cell is already on the free-list -- a remembered-set entry can outlive its cell (entries are
-   never removed, see vm.c), so retracing the set must check this before dereferencing. */
+   never removed, see VmHeap in heap.h), so retracing the set must check this before dereferencing. */
 bool pool_is_freed(void* cell);
 
 /* True if cell's remembered-set bit is already set. */

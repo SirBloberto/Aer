@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 
-/* Growable string buffer shared by value formatting (vm.c) and JSON encoding (aer_json.c).
+/* Growable string buffer shared by value formatting (value_format.c) and JSON encoding (aer_json.c).
    Always NUL-terminated; the caller owns buf and frees it (or hands it to aer_make_string). */
 typedef struct {
     char* buf;

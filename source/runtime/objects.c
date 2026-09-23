@@ -6,6 +6,10 @@
 #include "objects.h"
 #include "typed_array.h"
 
+/* Wraps an exclusively-owned (data, length) in a fresh heap box; never copies. Routes to
+   current_heap, guarded via vm_require_current_heap() because the lexer can call this
+   (emit_string_token) before any VM/pool exists -- without the guard, an uninitialized heap's
+   zero elem_size makes pool_alloc hand back a ~1-byte allocation (ASAN heap-buffer-overflow). */
 AerVal aer_make_string(char* data, unsigned int length) {
     AerString* s = aer_string_alloc(length);
     if (length <= AER_STRING_INLINE_MAX) {

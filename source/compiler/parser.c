@@ -2821,8 +2821,9 @@ static bool take_lhs_field_get(Chunk* c, unsigned int lhs_start, int* struct_reg
     return true;
 }
 
-/* An LHS that is exactly one `A op1 B` over plain registers, with op1 and the outer op both + - *: A, B and
-   op1, with the inner op discarded, for one OP_TYPED_ARRAY_CHAIN2 pass (see vm.c's op_chain2_index). */
+/* An LHS that is exactly one `A op1 B` over plain registers, with op1 and the outer op both + - *: A, B
+   and op1, with the inner op discarded, for one OP_TYPED_ARRAY_CHAIN2 pass (see op_chain2_index,
+   typed_array.h). */
 static bool take_lhs_chain2(Chunk* c, unsigned int lhs_start, int lhs, Opcode op, int* a, int* b,
                             Opcode* op1) {
     if (c->count - lhs_start != 1 || !(op == OP_ADD || op == OP_SUB || op == OP_MUL))
@@ -5255,7 +5256,7 @@ static int parse_function_expr(Chunk* c) {
 }
 
 /* Parses `(params...):' -- shared by the original top-level function compile and a later
-   specialization recompile (vm.c's vm_call_resolve_specialization, re-lexing a retained source span, see
+   specialization recompile (call.c's vm_call_resolve_specialization, re-lexing a retained source span, see
    ChunkFunction.source_span). Caller must already be positioned right at '('. Once one parameter
    has a default, every parameter after it must too. */
 static void parse_function_signature(Chunk* c, unsigned int* param_names, AerVal* param_defaults,
@@ -5504,12 +5505,12 @@ static void parse_function(Chunk* c) {
     patch_jump(c, patch, c->count);
 }
 
-/* Lazily compiles a specialized body for target_f's shape-sensitive parameter, keyed by a Shape
-   observed at a real call site (vm.c's vm_call_resolve_specialization is the only caller). Appends to the chunk
-   currently executing, so the caller must re-run chunk_ensure_field_cache/call_spec_cache after.
-   Every global it touches is saved and restored, so a false return can't corrupt what runs next.
-   raw_param_regs/types/count (NULL/NULL/0 for a shape-only compile) additionally bind those
-   parameters as raw locals; when set, *out_entry's shape/kind/raw_* are left for the caller. */
+/* Lazily compiles a specialized body for target_f's shape-sensitive parameter, keyed by a Shape seen at
+   a real call site (call.c's vm_call_resolve_specialization is the only caller). Appends to the running
+   chunk, so the caller must re-run chunk_ensure_field_cache/call_spec_cache after. Every global it touches
+   is saved and restored, so a false return can't corrupt what runs next. raw_param_regs/types/count
+   (NULL/NULL/0 for a shape-only compile) additionally bind those parameters as raw locals; when set,
+   *out_entry's shape/kind/raw_* are left for the caller. */
 bool parser_specialize_function(Chunk* c, ChunkFunction* target_f, Shape* shape, SpecKind kind,
                                 int param_index, SpecEntry* out_entry, const int* raw_param_regs,
                                 const ValueType* raw_param_types, int raw_param_count) {
@@ -5731,7 +5732,7 @@ static void parse_struct(Chunk* c) {
         unsigned int default_idx = chunk_add_pool(c, field_defaults[i]);
         chunk_emit(c, PACK_2X16(field_names[i], default_idx));
         /* Low byte is the ValueType tag, bit 0x100 is the narrow (`i`/`f`-suffixed-literal) marker
-           -- decoded by OP_DEFINE_STRUCT's handler (vm.c). */
+           -- decoded by OP_DEFINE_STRUCT's handler (handlers.c). */
         chunk_emit(c, (uint32_t)field_types[i] | (field_narrow[i] ? 0x100u : 0u));
     }
 

@@ -490,7 +490,7 @@ static void gc_collect(VM* vm, bool minor, PoolSweepTally* tally) {
 
 /* Generational GC -- trigger                                           */
 
-/* Tuning defaults, overridable via aer_gc_configure(), are applied in vm_heap_init (vm.c). */
+/* Tuning defaults, overridable via aer_gc_configure(), are applied in vm_heap_init (heap.c). */
 
 /* A full walk of every pool. A major sweep reports its own live count as it goes, so this is only
    for callers with no collection to piggyback on: aer_gc_stats, and the ceiling check after a minor. */
@@ -528,7 +528,7 @@ static bool gc_old_generation_grown(VmHeap* heap) {
 }
 
 /* Runs only between complete opcodes, where stack/scope/frame invariants are consistent. Called
-   from gc_maybe_collect (vm.c, always_inline, checked once per DISPATCH()) once the rare
+   from gc_maybe_collect (vm_internal.h, always_inline, checked once per DISPATCH()) once the rare
    threshold-crossing case actually happens -- the common case never reaches this file at all. */
 void gc_run_collection_cycle(VM* vm) {
     VmHeap* heap = &vm->heap;

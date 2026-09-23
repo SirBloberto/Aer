@@ -11,7 +11,7 @@
    per round in bounded vm_run_slice slices. Only the sliced shape keeps a long task from starving
    the others; a worker thread runs unbudgeted. */
 
-/* Every yield-checkpoint in vm_run_slice (vm.c's h_jump/h_call/h_iter_range_loop) only ever
+/* Every yield-checkpoint in vm_run_slice (handlers.c's h_jump/h_call/h_iter_range_loop) only ever
    fires at a genuine instruction boundary, so resuming a task is always just "call vm_run_slice
    again" -- no separate suspend/resume state to track here beyond "has this task's call already
    been set up." */

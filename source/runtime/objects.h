@@ -255,8 +255,9 @@ static inline bool vm_array_position(AerVal idx, unsigned int count, uint64_t* o
     return true;
 }
 
-/* Writes through `out` (avoids a 16-byte stack round-trip returning by value -- see
-   BINARY_OP_INT_REAL's comment). Safe even if `out` aliases obj's/idx's register. */
+/* Shared by h_index_get and the fused index-get handlers. Writes through `out`, which avoids a
+   16-byte stack round-trip returning by value (see BINARY_OP_INT_REAL's comment, handlers.c), and is
+   safe even if `out` aliases obj's or idx's register. */
 static inline void vm_index_get_compute(AerVal obj, AerVal idx, AerVal* out) {
     if (aer_type(obj) == TYPE_ARRAY) {
         AerArray* a = aer_as_array(obj);

@@ -5,7 +5,7 @@
 
 /* The entire native-module surface
    (math/random/string/time/json/collection/net/regex/actor/scheduler/io), all dispatched from
-   vm.c's OP_CALL_MODULE switch. */
+   call.c's OP_CALL_MODULE switch. */
 
 /* The hardcoded module names `import` accepts; `name` need not be NUL-terminated. */
 bool aer_stdlib_is_native_module(const char* name, unsigned int len);

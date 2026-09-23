@@ -1,5 +1,5 @@
 /* One row per opcode, in wire order: OPCODE(name, handler, doubled slot fields, description, operand
-   layout). vm.h expands it into the Opcode enum and op_scaled_fields, vm.c into the dispatch table, and
+   layout). vm.h expands it into the Opcode enum and op_scaled_fields, handlers.c into the dispatch table, and
    disasm.c, which defines the L_* layouts, into the operand table. A `none` handler is a parser tag. */
 
 /* Binary arithmetic */

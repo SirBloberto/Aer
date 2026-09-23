@@ -480,7 +480,7 @@ void aer_disassemble(Chunk* c, FILE* out) {
 /* aer_gc_stats() only counts live cells, which understates real usage -- string/array/dict
    payloads are separate xmalloc'd allocations the pool doesn't track. */
 void aer_debug_memory_report(FILE* out) {
-    /* vm_current_heap(), not vm.c's own require_current_heap() -- that one lazily installs the
+    /* vm_current_heap(), not heap_ref.c's vm_require_current_heap() -- that one lazily installs the
        bootstrap heap, which is the right thing for an allocation path but not for a read-only
        report. Nothing to describe if no VM ever ran. */
     VmHeap* heap = vm_current_heap();

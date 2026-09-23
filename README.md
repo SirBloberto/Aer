@@ -2215,7 +2215,10 @@ allowlisting, neither of which exist today.
 | `source/runtime/value_ops.h/c` | What the operators mean on values: truthiness, arithmetic and comparison across types, `in`, slicing bounds and casts |
 | `source/compiler/lexer.h/c` | Source text → token stream, indent/dedent tracking |
 | `source/compiler/parser.h/c` | Single-pass compiler: tokens → register-based bytecode, escape processing |
-| `source/vm/vm.h/c` | The register-based VM: `CallFrame` and the bump-pointer register stack, one handler function per opcode tail-calling the next, calls and specialization, built-ins |
+| `source/vm/vm.h/c` | The register-based VM's types (`CallFrame`, the bump-pointer register stack, `Chunk`) and its lifecycle: creating, resetting and freeing a VM, and the runtime error context |
+| `source/vm/handlers.c` | One function per opcode, each tail-calling the next through the dispatch table, and `vm_run_slice` |
+| `source/vm/call.c` | Calls: frame setup and growth, calls through a function value, builtins, which specialization a call site enters, and native and file-module calls |
+| `source/vm/vm_internal.h` | What those three files share and nothing outside the VM needs |
 | `source/vm/opcodes.def` | Every opcode, one row each: name, handler, which slot fields are stored doubled, description and operand layout. The `Opcode` enum, the dispatch table and the disassembler's table are all generated from it |
 | `source/vm/opcodes.h` | The `Opcode` enum, generated from `opcodes.def`, for code that names opcodes without needing the VM |
 | `source/vm/chunk.c` | Bytecode chunk: code, line table, constant pool, and the function, struct-shape and import tables |
