@@ -2209,6 +2209,8 @@ allowlisting, neither of which exist today.
 | `source/main.c` | Entry point, REPL loop, file runner |
 | `source/repl/terminal.h/c` | Raw-mode interactive REPL terminal |
 | `source/runtime/value.h` | `AerVal` — the one tagged-union value type, used internally and at the embedding boundary alike: null / boolean / integer / float / string / function / array / hashtable / packed array, and the `Shape` forward declaration |
+| `source/runtime/objects.h` | The object types that need more than `value.h` can see: `AerDict` (it embeds a hash table), `Shape` and `AerStruct` |
+| `source/runtime/heap.h/c` | A VM's heap: its size-classed pools, GC bookkeeping and tuning, and the string-payload allocator |
 | `source/compiler/lexer.h/c` | Source text → token stream, indent/dedent tracking |
 | `source/compiler/parser.h/c` | Single-pass compiler: tokens → register-based bytecode, escape processing |
 | `source/core/vm.h/c` | Bytecode chunk, register-based VM (`CallFrame`/bump-pointer register stack), struct-type registry, computed-goto dispatch loop, built-ins |
