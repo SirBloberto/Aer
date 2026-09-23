@@ -4,8 +4,6 @@
 #include "error.h"
 #include "hashtable.h"
 #include "heap.h"
-#include "pool.h"
-#include "strbuf.h"
 #include "objects.h"
 #include "opcodes.h"
 #include "value.h"

@@ -1,7 +1,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "error.h"
-#include "hashtable.h"
 #include "heap.h"
 #include "objects.h"
 #include "typed_array.h"

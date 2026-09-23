@@ -3,8 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include "aer.h"
-#include "aer_host.h"
-#include "aer_module.h"
 #include "aer_stdlib.h"
 #include "error.h"
 #include "lexer.h"

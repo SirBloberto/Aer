@@ -1,7 +1,6 @@
 #include <stdlib.h>
 #include "aer_actor.h"
 #include "aer_thread.h"
-#include "aer_module.h"
 #include "aer_stdlib.h"
 #include "error.h"
 
