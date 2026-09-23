@@ -246,11 +246,12 @@ int main(void) {
        truncation bug outright rather than just widening it. */
     {
         Chunk c = new_chunk();
-        chunk_emit(&c, PACK1(OP_RAW_LOAD_INT, 31));
+        chunk_emit(&c, PACK1(OP_RAW_LOAD_INT, FRAME_REGISTERS - 1));
         chunk_emit(&c, (uint32_t)(int32_t)(-2147483647 - 1));   /* INT32_MIN */
         unsigned int p = 0;
         uint32_t w0 = c.code[p++];
-        check((w0 & 0xFF) == OP_RAW_LOAD_INT && UNPACK_A(w0) == 31, "OP_RAW_LOAD_INT: word0 (slot) round-trips at max raw-int slot");
+        check((w0 & 0xFF) == OP_RAW_LOAD_INT && OPERAND_A(w0) == FRAME_REGISTERS - 1, "OP_RAW_LOAD_INT: word0 (slot) round-trips at the top slot");
+        check(UNPACK_A(w0) == 2 * (FRAME_REGISTERS - 1), "OP_RAW_LOAD_INT: the slot is stored doubled, and the top one still fits a byte");
         check((int32_t)c.code[p++] == (-2147483647 - 1), "OP_RAW_LOAD_INT: full int32 immediate round-trips at INT32_MIN");
         check(p == c.count, "OP_RAW_LOAD_INT: exactly 2 words emitted");
         chunk_free(&c);

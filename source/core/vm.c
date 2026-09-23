@@ -2831,6 +2831,8 @@ static const OpHandler aer_handlers[256];
 
 /* noinline, or the compiler folds it back into its tail caller along with the registers its calls save. */
 #define SEPARATE_HANDLER(name) __attribute__((noinline)) HANDLER(name)
+/* The register a doubled field names: its byte offset is the field times 8, which a load folds. */
+#define SCALED_REG(field) (*(AerVal*)((char*)registers + (size_t)(field) * 8))
 
 #define READ() (*pc++)
 #define PUSH(v)                                                                                              \
@@ -3588,13 +3590,13 @@ SEPARATE_HANDLER(index_set_any_from_real)
 }
 
 SEPARATE_HANDLER(index_get_any_as_int)
-    int dest = (int)UNPACK_A(op_word);
-    AerVal obj = registers[(int)UNPACK_B(op_word)];
+    unsigned int dest = UNPACK_A(op_word);
+    AerVal obj = SCALED_REG(UNPACK_B(op_word));
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     AerVal v;
     vm_index_get_compute(obj, *idx, &v);
     if (v.tag == TYPE_INTEGER)
-        registers[dest] = aer_int(v.as.i);
+        SCALED_REG(dest) = aer_int(v.as.i);
     else
         error("Expected an integer from this index, got %s", vm_type_name(c, v));
     if (aer_type(obj) == TYPE_STRING)
@@ -3603,15 +3605,15 @@ SEPARATE_HANDLER(index_get_any_as_int)
 }
 
 SEPARATE_HANDLER(index_get_any_as_real)
-    int dest = (int)UNPACK_A(op_word);
-    AerVal obj = registers[(int)UNPACK_B(op_word)];
+    unsigned int dest = UNPACK_A(op_word);
+    AerVal obj = SCALED_REG(UNPACK_B(op_word));
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     AerVal v;
     vm_index_get_compute(obj, *idx, &v);
     if (v.tag == TYPE_REAL)
-        registers[dest] = aer_real(v.as.d);
+        SCALED_REG(dest) = aer_real(v.as.d);
     else if (v.tag == TYPE_INTEGER)
-        registers[dest] = aer_real((double)v.as.i);
+        SCALED_REG(dest) = aer_real((double)v.as.i);
     else
         error("Expected a number from this index, got %s", vm_type_name(c, v));
     if (aer_type(obj) == TYPE_STRING)
@@ -3666,8 +3668,8 @@ HANDLER(index_set_raw_real)
 }
 
 HANDLER(index_get_raw_int)
-    int dest = (int)UNPACK_A(op_word);
-    AerVal obj = registers[(int)UNPACK_B(op_word)];
+    unsigned int dest = UNPACK_A(op_word);
+    AerVal obj = SCALED_REG(UNPACK_B(op_word));
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
         AerTypedArray* ta = aer_as_typed_array(obj);
@@ -3677,13 +3679,13 @@ HANDLER(index_get_raw_int)
             if (ta->elem_kind == TYPED_ELEM_INT64) {
                 int64_t v;
                 memcpy(&v, ta->data + (size_t)idx->as.i * 8, 8);
-                registers[dest] = aer_int(v);
+                SCALED_REG(dest) = aer_int(v);
                 DISPATCH();
             }
             if (ta->elem_kind == TYPED_ELEM_INT32) {
                 int32_t v;
                 memcpy(&v, ta->data + (size_t)idx->as.i * 4, 4);
-                registers[dest] = aer_int(v);
+                SCALED_REG(dest) = aer_int(v);
                 DISPATCH();
             }
         }
@@ -3692,8 +3694,8 @@ HANDLER(index_get_raw_int)
 }
 
 HANDLER(index_get_raw_real)
-    int dest = (int)UNPACK_A(op_word);
-    AerVal obj = registers[(int)UNPACK_B(op_word)];
+    unsigned int dest = UNPACK_A(op_word);
+    AerVal obj = SCALED_REG(UNPACK_B(op_word));
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
     if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
         AerTypedArray* ta = aer_as_typed_array(obj);
@@ -3702,13 +3704,13 @@ HANDLER(index_get_raw_real)
             if (ta->elem_kind == TYPED_ELEM_FLOAT64) {
                 double v;
                 memcpy(&v, ta->data + (size_t)idx->as.i * 8, 8);
-                registers[dest] = aer_real(v);
+                SCALED_REG(dest) = aer_real(v);
                 DISPATCH();
             }
             if (ta->elem_kind == TYPED_ELEM_FLOAT32) {
                 float v;
                 memcpy(&v, ta->data + (size_t)idx->as.i * 4, 4);
-                registers[dest] = aer_real((double)v);
+                SCALED_REG(dest) = aer_real((double)v);
                 DISPATCH();
             }
         }
@@ -4057,21 +4059,21 @@ HANDLER(iter_range_prep)
    loop-owned snapshots, so nothing can have retagged them. body_target is always a resolved
    address, never a patch placeholder. No gc_maybe_collect -- nothing here allocates. */
 HANDLER(iter_range_loop)
-    int cur_reg = (int)UNPACK_A(op_word);
-    int remaining_reg = (int)UNPACK_B(op_word);
-    int signed_step_reg = (int)UNPACK_C(op_word);
+    unsigned int cur_reg = UNPACK_A(op_word);
+    unsigned int remaining_reg = UNPACK_B(op_word);
+    unsigned int signed_step_reg = UNPACK_C(op_word);
     int item_dest_reg = (int)READ();
     int body_target = READ();
-    int64_t remaining = registers[remaining_reg].as.i;
+    int64_t remaining = SCALED_REG(remaining_reg).as.i;
     if (remaining == 0) {
         DISPATCH(); /* exhausted -- fall through to the exit code, cur_reg/item_dest_reg untouched */
     }
-    int64_t new_cur = registers[cur_reg].as.i + registers[signed_step_reg].as.i;
-    registers[cur_reg].as.i = new_cur;
-    registers[remaining_reg].as.i = remaining - 1;
+    int64_t new_cur = SCALED_REG(cur_reg).as.i + SCALED_REG(signed_step_reg).as.i;
+    SCALED_REG(cur_reg).as.i = new_cur;
+    SCALED_REG(remaining_reg).as.i = remaining - 1;
     /* Equal when the parser proved this loop's body never writes the loop variable, so cur_reg IS
        item_dest_reg and the store above already published this iteration's value. */
-    if (cur_reg != item_dest_reg)
+    if (cur_reg != 2u * (unsigned int)item_dest_reg)
         registers[item_dest_reg] = aer_int(new_cur);
     pc += (int32_t)body_target;
     /* range-for's own dedicated back-edge -- h_jump's check doesn't cover this loop shape since
@@ -5230,7 +5232,7 @@ HANDLER(cast)
 }
 
 HANDLER(raw_int_to_real)
-    registers[UNPACK_A(op_word)] = aer_real((double)registers[UNPACK_B(op_word)].as.i);
+    SCALED_REG(UNPACK_A(op_word)) = aer_real((double)SCALED_REG(UNPACK_B(op_word)).as.i);
     DISPATCH();
 }
 
@@ -5242,17 +5244,17 @@ HANDLER(raw_real_to_int)
 /* Skip both the RK-flag check and the tag check -- the parser already proved every operand's
    type at compile time. None allocate: integers/reals/booleans never have heap cells. */
 HANDLER(raw_load_int)
-    int dest = (int)UNPACK_A(op_word);
+    unsigned int dest = UNPACK_A(op_word);
     /* Full 32-bit signed immediate in its own dedicated word, so no literal reaching here can
        truncate -- a narrower field silently turned a 20M-iteration bound into 77056. */
-    registers[dest] = aer_int((int32_t)READ());
+    SCALED_REG(dest) = aer_int((int32_t)READ());
     DISPATCH();
 }
 
 HANDLER(raw_load_real)
-    int dest = (int)UNPACK_A(op_word);
+    unsigned int dest = UNPACK_A(op_word);
     unsigned int idx = (unsigned int)READ();
-    registers[dest] = aer_real(c->rawk_d[idx]);
+    SCALED_REG(dest) = aer_real(c->rawk_d[idx]);
     DISPATCH();
 }
 
@@ -5264,17 +5266,15 @@ HANDLER(raw_load_real)
    index is at most FRAME_REGISTERS-1 (127) and the flag is 0x80, so the two never collide. */
 #define RAW_I(x) (RK8_IS_CONST(x) ? c->rawk_i[RK8_INDEX(x)] : registers[x].as.i)
 #define RAW_D(x) (RK8_IS_CONST(x) ? c->rawk_d[RK8_INDEX(x)] : registers[x].as.d)
-/* The register a doubled field names: its byte offset is the field times 8, which a load folds. */
-#define SCALED_REG(field) (*(AerVal*)((char*)registers + (size_t)(field) * 8))
 
 #define RAW_ARITH_INT(name, op)                                                                              \
     static VmSliceResult h_raw_##name##_int(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {       \
         const uint32_t op_word = pc[-1];                                                                     \
         (void)op_word;                                                                                       \
-        int dest = (int)UNPACK_A(op_word);                                                                   \
-        int a = (int)UNPACK_B(op_word);                                                                      \
+        unsigned int dest = UNPACK_A(op_word);                                                               \
+        unsigned int a = UNPACK_B(op_word);                                                                  \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        registers[dest] = aer_int(registers[a].as.i op registers[b].as.i);                                   \
+        SCALED_REG(dest) = aer_int(SCALED_REG(a).as.i op SCALED_REG(b).as.i);                                \
         DISPATCH();                                                                                          \
     }
 /* The C field is a bare rawk_i index, not an RK -- the opcode itself already says "constant", so
@@ -5283,10 +5283,10 @@ HANDLER(raw_load_real)
     static VmSliceResult h_raw_##name##_int_k(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {     \
         const uint32_t op_word = pc[-1];                                                                     \
         (void)op_word;                                                                                       \
-        int dest = (int)UNPACK_A(op_word);                                                                   \
-        int a = (int)UNPACK_B(op_word);                                                                      \
+        unsigned int dest = UNPACK_A(op_word);                                                               \
+        unsigned int a = UNPACK_B(op_word);                                                                  \
         unsigned int k = UNPACK_C(op_word);                                                                  \
-        registers[dest] = aer_int(registers[a].as.i op c->rawk_i[k]);                                        \
+        SCALED_REG(dest) = aer_int(SCALED_REG(a).as.i op c->rawk_i[k]);                                      \
         DISPATCH();                                                                                          \
     }
 /* Writes the payload and leaves the tag: the destination is a real slot, whose tag frame entry
@@ -5306,20 +5306,20 @@ HANDLER(raw_load_real)
     static VmSliceResult h_raw_##name##_int(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {       \
         const uint32_t op_word = pc[-1];                                                                     \
         (void)op_word;                                                                                       \
-        int dest = (int)UNPACK_A(op_word);                                                                   \
-        int a = (int)UNPACK_B(op_word);                                                                      \
+        unsigned int dest = UNPACK_A(op_word);                                                               \
+        unsigned int a = UNPACK_B(op_word);                                                                  \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        registers[dest] = aer_bool(registers[a].as.i op RAW_I(b));                                           \
+        SCALED_REG(dest) = aer_bool(SCALED_REG(a).as.i op RAW_I(b));                                         \
         DISPATCH();                                                                                          \
     }
 #define RAW_CMP_REAL(name, op)                                                                               \
     static VmSliceResult h_raw_##name##_real(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {      \
         const uint32_t op_word = pc[-1];                                                                     \
         (void)op_word;                                                                                       \
-        int dest = (int)UNPACK_A(op_word);                                                                   \
-        int a = (int)UNPACK_B(op_word);                                                                      \
+        unsigned int dest = UNPACK_A(op_word);                                                               \
+        unsigned int a = UNPACK_B(op_word);                                                                  \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        registers[dest] = aer_bool(registers[a].as.d op RAW_D(b));                                           \
+        SCALED_REG(dest) = aer_bool(SCALED_REG(a).as.d op RAW_D(b));                                         \
         DISPATCH();                                                                                          \
     }
     RAW_ARITH_INT(add, +)
@@ -5333,44 +5333,44 @@ HANDLER(raw_load_real)
    it stays because error() only longjmps when an unwind target is set, and returns otherwise. */
 SEPARATE_HANDLER(raw_int_div_zero)
     Opcode op = (Opcode)(op_word & 0xFF);
-    int dest = (int)UNPACK_A(op_word);
+    unsigned int dest = UNPACK_A(op_word);
     error(op == OP_RAW_MOD_INT ? "Modulo by zero" : "Division by zero");
-    registers[dest] = (op == OP_RAW_DIV_INT) ? aer_real(0.0) : aer_int(0);
+    SCALED_REG(dest) = (op == OP_RAW_DIV_INT) ? aer_real(0.0) : aer_int(0);
     DISPATCH();
 }
 
 /* Matches OP_DIV's own semantics: int/int division always promotes to float, so this is the one
    OP_RAW_*_INT opcode whose dest is registers[].as.d, not registers[].as.i. */
 HANDLER(raw_div_int)
-    int dest = (int)UNPACK_A(op_word);
-    int a = (int)UNPACK_B(op_word);
+    unsigned int dest = UNPACK_A(op_word);
+    unsigned int a = UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    int64_t rv = registers[b].as.i;
+    int64_t rv = SCALED_REG(b).as.i;
     if (rv == 0)
         __attribute__((musttail)) return h_raw_int_div_zero(vm, pc, registers, c);
-    registers[dest] = aer_real((double)registers[a].as.i / (double)rv);
+    SCALED_REG(dest) = aer_real((double)SCALED_REG(a).as.i / (double)rv);
     DISPATCH();
 }
 
 HANDLER(raw_mod_int)
-    int dest = (int)UNPACK_A(op_word);
-    int a = (int)UNPACK_B(op_word);
+    unsigned int dest = UNPACK_A(op_word);
+    unsigned int a = UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    int64_t rv = registers[b].as.i;
+    int64_t rv = SCALED_REG(b).as.i;
     if (rv == 0)
         __attribute__((musttail)) return h_raw_int_div_zero(vm, pc, registers, c);
-    registers[dest] = aer_int(aer_mod_int64(registers[a].as.i, rv));
+    SCALED_REG(dest) = aer_int(aer_mod_int64(SCALED_REG(a).as.i, rv));
     DISPATCH();
 }
 
 HANDLER(raw_floor_div_int)
-    int dest = (int)UNPACK_A(op_word);
-    int a = (int)UNPACK_B(op_word);
+    unsigned int dest = UNPACK_A(op_word);
+    unsigned int a = UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    int64_t rv = registers[b].as.i;
+    int64_t rv = SCALED_REG(b).as.i;
     if (rv == 0)
         __attribute__((musttail)) return h_raw_int_div_zero(vm, pc, registers, c);
-    registers[dest] = aer_int((int64_t)floor((double)registers[a].as.i / (double)rv));
+    SCALED_REG(dest) = aer_int((int64_t)floor((double)SCALED_REG(a).as.i / (double)rv));
     DISPATCH();
 }
 
@@ -5387,10 +5387,10 @@ HANDLER(raw_floor_div_int)
     static VmSliceResult h_raw_##name##_real(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {      \
         const uint32_t op_word = pc[-1];                                                                     \
         (void)op_word;                                                                                       \
-        int dest = (int)UNPACK_A(op_word);                                                                   \
-        int a = (int)UNPACK_B(op_word);                                                                      \
+        unsigned int dest = UNPACK_A(op_word);                                                               \
+        unsigned int a = UNPACK_B(op_word);                                                                  \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        registers[dest].as.d = registers[dest].as.d op(registers[a].as.d * registers[b].as.d);               \
+        SCALED_REG(dest).as.d = SCALED_REG(dest).as.d op(SCALED_REG(a).as.d * SCALED_REG(b).as.d);           \
         DISPATCH();                                                                                          \
     }
     RAW_FUSED_MULACC_REAL(fma, +)
@@ -5398,15 +5398,15 @@ HANDLER(raw_floor_div_int)
 #undef RAW_FUSED_MULACC_REAL
 
 HANDLER(raw_div_real)
-    int dest = (int)UNPACK_A(op_word);
-    int a = (int)UNPACK_B(op_word);
+    unsigned int dest = UNPACK_A(op_word);
+    unsigned int a = UNPACK_B(op_word);
     unsigned int b = UNPACK_C(op_word);
-    double rv = registers[b].as.d;
+    double rv = SCALED_REG(b).as.d;
     if (rv == 0.0) {
         error("Division by zero");
-        registers[dest] = aer_real(0.0);
+        SCALED_REG(dest) = aer_real(0.0);
     } else
-        registers[dest] = aer_real(registers[a].as.d / rv);
+        SCALED_REG(dest) = aer_real(SCALED_REG(a).as.d / rv);
     DISPATCH();
 }
 
@@ -5445,16 +5445,16 @@ HANDLER(unbox_real)
 }
 
 HANDLER(raw_move_int)
-    int dest = (int)UNPACK_A(op_word);
-    int src = (int)UNPACK_B(op_word);
-    registers[dest] = aer_int(registers[src].as.i);
+    unsigned int dest = UNPACK_A(op_word);
+    unsigned int src = UNPACK_B(op_word);
+    SCALED_REG(dest) = aer_int(SCALED_REG(src).as.i);
     DISPATCH();
 }
 
 HANDLER(raw_move_real)
-    int dest = (int)UNPACK_A(op_word);
-    int src = (int)UNPACK_B(op_word);
-    registers[dest] = aer_real(registers[src].as.d);
+    unsigned int dest = UNPACK_A(op_word);
+    unsigned int src = UNPACK_B(op_word);
+    SCALED_REG(dest) = aer_real(SCALED_REG(src).as.d);
     DISPATCH();
 }
 
@@ -5464,24 +5464,24 @@ HANDLER(raw_move_real)
 #undef RAW_CMP_REAL
 
 HANDLER(raw_load_int_pool)
-    int dest = (int)UNPACK_A(op_word);
+    unsigned int dest = UNPACK_A(op_word);
     unsigned int idx = (unsigned int)READ();
-    registers[dest] = aer_int(c->rawk_i[idx]);
+    SCALED_REG(dest) = aer_int(c->rawk_i[idx]);
     DISPATCH();
 }
 
 /* Both operands raw: no tag, no table, no error path -- the comparison is the two loads the
    hardware would do anyway. */
-#define RAW_CMP_JUMP_IF_FALSE(name, member, rhs, op)                                                         \
+#define RAW_CMP_JUMP_IF_FALSE(name, member, rhs, op)                                                            \
     static VmSliceResult h_raw_##name##_jump_if_false(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {\
-        const uint32_t op_word = pc[-1];                                                                     \
-        (void)op_word;                                                                                       \
-        int a = (int)UNPACK_B(op_word);                                                                      \
-        unsigned int b = UNPACK_C(op_word);                                                                  \
-        int target = READ();                                                                                 \
-        if (!(registers[a].as.member op rhs(b)))                                                             \
-            pc += (int32_t)target;                                                                           \
-        DISPATCH();                                                                                          \
+        const uint32_t op_word = pc[-1];                                                                        \
+        (void)op_word;                                                                                          \
+        unsigned int a = UNPACK_B(op_word);                                                                     \
+        unsigned int b = UNPACK_C(op_word);                                                                     \
+        int target = READ();                                                                                    \
+        if (!(SCALED_REG(a).as.member op rhs(b)))                                                               \
+            pc += (int32_t)target;                                                                              \
+        DISPATCH();                                                                                             \
     }
 
     RAW_CMP_JUMP_IF_FALSE(lt_int, i, RAW_I, <)
@@ -5499,13 +5499,13 @@ HANDLER(raw_load_int_pool)
    RAW_ARITH_INT does -- a raw int slot doubles as a boxed integer. The limit is a plain slot, not
    an RK: the form this fuses always had it in one. */
 HANDLER(raw_inc_lte_int_jump_if_false)
-    int counter = (int)UNPACK_A(op_word);
-    int step = (int)UNPACK_B(op_word);
-    int limit = (int)UNPACK_C(op_word);
-    int64_t next = registers[counter].as.i + registers[step].as.i;
-    registers[counter] = aer_int(next);
+    unsigned int counter = UNPACK_A(op_word);
+    unsigned int step = UNPACK_B(op_word);
+    unsigned int limit = UNPACK_C(op_word);
+    int64_t next = SCALED_REG(counter).as.i + SCALED_REG(step).as.i;
+    SCALED_REG(counter) = aer_int(next);
     int target = READ();
-    if (!(registers[limit].as.i <= next))
+    if (!(SCALED_REG(limit).as.i <= next))
         pc += (int32_t)target;
     DISPATCH();
 }

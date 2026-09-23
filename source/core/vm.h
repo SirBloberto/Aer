@@ -441,7 +441,47 @@ static inline unsigned op_scaled_fields(Opcode op) {
     case OP_RAW_ADD_REAL:
     case OP_RAW_SUB_REAL:
     case OP_RAW_MUL_REAL:
+    case OP_RAW_DIV_REAL:
+    case OP_RAW_FMA_REAL:
+    case OP_RAW_FMS_REAL:
+    case OP_RAW_ADD_INT:
+    case OP_RAW_SUB_INT:
+    case OP_RAW_MUL_INT:
+    case OP_RAW_DIV_INT:
+    case OP_RAW_MOD_INT:
+    case OP_RAW_FLOOR_DIV_INT:
+    case OP_RAW_INC_LTE_INT_JUMP_IF_FALSE:
+    case OP_ITER_RANGE_LOOP:
         return SCALED_A | SCALED_B | SCALED_C;
+    case OP_RAW_ADD_INT_K:
+    case OP_RAW_SUB_INT_K:
+    case OP_RAW_LT_INT:
+    case OP_RAW_LTE_INT:
+    case OP_RAW_EQ_INT:
+    case OP_RAW_NEQ_INT:
+    case OP_RAW_LT_REAL:
+    case OP_RAW_LTE_REAL:
+    case OP_RAW_EQ_REAL:
+    case OP_RAW_NEQ_REAL:
+    case OP_RAW_INT_TO_REAL:
+    case OP_RAW_MOVE_INT:
+    case OP_RAW_MOVE_REAL:
+    case OP_INDEX_GET_RAW_INT:
+    case OP_INDEX_GET_RAW_REAL:
+        return SCALED_A | SCALED_B;
+    case OP_RAW_LT_INT_JUMP_IF_FALSE:
+    case OP_RAW_LTE_INT_JUMP_IF_FALSE:
+    case OP_RAW_EQ_INT_JUMP_IF_FALSE:
+    case OP_RAW_NEQ_INT_JUMP_IF_FALSE:
+    case OP_RAW_LT_REAL_JUMP_IF_FALSE:
+    case OP_RAW_LTE_REAL_JUMP_IF_FALSE:
+    case OP_RAW_EQ_REAL_JUMP_IF_FALSE:
+    case OP_RAW_NEQ_REAL_JUMP_IF_FALSE:
+        return SCALED_B;
+    case OP_RAW_LOAD_INT:
+    case OP_RAW_LOAD_REAL:
+    case OP_RAW_LOAD_INT_POOL:
+        return SCALED_A;
     default:
         return 0;
     }
@@ -503,8 +543,7 @@ static inline uint16_t pack_rk16(int rk) {
 /* op(8) | a(8) | w16(16) -- one small field plus one 16-bit field, both in word0. Used by opcodes
    whose only two real fields are a register/small-count and one RK16/count16 value (OP_FIELD_SET,
    OP_INDEX_FIELD_SET's obj_reg+rk_idx half). */
-#define PACK_OP_A_W16(op, a, w16)                                                                            \
-    (((uint32_t)(op) & 0xFF) | (((uint32_t)(a) & 0xFF) << 8) | (((uint32_t)(w16) & 0xFFFF) << 16))
+#define PACK_OP_A_W16(op, a, w16) (PACK3(op, a, 0, 0) | (((uint32_t)(w16) & 0xFFFF) << 16))
 #define UNPACK_W16(word) (((word) >> 16) & 0xFFFFU)
 
 /* OP_DEFINE_STRUCT's header word: op(8) | name_idx(16) | field_count(8) -- name_idx sits in the
