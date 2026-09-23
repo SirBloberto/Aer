@@ -2212,6 +2212,7 @@ allowlisting, neither of which exist today.
 | `source/runtime/objects.h` | The object types that need more than `value.h` can see: `AerDict` (it embeds a hash table), `Shape` and `AerStruct` |
 | `source/runtime/heap.h/c` | A VM's heap: its size-classed pools, GC bookkeeping and tuning, and the string-payload allocator |
 | `source/runtime/typed_array.h/c` | Typed arrays (columns): element access, the vectorized elementwise and broadcast kernels, fused chains, and the value checks |
+| `source/runtime/value_ops.h/c` | What the operators mean on values: truthiness, arithmetic and comparison across types, `in`, slicing bounds and casts |
 | `source/compiler/lexer.h/c` | Source text → token stream, indent/dedent tracking |
 | `source/compiler/parser.h/c` | Single-pass compiler: tokens → register-based bytecode, escape processing |
 | `source/core/vm.h/c` | Bytecode chunk, register-based VM (`CallFrame`/bump-pointer register stack), struct-type registry, computed-goto dispatch loop, built-ins |
