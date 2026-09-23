@@ -6,11 +6,11 @@ source/compiler/lexer.h 20
 source/compiler/parser.c 18
 source/compiler/parser.h 42
 source/core/chunk.c 13
-source/core/gc.c 21
-source/core/heap_ref.c 16
+source/runtime/gc.c 21
+source/runtime/heap_ref.c 16
 source/core/opcodes.def 42
-source/core/value.h 24
-source/core/value_format.c 8
+source/runtime/value.h 24
+source/runtime/value_format.c 8
 source/core/vm.c 14
 source/core/vm.h 45
 source/debug/disasm.c 8
