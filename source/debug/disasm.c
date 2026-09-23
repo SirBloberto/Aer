@@ -453,9 +453,9 @@ static unsigned int operand_word(unsigned char at) {
 static uint32_t operand_value(Chunk* c, unsigned int offset, unsigned char at) {
     uint32_t w = code_at(c, offset + operand_word(at));
     switch (at) {
-        case AT_A: return UNPACK_A(w);
-        case AT_B: return UNPACK_B(w);
-        case AT_C: return UNPACK_C(w);
+        case AT_A: return OPERAND_A(w);
+        case AT_B: return OPERAND_B(w);
+        case AT_C: return OPERAND_C(w);
         case AT_W16: return UNPACK_W16(w);
         case AT_W1_HI:
         case AT_W2_HI:
@@ -476,9 +476,9 @@ static unsigned int instruction_words(Chunk* c, unsigned int offset) {
         return 1;
     if (info->variable) {
         if (op == OP_INTERP)
-            return 1 + UNPACK_B(w0);
+            return 1 + OPERAND_B(w0);
         if (op == OP_INDEX_GET_INTERP)
-            return 1 + UNPACK_C(w0);
+            return 1 + OPERAND_C(w0);
         return 1 + (unsigned int)UNPACK_STRUCT_HEADER_COUNT(w0) * 2;
     }
     unsigned int words = 1;
@@ -554,11 +554,11 @@ static void print_variable_operands(FILE* out, Chunk* c, unsigned int offset, Op
     uint32_t w0 = c->code[offset];
     unsigned int pos = offset + 1;
     if (op == OP_INTERP || op == OP_INDEX_GET_INTERP) {
-        unsigned int count = (op == OP_INTERP) ? UNPACK_B(w0) : UNPACK_C(w0);
+        unsigned int count = (op == OP_INTERP) ? OPERAND_B(w0) : OPERAND_C(w0);
         if (op == OP_INTERP)
-            fprintf(out, "  reg=%u  parts=%u  [", UNPACK_A(w0), count);
+            fprintf(out, "  reg=%u  parts=%u  [", OPERAND_A(w0), count);
         else
-            fprintf(out, "  reg=%u  obj=r%u  parts=%u  [", UNPACK_A(w0), UNPACK_B(w0), count);
+            fprintf(out, "  reg=%u  obj=r%u  parts=%u  [", OPERAND_A(w0), OPERAND_B(w0), count);
         for (unsigned int i = 0; i < count; i++) {
             uint32_t rk = code_at(c, pos++);
             fprintf(out, "%s", i ? ", " : "");

@@ -274,7 +274,7 @@ static unsigned int last_instruction(Chunk* c) {
 /* Rewrites field A of the last instruction to dest, and forgets it: it now writes somewhere else. */
 static void retarget_last(Chunk* c, unsigned int at, int dest) {
     uint32_t w = c->code[at];
-    c->code[at] = PACK3((Opcode)(w & 0xFF), dest, UNPACK_B(w), UNPACK_C(w));
+    c->code[at] = PACK3((Opcode)(w & 0xFF), dest, OPERAND_B(w), OPERAND_C(w));
     P.peep.last.offset = NO_OFFSET;
 }
 
@@ -558,8 +558,8 @@ static unsigned int emit_cond_jump_if_false(Chunk* c, int rk_cond, unsigned int 
                 fused_op = OP_EQ_JUMP_IF_FALSE;
                 break; /* value unused when matched is false */
         }
-        if (matched && (int)UNPACK_A(w) == rk_cond) {
-            uint8_t rk_lhs8 = (uint8_t)UNPACK_B(w), rk_rhs8 = (uint8_t)UNPACK_C(w);
+        if (matched && (int)OPERAND_A(w) == rk_cond) {
+            uint8_t rk_lhs8 = (uint8_t)OPERAND_B(w), rk_rhs8 = (uint8_t)OPERAND_C(w);
             c->count =
                 cmp_word_start; /* discard the standalone comparison (keeping any LOADK before it) -- fused below instead */
             chunk_emit(c, PACK3(fused_op, 0, rk_lhs8, rk_rhs8));
@@ -695,10 +695,10 @@ static bool try_fuse_index_get_interp(Chunk* c, int dest_reg, int arr_reg, int r
     if (arr_reg == rk_idx)
         return false; /* the receiver is what we are about to stop writing */
     uint32_t w = c->code[at];
-    if ((Opcode)(w & 0xFF) != OP_INTERP || (int)UNPACK_A(w) != rk_idx)
+    if ((Opcode)(w & 0xFF) != OP_INTERP || (int)OPERAND_A(w) != rk_idx)
         return false;
 
-    unsigned int parts = UNPACK_B(w);
+    unsigned int parts = OPERAND_B(w);
     uint32_t operands[INTERP_MAX_PARTS];
     for (unsigned int i = 0; i < parts; i++)
         operands[i] = c->code[at + 1 + i];
@@ -1133,12 +1133,12 @@ static bool take_fused_mul_real(Chunk* c, unsigned int rhs_start, int rk_rhs, in
     if (c->count - rhs_start != 1)
         return false;
     uint32_t mw = c->code[rhs_start];
-    if ((Opcode)(mw & 0xFF) != OP_RAW_MUL_REAL || (int)UNPACK_A(mw) != (rk_rhs & RK_RAW_SLOT_MASK))
+    if ((Opcode)(mw & 0xFF) != OP_RAW_MUL_REAL || (int)OPERAND_A(mw) != (rk_rhs & RK_RAW_SLOT_MASK))
         return false;
-    *mul_a = (int)UNPACK_B(mw);
-    *mul_b = (int)UNPACK_C(mw);
+    *mul_a = (int)OPERAND_B(mw);
+    *mul_b = (int)OPERAND_C(mw);
     c->count = rhs_start;
-    raw_release_if_top((int)UNPACK_A(mw));
+    raw_release_if_top((int)OPERAND_A(mw));
     return true;
 }
 
@@ -1342,7 +1342,7 @@ static int raw_materialize(Chunk* c, int rk, RawKind kind) {
    retargeting one that belongs to a variable would drop that variable's own value. */
 static bool retarget_raw_write(Chunk* c, int src_slot, int dest_slot, RawKind kind) {
     unsigned int at = last_instruction(c);
-    if (at == NO_OFFSET || P.peep.last.raw_kind != kind || (int)UNPACK_A(c->code[at]) != src_slot)
+    if (at == NO_OFFSET || P.peep.last.raw_kind != kind || (int)OPERAND_A(c->code[at]) != src_slot)
         return false;
     if (!raw_is_temp(src_slot))
         return false;
@@ -1380,7 +1380,7 @@ static bool try_rewrite_index_get_raw(Chunk* c, int* rk, unsigned int start, Raw
     if (*rk & (RK_CONST_FLAG | RK_RAW_INT_FLAG | RK_RAW_REAL_FLAG))
         return false;
     uint32_t w = c->code[start];
-    if ((Opcode)(w & 0xFF) != OP_TYPED_INDEX_GET_UNCHECKED || (int)UNPACK_A(w) != *rk)
+    if ((Opcode)(w & 0xFF) != OP_TYPED_INDEX_GET_UNCHECKED || (int)OPERAND_A(w) != *rk)
         return false;
 
     bool is_int = (want == RAWK_INT);
@@ -1389,7 +1389,7 @@ static bool try_rewrite_index_get_raw(Chunk* c, int* rk, unsigned int start, Raw
     if (slot < 0)
         return false;
     c->code[start] =
-        PACK3(is_int ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL, slot, UNPACK_B(w), UNPACK_C(w));
+        PACK3(is_int ? OP_INDEX_GET_RAW_INT : OP_INDEX_GET_RAW_REAL, slot, OPERAND_B(w), OPERAND_C(w));
     *rk = (is_int ? RK_RAW_INT_FLAG : RK_RAW_REAL_FLAG) | slot;
     return true;
 }
@@ -2559,7 +2559,7 @@ static bool retarget_last_cmp(Chunk* c, int reg_rhs, int dest) {
     unsigned int at = last_instruction(c);
     if (at == NO_OFFSET || P.peep.last.raw_kind != RAWK_NONE || (Opcode)(c->code[at] & 0xFF) == OP_INTERP)
         return false;
-    if ((int)UNPACK_A(c->code[at]) != reg_rhs || !is_temp(reg_rhs))
+    if ((int)OPERAND_A(c->code[at]) != reg_rhs || !is_temp(reg_rhs))
         return false;
     /* Forgetting it matters here beyond bookkeeping: the retargeted comparison is the last word
        emitted, so an enclosing if/while would fuse its branch with it -- but it sits behind the
@@ -2770,12 +2770,12 @@ static bool try_fuse_fma_temp(Chunk* c, Opcode op, int* lhs, int rhs, unsigned i
         return false;
     uint32_t mw = c->code[rhs_start];
     if ((Opcode)(mw & 0xFF) != OP_RAW_MUL_REAL || rk_raw_kind(c, rhs) != RAWK_REAL ||
-        (int)UNPACK_A(mw) != (rhs & RK_RAW_SLOT_MASK))
+        (int)OPERAND_A(mw) != (rhs & RK_RAW_SLOT_MASK))
         return false;
     int lhs_slot = *lhs & RK_RAW_SLOT_MASK;
-    int mul_a = (int)UNPACK_B(mw), mul_b = (int)UNPACK_C(mw);
+    int mul_a = (int)OPERAND_B(mw), mul_b = (int)OPERAND_C(mw);
     c->count = rhs_start; /* discard the MUL -- fused below instead */
-    raw_release_if_top((int)UNPACK_A(mw));
+    raw_release_if_top((int)OPERAND_A(mw));
     chunk_emit(c, PACK3(op == OP_ADD ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL, lhs_slot, mul_a, mul_b));
     *lhs = RK_RAW_REAL_FLAG | lhs_slot;
     return true;
@@ -2807,7 +2807,7 @@ static FuseResult try_fuse_field_rhs(Chunk* c, Opcode op, int* lhs, int rhs, uns
     if (c->count - rhs_start != 2 || (c->code[rhs_start] & 0xFF) != OP_FIELD_GET ||
         !commuted_op(op, &field_op))
         return FUSE_NONE;
-    int struct_reg = (int)UNPACK_B(c->code[rhs_start]);
+    int struct_reg = (int)OPERAND_B(c->code[rhs_start]);
     unsigned int field_idx = c->code[rhs_start + 1];
     c->count = rhs_start; /* discard the OP_FIELD_GET just emitted, never executed */
 
@@ -2836,7 +2836,7 @@ static FuseResult try_fuse_field_rhs(Chunk* c, Opcode op, int* lhs, int rhs, uns
 static bool take_lhs_field_get(Chunk* c, unsigned int lhs_start, int* struct_reg, unsigned int* field_idx) {
     if (c->count - lhs_start != 2 || (c->code[lhs_start] & 0xFF) != OP_FIELD_GET)
         return false;
-    *struct_reg = (int)UNPACK_B(c->code[lhs_start]);
+    *struct_reg = (int)OPERAND_B(c->code[lhs_start]);
     *field_idx = c->code[lhs_start + 1];
     c->count = lhs_start;
     return true;
@@ -2850,9 +2850,9 @@ static bool take_lhs_chain2(Chunk* c, unsigned int lhs_start, int lhs, Opcode op
         return false;
     uint32_t w = c->code[lhs_start];
     Opcode wop = (Opcode)(w & 0xFF);
-    if (!(wop == OP_ADD || wop == OP_SUB || wop == OP_MUL) || (int)UNPACK_A(w) != lhs)
+    if (!(wop == OP_ADD || wop == OP_SUB || wop == OP_MUL) || (int)OPERAND_A(w) != lhs)
         return false;
-    uint8_t a8 = (uint8_t)UNPACK_B(w), b8 = (uint8_t)UNPACK_C(w);
+    uint8_t a8 = (uint8_t)OPERAND_B(w), b8 = (uint8_t)OPERAND_C(w);
     if (RK8_IS_CONST(a8) || RK8_IS_CONST(b8))
         return false;
     *op1 = wop;
@@ -3313,14 +3313,14 @@ static void compound_assign_raw_variable(Chunk* c, unsigned int name_idx, int ex
         if (at != NO_OFFSET) {
             uint32_t mw = c->code[at];
             if ((Opcode)(mw & 0xFF) == OP_RAW_MUL_REAL &&
-                (int)UNPACK_A(mw) == (rk_rhs & RK_RAW_SLOT_MASK)) {
+                (int)OPERAND_A(mw) == (rk_rhs & RK_RAW_SLOT_MASK)) {
                 c->count = at; /* discard the MUL -- fused below instead */
                 /* The FMA lands where the MUL was, so the window would otherwise hand it back as a
                    foldable MUL. */
                 P.peep.last.offset = NO_OFFSET;
-                raw_release_if_top((int)UNPACK_A(mw));
+                raw_release_if_top((int)OPERAND_A(mw));
                 Opcode fused = (boxed_op == OP_ADD) ? OP_RAW_FMA_REAL : OP_RAW_FMS_REAL;
-                chunk_emit(c, PACK3(fused, slot, (int)UNPACK_B(mw), (int)UNPACK_C(mw)));
+                chunk_emit(c, PACK3(fused, slot, (int)OPERAND_B(mw), (int)OPERAND_C(mw)));
                 return;
             }
         }
@@ -4091,13 +4091,13 @@ static void parse_loop_body_rotated(Chunk* c, unsigned int body_top, unsigned in
     if (back_op == OP_RAW_LTE_INT_JUMP_IF_FALSE && c->count > 0 &&
         P.loop_stack[P.loop_depth - 1].continue_patch_count == 0 && !(rhs & RK8_CONST_FLAG)) {
         uint32_t w = c->code[inc_at];
-        if ((Opcode)(w & 0xFF) == OP_RAW_ADD_INT && UNPACK_A(w) == UNPACK_B(w) &&
-            (uint8_t)UNPACK_A(w) == rhs) {
+        if ((Opcode)(w & 0xFF) == OP_RAW_ADD_INT && OPERAND_A(w) == OPERAND_B(w) &&
+            (uint8_t)OPERAND_A(w) == rhs) {
             c->count = inc_at; /* discard the increment -- folded into the back-edge below */
             P.peep.last.offset = NO_OFFSET;
             cond_pos = c->count;
-            chunk_emit(c, PACK3(OP_RAW_INC_LTE_INT_JUMP_IF_FALSE, (uint8_t)UNPACK_A(w),
-                                (uint8_t)UNPACK_C(w), lhs));
+            chunk_emit(c, PACK3(OP_RAW_INC_LTE_INT_JUMP_IF_FALSE, (uint8_t)OPERAND_A(w),
+                                (uint8_t)OPERAND_C(w), lhs));
             unsigned int patch_fused = c->count;
             chunk_emit(c, 0);
             patch_jump(c, patch_fused, body_top);
@@ -4136,7 +4136,7 @@ static void parse_for_body(Chunk* c, unsigned int loop_top, int rk_cond) {
         uint32_t w = c->code[loop_top];
         bool swap;
         if (complement_branch((Opcode)(w & 0xFF), &back_op, &swap)) {
-            uint8_t a = (uint8_t)UNPACK_B(w), b = (uint8_t)UNPACK_C(w);
+            uint8_t a = (uint8_t)OPERAND_B(w), b = (uint8_t)OPERAND_C(w);
             bool swap_encodable = !RK8_IS_CONST(a) && !RK8_IS_CONST(b);
             /* The complement of `i < K` wants K on the left, where these opcodes take only a slot, so
                a literal bound is loaded once into a preheader slot for the back-edge to read. */
@@ -4268,7 +4268,7 @@ static int chain_of_array_ops(Chunk* c, unsigned int start, unsigned int end, in
         unsigned int tok;
         if (!chain_token_for((Opcode)(w & 0xFF), &tok))
             return 0;
-        uint8_t d = (uint8_t)UNPACK_A(w), side[2] = {(uint8_t)UNPACK_B(w), (uint8_t)UNPACK_C(w)};
+        uint8_t d = (uint8_t)OPERAND_A(w), side[2] = {(uint8_t)OPERAND_B(w), (uint8_t)OPERAND_C(w)};
         /* A tree over k leaves has k-1 operators, so this bound follows from the leaf bound. */
         if (nops >= CHAIN_MAX_LEAVES || d >= FRAME_REGISTERS)
             return 0;
@@ -5022,8 +5022,8 @@ static int parse_builtin_call(Chunk* c, unsigned int name_idx) {
         int arg_orig_reg = base;
         if (arg_code_end - arg_code_begin == 1) {
             uint32_t w = c->code[arg_code_begin];
-            if ((w & 0xFF) == OP_MOVE && (int)UNPACK_A(w) == base)
-                arg_orig_reg = (int)UNPACK_B(w);
+            if ((w & 0xFF) == OP_MOVE && (int)OPERAND_A(w) == base)
+                arg_orig_reg = (int)OPERAND_B(w);
         }
         if (arg_orig_reg >= 0) {
             P.proof.last_length_call_result_reg = dest;
