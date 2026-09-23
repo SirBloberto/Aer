@@ -50,17 +50,14 @@ def corpus():
 def declared_opcodes():
     """Only the ones the dispatch table can actually reach.
 
-    Several Opcode members are never an instruction's opcode byte: OP_NOT and OP_NEGATE ride in
-    OP_UNARY's B field, and OP_AND/OP_OR/OP_PIPE are parser-internal tokens that compile to
-    jumps. Ranking those alongside real opcodes would report them at zero dispatches forever and
-    invite someone to "cut" a table slot they do not occupy.
+    Several opcodes are never an instruction's opcode byte: OP_NOT and OP_NEGATE ride in OP_UNARY's
+    B field, and OP_AND/OP_OR/OP_PIPE are parser-internal tokens that compile to jumps. Ranking those
+    alongside real opcodes would report them at zero dispatches forever and invite someone to "cut" a
+    table slot they do not occupy. Their opcodes.def rows name the handler `none`.
     """
-    enum_src = open(os.path.join(ROOT, "source", "core", "vm.h"), encoding="utf-8").read()
-    m = re.search(r"typedef enum \{(.*?)\} Opcode;", enum_src, re.S)
-    declared = re.findall(r"^    (OP_[A-Z0-9_]+),", m.group(1), re.M)
-    vm_src = open(os.path.join(ROOT, "source", "core", "vm.c"), encoding="utf-8").read()
-    dispatchable = set(re.findall(r"\[(OP_[A-Z0-9_]+)\]\s*=\s*h_", vm_src))
-    return [op for op in declared if op in dispatchable]
+    src = open(os.path.join(ROOT, "source", "core", "opcodes.def"), encoding="utf-8").read()
+    rows = re.findall(r"^OPCODE\(([A-Z0-9_]+), ([a-z0-9_]+),", src, re.M)
+    return ["OP_" + name for name, handler in rows if handler != "none"]
 
 
 def dispatches(binary, paths):

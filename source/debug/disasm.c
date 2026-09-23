@@ -46,6 +46,7 @@ typedef enum {
     F_MODULE_ID,
     F_MODULE_FN,
     F_BUILTIN_ID,
+    F_VARIABLE, /* first and only entry: the operand count lives in word0 */
 } Fld;
 
 typedef struct {
@@ -59,305 +60,33 @@ typedef struct {
     const char* name;
     const char* desc;
     Operand ops[MAX_OPERANDS];
-    /* Word count comes from the instruction itself rather than from ops[]: OP_DEFINE_STRUCT,
-       OP_INTERP and OP_INDEX_GET_INTERP each carry their operand count in word0. */
-    bool variable;
 } OpInfo;
 
-/* OP_INDEX_GET_INTERP is the last member of the Opcode enum (vm.h). */
-#define OP_INFO_MAX OP_INDEX_GET_INTERP
+#define OP_INFO_MAX (OP_OPCODE_COUNT_MARKER - 1)
 
-#define ROW(op, d, ...) [op] = {#op, d, {__VA_ARGS__}}
+/* Operand layouts for opcodes.def: one shape per opcode family, so the kind, width and checked axes
+   read as the matrix they are. */
+#define L_BINOP {AT_A, F_REG}, {AT_B, F_RK8}, {AT_C, F_RK8}
+#define L_CMP_JUMP {AT_B, F_RK8}, {AT_C, F_RK8}, {AT_W1, F_JUMP}
+#define L_RAW_CMP_JUMP(K, KK) {AT_B, K}, {AT_C, KK}, {AT_W1, F_JUMP}
+#define L_RAW_ARITH(K, KK) {AT_A, K}, {AT_B, K}, {AT_C, KK}
+#define L_RAW_CMP(K, KK) {AT_A, F_REG}, {AT_B, K}, {AT_C, KK}
+#define L_CALL {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1, F_JUMP}, {AT_W2, F_COUNT}
+#define L_CALL_VALUE {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1, F_REG}
+#define L_ITER {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_REG}, {AT_W1, F_REG}, {AT_W2, F_JUMP}
+#define L_FIELD_GET_RAW(K) {AT_A, K}, {AT_B, F_REG}, {AT_W1, F_OFF}
+#define L_FIELD_SET_RAW(K) {AT_A, F_REG}, {AT_W1, F_OFF}, {AT_W2, K}
+#define L_FIELD_COMPOUND_RAW(K) {AT_A, F_REG}, {AT_B, F_BINOP}, {AT_W1, F_OFF}, {AT_W2, K}
+#define L_IDX_FIELD_GET_RAW(K) {AT_A, K}, {AT_B, F_REG}, {AT_W1_HI, F_OFF}, {AT_W1_LO, F_RK16}
+#define L_IDX_FIELD_SET_RAW(K) {AT_A, F_REG}, {AT_W16, F_RK16}, {AT_W1_HI, F_OFF}, {AT_W1_LO, K}
+#define L_IDX_FIELD_COMPOUND_RAW(K)                                                                              {AT_A, F_REG}, {AT_B, F_BINOP}, {AT_W1_HI, F_OFF}, {AT_W1_LO, F_RK16}, {AT_W2, K}
+#define L_VARIABLE {0, F_VARIABLE}
 
-/* One shape per opcode family, so the kind, width and checked axes read as the matrix they are. */
-#define ROW_BINOP(op, d) ROW(op, d, {AT_A, F_REG}, {AT_B, F_RK8}, {AT_C, F_RK8})
-#define ROW_CMP_JUMP(op, d) ROW(op, d, {AT_B, F_RK8}, {AT_C, F_RK8}, {AT_W1, F_JUMP})
-#define ROW_RAW_CMP_JUMP(op, d, K, KK) ROW(op, d, {AT_B, K}, {AT_C, KK}, {AT_W1, F_JUMP})
-#define ROW_RAW_ARITH(op, d, K, KK) ROW(op, d, {AT_A, K}, {AT_B, K}, {AT_C, KK})
-#define ROW_RAW_CMP(op, d, K, KK) ROW(op, d, {AT_A, F_REG}, {AT_B, K}, {AT_C, KK})
-#define ROW_CALL(op, d)                                                                              \
-    ROW(op, d, {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1, F_JUMP}, {AT_W2, F_COUNT})
-#define ROW_CALL_VALUE(op, d)                                                                        \
-    ROW(op, d, {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1, F_REG})
-#define ROW_ITER(op, d)                                                                              \
-    ROW(op, d, {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_REG}, {AT_W1, F_REG}, {AT_W2, F_JUMP})
-#define ROW_FIELD_GET_RAW(op, d, K) ROW(op, d, {AT_A, K}, {AT_B, F_REG}, {AT_W1, F_OFF})
-#define ROW_FIELD_SET_RAW(op, d, K) ROW(op, d, {AT_A, F_REG}, {AT_W1, F_OFF}, {AT_W2, K})
-#define ROW_FIELD_COMPOUND_RAW(op, d, K)                                                             \
-    ROW(op, d, {AT_A, F_REG}, {AT_B, F_BINOP}, {AT_W1, F_OFF}, {AT_W2, K})
-#define ROW_IDX_FIELD_GET_RAW(op, d, K)                                                              \
-    ROW(op, d, {AT_A, K}, {AT_B, F_REG}, {AT_W1_HI, F_OFF}, {AT_W1_LO, F_RK16})
-#define ROW_IDX_FIELD_SET_RAW(op, d, K)                                                              \
-    ROW(op, d, {AT_A, F_REG}, {AT_W16, F_RK16}, {AT_W1_HI, F_OFF}, {AT_W1_LO, K})
-#define ROW_IDX_FIELD_COMPOUND_RAW(op, d, K)                                                         \
-    ROW(op, d, {AT_A, F_REG}, {AT_B, F_BINOP}, {AT_W1_HI, F_OFF}, {AT_W1_LO, F_RK16}, {AT_W2, K})
-
+#define OPCODE(name, handler, scaled, desc, ...) [OP_##name] = {"OP_" #name, desc, {__VA_ARGS__}},
 static const OpInfo op_info[OP_INFO_MAX + 1] = {
-    ROW_BINOP(OP_ADD, "reg = rk + rk"),
-    ROW_BINOP(OP_SUB, "reg = rk - rk"),
-    ROW_BINOP(OP_MUL, "reg = rk * rk"),
-    ROW_BINOP(OP_DIV, "reg = rk / rk"),
-    ROW_BINOP(OP_MOD, "reg = rk % rk"),
-    ROW_BINOP(OP_FLOOR_DIV, "reg = rk // rk"),
-    ROW_BINOP(OP_EQ, "reg = rk == rk"),
-    ROW_BINOP(OP_NEQ, "reg = rk != rk"),
-    ROW_BINOP(OP_LT, "reg = rk < rk"),
-    ROW_BINOP(OP_GT, "reg = rk > rk"),
-    ROW_BINOP(OP_LTE, "reg = rk <= rk"),
-    ROW_BINOP(OP_GTE, "reg = rk >= rk"),
-    ROW_BINOP(OP_IN, "reg = rk in rk"),
-    ROW_BINOP(OP_BITWISE_AND, "reg = rk & rk"),
-    ROW_BINOP(OP_BITWISE_OR, "reg = rk | rk"),
-    ROW_BINOP(OP_BITWISE_XOR, "reg = rk ^ rk"),
-    ROW_BINOP(OP_LSHIFT, "reg = rk << rk"),
-    ROW_BINOP(OP_RSHIFT, "reg = rk >> rk"),
-
-    /* Never dispatched standalone (parser tags, or embedded in OP_UNARY), but F_BINOP rendering
-       still reads their names from this table. */
-    ROW(OP_AND, ""),
-    ROW(OP_OR, ""),
-    ROW(OP_PIPE, ""),
-    ROW(OP_NEGATE, ""),
-    ROW(OP_NOT, ""),
-    ROW(OP_BITWISE_NOT, ""),
-    ROW(OP_TO_STR, ""),
-
-    ROW(OP_JUMP, "unconditional jump", {AT_W1, F_JUMP}),
-    [OP_DEFINE_STRUCT] = {"OP_DEFINE_STRUCT",
-                          "register a struct type (variable-length: header word, then that many field words)",
-                          {{0, F_END}},
-                          true},
-    ROW(OP_HALT, "stop execution"),
-    ROW(OP_LOADK, "reg = pool constant", {AT_A, F_REG}, {AT_W16, F_POOL}),
-    ROW(OP_MOVE, "reg = reg", {AT_A, F_REG}, {AT_B, F_REG}),
-    ROW(OP_IS_RESULT, "reg = is-result(reg)", {AT_A, F_REG}, {AT_B, F_REG}),
-    ROW(OP_JUMP_IF_FALSE_REG, "jump if !reg, no pop", {AT_A, F_REG}, {AT_W1, F_JUMP}),
-    ROW_CALL(OP_CALL, "call by compile-time-resolved offset"),
-    ROW_CALL_VALUE(OP_CALL_VALUE, "call a runtime function value held in a register"),
-    ROW_CALL(OP_TAIL_CALL, "tail call by compile-time-resolved offset, reuses this frame"),
-    ROW_CALL_VALUE(OP_TAIL_CALL_VALUE, "tail call through a register value, reuses this frame"),
-    ROW(OP_RETURN, "return reg to caller", {AT_A, F_REG}),
-    ROW(OP_CALL_MODULE, "call a native or file-module function by (module, function) name",
-        {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1, F_NAME}, {AT_W2, F_NAME},
-        {AT_W3_HI, F_MODULE_ID}, {AT_W3_LO, F_MODULE_FN}),
-    ROW(OP_CALL_BUILTIN, "global builtin (length/print/etc.) by name", {AT_A, F_REG}, {AT_B, F_REG},
-        {AT_C, F_COUNT}, {AT_W1, F_NAME}, {AT_W2, F_BUILTIN_ID}),
-    ROW(OP_ARRAY_NEW, "reg = new array from a contiguous reg range", {AT_A, F_REG}, {AT_B, F_REG},
-        {AT_C, F_COUNT}),
-    ROW(OP_INDEX_GET, "reg = reg[rk]", {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_RK8}),
-    ROW(OP_INDEX_SET, "reg[rk] = rk", {AT_A, F_REG}, {AT_B, F_RK8}, {AT_C, F_RK8}),
-    ROW(OP_TYPED_INDEX_GET_UNCHECKED, "loop-proven-safe: reg = typed_arr[rk]", {AT_A, F_REG},
-        {AT_B, F_REG}, {AT_C, F_RK8}),
-    ROW(OP_TYPED_INDEX_SET_UNCHECKED, "loop-proven-safe: typed_arr[rk] = rk", {AT_A, F_REG},
-        {AT_B, F_RK8}, {AT_C, F_RK8}),
-    ROW(OP_DESTRUCTURE, "reg, reg = destructure(reg)", {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_REG}),
-    ROW(OP_SLICE_GET, "reg = reg[rk:rk]", {AT_A, F_REG}, {AT_B, F_REG}, {AT_W1_HI, F_RK16},
-        {AT_W1_LO, F_RK16}),
-    ROW(OP_DICT_NEW, "reg = new dict from contiguous key/value reg pairs", {AT_A, F_REG},
-        {AT_B, F_REG}, {AT_C, F_COUNT}),
-    ROW(OP_ITER_NEXT_ARRAY, "for-each step, array or dict-keys", {AT_A, F_REG}, {AT_B, F_REG},
-        {AT_C, F_REG}, {AT_W1, F_JUMP}),
-    ROW_ITER(OP_ITER_NEXT_PAIR, "for-each step, dict key+value pairs"),
-    ROW_ITER(OP_ITER_RANGE_PREP, "rotated range-for: once-before-loop check"),
-    ROW_ITER(OP_ITER_RANGE_LOOP,
-             "rotated range-for: bottom-of-loop advance+check+branch-back (bounds snapshotted "
-             "once, never re-validated)"),
-    ROW(OP_STRUCT_NEW, "reg = new struct instance from a contiguous reg range", {AT_A, F_REG},
-        {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1, F_NAME}),
-    ROW(OP_FIELD_GET, "reg = struct.field", {AT_A, F_REG}, {AT_B, F_REG}, {AT_W1, F_NAME}),
-    ROW(OP_FIELD_SET, "struct.field = rk", {AT_A, F_REG}, {AT_W16, F_RK16}, {AT_W1, F_NAME}),
-    ROW(OP_ARRAY_REPEAT,
-        "reg = [fill_reg; rk_count] (struct -> packed array, number -> typed array)", {AT_A, F_REG},
-        {AT_B, F_REG}, {AT_C, F_COUNT}, {AT_W1_LO, F_RK16}),
-    ROW(OP_INDEX_FIELD_GET, "fused: reg = reg[rk].field (packed or struct array)", {AT_A, F_REG},
-        {AT_B, F_REG}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}),
-    ROW(OP_INDEX_FIELD_SET, "fused: reg[rk].field = rk (packed or struct array)", {AT_A, F_REG},
-        {AT_W16, F_RK16}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}),
-    ROW(OP_INDEX_FIELD_COMPOUND,
-        "fused: reg[rk].field OP= rk (resolved once, packed or struct array)", {AT_A, F_REG},
-        {AT_B, F_BINOP}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}, {AT_W2_LO, F_RK16}),
-    ROW(OP_UNARY, "reg = unary_op(rk)", {AT_A, F_REG}, {AT_B, F_BINOP}, {AT_C, F_RK8}),
-    ROW(OP_CAST, "reg = cast(rk)", {AT_A, F_REG}, {AT_B, F_CAST}, {AT_C, F_RK8}),
-    /* Covers both struct.field OP rk AND rk OP struct.field -- the parser canonicalizes the latter
-       into this same opcode wherever that is exact (see vm.h). */
-    ROW(OP_FIELD_BINARY, "fused: reg = struct.field OP rk (field on the left)", {AT_A, F_REG},
-        {AT_B, F_REG}, {AT_C, F_BINOP}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}),
-    ROW(OP_FIELD_COMPOUND, "fused: struct.field OP= rk (resolved once, no dest reg)", {AT_A, F_REG},
-        {AT_B, F_BINOP}, {AT_W1_HI, F_NAME}, {AT_W1_LO, F_RK16}),
-    ROW(OP_INDEX_COMPOUND, "fused: arr[rk] OP= rk (any receiver, no dest reg)", {AT_A, F_REG},
-        {AT_B, F_BINOP}, {AT_W1_HI, F_RK16}, {AT_W1_LO, F_RK16}),
-    ROW(OP_TYPED_ARRAY_CHAIN2,
-        "fused: reg = (reg op1 reg) op2 reg (typed-array chain, runtime-checked)", {AT_A, F_REG},
-        {AT_B, F_REG}, {AT_C, F_REG}, {AT_W1_HI, F_BINOP}, {AT_W1_LO, F_REG}, {AT_W2, F_BINOP}),
-    ROW(OP_PRINT_REPL, "shell mode: print reg unless null", {AT_A, F_REG}),
-
-    ROW(OP_RAW_LOAD_INT, "rawi = imm (full int32)", {AT_A, F_RAWI}, {AT_W1, F_IMM32}),
-    ROW(OP_RAW_LOAD_REAL, "rawr = pool constant", {AT_A, F_RAWR}, {AT_W1, F_POOL_RAWD}),
-    ROW_RAW_ARITH(OP_RAW_ADD_INT, "rawi = rawi + rawi", F_RAWI, F_RAWK_I),
-    ROW_RAW_ARITH(OP_RAW_SUB_INT, "rawi = rawi - rawi", F_RAWI, F_RAWK_I),
-    ROW_RAW_ARITH(OP_RAW_MUL_INT, "rawi = rawi * rawi", F_RAWI, F_RAWK_I),
-    ROW_RAW_ARITH(OP_RAW_ADD_INT_K, "rawi = rawi + rawk", F_RAWI, F_RAWK_I_AT),
-    ROW_RAW_ARITH(OP_RAW_SUB_INT_K, "rawi = rawi - rawk", F_RAWI, F_RAWK_I_AT),
-    /* int/int division promotes, so this one alone writes a raw real. */
-    ROW(OP_RAW_DIV_INT, "rawr = rawi / rawi (int/int division always promotes to real)",
-        {AT_A, F_RAWR}, {AT_B, F_RAWI}, {AT_C, F_RAWK_I}),
-    ROW_RAW_ARITH(OP_RAW_MOD_INT, "rawi = rawi % rawi", F_RAWI, F_RAWK_I),
-    ROW_RAW_ARITH(OP_RAW_FLOOR_DIV_INT, "rawi = floor(rawi / rawi)", F_RAWI, F_RAWK_I),
-    ROW_RAW_ARITH(OP_RAW_ADD_REAL, "rawr = rawr + rawr", F_RAWR, F_RAWK_D),
-    ROW_RAW_ARITH(OP_RAW_SUB_REAL, "rawr = rawr - rawr", F_RAWR, F_RAWK_D),
-    ROW_RAW_ARITH(OP_RAW_MUL_REAL, "rawr = rawr * rawr", F_RAWR, F_RAWK_D),
-    ROW_RAW_ARITH(OP_RAW_DIV_REAL, "rawr = rawr / rawr", F_RAWR, F_RAWK_D),
-    ROW_RAW_ARITH(OP_RAW_FMA_REAL,
-                  "rawr = rawr + rawr * rawr (fused mul-add dispatch, two roundings)", F_RAWR,
-                  F_RAWK_D),
-    ROW_RAW_ARITH(OP_RAW_FMS_REAL,
-                  "rawr = rawr - rawr * rawr (fused mul-sub dispatch, two roundings)", F_RAWR,
-                  F_RAWK_D),
-    ROW_RAW_CMP(OP_RAW_LT_INT, "reg = rawi < rawi", F_RAWI, F_RAWK_I),
-    ROW_RAW_CMP(OP_RAW_LTE_INT, "reg = rawi <= rawi", F_RAWI, F_RAWK_I),
-    ROW_RAW_CMP(OP_RAW_LT_REAL, "reg = rawr < rawr", F_RAWR, F_RAWK_D),
-    ROW_RAW_CMP(OP_RAW_LTE_REAL, "reg = rawr <= rawr", F_RAWR, F_RAWK_D),
-    ROW_RAW_CMP(OP_RAW_EQ_INT, "reg = rawi == rawi", F_RAWI, F_RAWK_I),
-    ROW_RAW_CMP(OP_RAW_NEQ_INT, "reg = rawi != rawi", F_RAWI, F_RAWK_I),
-    ROW_RAW_CMP(OP_RAW_EQ_REAL, "reg = rawr == rawr", F_RAWR, F_RAWK_D),
-    ROW_RAW_CMP(OP_RAW_NEQ_REAL, "reg = rawr != rawr", F_RAWR, F_RAWK_D),
-    ROW(OP_UNBOX_INT, "rawi = unbox(reg) (tag-checked)", {AT_A, F_RAWI}, {AT_B, F_REG}),
-    ROW(OP_UNBOX_REAL, "rawr = unbox(reg) (tag-checked)", {AT_A, F_RAWR}, {AT_B, F_REG}),
-    ROW(OP_RAW_MOVE_INT, "rawi = rawi", {AT_A, F_RAWI}, {AT_B, F_RAWI}),
-    ROW(OP_RAW_MOVE_REAL, "rawr = rawr", {AT_A, F_RAWR}, {AT_B, F_RAWR}),
-    ROW(OP_RAW_LOAD_INT_POOL, "rawi = pool constant", {AT_A, F_RAWI}, {AT_W1, F_POOL_RAWI}),
-
-    /* Shape-specialized field access: one row per (storage kind, checked-ness) pair. See vm.h's
-       own comment on this family, and on the compile-time proof behind the _UNCHECKED forms. */
-    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_INT, "specialized: rawi = packed_arr[rk].field",
-                          F_RAWI),
-    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_REAL, "specialized: rawr = packed_arr[rk].field",
-                          F_RAWR),
-    ROW_FIELD_GET_RAW(OP_FIELD_GET_RAW_INT, "specialized: rawi = struct.field", F_RAWI),
-    ROW_FIELD_GET_RAW(OP_FIELD_GET_RAW_REAL, "specialized: rawr = struct.field", F_RAWR),
-    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_INT, "specialized: packed_arr[rk].field = rawi",
-                          F_RAWI),
-    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_REAL, "specialized: packed_arr[rk].field = rawr",
-                          F_RAWR),
-    ROW_FIELD_SET_RAW(OP_FIELD_SET_RAW_INT, "specialized: struct.field = rawi", F_RAWI),
-    ROW_FIELD_SET_RAW(OP_FIELD_SET_RAW_REAL, "specialized: struct.field = rawr", F_RAWR),
-    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_INT, "specialized: struct.field OP= rawi", F_RAWI),
-    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_REAL, "specialized: struct.field OP= rawr", F_RAWR),
-    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT,
-                               "specialized: packed_arr[rk].field OP= rawi", F_RAWI),
-    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_REAL,
-                               "specialized: packed_arr[rk].field OP= rawr", F_RAWR),
-
-    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED,
-                          "specialized+loop-proven-safe: rawi = packed_arr[rk].field", F_RAWI),
-    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED,
-                          "specialized+loop-proven-safe: rawr = packed_arr[rk].field", F_RAWR),
-    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED,
-                          "specialized+loop-proven-safe: packed_arr[rk].field = rawi", F_RAWI),
-    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED,
-                          "specialized+loop-proven-safe: packed_arr[rk].field = rawr", F_RAWR),
-    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED,
-                               "specialized+loop-proven-safe: packed_arr[rk].field OP= rawi", F_RAWI),
-    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED,
-                               "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr", F_RAWR),
-
-    /* Narrow (int32/float32) counterparts of the whole family above -- same word layouts, just a
-       4-byte field instead of 8. */
-    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_INT32,
-                          "specialized: rawi = packed_arr[rk].field (narrow)", F_RAWI),
-    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_FLOAT32,
-                          "specialized: rawr = packed_arr[rk].field (narrow)", F_RAWR),
-    ROW_FIELD_GET_RAW(OP_FIELD_GET_RAW_INT32, "specialized: rawi = struct.field (narrow)", F_RAWI),
-    ROW_FIELD_GET_RAW(OP_FIELD_GET_RAW_FLOAT32, "specialized: rawr = struct.field (narrow)", F_RAWR),
-    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_INT32,
-                          "specialized: packed_arr[rk].field = rawi (narrow)", F_RAWI),
-    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_FLOAT32,
-                          "specialized: packed_arr[rk].field = rawr (narrow)", F_RAWR),
-    ROW_FIELD_SET_RAW(OP_FIELD_SET_RAW_INT32, "specialized: struct.field = rawi (narrow)", F_RAWI),
-    ROW_FIELD_SET_RAW(OP_FIELD_SET_RAW_FLOAT32, "specialized: struct.field = rawr (narrow)", F_RAWR),
-    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_INT32,
-                           "specialized: struct.field OP= rawi (narrow)", F_RAWI),
-    ROW_FIELD_COMPOUND_RAW(OP_FIELD_COMPOUND_RAW_FLOAT32,
-                           "specialized: struct.field OP= rawr (narrow)", F_RAWR),
-    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT32,
-                               "specialized: packed_arr[rk].field OP= rawi (narrow)", F_RAWI),
-    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32,
-                               "specialized: packed_arr[rk].field OP= rawr (narrow)", F_RAWR),
-
-    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED,
-                          "specialized+loop-proven-safe: rawi = packed_arr[rk].field (narrow)",
-                          F_RAWI),
-    ROW_IDX_FIELD_GET_RAW(OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED,
-                          "specialized+loop-proven-safe: rawr = packed_arr[rk].field (narrow)",
-                          F_RAWR),
-    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED,
-                          "specialized+loop-proven-safe: packed_arr[rk].field = rawi (narrow)",
-                          F_RAWI),
-    ROW_IDX_FIELD_SET_RAW(OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED,
-                          "specialized+loop-proven-safe: packed_arr[rk].field = rawr (narrow)",
-                          F_RAWR),
-    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED,
-                               "specialized+loop-proven-safe: packed_arr[rk].field OP= rawi (narrow)",
-                               F_RAWI),
-    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED,
-                               "specialized+loop-proven-safe: packed_arr[rk].field OP= rawr (narrow)",
-                               F_RAWR),
-
-    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD,
-                               "specialized: field += raw", F_RAWR),
-    ROW_IDX_FIELD_COMPOUND_RAW(OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD,
-                               "specialized: field += raw", F_RAWR),
-
-    ROW(OP_FIELD_COMPOUND_RAW_FLOAT32_FMA, "specialized: struct.field += rawr * rawr (narrow)",
-        {AT_A, F_REG}, {AT_B, F_RAWR}, {AT_C, F_RAWR}, {AT_W1, F_OFF}),
-    ROW(OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA,
-        "specialized+loop-proven-safe: packed_arr[rk].field += rawr * rawr", {AT_A, F_REG},
-        {AT_B, F_RAWR}, {AT_C, F_RAWR}, {AT_W1_HI, F_OFF}, {AT_W1_LO, F_RK16}),
-
-    ROW_CMP_JUMP(OP_EQ_JUMP_IF_FALSE, "jump if !(rk == rk)"),
-    ROW_CMP_JUMP(OP_NEQ_JUMP_IF_FALSE, "jump if !(rk != rk)"),
-    ROW_CMP_JUMP(OP_LT_JUMP_IF_FALSE, "jump if !(rk < rk)"),
-    ROW_CMP_JUMP(OP_GT_JUMP_IF_FALSE, "jump if !(rk > rk)"),
-    ROW_CMP_JUMP(OP_LTE_JUMP_IF_FALSE, "jump if !(rk <= rk)"),
-    ROW_CMP_JUMP(OP_GTE_JUMP_IF_FALSE, "jump if !(rk >= rk)"),
-
-    /* Variable-length: a header word, then part_count RK16 words, one per part. */
-    [OP_INTERP] = {"OP_INTERP", "reg = one string built from N parts", {{0, F_END}}, true},
-    [OP_INDEX_GET_INTERP] = {"OP_INDEX_GET_INTERP", "reg = dict[N-part key], key never allocated",
-                             {{0, F_END}}, true},
-
-    ROW_RAW_CMP_JUMP(OP_RAW_LT_INT_JUMP_IF_FALSE, "jump if !(rawi < rawi)", F_RAWI, F_RAWK_I),
-    ROW_RAW_CMP_JUMP(OP_RAW_LTE_INT_JUMP_IF_FALSE, "jump if !(rawi <= rawi)", F_RAWI, F_RAWK_I),
-    ROW(OP_RAW_INC_LTE_INT_JUMP_IF_FALSE, "rawi += rawi, then jump if !(rawi <= it)", {AT_A, F_RAWI},
-        {AT_B, F_RAWI}, {AT_C, F_RAWI}, {AT_W1, F_JUMP}),
-    ROW_RAW_CMP_JUMP(OP_RAW_LT_REAL_JUMP_IF_FALSE, "jump if !(rawr < rawr)", F_RAWR, F_RAWK_D),
-    ROW_RAW_CMP_JUMP(OP_RAW_LTE_REAL_JUMP_IF_FALSE, "jump if !(rawr <= rawr)", F_RAWR, F_RAWK_D),
-    ROW_RAW_CMP_JUMP(OP_RAW_EQ_INT_JUMP_IF_FALSE, "jump if !(rawi == rawi)", F_RAWI, F_RAWK_I),
-    ROW_RAW_CMP_JUMP(OP_RAW_NEQ_INT_JUMP_IF_FALSE, "jump if !(rawi != rawi)", F_RAWI, F_RAWK_I),
-    ROW_RAW_CMP_JUMP(OP_RAW_EQ_REAL_JUMP_IF_FALSE, "jump if !(rawr == rawr)", F_RAWR, F_RAWK_D),
-    ROW_RAW_CMP_JUMP(OP_RAW_NEQ_REAL_JUMP_IF_FALSE, "jump if !(rawr != rawr)", F_RAWR, F_RAWK_D),
-
-    ROW(OP_INDEX_GET_RAW_INT, "rawi = arr[rk] (checked)", {AT_A, F_RAWI}, {AT_B, F_REG},
-        {AT_C, F_RK8}),
-    ROW(OP_INDEX_SET_RAW_INT, "arr[rk] = rawi (checked)", {AT_A, F_REG}, {AT_B, F_RK8},
-        {AT_C, F_RAWI}),
-    ROW(OP_INDEX_SET_RAW_REAL, "arr[rk] = rawr (checked)", {AT_A, F_REG}, {AT_B, F_RK8},
-        {AT_C, F_RAWR}),
-    ROW(OP_INDEX_GET_RAW_REAL, "rawr = arr[rk] (checked)", {AT_A, F_RAWR}, {AT_B, F_REG},
-        {AT_C, F_RK8}),
-    ROW(OP_INDEX_COMPOUND_RAW_INT, "fused: arr[rk] OP= rawi (checked)", {AT_A, F_REG},
-        {AT_B, F_BINOP}, {AT_C, F_RK8}, {AT_W1, F_RAWI}),
-    ROW(OP_INDEX_COMPOUND_RAW_REAL, "fused: arr[rk] OP= rawr (checked)", {AT_A, F_REG},
-        {AT_B, F_BINOP}, {AT_C, F_RK8}, {AT_W1, F_RAWR}),
-    ROW(OP_CALL_SELF, "recursive call into this same specialized body", {AT_A, F_REG},
-        {AT_B, F_REG}, {AT_C, F_COUNT}),
-    ROW(OP_TAIL_CALL_SELF, "tail call into this same specialized body, reuses this frame",
-        {AT_A, F_REG}, {AT_B, F_REG}, {AT_C, F_COUNT}),
-    ROW(OP_RAW_MATH_REAL, "rawr = math fn(rawr), never boxed", {AT_A, F_RAWR}, {AT_B, F_RAWR},
-        {AT_C, F_FN_ID}),
-    ROW(OP_RAW_INT_TO_REAL, "rawr = (real)rawi", {AT_A, F_RAWR}, {AT_B, F_RAWI}),
-    ROW(OP_RAW_REAL_TO_INT, "rawi = (int)rawr, truncating", {AT_A, F_RAWI}, {AT_B, F_RAWR}),
+#include "opcodes.def"
 };
+#undef OPCODE
 
 #define AER_NAME_OF_MODULE(id, str, call) str,
 static const char* const module_names[] = {AER_NATIVE_MODULES(AER_NAME_OF_MODULE) "dynamic"};
@@ -474,7 +203,7 @@ static unsigned int instruction_words(Chunk* c, unsigned int offset) {
     const OpInfo* info = op_row(op);
     if (!info)
         return 1;
-    if (info->variable) {
+    if (info->ops[0].fld == F_VARIABLE) {
         if (op == OP_INTERP)
             return 1 + OPERAND_B(w0);
         if (op == OP_INDEX_GET_INTERP)
@@ -611,7 +340,7 @@ static unsigned int disassemble_one(Chunk* c, unsigned int offset, FILE* out) {
        exceeds it. */
     fprintf(out, "%6u  %-47s  %s", offset, opcode_name(op), info->desc);
 
-    if (info->variable)
+    if (info->ops[0].fld == F_VARIABLE)
         print_variable_operands(out, c, offset, op);
     else
         for (int i = 0; i < MAX_OPERANDS && info->ops[i].fld != F_END; i++)

@@ -2798,22 +2798,6 @@ __attribute__((used, noinline)) static void aer_layout_pad_fn(void) {
    can spend unbounded time), not on every DISPATCH(), so the check costs nothing on the common
    unlimited path and stays cheap even when a budget is active. See aer_scheduler.c for the caller
    that actually uses a nonzero budget. */
-/* Opcodes that legitimately have no dispatch label: OP_AND/OP_OR/OP_PIPE are parser tags (&&, ||
-   and |> compile to jumps and desugared calls), and the four unary ops only ever appear as
-   OP_UNARY's operand tag. Anything else missing an entry is a bug -- see vm_run_slice. */
-static bool opcode_is_tag_only(Opcode op) {
-    switch (op) {
-        case OP_AND:
-        case OP_OR:
-        case OP_PIPE:
-        case OP_NEGATE:
-        case OP_NOT:
-        case OP_BITWISE_NOT:
-        case OP_TO_STR: return true;
-        default: return false;
-    }
-}
-
 /* Every opcode is its own function, tail-calling the next. That makes the handler the unit the
    compiler allocates registers for and the unit perf reports, rather than one body whose live
    ranges span 150 blocks. The four parameters are the only values measured to earn a register;
@@ -5571,175 +5555,14 @@ static VmSliceResult h_halt(VM* vm, const uint32_t* pc, AerVal* registers, Chunk
 #undef AER_PROFILE_HIT
 #undef const_pool
 
+/* A parser tag's slot stays NULL: no instruction ever carries it. */
+#define h_none NULL
+#define OPCODE(name, handler, ...) [OP_##name] = h_##handler,
 static const OpHandler aer_handlers[256] = {
-        /* Unary ops have no entries -- only ever embedded as a tag inside OP_UNARY. OP_ADD..OP_IN ARE
-           real top-level dispatch targets (true single-level dispatch, PACK_BINARY). */
-        [OP_ADD] = h_add,
-        [OP_SUB] = h_sub,
-        [OP_MUL] = h_mul,
-        [OP_DIV] = h_div,
-        [OP_MOD] = h_mod,
-        [OP_FLOOR_DIV] = h_floor_div,
-        [OP_EQ] = h_eq,
-        [OP_NEQ] = h_neq,
-        [OP_LT] = h_lt,
-        [OP_GT] = h_gt,
-        [OP_LTE] = h_lte,
-        [OP_GTE] = h_gte,
-        [OP_IN] = h_in,
-        [OP_BITWISE_AND] = h_bitwise_and,
-        [OP_BITWISE_OR] = h_bitwise_or,
-        [OP_BITWISE_XOR] = h_bitwise_xor,
-        [OP_LSHIFT] = h_lshift,
-        [OP_RSHIFT] = h_rshift,
-        [OP_JUMP] = h_jump,
-        [OP_DEFINE_STRUCT] = h_define_struct,
-        [OP_HALT] = h_halt,
-        [OP_LOADK] = h_loadk,
-        [OP_MOVE] = h_move,
-        [OP_IS_RESULT] = h_is_result,
-        [OP_JUMP_IF_FALSE_REG] = h_jump_if_false_reg,
-        [OP_CALL] = h_call,
-        [OP_CALL_VALUE] = h_call_value,
-        [OP_TAIL_CALL] = h_tail_call,
-        [OP_TAIL_CALL_VALUE] = h_call_value,
-        [OP_CALL_MODULE] = h_call_module,
-        [OP_CALL_BUILTIN] = h_call_builtin,
-        [OP_RETURN] = h_return,
-        [OP_ARRAY_NEW] = h_array_new,
-        [OP_INDEX_GET] = h_index_get,
-        [OP_INDEX_SET] = h_index_set,
-        [OP_TYPED_INDEX_GET_UNCHECKED] = h_typed_index_get_unchecked,
-        [OP_TYPED_INDEX_SET_UNCHECKED] = h_typed_index_set_unchecked,
-        [OP_INDEX_GET_RAW_INT] = h_index_get_raw_int,
-        [OP_INDEX_SET_RAW_INT] = h_index_set_raw_int,
-        [OP_INDEX_SET_RAW_REAL] = h_index_set_raw_real,
-        [OP_INDEX_GET_RAW_REAL] = h_index_get_raw_real,
-        [OP_INDEX_COMPOUND_RAW_INT] = h_index_compound_raw_int,
-        [OP_INDEX_COMPOUND_RAW_REAL] = h_index_compound_raw_real,
-        [OP_CALL_SELF] = h_call_self,
-        [OP_TAIL_CALL_SELF] = h_tail_call_self,
-        [OP_RAW_MATH_REAL] = h_raw_math_real,
-        [OP_RAW_INT_TO_REAL] = h_raw_int_to_real,
-        [OP_RAW_REAL_TO_INT] = h_raw_real_to_int,
-        [OP_DESTRUCTURE] = h_destructure,
-        [OP_SLICE_GET] = h_slice_get,
-        [OP_DICT_NEW] = h_dict_new,
-        [OP_ITER_NEXT_ARRAY] = h_iter_next_array,
-        [OP_ITER_NEXT_PAIR] = h_iter_next_pair,
-        [OP_ITER_RANGE_PREP] = h_iter_range_prep,
-        [OP_ITER_RANGE_LOOP] = h_iter_range_loop,
-        [OP_STRUCT_NEW] = h_struct_new,
-        [OP_FIELD_GET] = h_field_get,
-        [OP_FIELD_SET] = h_field_set,
-        [OP_ARRAY_REPEAT] = h_array_repeat,
-        [OP_INDEX_FIELD_GET] = h_index_field_get,
-        [OP_INDEX_FIELD_SET] = h_index_field_set,
-        [OP_INDEX_FIELD_COMPOUND] = h_index_field_compound,
-        [OP_UNARY] = h_unary,
-        [OP_CAST] = h_cast,
-        [OP_FIELD_BINARY] = h_field_binary,
-        [OP_FIELD_COMPOUND] = h_field_compound,
-        [OP_INDEX_COMPOUND] = h_index_compound,
-        [OP_TYPED_ARRAY_CHAIN2] = h_typed_array_chain2,
-        [OP_PRINT_REPL] = h_print_repl,
-
-        /* Raw-arithmetic family -- see the h_raw_* labels below for why no vm_rk_ptr8/tag-check
-           is needed. */
-        [OP_RAW_LOAD_INT] = h_raw_load_int,
-        [OP_RAW_LOAD_REAL] = h_raw_load_real,
-        [OP_RAW_ADD_INT] = h_raw_add_int,
-        [OP_RAW_SUB_INT] = h_raw_sub_int,
-        [OP_RAW_ADD_INT_K] = h_raw_add_int_k,
-        [OP_RAW_SUB_INT_K] = h_raw_sub_int_k,
-        [OP_RAW_MUL_INT] = h_raw_mul_int,
-        [OP_RAW_DIV_INT] = h_raw_div_int,
-        [OP_RAW_MOD_INT] = h_raw_mod_int,
-        [OP_RAW_FLOOR_DIV_INT] = h_raw_floor_div_int,
-        [OP_RAW_ADD_REAL] = h_raw_add_real,
-        [OP_RAW_SUB_REAL] = h_raw_sub_real,
-        [OP_RAW_MUL_REAL] = h_raw_mul_real,
-        [OP_RAW_DIV_REAL] = h_raw_div_real,
-        [OP_RAW_FMA_REAL] = h_raw_fma_real,
-        [OP_RAW_FMS_REAL] = h_raw_fms_real,
-        [OP_RAW_LT_INT] = h_raw_lt_int,
-        [OP_RAW_LTE_INT] = h_raw_lte_int,
-        [OP_RAW_LT_REAL] = h_raw_lt_real,
-        [OP_RAW_LTE_REAL] = h_raw_lte_real,
-        [OP_RAW_EQ_INT] = h_raw_eq_int,
-        [OP_RAW_NEQ_INT] = h_raw_neq_int,
-        [OP_RAW_EQ_REAL] = h_raw_eq_real,
-        [OP_RAW_NEQ_REAL] = h_raw_neq_real,
-        [OP_UNBOX_INT] = h_unbox_int,
-        [OP_UNBOX_REAL] = h_unbox_real,
-        [OP_RAW_MOVE_INT] = h_raw_move_int,
-        [OP_RAW_MOVE_REAL] = h_raw_move_real,
-        [OP_RAW_LOAD_INT_POOL] = h_raw_load_int_pool,
-
-        [OP_INDEX_FIELD_GET_RAW_INT] = h_index_field_get_raw_int,
-        [OP_INDEX_FIELD_GET_RAW_REAL] = h_index_field_get_raw_real,
-        [OP_FIELD_GET_RAW_INT] = h_field_get_raw_int,
-        [OP_FIELD_GET_RAW_REAL] = h_field_get_raw_real,
-        [OP_INDEX_FIELD_SET_RAW_INT] = h_index_field_set_raw_int,
-        [OP_INDEX_FIELD_SET_RAW_REAL] = h_index_field_set_raw_real,
-        [OP_FIELD_SET_RAW_INT] = h_field_set_raw_int,
-        [OP_FIELD_SET_RAW_REAL] = h_field_set_raw_real,
-        [OP_FIELD_COMPOUND_RAW_INT] = h_field_compound_raw_int,
-        [OP_FIELD_COMPOUND_RAW_REAL] = h_field_compound_raw_real,
-        [OP_INDEX_FIELD_COMPOUND_RAW_INT] = h_index_field_compound_raw_int,
-        [OP_INDEX_FIELD_COMPOUND_RAW_REAL] = h_index_field_compound_raw_real,
-
-        [OP_INDEX_FIELD_GET_RAW_INT_UNCHECKED] = h_index_field_get_raw_int_unchecked,
-        [OP_INDEX_FIELD_GET_RAW_REAL_UNCHECKED] = h_index_field_get_raw_real_unchecked,
-        [OP_INDEX_FIELD_SET_RAW_INT_UNCHECKED] = h_index_field_set_raw_int_unchecked,
-        [OP_INDEX_FIELD_SET_RAW_REAL_UNCHECKED] = h_index_field_set_raw_real_unchecked,
-        [OP_INDEX_FIELD_COMPOUND_RAW_INT_UNCHECKED] = h_index_field_compound_raw_int_unchecked,
-        [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED] = h_index_field_compound_raw_real_unchecked,
-
-        [OP_INDEX_FIELD_GET_RAW_INT32] = h_index_field_get_raw_int32,
-        [OP_INDEX_FIELD_GET_RAW_FLOAT32] = h_index_field_get_raw_float32,
-        [OP_FIELD_GET_RAW_INT32] = h_field_get_raw_int32,
-        [OP_FIELD_GET_RAW_FLOAT32] = h_field_get_raw_float32,
-        [OP_INDEX_FIELD_SET_RAW_INT32] = h_index_field_set_raw_int32,
-        [OP_INDEX_FIELD_SET_RAW_FLOAT32] = h_index_field_set_raw_float32,
-        [OP_FIELD_SET_RAW_INT32] = h_field_set_raw_int32,
-        [OP_FIELD_SET_RAW_FLOAT32] = h_field_set_raw_float32,
-        [OP_FIELD_COMPOUND_RAW_INT32] = h_field_compound_raw_int32,
-        [OP_FIELD_COMPOUND_RAW_FLOAT32] = h_field_compound_raw_float32,
-        [OP_INDEX_FIELD_COMPOUND_RAW_INT32] = h_index_field_compound_raw_int32,
-        [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32] = h_index_field_compound_raw_float32,
-
-        [OP_INDEX_FIELD_GET_RAW_INT32_UNCHECKED] = h_index_field_get_raw_int32_unchecked,
-        [OP_INDEX_FIELD_GET_RAW_FLOAT32_UNCHECKED] = h_index_field_get_raw_float32_unchecked,
-        [OP_INDEX_FIELD_SET_RAW_INT32_UNCHECKED] = h_index_field_set_raw_int32_unchecked,
-        [OP_INDEX_FIELD_SET_RAW_FLOAT32_UNCHECKED] = h_index_field_set_raw_float32_unchecked,
-        [OP_INDEX_FIELD_COMPOUND_RAW_INT32_UNCHECKED] = h_index_field_compound_raw_int32_unchecked,
-        [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED] = h_index_field_compound_raw_float32_unchecked,
-        [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_ADD] = h_index_field_compound_raw_real_unchecked_add,
-        [OP_INDEX_FIELD_COMPOUND_RAW_FLOAT32_UNCHECKED_ADD] = h_index_field_compound_raw_float32_unchecked_add,
-        [OP_FIELD_COMPOUND_RAW_FLOAT32_FMA] = h_field_compound_raw_float32_fma,
-        [OP_INDEX_FIELD_COMPOUND_RAW_REAL_UNCHECKED_FMA] =
-            h_index_field_compound_raw_real_unchecked_fma,
-
-        [OP_EQ_JUMP_IF_FALSE] = h_eq_jump_if_false,
-        [OP_NEQ_JUMP_IF_FALSE] = h_neq_jump_if_false,
-        [OP_LT_JUMP_IF_FALSE] = h_lt_jump_if_false,
-        [OP_GT_JUMP_IF_FALSE] = h_gt_jump_if_false,
-        [OP_LTE_JUMP_IF_FALSE] = h_lte_jump_if_false,
-        [OP_GTE_JUMP_IF_FALSE] = h_gte_jump_if_false,
-
-        [OP_RAW_LT_INT_JUMP_IF_FALSE] = h_raw_lt_int_jump_if_false,
-        [OP_RAW_LTE_INT_JUMP_IF_FALSE] = h_raw_lte_int_jump_if_false,
-        [OP_RAW_LT_REAL_JUMP_IF_FALSE] = h_raw_lt_real_jump_if_false,
-        [OP_RAW_LTE_REAL_JUMP_IF_FALSE] = h_raw_lte_real_jump_if_false,
-        [OP_RAW_INC_LTE_INT_JUMP_IF_FALSE] = h_raw_inc_lte_int_jump_if_false,
-        [OP_RAW_EQ_INT_JUMP_IF_FALSE] = h_raw_eq_int_jump_if_false,
-        [OP_RAW_NEQ_INT_JUMP_IF_FALSE] = h_raw_neq_int_jump_if_false,
-        [OP_RAW_EQ_REAL_JUMP_IF_FALSE] = h_raw_eq_real_jump_if_false,
-        [OP_RAW_NEQ_REAL_JUMP_IF_FALSE] = h_raw_neq_real_jump_if_false,
-        [OP_INTERP] = h_interp,
-        [OP_INDEX_GET_INTERP] = h_index_get_interp,
+#include "opcodes.def"
 };
+#undef OPCODE
+#undef h_none
 
 VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     Chunk* c = vm->chunk;
@@ -5784,20 +5607,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions) {
     vm->slice_budget = max_instructions;
     chunk_ensure_debug_hits(c);
     chunk_ensure_field_cache(c);
-
-    /* A designated-initializer table leaves an opcode with no entry as NULL, so emitting one calls
-       through a null pointer instead of failing near the mistake -- OP_BINARY sat in the enum in
-       exactly that state. Once per process, not per call. */
-    static bool dispatch_table_checked = false;
-    if (!dispatch_table_checked) {
-        dispatch_table_checked = true;
-        for (int op = 0; op < (int)OP_OPCODE_COUNT_MARKER; op++) {
-            if (aer_handlers[op] == NULL && !opcode_is_tag_only((Opcode)op)) {
-                fprintf(stderr, "aer: internal error: opcode %d has no handler\n", op);
-                abort();
-            }
-        }
-    }
 
     /* An ordinary call, not a tail call: this frame owns catch_point, so it has to outlive the
        whole chain -- every handler longjmps back here. */

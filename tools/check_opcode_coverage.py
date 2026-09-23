@@ -35,14 +35,12 @@ NEVER_EMITTED = {"OP_AND", "OP_OR", "OP_PIPE", "OP_PRINT_REPL"}
 
 
 def declared_opcodes():
-    """Every name in the Opcode enum, in vm.h, excluding the count marker."""
-    src = open(os.path.join(ROOT, "source", "core", "vm.h"), encoding="utf-8").read()
-    m = re.search(r'typedef enum \{(.*?)\} Opcode;', src, re.S)
-    if not m:
-        sys.exit("could not find the Opcode enum in source/core/vm.h")
-    body = re.sub(r'/\*.*?\*/', '', m.group(1), flags=re.S)
-    names = re.findall(r'\b(OP_[A-Z0-9_]+)\b', body)
-    return {n for n in names if n != "OP_OPCODE_COUNT_MARKER"}
+    """Every opcode row in source/core/opcodes.def."""
+    src = open(os.path.join(ROOT, "source", "core", "opcodes.def"), encoding="utf-8").read()
+    names = re.findall(r"^OPCODE\(([A-Z0-9_]+),", src, re.M)
+    if not names:
+        sys.exit("could not find any OPCODE rows in source/core/opcodes.def")
+    return {"OP_" + n for n in names}
 
 
 def emitted_opcodes(binary, programs):

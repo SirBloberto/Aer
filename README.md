@@ -2212,6 +2212,7 @@ allowlisting, neither of which exist today.
 | `source/compiler/lexer.h/c` | Source text → token stream, indent/dedent tracking |
 | `source/compiler/parser.h/c` | Single-pass compiler: tokens → register-based bytecode, escape processing |
 | `source/core/vm.h/c` | Bytecode chunk, register-based VM (`CallFrame`/bump-pointer register stack), struct-type registry, computed-goto dispatch loop, built-ins |
+| `source/core/opcodes.def` | Every opcode, one row each: name, handler, which slot fields are stored doubled, description and operand layout. The `Opcode` enum, the dispatch table and the disassembler's table are all generated from it |
 | `source/core/chunk.c` | Bytecode chunk: code, line table, constant pool, and the function, struct-shape and import tables |
 | `source/core/gc.c` | Generational mark-sweep collector: root marking, write barrier, remembered set, card scan |
 | `source/core/heap_ref.c` | Which VM's heap is active, for allocations with no VM in scope |

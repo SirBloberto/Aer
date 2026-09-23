@@ -38,7 +38,7 @@ def main():
     args = ap.parse_args()
 
     rows, total_c, total_n = [], 0, 0
-    for pattern in ("source/**/*.c", "source/**/*.h"):
+    for pattern in ("source/**/*.c", "source/**/*.h", "source/**/*.def"):
         for path in glob.glob(pattern, recursive=True):
             c, n = count(path)
             rows.append((c, n, path.replace(os.sep, "/")))

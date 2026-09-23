@@ -82,7 +82,7 @@ OBJECT := $(patsubst source/%.c,object/%.o,$(SOURCE))
 # Deliberately coarse: any header edit rebuilds everything. -MMD/-MP was tried and genuinely does
 # not work under GNU Make on MSYS2, and a stale .o with a mismatched struct layout links cleanly
 # and misbehaves silently at runtime.
-HEADERS := $(wildcard include/*.h source/*.h source/compiler/*.h source/core/*.h source/debug/*.h source/repl/*.h source/runtime/*.h source/stdlib/*.h source/utilities/*.h)
+HEADERS := $(wildcard include/*.h source/*.h source/compiler/*.h source/core/*.h source/core/*.def source/debug/*.h source/repl/*.h source/runtime/*.h source/stdlib/*.h source/utilities/*.h)
 
 # Everything except main.c — conflicts with test-embed's/test-smoke's own main().
 LIBOBJECT := $(filter-out object/main.o,$(OBJECT))

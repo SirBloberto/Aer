@@ -56,7 +56,7 @@ def all_sources():
     for top in SCAN:
         for dirpath, _, names in os.walk(os.path.join(ROOT, top)):
             for name in sorted(names):
-                if name.endswith((".c", ".h")):
+                if name.endswith((".c", ".h", ".def")):
                     path = os.path.join(dirpath, name)
                     yield os.path.relpath(path, ROOT).replace(os.sep, "/"), path
 
@@ -101,7 +101,7 @@ def scan(max_block):
     for top in SCAN:
         for dirpath, _, names in os.walk(os.path.join(ROOT, top)):
             for name in names:
-                if not name.endswith((".c", ".h")):
+                if not name.endswith((".c", ".h", ".def")):
                     continue
                 path = os.path.join(dirpath, name)
                 rel = os.path.relpath(path, ROOT).replace(os.sep, "/")
@@ -112,20 +112,16 @@ def scan(max_block):
 
 
 def dangling_enum_comments():
-    """A comment block inside the Opcode enum that is followed by ANOTHER comment rather than by an
-    opcode. That is what a deleted opcode leaves behind: the enum entry goes, the paragraph
-    explaining it stays, and it then reads as documentation for whichever opcode follows. Three of
-    these had accumulated in vm.h, one describing an opcode removed the same day."""
-    path = os.path.join(ROOT, "source", "core", "vm.h")
+    """A comment block in opcodes.def followed by ANOTHER comment rather than by an opcode row. That
+    is what a deleted opcode leaves behind: the row goes, the paragraph explaining it stays, and it
+    then reads as documentation for whichever opcode follows. Three of these had accumulated when the
+    opcodes were still an enum in vm.h, one describing an opcode removed the same day. The file's own
+    header block is exempt."""
+    path = os.path.join(ROOT, "source", "core", "opcodes.def")
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as fh:
-        text = fh.read()
-    if "} Opcode;" not in text or "typedef enum {" not in text:
-        return []
-    head = text[: text.index("} Opcode;")]
-    offset = text[: head.index("typedef enum {")].count("\n")
-    lines = head[head.index("typedef enum {"):].splitlines()
+        lines = fh.read().splitlines()
 
     out = []
     i = 0
@@ -140,8 +136,8 @@ def dangling_enum_comments():
         j = i
         while j < len(lines) and not lines[j].strip():
             j += 1
-        if j < len(lines) and lines[j].strip().startswith("/*"):
-            out.append((offset + start + 1, lines[start].strip()[:70]))
+        if start > 0 and j < len(lines) and lines[j].strip().startswith("/*"):
+            out.append((start + 1, lines[start].strip()[:70]))
     return out
 
 
@@ -264,9 +260,9 @@ def main():
 
     stale = dangling_enum_comments()
     if stale:
-        print("Comment blocks in the Opcode enum that document no opcode:\n")
+        print("Comment blocks in opcodes.def that document no opcode:\n")
         for line, text in stale:
-            print("  source/core/vm.h:%d  %s" % (line, text))
+            print("  source/core/opcodes.def:%d  %s" % (line, text))
         print("\nAn opcode was deleted and its paragraph stayed. Delete it, or attach it to the")
         print("opcode it actually describes.")
         return 1
