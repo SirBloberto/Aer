@@ -6,15 +6,9 @@
 #include "heap.h"
 #include "pool.h"
 #include "strbuf.h"
+#include "opcodes.h"
 #include "value.h"
-
-typedef enum {
-#define OPCODE(name, ...) OP_##name,
-#include "opcodes.def"
-#undef OPCODE
-    OP_OPCODE_COUNT_MARKER /* not a real opcode -- sizes the static assert below */
-} Opcode;
-_Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — widen the opcode field");
+#include "value_format.h"
 
 /* Set = constant-pool index, clear = register (Lua's BITRK convention). Parser-internal: every
    emission site converts it to one of the wire encodings below. */
@@ -285,7 +279,7 @@ typedef struct {
     SpecEntry* last_entry;
 } CallSpecCacheEntry;
 
-typedef struct {
+typedef struct Chunk {
     uint32_t* code;
     unsigned int count, capacity;
 
@@ -415,7 +409,7 @@ static inline unsigned int frame_ref_slots(CallFrame* frame, AerVal** out_slots)
 _Static_assert((sizeof(CallFrame) & (sizeof(CallFrame) - 1)) == 0,
                "CallFrame must stay a power of two -- see CALL_FRAME_PAD");
 
-typedef struct {
+typedef struct VM {
     /* First, with call_stack beside it. A Thumb-2 `ldr` reaches a 12-bit displacement, so a field
        past 4095 bytes needs its offset materialized into a register first. Nothing mirrors the
        active frame's registers here: mark_vm_roots scans call_stack[f].registers directly, so a
@@ -500,28 +494,6 @@ void chunk_mark_line(Chunk* c, unsigned int offset, unsigned int line);
 
 /* The line whose statement contains `offset`, or 0 if there are no marks yet. */
 unsigned int chunk_line_for_offset(Chunk* c, unsigned int offset);
-
-/* Formats a real guaranteeing a decimal point/exponent/nan-inf marker survives -- bare "%g"
-   prints 42.0 as "42", which flips to integer through the JSON round-trip. The one shared site
-   (vm.c, aer_json.c, disasm.c). */
-unsigned int aer_format_real(double d, char* buf, size_t bufsize);
-
-/* Fast snprintf("%lld", ...) replacement -- see its own comment, value_format.c. */
-unsigned int aer_format_int(long long v, char* buf, size_t bufsize);
-
-/* The text of a value that renders without allocating -- null, integer, real, boolean, function -- using
-   scratch for numbers; false for strings and collections. print(), interpolation and interpolated dict
-   keys all render scalars through it, so a key cannot read back differently from how it was written. */
-bool aer_format_scalar(AerVal v, char* scratch, size_t size, const char** text, unsigned int* len);
-
-/* The spelling of each ValueType up to TYPE_DICT, and of each typed-array element kind. */
-extern const char* const aer_value_type_names[TYPE_STRUCT];
-extern const char* const aer_typed_elem_names[TYPED_ELEM_BOOL + 1];
-
-/* Shared recursive rendering (value_format.c) behind print() and vm_to_str() (interpolation, +,
-   etc.) -- one consistent representation, not a terse "<array[3]>" fallback. */
-void vm_format_value(Chunk* c, AerVal v, bool in_collection, StrBuf* sb);
-void vm_print_value(Chunk* c, AerVal v, bool in_collection);
 
 unsigned int chunk_add_pool(Chunk* c, AerVal v);
 
@@ -614,9 +586,6 @@ void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value);
 /* Called from vm.c's gc_maybe_collect once the threshold is actually crossed. gc_maybe_collect runs
    at hand-placed points in the allocating opcodes, not on every dispatch. */
 void gc_run_collection_cycle(VM* vm);
-
-/* Structural/reference equality, no error path -- the same scan OP_IN's array case uses. */
-bool values_equal(AerVal a, AerVal b);
 
 /* Must come from function_pool (pool_mark's slab lookup fails on xmalloc'd cells); returns
    uninitialized memory -- zero it yourself. */

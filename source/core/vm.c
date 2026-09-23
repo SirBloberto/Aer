@@ -354,27 +354,6 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
 
 /* Type helpers                                                         */
 
-/* A struct reports its declared name, a packed array that name plus "[]". */
-static const char* vm_type_name(Chunk* c, AerVal v) {
-    if (aer_type(v) == TYPE_STRUCT)
-        return aer_as_string(c->pool[aer_as_struct(v)->shape->name])->data;
-    if (aer_type(v) == TYPE_PACKED_ARRAY) {
-        /* static buf is safe only because every caller consumes the result immediately. */
-        AerPackedArray* pa = aer_as_packed_array(v);
-        static char buf[128];
-        snprintf(buf, sizeof(buf), "%s[]", aer_as_string(c->pool[pa->shape->name])->data);
-        return buf;
-    }
-    if (aer_type(v) == TYPE_TYPED_ARRAY) {
-        static char buf[32];
-        snprintf(buf, sizeof(buf), "%s[]", aer_typed_elem_names[aer_as_typed_array(v)->elem_kind]);
-        return buf;
-    }
-    if (aer_type(v) == TYPE_RESULT)
-        return "Result";
-    return aer_value_type_names[aer_type(v)];
-}
-
 static inline __attribute__((always_inline)) bool vm_truthy(AerVal v) {
     switch (aer_type(v)) {
         case TYPE_NULL: return false;
@@ -550,27 +529,6 @@ static AerVal vm_in(AerVal a, AerVal b) {
     return aer_bool(false);
 }
 
-/* Only used to name the operator in a type-mismatch message -- never on a path that already has
-   its own more specific error (e.g. 'in' has vm_in()'s own messages above). */
-static const char* binop_symbol(Opcode op) {
-    switch (op) {
-        case OP_ADD: return "+";
-        case OP_SUB: return "-";
-        case OP_MUL: return "*";
-        case OP_DIV: return "/";
-        case OP_FLOOR_DIV: return "//";
-        case OP_MOD: return "%";
-        case OP_EQ: return "==";
-        case OP_NEQ: return "!=";
-        case OP_LT: return "<";
-        case OP_GT: return ">";
-        case OP_LTE: return "<=";
-        case OP_GTE: return ">=";
-        case OP_IN: return "in";
-        default: return "that operator";
-    }
-}
-
 /* Defined below vm_typed_elem_width/read/write, which it needs; forward-declared here since
    vm_binary_cold (this function) is defined first in the file. */
 static AerVal vm_typed_array_binary_op(AerTypedArray* ta, AerTypedArray* tb, Opcode op);
@@ -738,27 +696,6 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
 
     error("Cannot apply '%s' to %s and %s", binop_symbol(op), vm_type_name(c, a), vm_type_name(c, b));
     return aer_bool(false);
-}
-
-/* Value stringification                                            */
-
-static AerVal vm_to_str(VM* vm, AerVal v) {
-    if (aer_type(v) == TYPE_STRING)
-        return v;
-
-    char buf[64];
-    const char* text;
-    unsigned int len;
-    /* Not interned: a runtime string is used once, and interning would grow the pool forever -- 7x
-       slower for 100k unique casts than for 10 distinct ones. */
-    if (aer_format_scalar(v, buf, sizeof(buf), &text, &len))
-        return aer_make_string_copy(text, len);
-    /* Recursive content has no bounded size, so this reuses print()'s formatter and hands over its
-       buffer as-is. */
-    StrBuf sb;
-    strbuf_init(&sb);
-    vm_format_value(vm->chunk, v, false, &sb);
-    return aer_make_string(sb.buf, (unsigned int)sb.len);
 }
 
 /* OP_INTERP's builder. A part is rendered into `scratch` only if it isn't already a string;

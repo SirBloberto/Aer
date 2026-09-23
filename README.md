@@ -2215,10 +2215,11 @@ allowlisting, neither of which exist today.
 | `source/compiler/parser.h/c` | Single-pass compiler: tokens → register-based bytecode, escape processing |
 | `source/core/vm.h/c` | Bytecode chunk, register-based VM (`CallFrame`/bump-pointer register stack), struct-type registry, computed-goto dispatch loop, built-ins |
 | `source/core/opcodes.def` | Every opcode, one row each: name, handler, which slot fields are stored doubled, description and operand layout. The `Opcode` enum, the dispatch table and the disassembler's table are all generated from it |
+| `source/core/opcodes.h` | The `Opcode` enum, generated from `opcodes.def`, for code that names opcodes without needing the VM |
 | `source/core/chunk.c` | Bytecode chunk: code, line table, constant pool, and the function, struct-shape and import tables |
 | `source/runtime/gc.c` | Generational mark-sweep collector: root marking, write barrier, remembered set, card scan |
 | `source/runtime/heap_ref.c` | Which VM's heap is active, for allocations with no VM in scope |
-| `source/runtime/value_format.c` | Converting any `AerVal` to text, for `print`, interpolation and `string()` |
+| `source/runtime/value_format.h/c` | Converting any `AerVal` to text, for `print`, interpolation and `string()`; type names and operator symbols for error messages; value equality |
 | `source/debug/disasm.c` | Bytecode disassembler and memory report behind `--debug-path` |
 | `source/stdlib/aer_stdlib.h` | Declares the entire native-module surface (math/random/string/time/json/collection/net/regex/actor/scheduler/io) — one header for a fixed, closed set |
 | `source/stdlib/aer_abi.h` | The standard library's wire identities: module, function and builtin ids, generated from one X-macro table |
