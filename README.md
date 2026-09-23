@@ -1725,7 +1725,7 @@ for this exercised end-to-end, and `source/runtime/aer_host.h` for the full regi
 Build and run the embedding smoke test (a minimal, complete example of everything above,
 including the deliberate-error and VM-reuse cases) with `make test-embed`.
 
-**`aer_io_register()`** (`source/stdlib/aer_io.h`) is the same registration mechanism applied to an
+**`aer_io_register()`** (declared in `source/stdlib/aer_stdlib.h`) is the same registration mechanism applied to an
 AER-provided (not host-defined) capability — see [File I/O](#file-io--io). Unlike a host's own
 custom functions, `vm_init()` calls this one itself, once per process, so every host's scripts get
 file access automatically — there's nothing for an embedding host to opt into or out of here.
@@ -2226,19 +2226,27 @@ allowlisting, neither of which exist today.
 | `source/compiler/lexer.h/c` | Source text → token stream, indent/dedent tracking |
 | `source/compiler/parser.h/c` | Single-pass compiler: tokens → register-based bytecode, escape processing |
 | `source/core/vm.h/c` | Bytecode chunk, register-based VM (`CallFrame`/bump-pointer register stack), struct-type registry, computed-goto dispatch loop, built-ins |
+| `source/core/chunk.c` | Bytecode chunk: code, line table, constant pool, and the function, struct-shape and import tables |
+| `source/core/gc.c` | Generational mark-sweep collector: root marking, write barrier, remembered set, card scan |
+| `source/core/heap_ref.c` | Which VM's heap is active, for allocations with no VM in scope |
+| `source/core/value_format.c` | Converting any `AerVal` to text, for `print`, interpolation and `string()` |
+| `source/debug/disasm.c` | Bytecode disassembler and memory report behind `--debug-path` |
 | `source/stdlib/aer_stdlib.h` | Declares the entire native-module surface (math/random/string/time/json/collection/net/regex/actor/scheduler/io) — one header for a fixed, closed set |
+| `source/stdlib/aer_abi.h` | The standard library's wire identities: module, function and builtin ids, generated from one X-macro table |
 | `source/stdlib/aer_stdlib.c` | `aer_stdlib_is_native_module()` — the hardcoded module names `import` accepts |
 | `source/stdlib/aer_math.c` / `aer_random.c` / `aer_string.c` / `aer_time.c` / `aer_collection.c` / `aer_net.c` / `aer_regex.c` | One file per hardcoded native module, dispatched by `vm.c`'s `OP_CALL_MODULE` switch |
 | `source/stdlib/aer_json.c` | `json` module — encode/decode, dispatched the same way as the modules above |
-| `source/stdlib/aer_actor_module.c` / `aer_scheduler_module.c` | Script-facing `actor`/`scheduler` modules — thin shims translating `AerVal` args to `aer_actor.c`/`aer_scheduler.c`'s own C signatures |
 | `source/stdlib/aer_io.c` | `io` module (file open/read/write/close) — registered via the generic host-function mechanism (`aer_register_function`), but called by `vm_init()` itself, so it's just as unconditionally available as the hardcoded modules above |
 | `source/runtime/aer_module.h/c` | File-based `import` — resolution, isolated per-file `Chunk`/`VM`, cross-VM call trampoline; `aer_vm_instantiate_from_file()` is the shared "spin up an independent VM+Chunk and run its top-level code once" primitive this and `aer_actor.c` both use |
-| `source/stdlib/aer_actor.h/c` | Independent long-lived VMs plus a host-side byte-string mailbox — spawn/call/send/receive, reachable from AER scripts via the `actor` module — see [Concurrency](#concurrency) |
-| `source/stdlib/aer_scheduler.h/c` | Cooperative round-robin scheduler over already-spawned actors, driving each queued task in bounded `vm_run_slice()` instruction budgets instead of to completion — see [Concurrency](#concurrency) |
+| `source/stdlib/aer_actor.h/c` | Independent long-lived VMs plus a host-side byte-string mailbox — spawn/call/send/receive, reachable from AER scripts via the `actor` module (whose script-facing entry point, like the `scheduler` module's, sits at the end of the same file) — see [Concurrency](#concurrency) |
+| `source/stdlib/aer_scheduler.c` | Cooperative round-robin scheduler over already-spawned actors, driving each queued task in bounded `vm_run_slice()` instruction budgets instead of to completion — see [Concurrency](#concurrency) |
 | `source/runtime/aer_host.h/c` | Host-registered native function registry (`aer_register_function`) — reached from AER the same way as `math`/`random`/`string` |
 | `source/utilities/hashtable.h/c` | FNV-1a open-addressing hash table backing every `AerDict` and `Chunk`'s own string-constant dedup table, with size-classed slab pools for small key/bucket allocations |
 | `source/utilities/pool.h/c` | Slab (bump/arena) allocator extended for the generational mark-sweep garbage collector — every pool-managed struct (`AerString`/`AerArray`/`AerDict`/`AerFunction`/`AerPackedArray`) carries its own one-byte GC state as its literal first field |
 | `source/utilities/error.h/c` | Error reporting with source location and column pointer; recoverable-error sink (callback or stderr), `aer_report_fatal` for genuinely unrecoverable conditions, `assert_failure_count` |
+| `source/utilities/strbuf.h/c` | Growable string buffer shared by value formatting and JSON encoding |
+| `source/utilities/aer_thread.h/c` | Thin threading layer, compiled in only when the scheduler is built to use OS threads |
+| `source/tools/aer_fmt.c` / `aer_lsp.c` | Source formatter and language server (`make fmt-tool`, `make lsp-tool`) |
 | `include/aer.h` | Public embedding API: version constant, error callback/query functions, custom native-function registration (see [Embedding](#embedding)) |
 | `tests/test_*.aer` | Runnable documentation and regression suites — `assert()`-based, exits nonzero on any failure. Run with `make test`. |
 | `examples/` | Standalone, runnable programs meant to be read — see [Practical Applications](#practical-applications) for the full list |

@@ -4331,8 +4331,8 @@ HANDLER(field_set)
 /* Shape-specialized raw field access -- only in a specialized body, where the parser resolved the
    field offset against a proven Shape, so there is no runtime lookup and neither side is boxed.
    The aer_type() check is a safety net: the reg_known_shape[] audit is not proven exhaustive, and a
-   gap should be loud rather than silent corruption. Storage kind stays in the opcode rather than
-   becoming an operand -- see OPTIMIZATION_HISTORY.md for the measurement. */
+   gap should be loud rather than silent corruption. Storage kind stays in the opcode: moving it into
+   an operand measured 1.5-2.2% slower. */
 /* Which storage a specialized field uses. Every handler below passes a literal, so each switch here
    folds to the single load or store that field needs -- the kind never reaches a runtime branch. */
 typedef enum { RAWW_INT, RAWW_REAL, RAWW_INT32, RAWW_FLOAT32 } RawWidth;

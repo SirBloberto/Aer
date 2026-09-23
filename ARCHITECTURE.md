@@ -464,8 +464,7 @@ parser tables have been reset for whatever compiles next.
 
 ## 5. Cross-cutting optimizations: current design and why
 
-Full "what was tried, measured, and reverted" narrative lives in a local, unshipped file
-(`OPTIMIZATION_HISTORY.md`) — this section states the current design and the headline number only.
+This section states the current design and the headline number only.
 
 ### 5.1 Dispatch-loop overhead
 
