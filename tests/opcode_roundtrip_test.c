@@ -69,10 +69,11 @@ int main(void) {
         check(UNPACK_2X16_HI(w) == 0x1234 && UNPACK_2X16_LO(w) == 0x5678, "PACK_2X16: distinct halves don't bleed into each other");
     }
     {
-        /* PACK_OP_A_W16: op(8) + a(8) + w16(16) -- OP_LOADK/OP_FIELD_SET/etc's word0 shape. */
-        uint32_t w = PACK_OP_A_W16(OP_LOADK, 0, 0);
-        check((w & 0xFF) == OP_LOADK && UNPACK_A(w) == 0 && UNPACK_W16(w) == 0, "PACK_OP_A_W16 boundary: all-zero round-trips");
-        w = PACK_OP_A_W16(OP_LOADK, 255, 0xFFFF);
+        /* PACK_OP_A_W16: op(8) + a(8) + w16(16) -- OP_LOADK/OP_FIELD_SET/etc's word0 shape. OP_HALT has
+           no doubled field, so the raw byte comes back unchanged. */
+        uint32_t w = PACK_OP_A_W16(OP_HALT, 0, 0);
+        check((w & 0xFF) == OP_HALT && UNPACK_A(w) == 0 && UNPACK_W16(w) == 0, "PACK_OP_A_W16 boundary: all-zero round-trips");
+        w = PACK_OP_A_W16(OP_HALT, 255, 0xFFFF);
         check(UNPACK_A(w) == 255 && UNPACK_W16(w) == 0xFFFF, "PACK_OP_A_W16 boundary: (255, 0xFFFF) round-trips");
     }
     {
@@ -125,7 +126,8 @@ int main(void) {
         unsigned int p = 0;
         uint32_t w = c.code[p++];
         check((w & 0xFF) == OP_LOADK, "OP_LOADK: opcode byte round-trips");
-        check(UNPACK_A(w) == 127, "OP_LOADK: dest register round-trips at max");
+        check(OPERAND_A(w) == 127, "OP_LOADK: dest register round-trips at max");
+        check(UNPACK_A(w) == 254 && UNPACK_W16(w) == 0xFFFF, "OP_LOADK: dest stored doubled, pool index untouched");
         check(UNPACK_W16(w) == 0xFFFF, "OP_LOADK: pool_idx round-trips at max (16 bits)");
         check(p == c.count, "OP_LOADK: exactly 1 word emitted (was 2 in the old encoding)");
         chunk_free(&c);

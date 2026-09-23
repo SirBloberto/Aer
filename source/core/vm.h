@@ -468,6 +468,11 @@ static inline unsigned op_scaled_fields(Opcode op) {
     case OP_RAW_MOVE_REAL:
     case OP_INDEX_GET_RAW_INT:
     case OP_INDEX_GET_RAW_REAL:
+    case OP_MOVE:
+    case OP_UNBOX_INT:
+    case OP_UNBOX_REAL:
+    case OP_INDEX_GET:
+    case OP_TYPED_INDEX_GET_UNCHECKED:
         return SCALED_A | SCALED_B;
     case OP_RAW_LT_INT_JUMP_IF_FALSE:
     case OP_RAW_LTE_INT_JUMP_IF_FALSE:
@@ -481,7 +486,14 @@ static inline unsigned op_scaled_fields(Opcode op) {
     case OP_RAW_LOAD_INT:
     case OP_RAW_LOAD_REAL:
     case OP_RAW_LOAD_INT_POOL:
+    case OP_LOADK:
+    case OP_JUMP_IF_FALSE_REG:
+    case OP_INDEX_SET:
+    case OP_TYPED_INDEX_SET_UNCHECKED:
         return SCALED_A;
+    case OP_INDEX_SET_RAW_INT:
+    case OP_INDEX_SET_RAW_REAL:
+        return SCALED_A | SCALED_C;
     default:
         return 0;
     }

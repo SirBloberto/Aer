@@ -2958,16 +2958,16 @@ HANDLER(define_struct)
 /* dest+pool_idx both fit in word0 now (op(8)+dest(8)+pool_idx(16)) -- no trailing word needed,
    down from the original design's 2-word form. */
 HANDLER(loadk)
-    int dest = (int)UNPACK_A(op_word);
+    unsigned int dest = UNPACK_A(op_word);
     unsigned int pool_idx = UNPACK_W16(op_word);
-    registers[dest] = c->pool[pool_idx];
+    SCALED_REG(dest) = c->pool[pool_idx];
     DISPATCH();
 }
 
 HANDLER(move)
-    int dest = (int)UNPACK_A(op_word);
-    int src = (int)UNPACK_B(op_word);
-    registers[dest] = registers[src];
+    unsigned int dest = UNPACK_A(op_word);
+    unsigned int src = UNPACK_B(op_word);
+    SCALED_REG(dest) = SCALED_REG(src);
     DISPATCH();
 }
 
@@ -3159,9 +3159,9 @@ HANDLER(in)
 
 /* Control flow -- stack-neutral, reads only registers[]/the pool. */
 HANDLER(jump_if_false_reg)
-    int reg = (int)UNPACK_A(op_word);
+    unsigned int reg = UNPACK_A(op_word);
     int target = READ();
-    if (!vm_truthy(registers[reg]))
+    if (!vm_truthy(SCALED_REG(reg)))
         pc += (int32_t)target;
     DISPATCH();
 }
@@ -3479,10 +3479,10 @@ HANDLER(array_new)
    shaped array, a negative or out-of-range index. Separate because the call is what makes the
    compiler give this opcode a stack frame, and the plain read needs none. */
 __attribute__((cold)) SEPARATE_HANDLER(index_get_compute)
-    int dest_reg = (int)UNPACK_A(op_word);
+    unsigned int dest_reg = UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    AerVal obj = registers[(int)UNPACK_B(op_word)];
-    vm_index_get_compute(obj, *idx, &registers[dest_reg]);
+    AerVal obj = SCALED_REG(UNPACK_B(op_word));
+    vm_index_get_compute(obj, *idx, &SCALED_REG(dest_reg));
     /* Only single-char string indexing allocates -- array/dict indexing never touches the heap, so
        skip the check for the dominant common case. */
     if (aer_type(obj) == TYPE_STRING)
@@ -3492,10 +3492,10 @@ __attribute__((cold)) SEPARATE_HANDLER(index_get_compute)
 
 /* Already type-generic (array/dict/string) with all bounds/negative-index logic. */
 HANDLER(index_get)
-    int dest_reg = (int)UNPACK_A(op_word);
-    int arr_reg = (int)UNPACK_B(op_word);
+    unsigned int dest_reg = UNPACK_A(op_word);
+    unsigned int arr_reg = UNPACK_B(op_word);
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    AerVal obj = registers[arr_reg];
+    AerVal obj = SCALED_REG(arr_reg);
     /* A negative index wraps to a huge unsigned value and falls through to vm_array_position, which
        counts it from the end -- so one compare covers both bounds and this skips nothing a plain
        in-range read needs. */
@@ -3503,7 +3503,7 @@ HANDLER(index_get)
         AerArray* a = aer_as_array(obj);
         uint64_t at = (uint64_t)aer_as_int(*idx);
         if (!a->shape && at < (uint64_t)a->count) {
-            registers[dest_reg] = a->items[at];
+            SCALED_REG(dest_reg) = a->items[at];
             DISPATCH();
         }
     }
@@ -3522,10 +3522,10 @@ HANDLER(destructure)
 
 /* Includes the internal write barrier, now exercised against a register-held reference. */
 HANDLER(index_set)
-    int arr_reg = (int)UNPACK_A(op_word);
+    unsigned int arr_reg = UNPACK_A(op_word);
     AerVal idx = *vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
     AerVal val = *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    vm_index_set_compute(vm, registers[arr_reg], idx, val);
+    vm_index_set_compute(vm, SCALED_REG(arr_reg), idx, val);
     DISPATCH();
 }
 
@@ -3535,16 +3535,16 @@ HANDLER(index_set)
    fast path applies. A miss must fall through to the fully generic behavior for any other
    container, not error: the parser's loop-safety proof knows nothing about container type. */
 HANDLER(typed_index_get_unchecked)
-    int dest_reg = (int)UNPACK_A(op_word);
-    int arr_reg = (int)UNPACK_B(op_word);
+    unsigned int dest_reg = UNPACK_A(op_word);
+    unsigned int arr_reg = UNPACK_B(op_word);
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    AerVal obj = registers[arr_reg];
+    AerVal obj = SCALED_REG(arr_reg);
     if (aer_type(obj) == TYPE_ARRAY) {
         /* A plain array can shrink inside the loop, so the proof covers only a typed one's index. */
         AerArray* a = aer_as_array(obj);
         if (a->shape || idx->tag != TYPE_INTEGER || (uint64_t)idx->as.i >= a->count)
             __attribute__((musttail)) return h_index_get(vm, pc, registers, c);
-        registers[dest_reg] = a->items[idx->as.i];
+        SCALED_REG(dest_reg) = a->items[idx->as.i];
         DISPATCH();
     }
     if (aer_type(obj) != TYPE_TYPED_ARRAY)
@@ -3552,21 +3552,21 @@ HANDLER(typed_index_get_unchecked)
     AerTypedArray* ta = aer_as_typed_array(obj);
     int64_t i = aer_as_int(*idx);
     unsigned int width = vm_typed_elem_width(ta->elem_kind);
-    registers[dest_reg] = vm_typed_elem_read(ta->data + (size_t)i * width, ta->elem_kind);
+    SCALED_REG(dest_reg) = vm_typed_elem_read(ta->data + (size_t)i * width, ta->elem_kind);
     DISPATCH();
 }
 
 SEPARATE_HANDLER(typed_index_set_reject_value)
-    AerTypedArray* ta = aer_as_typed_array(registers[(int)UNPACK_A(op_word)]);
+    AerTypedArray* ta = aer_as_typed_array(SCALED_REG(UNPACK_A(op_word)));
     vm_typed_array_check(c, ta->elem_kind, *vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word)));
     DISPATCH();
 }
 
 HANDLER(typed_index_set_unchecked)
-    int arr_reg = (int)UNPACK_A(op_word);
+    unsigned int arr_reg = UNPACK_A(op_word);
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
     AerVal* val = vm_rk_ptr8(registers, const_pool, UNPACK_C(op_word));
-    AerVal obj = registers[arr_reg];
+    AerVal obj = SCALED_REG(arr_reg);
     if (aer_type(obj) != TYPE_TYPED_ARRAY)
         __attribute__((musttail)) return h_index_set(vm, pc, registers, c);
     AerTypedArray* ta = aer_as_typed_array(obj);
@@ -3581,15 +3581,15 @@ HANDLER(typed_index_set_unchecked)
 
 SEPARATE_HANDLER(index_set_any_from_int)
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
-    vm_index_set_compute(vm, registers[(int)UNPACK_A(op_word)], *idx,
-                         aer_int(registers[UNPACK_C(op_word)].as.i));
+    vm_index_set_compute(vm, SCALED_REG(UNPACK_A(op_word)), *idx,
+                         aer_int(SCALED_REG(UNPACK_C(op_word)).as.i));
     DISPATCH();
 }
 
 SEPARATE_HANDLER(index_set_any_from_real)
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
-    vm_index_set_compute(vm, registers[(int)UNPACK_A(op_word)], *idx,
-                         aer_real(registers[UNPACK_C(op_word)].as.d));
+    vm_index_set_compute(vm, SCALED_REG(UNPACK_A(op_word)), *idx,
+                         aer_real(SCALED_REG(UNPACK_C(op_word)).as.d));
     DISPATCH();
 }
 
@@ -3630,9 +3630,9 @@ SEPARATE_HANDLER(index_get_any_as_real)
    typed-array case skips the AerVal entirely. A non-numeric result is the same error the raw
    arithmetic that consumes this slot would have raised one opcode later. */
 HANDLER(index_set_raw_int)
-    AerVal obj = registers[(int)UNPACK_A(op_word)];
+    AerVal obj = SCALED_REG(UNPACK_A(op_word));
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
-    int64_t v = registers[UNPACK_C(op_word)].as.i;
+    int64_t v = SCALED_REG(UNPACK_C(op_word)).as.i;
     if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
         AerTypedArray* ta = aer_as_typed_array(obj);
         if ((uint64_t)idx->as.i < (uint64_t)ta->count) {
@@ -3651,9 +3651,9 @@ HANDLER(index_set_raw_int)
 }
 
 HANDLER(index_set_raw_real)
-    AerVal obj = registers[(int)UNPACK_A(op_word)];
+    AerVal obj = SCALED_REG(UNPACK_A(op_word));
     AerVal* idx = vm_rk_ptr8(registers, const_pool, UNPACK_B(op_word));
-    double v = registers[UNPACK_C(op_word)].as.d;
+    double v = SCALED_REG(UNPACK_C(op_word)).as.d;
     if (aer_type(obj) == TYPE_TYPED_ARRAY && idx->tag == TYPE_INTEGER) {
         AerTypedArray* ta = aer_as_typed_array(obj);
         if ((uint64_t)idx->as.i < (uint64_t)ta->count) {
@@ -5427,22 +5427,22 @@ HANDLER(raw_div_real)
 /* Checks a slot whose type nothing proved, so every opcode after it can skip the check. The error
    wording names the operator, not "unbox", because that is what the source line reads as. */
 HANDLER(unbox_int)
-    int dest = (int)UNPACK_A(op_word);
-    AerVal* v = &registers[UNPACK_B(op_word)];
+    unsigned int dest = UNPACK_A(op_word);
+    AerVal* v = &SCALED_REG(UNPACK_B(op_word));
     if (v->tag == TYPE_INTEGER)
-        registers[dest] = aer_int(v->as.i);
+        SCALED_REG(dest) = aer_int(v->as.i);
     else
         error("Cannot apply this operator to integer and %s", vm_type_name(c, *v));
     DISPATCH();
 }
 
 HANDLER(unbox_real)
-    int dest = (int)UNPACK_A(op_word);
-    AerVal* v = &registers[UNPACK_B(op_word)];
+    unsigned int dest = UNPACK_A(op_word);
+    AerVal* v = &SCALED_REG(UNPACK_B(op_word));
     if (v->tag == TYPE_REAL)
-        registers[dest] = aer_real(v->as.d);
+        SCALED_REG(dest) = aer_real(v->as.d);
     else if (v->tag == TYPE_INTEGER)
-        registers[dest] = aer_real((double)v->as.i);
+        SCALED_REG(dest) = aer_real((double)v->as.i);
     else
         error("Cannot apply this operator to float and %s", vm_type_name(c, *v));
     DISPATCH();
