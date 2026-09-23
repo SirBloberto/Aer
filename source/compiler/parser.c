@@ -3871,6 +3871,18 @@ static void parse_chain_assignment(Chunk* c, unsigned int name_idx, bool first_i
     discard_statement_result(c, rk);
 }
 
+/* Called from inside an indented body; consumes through the DEDENT that closes it. */
+static void skip_rest_of_block(void) {
+    int depth = 1;
+    while (depth > 0 && !equal(TOKEN_END_OF_FILE)) {
+        if (equal(TOKEN_INDENT))
+            depth++;
+        else if (equal(TOKEN_DEDENT))
+            depth--;
+        lex();
+    }
+}
+
 /* Called when the skip-to-boundary loop stops at a plain NEWLINE, not already a boundary -- a
    statement that failed to introduce a block leaves an orphaned indented block otherwise. */
 static void skip_orphaned_block(void) {
@@ -3879,14 +3891,8 @@ static void skip_orphaned_block(void) {
     lex();
     if (!equal(TOKEN_INDENT))
         return;
-    int depth = 0;
-    do {
-        if (equal(TOKEN_INDENT))
-            depth++;
-        else if (equal(TOKEN_DEDENT))
-            depth--;
-        lex();
-    } while (depth > 0 && !equal(TOKEN_END_OF_FILE));
+    lex();
+    skip_rest_of_block();
 }
 
 /* Per-statement rollback: a compile error inside a body rolls back just that statement and
@@ -5703,10 +5709,12 @@ static void parse_struct(Chunk* c) {
         if (consume(TOKEN_NEW_LINE))
             continue;
         if (!equal(TOKEN_IDENTIFIER)) {
-            return error_at("Expected field name");
+            error_at("Expected field name");
+            break;
         }
         if (field_count >= MAX_STRUCT_FIELDS) {
-            return error_at("Too many struct fields (max %d)", MAX_STRUCT_FIELDS);
+            error_at("Too many struct fields (max %d)", MAX_STRUCT_FIELDS);
+            break;
         }
 
         unsigned int fname = chunk_add_pool(c, token.value);
@@ -5718,14 +5726,16 @@ static void parse_struct(Chunk* c) {
            default didn't already have. 'null' is the one default with no matching ValueType, and
            is what TYPE_ANY (unconstrained) means here -- never a spelled-out keyword. */
         if (!consume(TOKEN_ASSIGN)) {
-            return error_at("Struct field '%.*s' must have an explicit default value",
-                            (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
+            error_at("Struct field '%.*s' must have an explicit default value",
+                     (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
+            break;
         }
         AerVal dflt;
         bool narrow;
         if (!parse_literal_default(c, &dflt, &narrow)) {
-            return error_at("A struct field default must be a literal: a number, true, false, null, a "
-                            "string, an empty array [] or an empty hashtable {}");
+            error_at("A struct field default must be a literal: a number, true, false, null, a "
+                     "string, an empty array [] or an empty hashtable {}");
+            break;
         }
         field_names[field_count] = fname;
         field_defaults[field_count] = dflt;
@@ -5742,15 +5752,21 @@ static void parse_struct(Chunk* c) {
            rejected before that trust is established. */
         if (field_narrow[field_count] && field_types[field_count] == TYPE_INTEGER &&
             (aer_as_int(dflt) < INT32_MIN || aer_as_int(dflt) > INT32_MAX)) {
-            return error_at("Struct field '%.*s' default is out of range for a narrow (int32) field",
-                            (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
+            error_at("Struct field '%.*s' default is out of range for a narrow (int32) field",
+                     (int)aer_as_string(c->pool[fname])->length, aer_as_string(c->pool[fname])->data);
+            break;
         }
         field_count++;
 
         if (!equal(TOKEN_DEDENT) && !equal(TOKEN_END_OF_FILE))
             require(TOKEN_NEW_LINE, "expected newline after struct field");
         if (parse_had_error)
-            return;
+            break;
+    }
+    if (parse_had_error) {
+        skip_rest_of_block();
+        P.recovered_at_boundary = true;
+        return;
     }
     consume(TOKEN_DEDENT);
 
@@ -6003,6 +6019,9 @@ void parse(Chunk* c) {
             unsigned int patch_offset = P.pending_calls[i].patch_offset;
             c->code[patch_offset - 1] = OP_HALT;
             lexer_set_token_start(P.pending_calls[i].call_site_cursor);
+            /* After an earlier error, an unresolved name is most likely that failed declaration's. */
+            if (P.any_compile_error)
+                continue;
             error_at("Unknown function or struct type '%s' (never defined anywhere in this compile — not a "
                      "valid forward reference, module call, or struct construction target)",
                      aer_as_string(c->pool[P.pending_calls[i].name_idx])->data);

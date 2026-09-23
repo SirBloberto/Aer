@@ -1,0 +1,5 @@
+struct Point:
+    x: integer #!error: must have an explicit default value
+    y = 0
+p = Point(1, 2)
+print(p.x)

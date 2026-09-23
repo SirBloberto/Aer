@@ -9,9 +9,10 @@ That gap matters because vm->ip, which is what chunk_line_for_offset resolves ag
 synced at sites that can raise. A missed sync does not crash or corrupt anything; it just makes a
 future error blame the wrong line, which no other test would notice.
 
-Each case in tests/error_lines/ marks the one line it expects to fault with a trailing
+Each case in tests/error_lines/ marks every line it expects to fault with a trailing
 `#!error: <substring>`. The expected line number is the marker's own line, so it cannot drift out
-of date when a case is edited -- there is no second copy of it to forget to update.
+of date when a case is edited -- there is no second copy of it to forget to update. The first
+marker is checked in detail; the rest only count, so an error cascading from the first fails.
 
 Usage: python3 tests/error_lines.py [--binary binary/aer]
 """
@@ -41,7 +42,7 @@ PARSE_REPORT = re.compile(r"^(?P<path>.+?):(?P<line>\d+) \| .*\n.*\nError: (?P<m
 
 
 def expectation(path):
-    """(line number, expected message substring, expected function name or None, caller line or None)."""
+    """([(line number, expected message substring)], expected function name or None, caller line or None)."""
     found = []
     want_fn = None
     want_caller = None
@@ -53,9 +54,9 @@ def expectation(path):
                 want_caller = n
             elif MARKER in text:
                 found.append((n, text.split(MARKER, 1)[1].strip()))
-    if len(found) != 1:
-        sys.exit("%s: expected exactly one %s marker, found %d" % (path, MARKER, len(found)))
-    return found[0][0], found[0][1], want_fn, want_caller
+    if not found:
+        sys.exit("%s: no %s marker" % (path, MARKER))
+    return found, want_fn, want_caller
 
 
 def caller_line(out):
@@ -84,7 +85,8 @@ def main():
     failures = 0
     for name in cases:
         path = os.path.join(CASES, name)
-        want_line, want_msg, want_fn, want_caller = expectation(path)
+        markers, want_fn, want_caller = expectation(path)
+        want_line, want_msg = markers[0]
         r = subprocess.run([binary, path], capture_output=True, text=True)
         out = r.stdout + r.stderr
 
@@ -94,6 +96,7 @@ def main():
             failures += 1
             continue
         got_line, got_msg = int(m.group("line")), m.group("msg")
+        reported = len(REPORT.findall(out)) + len(PARSE_REPORT.findall(out))
         if got_line != want_line:
             print("FAIL %-34s reported line %d, expected %d (%s)" % (name, got_line, want_line, got_msg))
             failures += 1
@@ -107,6 +110,9 @@ def main():
             failures += 1
         elif want_caller is not None and caller_line(out) != want_caller:
             print("FAIL %-34s called from line %s, expected %d" % (name, caller_line(out), want_caller))
+            failures += 1
+        elif reported != len(markers):
+            print("FAIL %-34s reported %d error(s), expected %d" % (name, reported, len(markers)))
             failures += 1
         else:
             print("ok   %-34s line %d: %s" % (name, got_line, got_msg))

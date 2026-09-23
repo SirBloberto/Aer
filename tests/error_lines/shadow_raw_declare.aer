@@ -2,4 +2,4 @@ limit = 10
 
 function reset_limit():
     limit = 5 #!error: 'limit' is a top-level variable
-    return limit
+    return limit #!error: 'limit' is a top-level variable

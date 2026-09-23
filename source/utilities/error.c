@@ -167,8 +167,14 @@ void error(const char* format, ...) {
         AER_LONGJMP(*runtime_error_unwind_target, 1);
 }
 
-/* Print a message pinpointing the current token in the source. */
+/* Print a message pinpointing the current token. A statement reports only its first error. */
 void error_at(const char* format, ...) {
+    if (parse_had_error) {
+        runtime_had_error = true;
+        if (runtime_error_unwind_target)
+            AER_LONGJMP(*runtime_error_unwind_target, 1);
+        return;
+    }
     if (++parse_error_count > PARSE_ERROR_MAX) {
         if (parse_error_count == PARSE_ERROR_MAX + 1)
             emit_error("Error: too many errors; further messages suppressed\n");
