@@ -728,120 +728,79 @@ static const char* binop_symbol(Opcode op) {
 static AerVal vm_typed_array_binary_op(AerTypedArray* ta, AerTypedArray* tb, Opcode op);
 static AerVal vm_typed_array_scalar_op(AerTypedArray* a, AerVal scalar, Opcode op, bool flip);
 
-static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
-    /* Before the null handling below, so `null in arr` is a container search rather than a
-       comparison error. */
-    if (op == OP_IN)
-        return vm_in(a, b);
-
-    /* null equality: null == null is true; null op anything-else errors */
-    if (ta == TYPE_NULL || tb == TYPE_NULL) {
-        if (op == OP_EQ)
-            return aer_bool(ta == TYPE_NULL && tb == TYPE_NULL);
-        if (op == OP_NEQ)
-            return aer_bool(!(ta == TYPE_NULL && tb == TYPE_NULL));
-        error("Operator not valid for null");
-        return aer_bool(false);
+static AerVal vm_binary_real(double l, double rv, Opcode op) {
+    switch (op) {
+        case OP_ADD: return aer_real(l + rv);
+        case OP_SUB: return aer_real(l - rv);
+        case OP_MUL: return aer_real(l * rv);
+        case OP_DIV:
+            if (rv == 0.0) {
+                error("Division by zero");
+                return aer_real(0.0);
+            }
+            return aer_real(l / rv);
+        case OP_FLOOR_DIV:
+            if (rv == 0.0) {
+                error("Division by zero");
+                return aer_real(0.0);
+            }
+            return aer_real(floor(l / rv));
+        case OP_MOD:
+            if (rv == 0.0) {
+                error("Modulo by zero");
+                return aer_real(0.0);
+            }
+            return aer_real(aer_mod_double(l, rv));
+        case OP_EQ: return aer_bool(l == rv);
+        case OP_NEQ: return aer_bool(l != rv);
+        case OP_LT: return aer_bool(l < rv);
+        case OP_GT: return aer_bool(l > rv);
+        case OP_LTE: return aer_bool(l <= rv);
+        case OP_GTE: return aer_bool(l >= rv);
+        default: error("Operator not valid for reals"); return aer_real(0.0);
     }
+}
 
-    if (ta == TYPE_REAL || tb == TYPE_REAL) {
-        a = vm_promote_real(a);
-        b = vm_promote_real(b);
+static AerVal vm_binary_string(AerString* as, AerString* bs, Opcode op) {
+    bool eq = as->length == bs->length && strncmp(as->data, bs->data, as->length) == 0;
+    if (op == OP_EQ)
+        return aer_bool(eq);
+    if (op == OP_NEQ)
+        return aer_bool(!eq);
+    if (op == OP_ADD) {
+        unsigned int len = as->length + bs->length;
+        if (len <= AER_STRING_INLINE_MAX) {
+            /* Assembled on the stack, not the heap -- the concat result is short enough to land
+               entirely inline in the new AerString cell, so there's nothing to allocate at all. */
+            char stackbuf[AER_STRING_INLINE_MAX + 1];
+            memcpy(stackbuf, as->data, as->length);
+            memcpy(stackbuf + as->length, bs->data, bs->length);
+            return aer_make_string_copy(stackbuf, len);
+        }
+        char* buf = vm_string_payload_alloc(vm_require_current_heap(), len);
+        memcpy(buf, as->data, as->length);
+        memcpy(buf + as->length, bs->data, bs->length);
+        buf[len] = '\0';
+        /* aer_make_string takes ownership of buf. Used once here, so no interning. */
+        return aer_make_string(buf, len);
     }
-
-    if (aer_type(a) == TYPE_REAL && aer_type(b) == TYPE_REAL) {
-        double l = aer_as_real(a), rv = aer_as_real(b);
+    if (op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE) {
+        /* Same total order collection.sort() uses for strings -- one shared helper (value.h). */
+        int cmp = aer_string_compare(as, bs);
         switch (op) {
-            case OP_ADD: return aer_real(l + rv);
-            case OP_SUB: return aer_real(l - rv);
-            case OP_MUL: return aer_real(l * rv);
-            case OP_DIV:
-                if (rv == 0.0) {
-                    error("Division by zero");
-                    return aer_real(0.0);
-                }
-                return aer_real(l / rv);
-            case OP_FLOOR_DIV:
-                if (rv == 0.0) {
-                    error("Division by zero");
-                    return aer_real(0.0);
-                }
-                return aer_real(floor(l / rv));
-            case OP_MOD:
-                if (rv == 0.0) {
-                    error("Modulo by zero");
-                    return aer_real(0.0);
-                }
-                return aer_real(aer_mod_double(l, rv));
-            case OP_EQ: return aer_bool(l == rv);
-            case OP_NEQ: return aer_bool(l != rv);
-            case OP_LT: return aer_bool(l < rv);
-            case OP_GT: return aer_bool(l > rv);
-            case OP_LTE: return aer_bool(l <= rv);
-            case OP_GTE: return aer_bool(l >= rv);
-            default: error("Operator not valid for reals"); return aer_real(0.0);
+            case OP_LT: return aer_bool(cmp < 0);
+            case OP_GT: return aer_bool(cmp > 0);
+            case OP_LTE: return aer_bool(cmp <= 0);
+            default: return aer_bool(cmp >= 0); /* OP_GTE */
         }
     }
+    error("Operator not valid for strings");
+    return aer_bool(false);
+}
 
-    if (aer_type(a) == TYPE_BOOLEAN && aer_type(b) == TYPE_BOOLEAN) {
-        if (op == OP_EQ)
-            return aer_bool(aer_as_bool(a) == aer_as_bool(b));
-        if (op == OP_NEQ)
-            return aer_bool(aer_as_bool(a) != aer_as_bool(b));
-        error("Operator not valid for booleans");
-        return aer_bool(false);
-    }
-
-    if (aer_type(a) == TYPE_STRING && aer_type(b) == TYPE_STRING) {
-        AerString* as = aer_as_string(a);
-        AerString* bs = aer_as_string(b);
-        bool eq = as->length == bs->length && strncmp(as->data, bs->data, as->length) == 0;
-        if (op == OP_EQ)
-            return aer_bool(eq);
-        if (op == OP_NEQ)
-            return aer_bool(!eq);
-        if (op == OP_ADD) {
-            unsigned int len = as->length + bs->length;
-            if (len <= AER_STRING_INLINE_MAX) {
-                /* Assembled on the stack, not the heap -- the concat result is short enough to land
-                   entirely inline in the new AerString cell, so there's nothing to allocate at all. */
-                char stackbuf[AER_STRING_INLINE_MAX + 1];
-                memcpy(stackbuf, as->data, as->length);
-                memcpy(stackbuf + as->length, bs->data, bs->length);
-                return aer_make_string_copy(stackbuf, len);
-            }
-            char* buf = vm_string_payload_alloc(vm_require_current_heap(), len);
-            memcpy(buf, as->data, as->length);
-            memcpy(buf + as->length, bs->data, bs->length);
-            buf[len] = '\0';
-            /* aer_make_string takes ownership of buf. Used once here, so no interning. */
-            return aer_make_string(buf, len);
-        }
-        if (op == OP_LT || op == OP_GT || op == OP_LTE || op == OP_GTE) {
-            /* Same total order collection.sort() uses for strings -- one shared helper (value.h). */
-            int cmp = aer_string_compare(as, bs);
-            switch (op) {
-                case OP_LT: return aer_bool(cmp < 0);
-                case OP_GT: return aer_bool(cmp > 0);
-                case OP_LTE: return aer_bool(cmp <= 0);
-                default: return aer_bool(cmp >= 0); /* OP_GTE */
-            }
-        }
-        error("Operator not valid for strings");
-        return aer_bool(false);
-    }
-
-    /* Compared by identity only. Tested on the values' own tags: a struct-field caller passes the
-       field's declared type as ta, which is TYPE_ANY for an untyped field. */
-    if (aer_type(a) == aer_type(b) &&
-        (aer_type(a) == TYPE_ARRAY || aer_type(a) == TYPE_DICT || aer_type(a) == TYPE_RESULT)) {
-        if (op == OP_EQ || op == OP_NEQ)
-            return aer_bool((a.as.ptr == b.as.ptr) == (op == OP_EQ));
-        error("Operator not valid for %s",
-              aer_type(a) == TYPE_ARRAY ? "arrays" : aer_type(a) == TYPE_DICT ? "dicts" : "Results");
-        return aer_bool(false);
-    }
-
+/* Either side a column: elementwise between two, broadcast against a number, or an error that
+   says which of those it was not. */
+static AerVal vm_binary_column(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
     if (aer_type(a) == TYPE_TYPED_ARRAY && aer_type(b) == TYPE_TYPED_ARRAY) {
         AerTypedArray* tta = aer_as_typed_array(a);
         AerTypedArray* ttb = aer_as_typed_array(b);
@@ -869,20 +828,65 @@ static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType 
             return vm_typed_array_scalar_op(aer_as_typed_array(b), a, op, true);
     }
 
-    /* A column reaching here failed for a reason the generic message hides: either the operator is
-       not one columns have, or the other side is not a number to broadcast. Saying which saves the
-       reader looking for a type error that isn't there. */
-    if (aer_type(a) == TYPE_TYPED_ARRAY || aer_type(b) == TYPE_TYPED_ARRAY) {
-        bool other_is_num = (aer_type(a) == TYPE_TYPED_ARRAY ? tb : ta) == TYPE_INTEGER ||
-                            (aer_type(a) == TYPE_TYPED_ARRAY ? tb : ta) == TYPE_REAL;
-        if (other_is_num)
-            error("'%s' is not defined on a column — columns support + - * / and the comparisons",
-                  binop_symbol(op));
-        else
-            error("'%s' needs a number or another column on the other side, not %s", binop_symbol(op),
-                  vm_type_name(c, aer_type(a) == TYPE_TYPED_ARRAY ? b : a));
+    ValueType other = aer_type(a) == TYPE_TYPED_ARRAY ? tb : ta;
+    if (other == TYPE_INTEGER || other == TYPE_REAL)
+        error("'%s' is not defined on a column — columns support + - * / and the comparisons",
+              binop_symbol(op));
+    else
+        error("'%s' needs a number or another column on the other side, not %s", binop_symbol(op),
+              vm_type_name(c, aer_type(a) == TYPE_TYPED_ARRAY ? b : a));
+    return aer_bool(false);
+}
+
+static AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb) {
+    /* Before the null handling below, so `null in arr` is a container search rather than a
+       comparison error. */
+    if (op == OP_IN)
+        return vm_in(a, b);
+
+    /* null equality: null == null is true; null op anything-else errors */
+    if (ta == TYPE_NULL || tb == TYPE_NULL) {
+        if (op == OP_EQ)
+            return aer_bool(ta == TYPE_NULL && tb == TYPE_NULL);
+        if (op == OP_NEQ)
+            return aer_bool(!(ta == TYPE_NULL && tb == TYPE_NULL));
+        error("Operator not valid for null");
         return aer_bool(false);
     }
+
+    if (ta == TYPE_REAL || tb == TYPE_REAL) {
+        a = vm_promote_real(a);
+        b = vm_promote_real(b);
+    }
+
+    if (aer_type(a) == TYPE_REAL && aer_type(b) == TYPE_REAL)
+        return vm_binary_real(aer_as_real(a), aer_as_real(b), op);
+
+    if (aer_type(a) == TYPE_BOOLEAN && aer_type(b) == TYPE_BOOLEAN) {
+        if (op == OP_EQ)
+            return aer_bool(aer_as_bool(a) == aer_as_bool(b));
+        if (op == OP_NEQ)
+            return aer_bool(aer_as_bool(a) != aer_as_bool(b));
+        error("Operator not valid for booleans");
+        return aer_bool(false);
+    }
+
+    if (aer_type(a) == TYPE_STRING && aer_type(b) == TYPE_STRING)
+        return vm_binary_string(aer_as_string(a), aer_as_string(b), op);
+
+    /* Compared by identity only. Tested on the values' own tags: a struct-field caller passes the
+       field's declared type as ta, which is TYPE_ANY for an untyped field. */
+    if (aer_type(a) == aer_type(b) &&
+        (aer_type(a) == TYPE_ARRAY || aer_type(a) == TYPE_DICT || aer_type(a) == TYPE_RESULT)) {
+        if (op == OP_EQ || op == OP_NEQ)
+            return aer_bool((a.as.ptr == b.as.ptr) == (op == OP_EQ));
+        error("Operator not valid for %s",
+              aer_type(a) == TYPE_ARRAY ? "arrays" : aer_type(a) == TYPE_DICT ? "dicts" : "Results");
+        return aer_bool(false);
+    }
+
+    if (aer_type(a) == TYPE_TYPED_ARRAY || aer_type(b) == TYPE_TYPED_ARRAY)
+        return vm_binary_column(c, a, b, op, ta, tb);
 
     error("Cannot apply '%s' to %s and %s", binop_symbol(op), vm_type_name(c, a), vm_type_name(c, b));
     return aer_bool(false);
