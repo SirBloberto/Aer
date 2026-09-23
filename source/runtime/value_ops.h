@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include "objects.h"
 #include "opcodes.h"
 #include "value.h"
 

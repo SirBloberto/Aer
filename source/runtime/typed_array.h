@@ -30,7 +30,7 @@ AerVal vm_typed_array_chain2(AerTypedArray* a, AerTypedArray* b, AerTypedArray* 
 /* A binary operator with a column on either side: elementwise, broadcast, or an error naming why not. */
 AerVal vm_binary_column(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType ta, ValueType tb);
 
-/* Raises the error for a value the array cannot hold; false when it did. */
+/* True when the array can hold val; false after raising the error saying why not. */
 bool vm_typed_array_check(Chunk* c, TypedArrayElemKind kind, AerVal val);
 
 static inline AerVal vm_typed_elem_read(unsigned char* slot, TypedArrayElemKind kind) {

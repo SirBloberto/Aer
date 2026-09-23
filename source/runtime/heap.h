@@ -4,7 +4,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "hashtable.h"
-#include "objects.h"
 #include "pool.h"
 #include "value.h"
 
@@ -88,8 +87,8 @@ typedef struct {
     int gc_suppress_depth;
 
     /* Every AerDict this heap owns gets its key/sparse-array storage from here, one per heap like
-       the 7 GC pools above. Chunk.name_index has no owning VM, so it uses its own process-global
-       HashPools -- see vm.c's chunk_name_index_pools. */
+       the 7 GC pools above. Chunk.name_index has no owning VM, so each Chunk carries its own
+       (chunk.c). */
     HashPools dict_hash_pools;
 } VmHeap;
 

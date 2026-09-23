@@ -2209,7 +2209,7 @@ allowlisting, neither of which exist today.
 | `source/main.c` | Entry point, REPL loop, file runner |
 | `source/repl/terminal.h/c` | Raw-mode interactive REPL terminal |
 | `source/runtime/value.h` | `AerVal` — the one tagged-union value type, used internally and at the embedding boundary alike: null / boolean / integer / float / string / function / array / hashtable / packed array, and the `Shape` forward declaration |
-| `source/runtime/objects.h` | The object types that need more than `value.h` can see: `AerDict` (it embeds a hash table), `Shape` and `AerStruct` |
+| `source/runtime/objects.h/c` | The object types `value.h` cannot define (`AerDict`, `Shape`, `AerStruct`); strings, arrays, dicts, functions and Results; struct field access; reading by index |
 | `source/runtime/heap.h/c` | A VM's heap: its size-classed pools, GC bookkeeping and tuning, and the string-payload allocator |
 | `source/runtime/typed_array.h/c` | Typed arrays (columns): element access, the vectorized elementwise and broadcast kernels, fused chains, and the value checks |
 | `source/runtime/value_ops.h/c` | What the operators mean on values: truthiness, arithmetic and comparison across types, `in`, slicing bounds and casts |

@@ -3,6 +3,7 @@
 #include "error.h"
 #include "hashtable.h"
 #include "heap.h"
+#include "objects.h"
 
 /* Tuning defaults every freshly-initialized heap inherits -- process-wide mutable state, not
    hardcoded constants, specifically so aer_gc_configure()/aer_gc_set_ceiling() work when called

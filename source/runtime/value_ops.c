@@ -163,6 +163,7 @@ AerVal vm_binary_cold(Chunk* c, AerVal a, AerVal b, Opcode op, ValueType ta, Val
     return aer_bool(false);
 }
 
+/* Either bound may be null, meaning 0 or len. Out-of-range clamps rather than errors, Python-style. */
 bool vm_slice_bounds(AerVal start_v, AerVal end_v, int64_t len, int64_t* out_start, int64_t* out_end) {
     if (aer_type(start_v) != TYPE_NULL && aer_type(start_v) != TYPE_INTEGER) {
         error("Slice bounds must be integers");

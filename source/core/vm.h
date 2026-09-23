@@ -6,6 +6,7 @@
 #include "heap.h"
 #include "pool.h"
 #include "strbuf.h"
+#include "objects.h"
 #include "opcodes.h"
 #include "value.h"
 #include "value_format.h"
@@ -544,18 +545,6 @@ VmSliceResult vm_run_slice(VM* vm, unsigned int max_instructions);
    0 -- after the trampoline drains, the result is in call_stack[0].registers[0]. */
 bool setup_call(VM* target, ChunkFunction* fn, int arg_count, AerVal* args, unsigned int return_ip);
 
-/* An empty plain array with room for `capacity` items; 0 leaves items NULL. */
-AerArray* vm_new_array(unsigned int capacity);
-
-/* An array's item buffer at `capacity`, which both set as a->capacity and count toward the next
-   collection -- the array's one cell says nothing about them. alloc is for a new array, whose items
-   field is still garbage; grow is for an existing one. */
-void vm_array_alloc_items(AerArray* a, unsigned int capacity);
-void vm_array_grow_items(AerArray* a, unsigned int capacity);
-
-/* Same, for AerDict -- exposed for json.decode(). The caller must zero-init `map` itself. */
-AerDict* vm_new_dict(void);
-
 /* Every store into an already-existing array goes through this. `index` feeds card marking, so a
    minor GC rescans only the slots dirtied since the last cycle. A freshly built, not-yet-returned
    array needs no barrier. */
@@ -571,10 +560,6 @@ void gc_barrier_dict(VM* vm, AerDict* d, unsigned int index, AerVal new_value);
 /* Called from vm.c's gc_maybe_collect once the threshold is actually crossed. gc_maybe_collect runs
    at hand-placed points in the allocating opcodes, not on every dispatch. */
 void gc_run_collection_cycle(VM* vm);
-
-/* Must come from function_pool (pool_mark's slab lookup fails on xmalloc'd cells); returns
-   uninitialized memory -- zero it yourself. */
-AerFunction* vm_new_function(void);
 
 /* Test-only register readback (tests/smoke_test.c). */
 AerVal register_get(VM* vm, int slot);

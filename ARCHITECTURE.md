@@ -10,7 +10,7 @@ Source map, one job per directory:
 | directory | holds |
 |---|---|
 | `source/core/` | `vm.{c,h}` (bytecode format and the VM, including `vm_run_slice()`, the bounded-instruction-count entry point the scheduler drives), `opcodes.def`, `chunk.c` |
-| `source/runtime/` | `value.h` (the one value type and its accessors), `objects.h`, `heap.{c,h}`, `typed_array.{c,h}`, `value_ops.{c,h}`, `value_format.{c,h}`, `gc.c`, `heap_ref.c` -- the value and object layer the VM and the standard library share |
+| `source/runtime/` | `value.h` (the one value type and its accessors), `objects.{c,h}`, `heap.{c,h}`, `typed_array.{c,h}`, `value_ops.{c,h}`, `value_format.{c,h}`, `gc.c`, `heap_ref.c` -- the value and object layer the VM and the standard library share |
 | `source/compiler/` | `lexer.c`, `parser.c` -- the whole front end |
 | `source/stdlib/` | `aer_*.c` built-in modules (math/random/string/time/json/collection/net/regex/actor/scheduler/io) and `aer_abi.h`, their wire identities |
 | `source/host/` | `aer_module.c` (import) and `aer_host.c` (host embedding) |
