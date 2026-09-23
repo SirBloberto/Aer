@@ -1561,25 +1561,6 @@ static bool func_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offse
     return true;
 }
 
-/* A bare-name value reference or an omitted-defaults call needs the full signature to build a
-   real AerFunction, not just the offset. */
-static bool func_full_lookup(Chunk* c, unsigned int name_idx, unsigned int* out_offset,
-                             unsigned int* out_arity, unsigned int* out_min_arity, AerVal** out_defaults,
-                             unsigned int* out_max_registers, unsigned short* out_frame_bounds,
-                             unsigned int* out_func_index) {
-    ChunkFunction* f = chunk_find_function_by_name_idx(c, name_idx);
-    if (!f)
-        return false;
-    *out_offset = f->code_offset;
-    *out_arity = f->arity;
-    *out_min_arity = f->min_arity;
-    *out_defaults = f->defaults;
-    *out_max_registers = f->max_registers;
-    *out_frame_bounds = f->frame_bounds;
-    *out_func_index = (unsigned int)(f - c->functions);
-    return true;
-}
-
 /* Builds a real runtime AerFunction, reusing the existing constructor. `defaults` is used
    as-is, not copied. */
 static AerVal build_function_value(unsigned int func_offset, unsigned int arity, unsigned int min_arity,
@@ -1593,6 +1574,11 @@ static AerVal build_function_value(unsigned int func_offset, unsigned int arity,
     fn->max_registers = max_registers;
     fn->frame_bounds = frame_bounds;
     return aer_function_val(fn);
+}
+
+static AerVal function_value_of(const ChunkFunction* f) {
+    return build_function_value(f->code_offset, f->arity, f->min_arity, f->defaults, f->max_registers,
+                                f->frame_bounds);
 }
 
 /* Passed in explicitly, not read internally -- by the time this is called the caller has
@@ -2188,17 +2174,10 @@ static int parse_name_reference(Chunk* c, unsigned int name_idx) {
     if (var_lookup_rk(name_idx, &reg))
         return reg;
 
-    /* Built once per reference as a deduped pool constant. AerFunction carries its own register peaks,
-       so the function index is not needed. */
-    unsigned int func_offset, func_arity, func_min_arity, func_max_registers, func_index_unused;
-    unsigned short func_frame_bounds;
-    AerVal* func_defaults;
-    if (func_full_lookup(c, name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
-                         &func_max_registers, &func_frame_bounds, &func_index_unused)) {
-        AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
-                                         func_max_registers, func_frame_bounds);
-        return (int)chunk_add_pool(c, fv) | RK_CONST_FLAG;
-    }
+    /* Built once per reference as a deduped pool constant. */
+    ChunkFunction* f = chunk_find_function_by_name_idx(c, name_idx);
+    if (f)
+        return (int)chunk_add_pool(c, function_value_of(f)) | RK_CONST_FLAG;
 
     /* Must not fall through to var_slot -- that would read an uninitialized register. */
     if (report_if_shadowed_global(c, name_idx))
@@ -2877,6 +2856,72 @@ static RawKind elementwise_result_kind(Opcode op, int lhs, int rhs) {
     return kind;
 }
 
+/* `s.f OP rhs`, where the LHS was exactly one field read: fused into one OP_FIELD_BINARY. */
+static int emit_field_binary(Chunk* c, Opcode op, int lhs, int struct_reg, unsigned int field_idx, int rhs) {
+    /* lhs is always the OP_FIELD_GET result (never raw); rhs could be raw -- box it. */
+    rhs = drop_raw_marks(rhs);
+    release_if_top(rhs);
+    release_if_top(lhs);
+
+    int dest = reg_alloc();
+    if (!rk16_fits(rhs)) {
+        error_at("Expression too large to compile (register/constant index exceeds the fused "
+                 "field-op encoding's range)");
+        return lhs;
+    }
+    chunk_emit(c, PACK3(OP_FIELD_BINARY, dest, struct_reg, op));
+    chunk_emit(c, PACK_2X16(field_idx, pack_rk16(rhs)));
+    return dest;
+}
+
+/* `(a op1 b) op c` over typed arrays, where the LHS was exactly that one elementwise op. */
+static int emit_chain2(Chunk* c, Opcode op, int a, int b, Opcode op1, int rhs) {
+    /* C must be a plain register too -- the opcode reads registers[c_reg] directly, no RK
+       decode. materialize handles both "was raw" and "was a bare constant" in one call. */
+    int c_reg = materialize(c, rhs);
+    release_if_top(c_reg);
+    int dest = reg_alloc();
+    chunk_emit(c, PACK3(OP_TYPED_ARRAY_CHAIN2, dest, a, b));
+    chunk_emit(c, PACK_2X16((uint16_t)op1, (uint16_t)c_reg));
+    chunk_emit(c, (uint32_t)op);
+    return dest;
+}
+
+/* One binary operator with both operands parsed: a fusion with the RHS, then raw, then boxed. */
+static int emit_binary_step(Chunk* c, Opcode op, int lhs, int rhs, unsigned int lhs_start,
+                            unsigned int rhs_start) {
+    if (try_fuse_fma_temp(c, op, &lhs, rhs, rhs_start))
+        return lhs;
+    if (try_fuse_field_rhs(c, op, &lhs, rhs, rhs_start) != FUSE_NONE)
+        return lhs;
+
+    /* One operand already raw makes the other's wanted kind known, which is the only thing a
+       typed element read was missing to be read raw in the first place. */
+    RawKind kind_l = rk_raw_kind(c, lhs), kind_r = rk_raw_kind(c, rhs);
+    if (kind_l != RAWK_NONE && kind_r == RAWK_NONE)
+        try_rewrite_index_get_raw(c, &rhs, rhs_start, kind_l);
+    else if (kind_r != RAWK_NONE && kind_l == RAWK_NONE)
+        try_rewrite_index_get_raw(c, &lhs, lhs_start, kind_r);
+
+    /* Tries a native raw op first (both provably int/real); false means not raw-composable, and
+       lhs/rhs still need the ordinary free/emit_binary treatment. */
+    int raw_result;
+    if (try_emit_binary_raw(c, op, lhs, rhs, &raw_result))
+        return raw_result;
+
+    RawKind chain_elem = elementwise_result_kind(op, lhs, rhs);
+
+    /* Free-then-allocate, RHS then LHS, matching compile_node's own discipline exactly. */
+    release_if_top(rhs);
+    release_if_top(lhs);
+
+    int dest = reg_alloc();
+    emit_binary(c, dest, op, lhs, rhs);
+    if (dest >= 0 && dest < FRAME_REGISTERS)
+        P.regs.reg_elem_kind[dest] = chain_elem;
+    return dest;
+}
+
 static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned int lhs_start) {
     for (;;) {
         unsigned int prec;
@@ -2885,18 +2930,9 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
             break;
         lex();
 
-        if (op == OP_AND) {
-            lhs = compile_and(c, lhs, prec);
-            lhs_start = c->count;
-            continue;
-        }
-        if (op == OP_OR) {
-            lhs = compile_or(c, lhs, prec);
-            lhs_start = c->count;
-            continue;
-        }
-        if (op == OP_PIPE) {
-            lhs = compile_pipe(c, lhs);
+        if (op == OP_AND || op == OP_OR || op == OP_PIPE) {
+            lhs = op == OP_AND ? compile_and(c, lhs, prec) : op == OP_OR ? compile_or(c, lhs, prec)
+                                                                         : compile_pipe(c, lhs);
             lhs_start = c->count;
             continue;
         }
@@ -2912,79 +2948,14 @@ static int parse_binary_ops(Chunk* c, unsigned int min_prec, int lhs, unsigned i
         unsigned int rhs_start = c->count;
         int rhs = parse_binary(c, prec); /* same precedence as floor -> left-associative */
 
-        if (lhs_is_field) {
-            /* lhs is always the OP_FIELD_GET result (never raw); rhs could be raw -- box it. */
-            rhs = drop_raw_marks(rhs);
-            release_if_top(rhs);
-            release_if_top(lhs);
-
-            int dest = reg_alloc();
-            if (!rk16_fits(rhs)) {
-                error_at("Expression too large to compile (register/constant index exceeds the fused "
-                         "field-op encoding's range)");
-                return lhs;
-            }
-            chunk_emit(c, PACK3(OP_FIELD_BINARY, dest, lhs_struct_reg, op));
-            chunk_emit(c, PACK_2X16(lhs_field_idx, pack_rk16(rhs)));
-            lhs = dest;
-            lhs_start = c->count;
-            continue;
-        }
-
-        if (lhs_is_chain2) {
-            /* C must be a plain register too -- the opcode reads registers[c_reg] directly, no RK
-               decode. materialize handles both "was raw" and "was a bare constant" in one call. */
-            int c_reg = materialize(c, rhs);
-            release_if_top(c_reg);
-            int dest = reg_alloc();
-            chunk_emit(c, PACK3(OP_TYPED_ARRAY_CHAIN2, dest, lhs_chain2_a, lhs_chain2_b));
-            chunk_emit(c, PACK_2X16((uint16_t)lhs_chain2_op1, (uint16_t)c_reg));
-            chunk_emit(c, (uint32_t)op);
-            lhs = dest;
-            lhs_start = c->count;
-            continue;
-        }
-
-        if (try_fuse_fma_temp(c, op, &lhs, rhs, rhs_start)) {
-            lhs_start = c->count;
-            continue;
-        }
-        FuseResult field_rhs = try_fuse_field_rhs(c, op, &lhs, rhs, rhs_start);
-        if (field_rhs == FUSE_ERROR)
+        if (lhs_is_field)
+            lhs = emit_field_binary(c, op, lhs, lhs_struct_reg, lhs_field_idx, rhs);
+        else if (lhs_is_chain2)
+            lhs = emit_chain2(c, op, lhs_chain2_a, lhs_chain2_b, lhs_chain2_op1, rhs);
+        else
+            lhs = emit_binary_step(c, op, lhs, rhs, lhs_start, rhs_start);
+        if (parse_had_error)
             return lhs;
-        if (field_rhs == FUSE_DONE) {
-            lhs_start = c->count;
-            continue;
-        }
-
-        /* One operand already raw makes the other's wanted kind known, which is the only thing a
-           typed element read was missing to be read raw in the first place. */
-        RawKind kind_l = rk_raw_kind(c, lhs), kind_r = rk_raw_kind(c, rhs);
-        if (kind_l != RAWK_NONE && kind_r == RAWK_NONE)
-            try_rewrite_index_get_raw(c, &rhs, rhs_start, kind_l);
-        else if (kind_r != RAWK_NONE && kind_l == RAWK_NONE)
-            try_rewrite_index_get_raw(c, &lhs, lhs_start, kind_r);
-
-        /* Tries a native raw op first (both provably int/real); false means not raw-composable, and
-           lhs/rhs still need the ordinary free/emit_binary treatment. */
-        int raw_result;
-        if (try_emit_binary_raw(c, op, lhs, rhs, &raw_result)) {
-            lhs = raw_result;
-            lhs_start = c->count;
-            continue;
-        }
-
-        RawKind chain_elem = elementwise_result_kind(op, lhs, rhs);
-
-        /* Free-then-allocate, RHS then LHS, matching compile_node's own discipline exactly. */
-        release_if_top(rhs);
-        release_if_top(lhs);
-
-        int dest = reg_alloc();
-        emit_binary(c, dest, op, lhs, rhs);
-        if (dest >= 0 && dest < FRAME_REGISTERS)
-            P.regs.reg_elem_kind[dest] = chain_elem;
-        lhs = dest;
         lhs_start = c->count;
     }
     return lhs;
@@ -5090,18 +5061,12 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
         return 0;
 
     bool is_struct = !is_var && is_struct_name(name_idx);
-    unsigned int func_offset = 0, func_arity = 0, func_min_arity = 0, func_max_registers = 0;
-    unsigned short func_frame_bounds = 0;
-    unsigned int func_index = 0;
-    AerVal* func_defaults = NULL;
-    bool is_func = !is_var && !is_struct &&
-                   func_full_lookup(c, name_idx, &func_offset, &func_arity, &func_min_arity, &func_defaults,
-                                    &func_max_registers, &func_frame_bounds, &func_index);
+    ChunkFunction* f = is_var || is_struct ? NULL : chunk_find_function_by_name_idx(c, name_idx);
+    /* An argument can add a function and move the table, so the index outlives the pointer. */
+    int func_index = f ? (int)(f - c->functions) : -1;
     /* Optimistically assumed to be a function defined later in this same parse() call -- caught
-       and reported once parse()'s top-level loop ends if it never actually is. Builtins are already
-       handled unconditionally at the top of this function, so reaching here with none of
-       is_var/is_struct/is_func true always means an unresolved name, never a builtin. */
-    bool is_forward_ref = !is_var && !is_struct && !is_func;
+       and reported once parse()'s top-level loop ends if it never actually is. */
+    bool is_forward_ref = !is_var && !is_struct && !f;
     /* Captured now, before the argument list below consumes past it. */
     const char* call_site_cursor = current_source_cursor();
 
@@ -5113,9 +5078,10 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     if (parse_had_error)
         return 0;
 
-    if (is_func && !check_call_arity(c, name_idx, arg_count, func_min_arity, func_arity, call_site_cursor))
+    f = func_index >= 0 ? &c->functions[func_index] : NULL;
+    if (f && !check_call_arity(c, name_idx, arg_count, f->min_arity, f->arity, call_site_cursor))
         return 0;
-    bool needs_call_value = is_func && (unsigned int)arg_count < func_arity;
+    bool needs_call_value = f && (unsigned int)arg_count < f->arity;
 
     /* The result reuses the argument base, as Lua does, when that base is a temp -- a lone argument may
        be a variable's own register. Chosen before any callee_reg is allocated, so a freshly built
@@ -5124,37 +5090,27 @@ static int parse_call(Chunk* c, unsigned int name_idx) {
     int base = arg_reg_base < 0 ? dest : arg_reg_base;
 
     int callee_reg = -1;
-    bool self_call = false;
     if (needs_call_value) {
-        AerVal fv = build_function_value(func_offset, func_arity, func_min_arity, func_defaults,
-                                         func_max_registers, func_frame_bounds);
+        AerVal fv = function_value_of(f);
         callee_reg = reg_alloc();
         emit_loadk(c, callee_reg, chunk_add_pool(c, fv));
     }
 
-    if (is_var) {
-        last_bare_call_start = c->count;
-        emit_call_value(c, dest, base, arg_count, var_reg);
-        last_bare_call_end = c->count;
-    } else if (is_struct) {
+    bool self_call = false;
+    if (is_struct) {
         emit_struct_new(c, dest, name_idx, base, arg_count);
-    } else if (is_func) {
-        last_bare_call_start = c->count;
-        if (needs_call_value)
-            emit_call_value(c, dest, base, arg_count, callee_reg);
-        else if (P.fn.in_variant && (int)func_index == P.fn.current_func_idx && arg_count == (int)func_arity &&
-                 func_arity == func_min_arity) {
-            chunk_emit(c, PACK3(OP_CALL_SELF, dest, base, arg_count));
-            self_call = true;
-        }
-        else /* already resolved, so no forward-reference patch */
-            emit_call(c, dest, func_offset, base, arg_count, func_index);
-        last_bare_call_end = c->count;
     } else {
         last_bare_call_start = c->count;
-        unsigned int patch_offset = emit_call(c, dest, func_offset, base, arg_count, func_index);
-        if (is_forward_ref)
-            pending_call_add(name_idx, patch_offset, call_site_cursor);
+        if (is_var || needs_call_value)
+            emit_call_value(c, dest, base, arg_count, is_var ? var_reg : callee_reg);
+        else if (is_forward_ref)
+            pending_call_add(name_idx, emit_call(c, dest, 0, base, arg_count, 0), call_site_cursor);
+        else if (P.fn.in_variant && func_index == P.fn.current_func_idx && arg_count == (int)f->arity &&
+                 f->arity == f->min_arity) {
+            chunk_emit(c, PACK3(OP_CALL_SELF, dest, base, arg_count));
+            self_call = true;
+        } else /* already resolved, so no forward-reference patch */
+            emit_call(c, dest, f->code_offset, base, arg_count, (unsigned int)func_index);
         last_bare_call_end = c->count;
     }
 
