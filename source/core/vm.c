@@ -5264,6 +5264,8 @@ HANDLER(raw_load_real)
    index is at most FRAME_REGISTERS-1 (127) and the flag is 0x80, so the two never collide. */
 #define RAW_I(x) (RK8_IS_CONST(x) ? c->rawk_i[RK8_INDEX(x)] : registers[x].as.i)
 #define RAW_D(x) (RK8_IS_CONST(x) ? c->rawk_d[RK8_INDEX(x)] : registers[x].as.d)
+/* The register a doubled field names: its byte offset is the field times 8, which a load folds. */
+#define SCALED_REG(field) (*(AerVal*)((char*)registers + (size_t)(field) * 8))
 
 #define RAW_ARITH_INT(name, op)                                                                              \
     static VmSliceResult h_raw_##name##_int(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {       \
@@ -5294,10 +5296,10 @@ HANDLER(raw_load_real)
     static VmSliceResult h_raw_##name##_real(VM* vm, const uint32_t* pc, AerVal* registers, Chunk* c) {      \
         const uint32_t op_word = pc[-1];                                                                     \
         (void)op_word;                                                                                       \
-        int dest = (int)UNPACK_A(op_word);                                                                   \
-        int a = (int)UNPACK_B(op_word);                                                                      \
+        unsigned int dest = UNPACK_A(op_word);                                                               \
+        unsigned int a = UNPACK_B(op_word);                                                                  \
         unsigned int b = UNPACK_C(op_word);                                                                  \
-        registers[dest].as.d = registers[a].as.d op registers[b].as.d;                                       \
+        SCALED_REG(dest).as.d = SCALED_REG(a).as.d op SCALED_REG(b).as.d;                                    \
         DISPATCH();                                                                                          \
     }
 #define RAW_CMP_INT(name, op)                                                                                \

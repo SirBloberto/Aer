@@ -438,6 +438,10 @@ _Static_assert(OP_OPCODE_COUNT_MARKER <= 256, "Opcode enum exceeds one byte — 
    AerVal with an addressing scale of 8 instead of a separate shift. */
 static inline unsigned op_scaled_fields(Opcode op) {
     switch (op) {
+    case OP_RAW_ADD_REAL:
+    case OP_RAW_SUB_REAL:
+    case OP_RAW_MUL_REAL:
+        return SCALED_A | SCALED_B | SCALED_C;
     default:
         return 0;
     }
