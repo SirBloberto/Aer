@@ -165,8 +165,7 @@ lookup), then the grammar and semantics organized by topic.
 
 ## Keywords
 
-AER has **20 reserved words**, plus the two boolean literals. That's the entire list — nothing else
-in the language is reserved:
+AER has **15 keywords**, plus the two boolean literals:
 
 | Keyword | Role |
 |---------|------|
@@ -182,30 +181,17 @@ in the language is reserved:
 | `null` | the absence-of-a-value literal |
 | `import` | bring a native or file-based module into scope |
 | `true` / `false` | boolean literals |
-| `integer` / `float` / `boolean` | primitive type names — only meaningful as a cast call (`integer(x)`), but reserved everywhere so they can never be shadowed |
-| `array` / `hashtable` | collection type names — not valid cast targets themselves (there's no generic value-to-collection conversion), but reserved for the same reason |
 
-`string` is deliberately **not** on this list, even though it's a valid cast call (`string(x)`) — it
-collides with the stdlib `string` module (`import string`), so it stays an ordinary identifier like
-every other module name, matched by text rather than reserved. This costs nothing in practice:
-`string(x)` used as a cast and `string.upper(s)` used as a module call are both recognized by the
-parser from context, so `string` was never shadowable to begin with.
+**Ten more names are reserved** without being keywords: the built-in functions `print`, `length`,
+`type`, `assert`, `panic` and `Result` (see [Built-in Functions](#built-in-functions)), and the casts
+`integer`, `float`, `boolean` and `string`. A call to one always means the built-in, and using one as
+a variable, parameter or function name is a compile error — otherwise a script's own
+`function Result(a, b)` would silently take over every `Result(...)` call.
 
-**Everything else is an ordinary identifier**, including every stdlib module name
-(`math`, `random`, `string`, `time`, `collection`, `net`, `regex`, `json`, `io`) — none of these are
-keywords, and they can be shadowed by a local variable or parameter of the same name, composing with
-everything else a function value can (passed around, stored in a variable, piped through `|>`).
-
-**One narrower exception:** `print`, `length`, `type`, `assert`, `panic`, and `Result` (see
-[Built-in Functions](#built-in-functions)) aren't reserved words — they're ordinary identifiers,
-same as a stdlib module name — but calling one, e.g. `Result(value, err)`, always resolves to the
-real builtin regardless of any same-named local variable or function, and declaring a function with
-one of these names is a compile error. This is deliberately stricter than module-name shadowing:
-ordinary function-call resolution checks user-defined functions before falling back to a builtin, so
-without this guard a script defining its own `function Result(a, b): ...` would silently hijack
-every `Result(...)` call site with no error at all — module names don't carry this risk, since
-shadowing one is an intentional, well-understood feature, not an accidental collision with a
-fixed, load-bearing builtin.
+**Everything else is an ordinary identifier**, including `array`, `hashtable`, and every stdlib module
+name (`math`, `random`, `time`, `collection`, `net`, `regex`, `json`, `io`), which a local variable or
+parameter can shadow. `string` is the one module name that can't be shadowed, because it is also a
+cast; `string(x)` and `string.upper(s)` are told apart by what follows the name.
 
 ## Operators
 
@@ -276,7 +262,7 @@ directly by the VM, not syntax. The bar for being a builtin is "meaningful for (
 |----------|-----------|-----------|
 | `print(x)` | 1 arg | writes `x`'s string form to stdout, followed by a newline |
 | `type(x)` | 1 arg | returns `x`'s type name as a string (a struct instance returns its declared name) |
-| `length(x)` | 1 arg | element count of an array, entry count of a hashtable, or a string's character count |
+| `length(x)` | 1 arg | element count of an array, entry count of a hashtable, or a string's length in bytes |
 | `assert(cond, msg)` | 2 args | prints `ASSERT FAILED: msg` on a false `cond` and keeps running — see [Error Handling](#error-handling) |
 | `panic(msg)` | 1 arg | aborts like any runtime error, with your own message — see [Error Handling](#error-handling) |
 | `Result(value, err)` | 2 args | builds a genuine `Result` — exactly one argument must be null — capitalized like a struct constructor, not a plain builtin (see [Error Handling](#error-handling)) |
@@ -1752,7 +1738,7 @@ what a real permission system would still need on top of this.
 | `/` always returns float | `1 / 1` → `1.0` | Use `//` for integer floor division |
 | Arrays and hashtables are references | `b = a; b[0] = 99` modifies `a` too | `b = collection.copy(a)` when you really want a distinct container (shallow — one level) |
 | Referencing a name that was never assigned is a compile error | `print(x)` with no prior `x = ...` anywhere fails to compile | Assign it first (`x = null` if there's genuinely nothing better) |
-| Missing hashtable key returns `null` | No error, silent | Use `key in hashtable` before access |
+| Missing hashtable key returns `null` | No error, silent — unlike an array or string index out of range, which is an error | `key in hashtable` to test for it, or `d[key] or default` to read with a default (a stored `0`, `""` or `false` is falsy too, so it also gets the default) |
 | `collection.append()`/`delete()`/`sort()`/`shuffle()` mutate in place and also return the container | `arr = collection.append(arr, v)` works but is redundant — the mutation already happened | Call them as statements |
 | Repeated `s += x` in a loop is quadratic | Strings are immutable — every `+=` allocates a fresh buffer and copies the whole thing so far, not just the addition | Build a list with `collection.append()` and join once: `parts = []; for ...: collection.append(parts, x); s = string.join(parts, "")` |
 | No struct-to-struct conversion | There's no built-in way to reshape a hashtable or another struct into a Point | Build the struct explicitly: `Point(some_table["x"], ...)` |
