@@ -16,10 +16,10 @@ source/core/vm.h 45
 source/debug/disasm.c 8
 source/repl/terminal.c 11
 source/repl/terminal.h 0
-source/runtime/aer_host.c 11
-source/runtime/aer_host.h 33
-source/runtime/aer_module.c 17
-source/runtime/aer_module.h 41
+source/host/aer_host.c 11
+source/host/aer_host.h 33
+source/host/aer_module.c 17
+source/host/aer_module.h 41
 source/stdlib/aer_abi.h 14
 source/stdlib/aer_actor.c 15
 source/stdlib/aer_actor.h 64

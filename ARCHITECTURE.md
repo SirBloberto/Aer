@@ -12,7 +12,7 @@ Source map, one job per directory:
 | `source/core/` | `vm.{c,h}` (bytecode format and the VM, including `vm_run_slice()`, the bounded-instruction-count entry point the scheduler drives), `value.h` (the one value type and its accessors), `gc.c`, `chunk.c` |
 | `source/compiler/` | `lexer.c`, `parser.c` -- the whole front end |
 | `source/stdlib/` | `aer_*.c` built-in modules (math/random/string/time/json/collection/net/regex/actor/scheduler/io) and `aer_abi.h`, their wire identities |
-| `source/runtime/` | `aer_module.c` (import) and `aer_host.c` (host embedding) |
+| `source/host/` | `aer_module.c` (import) and `aer_host.c` (host embedding) |
 | `source/repl/` | `terminal.{c,h}` -- raw-mode interactive terminal |
 | `source/debug/` | `disasm.c` -- disassembler, in every build; `--debug-path` dumps it after a run |
 | `source/utilities/` | `pool` (allocator), `hashtable`, `strbuf`, `error` |

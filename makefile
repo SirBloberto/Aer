@@ -74,15 +74,17 @@ endif
 # This stamp changes whenever the setting does, and every object depends on it.
 THREAD_STAMP := object/.threads-$(if $(filter-out 0,$(THREADS)),on,off)
 
-FLAGS := -O2 -g -flto -Wall -Wextra -DAER_BUILD_REV=\"$(BUILD_REV)\" $(PIN_FLAGS) $(ARCH_FLAGS) $(THREAD_FLAGS) -I include -I source -I source/compiler -I source/core -I source/debug -I source/repl -I source/runtime -I source/stdlib -I source/utilities
+SRC_DIRS := compiler core debug host repl stdlib utilities
+INCLUDES := -I include -I source $(addprefix -I source/,$(SRC_DIRS))
+FLAGS := -O2 -g -flto -Wall -Wextra -DAER_BUILD_REV=\"$(BUILD_REV)\" $(PIN_FLAGS) $(ARCH_FLAGS) $(THREAD_FLAGS) $(INCLUDES)
 
-SOURCE := $(wildcard source/*.c source/compiler/*.c source/core/*.c source/debug/*.c source/repl/*.c source/runtime/*.c source/stdlib/*.c source/utilities/*.c)
+SOURCE := $(wildcard source/*.c $(addsuffix /*.c,$(addprefix source/,$(SRC_DIRS))))
 OBJECT := $(patsubst source/%.c,object/%.o,$(SOURCE))
 
 # Deliberately coarse: any header edit rebuilds everything. -MMD/-MP was tried and genuinely does
 # not work under GNU Make on MSYS2, and a stale .o with a mismatched struct layout links cleanly
 # and misbehaves silently at runtime.
-HEADERS := $(wildcard include/*.h source/*.h source/compiler/*.h source/core/*.h source/core/*.def source/debug/*.h source/repl/*.h source/runtime/*.h source/stdlib/*.h source/utilities/*.h)
+HEADERS := $(wildcard include/*.h source/*.h $(foreach d,$(SRC_DIRS),source/$(d)/*.h source/$(d)/*.def))
 
 # Everything except main.c — conflicts with test-embed's/test-smoke's own main().
 LIBOBJECT := $(filter-out object/main.o,$(OBJECT))
