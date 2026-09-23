@@ -117,7 +117,7 @@ def dangling_enum_comments():
     then reads as documentation for whichever opcode follows. Three of these had accumulated when the
     opcodes were still an enum in vm.h, one describing an opcode removed the same day. The file's own
     header block is exempt."""
-    path = os.path.join(ROOT, "source", "core", "opcodes.def")
+    path = os.path.join(ROOT, "source", "vm", "opcodes.def")
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as fh:
@@ -162,7 +162,7 @@ def dangling_label_comments():
     by two separate comment blocks. Deleting an opcode's handler leaves its paragraph behind, where
     it then reads as documentation for whichever label follows. Two of these were found by hand, one
     describing a struct cast sitting above lbl_dict_new."""
-    path = os.path.join(ROOT, "source", "core", "vm.c")
+    path = os.path.join(ROOT, "source", "vm", "vm.c")
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8", errors="replace") as fh:
@@ -262,7 +262,7 @@ def main():
     if stale:
         print("Comment blocks in opcodes.def that document no opcode:\n")
         for line, text in stale:
-            print("  source/core/opcodes.def:%d  %s" % (line, text))
+            print("  source/vm/opcodes.def:%d  %s" % (line, text))
         print("\nAn opcode was deleted and its paragraph stayed. Delete it, or attach it to the")
         print("opcode it actually describes.")
         return 1
@@ -271,7 +271,7 @@ def main():
     if orphaned:
         print("Dispatch labels in vm.c preceded by two separate comment blocks:\n")
         for line, label, text in orphaned:
-            print("  source/core/vm.c:%d  %s  above %s" % (line, text, label))
+            print("  source/vm/vm.c:%d  %s  above %s" % (line, text, label))
         print("\nThe first block almost certainly documents a handler that no longer follows it.")
         print("Delete it, or merge it into the comment for the label it actually describes.")
         return 1

@@ -35,11 +35,11 @@ NEVER_EMITTED = {"OP_AND", "OP_OR", "OP_PIPE", "OP_PRINT_REPL"}
 
 
 def declared_opcodes():
-    """Every opcode row in source/core/opcodes.def."""
-    src = open(os.path.join(ROOT, "source", "core", "opcodes.def"), encoding="utf-8").read()
+    """Every opcode row in source/vm/opcodes.def."""
+    src = open(os.path.join(ROOT, "source", "vm", "opcodes.def"), encoding="utf-8").read()
     names = re.findall(r"^OPCODE\(([A-Z0-9_]+),", src, re.M)
     if not names:
-        sys.exit("could not find any OPCODE rows in source/core/opcodes.def")
+        sys.exit("could not find any OPCODE rows in source/vm/opcodes.def")
     return {"OP_" + n for n in names}
 
 

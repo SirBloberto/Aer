@@ -55,7 +55,7 @@ def declared_opcodes():
     alongside real opcodes would report them at zero dispatches forever and invite someone to "cut" a
     table slot they do not occupy. Their opcodes.def rows name the handler `none`.
     """
-    src = open(os.path.join(ROOT, "source", "core", "opcodes.def"), encoding="utf-8").read()
+    src = open(os.path.join(ROOT, "source", "vm", "opcodes.def"), encoding="utf-8").read()
     rows = re.findall(r"^OPCODE\(([A-Z0-9_]+), ([a-z0-9_]+),", src, re.M)
     return ["OP_" + name for name, handler in rows if handler != "none"]
 

@@ -1251,7 +1251,7 @@ An embedding host can add its own modules the same way — see [Embedding](#embe
 **`scheduler.run()` uses real OS threads.** There is still no `async`/`await` or event loop, and any
 one AER call stack is a single synchronous dispatch loop — but **multiple independent `VM`+`Chunk`
 pairs can coexist in one process** (file-based `import` already relies on this — each imported file
-gets its own), each owning its own GC-managed heap (`VmHeap`, `source/core/vm.h`/`vm.c`), allocating
+gets its own), each owning its own GC-managed heap (`VmHeap`, `source/vm/vm.h`/`vm.c`), allocating
 and collecting entirely on its own with no shared pools. That heap independence is what makes
 running two of them at once possible at all, and `scheduler.run()` does exactly that: with more than
 one queued task on a multi-core machine it hands each task to a worker thread.
@@ -1856,7 +1856,7 @@ needs no equivalent parse-time recognition of its own — it's just an ordinary 
 runs the imported file's code synchronously, in an isolated `Chunk`/`VM`, before the importing
 file's own parse continues, which is why it's restricted to the top level of a file.
 
-### VM (`source/core/vm.c`)
+### VM (`source/vm/vm.c`)
 
 A **register-based** virtual machine with a computed-goto dispatch loop (direct-threaded — each
 instruction jumps straight to the next handler instead of looping back through a `switch`). Every
@@ -1871,7 +1871,7 @@ operands, small tags) directly into the high bits of one 64-bit word alongside t
 with a flag bit set, an index into the chunk's constant pool — one opcode per operator instead of a
 family of opcodes per operand-kind combination. A handful of opcodes (`OP_LOADK`, `OP_DEFINE_STRUCT`,
 `OP_CALL_MODULE`) can't fit every operand in one word and read one or more trailing plain words
-instead, the same convention `source/debug/disasm.c`'s decoder follows.
+instead, the same convention `source/vm/disasm.c`'s decoder follows.
 
 **Registers, not a scope chain:** every function call gets its own contiguous window into one
 shared, bump-pointer `VM.register_stack` (`CallFrame.registers`/`frame_size`) — pushing a frame is
@@ -2152,7 +2152,7 @@ objects a write barrier caught being mutated to hold a young reference — and o
 cells; old cells are presumed live and left untouched, which is what keeps minor collections cheap.
 A *major* collection (run periodically, after a fixed number of minor ones) traces the same roots
 with no remembered set needed and sweeps both generations. The seven pools live on a `VmHeap`
-embedded in each `VM` (`source/core/vm.h`), not a process-global — the main VM, every file-module's
+embedded in each `VM` (`source/vm/vm.h`), not a process-global — the main VM, every file-module's
 own VM, and every actor's own VM (`import`/`actor.spawn` both run their target in a fully separate
 `Chunk`+`VM` — see [Modularity](#modularity)) each collect only their own heap. A collection
 triggered by one VM's allocation pressure never marks or sweeps any other VM's cells.
@@ -2215,14 +2215,14 @@ allowlisting, neither of which exist today.
 | `source/runtime/value_ops.h/c` | What the operators mean on values: truthiness, arithmetic and comparison across types, `in`, slicing bounds and casts |
 | `source/compiler/lexer.h/c` | Source text → token stream, indent/dedent tracking |
 | `source/compiler/parser.h/c` | Single-pass compiler: tokens → register-based bytecode, escape processing |
-| `source/core/vm.h/c` | Bytecode chunk, register-based VM (`CallFrame`/bump-pointer register stack), struct-type registry, computed-goto dispatch loop, built-ins |
-| `source/core/opcodes.def` | Every opcode, one row each: name, handler, which slot fields are stored doubled, description and operand layout. The `Opcode` enum, the dispatch table and the disassembler's table are all generated from it |
-| `source/core/opcodes.h` | The `Opcode` enum, generated from `opcodes.def`, for code that names opcodes without needing the VM |
-| `source/core/chunk.c` | Bytecode chunk: code, line table, constant pool, and the function, struct-shape and import tables |
+| `source/vm/vm.h/c` | The register-based VM: `CallFrame` and the bump-pointer register stack, one handler function per opcode tail-calling the next, calls and specialization, built-ins |
+| `source/vm/opcodes.def` | Every opcode, one row each: name, handler, which slot fields are stored doubled, description and operand layout. The `Opcode` enum, the dispatch table and the disassembler's table are all generated from it |
+| `source/vm/opcodes.h` | The `Opcode` enum, generated from `opcodes.def`, for code that names opcodes without needing the VM |
+| `source/vm/chunk.c` | Bytecode chunk: code, line table, constant pool, and the function, struct-shape and import tables |
 | `source/runtime/gc.c` | Generational mark-sweep collector: root marking, write barrier, remembered set, card scan |
 | `source/runtime/heap_ref.c` | Which VM's heap is active, for allocations with no VM in scope |
 | `source/runtime/value_format.h/c` | Converting any `AerVal` to text, for `print`, interpolation and `string()`; type names and operator symbols for error messages; value equality |
-| `source/debug/disasm.c` | Bytecode disassembler and memory report behind `--debug-path` |
+| `source/vm/disasm.c` | Bytecode disassembler and memory report behind `--debug-path` |
 | `source/stdlib/aer_stdlib.h` | Declares the entire native-module surface (math/random/string/time/json/collection/net/regex/actor/scheduler/io) — one header for a fixed, closed set |
 | `source/stdlib/aer_abi.h` | The standard library's wire identities: module, function and builtin ids, generated from one X-macro table |
 | `source/stdlib/aer_stdlib.c` | `aer_stdlib_is_native_module()` — the hardcoded module names `import` accepts |
