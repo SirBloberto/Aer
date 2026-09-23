@@ -3,6 +3,7 @@
 #include "aer_stdlib.h"
 #include "error.h"
 #include "hashtable.h"
+#include "typed_array.h"
 
 /* qsort() comparator for sort() -- only called once the caller has verified every element is TYPE_STRING
    or every element is numeric, so no type-mismatch case needs handling here. */

@@ -6,6 +6,7 @@
 #include "aer_module.h"
 #include "aer_stdlib.h"
 #include "error.h"
+#include "typed_array.h"
 
 /* A message is bytes either way. A typed array carries its element kind and count alongside them,
    so the receiving side can rebuild one instead of parsing a string -- its buffer holds numbers and

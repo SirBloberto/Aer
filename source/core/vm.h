@@ -153,10 +153,6 @@ static inline uint16_t pack_rk16(int rk) {
    vm_run_slice's (see 5.18). */
 #define INTERP_KEY_MAX 256
 
-/* 1 for boolean, 4 for int32/float32, 8 for int64/float64. Not file-static: gc.c's free_typed_array
-   recomputes a dying array's buffer size from it. */
-unsigned int vm_typed_elem_width(TypedArrayElemKind kind);
-
 /* Which runtime shape a shape-sensitive parameter arrived as. STRUCT and PACKED_ARRAY carry a
    structural guarantee -- a struct's shape never changes, a packed array cannot hold mixed shapes
    -- so they need no per-access recheck. ARRAY_OF_STRUCTS carries none: a plain array may hold
@@ -564,9 +560,6 @@ AerArray* vm_new_array(unsigned int capacity);
    field is still garbage; grow is for an existing one. */
 void vm_array_alloc_items(AerArray* a, unsigned int capacity);
 void vm_array_grow_items(AerArray* a, unsigned int capacity);
-
-/* A zeroed typed array as a value -- exposed for actor.receive(). */
-AerVal vm_new_typed_array_val(TypedArrayElemKind kind, unsigned int count);
 
 /* Same, for AerDict -- exposed for json.decode(). The caller must zero-init `map` itself. */
 AerDict* vm_new_dict(void);

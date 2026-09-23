@@ -2,6 +2,7 @@
 #include "error.h"
 #include "hashtable.h"
 #include "pool.h"
+#include "typed_array.h"
 #include "vm.h"
 
 /* Generational GC -- write barrier and remembered set                   */
