@@ -1,5 +1,5 @@
-# Includes that reach a layer above their own, on purpose or not yet fixed. check_layers.py fails on
-# any new one and reports any listed one that has gone. Each group says why it is here.
+# Layer crossings that exist on purpose or are not yet fixed. check_layers.py fails on any new one
+# and reports any listed one that has gone. Each group says why it is here.
 
 # The collector's roots are VM frames; there is no heap to trace without the VM that owns it.
 source/runtime/gc.c -> vm.h

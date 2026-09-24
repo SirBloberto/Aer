@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fails when a source file includes a header from a layer above its own.
+"""Fails when a source file crosses a layer boundary.
 
 The directories under source/ are layers, lowest first. A file may include headers from its own
 layer or any layer below it, never above: that is what lets each layer be read, and changed, in
@@ -7,6 +7,11 @@ terms of the ones beneath it alone. include/aer.h is the published contract and 
 anywhere, and so may opcodes.h: it is one enum with no dependencies, and the operators the runtime
 implements are named by the same values. A header named *_internal.h belongs to its directory and
 may only be included from it.
+
+Two jobs each have one owner. Only runtime/ allocates from the heap, so an object's layout and the
+invariants of a freshly built one live in one place; the VM asks the runtime to build what it
+needs. Only compiler/ and bytecode/ write bytecode, so what a compiled program looks like is
+decided where it is compiled.
 
 Some upward includes are deliberate -- the collector's roots are VM frames, for one -- and each is
 listed in tools/layers_baseline.txt with the reason. A new one fails; a listed one that is gone is
@@ -24,6 +29,12 @@ BASELINE = os.path.join(ROOT, "tools", "layers_baseline.txt")
 VOCABULARY = {"opcodes.h"}
 
 LAYERS = ["utilities", "runtime", "bytecode", "compiler", "vm", "stdlib", "host", "repl", "cli", "tools"]
+
+# (what the job is, the pattern that does it, the layers allowed to)
+OWNERS = [
+    ("allocates from the heap", re.compile(r"\bheap_alloc\("), {"runtime"}),
+    ("writes bytecode", re.compile(r"\bchunk_emit\(|->code\[[^\]]*\]\s*=[^=]"), {"compiler", "bytecode"}),
+]
 
 
 def layer_of(rel):
@@ -44,6 +55,10 @@ def sources():
                     yield os.path.relpath(path, ROOT).replace(os.sep, "/"), path
 
 
+def without_comments(text):
+    return re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
+
+
 def main():
     files = dict(sources())
     home = {}
@@ -54,8 +69,8 @@ def main():
     for rel, path in files.items():
         mine = layer_of(rel)
         with open(path, encoding="utf-8", errors="replace") as fh:
-            includes = re.findall(r'^#include "([^"]+)"', fh.read(), re.M)
-        for inc in includes:
+            text = fh.read()
+        for inc in re.findall(r'^#include "([^"]+)"', text, re.M):
             target = home.get(inc)
             if target is None:
                 continue
@@ -66,6 +81,10 @@ def main():
                 continue
             elif mine in LAYERS and theirs in LAYERS and LAYERS.index(theirs) > LAYERS.index(mine):
                 found.add("%s -> %s" % (rel, inc))
+        code = without_comments(text)
+        for job, pattern, owners in OWNERS:
+            if mine not in owners and pattern.search(code):
+                found.add("%s %s" % (rel, job))
 
     allowed = set()
     if os.path.exists(BASELINE):
@@ -83,10 +102,10 @@ def main():
             print("  " + edge)
         print()
     if new:
-        print("Includes that reach a layer above their own (%s, lowest first):\n" % " < ".join(LAYERS))
+        print("Layer boundaries crossed (%s, lowest first):\n" % " < ".join(LAYERS))
         for edge in new:
             print("  " + edge)
-        print("\nMove the code to the layer it belongs in, or pass what it needs down from above.")
+        print("\nMove the code to the layer that owns it, or pass what it needs down from above.")
         return 1
     print("layer check: clean (%d deliberate exception(s) in tools/layers_baseline.txt)" % len(allowed))
     return 0

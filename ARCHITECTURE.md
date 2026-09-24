@@ -3621,6 +3621,8 @@ still needs.
 
 ## Contributing conventions
 
+**Layers.** `source/`'s directories are layers; `make check-layers` enforces which may depend on which, and which one owns heap allocation and bytecode. `tools/check_layers.py` says why, and `tools/layers_baseline.txt` lists each deliberate exception with its reason.
+
 ### Comments
 
 Default to no comment. When one is genuinely needed, default to a single line. Reserve multi-line
