@@ -7,10 +7,8 @@
 #include "strbuf.h"
 #include "value.h"
 
-/* Named rather than included: this header is for anything that formats a value, which should not need
-   the whole VM. */
+/* Named rather than included: formatting a value should not need the bytecode layer. */
 typedef struct Chunk Chunk;
-typedef struct VM VM;
 
 /* Formats a real guaranteeing a decimal point/exponent/nan-inf marker survives -- bare "%g"
    prints 42.0 as "42", which flips to integer through the JSON round-trip. The one shared site
@@ -44,6 +42,6 @@ const char* vm_type_name(Chunk* c, AerVal v);
 const char* binop_symbol(Opcode op);
 
 /* The value as a string, formatting anything that is not one already. */
-AerVal vm_to_str(VM* vm, AerVal v);
+AerVal vm_to_str(Chunk* c, AerVal v);
 
 #endif

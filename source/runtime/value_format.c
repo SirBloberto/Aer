@@ -1,10 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "chunk.h"
 #include "error.h"
 #include "hashtable.h"
 #include "strbuf.h"
-#include "vm.h"
 
 const char* const aer_value_type_names[TYPE_STRUCT] = {"null",   "boolean",  "integer", "float",
                                                        "string", "function", "array",   "hashtable"};
@@ -289,7 +289,7 @@ const char* binop_symbol(Opcode op) {
     }
 }
 
-AerVal vm_to_str(VM* vm, AerVal v) {
+AerVal vm_to_str(Chunk* c, AerVal v) {
     if (aer_type(v) == TYPE_STRING)
         return v;
 
@@ -304,6 +304,6 @@ AerVal vm_to_str(VM* vm, AerVal v) {
        buffer as-is. */
     StrBuf sb;
     strbuf_init(&sb);
-    vm_format_value(vm->chunk, v, false, &sb);
+    vm_format_value(c, v, false, &sb);
     return aer_make_string(sb.buf, (unsigned int)sb.len);
 }

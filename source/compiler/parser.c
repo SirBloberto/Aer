@@ -5858,11 +5858,7 @@ static void parse_statement(Chunk* c) {
              "break/continue, function/struct defs, return, imports, and calls are supported)");
 }
 
-/* Isolates a fresh, independent program -- call exactly once per independent compile (a
-   one-shot file run, a REPL session's startup, or one test case), never between statements of
-   the same program. */
-/* See parser.h for why this exists rather than tests reading a register index directly. */
-bool parser_read_variable(VM* vm, Chunk* c, const char* name, AerVal* out) {
+bool parser_variable_register(Chunk* c, const char* name, int* out_reg) {
     for (int i = P.var_count - 1; i >= 0; i--) {
         AerVal entry = c->pool[P.var_names[i]];
         if (aer_type(entry) != TYPE_STRING)
@@ -5870,12 +5866,15 @@ bool parser_read_variable(VM* vm, Chunk* c, const char* name, AerVal* out) {
         AerString* s = aer_as_string(entry);
         if (strlen(name) != s->length || memcmp(s->data, name, s->length) != 0)
             continue;
-        *out = vm->call_stack[vm->call_depth].registers[P.var_regs[i]];
+        *out_reg = P.var_regs[i];
         return true;
     }
     return false;
 }
 
+/* Isolates a fresh, independent program -- call exactly once per independent compile (a
+   one-shot file run, a REPL session's startup, or one test case), never between statements of
+   the same program. */
 void parser_reset(void) {
     reg_reset();
     peephole_window_reset();

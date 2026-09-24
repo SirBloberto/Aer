@@ -117,7 +117,7 @@ def dangling_enum_comments():
     then reads as documentation for whichever opcode follows. Three of these had accumulated when the
     opcodes were still an enum in vm.h, one describing an opcode removed the same day. The file's own
     header block is exempt."""
-    path = os.path.join(ROOT, "source", "vm", "opcodes.def")
+    path = os.path.join(ROOT, "source", "bytecode", "opcodes.def")
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as fh:
@@ -262,7 +262,7 @@ def main():
     if stale:
         print("Comment blocks in opcodes.def that document no opcode:\n")
         for line, text in stale:
-            print("  source/vm/opcodes.def:%d  %s" % (line, text))
+            print("  source/bytecode/opcodes.def:%d  %s" % (line, text))
         print("\nAn opcode was deleted and its paragraph stayed. Delete it, or attach it to the")
         print("opcode it actually describes.")
         return 1

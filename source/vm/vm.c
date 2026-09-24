@@ -130,7 +130,6 @@ static void ensure_io_registered(void) {
 
 bool aer_io_enabled = true;
 bool aer_net_enabled = true;
-bool aer_import_enabled = true;
 
 void aer_set_io_enabled(bool enabled) {
     aer_io_enabled = enabled;

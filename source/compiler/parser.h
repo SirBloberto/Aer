@@ -1,7 +1,7 @@
 #ifndef PARSER_H
 #define PARSER_H
 
-#include "vm.h"
+#include "chunk.h"
 
 /* The compiler: lexer output in, bytecode out. tests/smoke_test.c also drives the emitters
    directly to hand-build bytecode. */
@@ -65,10 +65,9 @@ void emit_field_set(Chunk* c, int struct_reg, unsigned int field_name_pool_idx, 
 /* `[value; count]` repeat-literal construction; rk_count is RK-encoded. */
 void emit_array_repeat(Chunk* c, int dest_reg, int fill_reg, int narrow_flag, int rk_count);
 
-/* A variable's value by name, from wherever the compiler placed it (boxed register, raw int slot,
-   or raw real slot); false if never assigned. For tests: which storage a variable earns moves with
-   optimization work, so a test reading a fixed register index asserts on a non-contract. */
-bool parser_read_variable(VM* vm, Chunk* c, const char* name, AerVal* out);
+/* The register a named variable lives in; false if it was never assigned. For tests: which slot a
+   variable earns moves with optimization work, so a test hardcoding an index asserts a non-contract. */
+bool parser_variable_register(Chunk* c, const char* name, int* out_reg);
 
 /* Reset every persistent compile table -- ONCE per independent program, never between
    statements of the same session (REPL persistence depends on it). */

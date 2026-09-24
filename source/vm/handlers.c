@@ -59,7 +59,7 @@ static AerVal vm_interp_build(VM* vm, const AerVal* parts, unsigned int count) {
         } else if (!aer_format_scalar(v, scratch[i], sizeof(scratch[i]), &piece[i], &piece_len[i])) {
             /* vm_to_str allocates; hold the result so a collection triggered by a later part cannot
                reclaim bytes this one still points at. */
-            AerVal s = vm_to_str(vm, v);
+            AerVal s = vm_to_str(vm->chunk, v);
             spilled[spill_count++] = s;
             piece[i] = aer_as_string(s)->data;
             piece_len[i] = aer_as_string(s)->length;
@@ -2620,7 +2620,7 @@ HANDLER(unary)
         case OP_TO_STR:
             /* The only allocating case -- NEGATE/NOT/BITWISE_NOT only ever produce plain tagged-union
                values. */
-            *result = vm_to_str(vm, v);
+            *result = vm_to_str(c, v);
             gc_maybe_collect(vm);
             break;
         default: *result = aer_null(); break;

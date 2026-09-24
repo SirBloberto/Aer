@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include "hashtable.h"
 #include "pool.h"
 #include "value.h"
@@ -133,5 +134,8 @@ unsigned int gc_count_live_cells(VmHeap* heap);
 
 /* Whole-heap teardown, not a sweep: frees every live cell's payload regardless of mark state. */
 void gc_finalize_all_pools(VmHeap* heap);
+
+/* Byte-accurate per-pool memory breakdown. */
+void aer_debug_memory_report(FILE* out);
 
 #endif

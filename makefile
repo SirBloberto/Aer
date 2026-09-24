@@ -74,7 +74,7 @@ endif
 # This stamp changes whenever the setting does, and every object depends on it.
 THREAD_STAMP := object/.threads-$(if $(filter-out 0,$(THREADS)),on,off)
 
-SRC_DIRS := compiler host repl runtime stdlib utilities vm
+SRC_DIRS := bytecode compiler host repl runtime stdlib utilities vm
 INCLUDES := -I include -I source $(addprefix -I source/,$(SRC_DIRS))
 FLAGS := -O2 -g -flto -Wall -Wextra -DAER_BUILD_REV=\"$(BUILD_REV)\" $(PIN_FLAGS) $(ARCH_FLAGS) $(THREAD_FLAGS) $(INCLUDES)
 

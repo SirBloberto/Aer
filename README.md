@@ -1871,7 +1871,7 @@ operands, small tags) directly into the high bits of one 64-bit word alongside t
 with a flag bit set, an index into the chunk's constant pool — one opcode per operator instead of a
 family of opcodes per operand-kind combination. A handful of opcodes (`OP_LOADK`, `OP_DEFINE_STRUCT`,
 `OP_CALL_MODULE`) can't fit every operand in one word and read one or more trailing plain words
-instead, the same convention `source/vm/disasm.c`'s decoder follows.
+instead, the same convention `source/bytecode/disasm.c`'s decoder follows.
 
 **Registers, not a scope chain:** every function call gets its own contiguous window into one
 shared, bump-pointer `VM.register_stack` (`CallFrame.registers`/`frame_size`) — pushing a frame is
@@ -2219,15 +2219,16 @@ allowlisting, neither of which exist today.
 | `source/vm/handlers.c` | One function per opcode, each tail-calling the next through the dispatch table, and `vm_run_slice` |
 | `source/vm/call.c` | Calls: frame setup and growth, calls through a function value, builtins, which specialization a call site enters, and native and file-module calls |
 | `source/vm/vm_internal.h` | What those three files share and nothing outside the VM needs |
-| `source/vm/opcodes.def` | Every opcode, one row each: name, handler, which slot fields are stored doubled, description and operand layout. The `Opcode` enum, the dispatch table and the disassembler's table are all generated from it |
-| `source/vm/opcodes.h` | The `Opcode` enum, generated from `opcodes.def`, for code that names opcodes without needing the VM |
-| `source/vm/chunk.c` | Bytecode chunk: code, line table, constant pool, and the function, struct-shape and import tables |
+| `source/bytecode/opcodes.def` | Every opcode, one row each: name, handler, which slot fields are stored doubled, description and operand layout. The `Opcode` enum, the dispatch table and the disassembler's table are all generated from it |
+| `source/bytecode/opcodes.h` | The `Opcode` enum, generated from `opcodes.def`, for code that names opcodes without needing the VM |
+| `source/bytecode/chunk.h/c` | The compiled program: code, line table, constant pool, and the function, struct-shape and import tables |
+| `source/bytecode/encoding.h` | How an instruction is laid out in its 32-bit words: operand fields, RK constants, doubled slot fields, frame limits |
 | `source/runtime/gc.c` | Generational mark-sweep collector: root marking, write barrier, remembered set, card scan |
 | `source/runtime/heap_ref.c` | Which VM's heap is active, for allocations with no VM in scope |
 | `source/runtime/value_format.h/c` | Converting any `AerVal` to text, for `print`, interpolation and `string()`; type names and operator symbols for error messages; value equality |
-| `source/vm/disasm.c` | Bytecode disassembler and memory report behind `--debug-path` |
+| `source/bytecode/disasm.c` | Bytecode disassembler and memory report behind `--debug-path` |
 | `source/stdlib/aer_stdlib.h` | Declares the entire native-module surface (math/random/string/time/json/collection/net/regex/actor/scheduler/io) — one header for a fixed, closed set |
-| `source/stdlib/aer_abi.h` | The standard library's wire identities: module, function and builtin ids, generated from one X-macro table |
+| `source/bytecode/aer_abi.h` | The standard library's wire identities: module, function and builtin ids, generated from one X-macro table |
 | `source/stdlib/aer_stdlib.c` | `aer_stdlib_is_native_module()` — the hardcoded module names `import` accepts |
 | `source/stdlib/aer_math.c` / `aer_random.c` / `aer_string.c` / `aer_time.c` / `aer_collection.c` / `aer_net.c` / `aer_regex.c` | One file per hardcoded native module, dispatched by `vm.c`'s `OP_CALL_MODULE` switch |
 | `source/stdlib/aer_json.c` | `json` module — encode/decode, dispatched the same way as the modules above |

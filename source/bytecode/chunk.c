@@ -3,13 +3,15 @@
 #include "aer_host.h"
 #include "aer_module.h"
 #include "aer_stdlib.h"
+#include "chunk.h"
 #include "error.h"
 #include "hashtable.h"
-#include "vm.h"
 
 /* Its own, not a VM's: a Chunk can outlive any one VM. Per-chunk rather than process-global so two
    actors, which own separate chunks, cannot reach the same pools -- runtime specialization calls
    chunk_add_pool from inside h_call, so a shared set would be written from two threads at once. */
+bool aer_import_enabled = true;
+
 void chunk_init(Chunk* c) {
     memset(c, 0, sizeof(*c));
     hashtable_pools_init(&c->name_index_pools);

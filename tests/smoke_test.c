@@ -33,9 +33,9 @@ static void check(bool cond, const char* what) {
    raw_ints[]/raw_reals[] and 54 assertions began reading unrelated, never-written registers. Which
    storage a variable earns is the compiler's choice to change, so tests ask by name. */
 static AerVal var_of(VM* vm, Chunk* c, const char* name) {
-    AerVal v;
-    if (!parser_read_variable(vm, c, name, &v)) return aer_null();
-    return v;
+    int reg;
+    if (!parser_variable_register(c, name, &reg)) return aer_null();
+    return register_get(vm, reg);
 }
 
 /* M5 slice 9 — compares a v3 register's string value against a C string, for interpolation tests. */
