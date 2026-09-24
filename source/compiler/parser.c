@@ -109,6 +109,7 @@ typedef struct {
     /* Counts backpatches: a jump landing after the last instruction would make a rewrite of it
        reachable on paths the original was not. */
     unsigned int patch_epoch;
+    unsigned int last_patch_target;
 } PeepholeWindow;
 
 /* An index read's element facts, handed to the assignment that consumes its result. Keyed on the
@@ -608,6 +609,7 @@ unsigned int emit_jump_if_false_reg(Chunk* c, int reg) {
 void patch_jump(Chunk* c, unsigned int patch_offset, unsigned int target) {
     c->code[patch_offset] = (uint32_t)(int32_t)((int64_t)target - (int64_t)patch_offset - 1);
     P.peep.patch_epoch++;
+    P.peep.last_patch_target = target;
 }
 
 /* A call's callee_offset is an absolute function entry, not intra-function control flow. */
@@ -4057,11 +4059,14 @@ static void parse_loop_body_rotated(Chunk* c, unsigned int body_top, unsigned in
     unsigned int cond_pos = c->count;
     /* `counter += step` as the body's last act, tested by this very back-edge, is the while form of
        what a range-for gets from OP_ITER_RANGE_LOOP. Only without a `continue`: that jumps here, and
-       a fused bump would then run on a path the separate increment never reached. Read off the tail
-       rather than through last_instruction, which a compound `i += 1` never records. */
+       a fused bump would then run on a path the separate increment never reached. Nor when a jump
+       lands just past it, as a trailing `if` does: that would skip into the fused instruction's
+       operand. Read off the tail rather than through last_instruction, which a compound `i += 1`
+       never records. */
     unsigned int inc_at = c->count - 1;
     if (back_op == OP_RAW_LTE_INT_JUMP_IF_FALSE && c->count > 0 &&
-        P.loop_stack[P.loop_depth - 1].continue_patch_count == 0 && !(rhs & RK8_CONST_FLAG)) {
+        P.loop_stack[P.loop_depth - 1].continue_patch_count == 0 && !(rhs & RK8_CONST_FLAG) &&
+        P.peep.last_patch_target != c->count) {
         uint32_t w = c->code[inc_at];
         if ((Opcode)(w & 0xFF) == OP_RAW_ADD_INT && OPERAND_A(w) == OPERAND_B(w) &&
             (uint8_t)OPERAND_A(w) == rhs) {
