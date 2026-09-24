@@ -11,12 +11,12 @@ Source map, one job per directory:
 |---|---|
 | `source/bytecode/` | the contract between compiler and VM: `opcodes.def`/`opcodes.h`, `encoding.h`, `chunk.{c,h}`, `aer_abi.h` (module and builtin ids), `disasm.c` (in every build; `--debug-path` dumps it after a run) |
 | `source/vm/` | `vm.{c,h}` (VM types and lifecycle), `handlers.c` (one function per opcode, and `vm_run_slice()`, the bounded-instruction-count entry point the scheduler drives), `call.c`, `vm_internal.h` |
-| `source/runtime/` | `value.h` (the one value type and its accessors), `objects.{c,h}`, `heap.{c,h}`, `typed_array.{c,h}`, `value_ops.{c,h}`, `value_format.{c,h}`, `gc.c`, `heap_ref.c` -- the value and object layer the VM and the standard library share |
+| `source/runtime/` | `value.h` (the one value type and its accessors), `objects.{c,h}`, `heap.{c,h}`, `typed_array.{c,h}`, `value_ops.{c,h}`, `value_format.{c,h}`, `hashtable.{c,h}`, `gc.c`, `heap_ref.c` -- the value and object layer the VM and the standard library share |
 | `source/compiler/` | `lexer.c`, `parser.c` -- the whole front end |
 | `source/stdlib/` | `aer_*.c` built-in modules (math/random/string/time/json/collection/net/regex/actor/scheduler/io) and `aer_abi.h`, their wire identities |
 | `source/host/` | `aer_module.c` (import) and `aer_host.c` (host embedding) |
 | `source/repl/` | `terminal.{c,h}` -- raw-mode interactive terminal |
-| `source/utilities/` | `pool` (allocator), `hashtable`, `strbuf`, `error` |
+| `source/utilities/` | `pool` (allocator), `strbuf`, `error`, `aer_thread` -- nothing that knows what a value is |
 | `include/` | `aer.h`, and nothing else: the entire public surface |
 | `source/tools/` | `aer_fmt.c`, `aer_lsp.c` -- separate binaries, deliberately outside the library's own source wildcard so they never link into it |
 

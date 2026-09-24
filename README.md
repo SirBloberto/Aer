@@ -1914,7 +1914,7 @@ fields to lay out.
 
 **Collections:** `AerArray` and `AerDict` are heap-allocated structs held by pointer inside an
 `AerVal`. Assignment copies the pointer — all aliases share the same data. Arrays grow with doubling
-reallocation; hashtables use `source/utilities/hashtable.c`'s open-addressed hash table (FNV-1a, linear
+reallocation; hashtables use `source/runtime/hashtable.c`'s open-addressed hash table (FNV-1a, linear
 probing, size-classed slab pools for small key/bucket allocations — see below). A struct instance is
 an `AerArray` with a non-`NULL` `shape` pointer into the chunk's struct-type registry — same
 allocation and reference semantics as an ordinary array, with bracket/slice/append/delete rejected
@@ -1949,7 +1949,7 @@ import time; calling one of its functions later uses a small trampoline (`setup_
 arguments across the VM boundary and runs the module's own VM just far enough to execute that one
 call before returning control to the caller.
 
-### Hash table (`source/utilities/hashtable.c`)
+### Hash table (`source/runtime/hashtable.c`)
 
 FNV-1a hash, split into a small sparse array of open-addressed probe indices (linear probing,
 growing at 70% load) pointing into a dense array of the actual key/hash/payload entries, packed in
@@ -2237,7 +2237,7 @@ allowlisting, neither of which exist today.
 | `source/stdlib/aer_actor.h/c` | Independent long-lived VMs plus a host-side byte-string mailbox — spawn/call/send/receive, reachable from AER scripts via the `actor` module (whose script-facing entry point, like the `scheduler` module's, sits at the end of the same file) — see [Concurrency](#concurrency) |
 | `source/stdlib/aer_scheduler.c` | Cooperative round-robin scheduler over already-spawned actors, driving each queued task in bounded `vm_run_slice()` instruction budgets instead of to completion — see [Concurrency](#concurrency) |
 | `source/host/aer_host.h/c` | Host-registered native function registry (`aer_register_function`) — reached from AER the same way as `math`/`random`/`string` |
-| `source/utilities/hashtable.h/c` | FNV-1a open-addressing hash table backing every `AerDict` and `Chunk`'s own string-constant dedup table, with size-classed slab pools for small key/bucket allocations |
+| `source/runtime/hashtable.h/c` | FNV-1a open-addressing hash table backing every `AerDict` and `Chunk`'s own string-constant dedup table, with size-classed slab pools for small key/bucket allocations |
 | `source/utilities/pool.h/c` | Slab (bump/arena) allocator extended for the generational mark-sweep garbage collector — every pool-managed struct (`AerString`/`AerArray`/`AerDict`/`AerFunction`/`AerPackedArray`) carries its own one-byte GC state as its literal first field |
 | `source/utilities/error.h/c` | Error reporting with source location and column pointer; recoverable-error sink (callback or stderr), `aer_report_fatal` for genuinely unrecoverable conditions, `assert_failure_count` |
 | `source/utilities/strbuf.h/c` | Growable string buffer shared by value formatting and JSON encoding |

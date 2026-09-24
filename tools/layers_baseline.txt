@@ -1,0 +1,40 @@
+# Includes that reach a layer above their own, on purpose or not yet fixed. check_layers.py fails on
+# any new one and reports any listed one that has gone. Each group says why it is here.
+
+# The collector's roots are VM frames; there is no heap to trace without the VM that owns it.
+source/runtime/gc.c -> vm.h
+
+# The VM currently reporting errors is stored beside the current heap, to share its thread-local
+# storage. It is VM state and belongs in vm/.
+source/runtime/heap_ref.c -> vm.h
+
+# A struct's name is a constant-pool index, so naming a type needs the chunk. Fixed by Shape owning
+# its name string.
+source/runtime/value_format.c -> chunk.h
+
+# chunk_add_import decides whether an import names a native or host module. That decision belongs
+# to the compiler; the chunk should only record the import.
+source/bytecode/chunk.c -> aer_host.h
+source/bytecode/chunk.c -> aer_module.h
+source/bytecode/chunk.c -> aer_stdlib.h
+
+# The compiler emits OP_RAW_MATH_REAL for math functions that map a real to a real, and asks the math
+# module which those are. Fixed by that flag moving into aer_abi.h's function table.
+source/compiler/parser.c -> aer_stdlib.h
+
+# Reporting a compile error asks the lexer where the current token is. Fixed by the same position
+# callback error.c already takes for runtime errors.
+source/utilities/error.c -> lexer.h
+
+# The VM calls native and file modules: OP_CALL_MODULE's dispatch, host functions, and the io
+# module's registration at VM creation.
+source/vm/call.c -> aer_host.h
+source/vm/call.c -> aer_module.h
+source/vm/call.c -> aer_stdlib.h
+source/vm/handlers.c -> aer_stdlib.h
+source/vm/vm.c -> aer_stdlib.h
+
+# actor.spawn loads a file into a fresh VM, and io is registered as a host module -- both are host
+# services reached from a stdlib module.
+source/stdlib/aer_actor.c -> aer_module.h
+source/stdlib/aer_io.c -> aer_host.h

@@ -284,6 +284,10 @@ check-format:
 check-comments:
 	python3 tools/check_comments.py
 
+# Fails when a source file includes a header from a layer above its own; see the script's docstring.
+check-layers:
+	python3 tools/check_layers.py
+
 # Fails when an opcode has no test or benchmark that emits it. Needs a build, so it is not folded
 # into check-style (which must stay a source-only, no-build check).
 check-opcode-coverage: all
@@ -295,7 +299,7 @@ LUA ?= lua
 test-differential: all
 	python3 tools/check_differential.py --binary binary/aer$(EXE) --lua $(LUA)
 
-check-style: check-format check-comments
+check-style: check-format check-comments check-layers
 
 # Everything CI runs that needs no second toolchain. `make test` alone misses the C-level tests,
 # which is how a stale assertion in tests/smoke_test.c survived a green local run.

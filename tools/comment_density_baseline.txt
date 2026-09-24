@@ -41,8 +41,8 @@ source/utilities/aer_thread.c 0
 source/utilities/aer_thread.h 19
 source/utilities/error.c 2
 source/utilities/error.h 29
-source/utilities/hashtable.c 15
-source/utilities/hashtable.h 28
+source/runtime/hashtable.c 15
+source/runtime/hashtable.h 28
 source/utilities/pool.c 14
 source/utilities/pool.h 53
 source/utilities/strbuf.c 0
