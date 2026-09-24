@@ -59,20 +59,7 @@ void vm_array_grow_items(AerArray* a, unsigned int capacity) {
 }
 
 AerDict* vm_new_dict(void) {
-    VmHeap* heap = vm_require_current_heap();
-    AerDict* d = heap_alloc(heap, &heap->dict_pool);
-    /* Zeroed here, not left to each caller, so setting .pools below can't be wiped out by a
-       caller's own zeroing running afterward. */
-    memset(&d->map, 0, sizeof(d->map));
-    d->map.pools = &heap->dict_hash_pools;
-    /* pool_alloc only zeroes gc_state (byte 0) -- a reused cell's previous occupant's dirty_cards
-       pointer would otherwise survive as garbage; see vm_new_array's identical reasoning. */
-    d->dirty_cards = NULL;
-    d->dirty_cards_bytes = 0;
-    d->dirty_min_byte = (unsigned int)-1;
-    d->dirty_max_byte = 0;
-    d->dirty_all = false;
-    return d;
+    return heap_new_dict(vm_require_current_heap());
 }
 
 AerFunction* vm_new_function(void) {
@@ -114,3 +101,14 @@ AerVal vm_struct_field_read(AerStruct* s, unsigned int slot) {
    pair-iteration. False once exhausted -- the dense array has no holes, so this is a plain
    bounds check, not a scan. */
 
+AerPackedArray* heap_new_packed_array(VmHeap* heap, Shape* shape, unsigned int count) {
+    AerPackedArray* pa = heap_alloc(heap, &heap->packed_array_pool);
+    unsigned int element_size = shape->instance_bytes;
+    pa->count = count;
+    pa->shape = shape;
+    /* malloc(0) is implementation-defined -- skip it for a zero-count array; bounds checks
+       reject every later access anyway. */
+    pa->data = count > 0 ? xmalloc((size_t)count * (size_t)element_size) : NULL;
+    heap->young_bytes += (size_t)count * (size_t)element_size;
+    return pa;
+}

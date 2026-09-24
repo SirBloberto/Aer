@@ -1280,14 +1280,7 @@ HANDLER(dict_new)
     int dest_reg = (int)UNPACK_A(op_word);
     int pair_reg_base = (int)UNPACK_B(op_word);
     int pair_count = (int)UNPACK_C(op_word);
-    AerDict* d = heap_alloc(&vm->heap, &vm->heap.dict_pool);
-    memset(&d->map, 0, sizeof(d->map));
-    d->map.pools = &vm->heap.dict_hash_pools;
-    d->dirty_cards = NULL;
-    d->dirty_cards_bytes = 0;
-    d->dirty_min_byte = (unsigned int)-1;
-    d->dirty_max_byte = 0;
-    d->dirty_all = false;
+    AerDict* d = heap_new_dict(&vm->heap);
     if (pair_count > 0)
         hashtable_reserve(&d->map, (unsigned int)pair_count);
     for (int i = 0; i < pair_count; i++) {
@@ -1523,9 +1516,7 @@ HANDLER(struct_new)
         if (!vm_check_narrow_field_write(declared, shape->field_narrow[i], registers[arg_reg_base + i]))
             DISPATCH();
     }
-    AerStruct* s = heap_alloc(&vm->heap, struct_pool_for_size(&vm->heap, shape->instance_bytes));
-    s->shape = shape;
-    s->fields = (unsigned char*)s + sizeof(AerStruct);
+    AerStruct* s = heap_new_struct(&vm->heap, shape);
     /* The _at form, with the shape already in hand: vm_struct_field_write re-reads s->shape twice
        per field through a non-inlinable external call, and this loop runs for every field of every
        construction -- 8.19% of bench/binary_trees.aer sat in it. */
@@ -2277,13 +2268,7 @@ HANDLER(array_repeat)
            shape->instance_bytes as the real per-element stride, not a hardcoded 8-bytes-per-field
            assumption, so a mix of narrow and wide fields lays out correctly either way. */
         unsigned int element_size = shape->instance_bytes;
-        AerPackedArray* pa = heap_alloc(&vm->heap, &vm->heap.packed_array_pool);
-        pa->count = (unsigned int)count;
-        pa->shape = shape;
-        /* malloc(0) is implementation-defined -- skip it for a zero-count array; bounds checks
-           reject every later access anyway. */
-        pa->data = count > 0 ? xmalloc((size_t)count * (size_t)element_size) : NULL;
-        vm->heap.young_bytes += (size_t)count * (size_t)element_size;
+        AerPackedArray* pa = heap_new_packed_array(&vm->heap, shape, (unsigned int)count);
         /* Every eligible field is raw -- 8 bytes, or 4 if narrow (TYPE_ANY, the only field kind
            needing a full boxed AerVal, was already rejected above) -- so src->fields IS one
            element's worth of bytes at exactly instance_bytes, laid out identically to a packed
@@ -2309,10 +2294,7 @@ HANDLER(array_repeat)
         else
             kind = (aer_type(fill) == TYPE_INTEGER) ? TYPED_ELEM_INT64 : TYPED_ELEM_FLOAT64;
         unsigned int width = vm_typed_elem_width(kind);
-        AerTypedArray* ta = heap_alloc(&vm->heap, &vm->heap.typed_array_pool);
-        ta->count = (unsigned int)count;
-        ta->elem_kind = kind;
-        ta->data = count > 0 ? typed_array_data_alloc(&vm->heap, (size_t)count * width) : NULL;
+        AerTypedArray* ta = heap_new_typed_array(&vm->heap, kind, (unsigned int)count);
         for (int64_t e = 0; e < count; e++)
             vm_typed_elem_write(ta->data + (size_t)e * width, kind, fill);
         registers[dest_reg] = aer_typed_array_val(ta);

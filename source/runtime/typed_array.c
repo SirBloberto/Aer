@@ -192,14 +192,17 @@ unsigned char* typed_array_data_alloc(VmHeap* heap, size_t size) {
     return xmalloc(size);
 }
 
-AerTypedArray* vm_new_typed_array(TypedArrayElemKind kind, unsigned int count) {
-    VmHeap* heap = vm_require_current_heap();
+AerTypedArray* heap_new_typed_array(VmHeap* heap, TypedArrayElemKind kind, unsigned int count) {
     AerTypedArray* ta = heap_alloc(heap, &heap->typed_array_pool);
     ta->count = count;
     ta->elem_kind = kind;
     unsigned int width = vm_typed_elem_width(kind);
     ta->data = count > 0 ? typed_array_data_alloc(heap, (size_t)count * width) : NULL;
     return ta;
+}
+
+AerTypedArray* vm_new_typed_array(TypedArrayElemKind kind, unsigned int count) {
+    return heap_new_typed_array(vm_require_current_heap(), kind, count);
 }
 
 /* A zeroed typed array as a value -- exposed for actor.receive(), which rebuilds one from the raw

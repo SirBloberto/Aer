@@ -111,6 +111,33 @@ static inline AerArray* heap_new_array(VmHeap* heap, unsigned int capacity) {
     return a;
 }
 
+/* An empty dict on `heap`. Every field is set: pool_alloc zeroes only gc_state, and a reused cell's
+   stale dirty_cards pointer would otherwise survive. */
+static inline AerDict* heap_new_dict(VmHeap* heap) {
+    AerDict* d = heap_alloc(heap, &heap->dict_pool);
+    memset(&d->map, 0, sizeof(d->map));
+    d->map.pools = &heap->dict_hash_pools;
+    d->dirty_cards = NULL;
+    d->dirty_cards_bytes = 0;
+    d->dirty_min_byte = (unsigned int)-1;
+    d->dirty_max_byte = 0;
+    d->dirty_all = false;
+    return d;
+}
+
+/* A struct of `shape` on `heap`, its fields inline in the same cell right after the header, and not
+   yet written. */
+static inline AerStruct* heap_new_struct(VmHeap* heap, Shape* shape) {
+    AerStruct* s = heap_alloc(heap, struct_pool_for_size(heap, shape->instance_bytes));
+    s->shape = shape;
+    s->fields = (unsigned char*)s + sizeof(AerStruct);
+    return s;
+}
+
+/* `count` elements of `shape` back to back at shape->instance_bytes each, not yet written; the
+   element data counts toward the next collection. */
+AerPackedArray* heap_new_packed_array(VmHeap* heap, Shape* shape, unsigned int count);
+
 static inline bool vm_dict_next_key(AerDict* d, int64_t* idx, AerVal* out_key) {
     if ((uint64_t)*idx >= d->map.count)
         return false;

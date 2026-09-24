@@ -23,15 +23,7 @@ AerVal vm_default_value(VM* vm, AerVal dflt) {
     if (aer_type(dflt) == TYPE_ARRAY && !aer_as_array(dflt)->shape)
         return aer_array_val(heap_new_array(&vm->heap, 0));
     if (aer_type(dflt) == TYPE_DICT) {
-        AerDict* d = heap_alloc(&vm->heap, &vm->heap.dict_pool);
-        memset(&d->map, 0, sizeof(d->map));
-        d->map.pools = &vm->heap.dict_hash_pools;
-        d->dirty_cards = NULL;
-        d->dirty_cards_bytes = 0;
-        d->dirty_min_byte = (unsigned int)-1;
-        d->dirty_max_byte = 0;
-        d->dirty_all = false;
-        return aer_dict_val(d);
+        return aer_dict_val(heap_new_dict(&vm->heap));
     }
     return dflt;
 }

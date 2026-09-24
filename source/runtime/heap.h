@@ -112,6 +112,9 @@ void vm_string_payload_free(VmHeap* heap, char* payload, unsigned int length);
    VM owns its own. */
 void vm_heap_init(VmHeap* heap);
 
+/* Frees every pool, payload and GC structure the heap owns; vm_heap_init's inverse. */
+void vm_heap_destroy(VmHeap* heap);
+
 /* Smallest tier that fits instance_bytes -- ceiling, never floor, since a cell smaller than the
    shape's own fields buffer would let AerStruct.fields (set to right after the header, in the
    same cell) run past the cell's actual allocation. */

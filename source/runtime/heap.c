@@ -70,6 +70,51 @@ void vm_heap_init(VmHeap* heap) {
     heap->pools_initialized = true;
 }
 
+void vm_heap_destroy(VmHeap* heap) {
+    /* Every live cell's separately-owned payload must be freed before its pool's slabs go away;
+       pool_destroy alone would leak them all. Unlike a normal sweep this finalizes regardless of
+       mark state -- the whole heap is going, not just recent garbage.
+       current_heap is saved/set/restored for free_typed_array, which stashes buffers into a
+       specific heap's cache; without it a stash can land in another live VM's heap. */
+    VmHeap* saved_current_heap = vm_current_heap();
+    vm_set_current_heap(heap);
+    gc_finalize_all_pools(heap);
+    vm_set_current_heap(saved_current_heap);
+
+    /* The free cache holds buffers belonging to no live cell, so the sweep above never reaches
+       them. */
+    for (unsigned int i = 0; i < TYPED_ARRAY_FREE_CACHE_SLOTS; i++)
+        free(heap->typed_array_free_cache[i].ptr);
+    heap->typed_array_free_cache_bytes = 0;
+
+    pool_destroy(&heap->string_pool);
+    pool_destroy(&heap->array_pool);
+    pool_destroy(&heap->dict_pool);
+    pool_destroy(&heap->function_pool);
+    for (unsigned int i = 0; i < STRUCT_PAYLOAD_TIER_COUNT; i++)
+        pool_destroy(&heap->struct_pools[i]);
+    for (unsigned int i = 0; i < STRING_PAYLOAD_TIER_COUNT; i++)
+        pool_destroy(&heap->string_payload_pools[i]);
+    pool_destroy(&heap->packed_array_pool);
+    pool_destroy(&heap->typed_array_pool);
+    pool_destroy(&heap->result_pool);
+    /* free_dict (above, via pool_finalize_all) already freed every live AerDict's own hashtable
+       entries back into heap->dict_hash_pools, so every key it ever handed out has already been
+       returned by the time these tiers are torn down. */
+    for (unsigned int i = 0; i < HASH_KEY_TIER_COUNT; i++)
+        pool_destroy(&heap->dict_hash_pools.key_pools[i]);
+    for (unsigned int i = 0; i < HASH_SPARSE_TIER_COUNT; i++)
+        pool_destroy(&heap->dict_hash_pools.sparse_pools[i]);
+    free(heap->remembered_set);
+    free(heap->gc_worklist.items);
+    free(heap->gc_worklist.ranges);
+    /* If this VM's heap was the active allocation target, it no longer exists -- leaving
+       current_heap dangling would be a use-after-free the moment anything allocates next. */
+    if (vm_current_heap() == heap)
+        vm_set_current_heap(NULL);
+    *heap = (VmHeap){0};
+}
+
 /* Tier owning a `length`-character payload, or -1 for the plain-malloc fallback. Both alloc and
    free derive the class through this one function, so they cannot disagree. */
 static int string_payload_tier(unsigned int length) {

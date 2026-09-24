@@ -17,7 +17,9 @@ static inline unsigned int vm_typed_elem_width(TypedArrayElemKind kind) {
     return kind == TYPED_ELEM_BOOL ? 1 : 8;
 }
 
-/* A zeroed typed array. vm_new_typed_array_val wraps it as a value, for actor.receive(). */
+/* A typed array of `count` unwritten elements, on `heap` or on the current heap.
+   vm_new_typed_array_val zeroes one and wraps it as a value, for actor.receive(). */
+AerTypedArray* heap_new_typed_array(VmHeap* heap, TypedArrayElemKind kind, unsigned int count);
 AerTypedArray* vm_new_typed_array(TypedArrayElemKind kind, unsigned int count);
 AerVal vm_new_typed_array_val(TypedArrayElemKind kind, unsigned int count);
 
