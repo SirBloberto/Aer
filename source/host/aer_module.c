@@ -186,8 +186,8 @@ InstantiateResult aer_vm_instantiate_from_file(char* path, VM** out_vm, Chunk** 
         ok = !parse_had_error;
     }
     InstantiateResult result = ok ? INSTANTIATE_OK : INSTANTIATE_PARSE_FAILED;
-    unsigned int halt_addr = mchunk->count;
-    chunk_emit(mchunk, OP_HALT);
+    /* The OP_HALT parse() ends with: the return address a call into this module comes back to. */
+    unsigned int halt_addr = ok ? mchunk->count - 1 : 0;
 
     if (ok) {
         runtime_had_error = false;

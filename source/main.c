@@ -137,7 +137,6 @@ static void run() {
        that) and has its own per-statement rollback/recovery, so it's safe to call repeatedly --
        once per REPL line, or once for a whole file. */
     parse(&chunk);
-    chunk_emit(&chunk, OP_HALT);
     runtime_had_error = false;
     /* A rolled-back statement compiles to a no-op, which is harmless for one bad REPL line but not
        for a file: a corrupted loop body (e.g. an increment that failed to compile) silently becomes

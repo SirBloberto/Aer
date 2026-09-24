@@ -5937,7 +5937,8 @@ void parser_restore_state(ParserState* s) {
 /* Per-statement rollback so a REPL survives a mistake; persistent tables are left alone (see
    parser_reset). Anything still pending in the forward-reference list never got defined, and is
    reported at its original call site, then neutralized by overwriting the call's opcode word with
-   OP_HALT -- patching only the jump target would still run the call's side effects. */
+   OP_HALT -- patching only the jump target would still run the call's side effects. What it compiles
+   ends in OP_HALT, so a caller runs it from where it began. */
 void parse(Chunk* c) {
     P.any_compile_error = false;
     parse_had_error = false;
@@ -5990,4 +5991,5 @@ void parse(Chunk* c) {
     }
     if (P.any_compile_error)
         parse_had_error = true;
+    chunk_emit(c, OP_HALT);
 }

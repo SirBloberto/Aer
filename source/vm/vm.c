@@ -217,7 +217,6 @@ bool aer_run_source(VM* vm, Chunk* chunk, const char* source) {
     shell((char*)source); /* shell() strdup()s its own copy -- never mutates through this pointer */
     lex();
     parse(chunk);
-    chunk_emit(chunk, OP_HALT);
     runtime_had_error = false;
     return vm_run(vm);
 }

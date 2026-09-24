@@ -68,7 +68,6 @@ static bool run_source(Chunk* c, VM* vm, const char* src) {
     parser_reset();
     parse(c);
     if (parse_had_error) return false;   /* don't run on possibly-incomplete bytecode */
-    chunk_emit(c, OP_HALT);
     vm_init(vm, c);
     runtime_had_error = false;
     return vm_run(vm);
